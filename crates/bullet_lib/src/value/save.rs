@@ -100,16 +100,21 @@ where
     let mut file = File::create(path).unwrap();
     let mut buf = Vec::new();
 
+    // カスタムフォーマットの有無を判定（trueだとYaneuraOu形式）
+    let has_custom_format = trainer.state.saved_format.iter().any(|fmt| fmt.is_custom());
     for fmt in &trainer.state.saved_format {
         buf.extend_from_slice(&fmt.write_to_byte_buffer(&weight_store)?);
     }
+    
+    // YaneuraOu形式の場合、パディング不要
+    if !has_custom_format {
+        let bytes = buf.len() % 64;
+        if bytes > 0 {
+            let chs = [b'b', b'u', b'l', b'l', b'e', b't'];
 
-    let bytes = buf.len() % 64;
-    if bytes > 0 {
-        let chs = [b'b', b'u', b'l', b'l', b'e', b't'];
-
-        for i in 0..64 - bytes {
-            buf.push(chs[i % chs.len()]);
+            for i in 0..64 - bytes {
+                buf.push(chs[i % chs.len()]);
+            }
         }
     }
 
