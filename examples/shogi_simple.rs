@@ -324,13 +324,14 @@ fn get_feature_hash(features: FeatureSet) -> u32 {
 fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usize, l3_size: usize) -> String {
     let (feature_name, input_size) = match feature_set {
         FeatureSet::HalfKP => ("HalfKP(Friend)", 125388usize),
-        FeatureSet::HalfkaHm => ("HalfKA(Friend)", 73305usize),
+        FeatureSet::HalfkaHm => ("HalfKA_hm(Friend)", 73305usize),
         FeatureSet::Halfka => ("HalfKA(Friend)", 138510usize),
     };
 
-    // Format: Features=HalfKP(Friend)[125388->256x2],Network=AffineTransform[1<-256](...)
+    // YaneuraOu互換のdescription文字列
+    // 第1層は AffineTransformSparseInput を使用
     let description = format!(
-        "Features={}[{}->{}x2],Network=AffineTransform[1<-{}](ClippedReLU[{}](AffineTransform[{}<-{}](ClippedReLU[{}](AffineTransform[{}<-{}](InputSlice[{}(0:{})])))))",
+        "Features={}[{}->{}x2],Network=AffineTransform[1<-{}](ClippedReLU[{}](AffineTransform[{}<-{}](ClippedReLU[{}](AffineTransformSparseInput[{}<-{}](InputSlice[{}(0:{})])))))",
         feature_name,
         input_size,
         l1_size,
