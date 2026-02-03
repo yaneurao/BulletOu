@@ -15,12 +15,12 @@ Options:
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
     --wdl <LAMBDA>      WDL lambda (default: 0.75)
-    --scale <N>         Eval scale (default: 1020)
+    --scale <N>         Eval scale (default: 1016)
                         FV_SCALE = QA*QB/scale (rounded)
+                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
                         QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
-                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32
-                        Note: Default (QA=255, scale=1020) -> FV_SCALE=16
-                        For FV_SCALE=32: --qa 255 --scale 510 or --qa 127 --scale 254
+                        Note: Default (QA=127, scale=1016) -> FV_SCALE=8
+                        For FV_SCALE=16: --qa 127 --scale 508 or --qa 255 --scale 1020
     --save-rate <N>     Save interval in superbatches (default: 10)
     --threads <N>       Number of threads (default: 4)
     --output <DIR>      Output directory (default: checkpoints)
@@ -68,10 +68,11 @@ enum FeatureSet {
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum OutputFormat {
     /// bullet format: all i16 (l0w, l0b, l1w, l1b, l2w, l2b, outw, outb)
-    #[default]
     Bullet,
-    /// rust-core format: L0 i16, L1-Out biases i32 + weights i8, with NNUE header
-    RustCore,
+    /// standard format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
+    /// Compatible with nnue-pytorch / YaneuraOu
+    #[default]
+    Standard,
 }
 
 /// Activation function selection
@@ -79,10 +80,10 @@ enum OutputFormat {
 enum ActivationType {
     /// SCReLU - Squared Clipped ReLU: y = clamp(x, 0, qa)²
     /// Higher expressiveness, used in modern Stockfish
-    #[default]
     Screlu,
     /// CReLU - Clipped ReLU: y = clamp(x, 0, qa)
     /// Traditional activation, used in YaneuraOu/Suisho
+    #[default]
     Crelu,
 }
 
@@ -125,16 +126,16 @@ struct Args {
     #[arg(long, value_enum, default_value = "halfka-hm")]
     features: FeatureSet,
 
-    /// Output format (bullet or rust-core)
-    /// bullet: all i16, no header (default)
-    /// rust-core: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
-    #[arg(long, value_enum, default_value = "bullet")]
+    /// Output format (standard or bullet)
+    /// standard: NNUE header + L0 i16 + L1-Out biases i32 + weights i8 (default)
+    /// bullet: all i16, no header
+    #[arg(long, value_enum, default_value = "standard")]
     output_format: OutputFormat,
 
-    /// Activation function (screlu or crelu)
-    /// screlu: Squared Clipped ReLU - higher expressiveness (default)
-    /// crelu: Clipped ReLU - traditional, used in YaneuraOu/Suisho
-    #[arg(long, value_enum, default_value = "screlu")]
+    /// Activation function (crelu or screlu)
+    /// crelu: Clipped ReLU - traditional, used in YaneuraOu/Suisho (default)
+    /// screlu: Squared Clipped ReLU - higher expressiveness
+    #[arg(long, value_enum, default_value = "crelu")]
     activation: ActivationType,
 
     /// Pairwise multiplication mode (off or on)
@@ -183,18 +184,18 @@ struct Args {
     lr: f32,
 
     /// WDL lambda (0.0=eval only, 1.0=game result only)
-    #[arg(long, default_value = "0.75")]
+    #[arg(long, default_value = "0.5")]
     wdl: f32,
 
     /// Eval scale for training target sigmoid(score / scale).
     /// FV_SCALE = QA*QB/scale (rounded).
     /// Recommended divisors for exact FV_SCALE:
-    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
     ///   QA=127 (CReLU):  508->16, 254->32, 1016->8
-    /// Note: Default (QA=255, scale=1020) gives FV_SCALE=16.
-    /// For FV_SCALE=32: use --qa 255 --scale 510  (SCReLU)
-    ///                  or  --qa 127 --scale 254  (CReLU)
-    #[arg(long, default_value = "1020")]
+    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
+    /// Note: Default (QA=127, scale=1016) gives FV_SCALE=8.
+    /// For FV_SCALE=16: use --qa 127 --scale 508  (CReLU)
+    ///                  or  --qa 255 --scale 1020 (SCReLU)
+    #[arg(long, default_value = "1016")]
     scale: i32,
 
     /// Save interval (superbatches)
@@ -214,7 +215,7 @@ struct Args {
     net_id: String,
 
     /// Quantization factor QA (for L0)
-    #[arg(long, default_value = "255")]
+    #[arg(long, default_value = "127")]
     qa: i16,
 
     /// Quantization factor QB (for later layers)
@@ -349,9 +350,9 @@ fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usiz
     description
 }
 
-/// rust-core 用に重みをパディング
+/// standard 用に重みをパディング
 ///
-/// rust-core は SIMD 最適化のため、各層の入力次元を32の倍数にパディングする。
+/// standard は SIMD 最適化のため、各層の入力次元を32の倍数にパディングする。
 /// 例: 入力次元8 → パディング後32 (24個の0を追加)
 ///
 /// # Arguments
@@ -559,8 +560,8 @@ fn main() {
                 SavedFormat::id("outb").round().quantise::<i16>(qa * qb),
             ]
         }
-        OutputFormat::RustCore => {
-            // rust-core format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
+        OutputFormat::Standard => {
+            // standard format: NNUE header + L0 i16 + L1-Out biases i32 + weights i8
             //
             // File layout:
             // - Header: version (u32), network_hash (u32), desc_len (u32), description
@@ -627,7 +628,7 @@ fn main() {
                 SavedFormat::custom(header),
                 // FeatureTransformer layer hash
                 SavedFormat::custom(ft_hash),
-                // L0: biases first, then weights (rust-core order)
+                // L0: biases first, then weights (standard order)
                 SavedFormat::id("l0b").round().quantise::<i16>(qa),
                 SavedFormat::id("l0w").round().quantise::<i16>(qa),
                 // Network layer hash
@@ -637,7 +638,7 @@ fn main() {
                 // bullet 内部は column-major だが、これは GPU (cuBLAS) 最適化のため
                 // 変換コストは出力時の1回のみで、学習効率には影響しない
                 //
-                // 重要: rust-core は SIMD 最適化のため 32バイトアライメントを要求
+                // 重要: standard は SIMD 最適化のため 32バイトアライメントを要求
                 // 各層の入力次元を pad32() でパディングする必要がある
                 //
                 // L1: biases i32, weights i8 (row-major, padded)
