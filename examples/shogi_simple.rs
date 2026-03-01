@@ -14,7 +14,12 @@ Options:
     --batch-size <N>    Batch size (default: 16384)
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
-    --wdl <LAMBDA>      WDL lambda (default: 0.75)
+    --wdl <LAMBDA>      WDL lambda for constant scheduler (default: 0.5)
+                        Cannot be used with --start-wdl/--end-wdl
+    --start-wdl <F>     Start WDL lambda for linear interpolation
+    --end-wdl <F>       End WDL lambda for linear interpolation
+                        Must use both --start-wdl and --end-wdl together
+    --win-rate-model    Use win rate model for score conversion
     --scale <N>         Eval scale (default: 1016)
                         FV_SCALE = QA*QB/scale (rounded)
                         QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
@@ -41,6 +46,12 @@ Examples:
 
     # Train with custom sizes
     cargo run --release --example shogi_simple -- --l1 1024 --l2 16 --l3 64 --data data/train.bin
+
+    # Train with win rate model
+    cargo run --release --example shogi_simple -- --win-rate-model --data data/train.bin
+
+    # Train with linear WDL (start at 0.2, end at 0.8)
+    cargo run --release --example shogi_simple -- --data data/train.bin --start-wdl 0.2 --end-wdl 0.8
 */
 
 use std::path::PathBuf;
@@ -56,6 +67,7 @@ use bullet_lib::{
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 use clap::{Parser, ValueEnum};
+use serde::Serialize;
 
 /// Feature set selection
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -188,9 +200,20 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// WDL lambda (0.0=eval only, 1.0=game result only)
-    #[arg(long, default_value = "0.5")]
-    wdl: f32,
+    /// WDL lambda (0.0=eval only, 1.0=game result only, default: 0.5)
+    /// Cannot be used with --start-wdl/--end-wdl
+    #[arg(long, conflicts_with_all = ["start_wdl", "end_wdl"])]
+    wdl: Option<f32>,
+
+    /// Start WDL lambda for linear interpolation
+    /// Must be used together with --end-wdl
+    #[arg(long, requires = "end_wdl")]
+    start_wdl: Option<f32>,
+
+    /// End WDL lambda for linear interpolation
+    /// Must be used together with --start-wdl
+    #[arg(long, requires = "start_wdl")]
+    end_wdl: Option<f32>,
 
     /// Eval scale for training target sigmoid(score / scale).
     /// FV_SCALE = QA*QB/scale (rounded).
@@ -259,6 +282,303 @@ struct Args {
     /// Only re-quantise checkpoint (no training, requires --resume)
     #[arg(long)]
     quantise_only: bool,
+
+    /// Use win rate model (score -> win probability conversion)
+    /// When enabled, converts evaluation score using:
+    ///   p = (score - 270.0) / 380.0
+    ///   pm = (-score - 270.0) / 380.0
+    ///   win_rate = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+    #[arg(long)]
+    win_rate_model: bool,
+}
+
+impl Args {
+    /// WDL lambda の値（デフォルト 0.5）
+    fn wdl_value(&self) -> f32 {
+        self.wdl.unwrap_or(0.5)
+    }
+
+    /// WDL値が [0.0, 1.0] の範囲内であることを検証
+    fn validate_wdl_range(name: &str, value: f32) -> Result<(), String> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(())
+        } else {
+            Err(format!("--{} must be between 0.0 and 1.0 (got {})", name, value))
+        }
+    }
+
+    /// Validates WDL-related arguments and creates the appropriate scheduler.
+    fn create_wdl_scheduler(&self) -> Result<wdl::WdlSchedulerEnum, String> {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => {
+                Self::validate_wdl_range("start-wdl", start)?;
+                Self::validate_wdl_range("end-wdl", end)?;
+                Ok(wdl::WdlSchedulerEnum::linear(start, end))
+            }
+            // clap の requires で排他制御済みだが念のため
+            (Some(_), None) => Err("--start-wdl requires --end-wdl".to_string()),
+            (None, Some(_)) => Err("--end-wdl requires --start-wdl".to_string()),
+            (None, None) => {
+                let wdl = self.wdl_value();
+                Self::validate_wdl_range("wdl", wdl)?;
+                Ok(wdl::WdlSchedulerEnum::constant(wdl))
+            }
+        }
+    }
+
+    /// Returns a display string for the WDL configuration.
+    fn wdl_display(&self) -> String {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => format!("Linear ({} -> {})", start, end),
+            _ => format!("Constant ({})", self.wdl_value()),
+        }
+    }
+}
+
+// =============================================================================
+// Experiment Log Structures
+// =============================================================================
+
+#[derive(Serialize, Clone)]
+struct ExperimentLog {
+    id: String,
+    name: String,
+    date: String,
+    commit: String,
+    command: String,
+    params: ExperimentParams,
+    data: ExperimentData,
+    results: ExperimentResults,
+    history: Vec<LossEntry>,
+    checkpoints: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentResults {
+    training_time_seconds: u64,
+    fv_scale: i32,
+    best_loss: Option<f64>,
+    best_loss_superbatch: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentParams {
+    l1: usize,
+    l2: usize,
+    l3: usize,
+    lr: f32,
+    lr_gamma: f32,
+    lr_step: usize,
+    batch_size: usize,
+    batches_per_superbatch: usize,
+    superbatches: usize,
+    start_superbatch: usize,
+    wdl: f32,
+    start_wdl: Option<f32>,
+    end_wdl: Option<f32>,
+    scale: i32,
+    weight_decay: f32,
+    win_rate_model: bool,
+    optimizer: String,
+    activation: String,
+    features: String,
+    pairwise: bool,
+    output_format: String,
+    qa: i16,
+    qb: i16,
+}
+
+#[derive(Serialize, Clone)]
+struct ExperimentData {
+    name: String,
+    positions: Option<u64>,
+    total_positions: u64,
+    epochs: Option<f64>,
+}
+
+#[derive(Serialize, Clone)]
+struct LossEntry {
+    superbatch: usize,
+    loss: f64,
+}
+
+// =============================================================================
+// Experiment Log Helper Functions
+// =============================================================================
+
+fn get_git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn get_timestamp() -> (String, String) {
+    use std::time::SystemTime;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let mut y = 1970i64;
+    let mut remaining_days = days as i64;
+    loop {
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md as i64 {
+            m = i;
+            break;
+        }
+        remaining_days -= md as i64;
+    }
+    let d = remaining_days + 1;
+    let id_ts = format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m + 1, d, hours, minutes, seconds);
+    let date = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, d, hours, minutes, seconds);
+    (id_ts, date)
+}
+
+fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
+    use std::collections::BTreeMap;
+    let content = match std::fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut superbatch_losses: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 3 {
+            if let (Ok(sb), Ok(loss)) = (parts[0].trim().parse::<usize>(), parts[2].trim().parse::<f64>()) {
+                let entry = superbatch_losses.entry(sb).or_insert((0.0, 0));
+                entry.0 += loss;
+                entry.1 += 1;
+            }
+        }
+    }
+    superbatch_losses
+        .into_iter()
+        .map(|(sb, (sum, count))| LossEntry { superbatch: sb, loss: sum / count as f64 })
+        .collect()
+}
+
+fn collect_checkpoints(output_dir: &std::path::Path, net_id: &str) -> Vec<String> {
+    let prefix = format!("{}-", net_id);
+    let mut checkpoints: Vec<String> = std::fs::read_dir(output_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && entry.path().is_dir() {
+                let suffix = &name[prefix.len()..];
+                if suffix.parse::<usize>().is_ok() {
+                    return Some(name);
+                }
+            }
+            None
+        })
+        .collect();
+    checkpoints.sort_by(|a, b| {
+        let a_num: usize = a[prefix.len()..].parse().unwrap_or(0);
+        let b_num: usize = b[prefix.len()..].parse().unwrap_or(0);
+        a_num.cmp(&b_num)
+    });
+    checkpoints
+}
+
+struct ExperimentContext {
+    output_dir: std::path::PathBuf,
+    net_id: String,
+    command: String,
+    params: ExperimentParams,
+    data_name: String,
+    superbatches: usize,
+    fv_scale: i32,
+}
+
+fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64) -> std::io::Result<()> {
+    let commit = get_git_commit();
+    let (id_ts, date) = get_timestamp();
+    let id = format!("{}-{}", id_ts, ctx.net_id);
+
+    let final_checkpoint = format!("{}-{}", ctx.net_id, ctx.superbatches);
+    let log_path = ctx.output_dir.join(&final_checkpoint).join("log.txt");
+    let history = parse_loss_history(&log_path);
+
+    let checkpoints = collect_checkpoints(&ctx.output_dir, &ctx.net_id);
+
+    let num_superbatches = if ctx.params.superbatches >= ctx.params.start_superbatch {
+        (ctx.params.superbatches - ctx.params.start_superbatch + 1) as u64
+    } else {
+        0
+    };
+    let total_positions = ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * num_superbatches;
+
+    // データファイルの総局面数を計算 (ファイルサイズ / 40バイト)
+    const PACKED_SFEN_VALUE_SIZE: u64 = 40;
+    let positions: u64 = ctx
+        .data_name
+        .split(',')
+        .filter_map(|path| std::fs::metadata(path.trim()).ok())
+        .map(|meta| meta.len() / PACKED_SFEN_VALUE_SIZE)
+        .sum();
+    let epochs = if positions > 0 { total_positions as f64 / positions as f64 } else { 0.0 };
+
+    // best loss を history から計算
+    let (best_loss, best_loss_superbatch) = history
+        .iter()
+        .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
+        .unwrap_or((None, None));
+
+    let experiment = ExperimentLog {
+        id,
+        name: ctx.net_id.clone(),
+        date,
+        commit,
+        command: ctx.command.clone(),
+        params: ctx.params.clone(),
+        data: ExperimentData {
+            name: ctx.data_name.clone(),
+            positions: Some(positions),
+            total_positions,
+            epochs: Some(epochs),
+        },
+        results: ExperimentResults {
+            training_time_seconds,
+            fv_scale: ctx.fv_scale,
+            best_loss,
+            best_loss_superbatch,
+        },
+        history,
+        checkpoints,
+    };
+
+    let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
+    let json_dir = ctx.output_dir.join(&ctx.net_id);
+    std::fs::create_dir_all(&json_dir)?;
+    let json_path = json_dir.join("experiment.json");
+    std::fs::write(&json_path, json)?;
+    println!("Experiment log saved to {}", json_path.display());
+    Ok(())
 }
 
 // =============================================================================
@@ -325,7 +645,7 @@ fn compute_fc_hash(l1_size: usize, l2_size: usize, l3_size: usize) -> u32 {
         let mut layer_hash: u32 = 0xCC03DAE4;
         layer_hash = layer_hash.wrapping_add(out_features as u32);
         layer_hash ^= prev_hash >> 1;
-        layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF;
+        layer_hash ^= prev_hash << 31;
 
         // Clipped ReLU hash (not for output layer)
         if i < 2 {
@@ -339,10 +659,10 @@ fn compute_fc_hash(l1_size: usize, l2_size: usize, l3_size: usize) -> u32 {
 
 /// 特徴量hash値を取得
 fn get_feature_hash(features: FeatureSet) -> u32 {
-    use bullet_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM, FEATURE_HASH_NONMIRROR};
+    use bullet_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR};
     match features {
         FeatureSet::HalfKP => FEATURE_HASH,
-        FeatureSet::HalfkaHm => FEATURE_HASH_HM,
+        FeatureSet::HalfkaHm => FEATURE_HASH_HM_V2,
         FeatureSet::Halfka => FEATURE_HASH_NONMIRROR,
     }
 }
@@ -362,15 +682,15 @@ fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usiz
         feature_name,
         input_size,
         l1_size,
-        l3_size,  // Output layer input
-        l3_size,  // L2 output / L3 input
-        l3_size,  // L2 output features
-        l2_size,  // L2 input features
-        l2_size,  // L1 output / L2 input
-        l2_size,  // L1 output features
-        l1_size * 2,  // L1 input (accumulator x2)
-        l1_size * 2,  // InputSlice size
-        l1_size * 2   // InputSlice range
+        l3_size,     // Output layer input
+        l3_size,     // L2 output / L3 input
+        l3_size,     // L2 output features
+        l2_size,     // L2 input features
+        l2_size,     // L1 output / L2 input
+        l2_size,     // L1 output features
+        l1_size * 2, // L1 input (accumulator x2)
+        l1_size * 2, // InputSlice size
+        l1_size * 2  // InputSlice range
     );
 
     description
@@ -469,13 +789,15 @@ fn main() {
     // Reckless/Stockfish: Pairwise uses QA=255 with CReLU
     // Traditional: CReLU uses QA=127, SCReLU uses QA=255
     let recommended_qa = match (args.activation, pairwise_enabled) {
-        (ActivationType::Screlu, _) => 255,      // SCReLU always uses QA=255
-        (ActivationType::Crelu, true) => 255,    // Pairwise + CReLU uses QA=255 (Reckless compatible)
-        (ActivationType::Crelu, false) => 127,   // Traditional CReLU uses QA=127
+        (ActivationType::Screlu, _) => 255,    // SCReLU always uses QA=255
+        (ActivationType::Crelu, true) => 255,  // Pairwise + CReLU uses QA=255 (Reckless compatible)
+        (ActivationType::Crelu, false) => 127, // Traditional CReLU uses QA=127
     };
     if qa != recommended_qa && !args.quantise_only {
-        eprintln!("WARNING: QA={} is not recommended for {} activation{}.",
-            qa, activation_name,
+        eprintln!(
+            "WARNING: QA={} is not recommended for {} activation{}.",
+            qa,
+            activation_name,
             if pairwise_enabled { " with pairwise" } else { "" }
         );
         eprintln!("         Recommended: --qa {}", recommended_qa);
@@ -507,26 +829,32 @@ fn main() {
     println!("Features: {} ({} dimensions)", feature_name, input_size);
     println!("Architecture: {} (L1={}, L2={}, L3={})", arch.display(), l1_size, l2_size, l3_size);
     if pairwise_enabled {
-        println!("Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
-            input_size, l1_size, l1_input_dim, l2_size, l3_size);
+        println!(
+            "Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
+            input_size, l1_size, l1_input_dim, l2_size, l3_size
+        );
     } else {
         println!("Network: {} -> {}x2 -> {} -> {} -> 1", input_size, l1_size, l2_size, l3_size);
     }
     println!("Activation: {}", activation_name);
     println!("Pairwise: {} (L1 input = {})", pairwise_name, l1_input_dim);
+    println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
     println!("Optimizer: {}", optimizer_name);
     println!("Weight decay: {}", args.weight_decay);
     println!("Scale: {}", args.scale);
     println!("Quantization: QA={}, QB={}", qa, qb);
-    let batches_per_superbatch_display = args
-        .batches_per_superbatch
-        .unwrap_or_else(|| (100_000_000 + args.batch_size - 1) / args.batch_size);
+    let batches_per_superbatch_display =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
     let positions_per_superbatch = batches_per_superbatch_display as u64 * args.batch_size as u64;
     println!("Batch size: {}", args.batch_size);
-    println!("Batches/superbatch: {} (~{}M positions)", batches_per_superbatch_display, positions_per_superbatch / 1_000_000);
+    println!(
+        "Batches/superbatch: {} (~{}M positions)",
+        batches_per_superbatch_display,
+        positions_per_superbatch / 1_000_000
+    );
     println!("Superbatches: {} (start={})", args.superbatches, args.start_superbatch);
     println!("Learning rate: {} (gamma={}, step={})", args.lr, args.lr_gamma, args.lr_step);
-    println!("WDL lambda: {}", args.wdl);
+    println!("WDL lambda: {}", args.wdl_display());
     println!("Save rate: {}", args.save_rate);
     println!("Threads: {} (queue={})", args.threads, args.batch_queue_size);
     println!("Output: {}", args.output.display());
@@ -534,10 +862,57 @@ fn main() {
     println!("Data: {}", args.data);
     println!("===========================");
 
+    // Capture data for experiment JSON before args.net_id is moved
+    let output_format_name = match args.output_format {
+        OutputFormat::Bullet => "bullet",
+        OutputFormat::Standard => "standard",
+    };
+    let experiment_params = ExperimentParams {
+        l1: l1_size,
+        l2: l2_size,
+        l3: l3_size,
+        lr: args.lr,
+        lr_gamma: args.lr_gamma,
+        lr_step: args.lr_step,
+        batch_size: args.batch_size,
+        batches_per_superbatch: batches_per_superbatch_display,
+        superbatches: args.superbatches,
+        start_superbatch: args.start_superbatch,
+        wdl: args.wdl_value(),
+        start_wdl: args.start_wdl,
+        end_wdl: args.end_wdl,
+        scale: args.scale,
+        weight_decay: args.weight_decay,
+        win_rate_model: args.win_rate_model,
+        optimizer: optimizer_name.to_string(),
+        activation: activation_name.to_string(),
+        features: feature_name.to_string(),
+        pairwise: pairwise_enabled,
+        output_format: output_format_name.to_string(),
+        qa: args.qa,
+        qb: args.qb,
+    };
+    let experiment_quantise_only = args.quantise_only;
+    let experiment_fv_scale = (i32::from(args.qa) * i32::from(args.qb) + args.scale / 2) / args.scale;
+    let experiment_ctx = ExperimentContext {
+        output_dir: args.output.clone(),
+        net_id: args.net_id.clone(),
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        params: experiment_params,
+        data_name: args.data.clone(),
+        superbatches: args.superbatches,
+        fv_scale: experiment_fv_scale,
+    };
+
+    // Create WDL scheduler
+    let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
+
     // Training schedule
-    let batches_per_superbatch = args
-        .batches_per_superbatch
-        .unwrap_or_else(|| (100_000_000 + args.batch_size - 1) / args.batch_size);
+    let batches_per_superbatch =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
     let schedule = TrainingSchedule {
         net_id: args.net_id,
         eval_scale: args.scale as f32,
@@ -547,7 +922,7 @@ fn main() {
             start_superbatch: args.start_superbatch,
             end_superbatch: args.superbatches,
         },
-        wdl_scheduler: wdl::ConstantWDL { value: args.wdl },
+        wdl_scheduler,
         lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
     };
@@ -654,9 +1029,7 @@ fn main() {
                     ((qa_i32 * qa_i32) >> shift) * i32::from(qb)
                 }
                 // SCReLU QA=255: x² >> 9 で 127 スケール
-                (ActivationType::Screlu, false, qa) if qa >= 255 => {
-                    127 * i32::from(qb)
-                }
+                (ActivationType::Screlu, false, qa) if qa >= 255 => 127 * i32::from(qb),
                 // CReLU / その他: qa スケール
                 _ => i32::from(qa) * i32::from(qb),
             };
@@ -683,142 +1056,166 @@ fn main() {
                 // 入力次元: l1_input_dim → pad32(l1_input_dim)
                 // Pairwise時はl1_size、通常時は2*l1_size
                 SavedFormat::id("l1b").round().quantise::<i32>(l1_bias_scale),
-                SavedFormat::id("l1w").transpose().transform({
-                    let out_dim = l2_size;
-                    let in_dim = l1_input_dim;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l1w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l2_size;
+                        let in_dim = l1_input_dim;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // L2: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l2 → pad32(l2)
                 // L2入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("l2w").transpose().transform({
-                    let out_dim = l3_size;
-                    let in_dim = l2_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l2w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l3_size;
+                        let in_dim = l2_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // Output: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l3 → pad32(l3)
                 // Output入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("outw").transpose().transform({
-                    let out_dim = 1;
-                    let in_dim = l3_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("outw")
+                    .transpose()
+                    .transform({
+                        let out_dim = 1;
+                        let in_dim = l3_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
             ]
         }
     };
 
     // Network builder macro with SCReLU activation (no pairwise)
     macro_rules! build_trainer_screlu {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    let stm_hidden = l0.forward(stm_inputs).screlu();
-                    let ntm_hidden = l0.forward(ntm_inputs).screlu();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                let stm_hidden = l0.forward(stm_inputs).screlu();
+                let ntm_hidden = l0.forward(ntm_inputs).screlu();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).screlu();
-                    let hidden2 = l2.forward(hidden1).screlu();
+                let hidden1 = l1.forward(combined).screlu();
+                let hidden2 = l2.forward(hidden1).screlu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with SCReLU activation + pairwise multiplication
     macro_rules! build_trainer_screlu_pairwise {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    // SCReLU + pairwise_mul (unusual but supported)
-                    let stm_hidden = l0.forward(stm_inputs).screlu().pairwise_mul();
-                    let ntm_hidden = l0.forward(ntm_inputs).screlu().pairwise_mul();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                // SCReLU + pairwise_mul (unusual but supported)
+                let stm_hidden = l0.forward(stm_inputs).screlu().pairwise_mul();
+                let ntm_hidden = l0.forward(ntm_inputs).screlu().pairwise_mul();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).screlu();
-                    let hidden2 = l2.forward(hidden1).screlu();
+                let hidden1 = l1.forward(combined).screlu();
+                let hidden2 = l2.forward(hidden1).screlu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with CReLU (Clipped ReLU) activation (no pairwise)
     macro_rules! build_trainer_crelu {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    let stm_hidden = l0.forward(stm_inputs).crelu();
-                    let ntm_hidden = l0.forward(ntm_inputs).crelu();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                let stm_hidden = l0.forward(stm_inputs).crelu();
+                let ntm_hidden = l0.forward(ntm_inputs).crelu();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).crelu();
-                    let hidden2 = l2.forward(hidden1).crelu();
+                let hidden1 = l1.forward(combined).crelu();
+                let hidden2 = l2.forward(hidden1).crelu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with CReLU activation + pairwise multiplication
     // This is the recommended combination for pairwise multiplication
     macro_rules! build_trainer_crelu_pairwise {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    // CReLU + pairwise_mul (recommended combination)
-                    let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
-                    let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                // CReLU + pairwise_mul (recommended combination)
+                let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
+                let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).crelu();
-                    let hidden2 = l2.forward(hidden1).crelu();
+                let hidden1 = l1.forward(combined).crelu();
+                let hidden2 = l2.forward(hidden1).crelu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Helper macro to either run training or just re-quantise
@@ -851,85 +1248,85 @@ fn main() {
 
     // Run training macro (to reduce duplication across feature sets, activations, and pairwise)
     macro_rules! run_training {
-        ($input:expr, screlu, false) => {{
+        ($input:expr, screlu, false, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_screlu!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_screlu!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_screlu!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, screlu, true) => {{
+        ($input:expr, screlu, true, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, crelu, false) => {{
+        ($input:expr, crelu, false, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_crelu!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_crelu!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_crelu!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, crelu, true) => {{
+        ($input:expr, crelu, true, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
@@ -938,19 +1335,53 @@ fn main() {
     }
 
     // Run training based on feature set, activation, and pairwise mode
+    let training_start = std::time::Instant::now();
+    let use_win_rate_model = args.win_rate_model;
     match (args.features, args.activation, pairwise_enabled) {
-        (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => run_training!(ShogiHalfKA_hm, screlu, false),
-        (FeatureSet::HalfkaHm, ActivationType::Screlu, true) => run_training!(ShogiHalfKA_hm, screlu, true),
-        (FeatureSet::HalfkaHm, ActivationType::Crelu, false) => run_training!(ShogiHalfKA_hm, crelu, false),
-        (FeatureSet::HalfkaHm, ActivationType::Crelu, true) => run_training!(ShogiHalfKA_hm, crelu, true),
-        (FeatureSet::Halfka, ActivationType::Screlu, false) => run_training!(ShogiHalfKA, screlu, false),
-        (FeatureSet::Halfka, ActivationType::Screlu, true) => run_training!(ShogiHalfKA, screlu, true),
-        (FeatureSet::Halfka, ActivationType::Crelu, false) => run_training!(ShogiHalfKA, crelu, false),
-        (FeatureSet::Halfka, ActivationType::Crelu, true) => run_training!(ShogiHalfKA, crelu, true),
-        (FeatureSet::HalfKP, ActivationType::Screlu, false) => run_training!(ShogiHalfKP, screlu, false),
-        (FeatureSet::HalfKP, ActivationType::Screlu, true) => run_training!(ShogiHalfKP, screlu, true),
-        (FeatureSet::HalfKP, ActivationType::Crelu, false) => run_training!(ShogiHalfKP, crelu, false),
-        (FeatureSet::HalfKP, ActivationType::Crelu, true) => run_training!(ShogiHalfKP, crelu, true),
+        (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKA_hm, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKA_hm, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKA_hm, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKA_hm, crelu, true, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKA, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKA, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKA, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKA, crelu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKP, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKP, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKP, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKP, crelu, true, use_win_rate_model)
+        }
+    }
+
+    // Generate experiment JSON after training completes
+    let training_time_seconds = training_start.elapsed().as_secs();
+    if !experiment_quantise_only {
+        if let Err(e) = generate_experiment_json(&experiment_ctx, training_time_seconds) {
+            eprintln!("Warning: Failed to generate experiment JSON: {}", e);
+        }
     }
 }
 
