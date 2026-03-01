@@ -21,6 +21,11 @@ Options:
                         QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
                         Note: Default (QA=127, scale=1016) -> FV_SCALE=8
                         For FV_SCALE=16: --qa 127 --scale 508 or --qa 255 --scale 1020
+    --batches-per-superbatch <N>  Batches per superbatch (default: auto ~100M positions)
+    --lr-gamma <F>      LR decay rate per step (default: 0.992)
+    --lr-step <N>       LR decay interval in superbatches (default: 1)
+    --start-superbatch <N>  Start superbatch number (default: 1)
+    --batch-queue-size <N>  Batch prefetch queue size (default: 64)
     --save-rate <N>     Save interval in superbatches (default: 10)
     --threads <N>       Number of threads (default: 4)
     --output <DIR>      Output directory (default: checkpoints)
@@ -225,6 +230,27 @@ struct Args {
     /// Weight decay (L2 regularization)
     #[arg(long, default_value = "0.01")]
     weight_decay: f32,
+
+    /// Batches per superbatch (default: auto-calculated for ~100M positions)
+    /// If not specified, calculated as ceil(100_000_000 / batch_size)
+    #[arg(long)]
+    batches_per_superbatch: Option<usize>,
+
+    /// LR scheduler gamma (decay rate per step)
+    #[arg(long, default_value = "0.992")]
+    lr_gamma: f32,
+
+    /// LR scheduler step interval (apply gamma every N superbatches)
+    #[arg(long, default_value = "1")]
+    lr_step: usize,
+
+    /// Start superbatch number (useful for resuming)
+    #[arg(long, default_value = "1")]
+    start_superbatch: usize,
+
+    /// Batch queue size (number of batches to prefetch)
+    #[arg(long, default_value = "64")]
+    batch_queue_size: usize,
 
     /// Resume from checkpoint path (e.g., checkpoints/v47/v47b-69)
     #[arg(long)]
@@ -492,36 +518,48 @@ fn main() {
     println!("Weight decay: {}", args.weight_decay);
     println!("Scale: {}", args.scale);
     println!("Quantization: QA={}, QB={}", qa, qb);
+    let batches_per_superbatch_display = args
+        .batches_per_superbatch
+        .unwrap_or_else(|| (100_000_000 + args.batch_size - 1) / args.batch_size);
+    let positions_per_superbatch = batches_per_superbatch_display as u64 * args.batch_size as u64;
     println!("Batch size: {}", args.batch_size);
-    println!("Superbatches: {}", args.superbatches);
-    println!("Learning rate: {}", args.lr);
+    println!("Batches/superbatch: {} (~{}M positions)", batches_per_superbatch_display, positions_per_superbatch / 1_000_000);
+    println!("Superbatches: {} (start={})", args.superbatches, args.start_superbatch);
+    println!("Learning rate: {} (gamma={}, step={})", args.lr, args.lr_gamma, args.lr_step);
     println!("WDL lambda: {}", args.wdl);
     println!("Save rate: {}", args.save_rate);
-    println!("Threads: {}", args.threads);
+    println!("Threads: {} (queue={})", args.threads, args.batch_queue_size);
     println!("Output: {}", args.output.display());
     println!("Net ID: {}", args.net_id);
     println!("Data: {}", args.data);
     println!("===========================");
 
     // Training schedule
+    let batches_per_superbatch = args
+        .batches_per_superbatch
+        .unwrap_or_else(|| (100_000_000 + args.batch_size - 1) / args.batch_size);
     let schedule = TrainingSchedule {
         net_id: args.net_id,
         eval_scale: args.scale as f32,
         steps: TrainingSteps {
             batch_size: args.batch_size,
-            batches_per_superbatch: 6104, // ~100M positions/superbatch
-            start_superbatch: 1,
+            batches_per_superbatch,
+            start_superbatch: args.start_superbatch,
             end_superbatch: args.superbatches,
         },
         wdl_scheduler: wdl::ConstantWDL { value: args.wdl },
-        lr_scheduler: lr::StepLR { start: args.lr, gamma: 0.3, step: 30 },
+        lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
     };
 
     // Local settings
     let output_dir = args.output.to_str().unwrap_or("checkpoints");
-    let settings =
-        LocalSettings { threads: args.threads, test_set: None, output_directory: output_dir, batch_queue_size: 64 };
+    let settings = LocalSettings {
+        threads: args.threads,
+        test_set: None,
+        output_directory: output_dir,
+        batch_queue_size: args.batch_queue_size,
+    };
 
     // Data loader (use existing file for --quantise-only to avoid file check)
     let data_files_owned: Vec<String> = if args.quantise_only {
