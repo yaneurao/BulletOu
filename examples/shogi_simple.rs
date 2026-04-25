@@ -20,12 +20,10 @@ Options:
     --end-wdl <F>       End WDL lambda for linear interpolation
                         Must use both --start-wdl and --end-wdl together
     --win-rate-model    Use win rate model for score conversion
-    --scale <N>         Eval scale (default: 1016)
+    --scale <N>         Eval scale (default: 600)
                         FV_SCALE = QA*QB/scale (rounded)
-                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
-                        QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
-                        Note: Default (QA=127, scale=1016) -> FV_SCALE=8
-                        For FV_SCALE=16: --qa 127 --scale 508 or --qa 255 --scale 1020
+                        QA=127 (CReLU):  8128/scale  -> 600->13, 508->16, 254->32, 1016->8
+                        QA=255 (SCReLU): 16320/scale -> 600->27, 510->32, 1020->16
     --batches-per-superbatch <N>  Batches per superbatch (default: auto ~100M positions)
     --lr-gamma <F>      LR decay rate per step (default: 0.992)
     --lr-step <N>       LR decay interval in superbatches (default: 1)
@@ -54,11 +52,14 @@ Examples:
     cargo run --release --example shogi_simple -- --data data/train.bin --start-wdl 0.2 --end-wdl 0.8
 */
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
-    nn::optimiser::{self, AdamWParams, RAdamParams, RangerParams},
+    nn::{
+        BackendMarker, NetworkBuilderNode,
+        optimiser::{self, AdamWParams, RAdamParams, RangerParams},
+    },
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -67,6 +68,14 @@ use bullet_lib::{
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy)]
+struct WrmLossParams {
+    nnue2score: f32,
+    in_scaling: f32,
+}
+
+static WRM_LOSS_PARAMS: OnceLock<WrmLossParams> = OnceLock::new();
 use serde::Serialize;
 
 /// Feature set selection
@@ -216,14 +225,11 @@ struct Args {
     end_wdl: Option<f32>,
 
     /// Eval scale for training target sigmoid(score / scale).
+    /// Eval_Coef=600 のDL教師データと整合させるため、デフォルト600。
     /// FV_SCALE = QA*QB/scale (rounded).
-    /// Recommended divisors for exact FV_SCALE:
-    ///   QA=127 (CReLU):  508->16, 254->32, 1016->8
-    ///   QA=255 (SCReLU): 510->32, 1020->16, 340->48
-    /// Note: Default (QA=127, scale=1016) gives FV_SCALE=8.
-    /// For FV_SCALE=16: use --qa 127 --scale 508  (CReLU)
-    ///                  or  --qa 255 --scale 1020 (SCReLU)
-    #[arg(long, default_value = "1016")]
+    ///   QA=127 (CReLU):  600->13, 508->16, 254->32, 1016->8
+    ///   QA=255 (SCReLU): 600->27, 510->32, 1020->16
+    #[arg(long, default_value = "600")]
     scale: i32,
 
     /// Save interval (superbatches)
@@ -290,6 +296,13 @@ struct Args {
     ///   win_rate = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
     #[arg(long)]
     win_rate_model: bool,
+
+    /// Apply WRM to network output in loss (nnue-pytorch-nodchip style).
+    /// Value is the in_scaling parameter (nodchip default: 340).
+    /// Requires --win-rate-model. When set, loss becomes |WRM_in(net) - WRM_out(target)|^2
+    /// instead of |sigmoid(net) - WRM_out(target)|^2.
+    #[arg(long, requires = "win_rate_model")]
+    wrm_in_scaling: Option<f32>,
 }
 
 impl Args {
@@ -333,6 +346,15 @@ impl Args {
             _ => format!("Constant ({})", self.wdl_value()),
         }
     }
+
+    fn validate_wrm_settings(&self) -> Result<(), String> {
+        if let Some(in_scaling) = self.wrm_in_scaling {
+            if !in_scaling.is_finite() || in_scaling <= 0.0 {
+                return Err(format!("--wrm-in-scaling must be a positive finite value (got {})", in_scaling));
+            }
+        }
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -344,6 +366,8 @@ struct ExperimentLog {
     id: String,
     name: String,
     date: String,
+    status: String,
+    last_updated_at: String,
     commit: String,
     command: String,
     params: ExperimentParams,
@@ -393,7 +417,7 @@ struct ExperimentData {
     name: String,
     positions: Option<u64>,
     total_positions: u64,
-    epochs: Option<f64>,
+    dataset_passes: Option<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -456,6 +480,21 @@ fn get_timestamp() -> (String, String) {
     (id_ts, date)
 }
 
+/// `prior` (resume 元 experiment.json から引き継いだ history) と
+/// `current` (現在 process の log.txt を parse した history) を superbatch でマージ。
+/// 同一 superbatch が両方にある場合は current を採用する (再学習で値が更新された場合に対応)。
+fn merge_loss_histories(prior: &[LossEntry], current: &[LossEntry]) -> Vec<LossEntry> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<usize, f64> = BTreeMap::new();
+    for entry in prior {
+        map.insert(entry.superbatch, entry.loss);
+    }
+    for entry in current {
+        map.insert(entry.superbatch, entry.loss);
+    }
+    map.into_iter().map(|(superbatch, loss)| LossEntry { superbatch, loss }).collect()
+}
+
 fn parse_loss_history(log_path: &std::path::Path) -> Vec<LossEntry> {
     use std::collections::BTreeMap;
     let content = match std::fs::read_to_string(log_path) {
@@ -512,73 +551,192 @@ struct ExperimentContext {
     data_name: String,
     superbatches: usize,
     fv_scale: i32,
+    /// 学習開始時に確定するID・日時・コミット（以後不変）
+    experiment_id: String,
+    experiment_date: String,
+    commit: String,
+    training_start: std::time::Instant,
+    /// データファイルの総局面数（初期化時に計算、以後不変）
+    positions: u64,
+    /// resume 時に既存 experiment.json から引き継いだ history。
+    /// build_experiment_log() で現在 process の history とマージされる。
+    prior_history: Vec<LossEntry>,
+    /// resume 時に既存 experiment.json から引き継いだ累積学習時間 (秒)。
+    /// build_experiment_log() で現在 process の経過時間に加算される。
+    prior_training_seconds: u64,
 }
 
-fn generate_experiment_json(ctx: &ExperimentContext, training_time_seconds: u64) -> std::io::Result<()> {
-    let commit = get_git_commit();
-    let (id_ts, date) = get_timestamp();
-    let id = format!("{}-{}", id_ts, ctx.net_id);
+impl ExperimentContext {
+    fn new(
+        output_dir: std::path::PathBuf,
+        net_id: String,
+        command: String,
+        params: ExperimentParams,
+        data_name: String,
+        superbatches: usize,
+        fv_scale: i32,
+    ) -> Self {
+        let commit = get_git_commit();
+        let (id_ts, date) = get_timestamp();
+        let id = format!("{}-{}", id_ts, &net_id);
 
-    let final_checkpoint = format!("{}-{}", ctx.net_id, ctx.superbatches);
-    let log_path = ctx.output_dir.join(&final_checkpoint).join("log.txt");
-    let history = parse_loss_history(&log_path);
+        const PACKED_SFEN_VALUE_SIZE: u64 = 40;
+        let positions: u64 = data_name
+            .split(',')
+            .filter_map(|path| std::fs::metadata(path.trim()).ok())
+            .map(|meta| meta.len() / PACKED_SFEN_VALUE_SIZE)
+            .sum();
 
-    let checkpoints = collect_checkpoints(&ctx.output_dir, &ctx.net_id);
+        Self {
+            output_dir,
+            net_id,
+            command,
+            params,
+            data_name,
+            superbatches,
+            fv_scale,
+            experiment_id: id,
+            experiment_date: date,
+            commit,
+            training_start: std::time::Instant::now(),
+            positions,
+            prior_history: Vec::new(),
+            prior_training_seconds: 0,
+        }
+    }
 
-    let num_superbatches = if ctx.params.superbatches >= ctx.params.start_superbatch {
-        (ctx.params.superbatches - ctx.params.start_superbatch + 1) as u64
-    } else {
-        0
-    };
-    let total_positions = ctx.params.batch_size as u64 * ctx.params.batches_per_superbatch as u64 * num_superbatches;
+    fn build_experiment_log(&self, status: &str) -> ExperimentLog {
+        let latest_checkpoint = collect_checkpoints(&self.output_dir, &self.net_id)
+            .last()
+            .cloned()
+            .unwrap_or_else(|| format!("{}-{}", self.net_id, self.superbatches));
+        let log_path = self.output_dir.join(&latest_checkpoint).join("log.txt");
+        let current_history = parse_loss_history(&log_path);
+        // resume 時は過去 run の history を引き継いだ上で、現在 process の history を上書き合成する。
+        // log.txt は checkpoint 単位で current process の error_record から書き直されるため、
+        // prior_history を持っていないと sb 1..=resume_point の loss が experiment.json から消える。
+        let history = merge_loss_histories(&self.prior_history, &current_history);
 
-    // データファイルの総局面数を計算 (ファイルサイズ / 40バイト)
-    const PACKED_SFEN_VALUE_SIZE: u64 = 40;
-    let positions: u64 = ctx
-        .data_name
-        .split(',')
-        .filter_map(|path| std::fs::metadata(path.trim()).ok())
-        .map(|meta| meta.len() / PACKED_SFEN_VALUE_SIZE)
-        .sum();
-    let epochs = if positions > 0 { total_positions as f64 / positions as f64 } else { 0.0 };
+        let checkpoints = collect_checkpoints(&self.output_dir, &self.net_id);
 
-    // best loss を history から計算
-    let (best_loss, best_loss_superbatch) = history
-        .iter()
-        .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
-        .unwrap_or((None, None));
+        // 実際に完了したsuperbatch数から計算（中間保存時に最終予定値を使わない）
+        let actual_superbatches = history.last().map(|e| e.superbatch).unwrap_or(0) as u64;
+        let total_positions =
+            self.params.batch_size as u64 * self.params.batches_per_superbatch as u64 * actual_superbatches;
+        let dataset_passes = if self.positions > 0 { total_positions as f64 / self.positions as f64 } else { 0.0 };
 
-    let experiment = ExperimentLog {
-        id,
-        name: ctx.net_id.clone(),
-        date,
-        commit,
-        command: ctx.command.clone(),
-        params: ctx.params.clone(),
-        data: ExperimentData {
-            name: ctx.data_name.clone(),
-            positions: Some(positions),
-            total_positions,
-            epochs: Some(epochs),
-        },
-        results: ExperimentResults {
-            training_time_seconds,
-            fv_scale: ctx.fv_scale,
-            best_loss,
-            best_loss_superbatch,
-        },
-        history,
-        checkpoints,
-    };
+        let (best_loss, best_loss_superbatch) = history
+            .iter()
+            .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|entry| (Some(entry.loss), Some(entry.superbatch)))
+            .unwrap_or((None, None));
 
-    let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
-    let json_dir = ctx.output_dir.join(&ctx.net_id);
-    std::fs::create_dir_all(&json_dir)?;
-    let json_path = json_dir.join("experiment.json");
-    std::fs::write(&json_path, json)?;
-    println!("Experiment log saved to {}", json_path.display());
-    Ok(())
+        let training_time_seconds = self.prior_training_seconds.saturating_add(self.training_start.elapsed().as_secs());
+        let (_, last_updated_at) = get_timestamp();
+
+        ExperimentLog {
+            id: self.experiment_id.clone(),
+            name: self.net_id.clone(),
+            date: self.experiment_date.clone(),
+            status: status.to_string(),
+            last_updated_at,
+            commit: self.commit.clone(),
+            command: self.command.clone(),
+            params: self.params.clone(),
+            data: ExperimentData {
+                name: self.data_name.clone(),
+                positions: Some(self.positions),
+                total_positions,
+                dataset_passes: Some(dataset_passes),
+            },
+            results: ExperimentResults {
+                training_time_seconds,
+                fv_scale: self.fv_scale,
+                best_loss,
+                best_loss_superbatch,
+            },
+            history,
+            checkpoints,
+        }
+    }
+
+    fn write_experiment_json(&self, status: &str) -> std::io::Result<()> {
+        let experiment = self.build_experiment_log(status);
+        let json = serde_json::to_string_pretty(&experiment).map_err(std::io::Error::other)?;
+        let json_dir = self.output_dir.join(&self.net_id);
+        std::fs::create_dir_all(&json_dir)?;
+        let json_path = json_dir.join("experiment.json");
+        std::fs::write(&json_path, &json)?;
+        println!("Experiment log saved to {} (status: {})", json_path.display(), status);
+        Ok(())
+    }
+
+    /// resume 時に既存 experiment.json から experiment_id / date / history を引き継ぐ。
+    ///
+    /// `ExperimentContext::new()` は呼ばれるたびに新しい timestamp ベースの
+    /// experiment_id を生成するため、resume 時にそのまま `write_experiment_json`
+    /// すると過去 run の experiment.json を別 ID で上書きしてしまい、
+    /// 履歴が分断される。本メソッドは resume 元の experiment.json を読んで
+    /// id / date を引き継ぐことで、resume が同一実験の続きとして記録されるようにする。
+    ///
+    /// 加えて `history` 配列も読み込み、`build_experiment_log` で現在 process の
+    /// loss history とマージできるようにする。これがないと
+    /// log.txt は checkpoint 単位で error_record から書き直されるため、
+    /// resume 後の experiment.json から sb 1..=resume_point の loss が消える。
+    fn inherit_resume_experiment_id(&mut self) {
+        let json_path = self.output_dir.join(&self.net_id).join("experiment.json");
+        if !json_path.exists() {
+            return;
+        }
+        let content = match std::fs::read_to_string(&json_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let existing: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        if let Some(id) = existing.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                println!("Inheriting experiment id from {}: {}", json_path.display(), id);
+                self.experiment_id = id.to_string();
+            }
+        }
+        if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
+            if !date.is_empty() {
+                self.experiment_date = date.to_string();
+            }
+        }
+        if let Some(secs) =
+            existing.get("results").and_then(|v| v.get("training_time_seconds")).and_then(|v| v.as_u64())
+        {
+            if secs > 0 {
+                println!("Inheriting prior training time: {} seconds", secs);
+                self.prior_training_seconds = secs;
+            }
+        }
+        if let Some(arr) = existing.get("history").and_then(|v| v.as_array()) {
+            let mut history: Vec<LossEntry> = arr
+                .iter()
+                .filter_map(|entry| {
+                    let sb = entry.get("superbatch").and_then(|v| v.as_u64())? as usize;
+                    let loss = entry.get("loss").and_then(|v| v.as_f64())?;
+                    Some(LossEntry { superbatch: sb, loss })
+                })
+                .collect();
+            history.sort_by_key(|e| e.superbatch);
+            if !history.is_empty() {
+                println!(
+                    "Inheriting {} history entries from previous run (sb {} .. {})",
+                    history.len(),
+                    history.first().unwrap().superbatch,
+                    history.last().unwrap().superbatch,
+                );
+                self.prior_history = history;
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -731,6 +889,10 @@ fn pad_weights_for_simd(weights: &[f32], out_dim: usize, in_dim: usize) -> Vec<f
 
 fn main() {
     let args = Args::parse();
+    args.validate_wrm_settings().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
 
     // Determine architecture
     let mut arch = Architecture::from_preset(&args.arch).unwrap_or_else(|| {
@@ -839,6 +1001,9 @@ fn main() {
     println!("Activation: {}", activation_name);
     println!("Pairwise: {} (L1 input = {})", pairwise_name, l1_input_dim);
     println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
+    if let Some(in_scaling) = args.wrm_in_scaling {
+        println!("WRM in_scaling: {} (network output WRM enabled)", in_scaling);
+    }
     println!("Optimizer: {}", optimizer_name);
     println!("Weight decay: {}", args.weight_decay);
     println!("Scale: {}", args.scale);
@@ -894,15 +1059,15 @@ fn main() {
     };
     let experiment_quantise_only = args.quantise_only;
     let experiment_fv_scale = (i32::from(args.qa) * i32::from(args.qb) + args.scale / 2) / args.scale;
-    let experiment_ctx = ExperimentContext {
-        output_dir: args.output.clone(),
-        net_id: args.net_id.clone(),
-        command: std::env::args().collect::<Vec<_>>().join(" "),
-        params: experiment_params,
-        data_name: args.data.clone(),
-        superbatches: args.superbatches,
-        fv_scale: experiment_fv_scale,
-    };
+    let mut experiment_ctx = ExperimentContext::new(
+        args.output.clone(),
+        args.net_id.clone(),
+        std::env::args().collect::<Vec<_>>().join(" "),
+        experiment_params,
+        args.data.clone(),
+        args.superbatches,
+        experiment_fv_scale,
+    );
 
     // Create WDL scheduler
     let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
@@ -927,13 +1092,25 @@ fn main() {
         save_rate: args.save_rate,
     };
 
+    // resume の場合は experiment_id を引き継ぐ。on_checkpoint_saved closure が
+    // experiment_ctx を不変借用する前に行う必要がある。
+    if !experiment_quantise_only && args.resume.is_some() {
+        experiment_ctx.inherit_resume_experiment_id();
+    }
+
     // Local settings
     let output_dir = args.output.to_str().unwrap_or("checkpoints");
+    let on_checkpoint_saved = |_superbatch: usize| {
+        if let Err(e) = experiment_ctx.write_experiment_json("running") {
+            eprintln!("Warning: Failed to update experiment JSON: {}", e);
+        }
+    };
     let settings = LocalSettings {
         threads: args.threads,
         test_set: None,
         output_directory: output_dir,
         batch_queue_size: args.batch_queue_size,
+        on_checkpoint_saved: if experiment_quantise_only { None } else { Some(&on_checkpoint_saved) },
     };
 
     // Data loader (use existing file for --quantise-only to avoid file check)
@@ -1095,6 +1272,34 @@ fn main() {
         }
     };
 
+    type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
+
+    /// Loss function: WRM applied to network output (nodchip style).
+    fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
+        let params =
+            *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
+        let offset = 270.0f32;
+        let scorenet = output * params.nnue2score;
+        let q = ((scorenet.copy() - offset) / params.in_scaling).sigmoid();
+        let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
+        let qf = (1.0 + q - qm) * 0.5;
+        qf.squared_error(target)
+    }
+
+    /// Loss function: standard sigmoid
+    fn loss_fn_sigmoid<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
+        output.sigmoid().squared_error(target)
+    }
+
+    let loss_fn: for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a> = if let Some(in_scaling) = args.wrm_in_scaling {
+        WRM_LOSS_PARAMS
+            .set(WrmLossParams { nnue2score: args.scale as f32, in_scaling })
+            .expect("WRM loss parameters should only be initialized once");
+        loss_fn_wrm
+    } else {
+        loss_fn_sigmoid
+    };
+
     // Network builder macro with SCReLU activation (no pairwise)
     macro_rules! build_trainer_screlu {
         ($opt:expr, $input:expr, $use_win_rate:expr) => {{
@@ -1103,7 +1308,7 @@ fn main() {
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+                .loss_fn(loss_fn);
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }
@@ -1133,7 +1338,7 @@ fn main() {
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+                .loss_fn(loss_fn);
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }
@@ -1164,7 +1369,7 @@ fn main() {
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+                .loss_fn(loss_fn);
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }
@@ -1195,7 +1400,7 @@ fn main() {
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+                .loss_fn(loss_fn);
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
             }
@@ -1335,7 +1540,6 @@ fn main() {
     }
 
     // Run training based on feature set, activation, and pairwise mode
-    let training_start = std::time::Instant::now();
     let use_win_rate_model = args.win_rate_model;
     match (args.features, args.activation, pairwise_enabled) {
         (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => {
@@ -1376,10 +1580,9 @@ fn main() {
         }
     }
 
-    // Generate experiment JSON after training completes
-    let training_time_seconds = training_start.elapsed().as_secs();
+    // Generate final experiment JSON (status: completed)
     if !experiment_quantise_only {
-        if let Err(e) = generate_experiment_json(&experiment_ctx, training_time_seconds) {
+        if let Err(e) = experiment_ctx.write_experiment_json("completed") {
             eprintln!("Warning: Failed to generate experiment JSON: {}", e);
         }
     }

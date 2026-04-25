@@ -44,7 +44,7 @@ where
         assert_eq!(batch_size, steps.batch_size);
 
         let mut batch_no = 0;
-        let mut superbatch = 1;
+        let mut superbatch = steps.start_superbatch;
 
         dataloader.load_and_map_batches(start_batch, batch_size, |batch| {
             let blend = wdl.blend(batch_no, superbatch, steps.end_superbatch);
@@ -91,6 +91,11 @@ impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
         let DenseInput { value, shape } = prepared_data.weights;
         let weights = HostDenseMatrix::new(value, Some(batch_size), shape);
         let _ = host_data.inputs.insert("entry_weights".to_string(), HostMatrix::Dense(weights));
+
+        if let Some(DenseInput { value, shape }) = prepared_data.hand_count {
+            let hand_count = HostDenseMatrix::new(value, Some(batch_size), shape);
+            let _ = host_data.inputs.insert("hand_count".to_string(), HostMatrix::Dense(hand_count));
+        }
 
         host_data
     }

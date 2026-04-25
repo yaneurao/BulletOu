@@ -16,6 +16,10 @@ cuda = ["bullet_cuda_backend"]
 hip = ["bullet_hip_backend", "bullet_hip_backend/hip", "bullet_cuda_backend?/error"]
 hip-cuda = ["bullet_hip_backend"]
 multigpu = ["bullet_cuda_backend/nccl"]
+# Threat profile gate. canonical test を除外するために使う build-time フラグ。
+# 通常の build では無効 (= canonical test 有効)。
+threat-profile-same-class = []
+threat-profile-same-class-major-pawn = []
 
 [dependencies]
 acyclib = { workspace = true }
@@ -74,3 +78,43 @@ path = "../../examples/extra/relabel.rs"
 [[example]]
 name = "shogi_simple"
 path = "../../examples/shogi_simple.rs"
+
+[[example]]
+name = "shogi_layerstack"
+path = "../../examples/shogi_layerstack.rs"
+
+[[example]]
+name = "shogi_layerstack_eval"
+path = "../../examples/shogi_layerstack_eval.rs"
+
+[[example]]
+name = "shogi_bucket_survey"
+path = "../../examples/shogi_bucket_survey.rs"
+
+[[example]]
+name = "shogi_progress_kpabs_train"
+path = "../../examples/shogi_progress_kpabs_train.rs"
+
+[[example]]
+name = "compare_progress_buckets"
+path = "../../examples/compare_progress_buckets.rs"
+
+[[example]]
+name = "merge_scores"
+path = "../../examples/merge_scores.rs"
+
+[[example]]
+name = "compilation"
+path = "../../examples/extra/compilation.rs"
+
+[[example]]
+name = "custom_pass"
+path = "../../examples/extra/custom_pass.rs"
+
+[[example]]
+name = "scan_bad_records"
+path = "../../examples/scan_bad_records.rs"
+
+[[example]]
+name = "recover_experiment"
+path = "../../examples/recover_experiment.rs"
