@@ -1,32 +1,17 @@
-# KP絶対を用いた進行度推定の実装ガイド
+# KP絶対を用いた進行度推定
 
-YaneuraOu/tanuki- と同方式の KP絶対（KP Absolute）ベースの進行度推定を
-bullet-shogi の `OutputBuckets` として実装するためのリファレンスドキュメント。
+bullet-shogi が採用している進行度推定方式の 1 つである **KP絶対（KP Absolute）**
+ベースのロジスティック回帰について、概念・仕様・利用上の注意点を解説する。
 
 学習ツール（`shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda`）の
 CLI 仕様・コマンド例は [`shogi_progress_kpabs_train.md`](shogi_progress_kpabs_train.md) を参照。
 
 ---
 
-## 1. 背景と目的
-
-### 既存実装の課題
-
-現在 bullet-shogi には 2 種類の進行度推定実装がある。
-
-| 実装 | 特徴量数 | 特徴量の性質 |
-|------|---------|------------|
-| `ShogiProgressBucket8` (coeff_v1) | 6個 | 盤上駒数・持ち駒数・成り駒数・玉の段 |
-| `ShogiProgressBucket8GikouLite` (coeff_v2) | 34個 | v1 + 玉からの Chebyshev 距離 3段階 |
-
-どちらも「意味的に解釈可能な手作り特徴量」であり、技巧（Gikou）の進行度特徴量を参考にした設計。
-
-**リファレンス元:** `crates/bullet_lib/src/game/outputs.rs`
-
-### 目標
+## 1. 背景
 
 YaneuraOu/tanuki- が WCSC27（2017）で採用した方式：
-**「KP絶対を用いたロジスティック回帰」** を実装する。
+**「KP絶対を用いたロジスティック回帰」** を bullet-shogi も同方式で採用している。
 
 > 進行度の推定には激指・技巧等が使用した、ロジスティック回帰を使用する。
 > 特徴量には KP絶対を用いる。
@@ -37,7 +22,7 @@ YaneuraOu/tanuki- が WCSC27（2017）で採用した方式：
 - [nodchip/nnue-pytorch](https://github.com/nodchip/nnue-pytorch) `tanuki_progress.cpp` の `Tanuki::Progress::Estimate`
 
 > 以降の本文では `yaneurao/YaneuraOu`（公式 YaneuraOu）と
-> `nodchip/nnue-pytorch`（Tanuki チームの将棋向け nnue-pytorch フォーク）の
+> `nodchip/nnue-pytorch`（Tanuki チームの将棋向け nnue-pytorch 派生）の
 > リポジトリを上記 URL のものとして扱う。
 
 ---
@@ -55,7 +40,8 @@ KP絶対インデックス = 玉の位置 (sq_k) × fe_end + 駒の BonaPiece (b
 - **K**：玉（King）の盤上の位置（0〜80、81升）
 - **P**：玉以外の駒の BonaPiece インデックス（0〜1547）
 
-各インデックスに対応した実数重みをテーブルとして持ち、該当する重みを合算して sigmoid を適用することで進行度（0.0〜1.0）を得る。
+各インデックスに対応した実数重みをテーブルとして持ち、該当する重みを合算して
+sigmoid を適用することで進行度（0.0〜1.0）を得る。
 
 ### YaneuraOu の実装
 
@@ -178,308 +164,9 @@ white_index = sq_wk_inv * FE_END + bp_white
 
 ---
 
-## 5. 実装設計
+## 5. 係数ファイル (progress.bin) の仕様
 
-### 5-1. 重みテーブル構造体
-
-`OutputBuckets` トレイトは `Copy + Default + 'static` を要求する。
-
-```rust
-// crates/bullet_lib/src/game/outputs.rs : OutputBuckets trait
-pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static { ... }
-```
-
-重みは 81 × 1548 = **125,388 要素**（約 500 KB）ある。
-この重みを bucket struct 自身に持たせると `Copy` 制約と相性が悪く、
-コピーコストも大きい。
-
-#### 解決策: `OnceLock<Box<[f32]>>` に 1 プロセス 1 セットだけ保持する
-
-実装では、重み本体は process-global な `OnceLock<Box<[f32]>>` に保持し、
-`ShogiProgressKPAbs` 自体は **ゼロサイズ型**として `Copy + Default` を満たす。
-これにより `Box::leak` は不要で、bucket 値のコピーも軽い。
-
-```rust
-pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
-
-static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
-static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
-    [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
-
-#[derive(Clone, Copy, Default)]
-pub struct ShogiProgressKPAbs;
-```
-
-### 5-2. 進行度推定関数
-
-```rust
-impl ShogiProgressKPAbs {
-    fn weights() -> &'static [f32] {
-        SHOGI_PROGRESS_KP_ABS_WEIGHTS
-            .get()
-            .map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS, |weights| weights.as_ref())
-    }
-
-    /// 局面の進行度を 0.0..=1.0 で返す
-    ///
-    /// # アルゴリズム
-    /// 先手玉視点と後手玉視点（盤反転）それぞれについて
-    /// 玉以外の全駒の KP絶対インデックスの重みを合算し、sigmoid を適用。
-    pub fn progress(&self, pos: &PackedSfenValue) -> f32 {
-        let board = pos.decode();  // ShogiBoard
-        if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
-            return 0.5;  // 無効局面では中立値
-        }
-
-        let weights = Self::weights();
-
-        // 玉位置
-        let sq_bk = board.black_king_sq.index();          // そのまま
-        let sq_wk = board.white_king_sq.inverse().index(); // 後手玉は反転
-
-        let mut sum = 0.0f32;
-
-        // --- 盤上駒（玉以外）---
-        for &pt in &BOARD_PIECE_TYPES {
-            for color in [Color::Black, Color::White] {
-                for sq in board.pieces(color, pt) {
-                    let piece = Piece::new(color, pt);
-
-                    // 先手視点 BonaPiece
-                    let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
-                    if bp_b != BonaPiece::ZERO {
-                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
-                    }
-
-                    // 後手視点 BonaPiece
-                    let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
-                    if bp_w != BonaPiece::ZERO {
-                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
-                    }
-                }
-            }
-        }
-
-        // --- 持ち駒 ---
-        for owner in [Color::Black, Color::White] {
-            let hand = if owner == Color::Black { board.black_hand } else { board.white_hand };
-            for &pt in &HAND_PIECE_TYPES {
-                let count = hand.count(pt);
-                for c in 1..=count {
-                    // 先手視点
-                    let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
-                    if bp_b != BonaPiece::ZERO {
-                        sum += weights[sq_bk * FE_OLD_END + bp_b.value() as usize];
-                    }
-                    // 後手視点
-                    let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
-                    if bp_w != BonaPiece::ZERO {
-                        sum += weights[sq_wk * FE_OLD_END + bp_w.value() as usize];
-                    }
-                }
-            }
-        }
-
-        // sigmoid
-        1.0 / (1.0 + (-sum).exp())
-    }
-}
-```
-
-### 5-3. OutputBuckets 実装
-
-`ShogiProgressKPAbs` 自体はゼロサイズなので、既存の Progress 系と同様に
-直接 `OutputBuckets<PackedSfenValue>` を実装できる。
-
-```rust
-impl OutputBuckets<PackedSfenValue> for ShogiProgressKPAbs {
-    const BUCKETS: usize = 8;
-
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
-        let p = self.progress(pos);
-        let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
-    }
-}
-```
-
-LayerStack の 9-bucket 実運用には、既存の `ShogiLayerStackBucket9` enum に
-新 variant を追加して組み込む。
-
-#### 5-3-1. `ShogiLayerStackBucket9` への variant 追加
-
-```rust
-// crates/bullet_lib/src/game/outputs.rs : ShogiLayerStackBucket9
-#[derive(Clone, Copy)]
-pub enum ShogiLayerStackBucket9 {
-    KingRank9,
-    Ply9([u16; 8]),
-    Progress8(ShogiProgressBucket8),
-    Progress8GikouLite(ShogiProgressBucket8GikouLite),
-    // ↓ 追加
-    Progress8KPAbs(ShogiProgressKPAbs),
-}
-```
-
-`ShogiProgressKPAbs` が `Copy` を満たしていれば、
-enum 全体も `Copy` を維持できる。
-
-```rust
-// impl OutputBuckets への dispatch 追加
-impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
-    const BUCKETS: usize = 9;
-
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
-        match self {
-            Self::KingRank9        => ShogiKingRankBucket::<9>.bucket(pos),
-            Self::Ply9(bounds)     => { /* 既存 */ }
-            Self::Progress8(b)     => b.bucket(pos),             // 既存
-            Self::Progress8GikouLite(b) => b.bucket(pos),        // 既存
-            // ↓ 追加
-            Self::Progress8KPAbs(b) => b.bucket(pos),
-        }
-    }
-}
-```
-
-**リファレンス元:** `crates/bullet_lib/src/game/outputs.rs` の `ShogiLayerStackBucket9` enum と `OutputBuckets<PackedSfenValue>` impl
-
-#### 5-3-2. CLI / `BucketMode` への追加
-
-```rust
-// examples/shogi_layerstack.rs : BucketMode
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum BucketMode {
-    #[default]
-    Kingrank9,
-    Ply9,
-    Progress8,
-    #[value(name = "progress8gikou")]
-    Progress8Gikou,
-    // ↓ 追加
-    #[value(name = "progress8kpabs")]
-    Progress8KPAbs,
-}
-```
-
-**変更が必要なのは `bucket_impl` の構築ブロックだけではない。**
-`BucketMode` に variant を追加すると、以下 3 つの match も同時に網羅する必要がある
-（どれか一つでも漏れるとコンパイルエラーになるか、`--progress-coeff` の検証で弾かれる）。
-
-##### `resolved_ply_bounds()`
-
-```rust
-// 既存: BucketMode::Progress8 | BucketMode::Progress8Gikou => { ... Ok(None) }
-// ↓ 追加
-BucketMode::Progress8 | BucketMode::Progress8Gikou | BucketMode::Progress8KPAbs => {
-    if self.ply_bounds.is_some() {
-        Err("--ply-bounds can only be used with --bucket-mode ply9".to_string())
-    } else {
-        Ok(None)
-    }
-}
-```
-
-**リファレンス元:** `examples/shogi_layerstack.rs` の `resolved_ply_bounds`
-
-##### `bucket_mode_name()`
-
-```rust
-// 既存
-BucketMode::Progress8Gikou => "progress8gikou",
-// ↓ 追加
-BucketMode::Progress8KPAbs => "progress8kpabs",
-```
-
-**リファレンス元:** `examples/shogi_layerstack.rs` の `bucket_mode_name`
-
-##### `load_progress_bucket()` と `LoadedProgressBucket`
-
-まず `LoadedProgressBucket` enum に variant を追加:
-
-```rust
-enum LoadedProgressBucket {
-    V1(ShogiProgressBucket8),
-    Gikou(ShogiProgressBucket8GikouLite),
-    KPAbs(ShogiProgressKPAbs),   // ↓ 追加
-}
-```
-
-次に `load_progress_bucket()` に arm を追加:
-
-```rust
-BucketMode::Progress8KPAbs => {
-    let path = self
-        .progress_coeff
-        .as_ref()
-        .ok_or_else(|| "--bucket-mode progress8kpabs requires --progress-coeff".to_string())?;
-    ShogiProgressKPAbs::load_from_bin(path).map(|v| Some(LoadedProgressBucket::KPAbs(v)))
-}
-// また既存の _ => { ... } アームの検証メッセージも更新が必要:
-// "can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
-```
-
-**リファレンス元:** `examples/shogi_layerstack.rs` の `LoadedProgressBucket` enum と `load_progress_bucket` メソッド
-
-##### `bucket_impl` 構築ブロック
-
-```rust
-BucketMode::Progress8KPAbs => match progress_bucket {
-    Some(LoadedProgressBucket::KPAbs(b)) => ShogiLayerStackBucket9::Progress8KPAbs(b),
-    _ => panic!("progress coeff (progress8kpabs) must exist in progress8kpabs mode"),
-},
-```
-
-**リファレンス元:** `examples/shogi_layerstack.rs` の main 内 `bucket_impl` 構築 (`match args.bucket_mode`)
-
-### 5-4. 係数ファイルの読み込み
-
-```rust
-impl ShogiProgressKPAbs {
-    /// yaneurao/YaneuraOu の Progress::Save() が出力する形式と同一の
-    /// progress.bin を読み込む。
-    ///
-    /// ファイル形式: double[81][1548] のバイナリ（little-endian）。
-    ///
-    /// 重みは process-global な OnceLock に保持する。
-    /// 1 プロセス中でロードできる KPAbs モデルは 1 つだけ。
-    ///
-    /// リファレンス: yaneurao/YaneuraOu / old_engines/eval/progress/progress.cpp / Tanuki::Progress::Save / Tanuki::Progress::Load
-    pub fn load_from_bin(path: &Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
-        if bytes.len() != expected {
-            return Err(format!(
-                "progress.bin サイズ不一致: got {} bytes, expected {}",
-                bytes.len(), expected
-            ));
-        }
-
-        let weights: Vec<f32> = bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
-            .collect();
-
-        SHOGI_PROGRESS_KP_ABS_WEIGHTS
-            .set(weights.into_boxed_slice())
-            .map_err(|_| "KPAbs weights are already loaded in this process".to_string())?;
-
-        Ok(Self)
-    }
-}
-```
-
-> **注意1:** `yaneurao/YaneuraOu` は `double`（64-bit float）でファイルに保存する。
-> bullet-shogi の推定ループでは `f32` に変換して使用する。
->
-> **注意2:** `OnceLock` により、1 プロセス中でロードできる KPAbs モデルは 1 つだけ。
-> 別の `progress.bin` を使う場合はプロセスを再起動する。
-
----
-
-## 6. 係数ファイルの仕様
-
-### ファイル形式
+### バイナリレイアウト
 
 | 項目 | 値 |
 |------|-----|
@@ -493,6 +180,9 @@ offset = (sq_k * 1548 + bp) * 8  bytes
 ```
 
 **リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Load` / `Tanuki::Progress::Save`
+
+> 推定ループ内では `f32` に変換して使用する（`f64` 重みのまま積和すると速度面で不利なため）。
+> ファイルそのものは `f64` で保存される。
 
 ### nodchip/nnue-pytorch での学習と保存
 
@@ -524,30 +214,38 @@ def build_linear_targets(length: int) -> torch.Tensor:
 
 ---
 
-## 7. 既存実装との差分まとめ
+## 6. 現状の進行度推定実装の特性
 
-| 観点 | 既存 (coeff_v1/v2) | 新実装 (KP絶対) |
-|------|-------------------|----------------|
-| 特徴量 | 手作りカウント（6〜34個） | KP絶対インデックス（動的列挙） |
-| パラメータ数 | 7〜35個 | 125,388個 |
-| 標準化 | z-score あり | **なし** |
-| 係数ファイル | JSON (`rshogi.progress_coeff.v1/v2`) | バイナリ `progress.bin`（f64） |
-| 学習スクリプト | 別途用意 | `nodchip/nnue-pytorch` の `train_progress.py` が使用可能 |
-| 表現力 | 低（局面の細部が消える） | 高（玉位置と各駒配置を記憶） |
+bullet-shogi には複数の進行度推定実装が存在し、LayerStack の bucket 選択用に
+切り替えて使用できる。
+
+| 観点 | `ShogiProgressBucket8` (coeff_v1) | `ShogiProgressBucket8GikouLite` (coeff_v2) | `ShogiProgressKPAbs` |
+|---|---|---|---|
+| 特徴量 | 手作りカウント（盤上駒数・持ち駒数・成り駒数・玉の段） | v1 + 玉からの Chebyshev 距離 3 段階 | KP絶対インデックス（動的列挙） |
+| 特徴量数 | 6 | 34 | 動的（玉位置 + 駒数で変動） |
+| パラメータ数 | 数個（特徴量 + bias） | 数十個（特徴量 + bias） | 125,388 |
+| 標準化 | z-score あり | z-score あり | なし |
+| 係数ファイル | JSON | JSON | バイナリ `progress.bin`（`f64`、1,003,104 bytes） |
+| 学習スクリプト | 別途用意 | 別途用意 | `nodchip/nnue-pytorch` の `train_progress.py`、または bullet-shogi の `shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda` |
+| 表現力 | 低（局面の細部が消える） | 中 | 高（玉位置と各駒配置を記憶） |
+| 由来 | 技巧（Gikou）の進行度特徴量を参考にした手作り | 同上の拡張 | YaneuraOu/tanuki- 由来 |
+
+実装は `crates/bullet_lib/src/game/outputs.rs` に集約されている。LayerStack 学習・推論で
+どの実装を使うかは `examples/shogi_layerstack.rs` の `BucketMode` で選択する。
 
 ---
 
-## 8. 実装時の注意事項
+## 7. 実装上の注意点
 
-### 8-1. `BonaPiece::ZERO` のスキップ
+### 7-1. `BonaPiece::ZERO` のスキップ
 
-`from_piece_square` は玉（King）に対して `BonaPiece::ZERO` を返す。
-また空マスも ZERO を返す。重みテーブルの index=0 への加算を避けるため、
+`BonaPiece::from_piece_square` は玉（King）および空マスに対して `BonaPiece::ZERO`
+を返す。重みテーブルの index=0 への加算を避けるため、KP絶対の積和ループでは
 `bp != BonaPiece::ZERO` のチェックが必要。
 
 **リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` の `BonaPiece::from_piece_square`（玉および空マスで `BonaPiece::ZERO` を返す）
 
-### 8-2. 後手玉の反転
+### 7-2. 後手玉の反転
 
 後手玉位置は必ず `inverse()` してから使う。
 
@@ -560,13 +258,15 @@ YaneuraOu での対応: `Inv(pos.king_square(WHITE))`
 
 **リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Estimate`（`Inv(pos.king_square(WHITE))`）
 
-### 8-3. 持ち駒は1枚ずつ列挙
+### 7-3. 持ち駒は 1 枚ずつ列挙
 
 YaneuraOu の `piece_list` は持ち駒も 1 枚ずつ別の BonaPiece として展開済み。
-bullet-shogi では `from_hand_piece(perspective, owner, pt, count)` を 1〜n 枚分
-ループで呼び出すことで同等の列挙を実現する。
+bullet-shogi 側は `BonaPiece::from_hand_piece(perspective, owner, pt, count)` を
+1〜n 枚分ループで呼び出すことで同等の列挙を実現する必要がある。
 
-### 8-4. YaneuraOu の `readme.txt` の記載
+### 7-4. YaneuraOu 本体での扱い
+
+YaneuraOu の `old_engines/eval/readme.txt` には次の記載がある:
 
 ```
 progress/
@@ -581,7 +281,7 @@ YaneuraOu 本体への組み込みは見送られたが、`nodchip/nnue-pytorch`
 
 ---
 
-## 9. 関連ファイル一覧
+## 8. 関連ファイル一覧
 
 ### bullet-shogi
 
@@ -590,8 +290,8 @@ YaneuraOu 本体への組み込みは見送られたが、`nodchip/nnue-pytorch`
 | `crates/bullet_lib/src/shogi/bona_piece.rs` | BonaPiece 定義・インデックス計算 |
 | `crates/bullet_lib/src/shogi/packed_sfen.rs` | PackedSfenValue・ShogiBoard 定義 |
 | `crates/bullet_lib/src/shogi/types.rs` | Square::inverse、BOARD_PIECE_TYPES 等 |
-| `crates/bullet_lib/src/game/outputs.rs` | 既存の進行度推定実装（coeff_v1/v2） |
-| `examples/shogi_layerstack.rs` | 学習ループ・BucketMode 実装例 |
+| `crates/bullet_lib/src/game/outputs.rs` | 進行度推定の各種実装（`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`） |
+| `examples/shogi_layerstack.rs` | LayerStack 学習・`BucketMode` による実装切り替え |
 | `examples/shogi_progress_kpabs_train.rs` | progress.bin 学習ツール（CPU 版） |
 | `examples/shogi_progress_kpabs_train_cuda.rs` | progress.bin 学習ツール（CUDA + reader 並列版） |
 | `docs/shogi/shogi_progress_kpabs_train.md` | 学習ツールの CLI 仕様・コマンド例 |
@@ -600,9 +300,9 @@ YaneuraOu 本体への組み込みは見送られたが、`nodchip/nnue-pytorch`
 
 | ファイル | 内容 |
 |---------|------|
-| `old_engines/eval/progress/progress.h` | Progress クラス定義・weights_[81][1548] |
-| `old_engines/eval/progress/progress.cpp` | Estimate・Learn・Load/Save 実装 |
-| `source/evaluate.h` | BonaPiece enum・fe_end 定義 |
+| `old_engines/eval/progress/progress.h` | `Tanuki::Progress` クラス定義・`weights_[SQ_NB][Eval::fe_end]` メンバ |
+| `old_engines/eval/progress/progress.cpp` | `Estimate` / `Learn` / `Load` / `Save` 実装 |
+| `source/evaluate.h` | `BonaPiece` enum・`fe_end` 定義 |
 
 ### nodchip/nnue-pytorch (<https://github.com/nodchip/nnue-pytorch>)
 
