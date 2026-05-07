@@ -32,9 +32,9 @@ YaneuraOu/tanuki- が WCSC27（2017）で採用した方式：
 > 特徴量には KP絶対を用いる。
 
 **リファレンス元:**
-- [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu) `old_engines/eval/progress/progress.h`（行 25）
-- [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu) `old_engines/eval/progress/progress.cpp`（行 271–282）
-- [nodchip/nnue-pytorch](https://github.com/nodchip/nnue-pytorch) `tanuki_progress.cpp`（行 195–204）
+- [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu) `old_engines/eval/progress/progress.h` の `Tanuki::Progress` クラス定義（`weights_[SQ_NB][Eval::fe_end]` メンバを含む）
+- [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu) `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Estimate`
+- [nodchip/nnue-pytorch](https://github.com/nodchip/nnue-pytorch) `tanuki_progress.cpp` の `Tanuki::Progress::Estimate`
 
 > 以降の本文では `yaneurao/YaneuraOu`（公式 YaneuraOu）と
 > `nodchip/nnue-pytorch`（Tanuki チームの将棋向け nnue-pytorch フォーク）の
@@ -60,7 +60,7 @@ KP絶対インデックス = 玉の位置 (sq_k) × fe_end + 駒の BonaPiece (b
 ### YaneuraOu の実装
 
 ```cpp
-// yaneurao/YaneuraOu : old_engines/eval/progress/progress.cpp 271–282
+// yaneurao/YaneuraOu : old_engines/eval/progress/progress.cpp / Tanuki::Progress::Estimate
 double Progress::Estimate(const Position& pos) {
     Square sq_bk = pos.king_square(BLACK);
     Square sq_wk = Inv(pos.king_square(WHITE));   // 後手玉を先手視点に反転
@@ -84,7 +84,7 @@ double Progress::Estimate(const Position& pos) {
 
 bullet-shogi の BonaPiece 定義は YaneuraOu に準拠しており、**完全に互換**。
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs`（行 1〜27）
+**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` 冒頭のモジュール docコメント
 
 ### 手駒領域（インデックス 1〜89）
 
@@ -121,7 +121,7 @@ bullet-shogi の BonaPiece 定義は YaneuraOu に準拠しており、**完全�
 > **注意:** 成歩・成香・成桂・成銀は金と**同じ**インデックス範囲を使う。
 > `PIECE_BASE[ProPawn][is_friend] == F_GOLD or E_GOLD`
 >
-> **リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs`（行 91〜122）
+> **リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` の `PIECE_BASE` テーブル
 
 ### マスのインデックス（Square::index）
 
@@ -140,7 +140,7 @@ pub const fn inverse(self) -> Self {
 }
 ```
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/types.rs`（`Square::inverse`）
+**リファレンス元:** `crates/bullet_lib/src/shogi/types.rs` の `Square::inverse`
 
 ---
 
@@ -174,7 +174,7 @@ white_index = sq_wk_inv * FE_END + bp_white
 
 先手視点・後手視点で**同じ重みテーブルを共有する**（YaneuraOu 実装と同じ）。
 
-**リファレンス元:** `nodchip/nnue-pytorch` の `tanuki_progress.cpp`（行 195–204）
+**リファレンス元:** `nodchip/nnue-pytorch` の `tanuki_progress.cpp` の `Tanuki::Progress::Estimate`
 
 ---
 
@@ -185,7 +185,7 @@ white_index = sq_wk_inv * FE_END + bp_white
 `OutputBuckets` トレイトは `Copy + Default + 'static` を要求する。
 
 ```rust
-// crates/bullet_lib/src/game/outputs.rs:5
+// crates/bullet_lib/src/game/outputs.rs : OutputBuckets trait
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static { ... }
 ```
 
@@ -309,7 +309,7 @@ LayerStack の 9-bucket 実運用には、既存の `ShogiLayerStackBucket9` enu
 #### 5-3-1. `ShogiLayerStackBucket9` への variant 追加
 
 ```rust
-// crates/bullet_lib/src/game/outputs.rs:438–444（現行）
+// crates/bullet_lib/src/game/outputs.rs : ShogiLayerStackBucket9
 #[derive(Clone, Copy)]
 pub enum ShogiLayerStackBucket9 {
     KingRank9,
@@ -342,12 +342,12 @@ impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
 }
 ```
 
-**リファレンス元:** `crates/bullet_lib/src/game/outputs.rs`（行 438–480）
+**リファレンス元:** `crates/bullet_lib/src/game/outputs.rs` の `ShogiLayerStackBucket9` enum と `OutputBuckets<PackedSfenValue>` impl
 
 #### 5-3-2. CLI / `BucketMode` への追加
 
 ```rust
-// examples/shogi_layerstack.rs:81–89（現行）
+// examples/shogi_layerstack.rs : BucketMode
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum BucketMode {
     #[default]
@@ -366,7 +366,7 @@ enum BucketMode {
 `BucketMode` に variant を追加すると、以下 3 つの match も同時に網羅する必要がある
 （どれか一つでも漏れるとコンパイルエラーになるか、`--progress-coeff` の検証で弾かれる）。
 
-##### `resolved_ply_bounds()` — 行 319 付近
+##### `resolved_ply_bounds()`
 
 ```rust
 // 既存: BucketMode::Progress8 | BucketMode::Progress8Gikou => { ... Ok(None) }
@@ -380,9 +380,9 @@ BucketMode::Progress8 | BucketMode::Progress8Gikou | BucketMode::Progress8KPAbs 
 }
 ```
 
-**リファレンス元:** `examples/shogi_layerstack.rs`（行 319–346）
+**リファレンス元:** `examples/shogi_layerstack.rs` の `resolved_ply_bounds`
 
-##### `bucket_mode_name()` — 行 350 付近
+##### `bucket_mode_name()`
 
 ```rust
 // 既存
@@ -391,9 +391,9 @@ BucketMode::Progress8Gikou => "progress8gikou",
 BucketMode::Progress8KPAbs => "progress8kpabs",
 ```
 
-**リファレンス元:** `examples/shogi_layerstack.rs`（行 350–357）
+**リファレンス元:** `examples/shogi_layerstack.rs` の `bucket_mode_name`
 
-##### `load_progress_bucket()` と `LoadedProgressBucket` — 行 359 付近
+##### `load_progress_bucket()` と `LoadedProgressBucket`
 
 まず `LoadedProgressBucket` enum に variant を追加:
 
@@ -419,9 +419,9 @@ BucketMode::Progress8KPAbs => {
 // "can only be used with --bucket-mode progress8/progress8gikou/progress8kpabs"
 ```
 
-**リファレンス元:** `examples/shogi_layerstack.rs`（行 359–391）
+**リファレンス元:** `examples/shogi_layerstack.rs` の `LoadedProgressBucket` enum と `load_progress_bucket` メソッド
 
-##### `bucket_impl` 構築ブロック — 行 1231 付近
+##### `bucket_impl` 構築ブロック
 
 ```rust
 BucketMode::Progress8KPAbs => match progress_bucket {
@@ -430,7 +430,7 @@ BucketMode::Progress8KPAbs => match progress_bucket {
 },
 ```
 
-**リファレンス元:** `examples/shogi_layerstack.rs`（行 1231–1250）
+**リファレンス元:** `examples/shogi_layerstack.rs` の main 内 `bucket_impl` 構築 (`match args.bucket_mode`)
 
 ### 5-4. 係数ファイルの読み込み
 
@@ -444,7 +444,7 @@ impl ShogiProgressKPAbs {
     /// 重みは process-global な OnceLock に保持する。
     /// 1 プロセス中でロードできる KPAbs モデルは 1 つだけ。
     ///
-    /// リファレンス: yaneurao/YaneuraOu : old_engines/eval/progress/progress.cpp 64–80
+    /// リファレンス: yaneurao/YaneuraOu / old_engines/eval/progress/progress.cpp / Tanuki::Progress::Save / Tanuki::Progress::Load
     pub fn load_from_bin(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
@@ -492,7 +492,7 @@ impl ShogiProgressKPAbs {
 offset = (sq_k * 1548 + bp) * 8  bytes
 ```
 
-**リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp`（行 46–80）
+**リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Load` / `Tanuki::Progress::Save`
 
 ### nodchip/nnue-pytorch での学習と保存
 
@@ -520,7 +520,7 @@ def build_linear_targets(length: int) -> torch.Tensor:
 損失関数: `MSE`、最適化: `Adam`（β1=0.9、β2=0.999、lr=2e-4）
 
 **リファレンス元:** `nodchip/nnue-pytorch` の `train_progress.py`、
-および `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp`（行 161–268）
+および `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Learn`
 
 ---
 
@@ -545,7 +545,7 @@ def build_linear_targets(length: int) -> torch.Tensor:
 また空マスも ZERO を返す。重みテーブルの index=0 への加算を避けるため、
 `bp != BonaPiece::ZERO` のチェックが必要。
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs`（行 158–181）
+**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` の `BonaPiece::from_piece_square`（玉および空マスで `BonaPiece::ZERO` を返す）
 
 ### 8-2. 後手玉の反転
 
@@ -558,7 +558,7 @@ def build_linear_targets(length: int) -> torch.Tensor:
 
 YaneuraOu での対応: `Inv(pos.king_square(WHITE))`
 
-**リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp`（行 273）
+**リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp` の `Tanuki::Progress::Estimate`（`Inv(pos.king_square(WHITE))`）
 
 ### 8-3. 持ち駒は1枚ずつ列挙
 
