@@ -93,6 +93,18 @@ struct Args {
     /// Progress report interval in games (game-relative mode only)
     #[arg(long, default_value_t = 1000)]
     log_interval_games: usize,
+
+    /// Save a per-epoch checkpoint as `<output_stem>.e{N}.<ext>` after each epoch.
+    /// The final `--output` file is still written after the last epoch.
+    #[arg(long)]
+    save_each_epoch: bool,
+}
+
+fn epoch_checkpoint_path(output: &Path, epoch: usize) -> PathBuf {
+    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("progress");
+    let ext = output.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+    let new_name = format!("{stem}.e{epoch}.{ext}");
+    output.with_file_name(new_name)
 }
 
 #[derive(Debug, Clone)]
@@ -815,6 +827,12 @@ fn main() -> io::Result<()> {
                 val_top_bucket,
                 val_top_share * 100.0
             );
+
+            if args.save_each_epoch {
+                let ckpt = epoch_checkpoint_path(&args.output, epoch);
+                write_progress_bin(&ckpt, &weights)?;
+                println!("epoch {} checkpoint: {}", epoch, ckpt.display());
+            }
         }
     } else {
         // === 近似版モード (従来通り) ===
@@ -854,6 +872,12 @@ fn main() -> io::Result<()> {
                     val_top_bucket,
                     val_top_share * 100.0
                 );
+            }
+
+            if args.save_each_epoch {
+                let ckpt = epoch_checkpoint_path(&args.output, epoch);
+                write_progress_bin(&ckpt, &weights)?;
+                println!("epoch {} checkpoint: {}", epoch, ckpt.display());
             }
         }
     }

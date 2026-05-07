@@ -96,8 +96,17 @@ name = "shogi_progress_kpabs_train"
 path = "../../examples/shogi_progress_kpabs_train.rs"
 
 [[example]]
+name = "shogi_progress_kpabs_train_cuda"
+path = "../../examples/shogi_progress_kpabs_train_cuda.rs"
+required-features = ["cuda"]
+
+[[example]]
 name = "compare_progress_buckets"
 path = "../../examples/compare_progress_buckets.rs"
+
+[[example]]
+name = "scan_entering_king"
+path = "../../examples/scan_entering_king.rs"
 
 [[example]]
 name = "merge_scores"
