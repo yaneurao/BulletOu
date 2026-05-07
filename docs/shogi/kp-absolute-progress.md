@@ -64,6 +64,34 @@ double Progress::Estimate(const Position& pos) {
 
 **リファレンス元:** `yaneurao/YaneuraOu` の `old_engines/eval/progress/progress.cpp`
 
+### Bucket 量子化
+
+進行度 `p ∈ [0.0, 1.0]` を LayerStack の bucket index へ量子化する式は次の通り:
+
+```
+bucket = clamp(floor(p * 8), 0, 7)
+```
+
+挙動の要点:
+
+- **切り捨て (floor) を使う**（切り上げではない）。`p` を等幅 1/8 ごとに区切り、
+  `[0, 1/8)` → 0, `[1/8, 2/8)` → 1, ..., `[7/8, 1)` → 7 と割り当てる
+- **結果値域は `{0, 1, ..., 7}` の 8 値**。`progress8kpabs` の "8" はこの 8 値分割を指す
+- **`p = 1.0` の境界ケース**は `floor(p * 8) = 8` となるが、`clamp(0, 7)` が
+  上限 7 に押し戻すため bucket 数は 8 に保たれる
+- 下限 0 のクランプは `sigmoid` 出力が常に `[0, 1]` に収まるため通常はトリガしないが、
+  数値誤差・無効局面の保険として機能する
+
+実装: `crates/bullet_lib/src/game/outputs.rs` の `ShogiProgressKPAbs` の
+`OutputBuckets::bucket` メソッド（`((p * 8.0).floor() as i32).clamp(0, 7) as u8`）。
+
+#### LayerStack の 9 buckets と Progress8KPAbs の 8 buckets の関係
+
+`ShogiLayerStackBucket9` enum は `BUCKETS = 9` で **LayerStack 全体の容量は
+9 bucket** だが、`Progress8KPAbs` variant が使うのはその内 **0〜7 の 8 bucket
+だけ**で、index 8 は未使用。`progress8kpabs` の bucket 数（8）と LayerStack の
+bucket 容量（9）は別の数値である点に注意。
+
 ---
 
 ## 3. BonaPiece インデックス体系

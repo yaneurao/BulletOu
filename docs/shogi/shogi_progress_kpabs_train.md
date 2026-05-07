@@ -15,7 +15,7 @@ KP-absolute 特徴量（玉位置 × 駒配置）に対する線形ロジステ�
 ```
 z      = Σ weights[kp_abs_index]
 p      = sigmoid(z)
-bucket = min(7, floor(p * 8))
+bucket = clamp(floor(p * 8), 0, 7)   // 結果は 0〜7 の 8 値
 ```
 
 - 重みの数: `81 × 1548 = 125,388`（玉位置 × `Eval::BonaPiece::fe_end`）
