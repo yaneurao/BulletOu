@@ -263,6 +263,12 @@ struct Args {
     #[arg(long, default_value_t = 600.0, requires = "wrm_in_scaling")]
     wrm_nnue2score: f32,
 
+    /// `|score| >= N` の局面を loss から除外する（weight=0）。
+    /// 典型用途: dlshogi 系教師の `±32000` mate-stamp を除く ablation 実験。
+    /// 未指定時は全局面を学習に使用（デフォルト挙動）。
+    #[arg(long)]
+    score_drop_abs: Option<u16>,
+
     /// Output bucket mode (kingrank9 / ply9 / progress8 / progress8gikou / progress8kpabs)
     #[arg(long, value_enum, default_value = "kingrank9")]
     bucket_mode: BucketMode,
@@ -683,6 +689,10 @@ struct ExperimentParams {
     scale: i32,
     weight_decay: f32,
     win_rate_model: bool,
+    /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
+    /// `None` または省略時は学習に全局面を使用（既存実験との後方互換のため `skip` で省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_drop_abs: Option<u16>,
     optimizer: String,
     qa: i16,
     qb: i16,
@@ -1941,6 +1951,10 @@ fn main() {
     if let Some(in_scaling) = args.wrm_in_scaling {
         println!("WRM in_scaling: {} nnue2score: {} (network output WRM enabled)", in_scaling, args.wrm_nnue2score);
     }
+    match args.score_drop_abs {
+        Some(cap) => println!("Score drop abs: |score| >= {} → weight=0 (record dropped from loss)", cap),
+        None => println!("Score drop abs: disabled"),
+    }
     let batches_per_superbatch_display =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
     let positions_per_superbatch = batches_per_superbatch_display as u64 * args.batch_size as u64;
@@ -1995,6 +2009,7 @@ fn main() {
         scale: args.scale,
         weight_decay: args.weight_decay,
         win_rate_model: args.win_rate_model,
+        score_drop_abs: args.score_drop_abs,
         optimizer: optimizer_name.to_string(),
         qa: QA,
         qb: QB,
@@ -2212,6 +2227,9 @@ fn main() {
                 .loss_fn(loss_fn);
             if $use_win_rate {
                 builder = builder.use_win_rate_model();
+            }
+            if let Some(cap) = args.score_drop_abs {
+                builder = builder.score_drop_abs(cap);
             }
             builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
                 // L0 (Feature Transformer)

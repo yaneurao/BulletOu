@@ -30,6 +30,9 @@ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     factorised: Vec<String>,
     wdl_output: bool,
     use_win_rate_model: bool,
+    /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
+    /// 設定すると `entry_weights * loss` が有効化される（weight_getter 未設定でも）。
+    score_drop_abs: Option<u16>,
     print_ir: bool,
 }
 
@@ -49,6 +52,7 @@ where
             loss_fn: None,
             wdl_output: false,
             use_win_rate_model: false,
+            score_drop_abs: None,
             factorised: Vec::new(),
             print_ir: false,
         }
@@ -118,6 +122,15 @@ where
         self
     }
 
+    /// `|score| >= cap` の局面を loss から除外する（weight を 0 にする）。
+    /// `cap = 0` を設定するとほぼ全レコードが除外されるので注意。
+    /// 典型用途: dlshogi 系教師の `±32000` mate-stamp を除く ablation 実験。
+    pub fn score_drop_abs(mut self, cap: u16) -> Self {
+        assert!(self.score_drop_abs.is_none(), "score_drop_abs already set!");
+        self.score_drop_abs = Some(cap);
+        self
+    }
+
     fn build_custom_internal<F>(self, f: F) -> ValueTrainer<O::Optimiser, I, Out::Inner>
     where
         F: for<'a> Fn(usize, usize, Nbn<'a>, Nb<'a>) -> (Nbn<'a>, Nbn<'a>),
@@ -137,7 +150,10 @@ where
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
         let (out, loss) = f(inputs, nnz, targets, &builder);
 
-        if self.weight_getter.is_some() {
+        // weight_getter または score_drop_abs のいずれかが指定されていれば
+        // entry_weights を loss に乗算する。score_drop_abs は loader 側で
+        // weights[i] = 0 を書き込むので、ここで入力が登録されている必要がある。
+        if self.weight_getter.is_some() || self.score_drop_abs.is_some() {
             let entry_weights = builder.new_dense_input("entry_weights", Shape::new(1, 1));
             let _ = entry_weights * loss;
         }
@@ -154,6 +170,7 @@ where
                 use_win_rate_model: self.use_win_rate_model,
                 wdl: self.wdl_output,
                 saved_format,
+                score_drop_abs: self.score_drop_abs,
             },
         })
     }
@@ -237,6 +254,7 @@ where
             factorised: self.factorised,
             wdl_output: self.wdl_output,
             use_win_rate_model: self.use_win_rate_model,
+            score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }
     }
@@ -265,6 +283,7 @@ where
             factorised: self.factorised,
             wdl_output: self.wdl_output,
             use_win_rate_model: self.use_win_rate_model,
+            score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }
     }

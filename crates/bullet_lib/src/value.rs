@@ -72,6 +72,9 @@ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
     saved_format: Vec<SavedFormat>,
     use_win_rate_model: bool,
     wdl: bool,
+    /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
+    /// builder の `score_drop_abs(cap)` で設定。
+    score_drop_abs: Option<u16>,
 }
 
 impl<Inp: SparseInputType, Out> ValueTrainerState<Inp, Out>
@@ -98,6 +101,7 @@ where
             threads,
             blend,
             scale,
+            self.score_drop_abs,
         ))
     }
 }
@@ -136,6 +140,7 @@ where
             self.state.use_win_rate_model,
             self.state.wdl,
             schedule.eval_scale,
+            self.state.score_drop_abs,
             dataloader.clone(),
         );
 
@@ -250,6 +255,7 @@ where
             self.state.use_win_rate_model,
             self.state.wdl,
             schedule.eval_scale,
+            self.state.score_drop_abs,
             dataloader.clone(),
         );
 

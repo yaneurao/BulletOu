@@ -72,6 +72,9 @@ pub struct DefaultDataLoader<I: SparseInputType, O, D> {
     use_win_rate_model: bool,
     wdl: bool,
     scale: f32,
+    /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外（weight を 0 にする）。
+    /// 特徴量デコードはそのまま走るが GPU 側で勾配寄与ゼロ。
+    score_drop_abs: Option<u16>,
     loader: D,
 }
 
@@ -85,9 +88,20 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
         use_win_rate_model: bool,
         wdl: bool,
         scale: f32,
+        score_drop_abs: Option<u16>,
         loader: D,
     ) -> Self {
-        Self { input_getter, output_getter, blend_getter, weight_getter, use_win_rate_model, wdl, scale, loader }
+        Self {
+            input_getter,
+            output_getter,
+            blend_getter,
+            weight_getter,
+            use_win_rate_model,
+            wdl,
+            scale,
+            score_drop_abs,
+            loader,
+        }
     }
 }
 
@@ -156,6 +170,7 @@ where
             threads,
             blend,
             self.scale,
+            self.score_drop_abs,
         )
     }
 }
@@ -195,6 +210,7 @@ where
         threads: usize,
         blend: f32,
         scale: f32,
+        score_drop_abs: Option<u16>,
     ) -> Self {
         let rscale = 1.0 / scale;
         let batch_size = data.len();
@@ -296,7 +312,13 @@ where
                                 );
 
                                 buckets_chunk[i] = i32::from(out.bucket(pos));
-                                weights_chunk[i] = weight_getter.map_or(1.0, |w| w(pos));
+                                let mut weight = weight_getter.map_or(1.0, |w| w(pos));
+                                if let Some(cap) = score_drop_abs {
+                                    if pos.score().unsigned_abs() >= cap {
+                                        weight = 0.0;
+                                    }
+                                }
+                                weights_chunk[i] = weight;
 
                                 if wdl {
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
