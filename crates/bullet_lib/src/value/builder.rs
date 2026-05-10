@@ -148,14 +148,17 @@ where
 
         let output_size = if self.wdl_output { 3 } else { 1 };
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
-        let (out, loss) = f(inputs, nnz, targets, &builder);
+        let (out, mut loss) = f(inputs, nnz, targets, &builder);
 
         // weight_getter または score_drop_abs のいずれかが指定されていれば
         // entry_weights を loss に乗算する。score_drop_abs は loader 側で
         // weights[i] = 0 を書き込むので、ここで入力が登録されている必要がある。
+        // 注意: 乗算結果を `loss` に再代入しないと EliminateUnusedOperations で
+        // 削除される（子ノードなし & 出力未登録のため）。upstream の `let _ =`
+        // パターンは `datapoint_weight_function` を no-op 化するバグだった。
         if self.weight_getter.is_some() || self.score_drop_abs.is_some() {
             let entry_weights = builder.new_dense_input("entry_weights", Shape::new(1, 1));
-            let _ = entry_weights * loss;
+            loss = entry_weights * loss;
         }
 
         let model = builder.build(Device::<ExecutionContext>::new(0).unwrap(), loss, out);

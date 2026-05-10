@@ -1952,7 +1952,7 @@ fn main() {
         println!("WRM in_scaling: {} nnue2score: {} (network output WRM enabled)", in_scaling, args.wrm_nnue2score);
     }
     match args.score_drop_abs {
-        Some(cap) => println!("Score drop abs: |score| >= {} → weight=0 (record dropped from loss)", cap),
+        Some(cap) => println!("Score drop abs: |score| >= {} -> weight=0 (record dropped from loss)", cap),
         None => println!("Score drop abs: disabled"),
     }
     let batches_per_superbatch_display =
