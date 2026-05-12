@@ -1,6 +1,6 @@
-# 3. KPPT / KPP_KKPT Training
+# KPPT / KPP_KKPT Training
 
-<a href="../../ja/tutorial/3-kppt-roadmap.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/shogi/kppt.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 BulletOu trains YaneuraOu's legacy KPPT-family evaluation functions and writes the corresponding three-file binary set (`KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin`). This page describes how to use it.
 
@@ -112,7 +112,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
-For the meaning of the scheduling units, see [§2.4 Training schedule](2-nnue-tutorial.md#24-training-schedule).
+For the meaning of the scheduling units, see [§2.4 Training schedule](../tutorial/2-nnue-tutorial.md#24-training-schedule).
 
 ## Memory requirements
 

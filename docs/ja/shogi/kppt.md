@@ -1,6 +1,6 @@
-# 3. KPPT / KPP_KKPT 学習
+# KPPT / KPP_KKPT 学習
 
-<a href="../../en/tutorial/3-kppt-roadmap.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/shogi/kppt.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 BulletOu はやねうら王の旧 KPPT 系評価関数 (`KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` の 3 ファイル組) を学習・出力できる。本ページではその使い方を説明する。
 
@@ -112,7 +112,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
-学習単位の意味は [§2.4 学習スケジュール](2-nnue-tutorial.md#24-学習スケジュール) を参照。
+学習単位の意味は [§2.4 学習スケジュール](../tutorial/2-nnue-tutorial.md#24-学習スケジュール) を参照。
 
 ## メモリ要件
 

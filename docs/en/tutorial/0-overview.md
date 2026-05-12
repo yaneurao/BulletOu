@@ -22,7 +22,7 @@ BulletOu inherits its core from `bullet` (jw1912) and `bullet-shogi` (SH11235). 
 |---|---|
 | **NNUE (HalfKP / HalfKA / Layer Stack)** | Inherited from bullet-shogi. Layer Stack with KP-Absolute progress buckets is the typical configuration for the strongest results. |
 | **NNUE with Threat / HandThreat / HandCount features** | 7 input feature variants are available. |
-| **KPPT** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` trains KK / KKP / KPP and produces the three corresponding `.bin` files (elmo(WCSC27)-compatible). See [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md). |
+| **KPPT** | `bullet_ou_train --eval-type kppt` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
 | **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
 | KK-only / KKP-only minimal variants | Run the corresponding `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` standalone. |
 
@@ -61,4 +61,4 @@ The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
 - [2. NNUE Tutorial](2-nnue-tutorial.md) — a deeper walkthrough that trains a real NNUE
-- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — how to train legacy YaneuraOu evals
+- [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

@@ -140,4 +140,4 @@ The pieces (Threat features, `progress.bin`, WDL scheduling) are explained in th
 - [Reference: Saved Networks](../4-saved-networks.md) — checkpoint layout, quantisation, transformation chains
 - [Reference: KP-Absolute Progress](../shogi/kp-absolute-progress.md) — what `--bucket-mode progress8kpabs` actually does
 - [Reference: shogi_progress_kpabs_train](../shogi/shogi_progress_kpabs_train.md) — how to train your own `progress.bin`
-- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — training the legacy YaneuraOu evals
+- [KPPT / KPP_KKPT Training](../shogi/kppt.md) — training the legacy YaneuraOu evals (reference)
