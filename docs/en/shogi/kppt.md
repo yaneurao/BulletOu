@@ -132,24 +132,11 @@ cargo run --release --features device-cuda --example bulletou -- \
     --superbatches 20
 ```
 
-### Training a single component standalone
-
-For development / smoke testing you can train just one component with `--eval-type KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP`:
-
-```bash
-cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type KPPT_KPP \
-    --teacher inbox/ref/small.hcpe \
-    --output checkpoints/kpp-smoke \
-    --superbatches 3 \
-    --batches-per-superbatch 100
-```
-
 ### Common KPPT-family CLI flags
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (required) |
+| `--eval-type` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |

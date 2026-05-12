@@ -9,19 +9,17 @@ sequentially in a single invocation and assemble the result into
     bulletou --eval-type KPPT            (KPPT family, KPP int16 × 2)
     bulletou --eval-type KPP_KKPT        (KPP_KKPT factorised, KPP int16)
 
-To train a single component standalone (= for development / smoke testing):
-
-    bulletou --eval-type KPPT_KK         KK only
-    bulletou --eval-type KPPT_KKP        KKP only
-    bulletou --eval-type KPPT_KPP        KPP only, KPPT layout
-    bulletou --eval-type KPP_KKPT_KPP    KPP only, KPP_KKPT layout
-
 For NNUE eval types, the architecture is selected with `--arch`
 (currently `256x2-32-32` only). Each save produces a YaneuraOu /
 Stockfish nnue-pytorch-compatible `nn.bin`:
 
     bulletou --eval-type NNUE_HALFKP     classic HalfKP NNUE (--arch 256x2-32-32)
     bulletou --eval-type NNUE_KP         classic K+P NNUE     (--arch 256x2-32-32)
+
+(YaneuraOu's KPPT engine requires all three of `KK_synthesized.bin` /
+`KKP_synthesized.bin` / `KPP_synthesized.bin` to load an eval, so the
+single-component trainers are internal helpers driven by `KPPT` /
+`KPP_KKPT` rather than CLI options.)
 
 Teacher data is given via `--teacher`. The argument is either a single
 file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
@@ -71,19 +69,13 @@ use clap::{Parser, ValueEnum};
 enum EvalType {
     /// KPPT family: train KK, KKP, and KPP sequentially and assemble the
     /// three-file KPPT eval (`KK_synthesized.bin` / `KKP_synthesized.bin` /
-    /// `KPP_synthesized.bin`) into `<output>/final/`.
+    /// `KPP_synthesized.bin`) per save. The engine requires all three
+    /// files together; single-component sub-trainings are not exposed as
+    /// CLI options (they exist as internal helpers driven by `KPPT`).
     Kppt,
     /// KPP_KKPT family (factorised KPPT): same as `KPPT` but KPP is written
     /// in the KPP_KKPT layout (no turn channel; half the KPP file size).
     KppKkpt,
-    /// KPPT KK component only.
-    KpptKk,
-    /// KPPT KKP component only.
-    KpptKkp,
-    /// KPPT KPP component only (with turn channel; ~740 MB).
-    KpptKpp,
-    /// KPP_KKPT KPP component only (no turn channel; ~388 MB).
-    KppKkptKpp,
     /// NNUE HalfKP. Original YaneuraOu halfkp_256x2-32-32 (Nasu-san PR #75,
     /// 2018): dual-perspective HalfKP feature transformer + 4-layer
     /// ClippedReLU network. Writes a YaneuraOu / Stockfish nnue-pytorch
@@ -129,26 +121,17 @@ impl EvalType {
         match self {
             EvalType::Kppt => "shogi_kppt",
             EvalType::KppKkpt => "shogi_kpp_kkpt",
-            EvalType::KpptKk => "shogi_kk",
-            EvalType::KpptKkp => "shogi_kkp",
-            EvalType::KpptKpp => "shogi_kpp",
-            EvalType::KppKkptKpp => "shogi_kpp_factorised",
             EvalType::NnueHalfkp => "shogi_nnue_halfkp",
             EvalType::NnueKp => "shogi_nnue_kp",
         }
     }
 
-    /// Does this eval type actually consume `--arch`? KPPT-family eval types
-    /// (KK/KKP/KPP individual components or the full family) have a fixed
-    /// architecture and ignore `--arch`; NNUE eval types use it.
+    /// Does this eval type actually consume `--arch`? KPPT family eval
+    /// types have a fixed architecture and ignore `--arch`; NNUE eval
+    /// types use it.
     fn uses_arch(self) -> bool {
         match self {
-            EvalType::Kppt
-            | EvalType::KppKkpt
-            | EvalType::KpptKk
-            | EvalType::KpptKkp
-            | EvalType::KpptKpp
-            | EvalType::KppKkptKpp => false,
+            EvalType::Kppt | EvalType::KppKkpt => false,
             EvalType::NnueHalfkp | EvalType::NnueKp => true,
         }
     }
@@ -161,24 +144,8 @@ impl EvalType {
         match self {
             EvalType::Kppt => "KPPT",
             EvalType::KppKkpt => "KPP_KKPT",
-            EvalType::KpptKk => "KPPT_KK",
-            EvalType::KpptKkp => "KPPT_KKP",
-            EvalType::KpptKpp => "KPPT_KPP",
-            EvalType::KppKkptKpp => "KPP_KKPT_KPP",
             EvalType::NnueHalfkp => "NNUE_HALFKP",
             EvalType::NnueKp => "NNUE_KP",
-        }
-    }
-
-    /// Suggested f32 -> i{16,32} quantisation scale for the YaneuraOu KPPT writer.
-    /// KK / KKP entries are i32 (large dynamic range) so 4000 = eval_scale * 10.
-    /// KPP entries are i16 (smaller dynamic range) so the scale is an
-    /// order of magnitude smaller. Unused for NNUE eval types.
-    fn default_yaneuraou_quant_scale(self) -> f32 {
-        match self {
-            EvalType::Kppt | EvalType::KppKkpt | EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
-            EvalType::KpptKpp | EvalType::KppKkptKpp => 400.0,
-            EvalType::NnueHalfkp | EvalType::NnueKp => 1.0, // unused
         }
     }
 
@@ -186,11 +153,25 @@ impl EvalType {
     /// types don't have a KPP file so this is ignored.
     fn kpp_format(self) -> KppFormat {
         match self {
-            EvalType::KppKkpt | EvalType::KppKkptKpp => KppFormat::KppKkpt,
+            EvalType::KppKkpt => KppFormat::KppKkpt,
             _ => KppFormat::Kppt,
         }
     }
 }
+
+/// Default `--yaneuraou-quant-scale` for each KPPT component. Used inside
+/// [`run_kppt_all`] to inject the component-appropriate scale into the
+/// child `Args` before dispatching to [`run_kppt_kk`] / [`run_kppt_kkp`] /
+/// [`run_kppt_kpp`]. The values exist as constants rather than as methods
+/// on `EvalType` because the public CLI no longer exposes per-component
+/// eval types.
+///
+/// - KK / KKP entries are i32 (large dynamic range) so 4000 = eval_scale * 10.
+/// - KPP entries are i16 (smaller dynamic range) so the scale is an order
+///   of magnitude smaller.
+const KPPT_KK_DEFAULT_QUANT_SCALE: f32 = 4000.0;
+const KPPT_KKP_DEFAULT_QUANT_SCALE: f32 = 4000.0;
+const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 
 // (teacher-path expansion and format inference live in
 //  `bullet_lib::teacher_path` so the single-component examples can share them.)
@@ -274,9 +255,9 @@ struct Args {
     #[arg(long, default_value = "400")]
     scale: u32,
 
-    /// f32 -> integer quantisation scale for the YaneuraOu output. If
-    /// omitted, an eval-type-specific default is used (4000 for KK/KKP,
-    /// 400 for KPP).
+    /// f32 -> integer quantisation scale for the YaneuraOu KPPT output.
+    /// If omitted, per-component defaults are used (4000 for KK/KKP, 400
+    /// for KPP). Ignored by NNUE eval types.
     #[arg(long)]
     yaneuraou_quant_scale: Option<f32>,
 
@@ -336,8 +317,17 @@ impl Args {
         self.net_id.clone().unwrap_or_else(|| self.eval_type.default_net_id().to_string())
     }
 
+    /// YaneuraOu integer-quantisation scale to multiply into f32 weights at
+    /// save time. The KPPT components have different defaults
+    /// (`KPPT_KK_DEFAULT_QUANT_SCALE` etc.); `run_kppt_all` injects the
+    /// right value into each child Args before calling
+    /// `run_kppt_kk` / `run_kppt_kkp` / `run_kppt_kpp`. By the time this is
+    /// read inside `run_training_inline!`, `yaneuraou_quant_scale` is
+    /// always populated (either by the user via the CLI flag or by the
+    /// parent run helper).
     fn yaneuraou_scale(&self) -> f32 {
-        self.yaneuraou_quant_scale.unwrap_or_else(|| self.eval_type.default_yaneuraou_quant_scale())
+        self.yaneuraou_quant_scale
+            .expect("yaneuraou_quant_scale must be set before invoking the KPPT trainer")
     }
 
     fn kpp_format(&self) -> KppFormat {
@@ -351,14 +341,6 @@ fn main() {
     let args = Args::parse();
     match args.eval_type {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
-        // Single-component eval-types do not currently auto-resume. (For
-        // resume, drive the full family with `--eval-type KPPT` / `KPP_KKPT`.)
-        EvalType::KpptKk => run_kppt_kk(&args, None),
-        EvalType::KpptKkp => run_kppt_kkp(&args, None),
-        // KPP trains the same network for both the KPPT and KPP_KKPT layouts;
-        // only the writer differs, selected inside `run_training_inline!` via
-        // `args.kpp_format()`.
-        EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args, None),
         EvalType::NnueHalfkp => run_halfkp(&args),
         EvalType::NnueKp => run_kp(&args),
     }
@@ -413,17 +395,7 @@ fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::Path
 fn run_kppt_all(args: &Args) {
     let output_dir = args.output_dir();
 
-    let kpp_eval_type = match args.eval_type {
-        EvalType::Kppt => EvalType::KpptKpp,
-        EvalType::KppKkpt => EvalType::KppKkptKpp,
-        _ => unreachable!("run_kppt_all called with non-family eval_type"),
-    };
-
-    eprintln!("=== bulletou: running {} family (3 components) ===", match args.eval_type {
-        EvalType::Kppt => "KPPT",
-        EvalType::KppKkpt => "KPP_KKPT",
-        _ => unreachable!(),
-    });
+    eprintln!("=== bulletou: running {} family (3 components) ===", args.eval_type.cli_name());
 
     // ---- Resume support -------------------------------------------------
     // If `<output>` already contains a numbered dir with a `state.bin`,
@@ -461,27 +433,31 @@ fn run_kppt_all(args: &Args) {
             (paths[0].clone(), paths[1].clone(), paths[2].clone())
         });
 
-    for (label, child_eval_type, net_id, resume_dir) in [
-        ("KK", EvalType::KpptKk, "kk", resume_dirs.as_ref().map(|d| d.0.clone())),
-        ("KKP", EvalType::KpptKkp, "kkp", resume_dirs.as_ref().map(|d| d.1.clone())),
-        ("KPP", kpp_eval_type, "kpp", resume_dirs.as_ref().map(|d| d.2.clone())),
-    ] {
-        eprintln!("\n=== [{label}] training ===");
+    // Each component gets its own child Args with the right net_id +
+    // component-specific yaneuraou_quant_scale default (user override via
+    // `--yaneuraou-quant-scale` is preserved). The parent's `args.eval_type`
+    // (KPPT or KPP_KKPT) flows through unchanged so `args.kpp_format()`
+    // inside `run_kppt_kpp` selects the right on-disk KPP layout.
+    let make_child = |net_id: &str, default_quant_scale: f32| -> Args {
         let mut child = args.clone();
-        child.eval_type = child_eval_type;
         child.net_id = Some(net_id.to_string());
-        // Force the child's yaneuraou_quant_scale default to match the child's
-        // eval-type when the user didn't override it.
-        if args.yaneuraou_quant_scale.is_none() {
-            child.yaneuraou_quant_scale = Some(child_eval_type.default_yaneuraou_quant_scale());
+        if child.yaneuraou_quant_scale.is_none() {
+            child.yaneuraou_quant_scale = Some(default_quant_scale);
         }
-        match child_eval_type {
-            EvalType::KpptKk => run_kppt_kk(&child, resume_dir.as_deref()),
-            EvalType::KpptKkp => run_kppt_kkp(&child, resume_dir.as_deref()),
-            EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&child, resume_dir.as_deref()),
-            _ => unreachable!(),
-        }
-    }
+        child
+    };
+
+    eprintln!("\n=== [KK] training ===");
+    let child_kk = make_child("kk", KPPT_KK_DEFAULT_QUANT_SCALE);
+    run_kppt_kk(&child_kk, resume_dirs.as_ref().map(|d| d.0.as_path()));
+
+    eprintln!("\n=== [KKP] training ===");
+    let child_kkp = make_child("kkp", KPPT_KKP_DEFAULT_QUANT_SCALE);
+    run_kppt_kkp(&child_kkp, resume_dirs.as_ref().map(|d| d.1.as_path()));
+
+    eprintln!("\n=== [KPP] training ===");
+    let child_kpp = make_child("kpp", KPPT_KPP_DEFAULT_QUANT_SCALE);
+    run_kppt_kpp(&child_kpp, resume_dirs.as_ref().map(|d| d.2.as_path()));
 
     // Cleanup the scratch resume dir if it was used.
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));

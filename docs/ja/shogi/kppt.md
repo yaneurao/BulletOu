@@ -132,24 +132,11 @@ cargo run --release --features device-cuda --example bulletou -- \
     --superbatches 20
 ```
 
-### 単体 component だけ学習する
-
-開発・動作確認用に、`--eval-type KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` で 1 component だけ学習することもできる:
-
-```bash
-cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type KPPT_KPP \
-    --teacher inbox/ref/small.hcpe \
-    --output checkpoints/kpp-smoke \
-    --superbatches 3 \
-    --batches-per-superbatch 100
-```
-
 ### 主要 CLI フラグ (KPPT 系すべて共通)
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `KPPT` (3 component 連続学習) / `KPP_KKPT` (factorised 版) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (必須) |
+| `--eval-type` | `KPPT` (3 component 連続学習) / `KPP_KKPT` (factorised 版) | (必須) |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
