@@ -14,7 +14,7 @@
 
 | `--eval-type` | 何を学習するか | 出力ファイル (per save) | `--arch` を使うか |
 |---|---|---|---|
-| **`NNUE_HALFKP`** ★初心者はここから | 古典的 HalfKP NNUE (那須さん 2018 年 PR #75 と同等)。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` | 使う |
+| **`NNUE_HALFKP`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` | 使う |
 | `NNUE_KP` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` | 使う |
 | `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | 使わない |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) | 使わない |
@@ -57,16 +57,27 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ### `--arch` を指定する
 
-NNUE 系 eval-type ではアーキテクチャを `--arch` で選ぶ。現状サポートしているのは `256x2-32-32` のみ:
+NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<L3>` で選ぶ。やねうら王が配布しているエンジンバイナリのディレクトリ名 (`NNUE_halfkp_*` のサフィックス) に揃えてあり、以下が選択可能:
+
+| `--arch` | L1 (accumulator) | L2 | L3 | 用途の目安 |
+|---|---|---|---|---|
+| `256x2-32-32` (デフォルト) | 256 | 32 | 32 | 古典的な小型 NNUE。学習時間が短く挙動確認向き |
+| `384x2-8-96` | 384 | 8 | 96 | |
+| `512x2-8-64` | 512 | 8 | 64 | 中型 |
+| `768x2-16-64` | 768 | 16 | 64 | |
+| `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
+| `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
-    --arch 256x2-32-32 \
+    --arch 1024x2-8-64 \
     --teacher teachers/
 ```
 
-`--arch` を省略すると `256x2-32-32` がデフォルト適用される (= 上記最小コマンドと同じ)。将来 `512x2-32-32` 等の preset が増えると、ここで切替可能になる。
+`--arch` を省略するとデフォルト `256x2-32-32` が適用される。`NNUE_KP` でも同じ preset 群が指定可能 (やねうら王が配布しているのは `NNUE_kp_256x2_32_32` のみだが、学習側は他 preset でも生成可能)。
+
+(`halfkpe9` / `halfkpvm` のように **入力特徴量自体が違う variant**、および `SFNNwoPSQT1536` は別 `--eval-type` として今後追加予定。`--arch` だけでは到達できない。)
 
 ### KPPT を学習する
 

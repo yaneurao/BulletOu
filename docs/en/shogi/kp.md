@@ -10,7 +10,7 @@ The architecture file in YaneuraOu source is `source/eval/nnue/architectures/kp_
 
 ## Architecture
 
-Selected via `--arch` (currently only `256x2-32-32`):
+L1 / L2 / L3 sizes are selected via `--arch`. NNUE_KP shares the preset list with NNUE_HALFKP (`256x2-32-32` default, plus `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64`). YaneuraOu currently ships its `NNUE_kp_*` engine binaries only for `256x2-32-32`; the trainer will happily produce others if you want to experiment. Below shows the default:
 
 ```
 Shogi position
@@ -64,7 +64,7 @@ FeatureSet<K, P>::kHashValue
 | L0 weight size | 125,388 × 256 | 1,710 × 256 |
 | Expressive power | Higher (king × piece correlations baked in) | Lower (must learn correlations through L0+L1) |
 
-KP was tried by Nasu-san in PR #75 (2018) alongside HalfKP, with the same 4-layer ClippedReLU network. HalfKP became the canonical choice because the cross-product input gave better strength; KP is included for completeness and for ablation experiments.
+KP was introduced alongside HalfKP in the same architecture family, with the same 4-layer ClippedReLU network. HalfKP became the canonical choice because the cross-product input produced stronger play; KP is kept for completeness and for ablation experiments.
 
 ## Actual usage
 
@@ -111,7 +111,7 @@ L1 / L2 / Output layers are byte-identical between HalfKP and KP for the same `-
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_KP` | (required) |
-| `--arch` | `256x2-32-32` (only preset for now) | `256x2-32-32` |
+| `--arch` | `256x2-32-32` / `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64` | `256x2-32-32` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-256x2-32-32`) |
 

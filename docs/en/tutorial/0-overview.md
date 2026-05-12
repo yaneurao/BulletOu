@@ -22,7 +22,7 @@ Currently `bulletou` can train these four targets:
 
 | `--eval-type` | What it is | Output |
 |---|---|---|
-| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE (Nasu-san's 2018 PR #75). See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
+| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
 | `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |

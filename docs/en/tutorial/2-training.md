@@ -14,7 +14,7 @@ We use **NNUE HalfKP as the running example** in this tutorial, but the same com
 
 | `--eval-type` | What it trains | Output (per save) | `--arch` used? |
 |---|---|---|---|
-| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE (matches Nasu-san's 2018 PR #75). See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` | yes |
+| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` | yes |
 | `NNUE_KP` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` | yes |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | no |
 | `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs | no |
@@ -57,16 +57,27 @@ That's it — no further flags needed. With `--output` omitted, checkpoints land
 
 ### Specifying `--arch`
 
-For NNUE eval types, the architecture is selected with `--arch`. Only `256x2-32-32` is supported today:
+For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`. The set mirrors the per-arch directories under YaneuraOu's NNUE engine binary distribution (`NNUE_halfkp_*`):
+
+| `--arch` | L1 (accumulator) | L2 | L3 | Notes |
+|---|---|---|---|---|
+| `256x2-32-32` (default) | 256 | 32 | 32 | Classic small NNUE; fast to train, good for sanity checks |
+| `384x2-8-96` | 384 | 8 | 96 | |
+| `512x2-8-64` | 512 | 8 | 64 | Medium |
+| `768x2-16-64` | 768 | 16 | 64 | |
+| `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
+| `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
-    --arch 256x2-32-32 \
+    --arch 1024x2-8-64 \
     --teacher teachers/
 ```
 
-Omitting `--arch` falls back to `256x2-32-32` (= same as the minimal command above). Future presets like `512x2-32-32` will be selectable through the same flag.
+Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` accepts the same preset list (YaneuraOu ships only `NNUE_kp_256x2_32_32`, but the trainer doesn't restrict you).
+
+(`halfkpe9` / `halfkpvm` — different *input feature sets*, not just different layer sizes — and `SFNNwoPSQT1536` are tracked as future `--eval-type` values, not reachable through `--arch` alone.)
 
 ### Training a KPPT eval
 

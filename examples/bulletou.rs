@@ -9,12 +9,18 @@ sequentially in a single invocation and assemble the result into
     bulletou --eval-type KPPT            (KPPT family, KPP int16 × 2)
     bulletou --eval-type KPP_KKPT        (KPP_KKPT factorised, KPP int16)
 
-For NNUE eval types, the architecture is selected with `--arch`
-(currently `256x2-32-32` only). Each save produces a YaneuraOu /
-Stockfish nnue-pytorch-compatible `nn.bin`:
+For NNUE eval types, the architecture is selected with `--arch`. Each
+save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
 
-    bulletou --eval-type NNUE_HALFKP     classic HalfKP NNUE (--arch 256x2-32-32)
-    bulletou --eval-type NNUE_KP         classic K+P NNUE     (--arch 256x2-32-32)
+    bulletou --eval-type NNUE_HALFKP                    classic HalfKP NNUE (default --arch 256x2-32-32)
+    bulletou --eval-type NNUE_HALFKP --arch 1024x2-8-64 larger HalfKP NNUE
+    bulletou --eval-type NNUE_KP                        K+P NNUE (default --arch 256x2-32-32)
+
+Supported `--arch` presets (matching the per-arch directories under
+YaneuraOu's NNUE engine binary distribution):
+
+    256x2-32-32   384x2-8-96   512x2-8-64
+    768x2-16-64   1024x2-8-32  1024x2-8-64
 
 (YaneuraOu's KPPT engine requires all three of `KK_synthesized.bin` /
 `KKP_synthesized.bin` / `KPP_synthesized.bin` to load an eval, so the
@@ -90,12 +96,33 @@ enum EvalType {
     NnueKp,
 }
 
-/// Pre-set NNUE architecture sizes. The textual value is `<L1>x2-<L2>-<L3>`.
+/// Pre-set NNUE architecture sizes — `<L1>x2-<L2>-<L3>` in the textual CLI
+/// form. The set matches the per-arch directories YaneuraOu ships its NNUE
+/// engine binaries under (`NNUE_halfkp_256x2_32_32`, `NNUE_halfkp_512x2_8_64`,
+/// …): network structure is fixed (4-layer ClippedReLU, dual-perspective);
+/// only `(L1, L2, L3)` vary. The same arch presets are usable from both
+/// `--eval-type NNUE_HALFKP` and `--eval-type NNUE_KP`; YaneuraOu's KP build
+/// currently only ships `256x2_32_32`, but the trainer doesn't restrict you.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum NnueArch {
-    /// L1=256, L2=32, L3=32 (the classic Stockfish NNUE preset).
+    /// L1=256, L2=32, L3=32 (classic Stockfish-style NNUE preset).
     #[clap(name = "256x2-32-32")]
     Arch256x2_32_32,
+    /// L1=384, L2=8, L3=96.
+    #[clap(name = "384x2-8-96")]
+    Arch384x2_8_96,
+    /// L1=512, L2=8, L3=64.
+    #[clap(name = "512x2-8-64")]
+    Arch512x2_8_64,
+    /// L1=768, L2=16, L3=64.
+    #[clap(name = "768x2-16-64")]
+    Arch768x2_16_64,
+    /// L1=1024, L2=8, L3=32.
+    #[clap(name = "1024x2-8-32")]
+    Arch1024x2_8_32,
+    /// L1=1024, L2=8, L3=64.
+    #[clap(name = "1024x2-8-64")]
+    Arch1024x2_8_64,
 }
 
 impl NnueArch {
@@ -103,6 +130,11 @@ impl NnueArch {
     fn dims(self) -> (usize, usize, usize) {
         match self {
             NnueArch::Arch256x2_32_32 => (256, 32, 32),
+            NnueArch::Arch384x2_8_96 => (384, 8, 96),
+            NnueArch::Arch512x2_8_64 => (512, 8, 64),
+            NnueArch::Arch768x2_16_64 => (768, 16, 64),
+            NnueArch::Arch1024x2_8_32 => (1024, 8, 32),
+            NnueArch::Arch1024x2_8_64 => (1024, 8, 64),
         }
     }
 
@@ -112,6 +144,11 @@ impl NnueArch {
     fn cli_name(self) -> &'static str {
         match self {
             NnueArch::Arch256x2_32_32 => "256x2-32-32",
+            NnueArch::Arch384x2_8_96 => "384x2-8-96",
+            NnueArch::Arch512x2_8_64 => "512x2-8-64",
+            NnueArch::Arch768x2_16_64 => "768x2-16-64",
+            NnueArch::Arch1024x2_8_32 => "1024x2-8-32",
+            NnueArch::Arch1024x2_8_64 => "1024x2-8-64",
         }
     }
 }
@@ -283,8 +320,11 @@ struct Args {
     score_drop_abs: u16,
 
     /// Network architecture preset for NNUE eval types. Format
-    /// `<L1>x2-<L2>-<L3>`. Only `256x2-32-32` is currently supported.
-    /// Ignored for KPPT / KPP_KKPT eval types.
+    /// `<L1>x2-<L2>-<L3>`. Supported values mirror the per-arch
+    /// directories under YaneuraOu's NNUE binary distribution
+    /// (`256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`,
+    /// `1024x2-8-32`, `1024x2-8-64`). Ignored for KPPT / KPP_KKPT
+    /// eval types.
     #[arg(long, default_value = "256x2-32-32")]
     arch: NnueArch,
 }
@@ -1190,9 +1230,11 @@ fn build_nnue_save_format(
 
 /// NNUE HalfKP training entry point.
 ///
-/// Architecture (currently locked to `--arch 256x2-32-32`) matches the
-/// original YaneuraOu halfkp_256x2-32-32 (PR #75, 2018) — ClippedReLU
-/// activation everywhere, not SqrClippedReLU:
+/// 4-layer ClippedReLU network with dual-perspective HalfKP input. L1 /
+/// L2 / L3 sizes come from `--arch` (`256x2-32-32`, `384x2-8-96`, …);
+/// the layer structure and activation function are fixed across all
+/// presets — only the sizes vary, matching YaneuraOu's per-arch
+/// `halfkp_*.h` headers.
 /// - Dual-perspective HalfKP feature transformer -> L1 (ClippedReLU)
 /// - L1 -> L2 (ClippedReLU)
 /// - L2 -> L3 (ClippedReLU)

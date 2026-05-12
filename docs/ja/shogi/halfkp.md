@@ -4,11 +4,13 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_HALFKP` は、やねうら王に最初に NNUE 系評価関数として入った `halfkp_256x2-32-32` (那須さんによる 2018 年の PR #75) を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。SqrClippedReLU (SCReLU) は別物 (2026 年の PR #311 で SFNNwoPSQT-1536 と一緒に導入された活性化関数) で、こちらでは使わない。
+`--eval-type NNUE_HALFKP` は、やねうら王が長年採用している古典的な HalfKP NNUE を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。
+
+活性化関数の歴史的経緯 (なぜ SCReLU ではなく ClippedReLU か) は [`spec/05-activation-history.md`](../../../spec/05-activation-history.md) を参照。
 
 ## アーキテクチャ
 
-`--arch` で選択する (今は `256x2-32-32` のみ):
+L1 / L2 / L3 サイズは `--arch` で選ぶ。サポートする preset (やねうら王が配布する NNUE エンジンの per-arch ディレクトリに対応): `256x2-32-32` (default)、`384x2-8-96`、`512x2-8-64`、`768x2-16-64`、`1024x2-8-32`、`1024x2-8-64`。以下はデフォルト構成の図:
 
 ```
 HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
@@ -88,7 +90,7 @@ checkpoints/my-halfkp/
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKP` | (必須) |
-| `--arch` | `256x2-32-32` (当面これのみ) | `256x2-32-32` |
+| `--arch` | `256x2-32-32` / `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64` | `256x2-32-32` |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-256x2-32-32`) |
 | `--max-epochs` | 教師データを何周するか | 1 |
