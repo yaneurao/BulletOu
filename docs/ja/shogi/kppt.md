@@ -150,7 +150,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
-学習単位の意味は [§2.4 学習スケジュール](../tutorial/2-nnue-tutorial.md#24-学習スケジュール) を参照。
+学習単位の意味は [§2.4 学習スケジュール](../tutorial/2-training.md#24-学習スケジュール) を参照。
 
 ## メモリ要件
 

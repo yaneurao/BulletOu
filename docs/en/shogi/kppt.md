@@ -150,7 +150,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
-For the meaning of the scheduling units, see [§2.4 Training schedule](../tutorial/2-nnue-tutorial.md#24-training-schedule).
+For the meaning of the scheduling units, see [§2.4 Training schedule](../tutorial/2-training.md#24-training-schedule).
 
 ## Memory requirements
 

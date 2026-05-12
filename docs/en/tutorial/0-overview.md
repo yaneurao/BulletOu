@@ -67,5 +67,5 @@ How the engine consumes the file depends on the engine; see its documentation.
 The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
-- [2. Running a training](2-nnue-tutorial.md) — train a real evaluation function on actual data and load it into an engine
+- [2. Running a training](2-training.md) — train a real evaluation function on actual data and load it into an engine
 - [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

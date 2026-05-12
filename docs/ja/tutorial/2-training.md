@@ -1,6 +1,6 @@
 # 2. 学習を走らせる — 実データで評価関数を作る
 
-<a href="../../en/tutorial/2-nnue-tutorial.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/tutorial/2-training.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ゴール: やねうら王互換エンジンが読み込める評価関数バイナリを、実際の教師データから学習する。
 

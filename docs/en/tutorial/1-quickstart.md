@@ -133,7 +133,7 @@ The `target/` directory will be rebuilt next time you `cargo build`.
 
 ---
 
-Next: [2. Running a training](2-nnue-tutorial.md) — train a real evaluation function on actual data and load it into an engine.
+Next: [2. Running a training](2-training.md) — train a real evaluation function on actual data and load it into an engine.
 
 ---
 

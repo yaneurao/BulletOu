@@ -1,6 +1,6 @@
 # 2. Running a training — make an evaluation function from real data
 
-<a href="../../ja/tutorial/2-nnue-tutorial.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/2-training.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 Goal: produce a YaneuraOu-loadable evaluation function from real training data and verify it in an engine.
 
