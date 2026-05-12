@@ -121,8 +121,8 @@ record を必要なだけ連結したものが `state.bin`。
 
 ```
 eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,1,1,32,0.234,0.001,1.000,524288,teachers/
-NNUE_HALFKP,1,1,64,0.231,0.001,1.000,1048576,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,32,0.234,0.001,1.000,524288,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,64,0.231,0.001,1.000,1048576,teachers/
 ...
 KPPT/kk,1,1,32,0.234,0.001,0.500,524288,teachers/
 KPPT/kkp,1,1,32,0.156,0.001,0.500,524288,teachers/
@@ -134,7 +134,7 @@ KPPT/kpp,1,1,32,0.245,0.001,0.500,524288,teachers/
 
 | 列 | 意味 |
 |---|---|
-| `eval` | CLI の `--eval-type` 値。マルチ component eval-type (KPPT 系) では `<eval-type>/<component>` 形式で `KPPT/kk`、`KPPT/kkp`、`KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録する。シングル component (NNUE 系) はそのまま `NNUE_HALFKP` 等。`--arch` の値は CSV には含めず、出力ディレクトリ名 (`checkpoints/NNUE_HALFKP-256x2-32-32/`) で表現する |
+| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` を付加。NNUE 系 (シングル component、`--arch` を使う) は `NNUE_HALFKP-256x2-32-32` のように eval-type と arch を `-` で結合。KPPT 系 (`--arch` を使わない、3 component 連続学習) は `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録 |
 | `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
 | `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される |
 | `curr_batch` | 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |

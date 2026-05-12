@@ -556,14 +556,13 @@ fn run_kppt_all(args: &Args) {
 /// each per-save `0NNN/learn.log` start with this line followed by data
 /// rows. Column meanings (9 total):
 ///
-/// - `eval`: CLI `--eval-type` value, with the training-component name
-///   slash-appended for multi-component eval types. NNUE eval types are
-///   single-component so the column holds just the eval-type name (e.g.
-///   `NNUE_HALFKP`). KPPT-family eval types have three components
-///   trained sequentially, so the column holds `KPPT/kk`, `KPPT/kkp`,
-///   `KPPT/kpp` (or `KPP_KKPT/kk`, etc.) depending on which component's
-///   row this is. (`--arch` is recorded in the output-directory name
-///   rather than in the CSV.)
+/// - `eval`: mirror of the output-dir name (`<eval-type>[-<arch>]`)
+///   plus a `/<component>` suffix for multi-component eval types. For
+///   NNUE eval types (single-component) the column holds the eval-type
+///   joined with the architecture, e.g. `NNUE_HALFKP-256x2-32-32`. For
+///   KPPT-family eval types (which ignore `--arch`, three components
+///   trained sequentially) it holds `KPPT/kk`, `KPPT/kkp`, `KPPT/kpp`
+///   (or `KPP_KKPT/kk`, etc.).
 /// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
 /// - `superbatch`: 1-indexed superbatch within the current epoch.
 ///   Increments every `--batches-per-superbatch` batches (default 6104).
@@ -592,6 +591,11 @@ const LEARN_LOG_HEADER: &str =
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
+    /// Arch suffix (`256x2-32-32` etc.) for NNUE eval types. Empty string for
+    /// KPPT-family eval types since they ignore `--arch`. When non-empty it is
+    /// joined into the `eval` column as `<eval-type>-<arch>`, matching the
+    /// output-dir naming.
+    arch: &'static str,
     lr_start: f32,
     lr_gamma: f32,
     lr_step: usize,
@@ -607,6 +611,7 @@ impl LogContext {
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
             eval_type: args.eval_type.cli_name(),
+            arch: if args.eval_type.uses_arch() { args.arch.cli_name() } else { "" },
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
             lr_step: args.lr_step,
@@ -679,14 +684,19 @@ fn enrich_bullet_log_to_csv(
         let loss = parts[2];
         let lr = ctx.lr_at(sb);
         let positions = ctx.positions_at(sb, b, position_offset);
-        // For multi-component eval types (KPPT family) the eval column
-        // is `<eval-type>/<component>` so each row self-describes. NNUE
-        // eval types are single-component (`nnue`), so just emit the
-        // eval-type name without redundant suffix.
-        let eval_field: std::borrow::Cow<'_, str> = if component == "nnue" {
+        // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
+        // `/<component>` suffix for multi-component eval types (KPPT
+        // family). NNUE rows are single-component so the slash is
+        // omitted; KPPT-family eval types don't consume `--arch`.
+        let head: std::borrow::Cow<'_, str> = if ctx.arch.is_empty() {
             std::borrow::Cow::Borrowed(ctx.eval_type)
         } else {
-            std::borrow::Cow::Owned(format!("{}/{}", ctx.eval_type, component))
+            std::borrow::Cow::Owned(format!("{}-{}", ctx.eval_type, ctx.arch))
+        };
+        let eval_field: std::borrow::Cow<'_, str> = if component == "nnue" {
+            head
+        } else {
+            std::borrow::Cow::Owned(format!("{}/{}", head, component))
         };
         out.push_str(&format!(
             "{eval},{epoch},{sb},{b},{loss},{lr},{lambda:.3},{positions},{teacher}\n",

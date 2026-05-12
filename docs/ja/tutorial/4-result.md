@@ -43,11 +43,11 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ```csv
 eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,1,1,32,0.6234,0.001,1.000,524288,teachers/
-NNUE_HALFKP,1,1,64,0.5891,0.001,1.000,1048576,teachers/
-NNUE_HALFKP,1,1,96,0.5510,0.001,1.000,1572864,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP,1,2,32,0.4523,0.001,1.000,100532224,teachers/
+NNUE_HALFKP-256x2-32-32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
@@ -57,7 +57,7 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 
 | 列 | 意味 | 例 |
 |---|---|---|
-| `eval` | `--eval-type` の値。マルチ component (KPPT 系) は `<eval-type>/<component>` 形式 | `NNUE_HALFKP` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-256x2-32-32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
 | `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
@@ -67,7 +67,7 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 | `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `524288` |
 | `teacher` | `--teacher` の値 | `teachers/` |
 
-`--arch` の値は CSV には含まれない (出力ディレクトリ名 `checkpoints/NNUE_HALFKP-256x2-32-32/` に含まれているので各行に重複させない)。
+NNUE 系は `--arch` を `eval` 列に含める (出力ディレクトリ名と同じ命名)。KPPT 系は `--arch` を使わないので `eval` 列に arch は出ない。
 
 正確な仕様は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット) を参照。
 

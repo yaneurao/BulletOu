@@ -43,11 +43,11 @@ The loss trajectory of every run, both during training and afterwards, is record
 
 ```csv
 eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,1,1,32,0.6234,0.001,1.000,524288,teachers/
-NNUE_HALFKP,1,1,64,0.5891,0.001,1.000,1048576,teachers/
-NNUE_HALFKP,1,1,96,0.5510,0.001,1.000,1572864,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP,1,2,32,0.4523,0.001,1.000,100532224,teachers/
+NNUE_HALFKP-256x2-32-32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
@@ -57,7 +57,7 @@ Bullet writes **one row every 32 batches**. With the default `--batches-per-supe
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval` | the `--eval-type` value. Multi-component eval types (KPPT family) use `<eval-type>/<component>` form | `NNUE_HALFKP` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-256x2-32-32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every `--batches-per-superbatch` (default 6104) batches | `1`, `2`, ... |
 | `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
@@ -67,7 +67,7 @@ Bullet writes **one row every 32 batches**. With the default `--batches-per-supe
 | `positions` | cumulative teacher positions (**carries across resumes**) | `524288` |
 | `teacher` | the `--teacher` value | `teachers/` |
 
-The `--arch` value isn't in the CSV — it's encoded in the output directory name (`checkpoints/NNUE_HALFKP-256x2-32-32/`) instead, since it's constant for a run.
+NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.
 
 Full spec: [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット).
 

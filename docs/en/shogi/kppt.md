@@ -93,9 +93,7 @@ KPPT/kpp,1,1,32,0.245,0.001,1.000,524288,teachers/
 ...
 ```
 
-The `eval` column uses the **`<eval-type>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows.
-
-The `--arch` value is recorded in the output-directory name (e.g. `checkpoints/KPPT/`) rather than in the CSV — `arch` is constant within a run, so duplicating it on every row would just waste space.
+The `eval` column uses the **`<eval-type>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows. KPPT-family eval types ignore `--arch`, so no arch suffix appears here (unlike NNUE rows, which embed it as `NNUE_HALFKP-256x2-32-32`).
 
 Per-save snapshot `0NNN/learn.log` and the top-level `<output>/learn.log` use the exact same format. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md).
 
