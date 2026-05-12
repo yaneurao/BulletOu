@@ -38,6 +38,19 @@ teachers/
 
 (`.hcpe` / `.hcpe3` / `.psv` work the same way. Format is inferred from the extension. You may also point `--teacher` at a directory, in which case all files of the same extension inside are concatenated.)
 
+### Pre-shuffle the teacher file
+
+> ⚠️ **Important**: shuffle the teacher file **before** handing it to BulletOu.
+
+Bullet's loader uses an **in-memory shuffle buffer (default 256 MB ≒ 6.7M positions for HCPE)** and Fisher-Yates shuffles its contents before slicing into batches. The shuffle is **intra-buffer only** — successive buffers contain disjoint sequential regions of the file, so the loader is really just doing local shuffles over 6.7M-position windows.
+
+`gensfen` and dlshogi-style generators emit positions **grouped by game** (positions from one game are contiguous), so training on an un-shuffled file produces **periodic loss spikes at every buffer boundary** (≈ every 410 batches with `--batch-size 16384`) as the distribution shifts.
+
+How to shuffle:
+- **`.hcpe` / `.hcpe3`**: easiest is dlshogi's shuffle script. HCPE records are fixed-length (38 bytes), so a byte-level random permutation is sufficient. Look in dlshogi's `utils/` directory.
+- **`.pack`**: enable the shuffle option in `gensfen` at generation time, or convert to PSV and shuffle that.
+- **Workaround if you only have an un-shuffled file**: raise `--buffer-mb` so the whole file fits in a single buffer. Example: a 1.94 GB `.hcpe` (≈ 51M positions) fits with `--buffer-mb 2048` and stops crossing buffer boundaries. This costs **host RAM** (not GPU memory), so it works as long as you have the headroom.
+
 ### Trying with a small subset first
 
 Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--batches-per-superbatch` so each superbatch consumes less data (see [§3.1](3-tune.md#31-training-schedule)).
