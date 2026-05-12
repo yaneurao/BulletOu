@@ -32,7 +32,7 @@ For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three fi
 
 ## 4.2 Reading the training log (`learn.log`)
 
-The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). Both are the **same 10-column CSV** format.
+The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). Both are the **same 9-column CSV** format.
 
 ### Which one to look at
 
@@ -42,29 +42,28 @@ The loss trajectory of every run, both during training and afterwards, is record
 ### Sample CSV
 
 ```csv
-eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,nnue,1,1,32,0.6234,0.001,1.0,524288,teachers/
-NNUE_HALFKP,nnue,1,1,64,0.5891,0.001,1.0,1048576,teachers/
-NNUE_HALFKP,nnue,1,1,96,0.5510,0.001,1.0,1572864,teachers/
+eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP,nnue,1,2,32,0.4523,0.001,1.0,100532224,teachers/
+NNUE_HALFKP,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
-Bullet writes **one row every 32 batches**. With the default `--batches-per-superbatch ≒ 6104`, that's about 191 rows per superbatch. Once `batch` reaches `batches_per_superbatch` (default 6104), `superbatch` increments by 1 and `batch` restarts from 1.
+Bullet writes **one row every 32 batches**. With the default `--batches-per-superbatch ≒ 6104`, that's about 191 rows per superbatch. Once `curr_batch` reaches `batches_per_superbatch` (default 6104), `superbatch` increments by 1 and `curr_batch` restarts from 1.
 
 ### Column meanings
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval` | the `--eval-type` value | `NNUE_HALFKP` |
-| `component` | training component | `nnue` (NNUE) / `kk` / `kkp` / `kpp` (KPPT) |
+| `eval` | the `--eval-type` value. Multi-component eval types (KPPT family) use `<eval-type>/<component>` form | `NNUE_HALFKP` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every `--batches-per-superbatch` (default 6104) batches | `1`, `2`, ... |
-| `batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
+| `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
 | `value_loss` | bullet's per-32-batch averaged loss | `0.234` |
 | `lr` | learning rate at that point (StepLR-derived) | `0.001` |
-| `lambda` | the `--lambda` value (constant per run) | `1.0` |
+| `lambda` | the `--lambda` value (constant per run, fixed 3-decimal) | `1.000` |
 | `positions` | cumulative teacher positions (**carries across resumes**) | `524288` |
 | `teacher` | the `--teacher` value | `teachers/` |
 
@@ -104,8 +103,8 @@ A healthy training run typically shows:
 
 4. **`superbatch` advances as expected**
    - With a teacher smaller than 100M positions, `superbatch` stays at 1 for the whole run (fallback save fires once at the end). That's by design.
-   - With a larger teacher, `superbatch` should increment every time `batch` reaches 6104 (= `--batches-per-superbatch` default).
-   - If `superbatch` is stuck at 1 and `batch` plateaus far below `batches_per_superbatch`, the dataloader may be cut short (e.g. the old HCPE polarity bug).
+   - With a larger teacher, `superbatch` should increment every time `curr_batch` reaches 6104 (= `--batches-per-superbatch` default).
+   - If `superbatch` is stuck at 1 and `curr_batch` plateaus far below `batches_per_superbatch`, the dataloader may be cut short (e.g. the old HCPE polarity bug).
 
 ### Quick plot
 
@@ -122,16 +121,23 @@ plt.savefig("loss_curve.png")
 
 ### KPPT case (kk / kkp / kpp recorded side-by-side)
 
-For KPPT-family eval types, each save writes kk → kkp → kpp logs back-to-back. Their rows share `(epoch, superbatch, batch, positions)` but differ in `component`, so filter before plotting:
+For KPPT-family eval types, each save writes kk → kkp → kpp logs back-to-back. Their rows share `(epoch, superbatch, curr_batch, positions)` but differ in the component portion of the `eval` column (`KPPT/kk` / `KPPT/kkp` / `KPPT/kpp`), so filter before plotting:
 
 ```python
 for c in ["kk", "kkp", "kpp"]:
-    sub = df[df["component"] == c]
+    sub = df[df["eval"] == f"KPPT/{c}"]
     plt.plot(sub["positions"], sub["value_loss"], label=c)
 plt.legend(); plt.xlabel("positions"); plt.ylabel("loss")
 ```
 
 The KK component is a much smaller network than KKP / KPP, so don't compare absolute loss values — look at the **trend per component**.
+
+To split the `eval` column into family / component as separate columns:
+
+```python
+df[["family", "component"]] = df["eval"].str.split("/", n=1, expand=True)
+df["component"] = df["component"].fillna("nnue")   # NNUE rows have no slash
+```
 
 ### Reading the log after a resume
 

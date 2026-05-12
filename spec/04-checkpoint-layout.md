@@ -117,12 +117,16 @@ record を必要なだけ連結したものが `state.bin`。
 
 ## `learn.log` フォーマット
 
-各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 10 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
+各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 9 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
 
 ```
-eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,nnue,1,1,32,0.234,0.001,1.0,524288,teachers/
-NNUE_HALFKP,nnue,1,1,64,0.231,0.001,1.0,1048576,teachers/
+eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,1,1,32,0.234,0.001,1.000,524288,teachers/
+NNUE_HALFKP,1,1,64,0.231,0.001,1.000,1048576,teachers/
+...
+KPPT/kk,1,1,32,0.234,0.001,0.500,524288,teachers/
+KPPT/kkp,1,1,32,0.156,0.001,0.500,524288,teachers/
+KPPT/kpp,1,1,32,0.245,0.001,0.500,524288,teachers/
 ...
 ```
 
@@ -130,14 +134,13 @@ NNUE_HALFKP,nnue,1,1,64,0.231,0.001,1.0,1048576,teachers/
 
 | 列 | 意味 |
 |---|---|
-| `eval` | CLI の `--eval-type` 値 (例: `NNUE_HALFKP`、`KPPT`)。`--arch` の値は CSV には含めず、出力ディレクトリ名 (`checkpoints/NNUE_HALFKP-256x2-32-32/`) で表現する |
-| `component` | 学習 component 名: NNUE 系は `nnue`、KPPT 系は `kk` / `kkp` / `kpp` |
+| `eval` | CLI の `--eval-type` 値。マルチ component eval-type (KPPT 系) では `<eval-type>/<component>` 形式で `KPPT/kk`、`KPPT/kkp`、`KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録する。シングル component (NNUE 系) はそのまま `NNUE_HALFKP` 等。`--arch` の値は CSV には含めず、出力ディレクトリ名 (`checkpoints/NNUE_HALFKP-256x2-32-32/`) で表現する |
 | `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
 | `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される |
-| `batch` | 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
+| `curr_batch` | 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
 | `value_loss` | bullet が 32 batch ごとに計算する loss 値 |
 | `lr` | その superbatch における学習率 (StepLR 由来) |
-| `lambda` | その時点の `--lambda` (1 run 内では定数) |
+| `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 3 桁固定** で出力 (`1.000`、`0.500` など) |
 | `positions` | この component で消費した累計教師局面数。**resume 跨ぎで累積される** (run 開始時に既存トップレベル `learn.log` の最大値を読み取って続きから書く)。multi-epoch (`--max-epochs > 1`) 内では epoch 境界で reset する (v1 制限) |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
 

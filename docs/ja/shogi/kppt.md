@@ -80,18 +80,20 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` は **10 列 + ヘッダ行の CSV** で、すべての eval-type で同じフォーマット:
+`learn.log` は **9 列 + ヘッダ行の CSV** で、すべての eval-type で同じフォーマット:
 
 ```
-eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
-KPPT,kk,1,1,32,0.234,0.001,1.0,524288,teachers/
-KPPT,kk,1,1,64,0.232,0.001,1.0,1048576,teachers/
+eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
+KPPT/kk,1,1,32,0.234,0.001,1.000,524288,teachers/
+KPPT/kk,1,1,64,0.232,0.001,1.000,1048576,teachers/
 ...
-KPPT,kkp,1,1,32,0.156,0.001,1.0,524288,teachers/
+KPPT/kkp,1,1,32,0.156,0.001,1.000,524288,teachers/
 ...
-KPPT,kpp,1,1,32,0.245,0.001,1.0,524288,teachers/
+KPPT/kpp,1,1,32,0.245,0.001,1.000,524288,teachers/
 ...
 ```
+
+`eval` 列は **`<eval-type>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。
 
 各 save の `0NNN/learn.log` snapshot もトップレベル `<output>/learn.log` も同じ書式。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md) を参照。
 

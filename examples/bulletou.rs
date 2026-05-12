@@ -554,23 +554,27 @@ fn run_kppt_all(args: &Args) {
 
 /// CSV header for `learn.log`. Both the top-level `<output>/learn.log` and
 /// each per-save `0NNN/learn.log` start with this line followed by data
-/// rows. Column meanings (10 total):
+/// rows. Column meanings (9 total):
 ///
-/// - `eval`: CLI `--eval-type` value (e.g. `NNUE_HALFKP`, `KPPT`).
-///   (The `--arch` value is recorded in the output directory name rather
-///   than in the CSV, to avoid duplicating the same constant on every row.)
-/// - `component`: training component identifier — `nnue` for the NNUE
-///   eval types, `kk` / `kkp` / `kpp` for the KPPT family.
+/// - `eval`: CLI `--eval-type` value, with the training-component name
+///   slash-appended for multi-component eval types. NNUE eval types are
+///   single-component so the column holds just the eval-type name (e.g.
+///   `NNUE_HALFKP`). KPPT-family eval types have three components
+///   trained sequentially, so the column holds `KPPT/kk`, `KPPT/kkp`,
+///   `KPPT/kpp` (or `KPP_KKPT/kk`, etc.) depending on which component's
+///   row this is. (`--arch` is recorded in the output-directory name
+///   rather than in the CSV.)
 /// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
 /// - `superbatch`: 1-indexed superbatch within the current epoch.
 ///   Increments every `--batches-per-superbatch` batches (default 6104).
-/// - `batch`: 1-indexed batch counter within the current superbatch (= the
-///   `curr_batch` field bullet records every 32 batches: 32, 64, 96, ...).
-///   Combine with `superbatch` for "(superbatch − 1) × batches_per_superbatch
-///   + batch" to get the total batch count.
+/// - `curr_batch`: 1-indexed batch counter within the current superbatch
+///   (= the `curr_batch` field bullet records every 32 batches: 32, 64,
+///   96, ...). Combine with `superbatch` for "(superbatch − 1) ×
+///   batches_per_superbatch + curr_batch" to get the total batch count.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
 /// - `lr`: learning rate at that superbatch (StepLR-derived).
-/// - `lambda`: `--lambda` value at that point (constant per run).
+/// - `lambda`: `--lambda` value at that point (constant per run), formatted
+///   to three decimal places (`1.000`, `0.500`, ...).
 /// - `positions`: cumulative number of teacher positions consumed so far
 ///   for this component, including positions from prior runs detected
 ///   in the existing top-level `learn.log` (resume-aware). Within a run,
@@ -580,11 +584,11 @@ fn run_kppt_all(args: &Args) {
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str =
-    "eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher";
+    "eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
-/// 10-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
+/// 9-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
@@ -650,7 +654,7 @@ fn csv_escape(s: &str) -> String {
 }
 
 /// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
-/// per line) into the enriched 10-column CSV body (no header). The header
+/// per line) into the enriched 9-column CSV body (no header). The header
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
 /// body can be concatenated under a single header by `assemble_numbered_dirs`.
 fn enrich_bullet_log_to_csv(
@@ -675,9 +679,18 @@ fn enrich_bullet_log_to_csv(
         let loss = parts[2];
         let lr = ctx.lr_at(sb);
         let positions = ctx.positions_at(sb, b, position_offset);
+        // For multi-component eval types (KPPT family) the eval column
+        // is `<eval-type>/<component>` so each row self-describes. NNUE
+        // eval types are single-component (`nnue`), so just emit the
+        // eval-type name without redundant suffix.
+        let eval_field: std::borrow::Cow<'_, str> = if component == "nnue" {
+            std::borrow::Cow::Borrowed(ctx.eval_type)
+        } else {
+            std::borrow::Cow::Owned(format!("{}/{}", ctx.eval_type, component))
+        };
         out.push_str(&format!(
-            "{eval},{component},{epoch},{sb},{b},{loss},{lr},{lambda},{positions},{teacher}\n",
-            eval = ctx.eval_type,
+            "{eval},{epoch},{sb},{b},{loss},{lr},{lambda:.3},{positions},{teacher}\n",
+            eval = eval_field,
             lambda = ctx.lambda,
             teacher = ctx.teacher_csv,
         ));
@@ -691,10 +704,13 @@ fn enrich_bullet_log_to_csv(
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
-/// The parser uses `splitn(10, ',')` so any commas inside the trailing
-/// `teacher` field (e.g. a comma-separated teacher list) don't disturb the
-/// first 9 columns. The component column is at index 1 and positions is
-/// at index 8 in the 10-column layout.
+/// The parser uses `splitn(9, ',')` so any commas inside the trailing
+/// `teacher` field (e.g. a comma-separated teacher list) don't disturb
+/// the first 8 columns. Component is extracted from the `eval` column at
+/// index 0: a slash-suffix (e.g. `KPPT/kk`) names the component
+/// explicitly; absence of a slash means a single-component NNUE eval
+/// type, which maps to the `"nnue"` component key. The `positions`
+/// column is at index 7 in the 9-column layout.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
@@ -703,12 +719,13 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(10, ',').collect();
-        if parts.len() < 9 {
+        let parts: Vec<&str> = line.splitn(9, ',').collect();
+        if parts.len() < 8 {
             continue;
         }
-        let component = parts[1];
-        let Ok(positions) = parts[8].parse::<usize>() else { continue };
+        let eval = parts[0];
+        let component = eval.split_once('/').map(|(_, c)| c).unwrap_or("nnue");
+        let Ok(positions) = parts[7].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {
             *entry = positions;
@@ -850,10 +867,10 @@ fn assemble_numbered_dirs(
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
         std::fs::write(dst.join("state.bin"), &state_buf)?;
         // Each component's bullet `log.txt` is the raw
-        // `superbatch,curr_batch,loss` CSV. Enrich each into the 7-column
+        // `superbatch,curr_batch,loss` CSV. Enrich each into the 9-column
         // `learn.log` format (header + data rows for kk, then kkp, then
         // kpp). Pure CSV, no separator between components — the
-        // `component` column distinguishes them.
+        // `eval` column's `<eval-type>/<component>` suffix distinguishes them.
         let mut log_buf = String::new();
         log_buf.push_str(LEARN_LOG_HEADER);
         log_buf.push('\n');

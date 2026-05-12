@@ -32,7 +32,7 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ## 4.2 学習ログ (`learn.log`) の読み方
 
-学習中・終了後の loss 推移は `<output>/learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。どちらも **同じ 10 列 CSV** フォーマット。
+学習中・終了後の loss 推移は `<output>/learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。どちらも **同じ 9 列 CSV** フォーマット。
 
 ### どっちを見るか
 
@@ -42,29 +42,28 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 ### CSV のサンプル
 
 ```csv
-eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,nnue,1,1,32,0.6234,0.001,1.0,524288,teachers/
-NNUE_HALFKP,nnue,1,1,64,0.5891,0.001,1.0,1048576,teachers/
-NNUE_HALFKP,nnue,1,1,96,0.5510,0.001,1.0,1572864,teachers/
+eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP,nnue,1,2,32,0.4523,0.001,1.0,100532224,teachers/
+NNUE_HALFKP,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
-bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--batches-per-superbatch ≒ 6104` なら、1 superbatch あたり約 191 行。`batch` 列が `batches_per_superbatch` (= 6104) に達すると `superbatch` が +1 されて `batch` は 1 から再開する。
+bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--batches-per-superbatch ≒ 6104` なら、1 superbatch あたり約 191 行。`curr_batch` 列が `batches_per_superbatch` (= 6104) に達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
 
 ### 列の意味
 
 | 列 | 意味 | 例 |
 |---|---|---|
-| `eval` | `--eval-type` の値 | `NNUE_HALFKP` |
-| `component` | 学習 component | `nnue` (NNUE 系) / `kk` / `kkp` / `kpp` (KPPT 系) |
+| `eval` | `--eval-type` の値。マルチ component (KPPT 系) は `<eval-type>/<component>` 形式 | `NNUE_HALFKP` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
-| `batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
+| `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
 | `value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
 | `lr` | その時点の学習率 (StepLR 由来) | `0.001` |
-| `lambda` | `--lambda` 値 (1 run 内で定数) | `1.0` |
+| `lambda` | `--lambda` 値 (1 run 内で定数、3 桁固定) | `1.000` |
 | `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `524288` |
 | `teacher` | `--teacher` の値 | `teachers/` |
 
@@ -83,7 +82,7 @@ print(df.tail())       # 最後の数行
 print(df["value_loss"].describe())   # loss の統計
 ```
 
-10 列 + CSV header 付きなので `pd.read_csv` で列名は自動取得される。
+9 列 + CSV header 付きなので `pd.read_csv` で列名は自動取得される。
 
 ### 学習が順調かを見るチェックリスト
 
@@ -104,8 +103,8 @@ print(df["value_loss"].describe())   # loss の統計
 
 4. **`superbatch` がきちんと進んでいるか**
    - 教師局面数が 1 億未満だと 1 周回しても `superbatch` は 1 のまま終わる (fallback save で 1 度だけ保存)。これは仕様
-   - 大きな教師なら `batch` が 6104 (デフォルト `--batches-per-superbatch`) に到達するごとに `superbatch` が +1 されているはず
-   - `superbatch` がいつまでも 1 のままで `batch` も小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
+   - 大きな教師なら `curr_batch` が 6104 (デフォルト `--batches-per-superbatch`) に到達するごとに `superbatch` が +1 されているはず
+   - `superbatch` がいつまでも 1 のままで `curr_batch` も小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
 
 ### 簡単なプロット
 
@@ -122,16 +121,23 @@ plt.savefig("loss_curve.png")
 
 ### KPPT の場合 (kk / kkp / kpp 同時記録)
 
-KPPT 系では 1 save につき kk → kkp → kpp の 3 component のログが連続して書かれる。同じ `(epoch, superbatch, batch, positions)` でも component が違うので、フィルタしてからプロット:
+KPPT 系では 1 save につき kk → kkp → kpp の 3 component のログが連続して書かれる。`eval` 列に `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` のように component が付いているので、それでフィルタしてからプロット:
 
 ```python
 for c in ["kk", "kkp", "kpp"]:
-    sub = df[df["component"] == c]
+    sub = df[df["eval"] == f"KPPT/{c}"]
     plt.plot(sub["positions"], sub["value_loss"], label=c)
 plt.legend(); plt.xlabel("positions"); plt.ylabel("loss")
 ```
 
 KK component の loss は KKP / KPP よりも小さいネットワークなので **絶対値の比較ではなく減少傾向** を見る。
+
+`eval` 列から family / component を分離したいときは:
+
+```python
+df[["family", "component"]] = df["eval"].str.split("/", n=1, expand=True)
+df["component"] = df["component"].fillna("nnue")   # NNUE 系はスラッシュなし
+```
 
 ### resume 後のログの見方
 
