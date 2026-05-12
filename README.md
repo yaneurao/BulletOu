@@ -25,7 +25,7 @@ Target evaluation functions:
 
 ### Usage
 
-- [Tutorial (docs/en/tutorial/)](docs/en/tutorial/): walks through installation, building, and running a first training session step by step.
+- [Tutorial](docs/en/tutorial/): walks through installation, building, and running a first training session step by step.
 - [Documentation](docs/en/): specification-level details such as training-data formats and output formats.
 
 
