@@ -4,6 +4,8 @@
 
 学習パイプラインの仕様レベルのドキュメント。「ある程度わかっている前提」で書かれている。
 
+初めて BulletOu を使う場合は、まず [チュートリアル](tutorial/) を参照。
+
 - [NNUE の基礎](reference/1-basics.md) — 入力/隠れ/出力層、perspective ネットワーク
 - [BulletOu を始める](reference/2-getting-started.md) — トレーニング全体の概観 (上流由来)
 - [学習データフォーマット](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv (上流由来 + 将棋拡張)
