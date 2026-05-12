@@ -17,4 +17,5 @@ Basic Usage:
 
 ### Shogi-specific Documentation
 
-- (Shogi-specific docs are currently in Japanese; see [docs/ja/shogi/](../ja/shogi/). English translations are pending.)
+- [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — Game-progress estimation using KP-Absolute features
+- [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — CLI spec of the `shogi_progress_kpabs_train` tool
