@@ -34,10 +34,15 @@ where
     Inp::RequiredDataType: LoadableDataType,
     Out: OutputBuckets<Inp::RequiredDataType>,
 {
-    std::fs::create_dir(path).unwrap_or(());
+    // 親ディレクトリ (e.g. checkpoints/kk-smoke) がまだ無い場合に備えて
+    // create_dir_all を使う。本家 bullet は create_dir + unwrap_or(()) のため、
+    // 親が無い + Linux のたまたま親が存在するケース以外で File::create が
+    // NotFound panic する (Windows で `指定されたパスが見つかりません` として
+    // 顕在化した)。
+    std::fs::create_dir_all(path).unwrap_or(());
 
     let optimiser_path = format!("{path}/optimiser_state");
-    std::fs::create_dir(optimiser_path.as_str()).unwrap_or(());
+    std::fs::create_dir_all(optimiser_path.as_str()).unwrap_or(());
     trainer.optimiser.write_to_checkpoint(&optimiser_path).unwrap();
 
     if let Err(e) = save_unquantised(trainer, &format!("{path}/raw.bin")) {
