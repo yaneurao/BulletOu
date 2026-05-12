@@ -53,11 +53,10 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt \
     --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --superbatches 20
+    --output checkpoints/my-kppt
 ```
 
-When the run completes:
+`--superbatches` is omitted, so the trainer auto-computes the value for one full pass through the teacher data (the resolved value is printed at startup as `auto-epoch: ... -> --superbatches N`). When the run completes:
 
 ```
 checkpoints/my-kppt/
@@ -105,7 +104,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` |
-| `--superbatches` | Total superbatches | 10 |
+| `--superbatches` | Total superbatches. **Omit to auto-compute for one epoch through the teacher data** (exact for fixed-length `.hcpe` / `.psv`, estimated from file size for variable-length `.pack` / `.hcpe3`) | (auto = 1 epoch) |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR scheduler | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | WDL linear interpolation | 0.0 / 1.0 |

@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::{ShogiKk, ShogiKkp, ShogiKpp},
     nn::optimiser,
-    teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    teacher_path::{DataFormat, compute_auto_epoch_superbatches, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -118,6 +118,19 @@ impl EvalType {
 // (teacher-path expansion and format inference live in
 //  `bullet_lib::teacher_path` so the single-component examples can share them.)
 
+/// Resolve `args.superbatches` to a concrete `end_superbatch` value.
+/// If the user did not pass `--superbatches`, fall back to a 1-epoch estimate
+/// via `compute_auto_epoch_superbatches`.
+fn resolve_end_superbatch(
+    args: &Args,
+    format: DataFormat,
+    teacher_files: &[&str],
+    batches_per_superbatch: usize,
+) -> usize {
+    args.superbatches
+        .unwrap_or_else(|| compute_auto_epoch_superbatches(teacher_files, format, args.batch_size, batches_per_superbatch))
+}
+
 // ----- CLI ---------------------------------------------------------------
 
 #[derive(Parser, Debug, Clone)]
@@ -154,9 +167,14 @@ struct Args {
     #[arg(long)]
     batches_per_superbatch: Option<usize>,
 
-    /// Number of superbatches to run (end_superbatch).
-    #[arg(long, default_value = "10")]
-    superbatches: usize,
+    /// Number of superbatches to run (= `end_superbatch`). If omitted, the
+    /// trainer covers the teacher data exactly once: the value is computed
+    /// from `total_positions / (batch_size * batches_per_superbatch)`. For
+    /// fixed-length formats (`.hcpe` / `.psv`) this is exact; for
+    /// variable-length formats (`.pack` / `.hcpe3`) the position count is a
+    /// rough estimate from file sizes (±~30%).
+    #[arg(long)]
+    superbatches: Option<usize>,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -257,8 +275,22 @@ fn main() {
 /// `--eval-type kpp-kkpt` uses the KPP_KKPT KPP layout (int16, no turn channel).
 fn run_kppt_all(args: &Args) {
     let output_dir = args.output_dir();
-    let total_superbatches = args.superbatches;
-    let last_sb = total_superbatches;
+
+    // Resolve the auto-epoch count once at the family level so all three
+    // children train for the same number of superbatches and the final-copy
+    // step knows which sub-directory to read from.
+    let batches_per_superbatch =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    let last_sb = resolve_end_superbatch(args, format, &data_files_ref, batches_per_superbatch);
 
     let kpp_eval_type = match args.eval_type {
         EvalType::Kppt => EvalType::KpptKpp,
@@ -281,6 +313,9 @@ fn run_kppt_all(args: &Args) {
         let mut child = args.clone();
         child.eval_type = child_eval_type;
         child.net_id = Some(net_id.to_string());
+        // Pin the child's --superbatches to the family-resolved value so each
+        // child does not re-resolve (and so they all agree).
+        child.superbatches = Some(last_sb);
         // Force the child's yaneuraou_quant_scale default to match the child's
         // eval-type when the user didn't override it.
         if args.yaneuraou_quant_scale.is_none() {
@@ -332,6 +367,19 @@ macro_rules! run_training_inline {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
 
+        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
+        let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+
+        let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
+
+        let end_superbatch = resolve_end_superbatch(args, format, &data_files_ref, batches_per_superbatch);
+
         let schedule = TrainingSchedule {
             net_id: args.net_id(),
             eval_scale: args.scale as f32,
@@ -339,7 +387,7 @@ macro_rules! run_training_inline {
                 batch_size: args.batch_size,
                 batches_per_superbatch,
                 start_superbatch: args.start_superbatch,
-                end_superbatch: args.superbatches,
+                end_superbatch,
             },
             wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
             lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
@@ -369,17 +417,6 @@ macro_rules! run_training_inline {
             batch_queue_size: args.batch_queue_size,
             on_checkpoint_saved: Some(&on_checkpoint_saved),
         };
-
-        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-        let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-
-        let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
 
         match format {
             DataFormat::Hcpe => {

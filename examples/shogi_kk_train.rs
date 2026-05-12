@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::ShogiKk,
     nn::optimiser,
-    teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    teacher_path::{DataFormat, compute_auto_epoch_superbatches, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -67,9 +67,10 @@ struct Args {
     #[arg(long)]
     batches_per_superbatch: Option<usize>,
 
-    /// Number of superbatches (approximately = number of epochs at default size).
-    #[arg(long, default_value = "10")]
-    superbatches: usize,
+    /// Number of superbatches to run. If omitted, the trainer runs for one
+    /// epoch through the teacher data (computed from file sizes).
+    #[arg(long)]
+    superbatches: Option<usize>,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -173,9 +174,25 @@ fn main() {
         out.forward(combined)
     });
 
+    // ------- Teacher data -------
+    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+
+    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+
     // ------- Schedule --------
     let batches_per_superbatch =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+
+    let end_superbatch = args.superbatches.unwrap_or_else(|| {
+        compute_auto_epoch_superbatches(&data_files_ref, format, args.batch_size, batches_per_superbatch)
+    });
 
     let schedule = TrainingSchedule {
         net_id: args.net_id.clone(),
@@ -184,7 +201,7 @@ fn main() {
             batch_size: args.batch_size,
             batches_per_superbatch,
             start_superbatch: args.start_superbatch,
-            end_superbatch: args.superbatches,
+            end_superbatch,
         },
         wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
         lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
@@ -199,17 +216,6 @@ fn main() {
         batch_queue_size: args.batch_queue_size,
         on_checkpoint_saved: None,
     };
-
-    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-
-    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
 
     // Each data format has its own loader concrete type, and `trainer.run` is
     // generic over the loader. We dispatch via a small macro so the run body

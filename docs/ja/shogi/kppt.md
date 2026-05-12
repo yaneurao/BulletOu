@@ -53,11 +53,10 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt \
     --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --superbatches 20
+    --output checkpoints/my-kppt
 ```
 
-完了すると、
+`--superbatches` を省略しているので、教師データを 1 周する分が自動で計算される (起動時に `auto-epoch: ... -> --superbatches N` がログに出る)。完了すると、
 
 ```
 checkpoints/my-kppt/
@@ -105,7 +104,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch の mini-batch 数 | `ceil(100M / batch-size)` |
-| `--superbatches` | 走らせる superbatch 数 | 10 |
+| `--superbatches` | 走らせる superbatch 数。**省略すると教師データを 1 周する数を自動算出** (固定長 `.hcpe` / `.psv` は正確、可変長 `.pack` / `.hcpe3` はファイルサイズからの推定) | (auto = 1 epoch) |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | WDL 線形補間 | 0.0 / 1.0 |
