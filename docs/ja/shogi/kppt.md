@@ -142,7 +142,7 @@ resume すると superbatch カウンタは 1 から再開される (run ごと�
 | `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL 線形補間 | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda 線形補間。`λ × 対局結果 + (1−λ) × 教師eval`、`λ = start → end` | 0.0 / 0.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
@@ -162,7 +162,7 @@ KPPT は歴史的に以下の組み合わせが多い:
 - 強めの weight decay
 - 小さめの learning rate (`--lr 1e-4 〜 1e-3`)
 
-一方 `bulletou` のデフォルトは NNUE 寄り (`--start-wdl 0.0 --end-wdl 1.0`、`--lr 1e-3`)。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
+`bulletou` のデフォルトは保守的に純 eval (`--start-wdl 0.0 --end-wdl 0.0`、`--lr 1e-3`) になっている。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
 
 ## 関連
 

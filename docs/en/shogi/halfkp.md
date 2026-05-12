@@ -94,6 +94,6 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--batches-per-superbatch` | Mini-batches per superbatch | ≈ 100M positions |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | LR schedule | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | Linear WDL schedule | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda linear schedule. Loss target = `λ × game_result + (1−λ) × teacher_eval`. `λ` interpolated `start → end` | 0.0 / 0.0 |
 
 Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to ClippedReLU (matching the original 2018 architecture). These can be added as flags later if needed.

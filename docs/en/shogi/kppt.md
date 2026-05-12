@@ -142,7 +142,7 @@ Resume / restart behaviour is identical across every eval-type; see the [tutoria
 | `--max-epochs` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR scheduler | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL linear interpolation | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda linear interpolation. `λ × game_result + (1−λ) × teacher_eval`, `λ = start → end` | 0.0 / 0.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
@@ -162,7 +162,7 @@ KPPT historically uses:
 - stronger weight decay
 - smaller learning rate (`--lr 1e-4` to `1e-3`)
 
-`bulletou`'s defaults are NNUE-oriented (`--start-wdl 0.0 --end-wdl 1.0`, `--lr 1e-3`). For production-quality KPPT, adjust WDL and learning rate along the above lines.
+`bulletou`'s defaults are deliberately conservative — pure eval (`--start-wdl 0.0 --end-wdl 0.0`, `--lr 1e-3`). For production-quality KPPT, adjust WDL and learning rate along the above lines.
 
 ## Related
 

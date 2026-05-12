@@ -94,6 +94,6 @@ checkpoints/my-halfkp/
 | `--batches-per-superbatch` | superbatch あたりの mini-batch 数 | ≈ 100M 局面 |
 | `--save-rate` | N superbatch ごとに save | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | LR scheduler | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | 線形 WDL scheduler | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda 線形 scheduler。loss ターゲット = `λ × 対局結果 + (1−λ) × 教師eval`。`λ` を `start → end` に補間 | 0.0 / 0.0 |
 
 loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。

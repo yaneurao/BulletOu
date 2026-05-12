@@ -144,7 +144,7 @@ Main flags:
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR (multiply by `lr-gamma` every `lr-step` superbatches) | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL (blend ratio between eval score and game result) linearly interpolated | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda linear schedule. The loss target is `λ × game_result + (1−λ) × teacher_eval`; `λ` linearly interpolates from `start` (superbatch 1) to `end` (last superbatch) | 0.0 / 0.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
