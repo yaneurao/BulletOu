@@ -48,7 +48,7 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 
 `--arch` を省略するとデフォルト `256x2-32-32` が適用される。`NNUE_KP` / `NNUE_HALFKPE9` でも同じ preset 群が指定可能。
 
-(`halfkpvm` のように **入力特徴量自体が違う variant**、および `SFNNwoPSQT1536` は別 `--eval-type` として今後追加予定。`--arch` だけでは到達できない。)
+(`halfkpvm` のように **入力特徴量自体が違う variant** は別 `--eval-type` (`NNUE_HALFKPVM`) として用意してある。`SFNNwoPSQT1536` は今後追加予定。`--arch` だけでは到達できない。)
 
 ## 4.4 KPPT を学習する
 

@@ -167,6 +167,44 @@ static constexpr std::uint32_t kHashValue =
 
 これは HalfKP の kHashValue と **完全に同じ値**。エンジン側は `kHashValue` だけでは HalfKP / HalfKPE9 を判別できず、description 文字列 (`HalfKPE9(Friend)`) と入力次元の違いで判別する。
 
+## HalfKP_vm
+
+YaneuraOu の `Features::HalfKP_vm` (`features/half_kp_vm.{h,cpp}`) 相当。HalfKP と同じ「(玉位置, 駒)」の sparse 特徴量だが、**玉の左右対称性** (6 筋以降の玉は 4 筋以前にミラー) を畳んで入力次元を約 1/2 にした版。
+
+| 項目 | 値 |
+|---|---|
+| dim | 45 × 1548 = **69,660** (= HalfKP の約 1/2) |
+| max_active | 38 (HalfKP と同じ、玉以外の駒) |
+| FEATURE_HASH_HALFKPVM | `0x0B6B1D9A` (= `0x0B6B1D9B ^ 1` for `Side::kFriend`) |
+| 識別子 (description) | `HalfKP_vm(Friend)` |
+
+active index 計算式 (`MakeIndex` 由来):
+
+```
+sq_k_eff = (king_file >= 5) ? Mir(king_sq) : king_sq      // file ∈ {0..4}, rank ∈ {0..8}
+bp_eff   = (king_file >= 5 && bp >= fe_hand_end)          // 盤上駒のみ
+              ? FE_HAND_END + piece_idx * SQ_NB + Mir(sq) // sq だけミラー
+              : bp                                        // 持駒はミラーしない
+
+index = fe_end × sq_k_eff + bp_eff
+      = (file_eff * 9 + rank) * 1548 + bp_eff             // file_eff ∈ {0..4}, ∴ index < 45 * 1548
+```
+
+- `Mir(sq)`: 筋反転 (file 0 ↔ 8, file 1 ↔ 7, ..., file 4 fixed)。Rust 実装は `Square::mirror_file()` 同等
+- 持駒 BonaPiece (`< fe_hand_end = 90`) は仮想的なエンコーディング (盤面 sq を持たない) のためミラーしない
+
+### FEATURE_HASH
+
+YaneuraOu の `kHashValue` 定義:
+```cpp
+static constexpr std::uint32_t kHashValue =
+    0x0B6B1D9Bu ^ (AssociatedKing == Side::kFriend);
+```
+
+`Side::kFriend` (= 1) を XOR して `0x0B6B1D9A` になる。これは HalfKP (`0x5D69D5B8`) / HalfKPE9 (同上) と **別値** なので、engine 側で description 検証なしでも判別できる。
+
+詳細は `crates/bulletou_lib/src/game/inputs/shogi_halfkpvm.rs`。
+
 ## HalfKP vs K-P 設計比較
 
 | | HalfKP | K-P |

@@ -48,7 +48,7 @@ For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`
 
 Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` / `NNUE_HALFKPE9` accept the same preset list.
 
-(`halfkpvm` — a different *input feature set* — and `SFNNwoPSQT1536` are tracked as future `--eval-type` values, not reachable through `--arch` alone.)
+(`halfkpvm` — a different *input feature set* — is exposed as its own `--eval-type NNUE_HALFKPVM`. `SFNNwoPSQT1536` is still tracked as a future `--eval-type` value. None of these are reachable through `--arch` alone.)
 
 ## 4.4 Training a KPPT eval
 

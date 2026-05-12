@@ -11,7 +11,8 @@
 //! ここに切り出すことで `bulletou` などの統合 CLI からも再利用できる。
 
 use crate::game::inputs::{
-    FEATURE_HASH, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HM_V2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
+    FEATURE_HASH, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HALFKPVM, FEATURE_HASH_HM_V2, FEATURE_HASH_KP,
+    FEATURE_HASH_NONMIRROR,
 };
 
 /// YaneuraOu / Stockfish 互換 NNUE バイナリのバージョンマジック。
@@ -35,6 +36,10 @@ pub enum NnueFeatureSet {
     /// 9 通り (= 自軍 0/1/2 × 敵軍 0/1/2) ぶん多重化。
     /// 1,128,492 次元 / perspective。
     HalfKpe9,
+    /// HalfKP_vm(Friend) — YaneuraOu の `halfkpvm_*` 系。HalfKP の玉位置
+    /// (5 筋以降) を file-mirror して左右対称性を畳んだ版。
+    /// 入力次元は 45 × 1548 = 69,660 (= HalfKP の約 1/2)。
+    HalfKpvm,
 }
 
 impl NnueFeatureSet {
@@ -46,6 +51,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKaHm => FEATURE_HASH_HM_V2,
             NnueFeatureSet::Kp => FEATURE_HASH_KP,
             NnueFeatureSet::HalfKpe9 => FEATURE_HASH_HALFKPE9,
+            NnueFeatureSet::HalfKpvm => FEATURE_HASH_HALFKPVM,
         }
     }
 
@@ -57,6 +63,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKaHm => 73_305,
             NnueFeatureSet::Kp => 1_710,
             NnueFeatureSet::HalfKpe9 => 1_128_492,
+            NnueFeatureSet::HalfKpvm => 69_660,
         }
     }
 
@@ -73,6 +80,8 @@ impl NnueFeatureSet {
             NnueFeatureSet::Kp => "K-P(Friend)",
             // YaneuraOu features/half_kpe9.h の kName と一致 (大文字 "E")。
             NnueFeatureSet::HalfKpe9 => "HalfKPE9(Friend)",
+            // YaneuraOu features/half_kp_vm.h の kName と一致。
+            NnueFeatureSet::HalfKpvm => "HalfKP_vm(Friend)",
         }
     }
 }

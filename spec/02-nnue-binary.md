@@ -1,6 +1,6 @@
 # 02. `nn.bin` バイナリ仕様
 
-NNUE 系 eval-type (`NNUE_HALFKP` / `NNUE_KP`) が `<output>/000N/nn.bin` に書き出すバイナリの仕様。**nnue-pytorch / Stockfish / YaneuraOu の NNUE 形式と byte 単位で同一**。
+NNUE 系 eval-type (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM`) が `<output>/000N/nn.bin` に書き出すバイナリの仕様。**nnue-pytorch / Stockfish / YaneuraOu の NNUE 形式と byte 単位で同一**。
 
 `bulletou_lib::value::nnue_save` モジュール参照。
 

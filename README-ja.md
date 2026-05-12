@@ -15,13 +15,14 @@
 
 対応する評価関数:
 
-- NNUE halfKP
-- NNUE halfKPE9
-- NNUE KP
-- NNUE halfka1 / halfka2
-- SFNN + ls9 (NNUEwoSQPT1536)
 - KPPT
 - KPP_KKPT
+- NNUE_HALFKP
+- NNUE_KP
+- NNUE_HALFKPE9
+- NNUE_HALFKPVM
+- NNUE halfka1 / halfka2
+- SFNN + halfka2 + ls9 (NNUEwoSQPT1536)
 
 ### 使い方
 
