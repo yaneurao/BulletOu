@@ -2,13 +2,12 @@
 
 <a href="../../en/tutorial/3-kppt-roadmap.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-> **状況: Phase 1 (KK 単体) 着地済み**。フル KPPT / KPP_KPPT 対応は段階的に進行中:
+> **状況: Phase 1 と 2 着地済み**。フル KPPT / KPP_KPPT 対応は段階的に進行中:
 >
 > - **Phase 1 (完了)** — `ShogiKk` sparse 入力 + `shogi_kk_train` example。
->   KK 単体の最小ネットでパイプライン疎通を確認できた状態。強さはまだ出ない (この段階の目標は配線確認のみ)。
-> - **Phase 2 (予定)** — `ShogiKkp` を追加して KK と結合。
-> - **Phase 3 (予定)** — `ShogiKpp` を追加 (= フル KPPT)。GPU メモリを多く要する。KPP 重みだけで 1.4 GB、Adam state 込みで 5.6 GB+。
-> - **Phase 4 (予定)** — やねうら王互換の `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPPT_synthesized.bin` 出力。
+> - **Phase 2 (完了)** — `ShogiKkp` sparse 入力 + `shogi_kk_kkp_train` example、および `yaneuraou_kppt::save_yaneuraou_kppt` writer。学習後の `raw.bin` から checkpoint ごとに **やねうら王互換の `KK_synthesized.bin` と `KKP_synthesized.bin`** を書き出す。`[1]` (手番依存項) は現状 0 埋め — 本物の手番項は Phase 3 で対応。
+> - **Phase 3 (予定)** — `ShogiKpp` を追加 (= フル KPPT)。GPU メモリを多く要する (KPP 重みだけで 1.4 GB、Adam state 込みで 5.6 GB+)。手番依存項も実装し、`KK[bk][wk][1]` / `KKP[bk][wk][bp][1]` を 0 ではなく学習結果で埋める。
+> - **Phase 4 (予定)** — `KPP_synthesized.bin` 出力。やねうら王形式出力の残作業。
 > - **Phase 5 (予定)** — KPP_KPPT (factorise 版)。
 
 ## なぜ KPPT / KPP_KPPT に対応するのか

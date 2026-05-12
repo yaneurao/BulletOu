@@ -2,17 +2,22 @@
 
 <a href="../../ja/tutorial/3-kppt-roadmap.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-> **Status: Phase 1 (KK only) is in.** The full KPPT / KPP_KPPT support
-> is rolling out in phases:
+> **Status: Phases 1 and 2 are in.** The full KPPT / KPP_KPPT support is
+> rolling out in phases:
 >
 > - **Phase 1 (DONE)** — `ShogiKk` sparse input + `shogi_kk_train` example.
->   The training pipeline runs end-to-end on a KK-only minimal network.
->   Strength is expected to be poor; this phase only confirms wire-up.
-> - **Phase 2 (planned)** — add `ShogiKkp` and combine with KK.
+> - **Phase 2 (DONE)** — `ShogiKkp` sparse input + `shogi_kk_kkp_train`
+>   example, plus a `yaneuraou_kppt::save_yaneuraou_kppt` writer that
+>   produces YaneuraOu-format `KK_synthesized.bin` and
+>   `KKP_synthesized.bin` from the trained `raw.bin` after every
+>   checkpoint. The `[1]` (turn-dependent) channel is filled with zero
+>   for now; the proper turn term is part of Phase 3.
 > - **Phase 3 (planned)** — add `ShogiKpp` (= full KPPT). Requires large
 >   GPU memory: KPP weights alone are ~1.4 GB (5.6 GB+ with Adam state).
-> - **Phase 4 (planned)** — emit YaneuraOu-compatible `KK_synthesized.bin`
->   / `KKP_synthesized.bin` / `KPPT_synthesized.bin`.
+>   Also wire up the turn-dependent term so that `KK[bk][wk][1]` /
+>   `KKP[bk][wk][bp][1]` are no longer zero.
+> - **Phase 4 (planned)** — emit `KPP_synthesized.bin` and any remaining
+>   loose ends in the YaneuraOu-format output.
 > - **Phase 5 (planned)** — `KPP_KPPT` factorised form.
 
 ## Why support KPPT / KPP_KPPT?
