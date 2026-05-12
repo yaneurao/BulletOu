@@ -99,7 +99,7 @@ KPPT,,kpp,1,1,0.245,0.001,1.0,524288,teachers/
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 
-中断・再開の挙動は eval-type 横断で同じなので、[チュートリアル §2.7](../tutorial/2-training.md#27-中断再開) を参照。
+中断・再開の挙動は eval-type 横断で同じなので、[チュートリアル §2.4](../tutorial/2-train.md#24-中断再開) を参照。
 
 ### KPP_KKPT (factorised)
 
@@ -131,7 +131,7 @@ KPPT,,kpp,1,1,0.245,0.001,1.0,524288,teachers/
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
-学習単位の意味は [§2.4 学習スケジュール](../tutorial/2-training.md#24-学習スケジュール) を参照。
+学習単位の意味は [§3.1 学習スケジュール](../tutorial/3-tune.md#31-学習スケジュール) を参照。
 
 ## メモリ要件
 

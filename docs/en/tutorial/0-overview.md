@@ -68,5 +68,7 @@ How the engine consumes the file depends on the engine; see its documentation.
 The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
-- [2. Running a training](2-training.md) — train a real evaluation function on actual data and load it into an engine
+- [2. Run a training](2-train.md) — train a real evaluation function on actual data (eval-type / teacher / command)
+- [3. Tune the training](3-tune.md) — adjust the schedule and `--lambda` (optional)
+- [4. Inspect and use the result](4-result.md) — output layout, reading `learn.log`, loading into an engine
 - [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

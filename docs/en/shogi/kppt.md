@@ -99,7 +99,7 @@ Per-save snapshot `0NNN/learn.log` and the top-level `<output>/learn.log` use th
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-Resume / restart behaviour is identical across every eval-type; see the [tutorial §2.7](../tutorial/2-training.md#27-resume) for details.
+Resume / restart behaviour is identical across every eval-type; see the [tutorial §2.4](../tutorial/2-train.md#24-stopping-and-resuming) for details.
 
 ### KPP_KKPT (factorised)
 
@@ -131,7 +131,7 @@ Resume / restart behaviour is identical across every eval-type; see the [tutoria
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
-For the meaning of the scheduling units, see [§2.4 Training schedule](../tutorial/2-training.md#24-training-schedule).
+For the meaning of the scheduling units, see [§3.1 Training schedule](../tutorial/3-tune.md#31-training-schedule).
 
 ## Memory requirements
 
