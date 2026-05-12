@@ -258,4 +258,4 @@ cargo run --release --features cuda --example shogi_layerstack -- \
 - [リファレンス: 学習済みネットワーク](../4-saved-networks.md) — checkpoint レイアウト、量子化、変換チェーン
 - [リファレンス: KP 絶対進行度](../shogi/kp-absolute-progress.md) — `--bucket-mode progress8kpabs` が実際に何をやっているか
 - [リファレンス: shogi_progress_kpabs_train](../shogi/shogi_progress_kpabs_train.md) — 自分で `progress.bin` を学習する方法
-- [3. KPPT / KPP_KPPT ロードマップ](3-kppt-roadmap.md) — 旧評価関数対応の計画
+- [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) — 旧評価関数の学習方法 (Phase 1〜4 実装済み)

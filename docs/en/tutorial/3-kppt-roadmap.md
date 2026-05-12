@@ -1,107 +1,211 @@
-# 3. KPPT / KPP_KPPT Roadmap
+# 3. KPPT / KPP_KKPT Training
 
 <a href="../../ja/tutorial/3-kppt-roadmap.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-> **Status: Phases 1 and 2 are in.** The full KPPT / KPP_KPPT support is
-> rolling out in phases:
+> **Status: Phases 1–3 landed. The three KPPT files (`KK_synthesized.bin` /
+> `KKP_synthesized.bin` / `KPP_synthesized.bin`) can now actually be produced**, in
+> either the KPPT or KPP_KKPT on-disk layout.
 >
-> - **Phase 1 (DONE)** — `ShogiKk` sparse input + `shogi_kk_train` example.
-> - **Phase 2 (DONE)** — `ShogiKkp` sparse input + `shogi_kk_kkp_train`
->   example, plus a `yaneuraou_kppt::save_yaneuraou_kppt` writer that
->   produces YaneuraOu-format `KK_synthesized.bin` and
->   `KKP_synthesized.bin` from the trained `raw.bin` after every
->   checkpoint. The `[1]` (turn-dependent) channel is filled with zero
->   for now; the proper turn term is part of Phase 3.
-> - **Phase 3 (planned)** — add `ShogiKpp` (= full KPPT). Requires large
->   GPU memory: KPP weights alone are ~1.4 GB (5.6 GB+ with Adam state).
->   Also wire up the turn-dependent term so that `KK[bk][wk][1]` /
->   `KKP[bk][wk][bp][1]` are no longer zero.
-> - **Phase 4 (planned)** — emit `KPP_synthesized.bin` and any remaining
->   loose ends in the YaneuraOu-format output.
-> - **Phase 5 (planned)** — `KPP_KPPT` factorised form.
+> - **Phase 1 (done)** — `ShogiKk` sparse input + `bullet_ou_train --eval-type kppt-kk`. Writes `KK_synthesized.bin`.
+> - **Phase 2 (done)** — `ShogiKkp` sparse input + `bullet_ou_train --eval-type kppt-kkp`. Writes `KKP_synthesized.bin`.
+> - **Phase 3 (done)** — `ShogiKpp` sparse input + `bullet_ou_train --eval-type kppt-kpp`. Writes `KPP_synthesized.bin` in the KPPT layout (`int16_t × 2`, ~740 MB).
+> - **Phase 4 (= KPP_KKPT writer, done)** — `bullet_ou_train --eval-type kpp-kkpt-kpp` writes `KPP_synthesized.bin` in the KPP_KKPT factorised layout (`int16_t × 1`, no turn channel, ~388 MB).
+> - **Phase 5 (not implemented)** — **joint training** (KK + KKP + KPP updated together with a shared gradient in one run). Currently the three components are trained independently and the three `.bin` files are merged manually. elmo-style joint training requires a tuple-input extension to `ValueTrainerBuilder`.
 
-## Why support KPPT / KPP_KPPT?
+## Why support KPPT / KPP_KKPT at all
 
-YaneuraOu has historically supported a family of evaluation functions before NNUE:
+YaneuraOu has a family of older (pre-NNUE) evaluation functions:
 
-- **KK** — king vs king position only
+- **KK** — king vs king
 - **KKP** — king × king × piece
-- **KPP** — king × piece × piece (the original "Apery / Bonanza" style)
-- **KPPT** — KPP plus a side-to-move tensor T
-- **KPP_KPPT** — a factorised form of KPPT (KP + KPPT, sharing parameters)
+- **KPP** — king × piece × piece (the Apery / Bonanza original)
+- **KPPT** — KPP + turn-tensor T (= with a side-to-move channel)
+- **KPP_KKPT** — KPPT factorised: KPP without turn, the turn term lives in KK and KKP
 
-Many strong shogi engines were built on these. There is still value in:
-
-- Continuing to improve / re-train classical evals as a research baseline
-- Using BulletOu's GPU pipeline to do what was historically very slow CPU-only training
-- Comparing classical and NNUE evals on the same training data
+Still useful today:
+- Improve / re-train classical evals as a research baseline.
+- Take advantage of BulletOu's GPU pipeline -- this was historically CPU-only and very slow (**100x+ speed-up** for training).
+- Run apples-to-apples comparisons between classical and NNUE evals on the same data.
+- Reproduce historically important evals such as elmo(WCSC27).
 
 ## Structural difference from NNUE
 
-NNUE is "**sparse feature transformer + small MLP**" — a (fairly) standard neural network shape that fits naturally into bullet's IR.
+NNUE is a "**sparse feature transformer + small MLP**" -- a standard NN shape.
 
-KPPT is "**sum of large sparse embedding tables, no hidden layers**":
+KPPT is "**a sum of huge sparse embedding tables, no hidden layer**":
 
 ```
-eval(pos) = KK[bk][wk] 
-          + Σ_i KKP[bk][wk][p_i] 
+eval(pos) = KK[bk][wk]
+          + Σ_i KKP[bk][wk][p_i]
           + Σ_{i<j} KPP[bk][p_i][p_j]
           + (turn term T)
 ```
 
-There is no "hidden layer" in the NN sense. It is a giant lookup-table sum.
+No hidden layer in the NN sense -- just a sum of large lookup tables.
 
-The biggest single table (`KPP`) is roughly **184 M parameters** (`81 × 1548 × 1548 / 2 × 2 channels`), which is a different scale of memory than the typical 1–10 M parameter NNUE.
+The biggest table (`KPP`) is `81 × 1548 × 1548 = 194,100,624` dims = 776 MB at f32, ~2.3 GB on GPU including Adam state.
 
-## What BulletOu needs to add
+## File formats (confirmed from YaneuraOu source)
 
-Tracking the spec discussion in [`docs/spec/bullet/shogi-port.md`](https://github.com/yaneurao/YaneuraOu) (yaneurao's workspace-side spec, not in this repo):
+From `source/eval/kppt/evaluate_kppt.h` and `eval/kpp_kkpt/evaluate_kpp_kkpt.h`:
 
-1. **Tuple `SparseInputType`s** for KK / KKP / KPP — each defines its own `num_inputs()`, `max_active()`, `map_features()`. The hard part is BonaPiece pair enumeration for KPP.
-2. **Multi-input `ValueTrainerBuilder`** — currently `inputs(SingleInputType)` is a single trait object; KPPT needs `inputs((Kk, Kkp, Kpp))` style tuple support. This is a non-trivial change in the builder DSL.
-3. **No-hidden-layer architecture** — directly sum embedding outputs, no MLP after the FT.
-4. **YaneuraOu-format writer** — BulletOu's current `SavedFormat` produces rshogi-compatible quantised binaries. KPPT/KPP_KPPT need to produce YaneuraOu's `KK_synthesized.bin`, `KKP_synthesized.bin`, `KPPT_synthesized.bin` triplet with the exact layout YaneuraOu's `evaluate_kppt.cpp` expects.
-5. **Training schedule tuning** — KPPT historically used ELMO-style WDL teacher, strong weight decay, and small lrs. The hyperparameters that work for NNUE will not directly transfer.
+| File | KPPT type | KPP_KKPT type | Size |
+|---|---|---|---|
+| `KK_synthesized.bin` | `int32_t kk[81][81][2]` | identical | 51 KB |
+| `KKP_synthesized.bin` | `int32_t kkp[81][81][1548][2]` | identical | 77 MB |
+| `KPP_synthesized.bin` | `int16_t kpp[81][1548][1548][2]` | `int16_t kpp[81][1548][1548]` | **740 MB / 388 MB** |
 
-## Estimated size of work
+The trailing `[2]` is `[stm_independent, stm_dependent]` (turn-independent + turn-dependent term).
+- **KPPT**: KPP has a turn channel.
+- **KPP_KKPT**: KPP has *no* turn channel; the turn term lives in KK and KKP only.
 
-From the workspace-side spec (`docs/spec/bullet/shogi-port.md`):
+BulletOu's current behaviour: **only `[0]` (the turn-independent term) is trained**, and `[1]` (the turn-dependent term) is filled with 0. Proper turn-term training is a future phase.
 
-| Component | Lines (rough) |
-|---|---|
-| KK / KKP / KPP SparseInputType implementations | 600–1,200 |
-| ValueTrainerBuilder tuple-input extension | 200–500 (in bullet core, may need to be upstreamed or maintained as a fork patch) |
-| YaneuraOu-format weight writer | 300–500 |
-| Factorisation helpers (for KP_KPPT) | 200–400 |
-| Schedule and regularisation tuning | mostly experimental cost, not LoC |
-| **Total** | **~1,300–2,600 LoC + experiment time** |
+## Actual usage
 
-In contrast, NNUE shogi support (already done in upstream `bullet-shogi`) is ~17,000 LoC, so KPPT support is much smaller in pure LoC terms — but it touches the bullet core builder DSL, which is a sensitive area.
+### Prerequisites
 
-## What the user-visible interface will probably look like
+- BulletOu built (`cargo build --release --features cuda --example bullet_ou_train`)
+- Training data (`.hcpe` / `.hcpe3` / `.pack`)
+- 4 GB+ of free GPU memory (Phase 3 KPP uses ~2.3 GB)
 
-When KPPT support lands, the expected end-user workflow will mirror the NNUE one:
+### KPPT (elmo-compatible, `int16_t × 2` KPP)
+
+Run the three phases independently. Joint training in a single run (writing all three files at once) is not yet implemented (Phase 5):
 
 ```bash
-cargo run --release --features cuda --example shogi_kppt_train -- \
-  --data /data/shogi/train.pack \
-  --output checkpoints/my-kppt-eval \
-  --eval-format kppt \
-  --epochs 1
+# Phase 1: KK training -> KK_synthesized.bin
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kk \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kppt \
+    --net-id kk \
+    --superbatches 20
+
+# Phase 2: KKP training -> KKP_synthesized.bin
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kkp \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kppt \
+    --net-id kkp \
+    --superbatches 20
+
+# Phase 3: KPP training -> KPP_synthesized.bin (KPPT layout)
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kpp \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kppt \
+    --net-id kpp \
+    --superbatches 20
 ```
 
-with output files following YaneuraOu's KPPT layout (`KK_synthesized.bin`, `KKP_synthesized.bin`, `KPPT_synthesized.bin`) directly in the checkpoint directory.
+Three `.bin` files have now been written; assemble them:
 
-`KPP_KPPT` would be a switch on top: `--eval-format kpp_kppt` (or a similar flag) plus an optional factorisation control.
+```bash
+mkdir -p checkpoints/my-kppt/final
+cp checkpoints/my-kppt/kk-20/KK_synthesized.bin   checkpoints/my-kppt/final/
+cp checkpoints/my-kppt/kkp-20/KKP_synthesized.bin checkpoints/my-kppt/final/
+cp checkpoints/my-kppt/kpp-20/KPP_synthesized.bin checkpoints/my-kppt/final/
+```
 
-## What you can do today
+Point a YaneuraOu KPPT engine at `checkpoints/my-kppt/final/`.
 
-Until KPPT support is implemented:
+### KPP_KKPT (factorised, `int16_t × 1` KPP)
 
-- Use **YaneuraOu's own `learn` command** for KPPT-family training (the original implementation; CPU-only, slow but functional).
-- Use **BulletOu for NNUE**, where the GPU acceleration is fully working.
-- If you want to help implement KPPT support, the BonaPiece pair enumeration code in `crates/bullet_lib/src/shogi/bona_piece.rs` is the natural starting point. The math is well-documented in `docs/en/shogi/kp-absolute-progress.md` (BonaPiece layout) and `docs/spec/bullet/shogi-port.md` (overall design).
+KK and KKP files are byte-identical to KPPT, so the first two commands are the **same**. Only the KPP writer differs:
 
----
+```bash
+# Phase 1: KK training (identical to KPPT)
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kk \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kpp-kkpt \
+    --net-id kk
 
-When KPPT lands, this page will be split into a real KPPT tutorial alongside [2. NNUE Tutorial](2-nnue-tutorial.md). Until then, it serves as a forward-looking design summary.
+# Phase 2: KKP training (identical to KPPT)
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kkp \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kpp-kkpt \
+    --net-id kkp
+
+# Phase 3: KPP training, KPP_KKPT layout (no turn channel, half the size)
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kpp-kkpt-kpp \
+    --data /path/to/train.hcpe \
+    --output checkpoints/my-kpp-kkpt \
+    --net-id kpp
+```
+
+Assemble the three files the same way as the KPPT case.
+
+### Running a single phase standalone
+
+For smoke testing or development, three standalone examples are kept around (these contain the same logic that `bullet_ou_train` dispatches to):
+
+```bash
+cargo run --release --features cuda --example shogi_kpp_train -- \
+    --data inbox/ref/small.hcpe \
+    --output checkpoints/kpp-smoke \
+    --superbatches 3 \
+    --batches-per-superbatch 100
+```
+
+### Common KPPT-family CLI flags
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--eval-type` | `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (required) |
+| `--data` | Training file (`.hcpe` / `.hcpe3` / `.pack`; comma-separated for multiple) | (required) |
+| `--output` | Checkpoint parent directory | per-eval-type default |
+| `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
+| `--batch-size` | Positions per gradient step | 16384 |
+| `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` |
+| `--superbatches` | Total superbatches | 10 |
+| `--save-rate` | Save every N superbatches | 1 |
+| `--lr` / `--lr-gamma` / `--lr-step` | StepLR scheduler | 0.001 / 0.1 / 8 |
+| `--start-wdl` / `--end-wdl` | WDL linear interpolation | 0.0 / 1.0 |
+| `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
+| `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
+
+For the meaning of the scheduling units, see [2.4 Training units](2-nnue-tutorial.md#24-training-units--batch--superbatch--save--lr).
+
+## Memory requirements
+
+| Phase | Weights | f32 weights | + Adam (3× state) | Suggested GPU mem |
+|---|---|---|---|---|
+| KK | 6,561 | 26 KB | 78 KB | almost anything |
+| KKP | 10,156,428 | 40 MB | 120 MB | 4 GB+ |
+| KPP | 194,100,624 | 776 MB | 2.33 GB | **8 GB+ recommended** (sparse buffers add ~100 MB more) |
+
+`max_active = 703` for KPP (= C(38, 2), the unordered pair count of non-king BonaPieces), so at `batch_size = 16384` the GPU-side sparse index buffer is ~92 MB.
+
+## What's still missing
+
+### Phase 5: joint training
+
+Currently KK / KKP / KPP are trained *independently* and their `.bin` files are merged. Each component tries to learn the full eval signal on its own, so e.g. KKP and KPP both relearn parts of what KK should capture (**redundant fits**), and the final ensemble eval is not optimal.
+
+elmo and YaneuraOu's `learn` command update the three components in a single gradient step. Achieving this in BulletOu requires extending bullet's `ValueTrainerBuilder` to take a tuple of `SparseInputType`s rather than a single one. That's a change to bullet core -- either we PR it upstream or maintain it as a BulletOu fork.
+
+### Turn-dependent ([1]) channel
+
+`KK[..][1]` / `KKP[..][1]` / `KPP[..][1]` are written as 0. Real training requires side-to-move as an input and learning a separate weight set. Phase 6.
+
+### Hyperparameter conventions for KPPT
+
+KPPT historically uses:
+- elmo-style WDL teaching (often `start_wdl = end_wdl = 0.5`)
+- Stronger weight decay
+- Smaller learning rate (1e-3 to 1e-4)
+
+`bullet_ou_train`'s defaults are NNUE-oriented (start_wdl=0.0, end_wdl=1.0). **Hyperparameter tuning is needed for production-grade results**. Tuning notes will accumulate in a separate experiment log.
+
+## Related
+
+- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kk.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kk.rs)
+- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kkp.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kkp.rs)
+- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kpp.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kpp.rs)
+- [BulletOu source: `crates/bullet_lib/src/value/yaneuraou_kppt.rs`](../../../crates/bullet_lib/src/value/yaneuraou_kppt.rs)
+- [YaneuraOu source: `source/eval/kppt/evaluate_kppt.h`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/kppt/evaluate_kppt.h)
+- [YaneuraOu source: `source/eval/kpp_kkpt/evaluate_kpp_kkpt.h`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/kpp_kkpt/evaluate_kpp_kkpt.h)

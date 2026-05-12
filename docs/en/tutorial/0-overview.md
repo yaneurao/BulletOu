@@ -22,11 +22,10 @@ BulletOu inherits its core from `bullet` (jw1912) and `bullet-shogi` (SH11235), 
 |---|---|---|
 | **NNUE (HalfKP / HalfKA / Layer Stack)** | **Supported now** | Inherited from bullet-shogi. Layer Stack with KP-Absolute progress buckets is the typical configuration for the strongest results. |
 | **NNUE with Threat / HandThreat / HandCount features** | Supported now | 7 input feature variants are available. |
-| **KPPT** | Planned | The structure (sum of large sparse embedding tables, no hidden layers) is different from NNUE; needs a builder DSL extension and a writer for the YaneuraOu `.bin` format. |
-| **KPP_KPPT** | Planned | A factorised variant of KPPT. Will follow once KPPT support lands. |
-| Other legacy YaneuraOu evals | Best effort | KK / KKP-only and similar minimal variants will be considered after KPPT works. |
-
-The "Planned" items are tracked in [3-kppt-roadmap.md](3-kppt-roadmap.md).
+| **KPPT (KK + KKP + KPP trained independently as three components)** | **Supported now** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` produces the three `.bin` files. See [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md). |
+| **KPP_KKPT (factorised variant)** | **Supported now** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
+| **Joint training (KK + KKP + KPP in one run)** | Planned (Phase 5) | Requires a tuple-input extension to `ValueTrainerBuilder`. |
+| Other legacy YaneuraOu evals | Best effort | KK-only / KKP-only minimal variants are already available via the corresponding `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` subcommand. |
 
 The default target for now is **shogi NNUE**, which is what the rest of this tutorial walks through.
 
@@ -88,4 +87,4 @@ The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
 - [2. NNUE Tutorial](2-nnue-tutorial.md) — a deeper walkthrough that trains a real NNUE
-- [3. KPPT / KPP_KPPT Roadmap](3-kppt-roadmap.md) — what the legacy-eval support will look like once implemented
+- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — how to train legacy YaneuraOu evals (Phases 1–4 done) and what's still missing
