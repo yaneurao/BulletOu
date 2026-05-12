@@ -38,7 +38,15 @@ pub struct LinearWDL {
 impl WdlScheduler for LinearWDL {
     fn blend(&self, _batch: usize, superbatch: usize, max: usize) -> f32 {
         let grad = (self.end - self.start) / (max - 1).max(1) as f32;
-        self.start + grad * (superbatch - 1) as f32
+        let raw = self.start + grad * (superbatch - 1) as f32;
+        // bullet trainer の data loader は double-buffer 化のため、メインが最終
+        // superbatch を実行中でも次 superbatch (= max + 1) の batch を先読みする。
+        // そのとき superbatch > max で raw は end を超えた値を返し、loader 側の
+        // `assert!((0.0..=1.0).contains(&blend))` で panic する (本家 bullet のバグ)。
+        // start と end の範囲に clamp して安全に止める。
+        let lo = self.start.min(self.end);
+        let hi = self.start.max(self.end);
+        raw.clamp(lo, hi)
     }
 
     fn colourful(&self) -> String {

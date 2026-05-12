@@ -76,15 +76,25 @@ pub fn parse_raw_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<f32>>> {
         // ---- Read the usize little-endian length ----
         const USIZE_BYTES: usize = std::mem::size_of::<usize>();
         if offset + USIZE_BYTES > bytes.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "raw.bin: EOF inside length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("raw.bin: EOF inside length (id={id:?}, offset={offset}, total={})", bytes.len()),
+            ));
         }
         let len_bytes: [u8; USIZE_BYTES] = bytes[offset..offset + USIZE_BYTES].try_into().unwrap();
         let len = usize::from_le_bytes(len_bytes);
         offset += USIZE_BYTES;
 
         // ---- Read len f32 values ----
-        if offset + len * 4 > bytes.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "raw.bin: EOF inside values"));
+        if offset + len.saturating_mul(4) > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "raw.bin: EOF inside values (id={id:?}, len={len}, need={} bytes, have={} bytes)",
+                    len.saturating_mul(4),
+                    bytes.len().saturating_sub(offset),
+                ),
+            ));
         }
         let mut values = Vec::with_capacity(len);
         for i in 0..len {
