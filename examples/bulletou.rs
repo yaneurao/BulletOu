@@ -284,34 +284,22 @@ struct Args {
     #[arg(long, default_value = "8")]
     lr_step: usize,
 
-    /// Start of the WDL-lambda linear schedule (superbatch 1).
+    /// Lambda — weight on the teacher's evaluation score (vs the actual
+    /// game result) in the loss target. Matches YaneuraOu's built-in
+    /// trainer convention:
     ///
-    /// WDL = Win / Draw / Loss — the three-valued game outcome label
-    /// stored alongside the teacher eval in each training position
-    /// (W = 1.0, D = 0.5, L = 0.0, from side-to-move perspective).
-    /// WDL-lambda controls how the loss target blends the teacher's
-    /// evaluation score with this game-result label:
+    ///     target = lambda * eval_score + (1 - lambda) * game_result
     ///
-    ///     target = lambda * game_result + (1 - lambda) * eval_score
+    /// where `eval_score` is the teacher engine's score after sigmoid
+    /// and `game_result` is W/D/L = 1.0 / 0.5 / 0.0 from side-to-move
+    /// perspective. So `lambda = 1.0` trains on pure eval, `lambda = 0.0`
+    /// trains on pure W/D/L, and intermediate values mix the two.
+    /// Default 1.0 (pure eval) matches YaneuraOu's traditional default.
     ///
-    /// where `game_result` is W/D/L = 1.0/0.5/0.0 and `eval_score` is
-    /// the teacher engine's score after sigmoid. So `lambda = 0.0` means
-    /// "train on pure eval score" and `lambda = 1.0` means "train on pure
-    /// game result". (Note: this is the opposite convention from
-    /// Stockfish nnue-pytorch, whose `lambda` is the eval-score weight.)
-    ///
-    /// `--start-wdl` and `--end-wdl` linearly interpolate this lambda
-    /// from the first to the last superbatch. Defaults are both 0.0
-    /// (= pure eval throughout training). Typical conservative tweak:
-    /// `--start-wdl 0.0 --end-wdl 0.25` to mix in some game result as
-    /// training progresses.
-    #[arg(long, default_value = "0.0")]
-    start_wdl: f32,
-
-    /// End of the WDL-lambda linear schedule (final superbatch). See
-    /// `--start-wdl` for what WDL-lambda means.
-    #[arg(long, default_value = "0.0")]
-    end_wdl: f32,
+    /// (WDL = Win/Draw/Loss is the three-valued game-result label each
+    /// teacher position carries alongside the eval score.)
+    #[arg(long, default_value = "1.0")]
+    lambda: f32,
 
     /// Eval-to-score sigmoid scale.
     #[arg(long, default_value = "400")]
@@ -809,7 +797,7 @@ macro_rules! run_training_inline {
                     start_superbatch: args.start_superbatch,
                     end_superbatch,
                 },
-                wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
+                wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
                 lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
                 save_rate: args.save_rate,
             };
@@ -1109,7 +1097,7 @@ macro_rules! run_training_inline_nnue {
                     start_superbatch: args.start_superbatch,
                     end_superbatch,
                 },
-                wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
+                wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
                 lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
                 save_rate: args.save_rate,
             };

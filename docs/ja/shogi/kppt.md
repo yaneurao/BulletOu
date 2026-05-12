@@ -142,7 +142,7 @@ resume すると superbatch カウンタは 1 から再開される (run ごと�
 | `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL-lambda 線形補間 (WDL = Win/Draw/Loss = 教師局面が持つ対局結果ラベル)。`λ × 対局結果 + (1−λ) × 教師eval`、`λ = start → end` | 0.0 / 0.0 |
+| `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
@@ -158,11 +158,11 @@ KK / KKP の学習は GPU メモリをほとんど使わない (4 GB GPU でも�
 
 KPPT は歴史的に以下の組み合わせが多い:
 
-- ELMO 式 WDL 教師 (`--start-wdl 0.5 --end-wdl 0.5` 等の中程度設定)
+- ELMO 式 WDL 教師 (`--lambda 0.5` 程度の中間値、eval と対局結果を 50:50 で混合)
 - 強めの weight decay
 - 小さめの learning rate (`--lr 1e-4 〜 1e-3`)
 
-`bulletou` のデフォルトは保守的に純 eval (`--start-wdl 0.0 --end-wdl 0.0`、`--lr 1e-3`) になっている。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
+`bulletou` のデフォルトは純 eval (`--lambda 1.0`、`--lr 1e-3`) になっている。KPPT で実用品質を狙う場合は `--lambda` と学習率を上記の方針で調整する。
 
 ## 関連
 

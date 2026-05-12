@@ -142,7 +142,7 @@ Resume / restart behaviour is identical across every eval-type; see the [tutoria
 | `--max-epochs` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR scheduler | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL-lambda linear interpolation (WDL = Win/Draw/Loss = game-result label). `λ × game_result + (1−λ) × teacher_eval`, `λ = start → end` | 0.0 / 0.0 |
+| `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
@@ -158,11 +158,11 @@ KK and KKP training are tiny on GPU memory (any 4 GB+ card is plenty).
 
 KPPT historically uses:
 
-- elmo-style WDL teaching (`--start-wdl 0.5 --end-wdl 0.5`, mid-range)
+- elmo-style WDL teaching (`--lambda 0.5` or so, blending eval and game result 50:50)
 - stronger weight decay
 - smaller learning rate (`--lr 1e-4` to `1e-3`)
 
-`bulletou`'s defaults are deliberately conservative — pure eval (`--start-wdl 0.0 --end-wdl 0.0`, `--lr 1e-3`). For production-quality KPPT, adjust WDL and learning rate along the above lines.
+`bulletou`'s default is pure eval (`--lambda 1.0`, `--lr 1e-3`). For production-quality KPPT, adjust `--lambda` and the learning rate along the above lines.
 
 ## Related
 
