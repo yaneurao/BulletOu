@@ -2,13 +2,7 @@
 
 <a href="../../en/tutorial/3-kppt-roadmap.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-> **状況: Phase 1〜3 着地済み。KPPT (elmo(WCSC27) 互換) と KPP_KKPT の 3 ファイル (`KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin`) を実際に出せる**。
->
-> - **Phase 1 (完了)** — `ShogiKk` sparse 入力 + `bullet_ou_train --eval-type kppt-kk`。`KK_synthesized.bin` を出す。
-> - **Phase 2 (完了)** — `ShogiKkp` sparse 入力 + `bullet_ou_train --eval-type kppt-kkp`。`KKP_synthesized.bin` を出す。
-> - **Phase 3 (完了)** — `ShogiKpp` sparse 入力 + `bullet_ou_train --eval-type kppt-kpp`。`KPP_synthesized.bin` (KPPT 形式、`int16_t × 2`、740 MB) を出す。
-> - **Phase 4 (= KPP_KKPT writer、完了)** — `bullet_ou_train --eval-type kpp-kkpt-kpp` で `KPP_synthesized.bin` (KPP_KKPT 形式、`int16_t × 1`、388 MB、手番チャンネルなし) を出す。
-> - **Phase 5 (未実装)** — **同時学習** (KK + KKP + KPP を 1 回の学習で共有勾配で更新)。現状は 3 component を独立に学習して `.bin` を組み合わせる構成。elmo 流の同時学習には `ValueTrainerBuilder` の tuple input 拡張が必要。
+BulletOu はやねうら王の旧 KPPT 系評価関数 (`KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` の 3 ファイル組) を学習・出力できる。本ページではその使い方を説明する。
 
 ## なぜ KPPT / KPP_KKPT に対応するのか
 
@@ -57,7 +51,7 @@ YaneuraOu の `source/eval/kppt/evaluate_kppt.h` と `eval/kpp_kkpt/evaluate_kpp
 - **KPPT**: KPP も手番項あり (`[2]`)
 - **KPP_KKPT**: KPP は手番項なし。手番は KK と KKP 側にだけ存在
 
-BulletOu の現状: **`[0]` (手番無関係項) のみ学習**、`[1]` (手番依存項) は 0 で埋めて出す。手番項の本格学習は将来の Phase で対応。
+BulletOu は **`[0]` (手番無関係項) のみ** を学習し、`[1]` (手番依存項) は 0 で書く。
 
 ## 実際の使い方
 
@@ -65,14 +59,14 @@ BulletOu の現状: **`[0]` (手番無関係項) のみ学習**、`[1]` (手番�
 
 - BulletOu をビルド済み (`cargo build --release --features cuda --example bullet_ou_train`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` のいずれか)
-- 4 GB+ の空き GPU メモリ (Phase 3 KPP は ~2.3 GB を使う)
+- 4 GB+ の空き GPU メモリ (KPP 学習は ~2.3 GB を使う)
 
 ### KPPT (elmo 互換、`int16_t × 2` 形式の KPP)
 
-3 つの phase をそれぞれ走らせる必要がある。 1 回の学習で 3 ファイル全部生成する「同時学習モード」は未実装 (Phase 5 で対応予定):
+KK / KKP / KPP の 3 component をそれぞれ独立に学習する:
 
 ```bash
-# Phase 1: KK 学習 → KK_synthesized.bin
+# KK 学習 → KK_synthesized.bin
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kppt-kk \
     --data /path/to/train.hcpe \
@@ -80,7 +74,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
     --net-id kk \
     --superbatches 20
 
-# Phase 2: KKP 学習 → KKP_synthesized.bin
+# KKP 学習 → KKP_synthesized.bin
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kppt-kkp \
     --data /path/to/train.hcpe \
@@ -88,7 +82,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
     --net-id kkp \
     --superbatches 20
 
-# Phase 3: KPP 学習 → KPP_synthesized.bin (KPPT 形式)
+# KPP 学習 → KPP_synthesized.bin (KPPT 形式)
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kppt-kpp \
     --data /path/to/train.hcpe \
@@ -113,21 +107,21 @@ cp checkpoints/my-kppt/kpp-20/KPP_synthesized.bin checkpoints/my-kppt/final/
 KK と KKP は KPPT と同じファイル形式なので **同じコマンド** を使う。違うのは KPP の writer だけ:
 
 ```bash
-# Phase 1: KK 学習 (= KPPT と同じ)
+# KK 学習 (= KPPT と同じ)
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kppt-kk \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --net-id kk
 
-# Phase 2: KKP 学習 (= KPPT と同じ)
+# KKP 学習 (= KPPT と同じ)
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kppt-kkp \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --net-id kkp
 
-# Phase 3: KPP 学習 (KPP_KKPT 形式 = 手番チャンネルなし、半分のサイズ)
+# KPP 学習 (KPP_KKPT 形式 = 手番チャンネルなし、半分のサイズ)
 cargo run --release --features cuda --example bullet_ou_train -- \
     --eval-type kpp-kkpt-kpp \
     --data /path/to/train.hcpe \
@@ -137,9 +131,9 @@ cargo run --release --features cuda --example bullet_ou_train -- \
 
 3 ファイルを集める手順は KPPT と同じ。
 
-### 単体 phase だけ動作確認したいとき
+### 単体 component の学習
 
-`shogi_kk_train` / `shogi_kk_kkp_train` / `shogi_kpp_train` という単体 example も残してある (これらは bullet_ou_train の内部で呼んでいるのと同じロジック)。お好みで:
+`shogi_kk_train` / `shogi_kk_kkp_train` / `shogi_kpp_train` という単体 example も用意してある (これらは bullet_ou_train の内部で呼んでいるのと同じロジック)。動作確認用に:
 
 ```bash
 cargo run --release --features cuda --example shogi_kpp_train -- \
@@ -170,7 +164,7 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 
 ## メモリ要件
 
-| Phase | 重みパラメータ数 | f32 重み | + Adam (3× state) | 推奨 GPU メモリ |
+| Component | 重みパラメータ数 | f32 重み | + Adam (3× state) | 推奨 GPU メモリ |
 |---|---|---|---|---|
 | KK | 6,561 | 26 KB | 78 KB | ほぼ何でも |
 | KKP | 10,156,428 | 40 MB | 120 MB | 4 GB+ |
@@ -178,26 +172,15 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 
 `max_active = 703` (KPP の 1 局面あたりアクティブ特徴数 = C(38, 2)) なので、batch_size 16384 で GPU 側の sparse index buffer は約 92 MB。
 
-## 何が未実装か
+## ハイパーパラメータの指針
 
-### Phase 5: 同時学習 (joint training)
+KPPT は歴史的に以下の組み合わせが多い:
 
-現状は KK / KKP / KPP を **独立に学習** して `.bin` を組み合わせる構成。3 component それぞれが eval ターゲットを単独で学習するので、本来 KK が捉えるべき信号も KKP / KPP が学習してしまい (= **過学習的な重複**)、最終 eval は最適ではない可能性がある。
+- ELMO 式 WDL 教師 (`--start-wdl 0.5 --end-wdl 0.5` 等の中程度設定)
+- 強めの weight decay
+- 小さめの learning rate (`--lr 1e-4 〜 1e-3`)
 
-elmo オリジナルや YaneuraOu の `learn` コマンドは 3 component を同時に勾配更新する。これを実現するには bullet の `ValueTrainerBuilder` を tuple input 対応に拡張する必要がある (現状は単一の `SparseInputType` しか取れない)。これは bullet core への変更で、上流 PR か fork メンテかの判断が要る。
-
-### 手番項 ([1] チャンネル)
-
-現状 `KK[..][1]` / `KKP[..][1]` / `KPP[..][1]` は 0 埋め。本格学習には side-to-move を入力に取り、別重みとして学習する必要がある。Phase 6 想定。
-
-### 学習スケジュールの定石
-
-KPPT は歴史的に:
-- ELMO 式 WDL 教師 (start_wdl=0.5、end_wdl=0.5 等の「中程度」設定が多い)
-- 強めの weight decay (大きすぎる重みを抑える)
-- 小さめの learning rate (1e-3 〜 1e-4 程度)
-
-を使うが、`bullet_ou_train` のデフォルトは NNUE 寄り (start_wdl=0.0、end_wdl=1.0)。**実用品質を狙うならハイパーパラメータの調整が要る**。本ロードマップとは別に、ハイパーパラメータ実験ノートを蓄積していく予定。
+一方 `bullet_ou_train` のデフォルトは NNUE 寄り (`--start-wdl 0.0 --end-wdl 1.0`、`--lr 1e-3`)。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
 
 ## 関連
 

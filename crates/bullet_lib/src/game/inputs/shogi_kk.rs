@@ -1,7 +1,7 @@
 //! 将棋 KK (King-King) 入力特徴量
 //!
-//! 旧 YaneuraOu 系評価関数 (KPPT 系) の **KK** 部分に相当する最小の sparse 特徴量。
-//! Phase 1 として「学習が走ることの確認」用に提供する。KKP / KPP は後続フェーズ。
+//! 旧 YaneuraOu 系評価関数 (KPPT 系) の **KK** 部分に相当する sparse 特徴量。
+//! KKP / KPP と組み合わせて使う。
 //!
 //! ## 表現
 //!
@@ -16,9 +16,9 @@
 //! ## やねうら王の KPPT との関係
 //!
 //! やねうら王の `KK_synthesized.bin` は `weights[81][81][2]` (i32, 手番別 2 channel)
-//! の形状で、玉ペアごとに 2 つの評価値を持つ。BulletOu の `ShogiKk` はその「玉ペア
-//! インデックス化」部分に対応する。学習後の重みをやねうら王形式に書き出す処理は
-//! Phase 4 で対応する。
+//! の形状で、玉ペアごとに 2 つの評価値を持つ。`ShogiKk` はその「玉ペア
+//! インデックス化」部分に対応し、学習後の重みは `crate::value::yaneuraou_kppt`
+//! の writer がやねうら王形式に変換して書き出す。
 
 use crate::game::inputs::SparseInputType;
 use crate::shogi::types::Color;

@@ -113,7 +113,7 @@ cargo run --release --features cuda --example shogi_simple_hcpe -- \
 Caveats specific to HCPE:
 
 - HCPE has no `game_ply`, so the Layer Stack `ply9` bucket cannot be used (this minimal example uses no bucketing).
-- HCPE has no policy teacher (MoveVisits); value-only training. HCPE3 with policy is planned separately.
+- HCPE has no policy teacher (MoveVisits); value-only training (use HCPE3 if you need a policy teacher).
 
 For real training you would replace `--data` with your full dataset and remove the `small.pack` / `small.hcpe` step.
 
@@ -274,4 +274,4 @@ The pieces (Threat features, `progress.bin`, WDL scheduling) are explained in th
 - [Reference: Saved Networks](../4-saved-networks.md) — checkpoint layout, quantisation, transformation chains
 - [Reference: KP-Absolute Progress](../shogi/kp-absolute-progress.md) — what `--bucket-mode progress8kpabs` actually does
 - [Reference: shogi_progress_kpabs_train](../shogi/shogi_progress_kpabs_train.md) — how to train your own `progress.bin`
-- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — how to train legacy YaneuraOu evals (Phases 1–4 done)
+- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — training the legacy YaneuraOu evals

@@ -31,7 +31,7 @@
 //! `progress8kpabs` / `progress8` / `progress8gikou` / `kingrank9` は局面ベースなので使える。
 //!
 //! また HCPE には MoveVisits (policy teacher) が存在しないため、value 学習のみが対象。
-//! Policy 蒸留や policy 教師を使いたい場合は HCPE3 を使う (今後対応予定)。
+//! Policy 蒸留や policy 教師を使いたい場合は HCPE3 を使う。
 
 use std::fs::File;
 use std::io::{BufReader, Read};

@@ -97,7 +97,7 @@ cargo run --release --features cuda --example shogi_simple_hcpe -- \
 HCPE 固有の制約:
 
 - HCPE には `game_ply` 情報がないので、Layer Stack の `ply9` bucket は使えない (この最小例は bucket を使わない)
-- HCPE には policy teacher (MoveVisits) がない。value 学習のみが対象。policy 教師込みは HCPE3 で対応予定
+- HCPE には policy teacher (MoveVisits) がない。value 学習のみが対象 (policy 教師込みの学習は HCPE3 を使う)
 
 本格学習では `--data` をフルデータセットに差し替え、`small.pack` / `small.hcpe` 工程を省略する。
 
@@ -258,4 +258,4 @@ cargo run --release --features cuda --example shogi_layerstack -- \
 - [リファレンス: 学習済みネットワーク](../4-saved-networks.md) — checkpoint レイアウト、量子化、変換チェーン
 - [リファレンス: KP 絶対進行度](../shogi/kp-absolute-progress.md) — `--bucket-mode progress8kpabs` が実際に何をやっているか
 - [リファレンス: shogi_progress_kpabs_train](../shogi/shogi_progress_kpabs_train.md) — 自分で `progress.bin` を学習する方法
-- [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) — 旧評価関数の学習方法 (Phase 1〜4 実装済み)
+- [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) — 旧評価関数の学習

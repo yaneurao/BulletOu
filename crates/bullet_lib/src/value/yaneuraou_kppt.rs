@@ -61,12 +61,12 @@
 //!
 //! ## Quantisation
 //!
-//! BulletOu's `kkw` / `kkpw` are f32. YaneuraOu's KPPT32 expects i32 values on
-//! a centipawn-ish scale. The `eval_scale` argument is multiplied in before
-//! rounding to i32. A reasonable starting value for shogi NNUE-style trainers
-//! is the same as `TrainingSchedule::eval_scale` (often 400) times some small
-//! integer such as 10, but the optimal scale will be tuned empirically once
-//! Phase 4 makes round-trip tests possible.
+//! BulletOu's `kkw` / `kkpw` / `kppw` are f32. YaneuraOu's KPPT32 expects i32
+//! values on a centipawn-ish scale (KK / KKP) or i16 (KPP). The `eval_scale`
+//! argument is multiplied in before rounding. A reasonable starting value for
+//! shogi NNUE-style trainers is the same as `TrainingSchedule::eval_scale`
+//! (often 400) times some small integer such as 10 for the i32 components,
+//! and an order of magnitude smaller for the i16 KPP component.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -257,7 +257,7 @@ fn write_kk_bin(path: &Path, kkw: &[f32], scale: f32) -> io::Result<()> {
             let bullet_idx = bk * SQ_NB + wk_inv;
             let v0 = quantise_to_i32(kkw[bullet_idx], scale);
             buf.extend_from_slice(&v0.to_le_bytes()); // [stm_independent]
-            buf.extend_from_slice(&0i32.to_le_bytes()); // [stm_dependent], Phase 2 では 0
+            buf.extend_from_slice(&0i32.to_le_bytes()); // [stm_dependent] は学習対象外 (0)
         }
     }
     std::fs::write(path, &buf)

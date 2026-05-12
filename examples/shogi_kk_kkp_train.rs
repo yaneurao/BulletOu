@@ -1,21 +1,17 @@
 /*!
-shogi_kk_kkp_train — KPPT Phase 2: KK + KKP minimal trainer that also writes
-the YaneuraOu KPPT-format `.bin` files (`KK_synthesized.bin` /
-`KKP_synthesized.bin`) after each checkpoint.
+shogi_kk_kkp_train — KKP-only standalone trainer for the KPPT family.
 
-Network (no hidden layer; KK and KKP are summed linearly):
+Despite the historical filename, this trains only the **KKP** weight tensor
+and writes `KKP_synthesized.bin`. The KK component is trained separately by
+`shogi_kk_train`; combining the two `.bin` files gives the KK + KKP portion
+of a KPPT eval (the KPP portion comes from `shogi_kpp_train`).
 
-    kk weights (6,561 dims, perspective dual)
-        +
+Network (no hidden layer; KKP only):
+
     kkp weights (10,156,428 dims, perspective dual)
         |
         v
     sum (per perspective) -> concat (2) -> linear(out, 2 -> 1) -> sigmoid
-
-This is the smallest configuration that produces a non-trivial YaneuraOu KPPT
-output (KK_synthesized.bin + KKP_synthesized.bin). Strength is still expected
-to be limited until KPP is added (Phase 3) and the turn term is wired up
-(Phase 3/4).
 
 Input format is inferred from the file extension (`.hcpe` / `.hcpe3` / `.pack`).
 Mixed extensions across `--data` files are rejected.
@@ -24,7 +20,7 @@ Usage:
 
     cargo run --release --features cuda --example shogi_kk_kkp_train -- \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
-        --output checkpoints/kk-kkp-phase2 \
+        --output checkpoints/kkp \
         --superbatches 3 \
         --batches-per-superbatch 100 \
         --save-rate 1
@@ -82,7 +78,7 @@ fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kk_kkp_train")]
-#[command(about = "KPPT Phase 2: KK + KKP minimal trainer with YaneuraOu-format output")]
+#[command(about = "KPPT KKP-only standalone trainer (writes KKP_synthesized.bin)")]
 struct Args {
     /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
     /// is inferred from the extension.
@@ -90,11 +86,11 @@ struct Args {
     data: String,
 
     /// Checkpoint output directory.
-    #[arg(long, default_value = "checkpoints/shogi_kk_kkp_phase2")]
+    #[arg(long, default_value = "checkpoints/shogi_kkp")]
     output: PathBuf,
 
     /// Net identifier (prefix of the saved checkpoint subdirectory).
-    #[arg(long, default_value = "shogi_kk_kkp_phase2")]
+    #[arg(long, default_value = "shogi_kkp")]
     net_id: String,
 
     /// Mini-batch size (positions per gradient step).
@@ -176,18 +172,15 @@ fn main() {
     //   ShogiKkp     (10,156,428 dims, ~38 active per perspective)
     //
     // But bullet's ValueTrainerBuilder only takes a single SparseInputType. To
-    // combine KK and KKP we build one big sparse input by concatenating the
-    // dim-spaces — but that requires a new combined SparseInputType.
+    // combine KK and KKP we'd need to build one big sparse input by
+    // concatenating the dim-spaces. Instead we train KKP alone here (it
+    // dominates KK in expressivity anyway) and write only
+    // `KKP_synthesized.bin`. A separate `shogi_kk_train` produces
+    // `KK_synthesized.bin`.
     //
-    // For Phase 2 we take the simpler path: train KKP alone here (it dominates
-    // KK in expressivity anyway), and write only `KKP_synthesized.bin`. A
-    // separate `shogi_kk_train` produces `KK_synthesized.bin`. The combined
-    // training that emits both files in one run is part of Phase 4 / the
-    // ValueTrainerBuilder tuple-input extension noted in the roadmap.
-    //
-    // The save_yaneuraou_kppt helper still tolerates either or both of `kkw` /
-    // `kkpw` being present in raw.bin, so a future combined run drops in
-    // without changes.
+    // `save_yaneuraou_kppt` tolerates either or both of `kkw` / `kkpw` /
+    // `kppw` being present in raw.bin, so a future combined run drops in
+    // without changes to the writer.
 
     let _ = ShogiKk; // imported for symmetry; not used in this example
 

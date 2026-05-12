@@ -1,19 +1,17 @@
 /*!
-shogi_kpp_train — KPPT Phase 3: KPP-only minimal trainer that also writes the
-YaneuraOu KPPT-format `KPP_synthesized.bin` after each checkpoint.
+shogi_kpp_train — KPP-only standalone trainer for the KPPT family.
 
-Network (no hidden layer; KPP is summed linearly):
+Trains the KPP weight tensor and writes `KPP_synthesized.bin` (KPPT layout,
+`int16_t × 2`, ~740 MB). The KK and KKP components are trained separately by
+`shogi_kk_train` and `shogi_kk_kkp_train`; combining the three `.bin` files
+gives a complete KPPT eval.
+
+Network (no hidden layer; KPP only):
 
     kpp weights (194,100,624 dims, perspective dual, max_active = 703)
         |
         v
     sum (per perspective) -> concat (2) -> linear(out, 2 -> 1) -> sigmoid
-
-Like the `shogi_kk_train` / `shogi_kk_kkp_train` siblings, this trains a single
-KPPT component standalone and writes only the corresponding YaneuraOu binary
-(`KPP_synthesized.bin`). A separate `shogi_kk_train` produces
-`KK_synthesized.bin`, and `shogi_kk_kkp_train` produces `KKP_synthesized.bin`;
-combined training that emits all three files from one run is part of Phase 4.
 
 Input format is inferred from the file extension (`.hcpe` / `.hcpe3` / `.pack`).
 Mixed extensions across `--data` files are rejected.
@@ -26,7 +24,7 @@ Usage:
 
     cargo run --release --features cuda --example shogi_kpp_train -- \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
-        --output checkpoints/kpp-phase3 \
+        --output checkpoints/kpp \
         --superbatches 3 \
         --batches-per-superbatch 100 \
         --save-rate 1
@@ -84,7 +82,7 @@ fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kpp_train")]
-#[command(about = "KPPT Phase 3: KPP-only trainer with YaneuraOu-format output")]
+#[command(about = "KPPT KPP-only standalone trainer (writes KPP_synthesized.bin)")]
 struct Args {
     /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
     /// is inferred from the extension.
@@ -92,11 +90,11 @@ struct Args {
     data: String,
 
     /// Checkpoint output directory.
-    #[arg(long, default_value = "checkpoints/shogi_kpp_phase3")]
+    #[arg(long, default_value = "checkpoints/shogi_kpp")]
     output: PathBuf,
 
     /// Net identifier (prefix of the saved checkpoint subdirectory).
-    #[arg(long, default_value = "shogi_kpp_phase3")]
+    #[arg(long, default_value = "shogi_kpp")]
     net_id: String,
 
     /// Mini-batch size (positions per gradient step).

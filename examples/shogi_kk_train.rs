@@ -1,17 +1,15 @@
 /*!
-shogi_kk_train — KPPT Phase 1: KK-only minimal trainer.
+shogi_kk_train — KK-only standalone trainer for the KPPT-family KK component.
 
-This example is the **first step toward KPPT / KPP_KPPT support**. It exercises
-the new `ShogiKk` sparse input (81 × 81 = 6,561 dims, max_active = 1) by training
-the simplest possible network end-to-end:
+Exercises the `ShogiKk` sparse input (81 × 81 = 6,561 dims, max_active = 1)
+in the simplest possible network:
 
   ShogiKk (sparse) -> linear -> 1 scalar  (dual-perspective concatenated)
 
-There is no hidden layer, no SCReLU, no Layer Stack. The goal here is purely
-"does the training pipeline work for a KPPT-style sparse input?". Strength is
-expected to be poor; the value of this example is wire-up confirmation.
-
-Later phases will add KKP, then KPP, then YaneuraOu-format `.bin` output.
+There is no hidden layer, no SCReLU, no Layer Stack. KK by itself is too weak
+to play strongly; this example produces `KK_synthesized.bin` to be combined
+with separately-trained `KKP_synthesized.bin` and `KPP_synthesized.bin`
+(see `shogi_kk_kkp_train` / `shogi_kpp_train`, or `bullet_ou_train --eval-type ...`).
 
 Inputs come from `.hcpe` (dlshogi-style 38-byte fixed-length), `.hcpe3`
 (dlshogi-style per-game variable-length), or `.pack` (YaneuraOu `gensfen`,
@@ -25,7 +23,7 @@ Usage:
 
     cargo run --release --features cuda --example shogi_kk_train -- \
         --data /data/shogi/train.hcpe \
-        --output checkpoints/kk-phase1 \
+        --output checkpoints/kk \
         --superbatches 10
 */
 
@@ -80,7 +78,7 @@ fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kk_train")]
-#[command(about = "KPPT Phase 1: train a KK-only minimal value network")]
+#[command(about = "KPPT KK-only standalone trainer (writes KK_synthesized.bin)")]
 struct Args {
     /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
     /// is inferred from the extension.
@@ -88,11 +86,11 @@ struct Args {
     data: String,
 
     /// Checkpoint output directory.
-    #[arg(long, default_value = "checkpoints/shogi_kk_phase1")]
+    #[arg(long, default_value = "checkpoints/shogi_kk")]
     output: PathBuf,
 
     /// Net identifier (prefix of the saved checkpoint subdirectory).
-    #[arg(long, default_value = "shogi_kk_phase1")]
+    #[arg(long, default_value = "shogi_kk")]
     net_id: String,
 
     /// Batch size.

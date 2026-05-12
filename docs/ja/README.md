@@ -34,9 +34,9 @@ NNUE 学習の中身:
 - [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — KP 絶対値を用いた進行度推定
 - [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — `shogi_progress_kpabs_train` ツールの CLI 仕様
 
-KPPT / KPP_KPPT:
+KPPT / KPP_KKPT:
 
-- 現状は未実装。設計案は [tutorial/3-kppt-roadmap.md](tutorial/3-kppt-roadmap.md) を参照。
+- 使い方は [tutorial/3-kppt-roadmap.md](tutorial/3-kppt-roadmap.md) を参照。
 
 ## examples
 

@@ -2,24 +2,22 @@
 bullet_ou_train — unified trainer entry point for BulletOu.
 
 A single binary that dispatches to the appropriate training routine via
-`--eval-type`. The currently supported types are the three KPPT phases:
+`--eval-type`. KPPT-family eval-types currently supported:
 
-    bullet_ou_train --eval-type kppt-kk    ...   (Phase 1: KK only)
-    bullet_ou_train --eval-type kppt-kkp   ...   (Phase 2: KKP only)
-    bullet_ou_train --eval-type kppt-kpp   ...   (Phase 3: KPP only)
+    bullet_ou_train --eval-type kppt-kk        ...   KK component
+    bullet_ou_train --eval-type kppt-kkp       ...   KKP component
+    bullet_ou_train --eval-type kppt-kpp       ...   KPP component (KPPT layout)
+    bullet_ou_train --eval-type kpp-kkpt-kpp   ...   KPP component (KPP_KKPT layout)
 
-Each writes the corresponding YaneuraOu KPPT-format `.bin` file
-(`KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin`) into
-the checkpoint directory after every save. To assemble a complete YaneuraOu
-KPPT eval (e.g. elmo(WCSC27)-style), run all three with the same data and
-merge the three `.bin` files into one directory.
-
-Joint training (one run that emits all three .bin files with shared gradient)
-is a future addition (will appear as `--eval-type kppt`).
+Each writes the corresponding YaneuraOu binary file (`KK_synthesized.bin` /
+`KKP_synthesized.bin` / `KPP_synthesized.bin`) into the checkpoint directory
+after every save. To assemble a complete YaneuraOu KPPT or KPP_KKPT eval,
+run the three required commands with the same data and merge the resulting
+`.bin` files into one directory.
 
 The standalone examples `shogi_kk_train` / `shogi_kk_kkp_train` /
-`shogi_kpp_train` remain available as direct entry points; the unified
-binary just dispatches to the same logic for users who prefer one CLI.
+`shogi_kpp_train` are alternative entry points that wrap the same training
+logic per component.
 
 Input format is inferred from the file extension (`.hcpe` / `.hcpe3` /
 `.pack`); mixed extensions are rejected.
@@ -29,7 +27,7 @@ Usage:
     cargo run --release --features cuda --example bullet_ou_train -- \
         --eval-type kppt-kk \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
-        --output checkpoints/kk-phase1 \
+        --output checkpoints/kk \
         --superbatches 10
 */
 
@@ -55,36 +53,36 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EvalType {
-    /// KPPT Phase 1: train only the KK term, write KK_synthesized.bin.
+    /// KPPT KK component: train the KK term, write KK_synthesized.bin.
     KpptKk,
-    /// KPPT Phase 2: train only the KKP term, write KKP_synthesized.bin.
+    /// KPPT KKP component: train the KKP term, write KKP_synthesized.bin.
     KpptKkp,
-    /// KPPT Phase 3: train only the KPP term, write KPP_synthesized.bin
-    /// (with turn channel — int16 × 2).
+    /// KPPT KPP component: train the KPP term, write KPP_synthesized.bin
+    /// in the KPPT layout (int16 × 2, with turn channel).
     KpptKpp,
-    /// KPP_KKPT (factorised KPPT): train the KPP term and write
-    /// `KPP_synthesized.bin` *without* the turn channel (int16 × 1, ~388 MB).
-    /// KK and KKP for the KPP_KKPT family are identical to `kppt-kk` /
-    /// `kppt-kkp` — use those for the other two components.
+    /// KPP_KKPT (factorised KPPT) KPP component: write `KPP_synthesized.bin`
+    /// in the KPP_KKPT layout (int16 × 1, no turn channel, ~388 MB). KK and
+    /// KKP files for the KPP_KKPT family are byte-identical to KPPT, so use
+    /// `kppt-kk` / `kppt-kkp` for those.
     KppKkptKpp,
 }
 
 impl EvalType {
     fn default_net_id(self) -> &'static str {
         match self {
-            EvalType::KpptKk => "shogi_kk_phase1",
-            EvalType::KpptKkp => "shogi_kk_kkp_phase2",
-            EvalType::KpptKpp => "shogi_kpp_phase3",
-            EvalType::KppKkptKpp => "shogi_kpp_kpp_kkpt",
+            EvalType::KpptKk => "shogi_kk",
+            EvalType::KpptKkp => "shogi_kkp",
+            EvalType::KpptKpp => "shogi_kpp",
+            EvalType::KppKkptKpp => "shogi_kpp_factorised",
         }
     }
 
     fn default_output(self) -> &'static str {
         match self {
-            EvalType::KpptKk => "checkpoints/shogi_kk_phase1",
-            EvalType::KpptKkp => "checkpoints/shogi_kk_kkp_phase2",
-            EvalType::KpptKpp => "checkpoints/shogi_kpp_phase3",
-            EvalType::KppKkptKpp => "checkpoints/shogi_kpp_kpp_kkpt",
+            EvalType::KpptKk => "checkpoints/shogi_kk",
+            EvalType::KpptKkp => "checkpoints/shogi_kkp",
+            EvalType::KpptKpp => "checkpoints/shogi_kpp",
+            EvalType::KppKkptKpp => "checkpoints/shogi_kpp_factorised",
         }
     }
 
@@ -261,10 +259,9 @@ fn main() {
     match args.eval_type {
         EvalType::KpptKk => run_kppt_kk(&args),
         EvalType::KpptKkp => run_kppt_kkp(&args),
-        // Phase 3 trains the same network (KPP-only standalone) regardless of
-        // whether the on-disk file is the KPPT (with turn channel) or
-        // KPP_KKPT (factorised) variant. Only the writer differs, and that's
-        // decided inside `run_training_inline!` via `args.kpp_format()`.
+        // KPP trains the same network for both the KPPT and KPP_KKPT layouts;
+        // only the writer differs, selected inside `run_training_inline!` via
+        // `args.kpp_format()`.
         EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args),
     }
 }
@@ -346,7 +343,7 @@ macro_rules! run_training_inline {
     }};
 }
 
-// ----- KPPT Phase 1: KK --------------------------------------------------
+// ----- KPPT: KK ---------------------------------------------------------
 
 fn run_kppt_kk(args: &Args) {
     let qa: i16 = 256;
@@ -383,7 +380,7 @@ fn run_kppt_kk(args: &Args) {
     run_training_inline!(args, &mut trainer);
 }
 
-// ----- KPPT Phase 2: KKP -------------------------------------------------
+// ----- KPPT: KKP --------------------------------------------------------
 
 fn run_kppt_kkp(args: &Args) {
     let qa: i16 = 256;
@@ -420,7 +417,7 @@ fn run_kppt_kkp(args: &Args) {
     run_training_inline!(args, &mut trainer);
 }
 
-// ----- KPPT Phase 3: KPP -------------------------------------------------
+// ----- KPPT: KPP --------------------------------------------------------
 
 fn run_kppt_kpp(args: &Args) {
     let qa: i16 = 256;

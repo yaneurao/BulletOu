@@ -16,18 +16,15 @@ BulletOu does **not** play shogi itself. It is the part of the pipeline that **l
 
 ## Supported evaluation function families
 
-BulletOu inherits its core from `bullet` (jw1912) and `bullet-shogi` (SH11235), so it natively supports **NNUE-style value networks** for shogi. Support for the older YaneuraOu evaluation function families is planned.
+BulletOu inherits its core from `bullet` (jw1912) and `bullet-shogi` (SH11235). It targets both **shogi NNUE-style value networks** and **YaneuraOu's legacy KPPT-family evaluation functions**.
 
-| Family | Status in BulletOu | Notes |
-|---|---|---|
-| **NNUE (HalfKP / HalfKA / Layer Stack)** | **Supported now** | Inherited from bullet-shogi. Layer Stack with KP-Absolute progress buckets is the typical configuration for the strongest results. |
-| **NNUE with Threat / HandThreat / HandCount features** | Supported now | 7 input feature variants are available. |
-| **KPPT (KK + KKP + KPP trained independently as three components)** | **Supported now** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` produces the three `.bin` files. See [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md). |
-| **KPP_KKPT (factorised variant)** | **Supported now** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
-| **Joint training (KK + KKP + KPP in one run)** | Planned (Phase 5) | Requires a tuple-input extension to `ValueTrainerBuilder`. |
-| Other legacy YaneuraOu evals | Best effort | KK-only / KKP-only minimal variants are already available via the corresponding `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` subcommand. |
-
-The default target for now is **shogi NNUE**, which is what the rest of this tutorial walks through.
+| Family | Notes |
+|---|---|
+| **NNUE (HalfKP / HalfKA / Layer Stack)** | Inherited from bullet-shogi. Layer Stack with KP-Absolute progress buckets is the typical configuration for the strongest results. |
+| **NNUE with Threat / HandThreat / HandCount features** | 7 input feature variants are available. |
+| **KPPT** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` trains KK / KKP / KPP and produces the three corresponding `.bin` files (elmo(WCSC27)-compatible). See [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md). |
+| **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
+| KK-only / KKP-only minimal variants | Run the corresponding `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` standalone. |
 
 ## Where the data comes from
 
@@ -87,4 +84,4 @@ The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
 - [2. NNUE Tutorial](2-nnue-tutorial.md) — a deeper walkthrough that trains a real NNUE
-- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — how to train legacy YaneuraOu evals (Phases 1–4 done) and what's still missing
+- [3. KPPT / KPP_KKPT Training](3-kppt-roadmap.md) — how to train legacy YaneuraOu evals

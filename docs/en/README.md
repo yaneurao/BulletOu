@@ -34,9 +34,9 @@ Shogi-specific:
 - [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — game-progress estimation using KP-Absolute features
 - [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — CLI spec of the `shogi_progress_kpabs_train` tool
 
-KPPT / KPP_KPPT:
+KPPT / KPP_KKPT:
 
-- Currently not implemented. See [tutorial/3-kppt-roadmap.md](tutorial/3-kppt-roadmap.md) for the design plan.
+- See [tutorial/3-kppt-roadmap.md](tutorial/3-kppt-roadmap.md) for usage.
 
 ## Examples
 

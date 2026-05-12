@@ -16,18 +16,15 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 
 ## 対応する評価関数
 
-BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継承しており、**将棋向け NNUE 評価値ネットワーク** にはネイティブで対応。やねうら王の旧来の評価関数群への対応は予定中。
+BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継承しており、**将棋向けの NNUE 評価値ネットワーク**と、**やねうら王の旧 KPPT 系評価関数**の両方を対象とする。
 
-| 評価関数 | BulletOu での状態 | 備考 |
-|---|---|---|
-| **NNUE (HalfKP / HalfKA / Layer Stack)** | **現在対応** | bullet-shogi から継承。KP 絶対進行度 bucket 付き Layer Stack が最強構成として典型 |
-| **NNUE + Threat / HandThreat / HandCount 特徴量** | 現在対応 | 7 種類の入力特徴量バリエーションあり |
-| **KPPT (KK + KKP + KPP の 3 component 独立学習)** | **現在対応** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` で 3 ファイル `.bin` を生成。詳細は [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) |
-| **KPP_KKPT (factorise 版)** | **現在対応** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type kpp-kkpt-kpp`) |
-| **同時学習 (KK + KKP + KPP 一括)** | 対応予定 (Phase 5) | tuple input ValueTrainerBuilder 拡張が必要 |
-| その他やねうら王旧評価関数 | 状況次第 | KK のみ / KKP のみ等のミニ版は単体 `bullet_ou_train --eval-type kppt-kk` 等で既に可能 |
-
-現状の主たる対象は **将棋 NNUE**。このチュートリアルもそれを中心に進める。
+| 評価関数 | 概要 |
+|---|---|
+| **NNUE (HalfKP / HalfKA / Layer Stack)** | bullet-shogi から継承。KP 絶対進行度 bucket 付き Layer Stack が最強構成として典型 |
+| **NNUE + Threat / HandThreat / HandCount 特徴量** | 7 種類の入力特徴量バリエーションあり |
+| **KPPT** | `bullet_ou_train --eval-type {kppt-kk,kppt-kkp,kppt-kpp}` で KK / KKP / KPP の各 component を学習し、3 ファイル `.bin` を生成 (elmo(WCSC27) 互換)。詳細は [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) |
+| **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type kpp-kkpt-kpp`) |
+| KK のみ / KKP のみ | 単体 `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` で生成可能 |
 
 ## 学習データはどこから来るか
 
@@ -81,4 +78,4 @@ BulletOu は複数の将棋学習データフォーマットを読み込める�
 
 - [1. クイックスタート](1-quickstart.md) — ツールチェーンを整えて、smoke test 用の最小学習を動かす
 - [2. NNUE チュートリアル](2-nnue-tutorial.md) — 実際の NNUE を学習する流れを詳しく
-- [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) — 旧評価関数の学習方法 (Phase 1〜4 実装済み) と未実装機能
+- [3. KPPT / KPP_KKPT 学習](3-kppt-roadmap.md) — 旧評価関数の学習方法

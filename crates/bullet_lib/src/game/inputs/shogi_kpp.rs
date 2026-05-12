@@ -1,6 +1,6 @@
 //! 将棋 KPP (King-Piece-Piece) 入力特徴量
 //!
-//! 旧 YaneuraOu 系評価関数 (KPPT 系) の **KPP** 部分。Phase 3 の中核。
+//! 旧 YaneuraOu 系評価関数 (KPPT 系) の **KPP** 部分。
 //!
 //! ## 表現
 //!
@@ -21,9 +21,8 @@
 //! 対称性があり、本トレーナでは `p1 < p2` の方のみを学習し、出力 writer 側で
 //! 対称コピー (`[p1][p2]` と `[p2][p1]` の両方に書き込む) を行う。
 //!
-//! `[2]` (= `[turn_independent, turn_dependent]`) のうち、Phase 3 では
-//! `[0]` = turn-independent のみ学習し、`[1]` = turn-dependent は 0 で書く。
-//! turn 項の学習は将来の Phase で別途扱う。
+//! `[2]` (= `[turn_independent, turn_dependent]`) のうち、`[0]` =
+//! turn-independent のみ学習し、`[1]` = turn-dependent は 0 で書く。
 //!
 //! ## 性質
 //!
