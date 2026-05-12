@@ -18,10 +18,11 @@ natively reads `.pack` and `.bin` (no conversion step needed).
 Usage:
 
     # Required:
-    #   --data <PATH>   one or more .hcpe files (comma-separated)
+    #   --teacher <PATH>   .hcpe file, directory of .hcpe files, or
+    #                      comma-separated combination
     #
     cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
-        --data /data/shogi/train.hcpe \
+        --teacher /data/shogi/train.hcpe \
         --output checkpoints/my-hcpe-net \
         --superbatches 40
 
@@ -37,6 +38,7 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::ShogiHalfKA_hm,
     nn::optimiser,
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -54,9 +56,10 @@ use clap::Parser;
 #[command(name = "shogi_simple_hcpe")]
 #[command(about = "Minimal shogi NNUE training from HCPE files")]
 struct Args {
-    /// Training data path(s). One or more `.hcpe` files separated by comma.
+    /// Teacher data: `.hcpe` file, directory of `.hcpe` files, or a
+    /// comma-separated combination of either.
     #[arg(long)]
-    data: String,
+    teacher: String,
 
     /// Checkpoint output directory.
     #[arg(long, default_value = "checkpoints/shogi_simple_hcpe")]
@@ -214,8 +217,19 @@ fn main() {
     };
 
     // ----- Data loader -----
-    let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
+    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    if format != DataFormat::Hcpe {
+        eprintln!("error: shogi_simple_hcpe accepts only .hcpe files (got {format:?})");
+        std::process::exit(2);
+    }
 
     let loader = HcpeDataLoader::new_concat_multiple(
         &data_files_ref,

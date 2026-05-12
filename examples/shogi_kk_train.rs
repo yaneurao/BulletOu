@@ -9,29 +9,27 @@ in the simplest possible network:
 There is no hidden layer, no SCReLU, no Layer Stack. KK by itself is too weak
 to play strongly; this example produces `KK_synthesized.bin` to be combined
 with separately-trained `KKP_synthesized.bin` and `KPP_synthesized.bin`
-(see `shogi_kk_kkp_train` / `shogi_kpp_train`, or `bullet_ou_train --eval-type ...`).
+(see `shogi_kk_kkp_train` / `shogi_kpp_train`, or `bulletou --eval-type ...`).
 
-Inputs come from `.hcpe` / `.hcpe3` (dlshogi-style) or `.pack` (produced by
-the `gensfen` script in YaneuraOu-ScriptCollection). The format is inferred
-from the file extension;
-mixed extensions across `--data` files are rejected. All three are decoded
-internally into a stream of `PackedSfenValue` (40-byte fixed-length) records,
-which is the trainer's internal unit — note that `.pack` itself is **not**
-a flat array of `PackedSfenValue`.
+Teacher data is given via `--teacher`: a file (`.hcpe` / `.hcpe3` / `.pack`
+/ `.psv`), a directory of such files (all concatenated), or a
+comma-separated combination. Format is inferred from the extension; all
+files must share the same extension.
 
 Usage:
 
     cargo run --release --features device-cuda --example shogi_kk_train -- \
-        --data /data/shogi/train.hcpe \
+        --teacher /data/shogi/train.hcpe \
         --output checkpoints/kk \
         --superbatches 10
 */
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bullet_lib::{
     game::inputs::ShogiKk,
     nn::optimiser,
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -39,51 +37,19 @@ use bullet_lib::{
     },
     value::{
         ValueTrainerBuilder,
-        loader::{Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
+        loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
     },
 };
 use clap::Parser;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataFormat {
-    Hcpe,
-    Hcpe3,
-    Pack,
-}
-
-fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
-    let mut found: Option<DataFormat> = None;
-    for p in paths {
-        let ext = Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-        let fmt = match ext.as_deref() {
-            Some("hcpe") => DataFormat::Hcpe,
-            Some("hcpe3") => DataFormat::Hcpe3,
-            Some("pack") => DataFormat::Pack,
-            _ => {
-                return Err(format!(
-                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack"
-                ));
-            }
-        };
-        match found {
-            None => found = Some(fmt),
-            Some(prev) if prev == fmt => {}
-            Some(prev) => {
-                return Err(format!("mixed data formats: {p} is {fmt:?} but previous file(s) were {prev:?}"));
-            }
-        }
-    }
-    found.ok_or_else(|| "no data files provided".to_string())
-}
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kk_train")]
 #[command(about = "KPPT KK-only standalone trainer (writes KK_synthesized.bin)")]
 struct Args {
-    /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
-    /// is inferred from the extension.
+    /// Teacher data: file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), directory
+    /// of such files (all concatenated), or comma-separated combination.
     #[arg(long)]
-    data: String,
+    teacher: String,
 
     /// Checkpoint output directory.
     #[arg(long, default_value = "checkpoints/shogi_kk")]
@@ -234,7 +200,10 @@ fn main() {
         on_checkpoint_saved: None,
     };
 
-    let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
+    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
 
     let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
@@ -261,6 +230,9 @@ fn main() {
         }
         DataFormat::Pack => {
             run_with_loader!(ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
+        }
+        DataFormat::Psv => {
+            run_with_loader!(DirectSequentialDataLoader::new(&data_files_ref))
         }
     }
 }

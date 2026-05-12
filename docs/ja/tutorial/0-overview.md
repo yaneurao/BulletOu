@@ -22,9 +22,9 @@ BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継�
 |---|---|
 | **NNUE (HalfKP / HalfKA / Layer Stack)** | bullet-shogi から継承。KP 絶対進行度 bucket 付き Layer Stack が最強構成として典型 |
 | **NNUE + Threat / HandThreat / HandCount 特徴量** | 7 種類の入力特徴量バリエーションあり |
-| **KPPT** | `bullet_ou_train --eval-type kppt` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
+| **KPPT** | `bulletou --eval-type kppt` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
 | **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type kpp-kkpt-kpp`) |
-| KK のみ / KKP のみ | 単体 `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` で生成可能 |
+| KK のみ / KKP のみ | 単体 `bulletou --eval-type kppt-kk` / `kppt-kkp` で生成可能 |
 
 ## 学習データはどこから来るか
 

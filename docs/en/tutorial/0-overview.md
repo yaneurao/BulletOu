@@ -22,9 +22,9 @@ BulletOu inherits its core from `bullet` (jw1912) and `bullet-shogi` (SH11235). 
 |---|---|
 | **NNUE (HalfKP / HalfKA / Layer Stack)** | Inherited from bullet-shogi. Layer Stack with KP-Absolute progress buckets is the typical configuration for the strongest results. |
 | **NNUE with Threat / HandThreat / HandCount features** | 7 input feature variants are available. |
-| **KPPT** | `bullet_ou_train --eval-type kppt` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
+| **KPPT** | `bulletou --eval-type kppt` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
 | **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
-| KK-only / KKP-only minimal variants | Run the corresponding `bullet_ou_train --eval-type kppt-kk` / `kppt-kkp` standalone. |
+| KK-only / KKP-only minimal variants | Run the corresponding `bulletou --eval-type kppt-kk` / `kppt-kkp` standalone. |
 
 ## Where the data comes from
 

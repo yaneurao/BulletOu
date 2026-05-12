@@ -1,38 +1,42 @@
 /*!
-bullet_ou_train — unified trainer entry point for BulletOu.
+bulletou — BulletOu trainer entry point.
 
 Dispatches to the appropriate training routine via `--eval-type`. The
 "family" eval-types train all three KPPT components (KK + KKP + KPP)
 sequentially in a single invocation and assemble the result into
 `<output>/final/`:
 
-    bullet_ou_train --eval-type kppt            (KPPT family, KPP int16 × 2)
-    bullet_ou_train --eval-type kpp-kkpt        (KPP_KKPT factorised, KPP int16)
+    bulletou --eval-type kppt            (KPPT family, KPP int16 × 2)
+    bulletou --eval-type kpp-kkpt        (KPP_KKPT factorised, KPP int16)
 
 To train a single component standalone (= for development / smoke testing):
 
-    bullet_ou_train --eval-type kppt-kk         KK only
-    bullet_ou_train --eval-type kppt-kkp        KKP only
-    bullet_ou_train --eval-type kppt-kpp        KPP only, KPPT layout
-    bullet_ou_train --eval-type kpp-kkpt-kpp    KPP only, KPP_KKPT layout
+    bulletou --eval-type kppt-kk         KK only
+    bulletou --eval-type kppt-kkp        KKP only
+    bulletou --eval-type kppt-kpp        KPP only, KPPT layout
+    bulletou --eval-type kpp-kkpt-kpp    KPP only, KPP_KKPT layout
 
-Input format is inferred from the file extension (`.hcpe` / `.hcpe3` /
-`.pack`); mixed extensions are rejected.
+Teacher data is given via `--teacher`. The argument is either a single
+file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
+files (all matching files are concatenated), or a comma-separated list
+of either. Format is inferred from the file extension; all files must
+share the same extension.
 
 Usage:
 
-    cargo run --release --features device-cuda --example bullet_ou_train -- \
+    cargo run --release --features device-cuda --example bulletou -- \
         --eval-type kppt \
-        --data /data/shogi/train.hcpe \
+        --teacher /data/shogi/train_set/ \
         --output checkpoints/my-kppt \
         --superbatches 20
 */
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bullet_lib::{
     game::inputs::{ShogiKk, ShogiKkp, ShogiKpp},
     nn::optimiser,
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -40,7 +44,7 @@ use bullet_lib::{
     },
     value::{
         ValueTrainerBuilder,
-        loader::{Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
+        loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         yaneuraou_kppt::{KppFormat, save_yaneuraou_eval},
     },
 };
@@ -111,54 +115,26 @@ impl EvalType {
     }
 }
 
-// ----- data format inference --------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataFormat {
-    Hcpe,
-    Hcpe3,
-    Pack,
-}
-
-fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
-    let mut found: Option<DataFormat> = None;
-    for p in paths {
-        let ext = Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-        let fmt = match ext.as_deref() {
-            Some("hcpe") => DataFormat::Hcpe,
-            Some("hcpe3") => DataFormat::Hcpe3,
-            Some("pack") => DataFormat::Pack,
-            _ => {
-                return Err(format!(
-                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack"
-                ));
-            }
-        };
-        match found {
-            None => found = Some(fmt),
-            Some(prev) if prev == fmt => {}
-            Some(prev) => {
-                return Err(format!("mixed data formats: {p} is {fmt:?} but previous file(s) were {prev:?}"));
-            }
-        }
-    }
-    found.ok_or_else(|| "no data files provided".to_string())
-}
+// (teacher-path expansion and format inference live in
+//  `bullet_lib::teacher_path` so the single-component examples can share them.)
 
 // ----- CLI ---------------------------------------------------------------
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "bullet_ou_train")]
+#[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 struct Args {
     /// Evaluation function type to train.
     #[arg(long, value_enum)]
     eval_type: EvalType,
 
-    /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
-    /// is inferred from the extension.
+    /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
+    /// `.psv`), a directory containing such files (all matching files are
+    /// concatenated), or a comma-separated list of either. Format is
+    /// inferred from the extension; all included files must share the same
+    /// extension.
     #[arg(long)]
-    data: String,
+    teacher: String,
 
     /// Checkpoint output directory. Defaults to a per-eval-type path.
     #[arg(long)]
@@ -290,7 +266,7 @@ fn run_kppt_all(args: &Args) {
         _ => unreachable!("run_kppt_all called with non-family eval_type"),
     };
 
-    eprintln!("=== bullet_ou_train: running {} family (3 components) ===", match args.eval_type {
+    eprintln!("=== bulletou: running {} family (3 components) ===", match args.eval_type {
         EvalType::Kppt => "KPPT",
         EvalType::KppKkpt => "KPP_KKPT",
         _ => unreachable!(),
@@ -394,7 +370,10 @@ macro_rules! run_training_inline {
             on_checkpoint_saved: Some(&on_checkpoint_saved),
         };
 
-        let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
+        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
         let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
 
         let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
@@ -413,6 +392,10 @@ macro_rules! run_training_inline {
             }
             DataFormat::Pack => {
                 let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                trainer.run(&schedule, &settings, &loader);
+            }
+            DataFormat::Psv => {
+                let loader = DirectSequentialDataLoader::new(&data_files_ref);
                 trainer.run(&schedule, &settings, &loader);
             }
         }

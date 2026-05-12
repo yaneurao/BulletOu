@@ -17,6 +17,9 @@ pub mod trainer;
 /// way to train value networks.
 pub mod value;
 
+/// Teacher-path resolution helpers shared by the trainer example binaries.
+pub mod teacher_path;
+
 // TODO: Remove these re-exports as they are exported in the `trainer` module
 pub use trainer::{
     schedule::{TrainingSchedule, TrainingSteps, lr, wdl},

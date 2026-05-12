@@ -67,7 +67,7 @@ cargo run --release --features device-cuda --example shogi_simple -- \
 
 ```bash
 cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
-    --data /data/shogi/raw.hcpe \
+    --teacher /data/shogi/raw.hcpe \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```

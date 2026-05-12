@@ -137,7 +137,7 @@ rm -rf checkpoints target
 
 ### 既存 example を自分用に編集する
 
-最も普通の使い方: リポジトリを clone して、[examples/](/examples) のいずれかを自分の目的に合わせて編集する。`shogi_simple.rs` や `bullet_ou_train.rs` を雛形に持つのが一般的。
+最も普通の使い方: リポジトリを clone して、[examples/](/examples) のいずれかを自分の目的に合わせて編集する。`shogi_simple.rs` や `bulletou.rs` を雛形に持つのが一般的。
 
 ### 独自 example を登録する
 

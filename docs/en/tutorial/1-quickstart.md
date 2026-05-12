@@ -137,7 +137,7 @@ Beyond the smoke test, here are the bits you'll likely want when adapting Bullet
 
 ### Editing an existing example
 
-The usual workflow: clone the repo and edit one of the files under [examples/](/examples) to your taste. `shogi_simple.rs` or `bullet_ou_train.rs` are common starting points.
+The usual workflow: clone the repo and edit one of the files under [examples/](/examples) to your taste. `shogi_simple.rs` or `bulletou.rs` are common starting points.
 
 ### Registering a custom example
 

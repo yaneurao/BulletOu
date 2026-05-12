@@ -13,8 +13,10 @@ Network (no hidden layer; KPP only):
         v
     sum (per perspective) -> concat (2) -> linear(out, 2 -> 1) -> sigmoid
 
-Input format is inferred from the file extension (`.hcpe` / `.hcpe3` / `.pack`).
-Mixed extensions across `--data` files are rejected.
+Teacher data is given via `--teacher`: a file (`.hcpe` / `.hcpe3` / `.pack`
+/ `.psv`), a directory of such files (all concatenated), or a
+comma-separated combination. Format is inferred from the extension; all
+files must share the same extension.
 
 Memory considerations: the KPP weight tensor is ~776 MB at f32, plus optimiser
 state (~2.3 GB total on GPU with AdamW). Sparse input batch buffers are also
@@ -23,18 +25,19 @@ state (~2.3 GB total on GPU with AdamW). Sparse input batch buffers are also
 Usage:
 
     cargo run --release --features device-cuda --example shogi_kpp_train -- \
-        --data inbox/ref/sp_dr2-15K_20240210.hcpe \
+        --teacher inbox/ref/sp_dr2-15K_20240210.hcpe \
         --output checkpoints/kpp \
         --superbatches 3 \
         --batches-per-superbatch 100 \
         --save-rate 1
 */
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bullet_lib::{
     game::inputs::ShogiKpp,
     nn::optimiser,
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -42,52 +45,20 @@ use bullet_lib::{
     },
     value::{
         ValueTrainerBuilder,
-        loader::{Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
+        loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         yaneuraou_kppt::save_yaneuraou_kppt,
     },
 };
 use clap::Parser;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataFormat {
-    Hcpe,
-    Hcpe3,
-    Pack,
-}
-
-fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
-    let mut found: Option<DataFormat> = None;
-    for p in paths {
-        let ext = Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-        let fmt = match ext.as_deref() {
-            Some("hcpe") => DataFormat::Hcpe,
-            Some("hcpe3") => DataFormat::Hcpe3,
-            Some("pack") => DataFormat::Pack,
-            _ => {
-                return Err(format!(
-                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack"
-                ));
-            }
-        };
-        match found {
-            None => found = Some(fmt),
-            Some(prev) if prev == fmt => {}
-            Some(prev) => {
-                return Err(format!("mixed data formats: {p} is {fmt:?} but previous file(s) were {prev:?}"));
-            }
-        }
-    }
-    found.ok_or_else(|| "no data files provided".to_string())
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kpp_train")]
 #[command(about = "KPPT KPP-only standalone trainer (writes KPP_synthesized.bin)")]
 struct Args {
-    /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
-    /// is inferred from the extension.
+    /// Teacher data: file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), directory
+    /// of such files (all concatenated), or comma-separated combination.
     #[arg(long)]
-    data: String,
+    teacher: String,
 
     /// Checkpoint output directory.
     #[arg(long, default_value = "checkpoints/shogi_kpp")]
@@ -241,7 +212,10 @@ fn main() {
         on_checkpoint_saved: Some(&on_checkpoint_saved),
     };
 
-    let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
+    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
 
     let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
@@ -265,6 +239,9 @@ fn main() {
         }
         DataFormat::Pack => {
             run_with_loader!(ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
+        }
+        DataFormat::Psv => {
+            run_with_loader!(DirectSequentialDataLoader::new(&data_files_ref))
         }
     }
 }

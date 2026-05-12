@@ -41,7 +41,7 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 ### Prerequisites
 
-- BulletOu built (`cargo build --release --features device-cuda --example bullet_ou_train`)
+- BulletOu built (`cargo build --release --features device-cuda --example bulletou`)
 - Training data (`.hcpe` / `.hcpe3` / `.pack`)
 - 4 GB+ of free GPU memory (KPP training uses ~2.3 GB)
 
@@ -50,9 +50,9 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 `--eval-type kppt` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt \
-    --data /path/to/train.hcpe \
+    --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt \
     --superbatches 20
 ```
@@ -75,9 +75,9 @@ Point a YaneuraOu KPPT engine at `checkpoints/my-kppt/final/`.
 `--eval-type kpp-kkpt` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kpp-kkpt \
-    --data /path/to/train.hcpe \
+    --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
 ```
@@ -87,9 +87,9 @@ cargo run --release --features device-cuda --example bullet_ou_train -- \
 For development / smoke testing you can train just one component with `--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp`:
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt-kpp \
-    --data inbox/ref/small.hcpe \
+    --teacher inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
     --batches-per-superbatch 100
@@ -100,7 +100,7 @@ cargo run --release --features device-cuda --example bullet_ou_train -- \
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `kppt` (3-component sequential) / `kpp-kkpt` (factorised) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (required) |
-| `--data` | Training file (`.hcpe` / `.hcpe3` / `.pack`; comma-separated for multiple) | (required) |
+| `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | per-eval-type default |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
 | `--batch-size` | Positions per gradient step | 16384 |
@@ -128,7 +128,7 @@ KPPT historically uses:
 - stronger weight decay
 - smaller learning rate (`--lr 1e-4` to `1e-3`)
 
-`bullet_ou_train`'s defaults are NNUE-oriented (`--start-wdl 0.0 --end-wdl 1.0`, `--lr 1e-3`). For production-quality KPPT, adjust WDL and learning rate along the above lines.
+`bulletou`'s defaults are NNUE-oriented (`--start-wdl 0.0 --end-wdl 1.0`, `--lr 1e-3`). For production-quality KPPT, adjust WDL and learning rate along the above lines.
 
 ## Related
 

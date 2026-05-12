@@ -41,7 +41,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ### 必要なもの
 
-- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bullet_ou_train`)
+- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bulletou`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` のいずれか)
 - 4 GB+ の空き GPU メモリ (KPP 学習は ~2.3 GB を使う)
 
@@ -50,9 +50,9 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 `--eval-type kppt` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt \
-    --data /path/to/train.hcpe \
+    --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt \
     --superbatches 20
 ```
@@ -75,9 +75,9 @@ checkpoints/my-kppt/
 `--eval-type kpp-kkpt` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kpp-kkpt \
-    --data /path/to/train.hcpe \
+    --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
 ```
@@ -87,9 +87,9 @@ cargo run --release --features device-cuda --example bullet_ou_train -- \
 開発・動作確認用に、`--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` で 1 component だけ学習することもできる:
 
 ```bash
-cargo run --release --features device-cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bulletou -- \
     --eval-type kppt-kpp \
-    --data inbox/ref/small.hcpe \
+    --teacher inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
     --batches-per-superbatch 100
@@ -100,7 +100,7 @@ cargo run --release --features device-cuda --example bullet_ou_train -- \
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--eval-type` | `kppt` (3 component 連続学習) / `kpp-kkpt` (factorised 版) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (必須) |
-| `--data` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack`、複数指定はカンマ区切り) | (必須) |
+| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | eval-type 別自動 |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
@@ -128,7 +128,7 @@ KPPT は歴史的に以下の組み合わせが多い:
 - 強めの weight decay
 - 小さめの learning rate (`--lr 1e-4 〜 1e-3`)
 
-一方 `bullet_ou_train` のデフォルトは NNUE 寄り (`--start-wdl 0.0 --end-wdl 1.0`、`--lr 1e-3`)。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
+一方 `bulletou` のデフォルトは NNUE 寄り (`--start-wdl 0.0 --end-wdl 1.0`、`--lr 1e-3`)。KPPT で実用品質を狙う場合は WDL と学習率を上記の方針で調整する。
 
 ## 関連
 

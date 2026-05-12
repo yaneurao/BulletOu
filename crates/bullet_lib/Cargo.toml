@@ -84,8 +84,8 @@ name = "shogi_kpp_train"
 path = "../../examples/shogi_kpp_train.rs"
 
 [[example]]
-name = "bullet_ou_train"
-path = "../../examples/bullet_ou_train.rs"
+name = "bulletou"
+path = "../../examples/bulletou.rs"
 
 [[example]]
 name = "shogi_layerstack"
