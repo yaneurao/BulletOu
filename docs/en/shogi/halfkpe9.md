@@ -104,7 +104,7 @@ Identical to HalfKP:
 
 ```
 checkpoints/NNUE_HALFKPE9-256x2-32-32/
-├── learn.log                          ← 7-column CSV, cumulative across runs/resumes
+├── learn.log                          ← 10-column CSV, cumulative across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
 │   ├── state.bin                      ← resume data

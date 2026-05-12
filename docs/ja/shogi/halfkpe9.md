@@ -104,7 +104,7 @@ HalfKP と完全に同じ:
 
 ```
 checkpoints/NNUE_HALFKPE9-256x2-32-32/
-├── learn.log                          ← 7 列 CSV (全 run / resume 累積)
+├── learn.log                          ← 10 列 CSV (全 run / resume 累積)
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用

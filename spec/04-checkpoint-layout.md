@@ -117,12 +117,12 @@ record を必要なだけ連結したものが `state.bin`。
 
 ## `learn.log` フォーマット
 
-各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 7 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
+各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 10 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
 
 ```
-epoch,component,superbatch,value_loss,lr,lambda,positions
-1,nnue,1,0.234,0.001,1.0,524288
-1,nnue,1,0.231,0.001,1.0,1048576
+eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,256x2-32-32,nnue,1,1,0.234,0.001,1.0,524288,teachers/
+NNUE_HALFKP,256x2-32-32,nnue,1,1,0.231,0.001,1.0,1048576,teachers/
 ...
 ```
 
@@ -130,13 +130,16 @@ epoch,component,superbatch,value_loss,lr,lambda,positions
 
 | 列 | 意味 |
 |---|---|
-| `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
+| `eval_type` | CLI の `--eval-type` 値 (例: `NNUE_HALFKP`、`KPPT`) |
+| `arch` | CLI の `--arch` 値 (NNUE 系のみ。KPPT 系は空文字) |
 | `component` | 学習 component 名: NNUE 系は `nnue`、KPPT 系は `kk` / `kkp` / `kpp` |
+| `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
 | `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ |
 | `value_loss` | bullet が 32 batch ごとに計算する loss 値 |
 | `lr` | その superbatch における学習率 (StepLR 由来) |
 | `lambda` | その時点の `--lambda` (1 run 内では定数) |
 | `positions` | この component で消費した累計教師局面数。**resume 跨ぎで累積される** (run 開始時に既存トップレベル `learn.log` の最大値を読み取って続きから書く)。multi-epoch (`--max-epochs > 1`) 内では epoch 境界で reset する (v1 制限) |
+| `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
 
 ### 行の頻度
 

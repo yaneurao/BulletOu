@@ -80,18 +80,20 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` は **7 列 + ヘッダ行の CSV** で、すべての eval-type で同じフォーマット:
+`learn.log` は **10 列 + ヘッダ行の CSV** で、すべての eval-type で同じフォーマット:
 
 ```
-epoch,component,superbatch,value_loss,lr,lambda,positions
-1,kk,1,0.234,0.001,1.0,524288
-1,kk,1,0.232,0.001,1.0,1048576
+eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher
+KPPT,,kk,1,1,0.234,0.001,1.0,524288,teachers/
+KPPT,,kk,1,1,0.232,0.001,1.0,1048576,teachers/
 ...
-1,kkp,1,0.156,0.001,1.0,524288
+KPPT,,kkp,1,1,0.156,0.001,1.0,524288,teachers/
 ...
-1,kpp,1,0.245,0.001,1.0,524288
+KPPT,,kpp,1,1,0.245,0.001,1.0,524288,teachers/
 ...
 ```
+
+`arch` 列は KPPT 系 eval type (= `--arch` を使わない eval type) では空になる。NNUE 系 eval type では `256x2-32-32` などの値が入る。
 
 各 save の `0NNN/learn.log` snapshot もトップレベル `<output>/learn.log` も同じ書式。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md) を参照。
 

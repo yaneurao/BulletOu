@@ -554,11 +554,14 @@ fn run_kppt_all(args: &Args) {
 
 /// CSV header for `learn.log`. Both the top-level `<output>/learn.log` and
 /// each per-save `0NNN/learn.log` start with this line followed by data
-/// rows. Column meanings:
+/// rows. Column meanings (10 total):
 ///
-/// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
+/// - `eval_type`: CLI `--eval-type` value (e.g. `NNUE_HALFKP`, `KPPT`).
+/// - `arch`: CLI `--arch` value for NNUE eval types (e.g. `256x2-32-32`),
+///   empty for KPPT-family eval types (which don't consume `--arch`).
 /// - `component`: training component identifier — `nnue` for the NNUE
 ///   eval types, `kk` / `kkp` / `kpp` for the KPPT family.
+/// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
 /// - `superbatch`: 1-indexed superbatch within the current epoch.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
 /// - `lr`: learning rate at that superbatch (StepLR-derived).
@@ -568,32 +571,43 @@ fn run_kppt_all(args: &Args) {
 ///   in the existing top-level `learn.log` (resume-aware). Within a run,
 ///   the value resets at epoch boundaries when `--max-epochs > 1` — a
 ///   known v1 limitation.
-const LEARN_LOG_HEADER: &str = "epoch,component,superbatch,value_loss,lr,lambda,positions";
+/// - `teacher`: the user's `--teacher` CLI value verbatim, RFC-4180
+///   escaped (quoted if it contains a comma / quote / newline) so a
+///   directory or comma-separated list is preserved as one CSV field.
+const LEARN_LOG_HEADER: &str =
+    "eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
-/// 7-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
-#[derive(Clone, Copy, Debug)]
+/// 10-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
+#[derive(Clone, Debug)]
 struct LogContext {
+    eval_type: &'static str,
+    arch: &'static str,
     lr_start: f32,
     lr_gamma: f32,
     lr_step: usize,
     lambda: f32,
     batch_size: usize,
     batches_per_superbatch: usize,
+    teacher_csv: String,
 }
 
 impl LogContext {
     fn from_args(args: &Args) -> Self {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        let arch = if args.eval_type.uses_arch() { args.arch.cli_name() } else { "" };
         Self {
+            eval_type: args.eval_type.cli_name(),
+            arch,
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
             lr_step: args.lr_step,
             lambda: args.lambda,
             batch_size: args.batch_size,
             batches_per_superbatch,
+            teacher_csv: csv_escape(&args.teacher),
         }
     }
 
@@ -612,8 +626,29 @@ impl LogContext {
     }
 }
 
+/// RFC 4180-ish CSV escape: wrap in double quotes and double inner quotes if
+/// the value contains a comma, a double quote, or a newline. Otherwise pass
+/// through unchanged. Used to keep the trailing `teacher` column parseable
+/// when the user passed a comma-separated list to `--teacher`.
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
 /// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
-/// per line) into the enriched 7-column CSV body (no header). The header
+/// per line) into the enriched 10-column CSV body (no header). The header
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
 /// body can be concatenated under a single header by `assemble_numbered_dirs`.
 fn enrich_bullet_log_to_csv(
@@ -639,8 +674,11 @@ fn enrich_bullet_log_to_csv(
         let lr = ctx.lr_at(sb);
         let positions = ctx.positions_at(sb, b, position_offset);
         out.push_str(&format!(
-            "{epoch},{component},{sb},{loss},{lr},{lambda},{positions}\n",
-            lambda = ctx.lambda
+            "{eval_type},{arch},{component},{epoch},{sb},{loss},{lr},{lambda},{positions},{teacher}\n",
+            eval_type = ctx.eval_type,
+            arch = ctx.arch,
+            lambda = ctx.lambda,
+            teacher = ctx.teacher_csv,
         ));
     }
     out
@@ -651,20 +689,25 @@ fn enrich_bullet_log_to_csv(
 /// pick up the cumulative offset across resumes.
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
+///
+/// The parser uses `splitn(10, ',')` so any commas inside the trailing
+/// `teacher` field (e.g. a comma-separated teacher list) don't disturb the
+/// first 9 columns. The component column index is 2 and the positions
+/// column index is 8 in the new 10-column layout.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("epoch,") {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval_type,") {
             continue;
         }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 7 {
+        let parts: Vec<&str> = line.splitn(10, ',').collect();
+        if parts.len() < 9 {
             continue;
         }
-        let component = parts[1];
-        let Ok(positions) = parts[6].parse::<usize>() else { continue };
+        let component = parts[2];
+        let Ok(positions) = parts[8].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {
             *entry = positions;
