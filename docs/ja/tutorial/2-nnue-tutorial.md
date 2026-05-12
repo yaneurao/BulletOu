@@ -28,17 +28,23 @@
 
 ## 2.2 学習データを用意する
 
-`.pack` ファイル (PackedSfenValue、やねうら王の `gensfen` 形式) が必要。
+以下のいずれかが必要:
+
+- **`.pack`** — PackedSfenValue、やねうら王の `gensfen` コマンドが生成する形式 (やねうら王系)
+- **`.hcpe`** — HuffmanCodedPosAndEval、dlshogi 系の 38 byte 固定長レコード形式
+
+両方対応。自分が使うジェネレータ (または手持ちの共有データセット) に合わせて選ぶ。
 
 入手方法:
 
-- **自分で生成** — やねうら王の `gensfen` コマンドを使う。やねうら王のドキュメント参照。典型的な規模は数億局面だが、このチュートリアル目的なら 1000 万〜1 億局面で十分
-- **共有データセットを使う** — 将棋コミュニティで `.pack` ファイルが共有されていることがある。出所が信頼できることを確認
+- **自分で生成** — やねうら王の `gensfen` (`.pack`) または dlshogi 系のデータ生成 (`.hcpe`) を使う。各プロジェクトのドキュメント参照。典型的な規模は数億局面だが、チュートリアル目的なら 1000 万〜1 億局面で十分
+- **共有データセットを使う** — 将棋コミュニティでは `.pack` と `.hcpe` の両方が共有されている。出所が信頼できることを確認
 
 本チュートリアルでは以下を仮定:
 
 ```
-/data/shogi/raw.pack
+/data/shogi/raw.pack    # または
+/data/shogi/raw.hcpe
 ```
 
 (パスは任意。自分の環境に合わせて読み替える。)
@@ -56,9 +62,16 @@ cargo run --release --package bullet-utils -- \
 
 (レコード長 40 byte が PackedSfenValue のレイアウト。)
 
-## 2.3 NNUE 学習を走らせる (shogi_simple)
+## 2.3 NNUE 学習を走らせる
 
-最もシンプルな将棋エンドツーエンド学習:
+データ形式に応じて、最小例が 2 つ用意されている:
+
+- **`shogi_simple`** — `.bin` / `.pack` (PackedSfenValue、やねうら王 `gensfen` 形式) を読み込む
+- **`shogi_simple_hcpe`** — `.hcpe` (HuffmanCodedPosAndEval、dlshogi 系形式) を読み込む
+
+データに合わせて選ぶ。ネット構造と学習ループはほぼ同じ。
+
+### パターン A: `.pack` (やねうら王 gensfen) の場合
 
 ```bash
 cargo run --release --features cuda --example shogi_simple -- \
@@ -68,7 +81,22 @@ cargo run --release --features cuda --example shogi_simple -- \
 
 (AMD GPU なら `--features cuda` を `--features rocm` に。)
 
-本格学習では `--data` をフルデータセットに差し替え、`small.pack` 工程を省略する。
+### パターン B: `.hcpe` (dlshogi 系) の場合
+
+```bash
+cargo run --release --features cuda --example shogi_simple_hcpe -- \
+  --data /data/shogi/train.hcpe \
+  --output checkpoints/my-first-shogi-net-hcpe
+```
+
+`shogi_simple_hcpe` は、各 HCPE レコード (Apery 系 HCP + eval + bestMove16 + gameResult) を内部で PackedSfenValue にデコードしてから、`shogi_simple` と同じ `ShogiHalfKA_hm` 特徴量 + SCReLU + dual-perspective + 出力 1 のネットに流す。`--data-format` のような切り替えはなく、ファイルは hcpe 固定 (シンプルさを優先した設計)。
+
+HCPE 固有の制約:
+
+- HCPE には `game_ply` 情報がないので、Layer Stack の `ply9` bucket は使えない (この最小例は bucket を使わない)
+- HCPE には policy teacher (MoveVisits) がない。value 学習のみが対象。policy 教師込みは HCPE3 で対応予定
+
+本格学習では `--data` をフルデータセットに差し替え、`small.pack` / `small.hcpe` 工程を省略する。
 
 動いていれば以下のような出力:
 
