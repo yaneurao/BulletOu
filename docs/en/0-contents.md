@@ -1,11 +1,13 @@
-# Bullet Documentation
+# BulletOu Documentation
 
-This is the documentation for the basic usage of `bullet_lib`.
-It is recommended to read the [progression examples](../../examples/progression/).
+**English** / [日本語](../ja/0-contents.md)
+
+This is the documentation for the basic usage of `bullet_lib` (the BulletOu Rust crate).
+It is recommended to read the [progression examples](../../examples/progression/) alongside the guides below.
 
 ### NNUE Guide
 
-Note that this guide is specifically for NNUE training.
+The guides below are specifically about NNUE training.
 
 Basic Usage:
 1. [NNUE Basics](1-basics.md)
@@ -13,3 +15,6 @@ Basic Usage:
 3. [Training Data](3-data.md)
 4. [Saved Networks](4-saved-networks.md)
 
+### Shogi-specific Documentation
+
+- (Shogi-specific docs are currently in Japanese; see [docs/ja/shogi/](../ja/shogi/). English translations are pending.)
