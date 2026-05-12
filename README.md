@@ -16,14 +16,6 @@ BulletOu is yaneurao's fork of [bullet-shogi](https://github.com/SH11235/bullet-
 - **Upstream**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — shogi support, PackedSfenValue loader, HalfKA / HalfKP / Threat / HandThreat features, Layer Stack with KP-Absolute progress buckets
 - **This repository**: [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) — yaneurao's adaptation for YaneuraOu
 
-Upstream changes can be pulled in with:
-
-```bash
-git remote add upstream https://github.com/SH11235/bullet-shogi.git
-git fetch upstream
-git merge upstream/shogi-support
-```
-
 ### Usage for NNUE / Value Network Training
 
 Before using, read the documentation at [docs/en/0-contents.md](docs/en/0-contents.md), which covers building, managing training data, and the network output format.

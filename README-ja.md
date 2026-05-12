@@ -16,14 +16,6 @@ BulletOu は、jw1912 による [bullet](https://github.com/jw1912/bullet) (チ�
 - **上流**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — 将棋向け fork。PackedSfenValue loader、HalfKA / HalfKP / Threat / HandThreat 特徴量、KP 絶対進行度 bucket 付き Layer Stack を実装
 - **本リポジトリ**: [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) — yaneurao によるやねうら王向け改造版
 
-上流の変更を取り込むには:
-
-```bash
-git remote add upstream https://github.com/SH11235/bullet-shogi.git
-git fetch upstream
-git merge upstream/shogi-support
-```
-
 ### NNUE / 評価値ネットワーク学習での使い方
 
 最初に [docs/ja/](docs/ja/) のドキュメントに目を通すことを推奨。ビルド方法、教師データの扱い、ネットワークの出力フォーマットなど主要な情報を扱う。
