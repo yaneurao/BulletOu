@@ -44,8 +44,7 @@ CPU-only execution is not supported (the mock GPU runtime is for type-checking o
 
 ### Documentation
 
-- English: [docs/en/](docs/en/)
-- 日本語: [docs/ja/](docs/ja/)
+See [docs/en/](docs/en/).
 
 ### License
 

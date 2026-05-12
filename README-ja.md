@@ -44,8 +44,7 @@ CPU のみでの学習はサポートされていない (mock GPU ランタイ�
 
 ### ドキュメント
 
-- English: [docs/en/](docs/en/)
-- 日本語: [docs/ja/](docs/ja/)
+[docs/ja/](docs/ja/) を参照。
 
 ### ライセンス
 
