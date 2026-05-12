@@ -184,7 +184,13 @@ where
                             let k = (rng.rng() as usize) % (j + 1);
                             buffer.swap(j, k);
                         }
-                        if !f(&buffer) {
+                        // Convention (same as shogipack / direct loaders): `f`
+                        // returns `true` to signal "stop, no more data needed"
+                        // and `false` for "continue, send more". The previous
+                        // `!f(...)` was inverted, causing a single buffer's
+                        // worth of records to be flushed and then the loader
+                        // to exit prematurely on every HCPE training run.
+                        if f(&buffer) {
                             return;
                         }
                         buffer.clear();
@@ -372,8 +378,10 @@ mod tests {
                 first_result = chunk[0].result() as u8;
             }
             got += chunk.len();
-            // 最初の 100k 局面だけ確認すれば smoke test として十分
-            got < 100_000
+            // Stop once we've decoded enough positions for a smoke test.
+            // (`true` means "stop", matching the shogipack / direct loaders'
+            // convention.)
+            got >= 100_000
         });
 
         eprintln!("decoded {got} positions; first.score = {first_score}, first.result = {first_result}");
