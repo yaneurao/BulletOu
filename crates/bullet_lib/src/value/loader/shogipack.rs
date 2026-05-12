@@ -265,7 +265,10 @@ fn decode_hcp_hand_entry(stream: &mut BitReader) -> Option<(usize, Option<Color>
 ///
 /// HCP/平手から初期化し、cshogi move16 を適用しながら
 /// PSfen 形式にパックする機能を提供する。
-struct MiniPosition {
+/// 同じ親モジュール (value::loader) 内の他の loader (hcpe.rs 等) から
+/// HCP の decode / PackedSfenValue の再パックを再利用するために、
+/// `MiniPosition` 自体と `from_hcp` / `to_packed_sfen_value` を pub(super) で公開する。
+pub(super) struct MiniPosition {
     board: [Piece; 81],
     hands: [Hand; 2],
     side_to_move: Color,
@@ -324,7 +327,7 @@ impl MiniPosition {
     }
 
     /// HuffmanCodedPos (HCP) 32バイトからデコード
-    fn from_hcp(hcp: &[u8; 32], game_ply: u16) -> Option<Self> {
+    pub(super) fn from_hcp(hcp: &[u8; 32], game_ply: u16) -> Option<Self> {
         let mut pos = Self { board: [Piece::NONE; 81], hands: [Hand::EMPTY; 2], side_to_move: Color::Black, game_ply };
 
         let mut stream = BitReader::new(hcp);
@@ -529,7 +532,7 @@ impl MiniPosition {
     }
 
     /// 現在の局面から PackedSfenValue を生成
-    fn to_packed_sfen_value(&self, score: i16, move16: u16, game_result: i8) -> PackedSfenValue {
+    pub(super) fn to_packed_sfen_value(&self, score: i16, move16: u16, game_result: i8) -> PackedSfenValue {
         let psfen = self.pack_to_psfen();
         let mut data = [0u8; 40];
         data[0..32].copy_from_slice(&psfen);
