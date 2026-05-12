@@ -21,7 +21,7 @@ Target evaluation functions:
 
 **First-time users** should start with the [tutorial (docs/en/tutorial/)](docs/en/tutorial/), which walks through installation, building, and running a first training session step by step.
 
-For specification-level details such as training-data formats and output formats, see [docs/en/0-contents.md](docs/en/0-contents.md).
+For specification-level details such as training-data formats and output formats, see [docs/en/](docs/en/).
 
 ### Building
 

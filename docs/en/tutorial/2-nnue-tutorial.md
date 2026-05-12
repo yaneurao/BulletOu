@@ -266,7 +266,7 @@ cargo run --release --features cuda --example shogi_layerstack -- \
   --start-wdl 0.0 --end-wdl 1.0
 ```
 
-The pieces (Threat features, `progress.bin`, WDL scheduling) are explained in the [reference docs](../0-contents.md). Use the `shogi_simple` smoke test as your "is everything plumbed correctly?" check, then iterate with `shogi_layerstack`.
+The pieces (Threat features, `progress.bin`, WDL scheduling) are explained in the [reference docs](../). Use the `shogi_simple` smoke test as your "is everything plumbed correctly?" check, then iterate with `shogi_layerstack`.
 
 ## 2.8 Where to go next
 

@@ -11,4 +11,4 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 | 2 | [NNUE Tutorial](2-nnue-tutorial.md) | Train a shogi NNUE from real data, step by step |
 | 3 | [KPPT / KPP_KKPT Training](3-kppt-roadmap.md) | Train legacy YaneuraOu evaluation functions (Phases 1–4 implemented) |
 
-After finishing the tutorial, the [Reference docs](../0-contents.md) cover specifications and design details (data formats, network output formats, etc.).
+After finishing the tutorial, the [Reference docs](../) cover specifications and design details (data formats, network output formats, etc.).

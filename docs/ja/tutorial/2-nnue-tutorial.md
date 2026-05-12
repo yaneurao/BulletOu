@@ -250,7 +250,7 @@ cargo run --release --features cuda --example shogi_layerstack -- \
   --start-wdl 0.0 --end-wdl 1.0
 ```
 
-各部品 (Threat 特徴量、`progress.bin`、WDL スケジュール) は [リファレンス](../0-contents.md) で説明されている。`shogi_simple` を「全部正しく繋がっているか」の確認用に使い、その後 `shogi_layerstack` で本格イテレーションを回す、というのが推奨フロー。
+各部品 (Threat 特徴量、`progress.bin`、WDL スケジュール) は [リファレンス](../) で説明されている。`shogi_simple` を「全部正しく繋がっているか」の確認用に使い、その後 `shogi_layerstack` で本格イテレーションを回す、というのが推奨フロー。
 
 ## 2.8 次のステップ
 

@@ -1,6 +1,6 @@
 # BulletOu Documentation
 
-<a href="../ja/0-contents.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../ja/"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 Documentation is split into two layers:
 

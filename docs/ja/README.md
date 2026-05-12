@@ -1,6 +1,6 @@
 # BulletOu ドキュメント
 
-<a href="../en/0-contents.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../en/"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ドキュメントは 2 階層に分かれている:
 
