@@ -57,7 +57,7 @@ How the engine consumes the file depends on the engine; see its documentation.
         ▼
 [ BulletOu training ]            ← this tutorial walks you through this part
         │
-        │  cargo run --release --example ... -- --data ... --output ...
+        │  cargo run --release --example bulletou -- --eval-type ... --teacher ... --output ...
         ▼
 [ Output ]                       ← consumed by the engine at play time
         nn.bin (NNUE family)

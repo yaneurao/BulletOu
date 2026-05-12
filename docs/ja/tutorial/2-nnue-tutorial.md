@@ -8,38 +8,43 @@
 
 ## 2.1 何を学習するか
 
-以下の構造の小さな NNUE を学習する (`shogi_simple.rs` のデフォルト):
+`bulletou --eval-type NNUE_HALFKP` で、HalfKP 入力 + SCReLU 4 層の古典的な NNUE を学習する:
 
 ```
 将棋の局面
        │
-       ▼ ShogiHalfKA_hm (73,305 次元 sparse 特徴量)
+       ▼ HalfKP sparse 特徴量 (125,388 次元、自玉 / 相手玉の 2 perspective)
        │
-       ▼ Feature Transformer (FT、隠れ層サイズ 1024 または 1536、perspective で 2 倍化)
+       ▼ L0 affine + SCReLU       ← 両 perspective で重み共有
        │
-       ▼ SCReLU 活性化
+       ▼ accumulator (256 次元 × 2 perspective = 連結して 512 次元)
        │
-       ▼ Linear → スカラー score
+       ▼ L1 affine (512 → 32) + SCReLU
+       ▼ L2 affine (32 → 32) + SCReLU
+       ▼ Out affine (32 → 1)
+       │
+       ▼ eval (centipawn ベースのスカラー)
 ```
 
-これは「将棋で実用最小の NNUE」位置にある構成。最強構成 (Layer Stack + threat 特徴量 + 大きな FT) には遠く及ばないが、学習の挙動を体感するには十分。
+アーキテクチャは `--arch` で選ぶが、本チュートリアル時点では `256x2-32-32` の 1 種類のみ (`x2` は dual-perspective、`256` は accumulator size、`32-32` は L2/L3 のサイズ)。Stockfish 系 NNUE の小型構成と同等。
 
-より強い構成をすぐ試したい場合は、`shogi_layerstack.rs` 例が本番品質のバリアント (Layer Stack、bucket 選択、Threat / HandThreat 特徴量オプション、WDL スケジュール対応)。
+最強構成 (Layer Stack + threat 特徴量 + 大きい FT) には届かないが、学習の挙動を体感するのと、エンジンに繋いで対局確認するには十分。
 
 ## 2.2 学習データを用意する
 
-`.pack` / `.hcpe` / `.hcpe3` のいずれかのファイルが必要。
+`.pack` / `.hcpe` / `.hcpe3` / `.psv` のいずれかのファイルが必要。
 
 - **自分で生成** — [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `gensfen` スクリプトで `.pack` を出力するか、dlshogi 系のデータ生成で `.hcpe` / `.hcpe3` を作る。チュートリアル目的なら 1000 万〜1 億局面で十分。
 - **共有データセットを使う** — 将棋コミュニティでは各フォーマットのデータが共有されている。
 
-本チュートリアルでは以下を仮定:
+本チュートリアルでは作業ディレクトリ直下に `teachers/` を作り、その下に教師ファイルを置く構成を仮定する:
 
 ```
-teacher.pack
+teachers/
+    teacher.pack
 ```
 
-(`.hcpe` / `.hcpe3` でも同様に動く。パスは自分の環境に読み替える。)
+(`.hcpe` / `.hcpe3` / `.psv` でも同様に動く。フォーマットは拡張子から自動判別される。複数ファイル混在もディレクトリ指定で OK だが、すべて同じ拡張子であること。)
 
 ### 小さなサブセットで動作確認したい場合
 
@@ -47,48 +52,43 @@ teacher.pack
 
 ## 2.3 NNUE 学習を走らせる
 
-データ形式に応じて example を選ぶ:
-
-- **`shogi_simple`** — `.pack` を読む
-- **`shogi_simple_hcpe`** — `.hcpe` を読む
-
-### `.pack` の場合
-
 ```bash
-cargo run --release --features device-cuda --example shogi_simple -- \
-    --data teacher.pack \
-    --output checkpoints/my-first-shogi-net \
-    --superbatches 40
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type NNUE_HALFKP \
+    --teacher teachers/ \
+    --output checkpoints/my-halfkp
 ```
 
 (AMD GPU なら `--features device-cuda` を `--features device-rocm` に。)
 
-### `.hcpe` の場合
+`--teacher` には:
+- 1 つのファイル (`teachers/teacher.pack` のようなフルパス)
+- ディレクトリ (上記例。中の同一拡張子ファイルがすべて連結される)
+- カンマ区切り複数指定
 
-```bash
-cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
-    --teacher teacher.hcpe \
-    --output checkpoints/my-first-shogi-net \
-    --superbatches 40
-```
+のいずれも渡せる。
 
-HCPE 固有の制約:
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
 
-- HCPE には `game_ply` 情報がないので、`game_ply` を使う bucket (Layer Stack の `ls9` 等) は使えない (この最小例は bucket を使わない)
-- HCPE には policy teacher が存在しないので value 学習のみ。policy 教師込みの学習が必要なら HCPE3 を使う
-
-動いていれば以下のような出力:
+動いていれば以下のような出力が流れる:
 
 ```
-superbatch 1 / 40   pos = ... pos/s = ...   loss = ...
-superbatch 2 / 40   ...
+=== bulletou: running NNUE_HALFKP (256x2-32-32 SCReLU, dual-perspective) ===
+Training Preamble
+Net Name               : shogi_nnue_halfkp
+Batch Size             : 16384
+Batches / Superbatch   : 6104
+Positions / Superbatch : 100007936
+...
+superbatch 1   pos = ... pos/s = ...   loss = ...
+superbatch 2   ...
 ```
 
-`pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で smoke test 構成なら数千万 pos/s 出る。下位 GPU では比例して低下。
+`pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で数千万 pos/s 出る。下位 GPU では比例して低下。
 
 ## 2.4 学習スケジュール
 
-ログに出てくる `superbatch 1 / 40` の「superbatch」は **checkpoint や学習率を更新するためのまとまり**で、デフォルトで約 1 億局面ぶん。学習の長さは `--superbatches` で指定する。
+ログに出てくる `superbatch` は **checkpoint や学習率を更新するためのまとまり**で、デフォルトで約 1 億局面ぶん。
 
 主要なフラグ:
 
@@ -96,48 +96,63 @@ superbatch 2 / 40   ...
 |---|---|---|
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
-| `--superbatches` | 走らせる superbatch の総数 | 10 |
+| `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし (= EOF まで) |
+| `--max-epochs` | 教師データを何周するか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR (`lr-step` superbatch ごとに `lr-gamma` 倍) | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL (eval スコア vs 対局結果の blend 比率) を `--superbatches` の区間で線形補間 | 0.0 / 1.0 |
+| `--start-wdl` / `--end-wdl` | WDL (eval スコア vs 対局結果の blend 比率) を線形補間 | 0.0 / 1.0 |
 
-実行例:
+実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
 ```bash
---batch-size 16384 --batches-per-superbatch 6104 --superbatches 40
-# = 1 superbatch ≒ 1 億局面、合計 40 億局面
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type NNUE_HALFKP \
+    --teacher teachers/ \
+    --output checkpoints/my-halfkp \
+    --superbatches 40
 ```
 
-スケジューラの詳細 (Cosine / Linear / Warmup 等) は [リファレンス](../) を参照。
+教師ファイルが 1 superbatch 未満 (≒ 1 億局面未満) しか無い場合は `--batches-per-superbatch` を小さくする (例: `1024` で 1 superbatch ≒ 1670 万局面) と、何回も save が走るようになる。
 
 ## 2.5 出力を確認する
 
-学習完了 (および各 checkpoint) のたびに、`checkpoints/my-first-shogi-net/` 配下に **`nn.bin`** が書き出される。これがやねうら王エンジンが対局時に読み込む NNUE 評価関数パラメーターファイル。
+学習完了後、`checkpoints/my-halfkp/` 配下は以下のレイアウト:
 
-## 2.6 エンジンに組み込む
-
-やねうら王エンジンが eval ファイルを探す場所 (通常 `eval/nn.bin`) に学習結果の `nn.bin` を置き、エンジンを起動して `bench` や簡易対局でロードを確認する。具体的なファイル配置はエンジンの設定 (`EvalDir` 等) に依存するのでエンジン側のドキュメントを参照。
-
-## 2.7 本番構成にステップアップする
-
-`shogi_simple` に慣れたら、`shogi_layerstack` でより強い学習に移る:
-
-```bash
-cargo run --release --features device-cuda --example shogi_layerstack -- \
-  --data teacher.pack \
-  --output checkpoints/my-layerstack-net \
-  --feature ShogiHalfKaHmThreat \
-  --bucket-mode progress8kpabs \
-  --progress-coeff progress.bin \
-  --start-wdl 0.0 --end-wdl 1.0
+```
+checkpoints/my-halfkp/
+├── learn.log                          ← 全 run / resume を連結した累積ログ
+├── 0001/
+│   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
+│   ├── state.bin                      ← resume 用の重み + Adam moments
+│   └── learn.log                      ← この save 時点の学習ログ snapshot
+├── 0002/
+├── ...
+└── 000N/                              ← 最新 (= 最後に保存された) save
+    ├── nn.bin
+    ├── state.bin
+    └── learn.log
 ```
 
-各部品 (Threat 特徴量、`progress.bin`、WDL スケジュール) は [リファレンス](../) で説明されている。`shogi_simple` を「全部正しく繋がっているか」の確認用に使い、その後 `shogi_layerstack` で本格イテレーションを回す、というのが推奨フロー。
+最新の `000N/nn.bin` がやねうら王エンジンに渡すファイル。
 
-## 2.8 次のステップ
+## 2.6 中断・再開
 
+同じ `--output` を指定してもう一度同じコマンドを走らせると、`bulletou` は自動的に最新 `000N/state.bin` から resume する (新 save は `000(N+1)/` から続く)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
+
+## 2.7 エンジンに組み込む
+
+やねうら王エンジンが eval ファイルを探す場所 (通常 `eval/nn.bin`) に学習結果の `000N/nn.bin` を置き、エンジンを起動して `bench` や簡易対局でロードを確認する。具体的なファイル配置はエンジンの設定 (`EvalDir` 等) に依存するのでエンジン側のドキュメントを参照。
+
+`state.bin` / `learn.log` はエンジンからは無視されるが、再学習や loss 推移の確認用に残しておくと便利。
+
+## 2.8 別のターゲットを学習したい場合
+
+- **KPPT** (`KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` の 3 ファイル組): `--eval-type KPPT` または factorised 版の `--eval-type KPP_KKPT`。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md)
+- 他の NNUE バリアント (HalfKA / KP / SFNN+ls9 等) は順次 `--eval-type` に追加予定
+
+## 2.9 次のステップ
+
+- [リファレンス: NNUE HalfKP 学習](../shogi/halfkp.md) — `nn.bin` のバイナリレイアウト、量子化、resume の詳細
 - [リファレンス: NNUE の基礎](../1-basics.md) — perspective NNUE の数式
 - [リファレンス: 学習済みネットワーク](../4-saved-networks.md) — checkpoint レイアウト、量子化、変換チェーン
-- [リファレンス: KP 絶対進行度](../shogi/kp-absolute-progress.md) — `--bucket-mode progress8kpabs` が実際に何をやっているか
-- [リファレンス: shogi_progress_kpabs_train](../shogi/shogi_progress_kpabs_train.md) — 自分で `progress.bin` を学習する方法
-- [KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習 (リファレンス)
+- [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習

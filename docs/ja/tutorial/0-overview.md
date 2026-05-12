@@ -57,7 +57,7 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
         ▼
 [ BulletOu で学習 ]              ← このチュートリアルの対象
         │
-        │  cargo run --release --example ... -- --data ... --output ...
+        │  cargo run --release --example bulletou -- --eval-type ... --teacher ... --output ...
         ▼
 [ 出力ファイル ]                  ← エンジンが対局時に読み込む
         nn.bin (NNUE 系)
