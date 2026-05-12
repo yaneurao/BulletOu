@@ -1,6 +1,6 @@
 # Getting Started
 
-<a href="../ja/2-getting-started.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/reference/2-getting-started.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 ### Installing Rust
 

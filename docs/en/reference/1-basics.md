@@ -1,6 +1,6 @@
 # 1. NNUE Basics
 
-<a href="../ja/1-basics.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/reference/1-basics.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 ## Simple Feed-Forward Network
 

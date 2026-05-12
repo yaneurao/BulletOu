@@ -1,6 +1,6 @@
 # 教師データ
 
-<a href="../en/3-data.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/reference/3-data.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ## 標準的なワークフロー
 
