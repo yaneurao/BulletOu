@@ -3,14 +3,17 @@ shogi_simple_hcpe - Train a shogi NNUE directly from HCPE (HuffmanCodedPosAndEva
 
 This is a minimal example that exercises the new `HcpeDataLoader`. It uses the
 same network shape as `shogi_simple.rs` (ShogiHalfKA_hm + single hidden layer +
-SCReLU activation + dual-perspective), but reads HCPE files instead of bullet's
-own `.bin` (PackedSfenValue) format. There is no input-format option — this
-example is *intentionally* hcpe-only, to keep the code short and unambiguous.
+SCReLU activation + dual-perspective), but reads `.hcpe` (dlshogi-style 38-byte
+fixed-length records) instead of the formats `shogi_simple.rs` consumes (a
+flat `.bin` dump of `PackedSfenValue` records, or YaneuraOu `gensfen`'s
+per-game variable-length `.pack`). All three eventually decode into the same
+in-memory `PackedSfenValue` stream the trainer consumes. There is no
+input-format option here — this example is *intentionally* hcpe-only, to keep
+the code short and unambiguous.
 
-For a richer training script (multiple feature sets, optimisers, win-rate model,
-quantisation control, resume, etc.) see `shogi_simple.rs`. To train on
-`.pack` files use the `shogi_simple.rs` route after converting them via
-bullet-utils.
+For a richer training script (multiple feature sets, optimisers, win-rate
+model, quantisation control, resume, etc.) see `shogi_simple.rs`, which
+natively reads `.pack` and `.bin` (no conversion step needed).
 
 Usage:
 
@@ -122,7 +125,7 @@ struct Args {
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
-    /// HCPE shuffle buffer size in megabytes (of PackedSfenValue).
+    /// HCPE shuffle buffer size in megabytes (decoded `PackedSfenValue` records).
     #[arg(long, default_value = "256")]
     buffer_mb: usize,
 

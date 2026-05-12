@@ -18,7 +18,7 @@ BulletOu は、jw1912 による [bullet](https://github.com/jw1912/bullet) (チ�
 ### 系譜・上流
 
 - **オリジナル**: [jw1912/bullet](https://github.com/jw1912/bullet) — 汎用 NNUE トレーナー (チェス向け)
-- **上流**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — 将棋向け fork。PackedSfenValue loader、HalfKA / HalfKP / Threat / HandThreat 特徴量、KP 絶対進行度 bucket 付き Layer Stack を実装
+- **上流**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — 将棋向け fork。`.pack` loader (やねうら王 `gensfen` のゲーム単位可変長ファイルを内部で `PackedSfenValue` 列に展開)、HalfKA / HalfKP / Threat / HandThreat 特徴量、KP 絶対進行度 bucket 付き Layer Stack を実装
 - **本リポジトリ**: [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) — yaneurao によるやねうら王向け改造版
 
 ### 使い方

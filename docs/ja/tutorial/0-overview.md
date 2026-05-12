@@ -32,11 +32,24 @@ BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継�
 
 ## 学習データはどこから来るか
 
-BulletOu は **PackedSfenValue** (`.pack`) — やねうら王の `gensfen` コマンドが生成するフォーマット — を読み込む。各レコードは「圧縮された局面 + その局面でのエンジン評価値 + 最終的な対局結果」のセット。
+BulletOu は複数の将棋学習データフォーマットを読み込める。主なものは:
 
-上流から継承した別のフォーマット (`bulletformat` / `binpack` 等) もサポートされているが、将棋作業では `.pack` が標準。
+- **`.pack`** — やねうら王の `gensfen` コマンドが生成する **ゲーム単位の可変長フォーマット**。1 レコード = 1 ゲーム:
+  `[start_flag (u8)][hcp+gamePly (平手以外のとき)][move16, eval] × moveNum [終局マーカー]`。
+  `ShogiPackLoader` が読み込み時にゲームを ply 単位に展開する。
+- **`.hcpe` / `.hcpe3`** — dlshogi 系のフォーマット (それぞれ 38 byte 固定長レコード / ゲーム単位可変長)。`HcpeDataLoader` / `Hcpe3DataLoader` が直接読む。
 
-学習データは BulletOu には **同梱されていない**。やねうら王の `gensfen` で自分で生成するか、他者が共有している `.pack` データセットを使う。
+どの形式でも、トレーナの下流が見る **内部単位** は **`PackedSfenValue`** — 40 byte 固定長レコード
+(`[hcp: 32B][score: i16][move: u16][gamePly: u16][game_result: i8][padding: u8]`)。
+`.pack` / `.hcpe` / `.hcpe3` のいずれの loader も、内部で PackedSfenValue 列に展開する。ファイル形式とこの内部単位は別物なので混同しないこと:
+
+| 用語 | 何か |
+|---|---|
+| `.pack` | やねうら王の `gensfen` が出す **ゲーム単位**の可変長ファイル |
+| `PackedSfenValue` | トレーナ内部で扱う **局面単位**の 40 byte 固定長レコード |
+| `.psv` | PackedSfenValue 列をそのままファイルに dump したときに使うローカル拡張子 (cross-validation 用ツール等) |
+
+学習データは BulletOu には **同梱されていない**。やねうら王の `gensfen` で自分で生成するか、他者が共有している `.pack` / `.hcpe` / `.hcpe3` データセットを使う。
 
 ## 出力はどこに行くか
 

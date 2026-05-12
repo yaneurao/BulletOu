@@ -13,8 +13,12 @@ expected to be poor; the value of this example is wire-up confirmation.
 
 Later phases will add KKP, then KPP, then YaneuraOu-format `.bin` output.
 
-Inputs come from HCPE (.hcpe), HCPE3 (.hcpe3), or PackedSfenValue (.pack)
-files. The format is chosen via `--data-format`.
+Inputs come from HCPE (.hcpe), HCPE3 (.hcpe3), or YaneuraOu gensfen's
+per-game variable-length `.pack` file. The format is chosen via
+`--data-format`. All three formats are decoded internally into a stream of
+`PackedSfenValue` (40-byte fixed-length) records, which is the trainer's
+internal unit — note that `.pack` itself is **not** a flat array of
+`PackedSfenValue`.
 
 Usage:
 
@@ -49,7 +53,7 @@ enum DataFormat {
     Hcpe,
     /// `.hcpe3` (per-game variable-length, dlshogi style).
     Hcpe3,
-    /// `.pack` (PackedSfenValue, YaneuraOu gensfen style).
+    /// `.pack` (YaneuraOu `gensfen`, per-game variable-length).
     Pack,
 }
 

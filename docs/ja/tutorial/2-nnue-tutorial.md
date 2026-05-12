@@ -30,44 +30,47 @@
 
 以下のいずれかが必要:
 
-- **`.pack`** — PackedSfenValue、やねうら王の `gensfen` コマンドが生成する形式 (やねうら王系)
-- **`.hcpe`** — HuffmanCodedPosAndEval、dlshogi 系の 38 byte 固定長レコード形式
+- **`.pack`** — やねうら王の `gensfen` が出す **ゲーム単位の可変長フォーマット**。1 ファイルレコード = 1 ゲーム (start_flag + (平手以外なら) hcp/ply + (move16, eval) × moveNum + 終局マーカー)。`ShogiPackLoader` がゲームを ply 単位に展開する。
+- **`.hcpe`** — dlshogi 系の **38 byte 固定長レコード**形式 (HCP + eval + bestMove16 + gameResult)。
+- **`.hcpe3`** — dlshogi 系の **ゲーム単位可変長**形式 (ゲームヘッダ + moveNum × MoveInfo + ply ごとの MoveVisits)。
 
-両方対応。自分が使うジェネレータ (または手持ちの共有データセット) に合わせて選ぶ。
+> ⚠️ `.pack` は「PackedSfenValue が連続したファイル」では **ない**。`PackedSfenValue` は **トレーナの内部単位** (40 byte 固定長レコード)、`.pack` は **ファイル形式** で別物。詳細は [概要](0-overview.md#学習データはどこから来るか) 参照。
+
+3 つすべてに対応。自分が使うジェネレータ (または手持ちの共有データセット) に合わせて選ぶ。
 
 入手方法:
 
-- **自分で生成** — やねうら王の `gensfen` (`.pack`) または dlshogi 系のデータ生成 (`.hcpe`) を使う。各プロジェクトのドキュメント参照。典型的な規模は数億局面だが、チュートリアル目的なら 1000 万〜1 億局面で十分
-- **共有データセットを使う** — 将棋コミュニティでは `.pack` と `.hcpe` の両方が共有されている。出所が信頼できることを確認
+- **自分で生成** — やねうら王の `gensfen` (`.pack`) または dlshogi 系のデータ生成 (`.hcpe` / `.hcpe3`) を使う。各プロジェクトのドキュメント参照。典型的な規模は数億局面だが、チュートリアル目的なら 1000 万〜1 億局面で十分
+- **共有データセットを使う** — 将棋コミュニティでは `.pack` / `.hcpe` / `.hcpe3` のいずれも共有されている。出所が信頼できることを確認
 
 本チュートリアルでは以下を仮定:
 
 ```
 /data/shogi/raw.pack    # または
-/data/shogi/raw.hcpe
+/data/shogi/raw.hcpe    # または
+/data/shogi/raw.hcpe3
 ```
 
 (パスは任意。自分の環境に合わせて読み替える。)
 
 ### まずは小さなテストデータで
 
-データセットが巨大 (数十 GB) なときは、最初に小さなサブセットでコマンドの動作確認をする方がはるかに楽。`bullet-utils` ツールで `.pack` を分割できる:
+データセットが巨大 (数十 GB) なときは、最初に小さなサブセットで動作確認すると楽。
 
-```bash
-cargo run --release --package bullet-utils -- \
-  shuffle --input /data/shogi/raw.pack --output /tmp/small.pack \
-  --record-size 40 --seed 42
-# (出力 /tmp/small.pack の先頭 1000 万レコード程度を初回テストに使う)
-```
+- **`.hcpe`** (固定 38 byte) は単に先頭を切り出せばよい:
+  ```bash
+  head -c $((38 * 10000000)) /data/shogi/raw.hcpe > /tmp/small.hcpe
+  ```
+  これで先頭 1000 万レコード分。
 
-(レコード長 40 byte が PackedSfenValue のレイアウト。)
+- **`.pack` / `.hcpe3`** (ゲーム単位の可変長) は、バイト単位で切り出すとゲーム境界が壊れるので NG。`gensfen` で直接小さな `.pack` を生成するか、`--batches-per-superbatch` で 1 superbatch あたりの消費量を抑えるかのいずれか (§2.3 参照)。
 
 ## 2.3 NNUE 学習を走らせる
 
 データ形式に応じて、最小例が 2 つ用意されている:
 
-- **`shogi_simple`** — `.bin` / `.pack` (PackedSfenValue、やねうら王 `gensfen` 形式) を読み込む
-- **`shogi_simple_hcpe`** — `.hcpe` (HuffmanCodedPosAndEval、dlshogi 系形式) を読み込む
+- **`shogi_simple`** — `.bin` (bullet-utils の変換で生成される `PackedSfenValue` 連続ファイル) または `.pack` (やねうら王 `gensfen` のゲーム単位可変長) を読み込む。
+- **`shogi_simple_hcpe`** — `.hcpe` (dlshogi 系の 38 byte 固定長) を読み込む。
 
 データに合わせて選ぶ。ネット構造と学習ループはほぼ同じ。
 

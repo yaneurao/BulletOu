@@ -18,7 +18,7 @@ BulletOu is yaneurao's fork of [bullet-shogi](https://github.com/SH11235/bullet-
 ### Lineage / Upstream
 
 - **Original**: [jw1912/bullet](https://github.com/jw1912/bullet) — general-purpose NNUE trainer (chess-focused)
-- **Upstream**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — shogi support, PackedSfenValue loader, HalfKA / HalfKP / Threat / HandThreat features, Layer Stack with KP-Absolute progress buckets
+- **Upstream**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — shogi support, `.pack` loader (YaneuraOu `gensfen`'s per-game variable-length file → decoded into a `PackedSfenValue` stream internally), HalfKA / HalfKP / Threat / HandThreat features, Layer Stack with KP-Absolute progress buckets
 - **This repository**: [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) — yaneurao's adaptation for YaneuraOu
 
 ### Usage
