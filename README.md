@@ -1,16 +1,22 @@
+<p align="center">
+  <img src="images/bulletou-logo-mascot-s.png" alt="BulletOu UltraFast Shogi AI ML">
+</p>
+
 <div align="center">
 
-# BulletOu
+  <h1>BulletOu</h1>
+
+  A Rust-based domain-specific ML library for training shogi AI evaluation function parameters. Designed for training evaluation function parameters used by [YaneuraOu](https://github.com/yaneurao/YaneuraOu).
 
 <a href="README-ja.md"><img alt="日本語で読む" src="https://img.shields.io/badge/README-日本語-DC2626?style=flat-square"></a>
 
 </div>
 
-A Rust-based domain-specific ML library for training shogi AI evaluation function parameters. Designed for training evaluation function parameters used by [YaneuraOu](https://github.com/yaneurao/YaneuraOu).
 
 Target evaluation functions:
 
 - NNUE halfKP
+- NNUE halfKPE9
 - NNUE KP
 - NNUE halfka1 / halfka2
 - SFNN + ls9 (NNUEwoSQPT1536)

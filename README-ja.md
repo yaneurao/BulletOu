@@ -1,19 +1,25 @@
+<p align="center">
+  <img src="images/bulletou-logo-mascot-s.png" alt="BulletOu UltraFast Shogi AI ML">
+</p>
+
 <div align="center">
 
-# BulletOu
+  <h1>BulletOu</h1>
+
+  将棋AIの評価関数パラメーターを学習するための、Rust 製ドメイン特化型 ML ライブラリ。やねうら王 ([YaneuraOu](https://github.com/yaneurao/YaneuraOu)) で用いる評価関数パラメーターの学習に使用することを想定している。
 
 <a href="README.md"><img alt="Read in English" src="https://img.shields.io/badge/README-English-DC2626?style=flat-square"></a>
 
 </div>
 
-将棋AIの評価関数パラメーターを学習するための、Rust 製ドメイン特化型 ML ライブラリ。やねうら王 ([YaneuraOu](https://github.com/yaneurao/YaneuraOu)) で用いる評価関数パラメーターの学習に使用することを想定している。
 
 対応する評価関数:
 
 - NNUE halfKP
+- NNUE halfKPE9
 - NNUE KP
-- NNUE halfka1/halfka2
-- SFNN + ls9(NNUEwoSQPT1536)
+- NNUE halfka1 / halfka2
+- SFNN + ls9 (NNUEwoSQPT1536)
 - KPPT
 - KPP_KKPT
 
