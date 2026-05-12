@@ -229,6 +229,12 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         logger::ansi(seconds, logger::num_cs()),
     );
 
+    // dataloader が `sender.send` でブロックしたままだと join がデッドロックする。
+    // (sync_channel(32) のバッファが満杯で、main loop は break で抜けたが
+    //  receiver はまだスコープに残っているので sender 側は永久に待ち続ける。)
+    // receiver を明示的に drop して sender.send を Err にし、dataloader 側の
+    // `if sender.send(batch).is_err() { return true; }` を発動させてから join。
+    drop(receiver);
     dataloader.join().unwrap()?;
 
     Ok(())
