@@ -73,25 +73,25 @@ def hcpe3_to_psv(hcpe3_path: str, psv_path: str, max_games: int = 0, max_positio
 
     max_games > 0 のときはその数のゲームで打ち切り (0=全件)。
     max_positions > 0 のときはその数の局面で打ち切り (0=全件)。
+
+    psv は局面ごとにストリーミング書き出しするため、メモリ使用量はゲーム数によらず
+    O(1) で済む。
     """
-    psvs: list[bytes] = []
     games_read = 0
+    positions_written = 0
+    truncated = False
 
     board = cshogi.Board()
 
-    with open(hcpe3_path, "rb") as f:
+    with open(hcpe3_path, "rb") as f, open(psv_path, "wb") as g:
         while True:
             header_bytes = f.read(HUFFMAN_CODED_POS_AND_EVAL3.itemsize)
             if len(header_bytes) < HUFFMAN_CODED_POS_AND_EVAL3.itemsize:
                 break  # EOF
             header = np.frombuffer(header_bytes, dtype=HUFFMAN_CODED_POS_AND_EVAL3, count=1)[0]
             move_num = int(header["moveNum"])
-            game_result_bits = int(header["result"]) & 0x3
-            # i8 として書き出す
-            game_result_i8 = struct.pack("<b", game_result_bits if game_result_bits < 128 else game_result_bits - 256)[0]
-            # 上はトリッキー: 0/1/2 なら i8 でも値は変わらない (signed/unsigned が同じビット)
-            # 単に 0/1/2 のいずれか
-            game_result_i8 = game_result_bits  # 0..2 なので i8 表現も同じ
+            # 0/1/2 は i8 でも u8 でも同じビット表現
+            game_result_i8 = int(header["result"]) & 0x3
 
             # 開始局面をセット
             board.set_hcp(header["hcp"])
@@ -100,6 +100,7 @@ def hcpe3_to_psv(hcpe3_path: str, psv_path: str, max_games: int = 0, max_positio
                 mi_bytes = f.read(MOVE_INFO.itemsize)
                 if len(mi_bytes) < MOVE_INFO.itemsize:
                     print(f"truncated MoveInfo at game {games_read} ply {i}", file=sys.stderr)
+                    truncated = True
                     break
                 mi = np.frombuffer(mi_bytes, dtype=MOVE_INFO, count=1)[0]
                 cand_num = int(mi["candidateNum"])
@@ -108,8 +109,7 @@ def hcpe3_to_psv(hcpe3_path: str, psv_path: str, max_games: int = 0, max_positio
                 psfen = np.zeros(32, dtype=np.uint8)
                 board.to_psfen(psfen)
 
-                # PackedSfenValue (40 byte) を組み立て
-                # i16 selectedMove16 のビットを u16 にそのまま入れる
+                # PackedSfenValue (40 byte) を組み立てて即書き出し
                 move16_u16 = int(mi["selectedMove16"]) & 0xFFFF
                 score_i16 = int(mi["eval"])
                 psv_bytes = bytearray(40)
@@ -119,7 +119,8 @@ def hcpe3_to_psv(hcpe3_path: str, psv_path: str, max_games: int = 0, max_positio
                 psv_bytes[36:38] = struct.pack("<H", i)  # gamePly = ply within game (0-indexed)
                 psv_bytes[38] = game_result_i8 & 0xFF
                 psv_bytes[39] = 0  # padding
-                psvs.append(bytes(psv_bytes))
+                g.write(psv_bytes)
+                positions_written += 1
 
                 # MoveVisits を読み飛ばし
                 if cand_num > 0:
@@ -127,30 +128,28 @@ def hcpe3_to_psv(hcpe3_path: str, psv_path: str, max_games: int = 0, max_positio
                     skipped = f.read(skip)
                     if len(skipped) < skip:
                         print(f"truncated MoveVisits at game {games_read} ply {i}", file=sys.stderr)
+                        truncated = True
                         break
 
                 # 次の ply へ
                 if i + 1 < move_num:
                     board.push_move16(int(mi["selectedMove16"]) & 0xFFFF)
 
-                if max_positions > 0 and len(psvs) >= max_positions:
+                if max_positions > 0 and positions_written >= max_positions:
                     break
 
             games_read += 1
-            if (games_read % 1000) == 0:
-                print(f"  read {games_read} games, {len(psvs)} positions")
+            if (games_read % 5000) == 0:
+                print(f"  read {games_read} games, {positions_written} positions")
 
+            if truncated:
+                break
             if max_games > 0 and games_read >= max_games:
                 break
-            if max_positions > 0 and len(psvs) >= max_positions:
+            if max_positions > 0 and positions_written >= max_positions:
                 break
 
-    print(f"read {games_read} games -> {len(psvs)} positions from {hcpe3_path}")
-
-    with open(psv_path, "wb") as g:
-        for rec in psvs:
-            g.write(rec)
-    print(f"wrote {len(psvs)} psv records to {psv_path}")
+    print(f"read {games_read} games -> wrote {positions_written} psv records to {psv_path}")
 
 
 if __name__ == "__main__":

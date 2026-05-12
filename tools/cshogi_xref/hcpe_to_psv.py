@@ -16,35 +16,48 @@ import numpy as np
 import cshogi
 
 
-def hcpe_to_psv(hcpe_path: str, psv_path: str, count: int = 0) -> None:
-    """count=0 のときは全件変換。それ以外は先頭 count 件のみ。"""
-    # 入力 hcpe
-    if count > 0:
-        hcpes = np.fromfile(hcpe_path, dtype=cshogi.HuffmanCodedPosAndEval, count=count)
-    else:
-        hcpes = np.fromfile(hcpe_path, dtype=cshogi.HuffmanCodedPosAndEval)
-    print(f"read {len(hcpes)} hcpe records from {hcpe_path}")
+def hcpe_to_psv(hcpe_path: str, psv_path: str, count: int = 0, batch: int = 100_000) -> None:
+    """count=0 のときは全件変換。それ以外は先頭 count 件のみ。
 
-    # 出力 psv
-    psvs = np.zeros(len(hcpes), dtype=cshogi.PackedSfenValue)
+    変換結果は `batch` 件ずつストリーミングで `psv_path` に書き出すため、
+    大規模ファイルでもメモリ使用量はバッチサイズ分に抑えられる。
+    """
+    import os
+
+    hcpe_item = cshogi.HuffmanCodedPosAndEval.itemsize  # 38
+    file_size = os.path.getsize(hcpe_path)
+    total = file_size // hcpe_item
+    if count > 0:
+        total = min(total, count)
+    print(f"converting {total} hcpe records from {hcpe_path}")
 
     board = cshogi.Board()
-    for i in range(len(hcpes)):
-        h = hcpes[i]
-        board.set_hcp(h["hcp"])
-        # PackedSfenValue['sfen'] は (32,) shape の uint8 view。直接書き込む
-        board.to_psfen(psvs[i]["sfen"])
-        psvs[i]["score"] = h["eval"]
-        # cshogi の hcpe.bestMove16 (i16) と psv.move (u16) は同じビット表現
-        psvs[i]["move"] = h["bestMove16"].view(np.uint16)
-        psvs[i]["gamePly"] = 0  # hcpe に存在しない情報
-        psvs[i]["game_result"] = h["gameResult"]
-        psvs[i]["padding"] = 0
-        if (i + 1) % 10000 == 0:
-            print(f"  converted {i + 1} / {len(hcpes)}")
+    written = 0
+    with open(psv_path, "wb") as g:
+        while written < total:
+            n = min(batch, total - written)
+            hcpes = np.fromfile(
+                hcpe_path,
+                dtype=cshogi.HuffmanCodedPosAndEval,
+                count=n,
+                offset=written * hcpe_item,
+            )
+            psvs = np.zeros(n, dtype=cshogi.PackedSfenValue)
+            for i in range(n):
+                h = hcpes[i]
+                board.set_hcp(h["hcp"])
+                board.to_psfen(psvs[i]["sfen"])
+                psvs[i]["score"] = h["eval"]
+                psvs[i]["move"] = h["bestMove16"].view(np.uint16)
+                psvs[i]["gamePly"] = 0
+                psvs[i]["game_result"] = h["gameResult"]
+                psvs[i]["padding"] = 0
+            g.write(psvs.tobytes())
+            written += n
+            if (written // batch) % 5 == 0:
+                print(f"  converted {written} / {total}")
 
-    psvs.tofile(psv_path)
-    print(f"wrote {len(psvs)} psv records to {psv_path}")
+    print(f"wrote {written} psv records to {psv_path}")
 
 
 if __name__ == "__main__":
