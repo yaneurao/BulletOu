@@ -1,6 +1,6 @@
 # shogi_progress_kpabs_train
 
-[English](../../en/shogi/shogi_progress_kpabs_train.md) / **日本語**
+<a href="../../en/shogi/shogi_progress_kpabs_train.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 LayerStack の bucket 選択に使う `progress.bin`（KP-absolute 進行度モデル）を学習するツール群。
 CPU 版・CUDA 版の 2 バリアントが提供される。

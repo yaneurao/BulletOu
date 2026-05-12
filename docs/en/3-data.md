@@ -1,5 +1,7 @@
 # Training Data
 
+<a href="../ja/3-data.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+
 ## General Workflow
 
 1. Store your data in some format (heavily recommended to use a binpack-like format)

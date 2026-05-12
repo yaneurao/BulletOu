@@ -1,6 +1,6 @@
 # BulletOu Documentation
 
-**English** / [日本語](../ja/0-contents.md)
+<a href="../ja/0-contents.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 This is the documentation for the basic usage of `bullet_lib` (the BulletOu Rust crate).
 It is recommended to read the [progression examples](../../examples/progression/) alongside the guides below.

@@ -2,9 +2,9 @@
 
 # BulletOu
 
-</div>
+<a href="README-ja.md"><img alt="日本語で読む" src="https://img.shields.io/badge/README-日本語-DC2626?style=flat-square"></a>
 
-**English** / [日本語](README-ja.md)
+</div>
 
 A domain-specific ML library for training NNUE-style value networks for **shogi (将棋)** engines, in particular for use with [YaneuraOu](https://github.com/yaneurao/YaneuraOu).
 

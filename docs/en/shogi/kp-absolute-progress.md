@@ -1,6 +1,6 @@
 # Game-Progress Estimation Using KP-Absolute Features
 
-**English** / [日本語](../../ja/shogi/kp-absolute-progress.md)
+<a href="../../ja/shogi/kp-absolute-progress.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 This document explains the concept, specification, and usage notes of **KP-Absolute** (KP絶対) based logistic regression, one of the game-progress estimation methods adopted by BulletOu (and its upstream `bullet-shogi`).
 

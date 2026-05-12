@@ -1,6 +1,6 @@
 # shogi_progress_kpabs_train
 
-**English** / [日本語](../../ja/shogi/shogi_progress_kpabs_train.md)
+<a href="../../ja/shogi/shogi_progress_kpabs_train.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 Tools for training `progress.bin` (the KP-Absolute progress model) used for LayerStack bucket selection.
 Two variants are provided: a CPU version and a CUDA version.

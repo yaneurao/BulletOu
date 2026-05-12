@@ -1,6 +1,6 @@
 # KP絶対を用いた進行度推定
 
-[English](../../en/shogi/kp-absolute-progress.md) / **日本語**
+<a href="../../en/shogi/kp-absolute-progress.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 bullet-shogi が採用している進行度推定方式の 1 つである **KP絶対（KP Absolute）**
 ベースのロジスティック回帰について、概念・仕様・利用上の注意点を解説する。

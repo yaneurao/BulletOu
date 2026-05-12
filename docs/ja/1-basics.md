@@ -1,6 +1,6 @@
 # 1. NNUE の基礎
 
-[English](../en/1-basics.md) / **日本語**
+<a href="../en/1-basics.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ## 単純なフィードフォワードネットワーク
 

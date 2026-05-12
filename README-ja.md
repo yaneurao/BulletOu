@@ -2,9 +2,9 @@
 
 # BulletOu
 
-</div>
+<a href="README.md"><img alt="Read in English" src="https://img.shields.io/badge/README-English-DC2626?style=flat-square"></a>
 
-[English](README.md) / **日本語**
+</div>
 
 **将棋エンジン用の NNUE 評価値ネットワーク**を学習するための、Rust 製ドメイン特化型 ML ライブラリ。やねうら王 ([YaneuraOu](https://github.com/yaneurao/YaneuraOu)) との組み合わせで使用することを想定している。
 

@@ -1,6 +1,6 @@
 # 学習済みネットワーク
 
-[English](../en/4-saved-networks.md) / **日本語**
+<a href="../en/4-saved-networks.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ## チェックポイントのレイアウト
 

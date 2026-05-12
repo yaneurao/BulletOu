@@ -1,5 +1,7 @@
 # Getting Started
 
+<a href="../ja/2-getting-started.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+
 ### Installing Rust
 
 Install Rust via [rustup](https://www.rust-lang.org/tools/install) (this is the official way to install rust).

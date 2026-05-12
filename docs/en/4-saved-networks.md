@@ -1,5 +1,7 @@
 # Saved Networks
 
+<a href="../ja/4-saved-networks.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+
 ## Checkpoint Layout
 
 When a checkpoint is saved to a directory `<out_dir>/<checkpoint_name>`, it will contain

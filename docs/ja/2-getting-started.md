@@ -1,6 +1,6 @@
 # はじめかた
 
-[English](../en/2-getting-started.md) / **日本語**
+<a href="../en/2-getting-started.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 ### Rust をインストールする
 
