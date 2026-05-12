@@ -26,7 +26,7 @@ git merge upstream/shogi-support
 
 ### NNUE / 評価値ネットワーク学習での使い方
 
-最初に [docs/ja/](docs/ja/) のドキュメントに目を通すことを推奨。ビルド方法、教師データの扱い、ネットワークの出力フォーマットなど主要な情報を扱う (※ 一部のドキュメントは現状英語版のみ。順次翻訳予定)。
+最初に [docs/ja/](docs/ja/) のドキュメントに目を通すことを推奨。ビルド方法、教師データの扱い、ネットワークの出力フォーマットなど主要な情報を扱う。
 
 通常はリポジトリを clone し、[examples](/examples) のいずれかを自分の目的に合わせて編集して使う。上流からの pull で消えにくい独自 example を作りたい場合は、[`bullet_lib` の `Cargo.toml`](crates/bullet_lib/Cargo.toml) に example を登録する。
 
