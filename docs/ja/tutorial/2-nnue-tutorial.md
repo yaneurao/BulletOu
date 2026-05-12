@@ -28,213 +28,95 @@
 
 ## 2.2 学習データを用意する
 
-以下のいずれかが必要:
+`.pack` / `.hcpe` / `.hcpe3` のいずれかのファイルが必要。
 
-- **`.pack`** — やねうら王の `gensfen` が出す **ゲーム単位の可変長フォーマット**。1 ファイルレコード = 1 ゲーム (start_flag + (平手以外なら) hcp/ply + (move16, eval) × moveNum + 終局マーカー)。`ShogiPackLoader` がゲームを ply 単位に展開する。
-- **`.hcpe`** — dlshogi 系の **38 byte 固定長レコード**形式 (HCP + eval + bestMove16 + gameResult)。
-- **`.hcpe3`** — dlshogi 系の **ゲーム単位可変長**形式 (ゲームヘッダ + moveNum × MoveInfo + ply ごとの MoveVisits)。
-
-> ⚠️ `.pack` は「PackedSfenValue が連続したファイル」では **ない**。`PackedSfenValue` は **トレーナの内部単位** (40 byte 固定長レコード)、`.pack` は **ファイル形式** で別物。詳細は [概要](0-overview.md#学習データはどこから来るか) 参照。
-
-3 つすべてに対応。自分が使うジェネレータ (または手持ちの共有データセット) に合わせて選ぶ。
-
-入手方法:
-
-- **自分で生成** — やねうら王の `gensfen` (`.pack`) または dlshogi 系のデータ生成 (`.hcpe` / `.hcpe3`) を使う。各プロジェクトのドキュメント参照。典型的な規模は数億局面だが、チュートリアル目的なら 1000 万〜1 億局面で十分
-- **共有データセットを使う** — 将棋コミュニティでは `.pack` / `.hcpe` / `.hcpe3` のいずれも共有されている。出所が信頼できることを確認
+- **自分で生成** — [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `gensfen` スクリプトで `.pack` を出力するか、dlshogi 系のデータ生成で `.hcpe` / `.hcpe3` を作る。チュートリアル目的なら 1000 万〜1 億局面で十分。
+- **共有データセットを使う** — 将棋コミュニティでは各フォーマットのデータが共有されている。
 
 本チュートリアルでは以下を仮定:
 
 ```
-/data/shogi/raw.pack    # または
-/data/shogi/raw.hcpe    # または
-/data/shogi/raw.hcpe3
+/data/shogi/raw.pack
 ```
 
-(パスは任意。自分の環境に合わせて読み替える。)
+(`.hcpe` / `.hcpe3` でも同様に動く。パスは自分の環境に読み替える。)
 
-### まずは小さなテストデータで
+### 小さなサブセットで動作確認したい場合
 
-データセットが巨大 (数十 GB) なときは、最初に小さなサブセットで動作確認すると楽。
-
-- **`.hcpe`** (固定 38 byte) は単に先頭を切り出せばよい:
-  ```bash
-  head -c $((38 * 10000000)) /data/shogi/raw.hcpe > /tmp/small.hcpe
-  ```
-  これで先頭 1000 万レコード分。
-
-- **`.pack` / `.hcpe3`** (ゲーム単位の可変長) は、バイト単位で切り出すとゲーム境界が壊れるので NG。`gensfen` で直接小さな `.pack` を生成するか、`--batches-per-superbatch` で 1 superbatch あたりの消費量を抑えるかのいずれか (§2.3 参照)。
+巨大なデータセット (数十 GB) でいきなり動かす前に、小さなサブセットで試したいときは、`gensfen` 等で小さめのファイルを生成するか、`--batches-per-superbatch` を指定して 1 superbatch あたりの消費量を絞る (§2.4 参照)。
 
 ## 2.3 NNUE 学習を走らせる
 
-データ形式に応じて、最小例が 2 つ用意されている:
+データ形式に応じて example を選ぶ:
 
-- **`shogi_simple`** — `.bin` (bullet-utils の変換で生成される `PackedSfenValue` 連続ファイル) または `.pack` (やねうら王 `gensfen` のゲーム単位可変長) を読み込む。
-- **`shogi_simple_hcpe`** — `.hcpe` (dlshogi 系の 38 byte 固定長) を読み込む。
+- **`shogi_simple`** — `.pack` を読む
+- **`shogi_simple_hcpe`** — `.hcpe` を読む
 
-データに合わせて選ぶ。ネット構造と学習ループはほぼ同じ。
-
-### パターン A: `.pack` (やねうら王 gensfen) の場合
+### `.pack` の場合
 
 ```bash
 cargo run --release --features cuda --example shogi_simple -- \
-  --data /tmp/small.pack \
-  --output checkpoints/my-first-shogi-net
+    --data /data/shogi/raw.pack \
+    --output checkpoints/my-first-shogi-net \
+    --superbatches 40
 ```
 
 (AMD GPU なら `--features cuda` を `--features rocm` に。)
 
-### パターン B: `.hcpe` (dlshogi 系) の場合
+### `.hcpe` の場合
 
 ```bash
 cargo run --release --features cuda --example shogi_simple_hcpe -- \
-  --data /data/shogi/train.hcpe \
-  --output checkpoints/my-first-shogi-net-hcpe
+    --data /data/shogi/raw.hcpe \
+    --output checkpoints/my-first-shogi-net \
+    --superbatches 40
 ```
-
-`shogi_simple_hcpe` は、各 HCPE レコード (Apery 系 HCP + eval + bestMove16 + gameResult) を内部で PackedSfenValue にデコードしてから、`shogi_simple` と同じ `ShogiHalfKA_hm` 特徴量 + SCReLU + dual-perspective + 出力 1 のネットに流す。`--data-format` のような切り替えはなく、ファイルは hcpe 固定 (シンプルさを優先した設計)。
 
 HCPE 固有の制約:
 
-- HCPE には `game_ply` 情報がないので、Layer Stack の `ply9` bucket は使えない (この最小例は bucket を使わない)
-- HCPE には policy teacher (MoveVisits) がない。value 学習のみが対象 (policy 教師込みの学習は HCPE3 を使う)
-
-本格学習では `--data` をフルデータセットに差し替え、`small.pack` / `small.hcpe` 工程を省略する。
+- HCPE には `game_ply` 情報がないので、`game_ply` を使う bucket (Layer Stack の `ply9` 等) は使えない (この最小例は bucket を使わない)
+- HCPE には policy teacher が存在しないので value 学習のみ。policy 教師込みの学習が必要なら HCPE3 を使う
 
 動いていれば以下のような出力:
 
 ```
-loaded 73305 input features (ShogiHalfKA_hm)
 superbatch 1 / 40   pos = ... pos/s = ...   loss = ...
 superbatch 2 / 40   ...
 ```
 
 `pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で smoke test 構成なら数千万 pos/s 出る。下位 GPU では比例して低下。
 
-## 2.4 学習の単位 — batch / superbatch / save / LR の関係
+## 2.4 学習スケジュール
 
-ログに出てくる `superbatch 1 / 40` の「superbatch」は何か、`--batch-size` と `--batches-per-superbatch` と `--superbatches` がそれぞれ何を意味するのか、ここで一括して整理する。これは本家 jw1912/bullet 由来の概念で、bullet-shogi / BulletOu でもそのまま使われている。
+ログに出てくる `superbatch 1 / 40` の「superbatch」は **checkpoint や学習率を更新するためのまとまり**で、デフォルトで約 1 億局面ぶん。学習の長さは `--superbatches` で指定する。
 
-### 2.4.1 3 つの単位
+主要なフラグ:
 
-```
-batch (= mini-batch, 1 gradient step)
-  └─ 16384 局面 を 1 回 forward + backward + optimizer step
-        │
-        │ × batches_per_superbatch 回
-        ▼
-superbatch
-  └─ デフォルト ≈ 100M 局面 (= 6104 batches × 16384 局面/batch)
-        │
-        │ × superbatches 回
-        ▼
-学習全体 (end_superbatch まで)
-```
-
-| CLI フラグ | 意味 | デフォルト |
+| フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--batch-size` | 1 gradient step の局面数 (= mini-batch size)。GPU メモリと収束特性を決める | `16384` |
-| `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数。**未指定なら `ceil(100_000_000 / batch_size)`** が入る | (自動) |
-| `--superbatches` | 走らせる superbatch の総数 (= `end_superbatch`)。学習全体の長さを決める | 例によるが KK/KKP 例では `10` |
+| `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
+| `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
+| `--superbatches` | 走らせる superbatch の総数 | 10 |
+| `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
+| `--lr` / `--lr-gamma` / `--lr-step` | StepLR (`lr-step` superbatch ごとに `lr-gamma` 倍) | 0.001 / 0.1 / 8 |
+| `--start-wdl` / `--end-wdl` | WDL (eval スコア vs 対局結果の blend 比率) を `--superbatches` の区間で線形補間 | 0.0 / 1.0 |
 
-`batches_per_superbatch` のデフォルト式は **「1 superbatch ≒ 1 億局面に揃える」** 設計。`--batch-size` をいじっても 1 superbatch あたりの局面数 (≈100M) はほぼ不変になる。これは本家 bullet のチェス NNUE 文化での暗黙のスケール感で、`bullet/examples/progression/1_simple.rs` 等では `batches_per_superbatch: 6104` がハードコードされている。
+実行例:
 
-### 2.4.2 superbatch は「epoch」と同じか?
-
-**完全には一致しない**。標準 ML 用語の epoch は「データセット全体を 1 周」だが、bullet の superbatch は **データセットサイズに関係なく「~100M 局面」固定**。
-
-- 教師データが 50M 局面しかなければ、1 superbatch でデータ 2 周ぶん回す (loader が末尾に達したら頭から再シャッフルする実装)
-- 教師データが 1B 局面あれば、1 superbatch でデータの 1/10 しか触れない
-
-実用上は **「checkpoint / LR / WDL の更新タイミングの単位」** と捉えるのが正確。
-
-### 2.4.3 checkpoint 保存タイミング — `--save-rate`
-
-```
---save-rate 1   →  毎 superbatch で保存
---save-rate 5   →  5 superbatch ごとに保存
---save-rate 0   →  最終 superbatch のみ保存 (途中保存なし)
+```bash
+--batch-size 16384 --batches-per-superbatch 6104 --superbatches 40
+# = 1 superbatch ≒ 1 億局面、合計 40 億局面
 ```
 
-各保存ポイントで `checkpoints/<net-id>-<superbatch>/` ディレクトリが作られ、その中に `raw.bin` / `quantised.bin` / `optimiser_state/` (＋ KPPT 系の例では `KK_synthesized.bin` / `KKP_synthesized.bin`) が書き出される。
-
-最終 superbatch (`end_superbatch`) は `--save-rate` の値に関わらず必ず保存される (`should_save` の OR 条件)。
-
-### 2.4.4 LR スケジューラの時間軸
-
-bullet の LR スケジューラはすべて `lr(batch, superbatch) -> f32` で値を返す関数で、**ほぼすべて `superbatch` をキー**にする (`Warmup` だけ batch 軸も使う)。詳細:
-
-| スケジューラ | 挙動 | CLI | 終端 superbatch 要求 |
-|---|---|---|---|
-| `ConstantLR` | 固定 | (該当フラグなし) | × |
-| `StepLR` | `step` superbatch ごとに `gamma` 倍 | `--lr` / `--lr-gamma` / `--lr-step` (現状 KK/KKP 例で使用) | × |
-| `DropLR` | `drop` superbatch で 1 回だけ `gamma` 倍 | — | × |
-| `LinearDecayLR` | `final_superbatch` まで線形補間 | — | **要** |
-| `CosineDecayLR` | 同、cosine 曲線 | — | **要** |
-| `ExponentialDecayLR` | 同、指数補間 | — | **要** |
-| `Warmup<LR>` | 最初の N batch だけ線形立ち上げ後、内側スケジューラへ | — | 内側依存 |
-
-`shogi_kk_kkp_train` のデフォルト `--lr 0.001 --lr-gamma 0.1 --lr-step 8` だと、1〜8 superbatch は `0.001`、9〜16 は `0.0001`、17〜24 は `0.00001`、... と毎 8 superbatch で 1/10 になる。`--superbatches 3` だと一度も下がらず学習が終わる。
-
-### 2.4.5 WDL スケジューラの時間軸
-
-WDL (Win/Draw/Loss = ゲーム結果ラベルへの blend 比率) も `superbatch` を時間軸として動く。デフォルト:
-
-```
---start-wdl 0.0  --end-wdl 1.0
-```
-
-これは「最初の superbatch は **eval スコアだけ**、最後の superbatch は **対局結果だけ**、間は線形補間」という指定。終端は `end_superbatch` (= `--superbatches`) を使うので、`--superbatches` を変えると WDL の傾きも自動で追従する。
-
-### 2.4.6 具体例
-
-```
---batch-size 16384
---batches-per-superbatch 100      ← 通常はもっと大きい (6104 がデフォルト)
---superbatches 3
---save-rate 1
---lr 0.001 --lr-gamma 0.1 --lr-step 8
---start-wdl 0.0 --end-wdl 1.0
-```
-
-意味:
-
-```
-1 superbatch  = 100 batches × 16384 局面 = 1,638,400 局面 (≈ 1.6M)
-学習全体     = 3 superbatches × 1.6M     = 4,915,200 局面 (≈ 4.9M)
-checkpoint   = sb=1, sb=2, sb=3 で計 3 回保存
-LR           = 全 superbatch 通じて 0.001 (8 sb 毎の drop が発火しない)
-WDL          = sb=1 で 0.0、sb=2 で 0.5、sb=3 で 1.0
-```
-
-なお、本格学習で「1 superbatch ≒ 100M 局面」スケールに戻すなら `--batches-per-superbatch` を **指定しない**のが正解 (= 自動で 6104 になる)。
+スケジューラの詳細 (Cosine / Linear / Warmup 等) は [リファレンス](../) を参照。
 
 ## 2.5 出力を確認する
 
-学習完了 (または checkpoint 保存) のたびに、`checkpoints/my-first-shogi-net/` に以下が出る:
-
-```
-my-first-shogi-net-final/
-├── raw.bin                ← float 重み (ここから再開可能)
-├── quantised.bin          ← 整数重み (rshogi 互換)
-└── optimiser_state/
-    ├── weights.bin
-    ├── moment1.bin
-    └── ...
-```
-
-- `quantised.bin` を対局時にエンジンが読む
-- `raw.bin` と `optimiser_state/` の組み合わせで、ここから学習を厳密に再開できる
+学習完了 (および各 checkpoint) のたびに、`checkpoints/my-first-shogi-net/` 配下に **`nn.bin`** が書き出される。これがやねうら王エンジンが対局時に読み込む NNUE 評価関数パラメーターファイル。
 
 ## 2.6 エンジンに組み込む
 
-具体的な手順はエンジンに依存する。やねうら王互換 NNUE 消費の典型手順:
-
-1. 必要なら `quantised.bin` をエンジンが想定する NN ファイル形式に変換する (BulletOu は rshogi 互換レイアウトで書く。やねうら王が読むには薄い変換層が要るかもしれない)
-2. エンジンが探す場所にファイルを置く
-3. ちょっとした対局や `bench` でロードできることを確認
-
-> エンジンへの組み込み自体は現状 BulletOu の範囲外 — トレーナーの仕事は `quantised.bin` を書くところで終わる。特定エンジンへ繋ぐのはエンジンごとの作業。
+やねうら王エンジンが eval ファイルを探す場所 (通常 `eval/nn.bin`) に学習結果の `nn.bin` を置き、エンジンを起動して `bench` や簡易対局でロードを確認する。具体的なファイル配置はエンジンの設定 (`EvalDir` 等) に依存するのでエンジン側のドキュメントを参照。
 
 ## 2.7 本番構成にステップアップする
 

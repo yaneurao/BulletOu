@@ -22,36 +22,20 @@ Still useful today:
 
 ## Structural difference from NNUE
 
-NNUE is a "**sparse feature transformer + small MLP**" -- a standard NN shape.
+NNUE is a "sparse feature transformer + small MLP" — a standard NN shape. KPPT is a different family: **no hidden layer at all, just a sum of three huge sparse lookup tables (KK / KKP / KPP)** for the evaluation score.
 
-KPPT is "**a sum of huge sparse embedding tables, no hidden layer**":
+## Output files
 
-```
-eval(pos) = KK[bk][wk]
-          + Σ_i KKP[bk][wk][p_i]
-          + Σ_{i<j} KPP[bk][p_i][p_j]
-          + (turn term T)
-```
+Training writes a three-file set into the checkpoint directory:
 
-No hidden layer in the NN sense -- just a sum of large lookup tables.
+| File | Size |
+|---|---|
+| `KK_synthesized.bin` | 51 KB |
+| `KKP_synthesized.bin` | 77 MB |
+| `KPP_synthesized.bin` (KPPT) | 740 MB |
+| `KPP_synthesized.bin` (KPP_KKPT) | 388 MB |
 
-The biggest table (`KPP`) is `81 × 1548 × 1548 = 194,100,624` dims = 776 MB at f32, ~2.3 GB on GPU including Adam state.
-
-## File formats (confirmed from YaneuraOu source)
-
-From `source/eval/kppt/evaluate_kppt.h` and `eval/kpp_kkpt/evaluate_kpp_kkpt.h`:
-
-| File | KPPT type | KPP_KKPT type | Size |
-|---|---|---|---|
-| `KK_synthesized.bin` | `int32_t kk[81][81][2]` | identical | 51 KB |
-| `KKP_synthesized.bin` | `int32_t kkp[81][81][1548][2]` | identical | 77 MB |
-| `KPP_synthesized.bin` | `int16_t kpp[81][1548][1548][2]` | `int16_t kpp[81][1548][1548]` | **740 MB / 388 MB** |
-
-The trailing `[2]` is `[stm_independent, stm_dependent]` (turn-independent + turn-dependent term).
-- **KPPT**: KPP has a turn channel.
-- **KPP_KKPT**: KPP has *no* turn channel; the turn term lives in KK and KKP only.
-
-BulletOu trains **only `[0]` (the turn-independent term)**; `[1]` (the turn-dependent term) is written as 0.
+KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel, halving its size. KK and KKP files are identical between the two families.
 
 ## Actual usage
 
@@ -160,17 +144,13 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
-For the meaning of the scheduling units, see [2.4 Training units](2-nnue-tutorial.md#24-training-units--batch--superbatch--save--lr).
+For the meaning of the scheduling units, see [§2.4 Training schedule](2-nnue-tutorial.md#24-training-schedule).
 
 ## Memory requirements
 
-| Component | Weights | f32 weights | + Adam (3× state) | Suggested GPU mem |
-|---|---|---|---|---|
-| KK | 6,561 | 26 KB | 78 KB | almost anything |
-| KKP | 10,156,428 | 40 MB | 120 MB | 4 GB+ |
-| KPP | 194,100,624 | 776 MB | 2.33 GB | **8 GB+ recommended** (sparse buffers add ~100 MB more) |
+KK and KKP training are tiny on GPU memory (any 4 GB+ card is plenty).
 
-`max_active = 703` for KPP (= C(38, 2), the unordered pair count of non-king BonaPieces), so at `batch_size = 16384` the GPU-side sparse index buffer is ~92 MB.
+**KPP uses roughly 2.3 GB of GPU memory**, so an **8 GB+ GPU is recommended**.
 
 ## Hyperparameter guidance
 

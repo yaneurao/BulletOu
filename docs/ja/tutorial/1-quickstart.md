@@ -106,7 +106,7 @@ superbatch 2 ...
 ...
 ```
 
-`checkpoints/` ディレクトリが作られ、各 checkpoint に `raw.bin`、`quantised.bin`、`optimiser_state/` が入っている。
+`checkpoints/` ディレクトリが作られ、学習結果のファイル群が書き出されている。
 
 > `simple` example は **チェス** であって将棋ではない。上流由来で残っているもの。これがエンドツーエンドで動く最小の example なので、smoke test に使っている。将棋 example は次の章で。
 

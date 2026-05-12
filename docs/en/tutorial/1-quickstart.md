@@ -106,7 +106,7 @@ superbatch 2 ...
 ...
 ```
 
-and the example will create a `checkpoints/` directory containing `raw.bin`, `quantised.bin`, and `optimiser_state/` for each saved checkpoint.
+and a `checkpoints/` directory containing the trained output is created.
 
 > The `simple` example is **chess**, not shogi. It exists upstream and we keep it because it is the smallest end-to-end example. The shogi examples come next.
 

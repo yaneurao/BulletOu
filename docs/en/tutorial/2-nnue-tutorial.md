@@ -28,229 +28,95 @@ If you want to skip ahead to a stronger configuration, the example `shogi_layers
 
 ## 2.2 Get training data
 
-You need either:
+You need a `.pack`, `.hcpe`, or `.hcpe3` file.
 
-- **`.pack`** — the **per-game variable-length** format produced by YaneuraOu's
-  `gensfen` command. One file record = one game (start_flag + optional
-  hcp/ply + (move16, eval) × moveNum + terminator). `ShogiPackLoader` expands
-  each game into per-ply records on the fly.
-- **`.hcpe`** — the dlshogi-style **38-byte fixed-length** record format
-  (HCP + eval + bestMove16 + gameResult).
-- **`.hcpe3`** — the dlshogi-style **per-game variable-length** format
-  (game header + moveNum × MoveInfo + per-ply MoveVisits).
-
-> ⚠️ `.pack` is **not** "a file of PackedSfenValue records". A `PackedSfenValue`
-> is the 40-byte fixed-length internal unit that the trainer consumes once a
-> loader has decoded the file. The two are different things — see the
-> [Overview](0-overview.md#where-the-data-comes-from) for the distinction.
-
-All three are supported; the choice depends on which generator you used (or
-which shared dataset you have).
-
-Options for obtaining data:
-
-- **Generate your own** with YaneuraOu's `gensfen` (`.pack`) or dlshogi's data generator (`.hcpe` / `.hcpe3`). See each project's documentation; a few hundred million positions is the typical scale, but for this tutorial even 10–100 million is enough.
-- **Use a shared dataset**. The shogi community shares `.pack`, `.hcpe`, and `.hcpe3` files on various sites. Make sure the source is trustworthy.
+- **Generate your own** — `.pack` is produced by the `gensfen` script in [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection); `.hcpe` / `.hcpe3` come from dlshogi-style generators. For this tutorial, 10–100 million positions is enough.
+- **Use a shared dataset** — the shogi community shares files in all three formats.
 
 For this walkthrough we'll assume:
 
 ```
-/data/shogi/raw.pack    # or
-/data/shogi/raw.hcpe    # or
-/data/shogi/raw.hcpe3
+/data/shogi/raw.pack
 ```
 
-(Path can be anywhere; substitute your own.)
+(`.hcpe` / `.hcpe3` work the same way. Substitute your own path.)
 
-### Tiny test data first
+### Trying with a small subset first
 
-If your full dataset is huge (tens of GB), it is convenient to first run with a small subset to make sure the command line works.
-
-- For **`.hcpe`** (fixed 38-byte records) you can just take the head of the
-  file:
-  ```bash
-  head -c $((38 * 10000000)) /data/shogi/raw.hcpe > /tmp/small.hcpe
-  ```
-  i.e. the first 10 million records.
-
-- For **`.pack` / `.hcpe3`** (variable-length per game), you cannot byte-slice
-  the file safely without breaking a game record boundary. Either generate a
-  smaller `.pack` from `gensfen` directly, or use `--batches-per-superbatch`
-  to cap how much data the trainer actually consumes per superbatch (covered
-  in §2.3).
+Before running on a huge dataset, you can try a smaller subset by generating a smaller `.pack` from `gensfen`, or by limiting `--batches-per-superbatch` so each superbatch consumes less data (see §2.4).
 
 ## 2.3 Run NNUE training
 
-BulletOu provides two minimal examples depending on what your training data format is:
+Pick the example matching your data format:
 
-- **`shogi_simple`** — reads `.bin` (a flat dump of `PackedSfenValue` records,
-  produced by bullet-utils' format converters) or `.pack` (per-game variable-
-  length, from YaneuraOu's `gensfen`).
-- **`shogi_simple_hcpe`** — reads `.hcpe` (dlshogi-style 38-byte fixed-length).
+- **`shogi_simple`** — reads `.pack`
+- **`shogi_simple_hcpe`** — reads `.hcpe`
 
-Pick whichever matches your data; otherwise the network shape and training loop are equivalent.
-
-### Option A: `.pack` data (yaneurao gensfen)
+### `.pack`
 
 ```bash
 cargo run --release --features cuda --example shogi_simple -- \
-  --data /tmp/small.pack \
-  --output checkpoints/my-first-shogi-net
+    --data /data/shogi/raw.pack \
+    --output checkpoints/my-first-shogi-net \
+    --superbatches 40
 ```
 
 (Use `--features rocm` instead of `cuda` for AMD GPUs.)
 
-### Option B: `.hcpe` data (dlshogi-style)
+### `.hcpe`
 
 ```bash
 cargo run --release --features cuda --example shogi_simple_hcpe -- \
-  --data /data/shogi/train.hcpe \
-  --output checkpoints/my-first-shogi-net-hcpe
+    --data /data/shogi/raw.hcpe \
+    --output checkpoints/my-first-shogi-net \
+    --superbatches 40
 ```
 
-`shogi_simple_hcpe` decodes each HCPE record (Apery-style HCP + eval + bestMove16 + gameResult) into the same internal PackedSfenValue used by `shogi_simple`, then feeds it into the same `ShogiHalfKA_hm` feature transformer and SCReLU + dual-perspective + 1-output network. There is no `--data-format` switch — the example is hcpe-only by design.
-
-Caveats specific to HCPE:
+HCPE-specific caveats:
 
 - HCPE has no `game_ply`, so the Layer Stack `ply9` bucket cannot be used (this minimal example uses no bucketing).
-- HCPE has no policy teacher (MoveVisits); value-only training (use HCPE3 if you need a policy teacher).
-
-For real training you would replace `--data` with your full dataset and remove the `small.pack` / `small.hcpe` step.
+- HCPE has no policy teacher; value-only training (use HCPE3 if you need a policy teacher).
 
 While it runs, you should see:
 
 ```
-loaded 73305 input features (ShogiHalfKA_hm)
 superbatch 1 / 40   pos = ... pos/s = ...   loss = ...
 superbatch 2 / 40   ...
 ```
 
 `pos/s` (positions per second) is the rough training-speed indicator. On a single RTX 4090 the smoke-test configuration runs in the tens-of-millions of pos/s range; on slower GPUs proportionally less.
 
-## 2.4 Training units — batch / superbatch / save / LR
+## 2.4 Training schedule
 
-The log line `superbatch 1 / 40` raises an obvious question: what *is* a superbatch, and what do `--batch-size`, `--batches-per-superbatch`, and `--superbatches` each mean? This section answers all of that at once. The concepts come from upstream jw1912/bullet and are inherited unchanged by bullet-shogi / BulletOu.
+The `superbatch 1 / 40` in the log is **the unit at which checkpoints and learning rate are updated**, about 100M positions by default. Total training length is set by `--superbatches`.
 
-### 2.4.1 The three units
+Main flags:
 
-```
-batch (= mini-batch, one gradient step)
-  └─ 16384 positions: one forward + backward + optimizer step
-        │
-        │ × batches_per_superbatch
-        ▼
-superbatch
-  └─ default ≈ 100M positions  (= 6104 batches × 16384 positions/batch)
-        │
-        │ × superbatches
-        ▼
-entire training (up to end_superbatch)
-```
-
-| CLI flag | Meaning | Default |
+| Flag | Meaning | Default |
 |---|---|---|
-| `--batch-size` | Positions per gradient step (= mini-batch size). Sets GPU memory pressure and convergence behaviour. | `16384` |
-| `--batches-per-superbatch` | Number of mini-batches that form one superbatch. **If unspecified, it is set to `ceil(100_000_000 / batch_size)`** automatically. | (auto) |
-| `--superbatches` | Total superbatches to run (= `end_superbatch`). Sets the overall training length. | example-dependent; `10` in the KK/KKP examples |
+| `--batch-size` | Positions per gradient step | 16384 |
+| `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
+| `--superbatches` | Total superbatches | 10 |
+| `--save-rate` | Save a checkpoint every N superbatches | 1 |
+| `--lr` / `--lr-gamma` / `--lr-step` | StepLR (multiply by `lr-gamma` every `lr-step` superbatches) | 0.001 / 0.1 / 8 |
+| `--start-wdl` / `--end-wdl` | WDL (blend ratio between eval score and game result) interpolated linearly across `--superbatches` | 0.0 / 1.0 |
 
-The default formula for `batches_per_superbatch` is designed to **keep one superbatch at roughly 100M positions**. Changing `--batch-size` does not significantly change the positions-per-superbatch count. This is the implicit scale in upstream bullet's chess NNUE culture — `bullet/examples/progression/1_simple.rs` and friends hard-code `batches_per_superbatch: 6104`.
+Example invocation:
 
-### 2.4.2 Is a superbatch the same as an epoch?
-
-**Not exactly.** In standard ML terminology, an epoch is "one full pass through the dataset". A bullet superbatch, in contrast, is **a fixed ~100M-position chunk regardless of dataset size**.
-
-- With 50M training positions, one superbatch sweeps through the data ~2× (loaders reshuffle and continue from the start when they hit EOF).
-- With 1B training positions, one superbatch only touches ~10% of the data.
-
-The accurate mental model: a superbatch is **the unit at which checkpoints / LR / WDL are updated**, not a pass through the data.
-
-### 2.4.3 Checkpoint timing — `--save-rate`
-
-```
---save-rate 1   →  save every superbatch
---save-rate 5   →  save every 5 superbatches
---save-rate 0   →  save only the final superbatch
+```bash
+--batch-size 16384 --batches-per-superbatch 6104 --superbatches 40
+# = 1 superbatch ≒ 100M positions, total 4 billion positions
 ```
 
-Each save point creates a `checkpoints/<net-id>-<superbatch>/` directory containing `raw.bin` / `quantised.bin` / `optimiser_state/` (plus, in the KPPT examples, `KK_synthesized.bin` / `KKP_synthesized.bin`).
-
-The final superbatch (`end_superbatch`) is always saved regardless of `--save-rate` (the `should_save` check is an OR).
-
-### 2.4.4 LR scheduler time axis
-
-Every bullet LR scheduler is a function `lr(batch, superbatch) -> f32`, and **virtually all of them key off `superbatch`** (only `Warmup` also uses the batch axis):
-
-| Scheduler | Behaviour | CLI | Requires final superbatch? |
-|---|---|---|---|
-| `ConstantLR` | fixed value | (no direct flag) | no |
-| `StepLR` | multiply by `gamma` every `step` superbatches | `--lr` / `--lr-gamma` / `--lr-step` (used by KK/KKP examples) | no |
-| `DropLR` | multiply by `gamma` once at superbatch `drop` | — | no |
-| `LinearDecayLR` | linear interpolate to `final_lr` by `final_superbatch` | — | **yes** |
-| `CosineDecayLR` | same, cosine curve | — | **yes** |
-| `ExponentialDecayLR` | same, exponential | — | **yes** |
-| `Warmup<LR>` | linear warmup over N batches, then defer to inner | — | inner-dependent |
-
-With the `shogi_kk_kkp_train` defaults `--lr 0.001 --lr-gamma 0.1 --lr-step 8`, the LR is `0.001` for superbatches 1–8, `0.0001` for 9–16, `0.00001` for 17–24, and so on — each `step` drops it by a factor of `gamma`. With `--superbatches 3` the drop never triggers and LR stays at `0.001` throughout.
-
-### 2.4.5 WDL scheduler time axis
-
-WDL (the blend ratio between eval score and game result label) is also indexed by superbatch. The default:
-
-```
---start-wdl 0.0  --end-wdl 1.0
-```
-
-means "first superbatch trains on **eval only**, last superbatch trains on **game result only**, linear interpolation in between." The endpoint is `end_superbatch` (= `--superbatches`), so changing `--superbatches` automatically rescales the WDL ramp.
-
-### 2.4.6 Worked example
-
-```
---batch-size 16384
---batches-per-superbatch 100      ← much smaller than the default 6104
---superbatches 3
---save-rate 1
---lr 0.001 --lr-gamma 0.1 --lr-step 8
---start-wdl 0.0 --end-wdl 1.0
-```
-
-Concretely:
-
-```
-1 superbatch  = 100 batches × 16384 positions = 1,638,400 positions (≈ 1.6M)
-total run     = 3 superbatches × 1.6M         = 4,915,200 positions (≈ 4.9M)
-checkpoints   = saved at sb=1, sb=2, sb=3 (three saves)
-LR            = 0.001 throughout (step=8 never triggers within 3 superbatches)
-WDL           = 0.0 at sb=1, 0.5 at sb=2, 1.0 at sb=3
-```
-
-For real training at the "~100M positions per superbatch" scale, **omit `--batches-per-superbatch`** so it defaults to `6104` for the standard `--batch-size 16384`.
+Scheduler details (Cosine / Linear / Warmup, etc.) live in the [reference](../).
 
 ## 2.5 Inspect the output
 
-When training finishes (or at every saved checkpoint), `checkpoints/my-first-shogi-net/` will contain:
-
-```
-my-first-shogi-net-final/
-├── raw.bin                ← float weights (resume from here)
-├── quantised.bin          ← integer weights (rshogi-compatible)
-└── optimiser_state/
-    ├── weights.bin
-    ├── moment1.bin
-    └── ...
-```
-
-- `quantised.bin` is what an engine will load at play time.
-- `raw.bin` and `optimiser_state/` together let you resume training from this exact point.
+At every checkpoint (and at the end of training), BulletOu writes **`nn.bin`** under `checkpoints/my-first-shogi-net/` — this is the NNUE evaluation parameter file that a YaneuraOu engine loads at play time.
 
 ## 2.6 Try it in an engine
 
-The exact integration depends on the engine. For YaneuraOu-compatible NNUE consumption, the typical steps are:
-
-1. Convert `quantised.bin` to the engine's expected NN file format if needed (BulletOu writes the rshogi-compatible layout; YaneuraOu may need a thin adapter).
-2. Place the file where the engine looks for it.
-3. Run a quick game or `bench` to confirm it loads without error.
-
-> Engine integration is currently outside the scope of BulletOu itself — the trainer's job ends at writing `quantised.bin`. Plumbing it into a specific engine is a per-engine task.
+Place the trained `nn.bin` where the YaneuraOu engine expects its eval file (typically `eval/nn.bin`; the exact location is controlled by the `EvalDir` setting or similar — consult the engine's documentation), then launch the engine and confirm it loads with a quick `bench` or test game.
 
 ## 2.7 Stepping up to the production setup
 

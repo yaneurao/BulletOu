@@ -28,50 +28,33 @@ BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継�
 
 ## 学習データはどこから来るか
 
-BulletOu は複数の将棋学習データフォーマットを読み込める。主なものは:
+BulletOu は以下のいずれかのフォーマットで学習データを読み込める:
 
-- **`.pack`** — やねうら王の `gensfen` コマンドが生成する **ゲーム単位の可変長フォーマット**。1 レコード = 1 ゲーム:
-  `[start_flag (u8)][hcp+gamePly (平手以外のとき)][move16, eval] × moveNum [終局マーカー]`。
-  `ShogiPackLoader` が読み込み時にゲームを ply 単位に展開する。
-- **`.hcpe` / `.hcpe3`** — dlshogi 系のフォーマット (それぞれ 38 byte 固定長レコード / ゲーム単位可変長)。`HcpeDataLoader` / `Hcpe3DataLoader` が直接読む。
+- **`.pack`** — [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `gensfen` スクリプトで生成
+- **`.hcpe`** / **`.hcpe3`** — dlshogi 系のフォーマット
 
-どの形式でも、トレーナの下流が見る **内部単位** は **`PackedSfenValue`** — 40 byte 固定長レコード
-(`[hcp: 32B][score: i16][move: u16][gamePly: u16][game_result: i8][padding: u8]`)。
-`.pack` / `.hcpe` / `.hcpe3` のいずれの loader も、内部で PackedSfenValue 列に展開する。ファイル形式とこの内部単位は別物なので混同しないこと:
-
-| 用語 | 何か |
-|---|---|
-| `.pack` | やねうら王の `gensfen` が出す **ゲーム単位**の可変長ファイル |
-| `PackedSfenValue` | トレーナ内部で扱う **局面単位**の 40 byte 固定長レコード |
-| `.psv` | PackedSfenValue 列をそのままファイルに dump したときに使うローカル拡張子 (cross-validation 用ツール等) |
-
-学習データは BulletOu には **同梱されていない**。やねうら王の `gensfen` で自分で生成するか、他者が共有している `.pack` / `.hcpe` / `.hcpe3` データセットを使う。
+学習データは BulletOu には同梱されていない。自分で生成するか、共有データセットを使う。
 
 ## 出力はどこに行くか
 
-学習が完了したとき (および途中のチェックポイントごとに)、BulletOu は以下を書き出す:
+学習が完了したとき (および途中のチェックポイントごとに)、BulletOu は対象の評価関数タイプに応じたバイナリファイルを書き出す。NNUE 系であれば **`nn.bin`** (やねうら王エンジンが対局時に読み込む評価関数パラメーターファイル)。KPPT 系であれば `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` の 3 ファイル。
 
-- `raw.bin` — float の生の重み (学習再開に使う)
-- `quantised.bin` — 量子化済み整数重み (推論に使う)
-- `optimiser_state/` — optimizer の内部状態 (学習再開に使う)
-
-将棋 NNUE の場合、エンジンが対局時に読むのは `quantised.bin`。具体的なエンジンへの組み込み方は、対象エンジンによる。やねうら王に対する組み込みについてはやねうら王側のドキュメントを参照。
+具体的なエンジンへの組み込み方はエンジン側のドキュメントを参照。
 
 ## 全体の流れ
 
 ```
 [ 学習データの生成・取得 ]
         │
-        │  やねうら王の gensfen → *.pack
+        │  YaneuraOu-ScriptCollection の gensfen スクリプト → *.pack
         ▼
 [ BulletOu で学習 ]              ← このチュートリアルの対象
         │
-        │  cargo run --release --example shogi_layerstack -- ...
+        │  cargo run --release --example ... -- --data ... --output ...
         ▼
-[ 出力ファイル ]
-        ├── raw.bin
-        ├── quantised.bin          ← 対局時にエンジンが読む
-        └── optimiser_state/
+[ 出力ファイル ]                  ← エンジンが対局時に読み込む
+        nn.bin (NNUE 系)
+        または KK_synthesized.bin / KKP_synthesized.bin / KPP_synthesized.bin (KPPT 系)
 ```
 
 このチュートリアルの残り:

@@ -22,36 +22,20 @@ BulletOu はやねうら王の旧 KPPT 系評価関数 (`KK_synthesized.bin` / `
 
 ## NNUE との構造の違い
 
-NNUE は「**疎特徴量変換器 + 小さい MLP**」 — 普通の NN 形状。
+NNUE は「疎特徴量変換器 + 小さい MLP」という普通の NN 形状。一方 KPPT は **隠れ層を持たず、巨大な疎ルックアップテーブル (KK / KKP / KPP) の和だけ**で評価値を作る、別系統の評価関数。
 
-KPPT は「**巨大な疎 embedding テーブルの和、隠れ層なし**」:
+## 出力ファイル
 
-```
-eval(pos) = KK[bk][wk]
-          + Σ_i KKP[bk][wk][p_i]
-          + Σ_{i<j} KPP[bk][p_i][p_j]
-          + (手番項 T)
-```
+学習後、checkpoint ディレクトリ配下に 3 ファイル組が書き出される:
 
-NN 的な「隠れ層」がない。巨大なルックアップテーブルの和だけ。
+| ファイル | サイズ |
+|---|---|
+| `KK_synthesized.bin` | 51 KB |
+| `KKP_synthesized.bin` | 77 MB |
+| `KPP_synthesized.bin` (KPPT) | 740 MB |
+| `KPP_synthesized.bin` (KPP_KKPT) | 388 MB |
 
-最大の `KPP` テーブルは `81 × 1548 × 1548 = 194,100,624` 次元、f32 で 776 MB、Adam 状態込みで GPU 上 2.3 GB。
-
-## ファイルフォーマット (やねうら王ソース確認済み)
-
-YaneuraOu の `source/eval/kppt/evaluate_kppt.h` と `eval/kpp_kkpt/evaluate_kpp_kkpt.h` 由来:
-
-| ファイル | KPPT 型 | KPP_KKPT 型 | サイズ |
-|---|---|---|---|
-| `KK_synthesized.bin` | `int32_t kk[81][81][2]` | 同左 | 51 KB |
-| `KKP_synthesized.bin` | `int32_t kkp[81][81][1548][2]` | 同左 | 77 MB |
-| `KPP_synthesized.bin` | `int16_t kpp[81][1548][1548][2]` | `int16_t kpp[81][1548][1548]` | **740 MB / 388 MB** |
-
-末尾の `[2]` は `[stm_independent, stm_dependent]` (手番無関係項 + 手番依存項)。
-- **KPPT**: KPP も手番項あり (`[2]`)
-- **KPP_KKPT**: KPP は手番項なし。手番は KK と KKP 側にだけ存在
-
-BulletOu は **`[0]` (手番無関係項) のみ** を学習し、`[1]` (手番依存項) は 0 で書く。
+KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャンネルを省いたぶんサイズが半分になっている。KK と KKP は両者で同じ。
 
 ## 実際の使い方
 
@@ -160,17 +144,13 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
-学習単位の意味は [2.4 学習の単位](2-nnue-tutorial.md#24-学習の単位--batch--superbatch--save--lr-の関係) を参照。
+学習単位の意味は [§2.4 学習スケジュール](2-nnue-tutorial.md#24-学習スケジュール) を参照。
 
 ## メモリ要件
 
-| Component | 重みパラメータ数 | f32 重み | + Adam (3× state) | 推奨 GPU メモリ |
-|---|---|---|---|---|
-| KK | 6,561 | 26 KB | 78 KB | ほぼ何でも |
-| KKP | 10,156,428 | 40 MB | 120 MB | 4 GB+ |
-| KPP | 194,100,624 | 776 MB | 2.33 GB | **8 GB+ 推奨 (バッチ buffer 込みで 3 GB ほど)** |
+KK / KKP の学習は GPU メモリをほとんど使わない (4 GB GPU でも余裕)。
 
-`max_active = 703` (KPP の 1 局面あたりアクティブ特徴数 = C(38, 2)) なので、batch_size 16384 で GPU 側の sparse index buffer は約 92 MB。
+**KPP は約 2.3 GB の GPU メモリを使う**ので、**8 GB+ の GPU 推奨**。
 
 ## ハイパーパラメータの指針
 

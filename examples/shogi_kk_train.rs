@@ -11,9 +11,9 @@ to play strongly; this example produces `KK_synthesized.bin` to be combined
 with separately-trained `KKP_synthesized.bin` and `KPP_synthesized.bin`
 (see `shogi_kk_kkp_train` / `shogi_kpp_train`, or `bullet_ou_train --eval-type ...`).
 
-Inputs come from `.hcpe` (dlshogi-style 38-byte fixed-length), `.hcpe3`
-(dlshogi-style per-game variable-length), or `.pack` (YaneuraOu `gensfen`,
-per-game variable-length). The format is inferred from the file extension;
+Inputs come from `.hcpe` / `.hcpe3` (dlshogi-style) or `.pack` (produced by
+the `gensfen` script in YaneuraOu-ScriptCollection). The format is inferred
+from the file extension;
 mixed extensions across `--data` files are rejected. All three are decoded
 internally into a stream of `PackedSfenValue` (40-byte fixed-length) records,
 which is the trainer's internal unit — note that `.pack` itself is **not**
