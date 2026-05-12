@@ -80,37 +80,20 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` format (per-save snapshot): bullet's per-component `log.txt` files concatenated with section headers:
+`learn.log` is a 7-column CSV with a header row, the same format used by every eval-type:
 
 ```
-# component: kk
-1,32,0.234
-1,64,0.231
+epoch,component,superbatch,value_loss,lr,lambda,positions
+1,kk,1,0.234,0.001,1.0,524288
+1,kk,1,0.232,0.001,1.0,1048576
 ...
-# component: kkp
-1,32,0.156
+1,kkp,1,0.156,0.001,1.0,524288
 ...
-# component: kpp
-1,32,0.245
+1,kpp,1,0.245,0.001,1.0,524288
 ...
 ```
 
-Each row is `<superbatch>,<curr_batch>,<loss>` CSV. Bullet writes one row every 32 batches.
-
-The top-level `<output>/learn.log` accumulates one section per run, prefixed with a header that records the wall-clock time and the range of numbered dirs produced:
-
-```
-# === run @ 2026-05-12T15:30:00Z saved 0001/-0005/ ===
-# component: kk
-1,32,0.234
-...
-# === run @ 2026-05-12T18:42:00Z saved 0006/-0010/ ===
-# component: kk
-1,32,0.118
-...
-```
-
-On resume the superbatch counter restarts at 1 (the LR scheduler restarts each run); each section's header tells you which run the rows belong to.
+Per-save snapshot `0NNN/learn.log` and the top-level `<output>/learn.log` use the exact same format. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md).
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 

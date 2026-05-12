@@ -519,13 +519,15 @@ fn run_kppt_all(args: &Args) {
     // series `0001/`, `0002/`, ..., each containing the three `.bin` files
     // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
     // `kpp-*/` subdirs are removed after assembly.
-    match assemble_numbered_dirs(&output_dir) {
-        Ok((first_idx, last_idx)) => {
+    let ctx = LogContext::from_args(args);
+    let prior_positions = read_prior_positions(&output_dir.join("learn.log"));
+    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions) {
+        Ok((_first_idx, last_idx)) => {
             // Append the new run's full loss history to a top-level
             // `<output>/learn.log` so the user has a single growing file
             // spanning all resumes. Per-save `<output>/0NNN/learn.log` files
             // are kept as snapshots.
-            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
                     output_dir.join("learn.log").display()
@@ -539,60 +541,149 @@ fn run_kppt_all(args: &Args) {
     }
 }
 
-/// Format the current wall-clock time as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
-/// Inlined gregorian conversion so we don't have to pull in `chrono`.
-fn current_utc_iso8601() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    let secs = now.as_secs();
-    let days = secs / 86400;
-    let tod = secs % 86400;
-    let hours = tod / 3600;
-    let minutes = (tod % 3600) / 60;
-    let seconds = tod % 60;
-    let mut y = 1970i64;
-    let mut remaining_days = days as i64;
-    loop {
-        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0usize;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining_days < md as i64 {
-            m = i;
-            break;
-        }
-        remaining_days -= md as i64;
-    }
-    let d = remaining_days + 1;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, d, hours, minutes, seconds)
+/// CSV header for `learn.log`. Both the top-level `<output>/learn.log` and
+/// each per-save `0NNN/learn.log` start with this line followed by data
+/// rows. Column meanings:
+///
+/// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
+/// - `component`: training component identifier — `nnue` for the NNUE
+///   eval types, `kk` / `kkp` / `kpp` for the KPPT family.
+/// - `superbatch`: 1-indexed superbatch within the current epoch.
+/// - `value_loss`: bullet's per-32-batch loss value at that point.
+/// - `lr`: learning rate at that superbatch (StepLR-derived).
+/// - `lambda`: `--lambda` value at that point (constant per run).
+/// - `positions`: cumulative number of teacher positions consumed so far
+///   for this component, including positions from prior runs detected
+///   in the existing top-level `learn.log` (resume-aware). Within a run,
+///   the value resets at epoch boundaries when `--max-epochs > 1` — a
+///   known v1 limitation.
+const LEARN_LOG_HEADER: &str = "epoch,component,superbatch,value_loss,lr,lambda,positions";
+
+/// Bundle of parameters the enrichment functions need to turn bullet's
+/// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
+/// 7-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
+#[derive(Clone, Copy, Debug)]
+struct LogContext {
+    lr_start: f32,
+    lr_gamma: f32,
+    lr_step: usize,
+    lambda: f32,
+    batch_size: usize,
+    batches_per_superbatch: usize,
 }
 
-/// Append a "run section" to `<output>/learn.log`. The section header records
-/// the timestamp and the range of numbered dirs produced by this run, and the
-/// body is the contents of the latest dir's `learn.log` (= the full per-batch
-/// loss history of all three components for this run).
-fn append_to_top_level_log(
-    output_dir: &std::path::Path,
-    first_idx: usize,
-    last_idx: usize,
-) -> std::io::Result<()> {
+impl LogContext {
+    fn from_args(args: &Args) -> Self {
+        let batches_per_superbatch =
+            args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        Self {
+            lr_start: args.lr,
+            lr_gamma: args.lr_gamma,
+            lr_step: args.lr_step,
+            lambda: args.lambda,
+            batch_size: args.batch_size,
+            batches_per_superbatch,
+        }
+    }
+
+    /// LR at a given superbatch — mirrors `bullet_lib::trainer::schedule::lr::StepLR`.
+    fn lr_at(&self, superbatch: usize) -> f32 {
+        let steps = superbatch.saturating_sub(1) / self.lr_step;
+        self.lr_start * self.lr_gamma.powi(steps as i32)
+    }
+
+    /// Cumulative teacher positions consumed up to `(superbatch, curr_batch)`
+    /// within the current epoch, plus the `position_offset` carried over
+    /// from prior runs (read from the existing top-level `learn.log`).
+    fn positions_at(&self, superbatch: usize, curr_batch: usize, position_offset: usize) -> usize {
+        position_offset
+            + (superbatch.saturating_sub(1) * self.batches_per_superbatch + curr_batch) * self.batch_size
+    }
+}
+
+/// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
+/// per line) into the enriched 7-column CSV body (no header). The header
+/// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
+/// body can be concatenated under a single header by `assemble_numbered_dirs`.
+fn enrich_bullet_log_to_csv(
+    raw: &str,
+    ctx: &LogContext,
+    epoch: usize,
+    component: &str,
+    position_offset: usize,
+) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, ',').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Ok(sb) = parts[0].parse::<usize>() else { continue };
+        let Ok(b) = parts[1].parse::<usize>() else { continue };
+        let loss = parts[2];
+        let lr = ctx.lr_at(sb);
+        let positions = ctx.positions_at(sb, b, position_offset);
+        out.push_str(&format!(
+            "{epoch},{component},{sb},{loss},{lr},{lambda},{positions}\n",
+            lambda = ctx.lambda
+        ));
+    }
+    out
+}
+
+/// Read the existing top-level `<output>/learn.log` and return the maximum
+/// `positions` value seen per component. Used at the start of a run to
+/// pick up the cumulative offset across resumes.
+///
+/// Returns an empty map if the file doesn't exist yet (= first run).
+fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let mut map = std::collections::BTreeMap::new();
+    let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("epoch,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() != 7 {
+            continue;
+        }
+        let component = parts[1];
+        let Ok(positions) = parts[6].parse::<usize>() else { continue };
+        let entry = map.entry(component.to_string()).or_insert(0);
+        if positions > *entry {
+            *entry = positions;
+        }
+    }
+    map
+}
+
+/// Append the body of the latest save dir's `learn.log` (already enriched
+/// 7-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
+/// the top-level `<output>/learn.log`, writing the CSV header on first
+/// file creation. The result is a single pure CSV — no section headers,
+/// no separators — that pandas / Excel can load directly.
+fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std::io::Result<()> {
     use std::io::Write;
     let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
-    let timestamp = current_utc_iso8601();
-    let header = format!("# === run @ {timestamp} saved {first_idx:04}/-{last_idx:04}/ ===\n");
     let top = output_dir.join("learn.log");
+    let top_existed = top.is_file();
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
-    file.write_all(header.as_bytes())?;
-    file.write_all(body.as_bytes())?;
-    if !body.ends_with('\n') {
+    let body_no_header = body
+        .strip_prefix(LEARN_LOG_HEADER)
+        .and_then(|rest| rest.strip_prefix('\n').or(Some(rest)))
+        .unwrap_or(body.as_str());
+    if !top_existed {
+        // first time: write the header before the first data block
+        writeln!(file, "{LEARN_LOG_HEADER}")?;
+    }
+    file.write_all(body_no_header.as_bytes())?;
+    if !body_no_header.ends_with('\n') {
         file.write_all(b"\n")?;
     }
     Ok(())
@@ -600,11 +691,13 @@ fn append_to_top_level_log(
 
 /// List checkpoint subdirs for `net_id_prefix` under `output_dir`, sorted by
 /// `(epoch, sb)`. Subdir names are `<prefix>-<sb>` (single-epoch) or
-/// `<prefix>-e<epoch>-<sb>` (multi-epoch).
+/// `<prefix>-e<epoch>-<sb>` (multi-epoch). Each returned tuple is
+/// `(epoch, sb, path)` so the caller knows which epoch/superbatch each
+/// dir corresponds to when enriching its `log.txt` into `learn.log`.
 fn list_component_checkpoints_sorted(
     output_dir: &std::path::Path,
     net_id_prefix: &str,
-) -> Vec<std::path::PathBuf> {
+) -> Vec<(usize, usize, std::path::PathBuf)> {
     let mut entries: Vec<(usize, usize, std::path::PathBuf)> = Vec::new();
     let prefix = format!("{net_id_prefix}-");
     let Ok(rd) = std::fs::read_dir(output_dir) else { return Vec::new() };
@@ -627,7 +720,7 @@ fn list_component_checkpoints_sorted(
         entries.push((epoch, sb, path));
     }
     entries.sort();
-    entries.into_iter().map(|(_, _, p)| p).collect()
+    entries
 }
 
 /// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
@@ -639,7 +732,11 @@ fn list_component_checkpoints_sorted(
 /// Returns `(first_idx, last_idx)` of the numbered dirs written in this run
 /// (1-based, inclusive). On resume the range starts above the previously
 /// existing count, so the caller can locate the latest dir to inspect.
-fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<(usize, usize)> {
+fn assemble_numbered_dirs(
+    output_dir: &std::path::Path,
+    ctx: &LogContext,
+    prior_positions: &std::collections::BTreeMap<String, usize>,
+) -> std::io::Result<(usize, usize)> {
     let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
     let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
     let kpp_dirs = list_component_checkpoints_sorted(output_dir, "kpp");
@@ -670,6 +767,10 @@ fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<(usiz
     // start at `existing_count + 1` so new saves extend the series.
     let existing_count = count_existing_numbered_dirs(output_dir);
 
+    let prior_kk = prior_positions.get("kk").copied().unwrap_or(0);
+    let prior_kkp = prior_positions.get("kkp").copied().unwrap_or(0);
+    let prior_kpp = prior_positions.get("kpp").copied().unwrap_or(0);
+
     eprintln!(
         "\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===",
         output_dir.display(),
@@ -679,37 +780,42 @@ fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<(usiz
         let idx = existing_count + i + 1;
         let dst = output_dir.join(format!("{idx:04}"));
         std::fs::create_dir_all(&dst)?;
+        let (kk_epoch, _kk_sb, kk_dir) = &kk_dirs[i];
+        let (kkp_epoch, _kkp_sb, kkp_dir) = &kkp_dirs[i];
+        let (kpp_epoch, _kpp_sb, kpp_dir) = &kpp_dirs[i];
         // engine-facing quantised .bin files
-        std::fs::copy(kk_dirs[i].join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
-        std::fs::copy(kkp_dirs[i].join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
-        std::fs::copy(kpp_dirs[i].join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
+        std::fs::copy(kk_dir.join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
+        std::fs::copy(kkp_dir.join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
+        std::fs::copy(kpp_dir.join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
         // bundle the three components' resume state (Adam weights + momentum + velocity)
         // into a single `state.bin` so the dir holds everything needed to resume.
         let mut state_buf: Vec<u8> = Vec::new();
-        bundle_component_state(&mut state_buf, "kk", &kk_dirs[i].join("optimiser_state"))?;
-        bundle_component_state(&mut state_buf, "kkp", &kkp_dirs[i].join("optimiser_state"))?;
-        bundle_component_state(&mut state_buf, "kpp", &kpp_dirs[i].join("optimiser_state"))?;
+        bundle_component_state(&mut state_buf, "kk", &kk_dir.join("optimiser_state"))?;
+        bundle_component_state(&mut state_buf, "kkp", &kkp_dir.join("optimiser_state"))?;
+        bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
         std::fs::write(dst.join("state.bin"), &state_buf)?;
-        // Bundle the three components' bullet `log.txt` (CSV
-        // `superbatch,batch,loss` lines accumulated up to this save) into a
-        // single `learn.log` with per-component section headers.
+        // Each component's bullet `log.txt` is the raw
+        // `superbatch,curr_batch,loss` CSV. Enrich each into the 7-column
+        // `learn.log` format (header + data rows for kk, then kkp, then
+        // kpp). Pure CSV, no separator between components — the
+        // `component` column distinguishes them.
         let mut log_buf = String::new();
-        for (label, dir) in [("kk", &kk_dirs[i]), ("kkp", &kkp_dirs[i]), ("kpp", &kpp_dirs[i])] {
-            log_buf.push_str(&format!("# component: {label}\n"));
-            match std::fs::read_to_string(dir.join("log.txt")) {
-                Ok(s) => log_buf.push_str(&s),
-                Err(_) => log_buf.push_str("# (log.txt missing)\n"),
-            }
-            if !log_buf.ends_with('\n') {
-                log_buf.push('\n');
-            }
+        log_buf.push_str(LEARN_LOG_HEADER);
+        log_buf.push('\n');
+        for (label, epoch, dir, prior) in [
+            ("kk", *kk_epoch, kk_dir, prior_kk),
+            ("kkp", *kkp_epoch, kkp_dir, prior_kkp),
+            ("kpp", *kpp_epoch, kpp_dir, prior_kpp),
+        ] {
+            let raw = std::fs::read_to_string(dir.join("log.txt")).unwrap_or_default();
+            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior));
         }
         std::fs::write(dst.join("learn.log"), log_buf)?;
         eprintln!("  -> {}/", dst.display());
     }
 
     // Remove the now-redundant per-component subdirs.
-    for d in kk_dirs.iter().chain(kkp_dirs.iter()).chain(kpp_dirs.iter()) {
+    for (_, _, d) in kk_dirs.iter().chain(kkp_dirs.iter()).chain(kpp_dirs.iter()) {
         if let Err(e) = std::fs::remove_dir_all(d) {
             eprintln!("  warning: failed to remove {}: {e}", d.display());
         }
@@ -1326,10 +1432,13 @@ fn run_halfkp(args: &Args) {
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
-    // copy each dir's `log.txt` to `learn.log` so the layout matches KPPT.
-    match finalize_nnue_dirs(&output_dir, &args.net_id()) {
-        Ok((first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+    // enrich each dir's bullet `log.txt` into the 7-column `learn.log`.
+    let ctx = LogContext::from_args(args);
+    let top_level_log = output_dir.join("learn.log");
+    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
+    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        Ok((_first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
                     output_dir.join("learn.log").display()
@@ -1415,9 +1524,12 @@ fn run_kp(args: &Args) {
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    match finalize_nnue_dirs(&output_dir, &args.net_id()) {
-        Ok((first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+    let ctx = LogContext::from_args(args);
+    let top_level_log = output_dir.join("learn.log");
+    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
+    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        Ok((_first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
                     output_dir.join("learn.log").display()
@@ -1434,9 +1546,14 @@ fn run_kp(args: &Args) {
 /// Single-component analogue of `assemble_numbered_dirs`: list `<net_id>-*/`
 /// (or `<net_id>-e<epoch>-<sb>/` for multi-epoch) under `output_dir`, sort
 /// by (epoch, sb), rename them to `0NNN/` starting at `existing_count + 1`,
-/// and copy each dir's `log.txt` to `learn.log` so the per-save layout has
-/// the same `learn.log` name as KPPT does.
-fn finalize_nnue_dirs(output_dir: &std::path::Path, net_id_prefix: &str) -> std::io::Result<(usize, usize)> {
+/// and enrich each dir's bullet-format `log.txt` into the 7-column CSV
+/// `learn.log` shared with KPPT.
+fn finalize_nnue_dirs(
+    output_dir: &std::path::Path,
+    ctx: &LogContext,
+    net_id_prefix: &str,
+    prior_position: usize,
+) -> std::io::Result<(usize, usize)> {
     let src_dirs = list_component_checkpoints_sorted(output_dir, net_id_prefix);
     let n = src_dirs.len();
     if n == 0 {
@@ -1456,18 +1573,21 @@ fn finalize_nnue_dirs(output_dir: &std::path::Path, net_id_prefix: &str) -> std:
         output_dir.display(),
         existing_count + 1
     );
-    for (i, src) in src_dirs.iter().enumerate() {
+    for (i, (epoch, _sb, src)) in src_dirs.iter().enumerate() {
         let idx = existing_count + i + 1;
         let dst = output_dir.join(format!("{idx:04}"));
         std::fs::rename(src, &dst)?;
-        // Promote bullet's `log.txt` to `learn.log` to match KPPT layout.
+        // Enrich bullet's `log.txt` (raw 3-col CSV) into 7-col `learn.log`.
         let log_txt = dst.join("log.txt");
         let learn_log = dst.join("learn.log");
-        if log_txt.is_file() {
-            std::fs::rename(&log_txt, &learn_log)?;
-        } else {
-            std::fs::write(&learn_log, "# (log.txt missing)\n")?;
-        }
+        let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
+        let body = enrich_bullet_log_to_csv(&raw, ctx, *epoch, "nnue", prior_position);
+        let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
+        content.push_str(LEARN_LOG_HEADER);
+        content.push('\n');
+        content.push_str(&body);
+        std::fs::write(&learn_log, content)?;
+        let _ = std::fs::remove_file(&log_txt);
         eprintln!("  -> {}/", dst.display());
     }
     Ok((existing_count + 1, existing_count + n))

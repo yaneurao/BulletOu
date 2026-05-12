@@ -115,29 +115,40 @@ record を必要なだけ連結したものが `state.bin`。
 
 実装: `count_existing_numbered_dirs(output_dir)` で既存数 N をカウントし、新 save の番号を `N + 1, N + 2, ...` とする。
 
-## トップレベル `learn.log`
+## `learn.log` フォーマット
 
-`<output>/learn.log` は **全 run / resume を跨いだ累積ログ**。run が完走するごとに 1 section 追記。
-
-### Section ヘッダー書式
+各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 7 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
 
 ```
-# === run @ <ISO8601-UTC> saved <first>/-<last>/ ===
+epoch,component,superbatch,value_loss,lr,lambda,positions
+1,nnue,1,0.234,0.001,1.0,524288
+1,nnue,1,0.231,0.001,1.0,1048576
+...
 ```
 
-例:
-```
-# === run @ 2026-05-12T15:30:00Z saved 0001/-0005/ ===
-```
+### 列の意味
 
-### Section body
+| 列 | 意味 |
+|---|---|
+| `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
+| `component` | 学習 component 名: NNUE 系は `nnue`、KPPT 系は `kk` / `kkp` / `kpp` |
+| `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ |
+| `value_loss` | bullet が 32 batch ごとに計算する loss 値 |
+| `lr` | その superbatch における学習率 (StepLR 由来) |
+| `lambda` | その時点の `--lambda` (1 run 内では定数) |
+| `positions` | この component で消費した累計教師局面数。**resume 跨ぎで累積される** (run 開始時に既存トップレベル `learn.log` の最大値を読み取って続きから書く)。multi-epoch (`--max-epochs > 1`) 内では epoch 境界で reset する (v1 制限) |
 
-その run の最新 numbered dir (`<last>/learn.log`) の中身をそのまま付ける (= その run の累積 loss 履歴)。
+### 行の頻度
 
-### 補足
+bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト `--batches-per-superbatch ≒ 6104` だと、1 superbatch あたり約 191 行。
 
-- 同じ run 中の中間 save の `learn.log` (例: `0001/learn.log`, `0002/learn.log` ...) は **その save 時点までの累積** で、トップレベル `learn.log` の section と独立。section 単位では最新 dir の learn.log だけ参照すれば run の全貌が分かる。
-- resume を跨ぐと superbatch カウンタは 1 から再開する (LR scheduler の reset と整合)。トップレベル `learn.log` 上では同じ superbatch 番号が複数 section で出現するため、section ヘッダーで run の境界を判別する。
+### 累積ロジック
+
+- 1 run 内で各 component が消費する局面数は単調増加: `positions = (superbatch − 1) × batches_per_superbatch × batch_size + curr_batch × batch_size + prior_offset`
+- `prior_offset` は run 開始時に `read_prior_positions()` で既存トップレベル `learn.log` から取得する (component 別の最大 `positions`)
+- 各 save dir の `0NNN/learn.log` は「**その save 時点までの累積**」(bullet が log.txt を逐次更新するため)。最新番号 dir の `learn.log` を読めばその run の全貌が分かる
+- トップレベル `<output>/learn.log` は run 終了時に最新 dir の内容を **ヘッダ行を除いて** 追記 (新規作成時のみ 1 度ヘッダを書く)。結果として 1 ファイル内のヘッダは常に 1 行のみ
+- resume を跨ぐと `superbatch` カウンタは 1 から再開するが、`epoch` も 1 から始まる。`positions` だけが累積を保つので、Pandas で sort key にすれば順序を保てる
 
 ## ファイル名規約 (一時)
 

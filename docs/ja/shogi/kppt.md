@@ -80,37 +80,20 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-各 save 配下の `learn.log` のフォーマット (3 component の bullet 既存 log.txt をセクションヘッダ付きで連結):
+`learn.log` は **7 列 + ヘッダ行の CSV** で、すべての eval-type で同じフォーマット:
 
 ```
-# component: kk
-1,32,0.234
-1,64,0.231
+epoch,component,superbatch,value_loss,lr,lambda,positions
+1,kk,1,0.234,0.001,1.0,524288
+1,kk,1,0.232,0.001,1.0,1048576
 ...
-# component: kkp
-1,32,0.156
+1,kkp,1,0.156,0.001,1.0,524288
 ...
-# component: kpp
-1,32,0.245
+1,kpp,1,0.245,0.001,1.0,524288
 ...
 ```
 
-各行は `<superbatch>,<curr_batch>,<loss>` の CSV。bullet は 32 batch ごとに 1 行記録する。
-
-トップレベルの `<output>/learn.log` には、1 run ごとに 1 section が追記される。section 頭にその run の wall-clock 時刻と生成された numbered dir の範囲が入る:
-
-```
-# === run @ 2026-05-12T15:30:00Z saved 0001/-0005/ ===
-# component: kk
-1,32,0.234
-...
-# === run @ 2026-05-12T18:42:00Z saved 0006/-0010/ ===
-# component: kk
-1,32,0.118
-...
-```
-
-resume すると superbatch カウンタは 1 から再開される (run ごとに LR scheduler が reset されるため)。トップレベルの learn.log ではセクションヘッダで run の境界を判別する。
+各 save の `0NNN/learn.log` snapshot もトップレベル `<output>/learn.log` も同じ書式。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md) を参照。
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 

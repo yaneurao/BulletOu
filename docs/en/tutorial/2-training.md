@@ -229,7 +229,7 @@ How it works:
 - On startup, `bulletou` looks under `--output` for numbered dirs containing `state.bin`.
 - The highest-numbered `state.bin` is loaded, restoring weights and Adam moments.
 - New saves continue numbering from one past the existing maximum (`0004/` here).
-- The cumulative `learn.log` gets a fresh section appended for the resumed run (the LR scheduler restarts, so the superbatch counter resets to 1).
+- The cumulative `learn.log` keeps appending CSV rows for the resumed run. The LR scheduler restarts each run so the superbatch counter resets to 1, but the `positions` column continues from the previous run's max (read off the existing `learn.log` at startup).
 
 This behaviour is identical for every eval-type (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP — all share the same mechanism). To start fresh, point `--output` at a different directory or delete the existing one.
 

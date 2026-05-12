@@ -231,7 +231,7 @@ checkpoints/.../
 - `bulletou` 起動時、`--output` 配下に番号付き dir + `state.bin` があれば検出
 - 最大番号の `state.bin` から重みと Adam moments を復元
 - 新 save は既存最大番号の次から書く (前例で `0003/` まであれば `0004/` から)
-- `learn.log` (累積版) には新 run 用の section が追記される (LR scheduler が reset されるため superbatch カウンタは 1 から再開)
+- `learn.log` (累積版) には新 run の CSV 行がそのまま追記される。LR scheduler は run ごとに reset されるため superbatch カウンタは 1 から再開するが、`positions` 列は累積される (新 run 開始時に既存 `learn.log` の最大 positions を読み取って続きから書く)
 
 この挙動は eval-type 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP すべて同じ仕組み)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
 
