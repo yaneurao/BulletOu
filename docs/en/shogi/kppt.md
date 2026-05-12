@@ -56,7 +56,7 @@ cargo run --release --features device-cuda --example bulletou -- \
     --output checkpoints/my-kppt
 ```
 
-Without `--superbatches` or `--max-epoch`, training runs through the teacher data once (until the dataloader returns EOF). To run multiple passes, pass `--max-epoch N` -- the LR scheduler restarts at the beginning of each epoch. When the run completes:
+Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader returns EOF). To run multiple passes, pass `--max-epochs N` -- the LR scheduler restarts at the beginning of each epoch. When the run completes:
 
 ```
 checkpoints/my-kppt/
@@ -105,7 +105,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` |
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |
-| `--max-epoch` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
+| `--max-epochs` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR scheduler | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | WDL linear interpolation | 0.0 / 1.0 |

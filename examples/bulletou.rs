@@ -157,7 +157,7 @@ struct Args {
     /// Cap on the number of superbatches per epoch. If omitted, there is no
     /// cap (= run until the dataloader reaches EOF). Specify this to stop
     /// each epoch early (e.g. to fit a quick smoke test). Mutually exclusive
-    /// with `--max-epoch` in practical use.
+    /// with `--max-epochs` in practical use.
     #[arg(long)]
     superbatches: Option<usize>,
 
@@ -167,7 +167,7 @@ struct Args {
     /// 1, so for example `--lr-step 8` applies independently within each
     /// epoch. Default 1.
     #[arg(long, default_value = "1")]
-    max_epoch: usize,
+    max_epochs: usize,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -305,7 +305,7 @@ fn run_kppt_all(args: &Args) {
 
     // Assemble the three .bin files into <output>/final/. Locate each
     // component's most-recent checkpoint directory by parsing the suffix
-    // (`<net_id>-<sb>` for max_epoch=1, `<net_id>-e<e>-<sb>` otherwise) --
+    // (`<net_id>-<sb>` for max_epochs=1, `<net_id>-e<e>-<sb>` otherwise) --
     // we cannot predict the values up front because `--superbatches` may be
     // unbounded (= each component trains to its EOF).
     let final_dir = output_dir.join("final");
@@ -402,19 +402,19 @@ macro_rules! run_training_inline {
         let output_dir_buf = args.output_dir();
         let yaneuraou_scale = args.yaneuraou_scale();
         let kpp_format = args.kpp_format();
-        let max_epoch = args.max_epoch.max(1);
+        let max_epochs = args.max_epochs.max(1);
 
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        for epoch in 1..=max_epoch {
-            if max_epoch > 1 {
-                eprintln!("\n=== epoch {epoch} / {max_epoch} ===");
+        for epoch in 1..=max_epochs {
+            if max_epochs > 1 {
+                eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
             }
 
-            // checkpoint dir 名は max_epoch=1 のとき従来通り `<net_id>-<superbatch>`、
+            // checkpoint dir 名は max_epochs=1 のとき従来通り `<net_id>-<superbatch>`、
             // 複数 epoch のときは `<net_id>-e<epoch>-<superbatch>` で重複を避ける。
-            let net_id_for_epoch = if max_epoch > 1 {
+            let net_id_for_epoch = if max_epochs > 1 {
                 format!("{net_id_base}-e{epoch}")
             } else {
                 net_id_base.clone()

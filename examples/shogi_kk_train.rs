@@ -69,14 +69,14 @@ struct Args {
 
     /// Cap on the number of superbatches per epoch. If omitted, run each
     /// epoch until the dataloader reaches EOF (no cap). Mutually exclusive
-    /// with `--max-epoch` in practical use.
+    /// with `--max-epochs` in practical use.
     #[arg(long)]
     superbatches: Option<usize>,
 
     /// Number of epochs (= dataloader EOFs) to run. LR scheduler restarts at
     /// superbatch 1 each epoch.
     #[arg(long, default_value = "1")]
-    max_epoch: usize,
+    max_epochs: usize,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -198,7 +198,7 @@ fn main() {
 
     let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
 
-    let max_epoch = args.max_epoch.max(1);
+    let max_epochs = args.max_epochs.max(1);
     let output_dir = args.output.to_str().unwrap_or("checkpoints").to_string();
     let settings = LocalSettings {
         threads: args.threads,
@@ -208,11 +208,11 @@ fn main() {
         on_checkpoint_saved: None,
     };
 
-    for epoch in 1..=max_epoch {
-        if max_epoch > 1 {
-            eprintln!("\n=== epoch {epoch} / {max_epoch} ===");
+    for epoch in 1..=max_epochs {
+        if max_epochs > 1 {
+            eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
         }
-        let net_id_for_epoch = if max_epoch > 1 {
+        let net_id_for_epoch = if max_epochs > 1 {
             format!("{}-e{epoch}", args.net_id)
         } else {
             args.net_id.clone()

@@ -56,7 +56,7 @@ cargo run --release --features device-cuda --example bulletou -- \
     --output checkpoints/my-kppt
 ```
 
-`--superbatches` も `--max-epoch` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epoch 3` のように指定する (各 epoch 開始時に LR がリセットされる)。完了すると、
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。完了すると、
 
 ```
 checkpoints/my-kppt/
@@ -105,7 +105,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch の mini-batch 数 | `ceil(100M / batch-size)` |
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
-| `--max-epoch` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
+| `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | WDL 線形補間 | 0.0 / 1.0 |

@@ -85,7 +85,7 @@ struct Args {
     /// Number of epochs (= dataloader EOFs) to run. LR scheduler restarts at
     /// superbatch 1 each epoch.
     #[arg(long, default_value = "1")]
-    max_epoch: usize,
+    max_epochs: usize,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -196,14 +196,14 @@ fn main() {
     let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
 
     let yaneuraou_scale = args.yaneuraou_quant_scale;
-    let max_epoch = args.max_epoch.max(1);
+    let max_epochs = args.max_epochs.max(1);
     let output_dir_str = args.output.to_str().unwrap_or("checkpoints").to_string();
 
-    for epoch in 1..=max_epoch {
-        if max_epoch > 1 {
-            eprintln!("\n=== epoch {epoch} / {max_epoch} ===");
+    for epoch in 1..=max_epochs {
+        if max_epochs > 1 {
+            eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
         }
-        let net_id_for_epoch = if max_epoch > 1 {
+        let net_id_for_epoch = if max_epochs > 1 {
             format!("{}-e{epoch}", args.net_id)
         } else {
             args.net_id.clone()
