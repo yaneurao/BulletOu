@@ -27,10 +27,10 @@
 
 ```bash
 # NVIDIA GPU (CUDA 12.x + cuDNN 9.x)
-CUDA_PATH=/usr/local/cuda cargo build --release --features cuda
+CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
 
 # AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features rocm
+HIP_PATH=/opt/rocm cargo build --release --features device-rocm
 ```
 
 CPU のみでの学習はサポートされていない (mock GPU ランタイムは型チェック用のスタブのみ)。

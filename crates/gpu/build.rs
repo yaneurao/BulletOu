@@ -25,7 +25,7 @@ fn main() {
         println!("cargo:rustc-link-search=native=/usr/lib/wsl/lib/");
     }
 
-    if cfg!(feature = "cuda") {
+    if cfg!(feature = "device-cuda") {
         let cuda_path = get_var_path("CUDA_PATH");
 
         let paths = if cfg!(target_family = "windows") { vec!["lib/x64", "lib"] } else { vec!["lib64"] };
@@ -40,7 +40,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cublas");
     }
 
-    if cfg!(feature = "rocm") {
+    if cfg!(feature = "device-rocm") {
         let hip_path = get_var_path("HIP_PATH");
 
         println!("cargo:rustc-link-search=native={}", hip_path.join("lib").to_str().unwrap());

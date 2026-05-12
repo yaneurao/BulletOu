@@ -67,12 +67,12 @@ Choose **one** of the following depending on your GPU:
 
 ```bash
 # NVIDIA GPU (CUDA)
-CUDA_PATH=/usr/local/cuda cargo build --release --features cuda
+CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
 ```
 
 ```bash
 # AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features rocm
+HIP_PATH=/opt/rocm cargo build --release --features device-rocm
 ```
 
 (On Windows, set the env vars accordingly: `set CUDA_PATH=...` or use PowerShell `$env:CUDA_PATH=...`.)
@@ -91,10 +91,10 @@ The `simple` example trains a tiny chess (yes, chess) NNUE. It does not need any
 
 ```bash
 # NVIDIA
-cargo run --release --features cuda --example simple
+cargo run --release --features device-cuda --example simple
 
 # AMD
-cargo run --release --features rocm --example simple
+cargo run --release --features device-rocm --example simple
 ```
 
 If everything is working, you will see output like:

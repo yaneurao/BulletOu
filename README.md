@@ -27,10 +27,10 @@ For specification-level details such as training-data formats and output formats
 
 ```bash
 # NVIDIA GPU (CUDA 12.x + cuDNN 9.x)
-CUDA_PATH=/usr/local/cuda cargo build --release --features cuda
+CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
 
 # AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features rocm
+HIP_PATH=/opt/rocm cargo build --release --features device-rocm
 ```
 
 CPU-only training is not supported (the mock GPU runtime is a type-checking stub only).

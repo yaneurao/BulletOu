@@ -5,13 +5,13 @@ pub use bullet_trainer::model::{
     builder::{Affine, InitSettings, ModelBuilder, ModelNode},
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device-cuda")]
 pub type ExecutionContext = bullet_gpu::runtime::cuda::Cuda;
 
-#[cfg(feature = "rocm")]
+#[cfg(feature = "device-rocm")]
 pub type ExecutionContext = bullet_gpu::runtime::rocm::ROCm;
 
-#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+#[cfg(not(any(feature = "device-cuda", feature = "device-rocm")))]
 pub type ExecutionContext = bullet_gpu::runtime::mock::MockGpu;
 
 pub type Model = TrainerModel<ExecutionContext>;

@@ -20,7 +20,7 @@ Usage:
     # Required:
     #   --data <PATH>   one or more .hcpe files (comma-separated)
     #
-    cargo run --release --features cuda --example shogi_simple_hcpe -- \
+    cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
         --data /data/shogi/train.hcpe \
         --output checkpoints/my-hcpe-net \
         --superbatches 40

@@ -67,12 +67,12 @@ GPU に応じて以下の **どちらか** を実行:
 
 ```bash
 # NVIDIA GPU (CUDA)
-CUDA_PATH=/usr/local/cuda cargo build --release --features cuda
+CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
 ```
 
 ```bash
 # AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features rocm
+HIP_PATH=/opt/rocm cargo build --release --features device-rocm
 ```
 
 (Windows では `set CUDA_PATH=...` または PowerShell の `$env:CUDA_PATH=...` で環境変数を設定する。)
@@ -91,10 +91,10 @@ HIP_PATH=/opt/rocm cargo build --release --features rocm
 
 ```bash
 # NVIDIA
-cargo run --release --features cuda --example simple
+cargo run --release --features device-cuda --example simple
 
 # AMD
-cargo run --release --features rocm --example simple
+cargo run --release --features device-rocm --example simple
 ```
 
 正常に動けば、以下のような出力が出る:

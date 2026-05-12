@@ -22,7 +22,7 @@ state (~2.3 GB total on GPU with AdamW). Sparse input batch buffers are also
 
 Usage:
 
-    cargo run --release --features cuda --example shogi_kpp_train -- \
+    cargo run --release --features device-cuda --example shogi_kpp_train -- \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
         --output checkpoints/kpp \
         --superbatches 3 \

@@ -355,7 +355,7 @@ pub fn generate(sub: &SubGraph, props: &DeviceProps) -> Result<Option<(Pointwise
     Ok(Some((pntwise, p2size > 0)))
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "device-cuda", feature = "device-rocm"))]
 #[cfg(test)]
 mod tests {
     use bullet_compiler::tensor::{DType, DValue, IRBuilder, IRTrace, Size, TValue, operation::SubGraph};
@@ -486,7 +486,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device-cuda")]
     mod cuda {
         use crate::runtime::cuda::{Cuda, CudaError};
 
@@ -510,7 +510,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "device-rocm")]
     mod rocm {
         use crate::runtime::rocm::{ROCm, ROCmError};
 

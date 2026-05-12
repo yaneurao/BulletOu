@@ -21,7 +21,7 @@ a flat array of `PackedSfenValue`.
 
 Usage:
 
-    cargo run --release --features cuda --example shogi_kk_train -- \
+    cargo run --release --features device-cuda --example shogi_kk_train -- \
         --data /data/shogi/train.hcpe \
         --output checkpoints/kk \
         --superbatches 10

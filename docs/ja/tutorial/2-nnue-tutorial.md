@@ -55,18 +55,18 @@
 ### `.pack` の場合
 
 ```bash
-cargo run --release --features cuda --example shogi_simple -- \
+cargo run --release --features device-cuda --example shogi_simple -- \
     --data /data/shogi/raw.pack \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
 
-(AMD GPU なら `--features cuda` を `--features rocm` に。)
+(AMD GPU なら `--features device-cuda` を `--features device-rocm` に。)
 
 ### `.hcpe` の場合
 
 ```bash
-cargo run --release --features cuda --example shogi_simple_hcpe -- \
+cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
     --data /data/shogi/raw.hcpe \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
@@ -123,7 +123,7 @@ superbatch 2 / 40   ...
 `shogi_simple` に慣れたら、`shogi_layerstack` でより強い学習に移る:
 
 ```bash
-cargo run --release --features cuda --example shogi_layerstack -- \
+cargo run --release --features device-cuda --example shogi_layerstack -- \
   --data /data/shogi/train.pack \
   --output checkpoints/my-layerstack-net \
   --feature ShogiHalfKaHmThreat \

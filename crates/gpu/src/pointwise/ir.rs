@@ -458,7 +458,7 @@ impl PointwiseIR {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "device-cuda", feature = "device-rocm"))]
 #[cfg(test)]
 mod tests {
     use bullet_compiler::tensor::TValue;
@@ -506,7 +506,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device-cuda")]
     mod cuda {
         use crate::runtime::cuda::{Cuda, CudaError};
 
@@ -516,7 +516,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "device-rocm")]
     mod rocm {
         use crate::runtime::rocm::{ROCm, ROCmError};
 

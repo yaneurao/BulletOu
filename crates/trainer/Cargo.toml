@@ -15,5 +15,5 @@ rand = "0.9"
 rand_distr = "0.5.1"
 
 [features]
-cuda = ["bullet-gpu/cuda"]
-rocm = ["bullet-gpu/rocm"]
+device-cuda = ["bullet-gpu/device-cuda"]
+device-rocm = ["bullet-gpu/device-rocm"]

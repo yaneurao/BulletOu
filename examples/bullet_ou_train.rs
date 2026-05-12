@@ -21,7 +21,7 @@ Input format is inferred from the file extension (`.hcpe` / `.hcpe3` /
 
 Usage:
 
-    cargo run --release --features cuda --example bullet_ou_train -- \
+    cargo run --release --features device-cuda --example bullet_ou_train -- \
         --eval-type kppt \
         --data /data/shogi/train.hcpe \
         --output checkpoints/my-kppt \

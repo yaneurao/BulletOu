@@ -18,7 +18,7 @@ Mixed extensions across `--data` files are rejected.
 
 Usage:
 
-    cargo run --release --features cuda --example shogi_kk_kkp_train -- \
+    cargo run --release --features device-cuda --example shogi_kk_kkp_train -- \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
         --output checkpoints/kkp \
         --superbatches 3 \

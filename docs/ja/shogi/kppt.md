@@ -41,7 +41,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ### 必要なもの
 
-- BulletOu をビルド済み (`cargo build --release --features cuda --example bullet_ou_train`)
+- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bullet_ou_train`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` のいずれか)
 - 4 GB+ の空き GPU メモリ (KPP 学習は ~2.3 GB を使う)
 
@@ -50,7 +50,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 `--eval-type kppt` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kppt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kppt \
@@ -75,7 +75,7 @@ checkpoints/my-kppt/
 `--eval-type kpp-kkpt` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kpp-kkpt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
@@ -87,7 +87,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
 開発・動作確認用に、`--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` で 1 component だけ学習することもできる:
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kppt-kpp \
     --data inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \

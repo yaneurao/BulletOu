@@ -41,7 +41,7 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 ### Prerequisites
 
-- BulletOu built (`cargo build --release --features cuda --example bullet_ou_train`)
+- BulletOu built (`cargo build --release --features device-cuda --example bullet_ou_train`)
 - Training data (`.hcpe` / `.hcpe3` / `.pack`)
 - 4 GB+ of free GPU memory (KPP training uses ~2.3 GB)
 
@@ -50,7 +50,7 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 `--eval-type kppt` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kppt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kppt \
@@ -75,7 +75,7 @@ Point a YaneuraOu KPPT engine at `checkpoints/my-kppt/final/`.
 `--eval-type kpp-kkpt` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kpp-kkpt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
@@ -87,7 +87,7 @@ cargo run --release --features cuda --example bullet_ou_train -- \
 For development / smoke testing you can train just one component with `--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp`:
 
 ```bash
-cargo run --release --features cuda --example bullet_ou_train -- \
+cargo run --release --features device-cuda --example bullet_ou_train -- \
     --eval-type kppt-kpp \
     --data inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \

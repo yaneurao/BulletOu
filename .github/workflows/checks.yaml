@@ -16,8 +16,8 @@ jobs:
             components: clippy
         - run: |
             cargo clippy --workspace
-            CUDA_PATH=. cargo clippy --workspace --features cuda
-            HIP_PATH=. cargo clippy --workspace --features rocm
+            CUDA_PATH=. cargo clippy --workspace --features device-cuda
+            HIP_PATH=. cargo clippy --workspace --features device-rocm
 
   test:
     name: test

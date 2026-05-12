@@ -55,18 +55,18 @@ Pick the example matching your data format:
 ### `.pack`
 
 ```bash
-cargo run --release --features cuda --example shogi_simple -- \
+cargo run --release --features device-cuda --example shogi_simple -- \
     --data /data/shogi/raw.pack \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
 
-(Use `--features rocm` instead of `cuda` for AMD GPUs.)
+(Use `--features device-rocm` instead of `cuda` for AMD GPUs.)
 
 ### `.hcpe`
 
 ```bash
-cargo run --release --features cuda --example shogi_simple_hcpe -- \
+cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
     --data /data/shogi/raw.hcpe \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
@@ -123,7 +123,7 @@ Place the trained `nn.bin` where the YaneuraOu engine expects its eval file (typ
 When you are comfortable with `shogi_simple`, move to `shogi_layerstack` for stronger results:
 
 ```bash
-cargo run --release --features cuda --example shogi_layerstack -- \
+cargo run --release --features device-cuda --example shogi_layerstack -- \
   --data /data/shogi/train.pack \
   --output checkpoints/my-layerstack-net \
   --feature ShogiHalfKaHmThreat \

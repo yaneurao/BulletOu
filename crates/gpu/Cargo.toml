@@ -13,5 +13,5 @@ description = "Compile and execute tensor DAGs on CUDA/ROCm devices"
 bullet-compiler = { workspace = true }
 
 [features]
-cuda = []
-rocm = []
+device-cuda = []
+device-rocm = []
