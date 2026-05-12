@@ -387,4 +387,57 @@ mod tests {
         eprintln!("decoded {got} positions; first.score = {first_score}, first.result = {first_result}");
         assert!(got >= 1);
     }
+
+    /// Regression test for the callback-polarity bug
+    /// ([`docs/...`] / commit `7bb413a`): targets a multi-buffer-sized HCPE
+    /// teacher (yaneurao's kif20251209-25000a 1.61 GB file with ~45.5M
+    /// records) with a callback that NEVER asks to stop (`|_| false`), and
+    /// asserts the loader reads the whole file rather than terminating
+    /// after the first shuffle-buffer flush. Buffer is intentionally small
+    /// (`buffer_size_mb = 16` ≒ 420k records) so the bug — if reintroduced
+    /// — would visibly truncate the count to ~420k instead of ~45.5M.
+    ///
+    /// `#[ignore]` because the input file lives outside the repo.
+    /// Run with: `cargo test -p bullet_lib --lib hcpe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn reads_entire_file_when_callback_always_continues() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../inbox/ref/kif20251209-25000a.pack-51160847.hcpe");
+        let path_str = path.to_string_lossy().to_string();
+
+        if std::fs::metadata(&path).is_err() {
+            eprintln!("skipping: {path_str} not found");
+            return;
+        }
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let expected = (meta.len() / HCPE_RECORD_SIZE as u64) as usize;
+        eprintln!("file {} bytes -> expected {expected} records", meta.len());
+
+        // 16 MB buffer is intentionally small so multi-flush behaviour is exercised.
+        let loader = HcpeDataLoader::new(&path_str, 16, |_| true);
+
+        let mut got: usize = 0;
+        let mut flushes: usize = 0;
+        loader.map_chunks(0, |chunk| {
+            got += chunk.len();
+            flushes += 1;
+            false // always ask for more — convention: false = continue
+        });
+
+        eprintln!("decoded {got} records across {flushes} buffer flushes");
+        // Decode is lossless for valid HCPE records; any drops would come
+        // from `decode_hcpe_record` returning None on a malformed sample.
+        // A small rounding tolerance accounts for the trailing partial
+        // chunk (the file size may not be an exact multiple of the chunk
+        // boundary the loader's BufReader uses).
+        assert!(
+            got >= expected.saturating_sub(8),
+            "loader returned {got} records, but expected ~{expected} (= file_size / 38)"
+        );
+        assert!(
+            flushes >= 2,
+            "expected multiple buffer flushes for a 1.61 GB file with a 16 MB buffer, got {flushes}"
+        );
+    }
 }
