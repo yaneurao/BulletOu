@@ -142,7 +142,7 @@ resume すると superbatch カウンタは 1 から再開される (run ごと�
 | `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL-lambda 線形補間。`λ × 対局結果 + (1−λ) × 教師eval`、`λ = start → end` | 0.0 / 0.0 |
+| `--start-wdl` / `--end-wdl` | WDL-lambda 線形補間 (WDL = Win/Draw/Loss = 教師局面が持つ対局結果ラベル)。`λ × 対局結果 + (1−λ) × 教師eval`、`λ = start → end` | 0.0 / 0.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 

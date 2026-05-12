@@ -146,7 +146,7 @@ superbatch 2   ...
 | `--max-epochs` | 教師データを何周するか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR (`lr-step` superbatch ごとに `lr-gamma` 倍) | 0.001 / 0.1 / 8 |
-| `--start-wdl` / `--end-wdl` | WDL-lambda の線形スケジュール。`target = λ × 対局結果 + (1−λ) × 教師eval` を superbatch 1 → 最終 superbatch にかけて `λ = start → end` と線形補間 | 0.0 / 0.0 (= 純 eval) |
+| `--start-wdl` / `--end-wdl` | WDL-lambda の線形スケジュール。**WDL** = Win/Draw/Loss = 各教師局面に付随する対局結果ラベル (W=1.0、D=0.5、L=0.0、side-to-move 視点)。`target = λ × 対局結果 + (1−λ) × 教師eval` を superbatch 1 → 最終 superbatch にかけて `λ = start → end` と線形補間 | 0.0 / 0.0 (= 純 eval) |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 

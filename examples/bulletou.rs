@@ -286,8 +286,11 @@ struct Args {
 
     /// Start of the WDL-lambda linear schedule (superbatch 1).
     ///
+    /// WDL = Win / Draw / Loss — the three-valued game outcome label
+    /// stored alongside the teacher eval in each training position
+    /// (W = 1.0, D = 0.5, L = 0.0, from side-to-move perspective).
     /// WDL-lambda controls how the loss target blends the teacher's
-    /// evaluation score with the actual game result:
+    /// evaluation score with this game-result label:
     ///
     ///     target = lambda * game_result + (1 - lambda) * eval_score
     ///
