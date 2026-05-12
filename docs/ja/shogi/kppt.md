@@ -114,7 +114,7 @@ resume すると superbatch カウンタは 1 から再開される (run ごと�
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 
-中断・再開の挙動は eval-type 横断で同じなので、[チュートリアル §2.6](../tutorial/2-training.md#26-中断再開) を参照。
+中断・再開の挙動は eval-type 横断で同じなので、[チュートリアル §2.7](../tutorial/2-training.md#27-中断再開) を参照。
 
 ### KPP_KKPT (factorised)
 

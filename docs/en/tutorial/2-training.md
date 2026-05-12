@@ -144,7 +144,7 @@ Main flags:
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR (multiply by `lr-gamma` every `lr-step` superbatches) | 0.001 / 0.1 / 8 |
-| `--lambda` | Blend weight between teacher eval and W/D/L (matches YaneuraOu's built-in `lambda` convention): `target = λ × teacher_eval + (1−λ) × game_result`. `λ = 1.0` is pure eval, `λ = 0.0` is pure W/D/L, intermediate values mix the two. **WDL** = Win/Draw/Loss = the game-result label each teacher position carries (W=1.0, D=0.5, L=0.0, side-to-move perspective) | 1.0 (= pure eval) |
+| `--lambda` | Blend weight between teacher eval and the W/D/L game result (see §2.5) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -157,7 +157,39 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
 
 If your teacher file is smaller than one superbatch (< 100M positions), lower `--batches-per-superbatch` (e.g. `1024` ⇒ 1 superbatch ≒ 16.78M positions) so multiple saves fire.
 
-## 2.5 Inspect the output
+## 2.5 Training target (`--lambda`)
+
+Each teacher position carries **two labels**:
+
+1. **Teacher eval** — the teacher engine's evaluation of that position (sigmoid-transformed).
+2. **Game result** — the actual outcome of that game (W/D/L = 1.0 / 0.5 / 0.0, from side-to-move perspective).
+
+`--lambda <λ>` controls how the loss target blends the two (matches YaneuraOu's built-in `lambda` convention):
+
+```
+target = λ × teacher_eval + (1 − λ) × game_result
+```
+
+| `--lambda` | Meaning |
+|---|---|
+| `1.0` (default) | 100% teacher eval, game result ignored |
+| `0.5` | 50/50 blend (the classic elmo-style mix) |
+| `0.0` | 100% game result, teacher eval ignored |
+| `0.7` etc. | Any intermediate value is fine |
+
+The default `1.0` (pure eval) is the safe starting point: the network learns to imitate the teacher engine's scores directly.
+
+Lower `--lambda` to mix in the W/D/L game result. Pure-result training (`--lambda 0.0`) doesn't rely on teacher strength but has sparser gradients and slower convergence. A practical mix is usually `0.5–0.8`.
+
+```bash
+# elmo-style 50/50 blend on KPPT
+./target/release/examples/bulletou \
+    --eval-type KPPT \
+    --teacher teachers/ \
+    --lambda 0.5
+```
+
+## 2.6 Inspect the output
 
 After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32/`) has the following layout:
 
@@ -180,7 +212,7 @@ checkpoints/NNUE_HALFKP-256x2-32-32/
 
 For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three files `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` (all three are required together).
 
-## 2.6 Resume
+## 2.7 Resume
 
 Stop mid-training (Ctrl+C, machine reboot, whatever) and **re-run the exact same command with the same `--output` — `bulletou` automatically resumes from the latest `000N/state.bin`**.
 
@@ -201,7 +233,7 @@ How it works:
 
 This behaviour is identical for every eval-type (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP — all share the same mechanism). To start fresh, point `--output` at a different directory or delete the existing one.
 
-## 2.7 Load into an engine
+## 2.8 Load into an engine
 
 A minimum walkthrough for verifying the trained weights in a YaneuraOu engine.
 
@@ -241,7 +273,7 @@ The first training run uses a small teacher and few superbatches, so don't expec
 
 Per-eval-type hyperparameter advice lives in the reference docs ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [kppt.md](../shogi/kppt.md)).
 
-## 2.8 Where to go next
+## 2.9 Where to go next
 
 - [Reference: NNUE HalfKP Training](../shogi/halfkp.md) — `nn.bin` binary layout, quantisation, resume details
 - [Reference: NNUE K-P Training](../shogi/kp.md) — input feature comparison vs HalfKP

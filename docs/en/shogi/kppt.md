@@ -114,7 +114,7 @@ On resume the superbatch counter restarts at 1 (the LR scheduler restarts each r
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-Resume / restart behaviour is identical across every eval-type; see the [tutorial §2.6](../tutorial/2-training.md#26-resume) for details.
+Resume / restart behaviour is identical across every eval-type; see the [tutorial §2.7](../tutorial/2-training.md#27-resume) for details.
 
 ### KPP_KKPT (factorised)
 
