@@ -36,7 +36,7 @@
 本チュートリアルでは以下を仮定:
 
 ```
-/data/shogi/raw.pack
+teacher.pack
 ```
 
 (`.hcpe` / `.hcpe3` でも同様に動く。パスは自分の環境に読み替える。)
@@ -56,7 +56,7 @@
 
 ```bash
 cargo run --release --features device-cuda --example shogi_simple -- \
-    --data /data/shogi/raw.pack \
+    --data teacher.pack \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
@@ -67,14 +67,14 @@ cargo run --release --features device-cuda --example shogi_simple -- \
 
 ```bash
 cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
-    --teacher /data/shogi/raw.hcpe \
+    --teacher teacher.hcpe \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
 
 HCPE 固有の制約:
 
-- HCPE には `game_ply` 情報がないので、`game_ply` を使う bucket (Layer Stack の `ply9` 等) は使えない (この最小例は bucket を使わない)
+- HCPE には `game_ply` 情報がないので、`game_ply` を使う bucket (Layer Stack の `ls9` 等) は使えない (この最小例は bucket を使わない)
 - HCPE には policy teacher が存在しないので value 学習のみ。policy 教師込みの学習が必要なら HCPE3 を使う
 
 動いていれば以下のような出力:
@@ -124,7 +124,7 @@ superbatch 2 / 40   ...
 
 ```bash
 cargo run --release --features device-cuda --example shogi_layerstack -- \
-  --data /data/shogi/train.pack \
+  --data teacher.pack \
   --output checkpoints/my-layerstack-net \
   --feature ShogiHalfKaHmThreat \
   --bucket-mode progress8kpabs \

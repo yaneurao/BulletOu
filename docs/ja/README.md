@@ -11,8 +11,6 @@
 
 ## チュートリアル (最初に読む)
 
-全体の目次は [`tutorial/`](tutorial/) に。
-
 1. [概要 — BulletOu が学習する対象と、対応する評価関数の種類](tutorial/0-overview.md)
 2. [クイックスタート — インストール、ビルド、最初の学習を動かす](tutorial/1-quickstart.md)
 3. [NNUE チュートリアル — 将棋 NNUE の学習を詳しく見ていく](tutorial/2-nnue-tutorial.md)

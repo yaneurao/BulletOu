@@ -16,12 +16,15 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 
 ## 対応する評価関数
 
-BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継承しており、**将棋向けの NNUE 評価値ネットワーク**と、**やねうら王の旧 KPPT 系評価関数**の両方を対象とする。
-
 | 評価関数 | 概要 |
 |---|---|
-| **NNUE (HalfKP / HalfKA / Layer Stack)** | bullet-shogi から継承。KP 絶対進行度 bucket 付き Layer Stack が最強構成として典型 |
-| **NNUE + Threat / HandThreat / HandCount 特徴量** | 7 種類の入力特徴量バリエーションあり |
+| **NNUE HalfKP** | 玉位置 × 駒位置の sparse 特徴量 (古典的 NNUE) |
+| **NNUE HalfKA** | HalfKP + 玉も特徴量に含める |
+| **NNUE Layer Stack** | 局面進行度 bucket に応じて出力サブネットを切替える構成 (KP 絶対進行度 bucket が典型) |
+| **NNUE + Threat** | 盤上駒の利き threat を追加した入力特徴量 |
+| **NNUE + HandThreat** | 持ち駒 drop threat を追加した入力特徴量 |
+| **NNUE + HandThreatDefensive** | 防御的な持ち駒 drop threat を追加 (非対称 emission) |
+| **NNUE + HandCount** | 持ち駒枚数を dense aux input として追加 |
 | **KPPT** | `bulletou --eval-type kppt` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
 | **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type kpp-kkpt-kpp`) |
 | KK のみ / KKP のみ | 単体 `bulletou --eval-type kppt-kk` / `kppt-kkp` で生成可能 |
@@ -30,8 +33,12 @@ BulletOu の中核は `bullet` (jw1912) と `bullet-shogi` (SH11235) から継�
 
 BulletOu は以下のいずれかのフォーマットで学習データを読み込める:
 
-- **`.pack`** — [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `gensfen` スクリプトで生成
-- **`.hcpe`** / **`.hcpe3`** — dlshogi 系のフォーマット
+| フォーマット | gensfen スクリプト で生成可能 | dlshogi の selfplay で生成可能 | 説明 |
+|---|---|---|---|
+| `.pack` | ☑ | □ | やねうら王の gensfen スクリプトで生成される |
+| `.psv` | ☑ | □ | やねうら王の旧来からある教師フォーマット |
+| `.hcpe` | ☑ | ☑ | Apery の教師フォーマット |
+| `.hcpe3` | ☑ | ☑ | hcpe を dlshogi 作者が拡張したフォーマット |
 
 学習データは BulletOu には同梱されていない。自分で生成するか、共有データセットを使う。
 

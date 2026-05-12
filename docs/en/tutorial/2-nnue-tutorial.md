@@ -36,7 +36,7 @@ You need a `.pack`, `.hcpe`, or `.hcpe3` file.
 For this walkthrough we'll assume:
 
 ```
-/data/shogi/raw.pack
+teacher.pack
 ```
 
 (`.hcpe` / `.hcpe3` work the same way. Substitute your own path.)
@@ -56,7 +56,7 @@ Pick the example matching your data format:
 
 ```bash
 cargo run --release --features device-cuda --example shogi_simple -- \
-    --data /data/shogi/raw.pack \
+    --data teacher.pack \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
@@ -67,14 +67,14 @@ cargo run --release --features device-cuda --example shogi_simple -- \
 
 ```bash
 cargo run --release --features device-cuda --example shogi_simple_hcpe -- \
-    --teacher /data/shogi/raw.hcpe \
+    --teacher teacher.hcpe \
     --output checkpoints/my-first-shogi-net \
     --superbatches 40
 ```
 
 HCPE-specific caveats:
 
-- HCPE has no `game_ply`, so the Layer Stack `ply9` bucket cannot be used (this minimal example uses no bucketing).
+- HCPE has no `game_ply`, so the Layer Stack `ls9` bucket cannot be used (this minimal example uses no bucketing).
 - HCPE has no policy teacher; value-only training (use HCPE3 if you need a policy teacher).
 
 While it runs, you should see:
@@ -124,7 +124,7 @@ When you are comfortable with `shogi_simple`, move to `shogi_layerstack` for str
 
 ```bash
 cargo run --release --features device-cuda --example shogi_layerstack -- \
-  --data /data/shogi/train.pack \
+  --data teacher.pack \
   --output checkpoints/my-layerstack-net \
   --feature ShogiHalfKaHmThreat \
   --bucket-mode progress8kpabs \

@@ -11,8 +11,6 @@ Documentation is split into two layers:
 
 ## Tutorial (start here)
 
-See [`tutorial/`](tutorial/) for the full table of contents.
-
 1. [Overview — what BulletOu trains, supported evaluation function families](tutorial/0-overview.md)
 2. [Quick Start — install, build, and run your first training session](tutorial/1-quickstart.md)
 3. [NNUE Tutorial — a deeper walkthrough of training a shogi NNUE](tutorial/2-nnue-tutorial.md)
