@@ -10,6 +10,7 @@ mod shogi_halfka_hm_hand_threat;
 mod shogi_halfka_hm_hand_threat_defensive;
 mod shogi_halfka_hm_threat;
 mod shogi_halfkp;
+mod shogi_kk;
 pub mod shogi_threat_exclusion;
 
 #[allow(deprecated)]
@@ -29,6 +30,7 @@ pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;
 pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
 pub use shogi_halfkp::{FEATURE_HASH, ShogiHalfKP};
+pub use shogi_kk::{KK_INPUTS, KK_MAX_ACTIVE, ShogiKk};
 pub use shogi_threat_exclusion::ThreatProfile;
 
 #[allow(deprecated)]
