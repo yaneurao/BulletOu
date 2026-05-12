@@ -90,7 +90,7 @@ If `--output` already contains numbered dirs with `state.bin`, `bulletou` automa
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKP` | (required) |
-| `--arch` | `256x2-32-32` / `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32`) |
 | `--max-epochs` | Number of full passes through the teacher | 1 |

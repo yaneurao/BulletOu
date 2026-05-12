@@ -24,7 +24,7 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 | `--eval-type` | `--arch` を使うか | 現状サポートする `--arch` 値 |
 |---|---|---|
 | `KPPT` / `KPP_KKPT` | 使わない (固定 architecture) | n/a |
-| `NNUE_HALFKP` / `NNUE_KP` | 使う | `256x2-32-32` (default) / `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64` (やねうら王が `NNUE_halfkp_*` で配布している全 preset と一致) |
+| `NNUE_HALFKP` / `NNUE_KP` | 使う | `256x2-32-32` (default)<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64`<br>(やねうら王が `NNUE_halfkp_*` で配布している全 preset と一致) |
 
 `--arch` の値は `<L1>x2-<L2>-<L3>` 表記 (Stockfish 慣習に準拠)。`x2` は dual-perspective を意味する固定リテラル。
 

@@ -111,7 +111,7 @@ L1 / L2 / Output layers are byte-identical between HalfKP and KP for the same `-
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_KP` | (required) |
-| `--arch` | `256x2-32-32` / `384x2-8-96` / `512x2-8-64` / `768x2-16-64` / `1024x2-8-32` / `1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-256x2-32-32`) |
 
