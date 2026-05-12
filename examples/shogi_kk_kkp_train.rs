@@ -17,18 +17,20 @@ output (KK_synthesized.bin + KKP_synthesized.bin). Strength is still expected
 to be limited until KPP is added (Phase 3) and the turn term is wired up
 (Phase 3/4).
 
+Input format is inferred from the file extension (`.hcpe` / `.hcpe3` / `.pack`).
+Mixed extensions across `--data` files are rejected.
+
 Usage:
 
     cargo run --release --features cuda --example shogi_kk_kkp_train -- \
         --data inbox/ref/sp_dr2-15K_20240210.hcpe \
-        --data-format hcpe \
         --output checkpoints/kk-kkp-phase2 \
         --superbatches 3 \
         --batches-per-superbatch 100 \
         --save-rate 1
 */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bullet_lib::{
     game::inputs::{ShogiKk, ShogiKkp},
@@ -44,60 +46,96 @@ use bullet_lib::{
         yaneuraou_kppt::save_yaneuraou_kppt,
     },
 };
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataFormat {
-    #[default]
     Hcpe,
     Hcpe3,
     Pack,
+}
+
+fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
+    let mut found: Option<DataFormat> = None;
+    for p in paths {
+        let ext = Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+        let fmt = match ext.as_deref() {
+            Some("hcpe") => DataFormat::Hcpe,
+            Some("hcpe3") => DataFormat::Hcpe3,
+            Some("pack") => DataFormat::Pack,
+            _ => {
+                return Err(format!(
+                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack"
+                ));
+            }
+        };
+        match found {
+            None => found = Some(fmt),
+            Some(prev) if prev == fmt => {}
+            Some(prev) => {
+                return Err(format!("mixed data formats: {p} is {fmt:?} but previous file(s) were {prev:?}"));
+            }
+        }
+    }
+    found.ok_or_else(|| "no data files provided".to_string())
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kk_kkp_train")]
 #[command(about = "KPPT Phase 2: KK + KKP minimal trainer with YaneuraOu-format output")]
 struct Args {
-    /// Training data path(s) (comma-separated).
+    /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
+    /// is inferred from the extension.
     #[arg(long)]
     data: String,
 
-    #[arg(long, value_enum, default_value = "hcpe")]
-    data_format: DataFormat,
-
+    /// Checkpoint output directory.
     #[arg(long, default_value = "checkpoints/shogi_kk_kkp_phase2")]
     output: PathBuf,
 
+    /// Net identifier (prefix of the saved checkpoint subdirectory).
     #[arg(long, default_value = "shogi_kk_kkp_phase2")]
     net_id: String,
 
+    /// Mini-batch size (positions per gradient step).
     #[arg(long, default_value = "16384")]
     batch_size: usize,
 
+    /// Number of mini-batches per superbatch. Default ≈ 100M positions per
+    /// superbatch (100_000_000 / batch_size).
     #[arg(long)]
     batches_per_superbatch: Option<usize>,
 
+    /// Number of superbatches to run (end_superbatch). A superbatch is the
+    /// "epoch-like" unit for checkpointing / LR / WDL scheduling.
     #[arg(long, default_value = "10")]
     superbatches: usize,
 
+    /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
     start_superbatch: usize,
 
+    /// Initial Adam learning rate.
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
+    /// LR gamma (multiplicative drop applied every `lr_step` superbatches).
     #[arg(long, default_value = "0.1")]
     lr_gamma: f32,
 
+    /// LR step: apply `lr_gamma` every N superbatches.
     #[arg(long, default_value = "8")]
     lr_step: usize,
 
+    /// Start of the WDL linear schedule (0 = pure eval, 1 = pure game result).
     #[arg(long, default_value = "0.0")]
     start_wdl: f32,
 
+    /// End of the WDL linear schedule.
     #[arg(long, default_value = "1.0")]
     end_wdl: f32,
 
+    /// Eval-to-score sigmoid scale.
     #[arg(long, default_value = "400")]
     scale: u32,
 
@@ -106,18 +144,25 @@ struct Args {
     #[arg(long, default_value = "4000.0")]
     yaneuraou_quant_scale: f32,
 
+    /// Save every N superbatches (1 = save every superbatch, 5 = every 5th).
     #[arg(long, default_value = "1")]
     save_rate: usize,
 
+    /// Dataloader worker threads (CPU side).
     #[arg(long, default_value = "4")]
     threads: usize,
 
+    /// GPU-side batch queue depth (number of batches the dataloader may
+    /// stage ahead of training).
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
+    /// Loader shuffle buffer size in megabytes.
     #[arg(long, default_value = "256")]
     buffer_mb: usize,
 
+    /// Drop positions whose |score| >= this. Useful to exclude ±32000 mate
+    /// stamps. Set to 0 to disable.
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 }
@@ -220,6 +265,11 @@ fn main() {
     let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
 
+    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+
     macro_rules! run_with_loader {
         ($loader:expr) => {{
             let loader = $loader;
@@ -227,7 +277,7 @@ fn main() {
         }};
     }
 
-    match args.data_format {
+    match format {
         DataFormat::Hcpe => {
             run_with_loader!(HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
         }

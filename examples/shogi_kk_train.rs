@@ -13,23 +13,23 @@ expected to be poor; the value of this example is wire-up confirmation.
 
 Later phases will add KKP, then KPP, then YaneuraOu-format `.bin` output.
 
-Inputs come from HCPE (.hcpe), HCPE3 (.hcpe3), or YaneuraOu gensfen's
-per-game variable-length `.pack` file. The format is chosen via
-`--data-format`. All three formats are decoded internally into a stream of
-`PackedSfenValue` (40-byte fixed-length) records, which is the trainer's
-internal unit — note that `.pack` itself is **not** a flat array of
-`PackedSfenValue`.
+Inputs come from `.hcpe` (dlshogi-style 38-byte fixed-length), `.hcpe3`
+(dlshogi-style per-game variable-length), or `.pack` (YaneuraOu `gensfen`,
+per-game variable-length). The format is inferred from the file extension;
+mixed extensions across `--data` files are rejected. All three are decoded
+internally into a stream of `PackedSfenValue` (40-byte fixed-length) records,
+which is the trainer's internal unit — note that `.pack` itself is **not**
+a flat array of `PackedSfenValue`.
 
 Usage:
 
     cargo run --release --features cuda --example shogi_kk_train -- \
         --data /data/shogi/train.hcpe \
-        --data-format hcpe \
         --output checkpoints/kk-phase1 \
         --superbatches 10
 */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bullet_lib::{
     game::inputs::ShogiKk,
@@ -44,30 +44,48 @@ use bullet_lib::{
         loader::{Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
     },
 };
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataFormat {
-    /// `.hcpe` (38-byte fixed-length records, Apery-style HCP).
-    #[default]
     Hcpe,
-    /// `.hcpe3` (per-game variable-length, dlshogi style).
     Hcpe3,
-    /// `.pack` (YaneuraOu `gensfen`, per-game variable-length).
     Pack,
+}
+
+fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
+    let mut found: Option<DataFormat> = None;
+    for p in paths {
+        let ext = Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+        let fmt = match ext.as_deref() {
+            Some("hcpe") => DataFormat::Hcpe,
+            Some("hcpe3") => DataFormat::Hcpe3,
+            Some("pack") => DataFormat::Pack,
+            _ => {
+                return Err(format!(
+                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack"
+                ));
+            }
+        };
+        match found {
+            None => found = Some(fmt),
+            Some(prev) if prev == fmt => {}
+            Some(prev) => {
+                return Err(format!("mixed data formats: {p} is {fmt:?} but previous file(s) were {prev:?}"));
+            }
+        }
+    }
+    found.ok_or_else(|| "no data files provided".to_string())
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "shogi_kk_train")]
 #[command(about = "KPPT Phase 1: train a KK-only minimal value network")]
 struct Args {
-    /// Training data path(s) (comma-separated).
+    /// Training data file(s), comma-separated. Format (`.hcpe` / `.hcpe3` / `.pack`)
+    /// is inferred from the extension.
     #[arg(long)]
     data: String,
-
-    /// Data format selector.
-    #[arg(long, value_enum, default_value = "hcpe")]
-    data_format: DataFormat,
 
     /// Checkpoint output directory.
     #[arg(long, default_value = "checkpoints/shogi_kk_phase1")]
@@ -221,6 +239,11 @@ fn main() {
     let data_files_owned: Vec<String> = args.data.split(',').map(|s| s.trim().to_string()).collect();
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
 
+    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+
     // Each data format has its own loader concrete type, and `trainer.run` is
     // generic over the loader. We dispatch via a small macro so the run body
     // is shared without trait-objecting the loader (which is not object-safe).
@@ -231,7 +254,7 @@ fn main() {
         }};
     }
 
-    match args.data_format {
+    match format {
         DataFormat::Hcpe => {
             run_with_loader!(HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
         }
