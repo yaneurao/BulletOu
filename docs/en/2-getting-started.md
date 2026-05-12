@@ -10,12 +10,12 @@ You can use `bullet` as a crate:
 ```toml
 bullet = { git = "https://github.com/jw1912/bullet", package = "bullet_lib" }
 ```
-or by editing and running one of the [examples](../examples):
+or by editing and running one of the [examples](../../examples):
 ```
 cargo r -r --example <example name>
 ```
 
-A basic inference example is included in [examples/simple](../examples/simple.rs), and if you've never
+A basic inference example is included in [examples/simple](../../examples/simple.rs), and if you've never
 trained an NNUE before it is recommended to start with an architecture and training schedule similar to it.
 
 ### Utilities

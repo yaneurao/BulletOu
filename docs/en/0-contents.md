@@ -1,7 +1,7 @@
 # Bullet Documentation
 
 This is the documentation for the basic usage of `bullet_lib`.
-It is recommended to read the [progression examples](../examples/progression/).
+It is recommended to read the [progression examples](../../examples/progression/).
 
 ### NNUE Guide
 
