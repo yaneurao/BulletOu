@@ -15,14 +15,14 @@ Good:
 
 ```markdown
 - [Tutorial](docs/en/tutorial/): walks through ...
-- [Checkpoint layout spec](spec/04-checkpoint-layout.md)
+- [Checkpoint layout spec](docs/spec/04-checkpoint-layout.md)
 ```
 
 Bad:
 
 ```markdown
 - [Tutorial (docs/en/tutorial/)](docs/en/tutorial/): walks through ...
-- [Checkpoint layout (spec/04-checkpoint-layout.md)](spec/04-checkpoint-layout.md)
+- [Checkpoint layout (docs/spec/04-checkpoint-layout.md)](docs/spec/04-checkpoint-layout.md)
 ```
 
 This also applies when the visible text is the bare URL: prefer

@@ -6,7 +6,7 @@
 
 `--eval-type NNUE_HALFKP` は、やねうら王が長年採用している古典的な HalfKP NNUE を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。
 
-活性化関数の歴史的経緯 (なぜ SCReLU ではなく ClippedReLU か) は [`spec/05-activation-history.md`](../../../spec/05-activation-history.md) を参照。
+活性化関数の歴史的経緯 (なぜ SCReLU ではなく ClippedReLU か) は [`spec/05-activation-history.md`](../../spec/05-activation-history.md) を参照。
 
 ## アーキテクチャ
 

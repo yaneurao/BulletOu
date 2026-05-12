@@ -70,7 +70,7 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 
 NNUE 系は `--arch` を `eval` 列に含める (出力ディレクトリ名と同じ命名)。KPPT 系は `--arch` を使わないので `eval` 列に arch は出ない。
 
-正確な仕様は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット) を参照。
+正確な仕様は [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md#learnlog-フォーマット) を参照。
 
 ### pandas で読む
 
@@ -159,7 +159,7 @@ resume すると新 run の行が学習ログにそのまま追記される。�
 - [リファレンス: NNUE K-P 学習](../shogi/kp.md) — HalfKP との比較、入力 feature の構造
 - [リファレンス: NNUE HalfKPE9 学習](../shogi/halfkpe9.md) — 利き数情報拡張版
 - [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習
-- [仕様: spec/](../../../spec/) — eval-type 一覧 / バイナリレイアウト / hash 計算式 / `learn.log` フォーマット
+- [仕様: spec/](../../spec/) — eval-type 一覧 / バイナリレイアウト / hash 計算式 / `learn.log` フォーマット
 
 ---
 

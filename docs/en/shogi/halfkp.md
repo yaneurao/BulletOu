@@ -6,7 +6,7 @@
 
 `--eval-type NNUE_HALFKP` trains the classic YaneuraOu HalfKP NNUE — dual-perspective HalfKP feature transformer + 4 ClippedReLU layers. This is the evaluation function family YaneuraOu has supported the longest.
 
-The activation-function history (why ClippedReLU and not SCReLU) is documented in [`spec/05-activation-history.md`](../../../spec/05-activation-history.md).
+The activation-function history (why ClippedReLU and not SCReLU) is documented in [`spec/05-activation-history.md`](../../spec/05-activation-history.md).
 
 ## Architecture
 

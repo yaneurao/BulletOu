@@ -70,7 +70,7 @@ Bullet writes **one row every 32 batches**. With the default `--batches-per-supe
 
 NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.
 
-Full spec: [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット).
+Full spec: [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md#learnlog-フォーマット).
 
 ### Read with pandas
 
@@ -159,7 +159,7 @@ Using `positions` as the time axis gives you a continuous loss curve across resu
 - [Reference: NNUE K-P Training](../shogi/kp.md) — comparison vs HalfKP, input feature structure
 - [Reference: NNUE HalfKPE9 Training](../shogi/halfkpe9.md) — HalfKP with attacker-count buckets
 - [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — legacy YaneuraOu evals
-- [Specifications: spec/](../../../spec/) — eval-type matrix, binary layout, hash derivations, `learn.log` format
+- [Specifications: spec/](../../spec/) — eval-type matrix, binary layout, hash derivations, `learn.log` format
 
 ---
 

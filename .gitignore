@@ -21,4 +21,5 @@ yaneuraou/
 __pycache__
 scripts/
 
-images/bulletou-logo-mascot.png
+docs/images/bulletou-logo-mascot.png
+/tools

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/bulletou-logo-mascot-s0.png" alt="BulletOu UltraFast Shogi AI ML" width="480px">
+  <img src="docs/images/bulletou-logo-mascot-s0.png" alt="BulletOu UltraFast Shogi AI ML" width="480px">
 </p>
 
 <div align="center">
