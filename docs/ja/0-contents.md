@@ -10,10 +10,10 @@ BulletOu (`bullet_lib` Rust crate) の基本的な使い方をまとめたドキ
 以下のガイドは NNUE 学習に特化した内容。
 
 基本的な使い方:
-1. NNUE の基礎 — *英語版のみ: [1-basics.md](../en/1-basics.md) (翻訳予定)*
-2. はじめかた — *英語版のみ: [2-getting-started.md](../en/2-getting-started.md) (翻訳予定)*
-3. 教師データ — *英語版のみ: [3-data.md](../en/3-data.md) (翻訳予定)*
-4. 学習済みネットワーク — *英語版のみ: [4-saved-networks.md](../en/4-saved-networks.md) (翻訳予定)*
+1. [NNUE の基礎](1-basics.md)
+2. [はじめかた](2-getting-started.md)
+3. [教師データ](3-data.md)
+4. [学習済みネットワーク](4-saved-networks.md)
 
 ### 将棋向けドキュメント
 
