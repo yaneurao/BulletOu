@@ -6,15 +6,15 @@ Dispatches to the appropriate training routine via `--eval-type`. The
 sequentially in a single invocation and assemble the result into
 `<output>/final/`:
 
-    bulletou --eval-type kppt            (KPPT family, KPP int16 × 2)
-    bulletou --eval-type kpp-kkpt        (KPP_KKPT factorised, KPP int16)
+    bulletou --eval-type KPPT            (KPPT family, KPP int16 × 2)
+    bulletou --eval-type KPP_KKPT        (KPP_KKPT factorised, KPP int16)
 
 To train a single component standalone (= for development / smoke testing):
 
-    bulletou --eval-type kppt-kk         KK only
-    bulletou --eval-type kppt-kkp        KKP only
-    bulletou --eval-type kppt-kpp        KPP only, KPPT layout
-    bulletou --eval-type kpp-kkpt-kpp    KPP only, KPP_KKPT layout
+    bulletou --eval-type KPPT_KK         KK only
+    bulletou --eval-type KPPT_KKP        KKP only
+    bulletou --eval-type KPPT_KPP        KPP only, KPPT layout
+    bulletou --eval-type KPP_KKPT_KPP    KPP only, KPP_KKPT layout
 
 Teacher data is given via `--teacher`. The argument is either a single
 file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
@@ -25,7 +25,7 @@ share the same extension.
 Usage:
 
     cargo run --release --features device-cuda --example bulletou -- \
-        --eval-type kppt \
+        --eval-type KPPT \
         --teacher /data/shogi/train_set/ \
         --output checkpoints/my-kppt \
         --superbatches 20
@@ -56,12 +56,13 @@ use clap::{Parser, ValueEnum};
 // ----- eval-type ---------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "SCREAMING_SNAKE_CASE")]
 enum EvalType {
     /// KPPT family: train KK, KKP, and KPP sequentially and assemble the
     /// three-file KPPT eval (`KK_synthesized.bin` / `KKP_synthesized.bin` /
     /// `KPP_synthesized.bin`) into `<output>/final/`.
     Kppt,
-    /// KPP_KKPT family (factorised KPPT): same as `kppt` but KPP is written
+    /// KPP_KKPT family (factorised KPPT): same as `KPPT` but KPP is written
     /// in the KPP_KKPT layout (no turn channel; half the KPP file size).
     KppKkpt,
     /// KPPT KK component only.
@@ -253,7 +254,7 @@ fn main() {
     match args.eval_type {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         // Single-component eval-types do not currently auto-resume. (For
-        // resume, drive the full family with `--eval-type kppt` / `kpp-kkpt`.)
+        // resume, drive the full family with `--eval-type KPPT` / `KPP_KKPT`.)
         EvalType::KpptKk => run_kppt_kk(&args, None),
         EvalType::KpptKkp => run_kppt_kkp(&args, None),
         // KPP trains the same network for both the KPPT and KPP_KKPT layouts;
@@ -307,8 +308,8 @@ fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::Path
 /// the three resulting `.bin` files into `<output>/final/` so the engine has
 /// a single directory to point at.
 ///
-/// `--eval-type kppt` uses the KPPT KPP layout (int16 × 2, with turn channel).
-/// `--eval-type kpp-kkpt` uses the KPP_KKPT KPP layout (int16, no turn channel).
+/// `--eval-type KPPT` uses the KPPT KPP layout (int16 × 2, with turn channel).
+/// `--eval-type KPP_KKPT` uses the KPP_KKPT KPP layout (int16, no turn channel).
 fn run_kppt_all(args: &Args) {
     let output_dir = args.output_dir();
 

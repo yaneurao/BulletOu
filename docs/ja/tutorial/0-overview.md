@@ -25,9 +25,9 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 | **NNUE + HandThreat** | 持ち駒 drop threat を追加した入力特徴量 |
 | **NNUE + HandThreatDefensive** | 防御的な持ち駒 drop threat を追加 (非対称 emission) |
 | **NNUE + HandCount** | 持ち駒枚数を dense aux input として追加 |
-| **KPPT** | `bulletou --eval-type kppt` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
-| **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type kpp-kkpt-kpp`) |
-| KK のみ / KKP のみ | 単体 `bulletou --eval-type kppt-kk` / `kppt-kkp` で生成可能 |
+| **KPPT** | `bulletou --eval-type KPPT` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
+| **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く (`--eval-type KPP_KKPT_KPP`) |
+| KK のみ / KKP のみ | 単体 `bulletou --eval-type KPPT_KK` / `KPPT_KKP` で生成可能 |
 
 ## 学習データはどこから来るか
 

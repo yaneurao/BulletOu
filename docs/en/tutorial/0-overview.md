@@ -25,9 +25,9 @@ BulletOu does **not** play shogi itself. It is the part of the pipeline that **l
 | **NNUE + HandThreat** | Adds drop-threat features for pieces in hand |
 | **NNUE + HandThreatDefensive** | Adds defensive drop-threat features (asymmetric emission) |
 | **NNUE + HandCount** | Adds hand-piece counts as a dense auxiliary input |
-| **KPPT** | `bulletou --eval-type kppt` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
-| **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type kpp-kkpt-kpp`). |
-| KK-only / KKP-only minimal variants | Run the corresponding `bulletou --eval-type kppt-kk` / `kppt-kkp` standalone. |
+| **KPPT** | `bulletou --eval-type KPPT` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
+| **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel (`--eval-type KPP_KKPT_KPP`). |
+| KK-only / KKP-only minimal variants | Run the corresponding `bulletou --eval-type KPPT_KK` / `KPPT_KKP` standalone. |
 
 ## Where the data comes from
 

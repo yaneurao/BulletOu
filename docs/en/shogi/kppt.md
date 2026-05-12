@@ -47,11 +47,11 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 ### KPPT (elmo-compatible)
 
-`--eval-type kppt` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
+`--eval-type KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kppt \
+    --eval-type KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
 ```
@@ -106,11 +106,11 @@ Just re-running the same command picks up where it left off. To start fresh, poi
 
 ### KPP_KKPT (factorised)
 
-`--eval-type kpp-kkpt` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
+`--eval-type KPP_KKPT` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kpp-kkpt \
+    --eval-type KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
@@ -118,11 +118,11 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ### Training a single component standalone
 
-For development / smoke testing you can train just one component with `--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp`:
+For development / smoke testing you can train just one component with `--eval-type KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP`:
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kppt-kpp \
+    --eval-type KPPT_KPP \
     --teacher inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
@@ -133,7 +133,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `kppt` (3-component sequential) / `kpp-kkpt` (factorised) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (required) |
+| `--eval-type` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (required) |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | per-eval-type default |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |

@@ -47,11 +47,11 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ### KPPT (elmo 互換)
 
-`--eval-type kppt` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
+`--eval-type KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kppt \
+    --eval-type KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
 ```
@@ -106,11 +106,11 @@ checkpoints/my-kppt/
 
 ### KPP_KKPT (factorised)
 
-`--eval-type kpp-kkpt` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
+`--eval-type KPP_KKPT` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kpp-kkpt \
+    --eval-type KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
@@ -118,11 +118,11 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ### 単体 component だけ学習する
 
-開発・動作確認用に、`--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` で 1 component だけ学習することもできる:
+開発・動作確認用に、`--eval-type KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` で 1 component だけ学習することもできる:
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
-    --eval-type kppt-kpp \
+    --eval-type KPPT_KPP \
     --teacher inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
@@ -133,7 +133,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `kppt` (3 component 連続学習) / `kpp-kkpt` (factorised 版) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (必須) |
+| `--eval-type` | `KPPT` (3 component 連続学習) / `KPP_KKPT` (factorised 版) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (必須) |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | eval-type 別自動 |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
