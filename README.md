@@ -13,15 +13,15 @@ Target evaluation functions:
 - NNUE halfKP
 - NNUE KP
 - NNUE halfka1 / halfka2
-- SFNN + layerstack9 (NNUEwoSQPT1536)
+- SFNN + ls9 (NNUEwoSQPT1536)
 - KPPT
 - KPP_KPPT
 
 ### Usage
 
-**First-time users** should start with the [tutorial (docs/en/tutorial/)](docs/en/tutorial/), which walks through installation, building, and running a first training session step by step.
+- [Tutorial (docs/en/tutorial/)](docs/en/tutorial/): walks through installation, building, and running a first training session step by step.
+- [Documentation](docs/en/): specification-level details such as training-data formats and output formats.
 
-For specification-level details such as training-data formats and output formats, see [docs/en/](docs/en/).
 
 ### Building
 
@@ -35,10 +35,6 @@ HIP_PATH=/opt/rocm cargo build --release --features device-rocm
 
 CPU-only training is not supported (the mock GPU runtime is a type-checking stub only).
 
-### Documentation
-
-See [docs/en/](docs/en/).
-
 
 ### Lineage / Upstream
 
@@ -50,8 +46,3 @@ See [docs/en/](docs/en/).
 ### License
 
 MIT (inherited from upstream). Original copyright notices are preserved in `LICENSE`.
-
-### Help / Feedback
-
-- File issues at <https://github.com/yaneurao/BulletOu/issues>
-- For general bullet-related discussion (upstream / chess), see the `#bullet` channel in the [Engine Programming](https://discord.com/invite/F6W6mMsTGN) Discord server.
