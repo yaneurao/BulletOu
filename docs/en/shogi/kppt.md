@@ -56,18 +56,26 @@ cargo run --release --features device-cuda --example bulletou -- \
     --output checkpoints/my-kppt
 ```
 
-Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader returns EOF). To run multiple passes, pass `--max-epochs N` -- the LR scheduler restarts at the beginning of each epoch. When the run completes:
+Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader returns EOF). To run multiple passes, pass `--max-epochs N` — the LR scheduler restarts at the beginning of each epoch.
+
+When training finishes, the saved checkpoints are laid out as zero-padded numbered directories, one per save point, each containing the three `.bin` files:
 
 ```
 checkpoints/my-kppt/
-├── kk-20/  kkp-20/  kpp-20/        ← per-component checkpoints
-└── final/
+├── 0001/
+│   ├── KK_synthesized.bin
+│   ├── KKP_synthesized.bin
+│   └── KPP_synthesized.bin
+├── 0002/
+│   ├── ...
+├── ...
+└── 000N/                              ← the most recent save
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
-    └── KPP_synthesized.bin          ← give this directory to the engine
+    └── KPP_synthesized.bin
 ```
 
-Point a YaneuraOu KPPT engine at `checkpoints/my-kppt/final/`.
+Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`).
 
 ### KPP_KKPT (factorised)
 

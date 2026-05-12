@@ -56,18 +56,26 @@ cargo run --release --features device-cuda --example bulletou -- \
     --output checkpoints/my-kppt
 ```
 
-`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。完了すると、
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
+
+完了すると、各 save 単位で `0001/`, `0002/`, ... と 4 桁番号のディレクトリが並び、それぞれに 3 ファイルが入る:
 
 ```
 checkpoints/my-kppt/
-├── kk-20/  kkp-20/  kpp-20/        ← 各 component の checkpoint
-└── final/
+├── 0001/
+│   ├── KK_synthesized.bin
+│   ├── KKP_synthesized.bin
+│   └── KPP_synthesized.bin
+├── 0002/
+│   ├── ...
+├── ...
+└── 000N/                              ← 最新 (= 最後に保存された) save
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
-    └── KPP_synthesized.bin           ← この 3 ファイルをエンジンに渡す
+    └── KPP_synthesized.bin
 ```
 
-`checkpoints/my-kppt/final/` をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能。
+最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能。
 
 ### KPP_KKPT (factorised)
 

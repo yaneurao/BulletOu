@@ -303,70 +303,99 @@ fn run_kppt_all(args: &Args) {
         }
     }
 
-    // Assemble the three .bin files into <output>/final/. Locate each
-    // component's most-recent checkpoint directory by parsing the suffix
-    // (`<net_id>-<sb>` for max_epochs=1, `<net_id>-e<e>-<sb>` otherwise) --
-    // we cannot predict the values up front because `--superbatches` may be
-    // unbounded (= each component trains to its EOF).
-    let final_dir = output_dir.join("final");
-    if let Err(e) = std::fs::create_dir_all(&final_dir) {
-        eprintln!("error: failed to create {}: {e}", final_dir.display());
+    // Re-organise per-component checkpoint subdirs into a flat, zero-padded
+    // series `0001/`, `0002/`, ..., each containing the three `.bin` files
+    // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
+    // `kpp-*/` subdirs are removed after assembly.
+    if let Err(e) = assemble_numbered_dirs(&output_dir) {
+        eprintln!("error: failed to assemble numbered checkpoint dirs: {e}");
         std::process::exit(1);
     }
-    let assembly_pairs = [
-        ("kk", "KK_synthesized.bin"),
-        ("kkp", "KKP_synthesized.bin"),
-        ("kpp", "KPP_synthesized.bin"),
-    ];
-    for (net_id, filename) in assembly_pairs {
-        let last_ckpt = find_last_checkpoint(&output_dir, net_id).unwrap_or_else(|| {
-            eprintln!("error: no checkpoint subdirectory found under {} for net-id `{net_id}`", output_dir.display());
-            std::process::exit(1);
-        });
-        let src = last_ckpt.join(filename);
-        let dst = final_dir.join(filename);
-        if let Err(e) = std::fs::copy(&src, &dst) {
-            eprintln!("error: failed to copy {} -> {}: {e}", src.display(), dst.display());
-            std::process::exit(1);
-        }
-        eprintln!("  copied {} -> {}", src.display(), dst.display());
-    }
-
-    eprintln!("\n=== done. assembled eval at {} ===", final_dir.display());
 }
 
-/// Find the most-recent checkpoint subdirectory for `net_id_prefix` under
-/// `output_dir`. Subdirectory names are either `<prefix>-<sb>` (single-epoch
-/// mode) or `<prefix>-e<epoch>-<sb>` (multi-epoch mode); the one with the
-/// largest `(epoch, sb)` pair wins.
-fn find_last_checkpoint(output_dir: &std::path::Path, net_id_prefix: &str) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(output_dir).ok()?;
-    let mut latest: Option<(usize, usize, std::path::PathBuf)> = None;
+/// List checkpoint subdirs for `net_id_prefix` under `output_dir`, sorted by
+/// `(epoch, sb)`. Subdir names are `<prefix>-<sb>` (single-epoch) or
+/// `<prefix>-e<epoch>-<sb>` (multi-epoch).
+fn list_component_checkpoints_sorted(
+    output_dir: &std::path::Path,
+    net_id_prefix: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut entries: Vec<(usize, usize, std::path::PathBuf)> = Vec::new();
     let prefix = format!("{net_id_prefix}-");
-    for entry in entries.flatten() {
+    let Ok(rd) = std::fs::read_dir(output_dir) else { return Vec::new() };
+    for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
         let Some(rest) = name.strip_prefix(&prefix) else { continue };
-        let (epoch, sb) = if let Some(after_e) = rest.strip_prefix('e') {
-            // `<prefix>-e<E>-<SB>`
-            let (e_str, sb_str) = after_e.split_once('-')?;
-            (e_str.parse().ok()?, sb_str.parse().ok()?)
-        } else {
-            // `<prefix>-<SB>`
-            (1usize, rest.parse().ok()?)
-        };
-        match &latest {
-            None => latest = Some((epoch, sb, path)),
-            Some((e_prev, sb_prev, _)) if (epoch, sb) > (*e_prev, *sb_prev) => {
-                latest = Some((epoch, sb, path));
+        let parsed: Option<(usize, usize)> = (|| {
+            if let Some(after_e) = rest.strip_prefix('e') {
+                let (e_str, sb_str) = after_e.split_once('-')?;
+                Some((e_str.parse().ok()?, sb_str.parse().ok()?))
+            } else {
+                rest.parse::<usize>().ok().map(|sb| (1, sb))
             }
-            _ => {}
+        })();
+        let Some((epoch, sb)) = parsed else { continue };
+        entries.push((epoch, sb, path));
+    }
+    entries.sort();
+    entries.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
+/// produced by the three children of `run_kppt_all`, and assemble them into
+/// flat `<output>/0001/`, `0002/`, ... directories each containing the
+/// three `.bin` files. Removes the per-component subdirs after assembly so
+/// the user sees a clean numbered layout.
+fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<()> {
+    let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
+    let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
+    let kpp_dirs = list_component_checkpoints_sorted(output_dir, "kpp");
+
+    let n = kk_dirs.len().min(kkp_dirs.len()).min(kpp_dirs.len());
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "no checkpoint subdirs under {} (kk={}, kkp={}, kpp={})",
+                output_dir.display(),
+                kk_dirs.len(),
+                kkp_dirs.len(),
+                kpp_dirs.len()
+            ),
+        ));
+    }
+    if kk_dirs.len() != n || kkp_dirs.len() != n || kpp_dirs.len() != n {
+        eprintln!(
+            "  warning: component save counts differ (kk={}, kkp={}, kpp={}); using the common prefix of {n}",
+            kk_dirs.len(),
+            kkp_dirs.len(),
+            kpp_dirs.len()
+        );
+    }
+
+    eprintln!("\n=== assembling {n} checkpoint dir(s) under {} ===", output_dir.display());
+    for i in 0..n {
+        let idx = i + 1;
+        let dst = output_dir.join(format!("{idx:04}"));
+        std::fs::create_dir_all(&dst)?;
+        std::fs::copy(kk_dirs[i].join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
+        std::fs::copy(kkp_dirs[i].join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
+        std::fs::copy(kpp_dirs[i].join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
+        eprintln!("  -> {}/", dst.display());
+    }
+
+    // Remove the now-redundant per-component subdirs.
+    for d in kk_dirs.iter().chain(kkp_dirs.iter()).chain(kpp_dirs.iter()) {
+        if let Err(e) = std::fs::remove_dir_all(d) {
+            eprintln!("  warning: failed to remove {}: {e}", d.display());
         }
     }
-    latest.map(|(_, _, p)| p)
+
+    Ok(())
 }
 
 // `Trainer<G, O, S>` の concrete type は bullet API として直接露出していないので、
