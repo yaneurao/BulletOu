@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::{ShogiKk, ShogiKkp, ShogiKpp},
     nn::optimiser,
-    teacher_path::{DataFormat, compute_auto_epoch_superbatches, expand_teacher, infer_data_format},
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -118,19 +118,6 @@ impl EvalType {
 // (teacher-path expansion and format inference live in
 //  `bullet_lib::teacher_path` so the single-component examples can share them.)
 
-/// Resolve `args.superbatches` to a concrete `end_superbatch` value.
-/// If the user did not pass `--superbatches`, fall back to a 1-epoch estimate
-/// via `compute_auto_epoch_superbatches`.
-fn resolve_end_superbatch(
-    args: &Args,
-    format: DataFormat,
-    teacher_files: &[&str],
-    batches_per_superbatch: usize,
-) -> usize {
-    args.superbatches
-        .unwrap_or_else(|| compute_auto_epoch_superbatches(teacher_files, format, args.batch_size, batches_per_superbatch))
-}
-
 // ----- CLI ---------------------------------------------------------------
 
 #[derive(Parser, Debug, Clone)]
@@ -167,14 +154,20 @@ struct Args {
     #[arg(long)]
     batches_per_superbatch: Option<usize>,
 
-    /// Number of superbatches to run (= `end_superbatch`). If omitted, the
-    /// trainer covers the teacher data exactly once: the value is computed
-    /// from `total_positions / (batch_size * batches_per_superbatch)`. For
-    /// fixed-length formats (`.hcpe` / `.psv`) this is exact; for
-    /// variable-length formats (`.pack` / `.hcpe3`) the position count is a
-    /// rough estimate from file sizes (±~30%).
+    /// Cap on the number of superbatches per epoch. If omitted, there is no
+    /// cap (= run until the dataloader reaches EOF). Specify this to stop
+    /// each epoch early (e.g. to fit a quick smoke test). Mutually exclusive
+    /// with `--max-epoch` in practical use.
     #[arg(long)]
     superbatches: Option<usize>,
+
+    /// Number of epochs to train. One epoch = one full pass through the
+    /// teacher data (= one dataloader EOF). After each epoch the dataloader
+    /// is rebuilt from scratch and the LR scheduler restarts at superbatch
+    /// 1, so for example `--lr-step 8` applies independently within each
+    /// epoch. Default 1.
+    #[arg(long, default_value = "1")]
+    max_epoch: usize,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -276,22 +269,6 @@ fn main() {
 fn run_kppt_all(args: &Args) {
     let output_dir = args.output_dir();
 
-    // Resolve the auto-epoch count once at the family level so all three
-    // children train for the same number of superbatches and the final-copy
-    // step knows which sub-directory to read from.
-    let batches_per_superbatch =
-        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
-    let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-    let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    let last_sb = resolve_end_superbatch(args, format, &data_files_ref, batches_per_superbatch);
-
     let kpp_eval_type = match args.eval_type {
         EvalType::Kppt => EvalType::KpptKpp,
         EvalType::KppKkpt => EvalType::KppKkptKpp,
@@ -313,9 +290,6 @@ fn run_kppt_all(args: &Args) {
         let mut child = args.clone();
         child.eval_type = child_eval_type;
         child.net_id = Some(net_id.to_string());
-        // Pin the child's --superbatches to the family-resolved value so each
-        // child does not re-resolve (and so they all agree).
-        child.superbatches = Some(last_sb);
         // Force the child's yaneuraou_quant_scale default to match the child's
         // eval-type when the user didn't override it.
         if args.yaneuraou_quant_scale.is_none() {
@@ -329,7 +303,11 @@ fn run_kppt_all(args: &Args) {
         }
     }
 
-    // Assemble the three .bin files into <output>/final/.
+    // Assemble the three .bin files into <output>/final/. Locate each
+    // component's most-recent checkpoint directory by parsing the suffix
+    // (`<net_id>-<sb>` for max_epoch=1, `<net_id>-e<e>-<sb>` otherwise) --
+    // we cannot predict the values up front because `--superbatches` may be
+    // unbounded (= each component trains to its EOF).
     let final_dir = output_dir.join("final");
     if let Err(e) = std::fs::create_dir_all(&final_dir) {
         eprintln!("error: failed to create {}: {e}", final_dir.display());
@@ -341,7 +319,11 @@ fn run_kppt_all(args: &Args) {
         ("kpp", "KPP_synthesized.bin"),
     ];
     for (net_id, filename) in assembly_pairs {
-        let src = output_dir.join(format!("{net_id}-{last_sb}")).join(filename);
+        let last_ckpt = find_last_checkpoint(&output_dir, net_id).unwrap_or_else(|| {
+            eprintln!("error: no checkpoint subdirectory found under {} for net-id `{net_id}`", output_dir.display());
+            std::process::exit(1);
+        });
+        let src = last_ckpt.join(filename);
         let dst = final_dir.join(filename);
         if let Err(e) = std::fs::copy(&src, &dst) {
             eprintln!("error: failed to copy {} -> {}: {e}", src.display(), dst.display());
@@ -351,6 +333,40 @@ fn run_kppt_all(args: &Args) {
     }
 
     eprintln!("\n=== done. assembled eval at {} ===", final_dir.display());
+}
+
+/// Find the most-recent checkpoint subdirectory for `net_id_prefix` under
+/// `output_dir`. Subdirectory names are either `<prefix>-<sb>` (single-epoch
+/// mode) or `<prefix>-e<epoch>-<sb>` (multi-epoch mode); the one with the
+/// largest `(epoch, sb)` pair wins.
+fn find_last_checkpoint(output_dir: &std::path::Path, net_id_prefix: &str) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(output_dir).ok()?;
+    let mut latest: Option<(usize, usize, std::path::PathBuf)> = None;
+    let prefix = format!("{net_id_prefix}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let (epoch, sb) = if let Some(after_e) = rest.strip_prefix('e') {
+            // `<prefix>-e<E>-<SB>`
+            let (e_str, sb_str) = after_e.split_once('-')?;
+            (e_str.parse().ok()?, sb_str.parse().ok()?)
+        } else {
+            // `<prefix>-<SB>`
+            (1usize, rest.parse().ok()?)
+        };
+        match &latest {
+            None => latest = Some((epoch, sb, path)),
+            Some((e_prev, sb_prev, _)) if (epoch, sb) > (*e_prev, *sb_prev) => {
+                latest = Some((epoch, sb, path));
+            }
+            _ => {}
+        }
+    }
+    latest.map(|(_, _, p)| p)
 }
 
 // `Trainer<G, O, S>` の concrete type は bullet API として直接露出していないので、
@@ -378,62 +394,86 @@ macro_rules! run_training_inline {
             std::process::exit(2);
         });
 
-        let end_superbatch = resolve_end_superbatch(args, format, &data_files_ref, batches_per_superbatch);
+        // --superbatches が未指定なら epoch ごとに loader EOF まで回す (= usize::MAX で
+        // 上限なし、loader 側で EOF が来たら trainer.run が返る)。
+        let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
 
-        let schedule = TrainingSchedule {
-            net_id: args.net_id(),
-            eval_scale: args.scale as f32,
-            steps: TrainingSteps {
-                batch_size: args.batch_size,
-                batches_per_superbatch,
-                start_superbatch: args.start_superbatch,
-                end_superbatch,
-            },
-            wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
-            lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
-            save_rate: args.save_rate,
-        };
-
-        let net_id = args.net_id();
+        let net_id_base = args.net_id();
         let output_dir_buf = args.output_dir();
         let yaneuraou_scale = args.yaneuraou_scale();
         let kpp_format = args.kpp_format();
-        let on_checkpoint_saved = move |superbatch: usize| {
-            let ckpt_dir = output_dir_buf.join(format!("{net_id}-{superbatch}"));
-            match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
-                Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
-                Err(e) => {
-                    eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display())
-                }
-            }
-        };
+        let max_epoch = args.max_epoch.max(1);
 
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
-        let settings = LocalSettings {
-            threads: args.threads,
-            test_set: None,
-            output_directory: output_dir,
-            batch_queue_size: args.batch_queue_size,
-            on_checkpoint_saved: Some(&on_checkpoint_saved),
-        };
 
-        match format {
-            DataFormat::Hcpe => {
-                let loader = HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                trainer.run(&schedule, &settings, &loader);
+        for epoch in 1..=max_epoch {
+            if max_epoch > 1 {
+                eprintln!("\n=== epoch {epoch} / {max_epoch} ===");
             }
-            DataFormat::Hcpe3 => {
-                let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                trainer.run(&schedule, &settings, &loader);
-            }
-            DataFormat::Pack => {
-                let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                trainer.run(&schedule, &settings, &loader);
-            }
-            DataFormat::Psv => {
-                let loader = DirectSequentialDataLoader::new(&data_files_ref);
-                trainer.run(&schedule, &settings, &loader);
+
+            // checkpoint dir 名は max_epoch=1 のとき従来通り `<net_id>-<superbatch>`、
+            // 複数 epoch のときは `<net_id>-e<epoch>-<superbatch>` で重複を避ける。
+            let net_id_for_epoch = if max_epoch > 1 {
+                format!("{net_id_base}-e{epoch}")
+            } else {
+                net_id_base.clone()
+            };
+
+            let schedule = TrainingSchedule {
+                net_id: net_id_for_epoch.clone(),
+                eval_scale: args.scale as f32,
+                steps: TrainingSteps {
+                    batch_size: args.batch_size,
+                    batches_per_superbatch,
+                    start_superbatch: args.start_superbatch,
+                    end_superbatch,
+                },
+                wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
+                lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                save_rate: args.save_rate,
+            };
+
+            let net_id_for_cb = net_id_for_epoch.clone();
+            let output_dir_for_cb = output_dir_buf.clone();
+            let on_checkpoint_saved = move |superbatch: usize| {
+                let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
+                match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
+                    Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
+                    Err(e) => {
+                        eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display())
+                    }
+                }
+            };
+
+            let settings = LocalSettings {
+                threads: args.threads,
+                test_set: None,
+                output_directory: output_dir,
+                batch_queue_size: args.batch_queue_size,
+                on_checkpoint_saved: Some(&on_checkpoint_saved),
+            };
+
+            match format {
+                DataFormat::Hcpe => {
+                    let loader =
+                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    trainer.run(&schedule, &settings, &loader);
+                }
+                DataFormat::Hcpe3 => {
+                    let loader =
+                        Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    trainer.run(&schedule, &settings, &loader);
+                }
+                DataFormat::Pack => {
+                    let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                        .with_single_epoch(true);
+                    trainer.run(&schedule, &settings, &loader);
+                }
+                DataFormat::Psv => {
+                    let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                    trainer.run(&schedule, &settings, &loader);
+                }
             }
         }
     }};

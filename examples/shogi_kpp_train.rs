@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::ShogiKpp,
     nn::optimiser,
-    teacher_path::{DataFormat, compute_auto_epoch_superbatches, expand_teacher, infer_data_format},
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -77,10 +77,15 @@ struct Args {
     #[arg(long)]
     batches_per_superbatch: Option<usize>,
 
-    /// Number of superbatches to run. If omitted, the trainer runs for one
-    /// epoch through the teacher data (computed from file sizes).
+    /// Cap on the number of superbatches per epoch. If omitted, run each
+    /// epoch until the dataloader reaches EOF.
     #[arg(long)]
     superbatches: Option<usize>,
+
+    /// Number of epochs (= dataloader EOFs) to run. LR scheduler restarts at
+    /// superbatch 1 each epoch.
+    #[arg(long, default_value = "1")]
+    max_epoch: usize,
 
     /// Starting superbatch counter (>1 to resume / extend).
     #[arg(long, default_value = "1")]
@@ -188,65 +193,75 @@ fn main() {
     let batches_per_superbatch =
         args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
 
-    let end_superbatch = args.superbatches.unwrap_or_else(|| {
-        compute_auto_epoch_superbatches(&data_files_ref, format, args.batch_size, batches_per_superbatch)
-    });
+    let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
 
-    let schedule = TrainingSchedule {
-        net_id: args.net_id.clone(),
-        eval_scale: args.scale as f32,
-        steps: TrainingSteps {
-            batch_size: args.batch_size,
-            batches_per_superbatch,
-            start_superbatch: args.start_superbatch,
-            end_superbatch,
-        },
-        wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
-        lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
-        save_rate: args.save_rate,
-    };
-
-    // After every checkpoint, also write the YaneuraOu KPP binary alongside
-    // raw.bin / quantised.bin in the saved superbatch directory.
-    let net_id = args.net_id.clone();
-    let output_dir_buf = args.output.clone();
     let yaneuraou_scale = args.yaneuraou_quant_scale;
-    let on_checkpoint_saved = move |superbatch: usize| {
-        let ckpt_dir = output_dir_buf.join(format!("{net_id}-{superbatch}"));
-        match save_yaneuraou_kppt(&ckpt_dir, yaneuraou_scale) {
-            Ok(()) => eprintln!("  also wrote KPP_synthesized.bin in {}", ckpt_dir.display()),
-            Err(e) => eprintln!("  WARN: failed to write YaneuraOu KPP binary in {}: {e}", ckpt_dir.display()),
-        }
-    };
+    let max_epoch = args.max_epoch.max(1);
+    let output_dir_str = args.output.to_str().unwrap_or("checkpoints").to_string();
 
-    let output_dir = args.output.to_str().unwrap_or("checkpoints");
-    let settings = LocalSettings {
-        threads: args.threads,
-        test_set: None,
-        output_directory: output_dir,
-        batch_queue_size: args.batch_queue_size,
-        on_checkpoint_saved: Some(&on_checkpoint_saved),
-    };
+    for epoch in 1..=max_epoch {
+        if max_epoch > 1 {
+            eprintln!("\n=== epoch {epoch} / {max_epoch} ===");
+        }
+        let net_id_for_epoch = if max_epoch > 1 {
+            format!("{}-e{epoch}", args.net_id)
+        } else {
+            args.net_id.clone()
+        };
+        let net_id_for_cb = net_id_for_epoch.clone();
+        let output_dir_for_cb = args.output.clone();
+        let on_checkpoint_saved = move |superbatch: usize| {
+            let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
+            match save_yaneuraou_kppt(&ckpt_dir, yaneuraou_scale) {
+                Ok(()) => eprintln!("  also wrote KPP_synthesized.bin in {}", ckpt_dir.display()),
+                Err(e) => {
+                    eprintln!("  WARN: failed to write YaneuraOu KPP binary in {}: {e}", ckpt_dir.display())
+                }
+            }
+        };
 
-    macro_rules! run_with_loader {
-        ($loader:expr) => {{
-            let loader = $loader;
-            trainer.run(&schedule, &settings, &loader);
-        }};
-    }
+        let schedule = TrainingSchedule {
+            net_id: net_id_for_epoch,
+            eval_scale: args.scale as f32,
+            steps: TrainingSteps {
+                batch_size: args.batch_size,
+                batches_per_superbatch,
+                start_superbatch: args.start_superbatch,
+                end_superbatch,
+            },
+            wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
+            lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+            save_rate: args.save_rate,
+        };
 
-    match format {
-        DataFormat::Hcpe => {
-            run_with_loader!(HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
-        }
-        DataFormat::Hcpe3 => {
-            run_with_loader!(Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
-        }
-        DataFormat::Pack => {
-            run_with_loader!(ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true))
-        }
-        DataFormat::Psv => {
-            run_with_loader!(DirectSequentialDataLoader::new(&data_files_ref))
+        let settings = LocalSettings {
+            threads: args.threads,
+            test_set: None,
+            output_directory: &output_dir_str,
+            batch_queue_size: args.batch_queue_size,
+            on_checkpoint_saved: Some(&on_checkpoint_saved),
+        };
+
+        match format {
+            DataFormat::Hcpe => {
+                let loader =
+                    HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                trainer.run(&schedule, &settings, &loader);
+            }
+            DataFormat::Hcpe3 => {
+                let loader =
+                    Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                trainer.run(&schedule, &settings, &loader);
+            }
+            DataFormat::Pack => {
+                let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                    .with_single_epoch(true);
+                trainer.run(&schedule, &settings, &loader);
+            }
+            DataFormat::Psv => {
+                let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                trainer.run(&schedule, &settings, &loader);
+            }
         }
     }
 }

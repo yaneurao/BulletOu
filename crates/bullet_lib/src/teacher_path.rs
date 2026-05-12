@@ -29,61 +29,6 @@ pub enum DataFormat {
     Psv,
 }
 
-impl DataFormat {
-    /// Average bytes per position. Exact for fixed-length formats
-    /// (`Hcpe` = 38, `Psv` = 40); rough estimate for variable-length formats
-    /// (`Pack` ≈ 4, `Hcpe3` ≈ 10), based on typical shogi corpora.
-    pub fn avg_bytes_per_position(self) -> u64 {
-        match self {
-            DataFormat::Hcpe => 38,
-            DataFormat::Psv => 40,
-            DataFormat::Pack => 4,
-            DataFormat::Hcpe3 => 10,
-        }
-    }
-
-    /// Whether [`avg_bytes_per_position`](Self::avg_bytes_per_position) is
-    /// an exact value (fixed-length record) or an approximation.
-    pub fn position_count_is_exact(self) -> bool {
-        matches!(self, DataFormat::Hcpe | DataFormat::Psv)
-    }
-}
-
-/// Estimate the number of training positions across a set of teacher files,
-/// using `avg_bytes_per_position()`. Exact for `.hcpe` / `.psv`; approximate
-/// for `.pack` / `.hcpe3`.
-pub fn estimate_position_count(paths: &[&str], format: DataFormat) -> u64 {
-    let bpp = format.avg_bytes_per_position();
-    let total_bytes: u64 = paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    total_bytes / bpp
-}
-
-/// Compute the number of superbatches needed to cover the teacher data
-/// exactly once: `ceil(total_positions / (batch_size * batches_per_superbatch))`,
-/// with a minimum of 1. Logs the chosen value to stderr.
-///
-/// Used by the trainer binaries as the default `--superbatches` when the
-/// user does not pass one explicitly. For variable-length formats the
-/// position count is estimated (see [`DataFormat::avg_bytes_per_position`]).
-pub fn compute_auto_epoch_superbatches(
-    teacher_files: &[&str],
-    format: DataFormat,
-    batch_size: usize,
-    batches_per_superbatch: usize,
-) -> usize {
-    let total_positions = estimate_position_count(teacher_files, format);
-    let positions_per_sb = (batch_size as u64) * (batches_per_superbatch as u64);
-    let sb = total_positions.div_ceil(positions_per_sb.max(1)).max(1) as usize;
-    let approx = if format.position_count_is_exact() { "" } else { "~" };
-    eprintln!(
-        "auto-epoch: {approx}{total_positions} positions / {positions_per_sb} per superbatch -> --superbatches {sb}"
-    );
-    sb
-}
 
 /// Resolve a `--teacher` argument into a concrete list of file paths.
 ///

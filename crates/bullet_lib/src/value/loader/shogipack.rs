@@ -730,6 +730,7 @@ pub struct ShogiPackLoader<T: Fn(&PackedSfenValue) -> bool> {
     file_paths: Vec<String>,
     buffer_size: usize,
     filter: T,
+    single_epoch: bool,
 }
 
 impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
@@ -744,7 +745,16 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
             file_paths: paths.iter().map(|x| x.to_string()).collect(),
             buffer_size: buffer_size_mb * 1024 * 1024 / std::mem::size_of::<PackedSfenValue>() / 2,
             filter,
+            single_epoch: false,
         }
+    }
+
+    /// 1 周読み終わったら止める (= reader thread が無限ループを抜けて
+    /// downstream pipeline が naturally drain される)。`--superbatches`
+    /// 未指定で「教師 1 周」モードを実現するためのフラグ。
+    pub fn with_single_epoch(mut self, enabled: bool) -> Self {
+        self.single_epoch = enabled;
+        self
     }
 }
 
@@ -764,6 +774,7 @@ where
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
+        let single_epoch = self.single_epoch;
 
         // ===== Resume support (consume-and-drop, best-effort) =====
         //
@@ -847,6 +858,12 @@ where
                 // sweep 終了マーカー (空 Vec)。小規模 corpus でも shuffle buffer が
                 // flush されるよう downstream に通知する。
                 if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err() {
+                    break;
+                }
+
+                // single_epoch モードでは 1 sweep 完了で打ち切る (= downstream に
+                // も EOF を伝播させて学習を 1 epoch で終わらせる)。
+                if single_epoch {
                     break;
                 }
             }

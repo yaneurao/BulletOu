@@ -18,6 +18,7 @@ pub struct DirectSequentialDataLoader {
     file_paths: Vec<String>,
     shuffle_each_epoch: bool,
     shuffle_seed: u64,
+    single_epoch: bool,
 }
 
 impl DirectSequentialDataLoader {
@@ -29,7 +30,16 @@ impl DirectSequentialDataLoader {
             assert!(path_buf.exists(), "File not found: {path}");
         }
 
-        Self { file_paths, shuffle_each_epoch: false, shuffle_seed: 0 }
+        Self { file_paths, shuffle_each_epoch: false, shuffle_seed: 0, single_epoch: false }
+    }
+
+    /// 1 周ぶん読んだら停止する。`map_chunks` が return することで上位の
+    /// dataloader thread が終端し、学習が自然に終わる。
+    ///
+    /// 未指定 (= false) のときは既存挙動 (epoch を無限に回し続ける) のまま。
+    pub fn with_single_epoch(mut self, enabled: bool) -> Self {
+        self.single_epoch = enabled;
+        self
     }
 
     pub fn map_file_sizes<F: FnMut(&str, u64)>(&self, mut f: F) {
@@ -187,6 +197,9 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
             }
 
             epoch_idx += 1;
+            if self.single_epoch {
+                break 'dataloading;
+            }
         }
     }
 }
