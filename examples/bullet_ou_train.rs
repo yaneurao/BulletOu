@@ -1,23 +1,20 @@
 /*!
 bullet_ou_train — unified trainer entry point for BulletOu.
 
-A single binary that dispatches to the appropriate training routine via
-`--eval-type`. KPPT-family eval-types currently supported:
+Dispatches to the appropriate training routine via `--eval-type`. The
+"family" eval-types train all three KPPT components (KK + KKP + KPP)
+sequentially in a single invocation and assemble the result into
+`<output>/final/`:
 
-    bullet_ou_train --eval-type kppt-kk        ...   KK component
-    bullet_ou_train --eval-type kppt-kkp       ...   KKP component
-    bullet_ou_train --eval-type kppt-kpp       ...   KPP component (KPPT layout)
-    bullet_ou_train --eval-type kpp-kkpt-kpp   ...   KPP component (KPP_KKPT layout)
+    bullet_ou_train --eval-type kppt            (KPPT family, KPP int16 × 2)
+    bullet_ou_train --eval-type kpp-kkpt        (KPP_KKPT factorised, KPP int16)
 
-Each writes the corresponding YaneuraOu binary file (`KK_synthesized.bin` /
-`KKP_synthesized.bin` / `KPP_synthesized.bin`) into the checkpoint directory
-after every save. To assemble a complete YaneuraOu KPPT or KPP_KKPT eval,
-run the three required commands with the same data and merge the resulting
-`.bin` files into one directory.
+To train a single component standalone (= for development / smoke testing):
 
-The standalone examples `shogi_kk_train` / `shogi_kk_kkp_train` /
-`shogi_kpp_train` are alternative entry points that wrap the same training
-logic per component.
+    bullet_ou_train --eval-type kppt-kk         KK only
+    bullet_ou_train --eval-type kppt-kkp        KKP only
+    bullet_ou_train --eval-type kppt-kpp        KPP only, KPPT layout
+    bullet_ou_train --eval-type kpp-kkpt-kpp    KPP only, KPP_KKPT layout
 
 Input format is inferred from the file extension (`.hcpe` / `.hcpe3` /
 `.pack`); mixed extensions are rejected.
@@ -25,10 +22,10 @@ Input format is inferred from the file extension (`.hcpe` / `.hcpe3` /
 Usage:
 
     cargo run --release --features cuda --example bullet_ou_train -- \
-        --eval-type kppt-kk \
-        --data inbox/ref/sp_dr2-15K_20240210.hcpe \
-        --output checkpoints/kk \
-        --superbatches 10
+        --eval-type kppt \
+        --data /data/shogi/train.hcpe \
+        --output checkpoints/my-kppt \
+        --superbatches 20
 */
 
 use std::path::{Path, PathBuf};
@@ -53,23 +50,28 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EvalType {
-    /// KPPT KK component: train the KK term, write KK_synthesized.bin.
+    /// KPPT family: train KK, KKP, and KPP sequentially and assemble the
+    /// three-file KPPT eval (`KK_synthesized.bin` / `KKP_synthesized.bin` /
+    /// `KPP_synthesized.bin`) into `<output>/final/`.
+    Kppt,
+    /// KPP_KKPT family (factorised KPPT): same as `kppt` but KPP is written
+    /// in the KPP_KKPT layout (no turn channel; half the KPP file size).
+    KppKkpt,
+    /// KPPT KK component only.
     KpptKk,
-    /// KPPT KKP component: train the KKP term, write KKP_synthesized.bin.
+    /// KPPT KKP component only.
     KpptKkp,
-    /// KPPT KPP component: train the KPP term, write KPP_synthesized.bin
-    /// in the KPPT layout (int16 × 2, with turn channel).
+    /// KPPT KPP component only (with turn channel; ~740 MB).
     KpptKpp,
-    /// KPP_KKPT (factorised KPPT) KPP component: write `KPP_synthesized.bin`
-    /// in the KPP_KKPT layout (int16 × 1, no turn channel, ~388 MB). KK and
-    /// KKP files for the KPP_KKPT family are byte-identical to KPPT, so use
-    /// `kppt-kk` / `kppt-kkp` for those.
+    /// KPP_KKPT KPP component only (no turn channel; ~388 MB).
     KppKkptKpp,
 }
 
 impl EvalType {
     fn default_net_id(self) -> &'static str {
         match self {
+            EvalType::Kppt => "shogi_kppt",
+            EvalType::KppKkpt => "shogi_kpp_kkpt",
             EvalType::KpptKk => "shogi_kk",
             EvalType::KpptKkp => "shogi_kkp",
             EvalType::KpptKpp => "shogi_kpp",
@@ -79,6 +81,8 @@ impl EvalType {
 
     fn default_output(self) -> &'static str {
         match self {
+            EvalType::Kppt => "checkpoints/shogi_kppt",
+            EvalType::KppKkpt => "checkpoints/shogi_kpp_kkpt",
             EvalType::KpptKk => "checkpoints/shogi_kk",
             EvalType::KpptKkp => "checkpoints/shogi_kkp",
             EvalType::KpptKpp => "checkpoints/shogi_kpp",
@@ -87,12 +91,12 @@ impl EvalType {
     }
 
     /// Suggested f32 -> i{16,32} quantisation scale for the YaneuraOu writer.
-    /// KK / KKP are i32 (large dynamic range) so default 4000 = eval_scale * 10.
-    /// KPP and KPP_KKPT KPP are i16 (small dynamic range) so default is an
+    /// KK / KKP entries are i32 (large dynamic range) so 4000 = eval_scale * 10.
+    /// KPP entries are i16 (smaller dynamic range) so the scale is an
     /// order of magnitude smaller.
     fn default_yaneuraou_quant_scale(self) -> f32 {
         match self {
-            EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
+            EvalType::Kppt | EvalType::KppKkpt | EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
             EvalType::KpptKpp | EvalType::KppKkptKpp => 400.0,
         }
     }
@@ -101,7 +105,7 @@ impl EvalType {
     /// don't have a KPP file so this is ignored.
     fn kpp_format(self) -> KppFormat {
         match self {
-            EvalType::KppKkptKpp => KppFormat::KppKkpt,
+            EvalType::KppKkpt | EvalType::KppKkptKpp => KppFormat::KppKkpt,
             _ => KppFormat::Kppt,
         }
     }
@@ -143,9 +147,9 @@ fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
 
 // ----- CLI ---------------------------------------------------------------
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bullet_ou_train")]
-#[command(about = "BulletOu unified trainer (KPPT phases for now)")]
+#[command(about = "BulletOu unified trainer")]
 struct Args {
     /// Evaluation function type to train.
     #[arg(long, value_enum)]
@@ -257,6 +261,7 @@ impl Args {
 fn main() {
     let args = Args::parse();
     match args.eval_type {
+        EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         EvalType::KpptKk => run_kppt_kk(&args),
         EvalType::KpptKkp => run_kppt_kkp(&args),
         // KPP trains the same network for both the KPPT and KPP_KKPT layouts;
@@ -264,6 +269,77 @@ fn main() {
         // `args.kpp_format()`.
         EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args),
     }
+}
+
+// ----- KPPT family: KK + KKP + KPP sequential dispatch -------------------
+
+/// Run the three KPPT components (KK, KKP, KPP) sequentially, then assemble
+/// the three resulting `.bin` files into `<output>/final/` so the engine has
+/// a single directory to point at.
+///
+/// `--eval-type kppt` uses the KPPT KPP layout (int16 × 2, with turn channel).
+/// `--eval-type kpp-kkpt` uses the KPP_KKPT KPP layout (int16, no turn channel).
+fn run_kppt_all(args: &Args) {
+    let output_dir = args.output_dir();
+    let total_superbatches = args.superbatches;
+    let last_sb = total_superbatches;
+
+    let kpp_eval_type = match args.eval_type {
+        EvalType::Kppt => EvalType::KpptKpp,
+        EvalType::KppKkpt => EvalType::KppKkptKpp,
+        _ => unreachable!("run_kppt_all called with non-family eval_type"),
+    };
+
+    eprintln!("=== bullet_ou_train: running {} family (3 components) ===", match args.eval_type {
+        EvalType::Kppt => "KPPT",
+        EvalType::KppKkpt => "KPP_KKPT",
+        _ => unreachable!(),
+    });
+
+    for (label, child_eval_type, net_id) in [
+        ("KK", EvalType::KpptKk, "kk"),
+        ("KKP", EvalType::KpptKkp, "kkp"),
+        ("KPP", kpp_eval_type, "kpp"),
+    ] {
+        eprintln!("\n=== [{label}] training ===");
+        let mut child = args.clone();
+        child.eval_type = child_eval_type;
+        child.net_id = Some(net_id.to_string());
+        // Force the child's yaneuraou_quant_scale default to match the child's
+        // eval-type when the user didn't override it.
+        if args.yaneuraou_quant_scale.is_none() {
+            child.yaneuraou_quant_scale = Some(child_eval_type.default_yaneuraou_quant_scale());
+        }
+        match child_eval_type {
+            EvalType::KpptKk => run_kppt_kk(&child),
+            EvalType::KpptKkp => run_kppt_kkp(&child),
+            EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&child),
+            _ => unreachable!(),
+        }
+    }
+
+    // Assemble the three .bin files into <output>/final/.
+    let final_dir = output_dir.join("final");
+    if let Err(e) = std::fs::create_dir_all(&final_dir) {
+        eprintln!("error: failed to create {}: {e}", final_dir.display());
+        std::process::exit(1);
+    }
+    let assembly_pairs = [
+        ("kk", "KK_synthesized.bin"),
+        ("kkp", "KKP_synthesized.bin"),
+        ("kpp", "KPP_synthesized.bin"),
+    ];
+    for (net_id, filename) in assembly_pairs {
+        let src = output_dir.join(format!("{net_id}-{last_sb}")).join(filename);
+        let dst = final_dir.join(filename);
+        if let Err(e) = std::fs::copy(&src, &dst) {
+            eprintln!("error: failed to copy {} -> {}: {e}", src.display(), dst.display());
+            std::process::exit(1);
+        }
+        eprintln!("  copied {} -> {}", src.display(), dst.display());
+    }
+
+    eprintln!("\n=== done. assembled eval at {} ===", final_dir.display());
 }
 
 // `Trainer<G, O, S>` の concrete type は bullet API として直接露出していないので、

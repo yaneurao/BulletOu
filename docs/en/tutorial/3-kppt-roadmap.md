@@ -45,82 +45,50 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 - Training data (`.hcpe` / `.hcpe3` / `.pack`)
 - 4 GB+ of free GPU memory (KPP training uses ~2.3 GB)
 
-### KPPT (elmo-compatible, `int16_t × 2` KPP)
+### KPPT (elmo-compatible)
 
-Train the three components (KK / KKP / KPP) independently:
+`--eval-type kppt` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
 
 ```bash
-# KK training -> KK_synthesized.bin
 cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kk \
+    --eval-type kppt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kppt \
-    --net-id kk \
-    --superbatches 20
-
-# KKP training -> KKP_synthesized.bin
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kkp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --net-id kkp \
-    --superbatches 20
-
-# KPP training -> KPP_synthesized.bin (KPPT layout)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kpp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --net-id kpp \
     --superbatches 20
 ```
 
-Three `.bin` files have now been written; assemble them:
+When the run completes:
 
-```bash
-mkdir -p checkpoints/my-kppt/final
-cp checkpoints/my-kppt/kk-20/KK_synthesized.bin   checkpoints/my-kppt/final/
-cp checkpoints/my-kppt/kkp-20/KKP_synthesized.bin checkpoints/my-kppt/final/
-cp checkpoints/my-kppt/kpp-20/KPP_synthesized.bin checkpoints/my-kppt/final/
+```
+checkpoints/my-kppt/
+├── kk-20/  kkp-20/  kpp-20/        ← per-component checkpoints
+└── final/
+    ├── KK_synthesized.bin
+    ├── KKP_synthesized.bin
+    └── KPP_synthesized.bin          ← give this directory to the engine
 ```
 
 Point a YaneuraOu KPPT engine at `checkpoints/my-kppt/final/`.
 
-### KPP_KKPT (factorised, `int16_t × 1` KPP)
+### KPP_KKPT (factorised)
 
-KK and KKP files are byte-identical to KPPT, so the first two commands are the **same**. Only the KPP writer differs:
+`--eval-type kpp-kkpt` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
-# KK training (identical to KPPT)
 cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kk \
+    --eval-type kpp-kkpt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
-    --net-id kk
-
-# KKP training (identical to KPPT)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kkp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --net-id kkp
-
-# KPP training, KPP_KKPT layout (no turn channel, half the size)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kpp-kkpt-kpp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --net-id kpp
+    --superbatches 20
 ```
-
-Assemble the three files the same way as the KPPT case.
 
 ### Training a single component standalone
 
-For smoke-testing or development, three single-component examples are also available; they contain the same logic `bullet_ou_train` dispatches to:
+For development / smoke testing you can train just one component with `--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp`:
 
 ```bash
-cargo run --release --features cuda --example shogi_kpp_train -- \
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kpp \
     --data inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
@@ -131,7 +99,7 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (required) |
+| `--eval-type` | `kppt` (3-component sequential) / `kpp-kkpt` (factorised) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (required) |
 | `--data` | Training file (`.hcpe` / `.hcpe3` / `.pack`; comma-separated for multiple) | (required) |
 | `--output` | Checkpoint parent directory | per-eval-type default |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |

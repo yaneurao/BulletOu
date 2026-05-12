@@ -45,82 +45,50 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` のいずれか)
 - 4 GB+ の空き GPU メモリ (KPP 学習は ~2.3 GB を使う)
 
-### KPPT (elmo 互換、`int16_t × 2` 形式の KPP)
+### KPPT (elmo 互換)
 
-KK / KKP / KPP の 3 component をそれぞれ独立に学習する:
+`--eval-type kppt` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
 
 ```bash
-# KK 学習 → KK_synthesized.bin
 cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kk \
+    --eval-type kppt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kppt \
-    --net-id kk \
-    --superbatches 20
-
-# KKP 学習 → KKP_synthesized.bin
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kkp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --net-id kkp \
-    --superbatches 20
-
-# KPP 学習 → KPP_synthesized.bin (KPPT 形式)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kpp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kppt \
-    --net-id kpp \
     --superbatches 20
 ```
 
-3 つの `.bin` ファイルが出るのでまとめる:
+完了すると、
 
-```bash
-mkdir -p checkpoints/my-kppt/final
-cp checkpoints/my-kppt/kk-20/KK_synthesized.bin   checkpoints/my-kppt/final/
-cp checkpoints/my-kppt/kkp-20/KKP_synthesized.bin checkpoints/my-kppt/final/
-cp checkpoints/my-kppt/kpp-20/KPP_synthesized.bin checkpoints/my-kppt/final/
+```
+checkpoints/my-kppt/
+├── kk-20/  kkp-20/  kpp-20/        ← 各 component の checkpoint
+└── final/
+    ├── KK_synthesized.bin
+    ├── KKP_synthesized.bin
+    └── KPP_synthesized.bin           ← この 3 ファイルをエンジンに渡す
 ```
 
 `checkpoints/my-kppt/final/` をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能。
 
-### KPP_KKPT (factorised、`int16_t × 1` 形式の KPP)
+### KPP_KKPT (factorised)
 
-KK と KKP は KPPT と同じファイル形式なので **同じコマンド** を使う。違うのは KPP の writer だけ:
+`--eval-type kpp-kkpt` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
-# KK 学習 (= KPPT と同じ)
 cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kk \
+    --eval-type kpp-kkpt \
     --data /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
-    --net-id kk
-
-# KKP 学習 (= KPPT と同じ)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kppt-kkp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --net-id kkp
-
-# KPP 学習 (KPP_KKPT 形式 = 手番チャンネルなし、半分のサイズ)
-cargo run --release --features cuda --example bullet_ou_train -- \
-    --eval-type kpp-kkpt-kpp \
-    --data /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --net-id kpp
+    --superbatches 20
 ```
 
-3 ファイルを集める手順は KPPT と同じ。
+### 単体 component だけ学習する
 
-### 単体 component の学習
-
-`shogi_kk_train` / `shogi_kk_kkp_train` / `shogi_kpp_train` という単体 example も用意してある (これらは bullet_ou_train の内部で呼んでいるのと同じロジック)。動作確認用に:
+開発・動作確認用に、`--eval-type kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` で 1 component だけ学習することもできる:
 
 ```bash
-cargo run --release --features cuda --example shogi_kpp_train -- \
+cargo run --release --features cuda --example bullet_ou_train -- \
+    --eval-type kppt-kpp \
     --data inbox/ref/small.hcpe \
     --output checkpoints/kpp-smoke \
     --superbatches 3 \
@@ -131,7 +99,7 @@ cargo run --release --features cuda --example shogi_kpp_train -- \
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (必須) |
+| `--eval-type` | `kppt` (3 component 連続学習) / `kpp-kkpt` (factorised 版) / `kppt-kk` / `kppt-kkp` / `kppt-kpp` / `kpp-kkpt-kpp` | (必須) |
 | `--data` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack`、複数指定はカンマ区切り) | (必須) |
 | `--output` | チェックポイント親ディレクトリ | eval-type 別自動 |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
