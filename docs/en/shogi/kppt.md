@@ -66,7 +66,8 @@ checkpoints/my-kppt/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
-│   └── state.bin                      ← resume data (weights + Adam moments for all 3 components)
+│   ├── state.bin                      ← resume data (weights + Adam moments for all 3 components)
+│   └── learn.log                      ← training log (per-batch loss for all 3 components)
 ├── 0002/
 │   ├── ...
 ├── ...
@@ -74,8 +75,26 @@ checkpoints/my-kppt/
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
     ├── KPP_synthesized.bin
-    └── state.bin
+    ├── state.bin
+    └── learn.log
 ```
+
+`learn.log` format: bullet's existing per-component `log.txt` files concatenated with section headers:
+
+```
+# component: kk
+1,32,0.234
+1,64,0.231
+...
+# component: kkp
+1,32,0.156
+...
+# component: kpp
+1,32,0.245
+...
+```
+
+Each row is `<superbatch>,<curr_batch>,<loss>` CSV. Bullet writes one row every 32 batches.
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 

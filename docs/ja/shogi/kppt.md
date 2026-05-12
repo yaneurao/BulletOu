@@ -66,7 +66,8 @@ checkpoints/my-kppt/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
-│   └── state.bin                      ← resume 用の重み + Adam moments (3 component ぶん)
+│   ├── state.bin                      ← resume 用の重み + Adam moments (3 component ぶん)
+│   └── learn.log                      ← 学習ログ (3 component の batch ごとの loss を CSV で連結)
 ├── 0002/
 │   ├── ...
 ├── ...
@@ -74,8 +75,26 @@ checkpoints/my-kppt/
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
     ├── KPP_synthesized.bin
-    └── state.bin
+    ├── state.bin
+    └── learn.log
 ```
+
+`learn.log` のフォーマット (3 component の bullet 既存 log.txt をセクションヘッダ付きで連結):
+
+```
+# component: kk
+1,32,0.234
+1,64,0.231
+...
+# component: kkp
+1,32,0.156
+...
+# component: kpp
+1,32,0.245
+...
+```
+
+各行は `<superbatch>,<curr_batch>,<loss>` の CSV。bullet は 32 batch ごとに 1 行記録する。
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 

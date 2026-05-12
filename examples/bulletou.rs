@@ -483,6 +483,21 @@ fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<()> {
         bundle_component_state(&mut state_buf, "kkp", &kkp_dirs[i].join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kpp", &kpp_dirs[i].join("optimiser_state"))?;
         std::fs::write(dst.join("state.bin"), &state_buf)?;
+        // Bundle the three components' bullet `log.txt` (CSV
+        // `superbatch,batch,loss` lines accumulated up to this save) into a
+        // single `learn.log` with per-component section headers.
+        let mut log_buf = String::new();
+        for (label, dir) in [("kk", &kk_dirs[i]), ("kkp", &kkp_dirs[i]), ("kpp", &kpp_dirs[i])] {
+            log_buf.push_str(&format!("# component: {label}\n"));
+            match std::fs::read_to_string(dir.join("log.txt")) {
+                Ok(s) => log_buf.push_str(&s),
+                Err(_) => log_buf.push_str("# (log.txt missing)\n"),
+            }
+            if !log_buf.ends_with('\n') {
+                log_buf.push('\n');
+            }
+        }
+        std::fs::write(dst.join("learn.log"), log_buf)?;
         eprintln!("  -> {}/", dst.display());
     }
 
