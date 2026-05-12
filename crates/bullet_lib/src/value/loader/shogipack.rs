@@ -399,7 +399,7 @@ impl MiniPosition {
     /// - bits 0-6:  移動先 (to)
     /// - bits 7-13: 移動元 (from) または打ち駒種 (from >= 81)
     /// - bit 14:    成りフラグ
-    fn do_move(&mut self, move16: u16) {
+    pub(super) fn do_move(&mut self, move16: u16) {
         let to = (move16 & 0x7F) as usize;
         let from_or_pt = ((move16 >> 7) & 0x7F) as usize;
         let promote = (move16 & 0x4000) != 0;

@@ -1,5 +1,6 @@
 mod direct;
 pub mod hcpe;
+pub mod hcpe3;
 mod montybinpack;
 mod rng;
 pub mod sfbinpack;
@@ -9,6 +10,7 @@ pub mod viribinpack;
 
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
 pub use hcpe::HcpeDataLoader;
+pub use hcpe3::Hcpe3DataLoader;
 pub use montybinpack::MontyBinpackLoader;
 pub use sfbinpack::SfBinpackLoader;
 pub use shogipack::ShogiPackLoader;

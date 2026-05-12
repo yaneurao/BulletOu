@@ -27,18 +27,38 @@ python3 tools/cshogi_xref/hcpe_to_psv.py \
     inbox/ref/full.psv
 ```
 
-## Rust 側のクロスバリデーションテスト
+## hcpe3_to_psv.py
 
-`crates/bullet_lib/src/value/loader/hcpe.rs::tests::cross_validate_against_cshogi_psv`。`#[ignore]` で常時実行はしない。
+cshogi の `Board.set_hcp` + `Board.push_move16` + `Board.to_psfen` を順に使い、`.hcpe3` のゲーム単位レコードを ply 単位の psv (PackedSfenValue) に展開して書き出す。
+
+MoveVisits (policy teacher) は読み飛ばす (value 用)。`gamePly` フィールドは ply 番号 (0-indexed) を入れる (BulletOu の `MiniPosition.game_ply` 進行と一致)。
 
 ```bash
-# psv を作ってから
+# 先頭 10000 局面分だけ展開
+python3 tools/cshogi_xref/hcpe3_to_psv.py \
+    inbox/ref/sp_dr2-15K_20240210.hcpe3 \
+    inbox/ref/sp_dr2-15K_20240210.hcpe3.psv 0 10000
+
+# 全件 (max_games=0, max_positions=0)
+python3 tools/cshogi_xref/hcpe3_to_psv.py \
+    inbox/ref/full.hcpe3 \
+    inbox/ref/full.hcpe3.psv
+```
+
+引数: `<hcpe3-in> <psv-out> [max_games] [max_positions]`
+
+## Rust 側のクロスバリデーションテスト
+
+### HCPE
+
+`crates/bullet_lib/src/value/loader/hcpe.rs::tests::cross_validate_against_cshogi_psv`。
+
+```bash
 python3 tools/cshogi_xref/hcpe_to_psv.py \
     inbox/ref/sp_dr2-15K_20240210.hcpe \
     inbox/ref/sp_dr2-15K_20240210.psv 10000
 
-# Rust テストで照合
-cargo test -p bullet_lib --lib cross_validate_against_cshogi_psv -- --ignored --nocapture
+cargo test -p bullet_lib --lib hcpe::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
 ```
 
 期待される出力:
@@ -46,4 +66,24 @@ cargo test -p bullet_lib --lib cross_validate_against_cshogi_psv -- --ignored --
 ```
 comparing 10000 records (hcpe total = 4583825, psv total = 10000)
 OK: all 10000 records match byte-for-byte (BulletOu == cshogi)
+```
+
+### HCPE3
+
+`crates/bullet_lib/src/value/loader/hcpe3.rs::tests::cross_validate_against_cshogi_psv`。
+
+```bash
+python3 tools/cshogi_xref/hcpe3_to_psv.py \
+    inbox/ref/sp_dr2-15K_20240210.hcpe3 \
+    inbox/ref/sp_dr2-15K_20240210.hcpe3.psv 0 10000
+
+cargo test -p bullet_lib --lib hcpe3::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
+```
+
+期待される出力:
+
+```
+Rust side: decoded 10000 positions
+cshogi side: psv file has 10000 records
+OK: all 10000 HCPE3 records match byte-for-byte (BulletOu == cshogi)
 ```
