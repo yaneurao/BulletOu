@@ -127,7 +127,105 @@ superbatch 2 / 40   ...
 
 `pos/s` (positions per second) is the rough training-speed indicator. On a single RTX 4090 the smoke-test configuration runs in the tens-of-millions of pos/s range; on slower GPUs proportionally less.
 
-## 2.4 Inspect the output
+## 2.4 Training units — batch / superbatch / save / LR
+
+The log line `superbatch 1 / 40` raises an obvious question: what *is* a superbatch, and what do `--batch-size`, `--batches-per-superbatch`, and `--superbatches` each mean? This section answers all of that at once. The concepts come from upstream jw1912/bullet and are inherited unchanged by bullet-shogi / BulletOu.
+
+### 2.4.1 The three units
+
+```
+batch (= mini-batch, one gradient step)
+  └─ 16384 positions: one forward + backward + optimizer step
+        │
+        │ × batches_per_superbatch
+        ▼
+superbatch
+  └─ default ≈ 100M positions  (= 6104 batches × 16384 positions/batch)
+        │
+        │ × superbatches
+        ▼
+entire training (up to end_superbatch)
+```
+
+| CLI flag | Meaning | Default |
+|---|---|---|
+| `--batch-size` | Positions per gradient step (= mini-batch size). Sets GPU memory pressure and convergence behaviour. | `16384` |
+| `--batches-per-superbatch` | Number of mini-batches that form one superbatch. **If unspecified, it is set to `ceil(100_000_000 / batch_size)`** automatically. | (auto) |
+| `--superbatches` | Total superbatches to run (= `end_superbatch`). Sets the overall training length. | example-dependent; `10` in the KK/KKP examples |
+
+The default formula for `batches_per_superbatch` is designed to **keep one superbatch at roughly 100M positions**. Changing `--batch-size` does not significantly change the positions-per-superbatch count. This is the implicit scale in upstream bullet's chess NNUE culture — `bullet/examples/progression/1_simple.rs` and friends hard-code `batches_per_superbatch: 6104`.
+
+### 2.4.2 Is a superbatch the same as an epoch?
+
+**Not exactly.** In standard ML terminology, an epoch is "one full pass through the dataset". A bullet superbatch, in contrast, is **a fixed ~100M-position chunk regardless of dataset size**.
+
+- With 50M training positions, one superbatch sweeps through the data ~2× (loaders reshuffle and continue from the start when they hit EOF).
+- With 1B training positions, one superbatch only touches ~10% of the data.
+
+The accurate mental model: a superbatch is **the unit at which checkpoints / LR / WDL are updated**, not a pass through the data.
+
+### 2.4.3 Checkpoint timing — `--save-rate`
+
+```
+--save-rate 1   →  save every superbatch
+--save-rate 5   →  save every 5 superbatches
+--save-rate 0   →  save only the final superbatch
+```
+
+Each save point creates a `checkpoints/<net-id>-<superbatch>/` directory containing `raw.bin` / `quantised.bin` / `optimiser_state/` (plus, in the KPPT examples, `KK_synthesized.bin` / `KKP_synthesized.bin`).
+
+The final superbatch (`end_superbatch`) is always saved regardless of `--save-rate` (the `should_save` check is an OR).
+
+### 2.4.4 LR scheduler time axis
+
+Every bullet LR scheduler is a function `lr(batch, superbatch) -> f32`, and **virtually all of them key off `superbatch`** (only `Warmup` also uses the batch axis):
+
+| Scheduler | Behaviour | CLI | Requires final superbatch? |
+|---|---|---|---|
+| `ConstantLR` | fixed value | (no direct flag) | no |
+| `StepLR` | multiply by `gamma` every `step` superbatches | `--lr` / `--lr-gamma` / `--lr-step` (used by KK/KKP examples) | no |
+| `DropLR` | multiply by `gamma` once at superbatch `drop` | — | no |
+| `LinearDecayLR` | linear interpolate to `final_lr` by `final_superbatch` | — | **yes** |
+| `CosineDecayLR` | same, cosine curve | — | **yes** |
+| `ExponentialDecayLR` | same, exponential | — | **yes** |
+| `Warmup<LR>` | linear warmup over N batches, then defer to inner | — | inner-dependent |
+
+With the `shogi_kk_kkp_train` defaults `--lr 0.001 --lr-gamma 0.1 --lr-step 8`, the LR is `0.001` for superbatches 1–8, `0.0001` for 9–16, `0.00001` for 17–24, and so on — each `step` drops it by a factor of `gamma`. With `--superbatches 3` the drop never triggers and LR stays at `0.001` throughout.
+
+### 2.4.5 WDL scheduler time axis
+
+WDL (the blend ratio between eval score and game result label) is also indexed by superbatch. The default:
+
+```
+--start-wdl 0.0  --end-wdl 1.0
+```
+
+means "first superbatch trains on **eval only**, last superbatch trains on **game result only**, linear interpolation in between." The endpoint is `end_superbatch` (= `--superbatches`), so changing `--superbatches` automatically rescales the WDL ramp.
+
+### 2.4.6 Worked example
+
+```
+--batch-size 16384
+--batches-per-superbatch 100      ← much smaller than the default 6104
+--superbatches 3
+--save-rate 1
+--lr 0.001 --lr-gamma 0.1 --lr-step 8
+--start-wdl 0.0 --end-wdl 1.0
+```
+
+Concretely:
+
+```
+1 superbatch  = 100 batches × 16384 positions = 1,638,400 positions (≈ 1.6M)
+total run     = 3 superbatches × 1.6M         = 4,915,200 positions (≈ 4.9M)
+checkpoints   = saved at sb=1, sb=2, sb=3 (three saves)
+LR            = 0.001 throughout (step=8 never triggers within 3 superbatches)
+WDL           = 0.0 at sb=1, 0.5 at sb=2, 1.0 at sb=3
+```
+
+For real training at the "~100M positions per superbatch" scale, **omit `--batches-per-superbatch`** so it defaults to `6104` for the standard `--batch-size 16384`.
+
+## 2.5 Inspect the output
 
 When training finishes (or at every saved checkpoint), `checkpoints/my-first-shogi-net/` will contain:
 
@@ -144,7 +242,7 @@ my-first-shogi-net-final/
 - `quantised.bin` is what an engine will load at play time.
 - `raw.bin` and `optimiser_state/` together let you resume training from this exact point.
 
-## 2.5 Try it in an engine
+## 2.6 Try it in an engine
 
 The exact integration depends on the engine. For YaneuraOu-compatible NNUE consumption, the typical steps are:
 
@@ -154,7 +252,7 @@ The exact integration depends on the engine. For YaneuraOu-compatible NNUE consu
 
 > Engine integration is currently outside the scope of BulletOu itself — the trainer's job ends at writing `quantised.bin`. Plumbing it into a specific engine is a per-engine task.
 
-## 2.6 Stepping up to the production setup
+## 2.7 Stepping up to the production setup
 
 When you are comfortable with `shogi_simple`, move to `shogi_layerstack` for stronger results:
 
@@ -170,7 +268,7 @@ cargo run --release --features cuda --example shogi_layerstack -- \
 
 The pieces (Threat features, `progress.bin`, WDL scheduling) are explained in the [reference docs](../0-contents.md). Use the `shogi_simple` smoke test as your "is everything plumbed correctly?" check, then iterate with `shogi_layerstack`.
 
-## 2.7 Where to go next
+## 2.8 Where to go next
 
 - [Reference: NNUE Basics](../1-basics.md) — the math behind perspective NNUE
 - [Reference: Saved Networks](../4-saved-networks.md) — checkpoint layout, quantisation, transformation chains

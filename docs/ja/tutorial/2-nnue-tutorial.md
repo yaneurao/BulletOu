@@ -111,7 +111,105 @@ superbatch 2 / 40   ...
 
 `pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で smoke test 構成なら数千万 pos/s 出る。下位 GPU では比例して低下。
 
-## 2.4 出力を確認する
+## 2.4 学習の単位 — batch / superbatch / save / LR の関係
+
+ログに出てくる `superbatch 1 / 40` の「superbatch」は何か、`--batch-size` と `--batches-per-superbatch` と `--superbatches` がそれぞれ何を意味するのか、ここで一括して整理する。これは本家 jw1912/bullet 由来の概念で、bullet-shogi / BulletOu でもそのまま使われている。
+
+### 2.4.1 3 つの単位
+
+```
+batch (= mini-batch, 1 gradient step)
+  └─ 16384 局面 を 1 回 forward + backward + optimizer step
+        │
+        │ × batches_per_superbatch 回
+        ▼
+superbatch
+  └─ デフォルト ≈ 100M 局面 (= 6104 batches × 16384 局面/batch)
+        │
+        │ × superbatches 回
+        ▼
+学習全体 (end_superbatch まで)
+```
+
+| CLI フラグ | 意味 | デフォルト |
+|---|---|---|
+| `--batch-size` | 1 gradient step の局面数 (= mini-batch size)。GPU メモリと収束特性を決める | `16384` |
+| `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数。**未指定なら `ceil(100_000_000 / batch_size)`** が入る | (自動) |
+| `--superbatches` | 走らせる superbatch の総数 (= `end_superbatch`)。学習全体の長さを決める | 例によるが KK/KKP 例では `10` |
+
+`batches_per_superbatch` のデフォルト式は **「1 superbatch ≒ 1 億局面に揃える」** 設計。`--batch-size` をいじっても 1 superbatch あたりの局面数 (≈100M) はほぼ不変になる。これは本家 bullet のチェス NNUE 文化での暗黙のスケール感で、`bullet/examples/progression/1_simple.rs` 等では `batches_per_superbatch: 6104` がハードコードされている。
+
+### 2.4.2 superbatch は「epoch」と同じか?
+
+**完全には一致しない**。標準 ML 用語の epoch は「データセット全体を 1 周」だが、bullet の superbatch は **データセットサイズに関係なく「~100M 局面」固定**。
+
+- 教師データが 50M 局面しかなければ、1 superbatch でデータ 2 周ぶん回す (loader が末尾に達したら頭から再シャッフルする実装)
+- 教師データが 1B 局面あれば、1 superbatch でデータの 1/10 しか触れない
+
+実用上は **「checkpoint / LR / WDL の更新タイミングの単位」** と捉えるのが正確。
+
+### 2.4.3 checkpoint 保存タイミング — `--save-rate`
+
+```
+--save-rate 1   →  毎 superbatch で保存
+--save-rate 5   →  5 superbatch ごとに保存
+--save-rate 0   →  最終 superbatch のみ保存 (途中保存なし)
+```
+
+各保存ポイントで `checkpoints/<net-id>-<superbatch>/` ディレクトリが作られ、その中に `raw.bin` / `quantised.bin` / `optimiser_state/` (＋ KPPT 系の例では `KK_synthesized.bin` / `KKP_synthesized.bin`) が書き出される。
+
+最終 superbatch (`end_superbatch`) は `--save-rate` の値に関わらず必ず保存される (`should_save` の OR 条件)。
+
+### 2.4.4 LR スケジューラの時間軸
+
+bullet の LR スケジューラはすべて `lr(batch, superbatch) -> f32` で値を返す関数で、**ほぼすべて `superbatch` をキー**にする (`Warmup` だけ batch 軸も使う)。詳細:
+
+| スケジューラ | 挙動 | CLI | 終端 superbatch 要求 |
+|---|---|---|---|
+| `ConstantLR` | 固定 | (該当フラグなし) | × |
+| `StepLR` | `step` superbatch ごとに `gamma` 倍 | `--lr` / `--lr-gamma` / `--lr-step` (現状 KK/KKP 例で使用) | × |
+| `DropLR` | `drop` superbatch で 1 回だけ `gamma` 倍 | — | × |
+| `LinearDecayLR` | `final_superbatch` まで線形補間 | — | **要** |
+| `CosineDecayLR` | 同、cosine 曲線 | — | **要** |
+| `ExponentialDecayLR` | 同、指数補間 | — | **要** |
+| `Warmup<LR>` | 最初の N batch だけ線形立ち上げ後、内側スケジューラへ | — | 内側依存 |
+
+`shogi_kk_kkp_train` のデフォルト `--lr 0.001 --lr-gamma 0.1 --lr-step 8` だと、1〜8 superbatch は `0.001`、9〜16 は `0.0001`、17〜24 は `0.00001`、... と毎 8 superbatch で 1/10 になる。`--superbatches 3` だと一度も下がらず学習が終わる。
+
+### 2.4.5 WDL スケジューラの時間軸
+
+WDL (Win/Draw/Loss = ゲーム結果ラベルへの blend 比率) も `superbatch` を時間軸として動く。デフォルト:
+
+```
+--start-wdl 0.0  --end-wdl 1.0
+```
+
+これは「最初の superbatch は **eval スコアだけ**、最後の superbatch は **対局結果だけ**、間は線形補間」という指定。終端は `end_superbatch` (= `--superbatches`) を使うので、`--superbatches` を変えると WDL の傾きも自動で追従する。
+
+### 2.4.6 具体例
+
+```
+--batch-size 16384
+--batches-per-superbatch 100      ← 通常はもっと大きい (6104 がデフォルト)
+--superbatches 3
+--save-rate 1
+--lr 0.001 --lr-gamma 0.1 --lr-step 8
+--start-wdl 0.0 --end-wdl 1.0
+```
+
+意味:
+
+```
+1 superbatch  = 100 batches × 16384 局面 = 1,638,400 局面 (≈ 1.6M)
+学習全体     = 3 superbatches × 1.6M     = 4,915,200 局面 (≈ 4.9M)
+checkpoint   = sb=1, sb=2, sb=3 で計 3 回保存
+LR           = 全 superbatch 通じて 0.001 (8 sb 毎の drop が発火しない)
+WDL          = sb=1 で 0.0、sb=2 で 0.5、sb=3 で 1.0
+```
+
+なお、本格学習で「1 superbatch ≒ 100M 局面」スケールに戻すなら `--batches-per-superbatch` を **指定しない**のが正解 (= 自動で 6104 になる)。
+
+## 2.5 出力を確認する
 
 学習完了 (または checkpoint 保存) のたびに、`checkpoints/my-first-shogi-net/` に以下が出る:
 
@@ -128,7 +226,7 @@ my-first-shogi-net-final/
 - `quantised.bin` を対局時にエンジンが読む
 - `raw.bin` と `optimiser_state/` の組み合わせで、ここから学習を厳密に再開できる
 
-## 2.5 エンジンに組み込む
+## 2.6 エンジンに組み込む
 
 具体的な手順はエンジンに依存する。やねうら王互換 NNUE 消費の典型手順:
 
@@ -138,7 +236,7 @@ my-first-shogi-net-final/
 
 > エンジンへの組み込み自体は現状 BulletOu の範囲外 — トレーナーの仕事は `quantised.bin` を書くところで終わる。特定エンジンへ繋ぐのはエンジンごとの作業。
 
-## 2.6 本番構成にステップアップする
+## 2.7 本番構成にステップアップする
 
 `shogi_simple` に慣れたら、`shogi_layerstack` でより強い学習に移る:
 
@@ -154,7 +252,7 @@ cargo run --release --features cuda --example shogi_layerstack -- \
 
 各部品 (Threat 特徴量、`progress.bin`、WDL スケジュール) は [リファレンス](../0-contents.md) で説明されている。`shogi_simple` を「全部正しく繋がっているか」の確認用に使い、その後 `shogi_layerstack` で本格イテレーションを回す、というのが推奨フロー。
 
-## 2.7 次のステップ
+## 2.8 次のステップ
 
 - [リファレンス: NNUE の基礎](../1-basics.md) — perspective NNUE の数式
 - [リファレンス: 学習済みネットワーク](../4-saved-networks.md) — checkpoint レイアウト、量子化、変換チェーン
