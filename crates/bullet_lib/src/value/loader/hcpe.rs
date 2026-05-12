@@ -233,12 +233,16 @@ mod tests {
     /// PackedSfenValue 化した `sp_dr2-15K_20240210.psv` を **バイト単位で照合** する
     /// クロスバリデーション。
     ///
-    /// 前提として `tools/cshogi_xref/hcpe_to_psv.py` を使い、
-    /// `inbox/ref/sp_dr2-15K_20240210.psv` を事前に cshogi で生成しておくこと:
+    /// 比較件数は環境変数 `XREF_COUNT` で上書きできる (default 10000)。psv ファイル側に
+    /// 十分なレコードが書かれていることが前提。例えば 100 万件で検証するには:
+    ///
     /// ```
     /// python3 tools/cshogi_xref/hcpe_to_psv.py \
     ///     inbox/ref/sp_dr2-15K_20240210.hcpe \
-    ///     inbox/ref/sp_dr2-15K_20240210.psv 10000
+    ///     inbox/ref/sp_dr2-15K_20240210.psv 1000000
+    ///
+    /// XREF_COUNT=1000000 cargo test -p bullet_lib --lib \
+    ///     hcpe::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
     /// ```
     ///
     /// `decode_hcpe_record` (BulletOu の HCP デコーダー → PackedSfen 再エンコード) と
@@ -268,8 +272,12 @@ mod tests {
 
         let n_hcpe = hcpe_bytes.len() / HCPE_RECORD_SIZE;
         let n_psv = psv_bytes.len() / 40;
-        let n = n_hcpe.min(n_psv);
-        eprintln!("comparing {n} records (hcpe total = {n_hcpe}, psv total = {n_psv})");
+        let cap: usize =
+            std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        let n = n_hcpe.min(n_psv).min(cap);
+        eprintln!(
+            "comparing {n} records (hcpe total = {n_hcpe}, psv total = {n_psv}, cap = {cap})"
+        );
         assert!(n > 0, "need at least 1 record to compare");
 
         let mut mismatches = 0usize;

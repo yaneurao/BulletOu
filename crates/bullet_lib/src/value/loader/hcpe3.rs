@@ -299,8 +299,19 @@ mod tests {
     ///     inbox/ref/sp_dr2-15K_20240210.hcpe3.psv 0 10000
     /// ```
     ///
+    /// 比較件数は環境変数 `XREF_COUNT` で上書きできる (default 10000)。100 万件で
+    /// 検証するなら:
+    /// ```
+    /// python3 tools/cshogi_xref/hcpe3_to_psv.py \
+    ///     inbox/ref/sp_dr2-15K_20240210.hcpe3 \
+    ///     inbox/ref/sp_dr2-15K_20240210.hcpe3.psv 0 1000000
+    ///
+    /// XREF_COUNT=1000000 cargo test -p bullet_lib --lib \
+    ///     hcpe3::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
+    /// ```
+    ///
     /// 注: decode_one_game は ply を順序通り出力する (shuffle なし)。
-    /// この単体テストでは HcpeDataLoader (shuffle あり) ではなく、decode_one_game 直接を呼ぶ。
+    /// この単体テストでは Hcpe3DataLoader (shuffle あり) ではなく、decode_one_game 直接を呼ぶ。
     #[test]
     #[ignore]
     fn cross_validate_against_cshogi_psv() {
@@ -320,11 +331,14 @@ mod tests {
             return;
         }
 
-        // Rust 側: decode_one_game を順次呼び、最初の 10000 ply を集める。
+        // 比較件数は XREF_COUNT で上書き可能 (default 10000)
+        let target_count: usize =
+            std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+
+        // Rust 側: decode_one_game を順次呼び、最初の target_count ply を集める。
         let file = std::fs::File::open(&hcpe3_path).expect("open hcpe3");
         let mut reader = BufReader::with_capacity(1 << 20, file);
-        let mut ours: Vec<PackedSfenValue> = Vec::new();
-        let target_count = 10_000usize;
+        let mut ours: Vec<PackedSfenValue> = Vec::with_capacity(target_count);
         loop {
             match decode_one_game(&mut reader, &mut ours) {
                 Ok(true) => {
@@ -337,7 +351,7 @@ mod tests {
                 Err(e) => panic!("decode error: {e}"),
             }
         }
-        eprintln!("Rust side: decoded {} positions", ours.len());
+        eprintln!("Rust side: decoded {} positions (target {})", ours.len(), target_count);
 
         // cshogi 側: psv ファイルを直接読む
         let psv_bytes = std::fs::read(&psv_path).expect("read psv");
