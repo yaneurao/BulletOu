@@ -2,7 +2,18 @@
 
 <a href="../../ja/tutorial/3-kppt-roadmap.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-> **Status: NOT YET IMPLEMENTED.** This page describes the design plan for KPPT / KPP_KPPT support in BulletOu. The current codebase trains NNUE only. Track progress in the repository's issues/PRs.
+> **Status: Phase 1 (KK only) is in.** The full KPPT / KPP_KPPT support
+> is rolling out in phases:
+>
+> - **Phase 1 (DONE)** — `ShogiKk` sparse input + `shogi_kk_train` example.
+>   The training pipeline runs end-to-end on a KK-only minimal network.
+>   Strength is expected to be poor; this phase only confirms wire-up.
+> - **Phase 2 (planned)** — add `ShogiKkp` and combine with KK.
+> - **Phase 3 (planned)** — add `ShogiKpp` (= full KPPT). Requires large
+>   GPU memory: KPP weights alone are ~1.4 GB (5.6 GB+ with Adam state).
+> - **Phase 4 (planned)** — emit YaneuraOu-compatible `KK_synthesized.bin`
+>   / `KKP_synthesized.bin` / `KPPT_synthesized.bin`.
+> - **Phase 5 (planned)** — `KPP_KPPT` factorised form.
 
 ## Why support KPPT / KPP_KPPT?
 

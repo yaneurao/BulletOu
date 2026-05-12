@@ -2,7 +2,14 @@
 
 <a href="../../en/tutorial/3-kppt-roadmap.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-> **状況: 未実装**。このページは BulletOu における KPPT / KPP_KPPT 対応の設計予定をまとめたもの。現状のコードは NNUE のみ学習する。進捗はリポジトリの issue / PR で追う。
+> **状況: Phase 1 (KK 単体) 着地済み**。フル KPPT / KPP_KPPT 対応は段階的に進行中:
+>
+> - **Phase 1 (完了)** — `ShogiKk` sparse 入力 + `shogi_kk_train` example。
+>   KK 単体の最小ネットでパイプライン疎通を確認できた状態。強さはまだ出ない (この段階の目標は配線確認のみ)。
+> - **Phase 2 (予定)** — `ShogiKkp` を追加して KK と結合。
+> - **Phase 3 (予定)** — `ShogiKpp` を追加 (= フル KPPT)。GPU メモリを多く要する。KPP 重みだけで 1.4 GB、Adam state 込みで 5.6 GB+。
+> - **Phase 4 (予定)** — やねうら王互換の `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPPT_synthesized.bin` 出力。
+> - **Phase 5 (予定)** — KPP_KPPT (factorise 版)。
 
 ## なぜ KPPT / KPP_KPPT に対応するのか
 
