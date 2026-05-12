@@ -3,10 +3,10 @@
 /checkpoints
 /.cargo
 /data
+/inbox
 /.idea
 /.vscode
 /visualisation
-/data
 
 *.epd
 *.txt
