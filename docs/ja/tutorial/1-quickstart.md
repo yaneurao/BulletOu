@@ -1,0 +1,101 @@
+# 1. クイックスタート — BulletOu をビルドして最小の学習を動かす
+
+<a href="../../en/tutorial/1-quickstart.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+
+この章のゴール: 新規 clone した状態から BulletOu をビルドして、checkpoint ファイルを出力する小さな学習を動かす。ここまで通れば、ツールチェーン側は健全。
+
+**強い NNUE を学習することが目的ではない** (それは次の章でやる)。これは smoke test。
+
+## 1.1 必要なもの
+
+以下が必要:
+
+- **NVIDIA または AMD の GPU** (新しめのもの)。CPU だけでの学習はサポートされていない (GPU 前提の設計)
+- **Rust ツールチェーン** (stable、1.87 以降)。[rustup](https://www.rust-lang.org/tools/install) でインストール
+- **CUDA Toolkit 12.x** (NVIDIA GPU の場合) または **HIP SDK / ROCm** (AMD GPU の場合)
+- ビルドとテストデータ用に **10 GB 程度の空きディスク**
+
+Windows + NVIDIA の場合、cuDNN (および任意で TensorRT) のバージョンを揃える必要がある。詳細は本ワークスペース側の調査メモ ([../../../docs/spec/onnxruntime-gpu-windows.md](https://github.com/yaneurao/BulletOu)) を参照 (これは ONNX Runtime の話だが、CUDA 周りの DLL 設定は共通)。
+
+> **CPU だけで動かしたい?** ソースツリーには `mock` GPU バックエンドがあるが、これは型チェック用のスタブで実際の学習はできない。GPU がない場合、このチュートリアルは動かない。クラウド GPU (Vast.ai / Lambda Labs / Paperspace / Google Colab 等) を借りるのが現実的。
+
+## 1.2 ソースを取得する
+
+```bash
+git clone https://github.com/yaneurao/BulletOu.git
+cd BulletOu
+```
+
+## 1.3 ビルド
+
+GPU に応じて以下の **どちらか** を実行:
+
+```bash
+# NVIDIA GPU (CUDA)
+CUDA_PATH=/usr/local/cuda cargo build --release --features cuda
+```
+
+```bash
+# AMD GPU (ROCm)
+HIP_PATH=/opt/rocm cargo build --release --features rocm
+```
+
+(Windows では `set CUDA_PATH=...` または PowerShell の `$env:CUDA_PATH=...` で環境変数を設定する。)
+
+初回ビルドは数分〜十数分かかる。エラーなく完了すれば準備 OK。
+
+### よくあるビルドエラー
+
+- **`CUDA_PATH is not defined`** — 環境変数を CUDA のインストール先 (例: `/usr/local/cuda`、`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`) に設定する
+- **`cublas` / `nvrtc` のリンクエラー** — CUDA のバージョンが古すぎる可能性。12.x 以降を使う
+- **`hipblas` / `hiprtc` のリンクエラー** — HIP SDK をインストールし、`HIP_PATH` を設定する。場合により `GCN_ARCH_NAME` も設定が必要 (Linux なら `rocminfo`、Windows なら `hipinfo` で取得できる)
+
+## 1.4 smoke test 用の学習を動かす
+
+`simple` example は小さなチェス (将棋ではない) の NNUE を学習する。外部データが不要で、数分で終わる。パイプラインを端から端まで通すには十分。
+
+```bash
+# NVIDIA
+cargo run --release --features cuda --example simple
+
+# AMD
+cargo run --release --features rocm --example simple
+```
+
+正常に動けば、以下のような出力が出る:
+
+```
+... starting training ...
+superbatch 1 ... loss = ...
+superbatch 2 ...
+...
+```
+
+`checkpoints/` ディレクトリが作られ、各 checkpoint に `raw.bin`、`quantised.bin`、`optimiser_state/` が入っている。
+
+> `simple` example は **チェス** であって将棋ではない。上流由来で残っているもの。これがエンドツーエンドで動く最小の example なので、smoke test に使っている。将棋 example は次の章で。
+
+## 1.5 今、何が起きたか
+
+BulletOu をビルドして、完全な学習セッションを走らせた。動いたパイプライン:
+
+1. `simple.rs` で小さな NNUE をビルド (チェス用 `Chess768` 入力特徴量 → 小さな隠れ層 → スカラー出力)
+2. 同梱された小さなデータ (チェス用 `bulletformat`) を読み込み
+3. 数 superbatch 分の学習
+4. checkpoint を書き出し
+
+次の章では、チェス用入力特徴量を **将棋用** に置き換え、実際の `.pack` データを使う。パイプラインは同じで、特徴量とデータローダーだけが違う。
+
+## 1.6 後片付け
+
+完了したら、`checkpoints/` と `target/` を削除して構わない:
+
+```bash
+rm -rf checkpoints target
+```
+
+`target/` は次回 `cargo build` のときに再生成される。
+
+---
+
+次へ: [2. NNUE チュートリアル](2-nnue-tutorial.md) — `.pack` データから実際に将棋 NNUE を学習する。
