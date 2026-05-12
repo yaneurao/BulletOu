@@ -83,10 +83,11 @@ enum EvalType {
     KpptKpp,
     /// KPP_KKPT KPP component only (no turn channel; ~388 MB).
     KppKkptKpp,
-    /// NNUE HalfKP. Classic Stockfish-style NNUE with HalfKP input features
-    /// and a 4-layer dual-perspective network. Writes a YaneuraOu / Stockfish
-    /// nnue-pytorch-compatible `nn.bin` per save. Architecture is selected
-    /// via `--arch` (default `256x2-32-32`, SCReLU activation).
+    /// NNUE HalfKP. Original YaneuraOu halfkp_256x2-32-32 (Nasu-san PR #75,
+    /// 2018): dual-perspective HalfKP feature transformer + 4-layer
+    /// ClippedReLU network. Writes a YaneuraOu / Stockfish nnue-pytorch
+    /// compatible `nn.bin` per save. Architecture is selected via `--arch`
+    /// (default `256x2-32-32`).
     NnueHalfkp,
 }
 
@@ -1085,15 +1086,18 @@ macro_rules! run_training_inline_nnue {
 /// nnue-pytorch's NNUE file format (which YaneuraOu and Stockfish read).
 /// `convert_save_dir_to_nnue_layout` later renames that file to `nn.bin`.
 fn build_halfkp_save_format(l1_size: usize, l2_size: usize, l3_size: usize) -> Vec<SavedFormat> {
-    // Quantisation scales:
-    // - L0 weights/biases use qa=255 (SCReLU output is squared down to 127).
+    // Quantisation scales for the original HalfKP NNUE (Nasu-san PR #75,
+    // 2018) which uses ClippedReLU throughout:
+    // - L0 weights/biases use qa=127 (CReLU output range is 0..127).
     // - L1/L2/Out weights use qb=64 (i8 row-major after .transpose()).
-    let qa: i16 = 255;
+    // SqrClippedReLU (SCReLU) is a later, separate activation added in
+    // PR #311 (2026) for SFNNwoPSQT-1536 and is NOT used here.
+    let qa: i16 = 127;
     let qb: i16 = 64;
     let feature_set = NnueFeatureSet::HalfKp;
 
     let l1_input_dim = 2 * l1_size; // dual perspective concat
-    let l1_bias = l1_bias_scale(NnueActivation::Screlu, /*pairwise=*/ false, qa, qb);
+    let l1_bias = l1_bias_scale(NnueActivation::Crelu, /*pairwise=*/ false, qa, qb);
 
     vec![
         SavedFormat::custom(header_bytes(feature_set, l1_size, l2_size, l3_size)),
@@ -1144,10 +1148,12 @@ fn build_halfkp_save_format(l1_size: usize, l2_size: usize, l3_size: usize) -> V
 
 /// NNUE HalfKP training entry point.
 ///
-/// Architecture (currently locked to `--arch 256x2-32-32`):
-/// - Dual-perspective HalfKP feature transformer -> L1 (SCReLU)
-/// - L1 -> L2 (SCReLU)
-/// - L2 -> L3 (SCReLU)
+/// Architecture (currently locked to `--arch 256x2-32-32`) matches the
+/// original YaneuraOu halfkp_256x2-32-32 (PR #75, 2018) — ClippedReLU
+/// activation everywhere, not SqrClippedReLU:
+/// - Dual-perspective HalfKP feature transformer -> L1 (ClippedReLU)
+/// - L1 -> L2 (ClippedReLU)
+/// - L2 -> L3 (ClippedReLU)
 /// - L3 -> 1 (eval scalar)
 ///
 /// Per-save layout (after `convert_save_dir_to_nnue_layout`):
@@ -1159,7 +1165,7 @@ fn run_halfkp(args: &Args) {
     let l1_input_dim = 2 * l1_size;
 
     eprintln!(
-        "=== bulletou: running NNUE_HALFKP ({}x2-{}-{} SCReLU, dual-perspective) ===",
+        "=== bulletou: running NNUE_HALFKP ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
         l1_size, l2_size, l3_size
     );
 
@@ -1204,11 +1210,11 @@ fn run_halfkp(args: &Args) {
         let l2 = builder.new_affine("l2", l2_size, l3_size);
         let out = builder.new_affine("out", l3_size, 1);
 
-        let stm_hidden = l0.forward(stm_inputs).screlu();
-        let ntm_hidden = l0.forward(ntm_inputs).screlu();
+        let stm_hidden = l0.forward(stm_inputs).crelu();
+        let ntm_hidden = l0.forward(ntm_inputs).crelu();
         let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).screlu();
-        let hidden2 = l2.forward(hidden1).screlu();
+        let hidden1 = l1.forward(combined).crelu();
+        let hidden2 = l2.forward(hidden1).crelu();
         out.forward(hidden2)
     });
 

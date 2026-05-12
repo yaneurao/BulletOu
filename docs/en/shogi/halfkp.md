@@ -4,7 +4,7 @@
 
 [Back to Reference index](../README.md)
 
-`--eval-type NNUE_HALFKP` trains a classic Stockfish-style NNUE with HalfKP input features. The network is dual-perspective (own / opponent feature transformers share weights) followed by a small fully-connected stack.
+`--eval-type NNUE_HALFKP` trains the original YaneuraOu HalfKP NNUE (the `halfkp_256x2-32-32` architecture introduced by Nasu-san in YaneuraOu PR #75, 2018) — dual-perspective HalfKP feature transformer + 4 ClippedReLU layers. The "SqrClippedReLU" (`SCReLU`) activation was added later, in PR #311 (2026) for SFNNwoPSQT-1536, and is *not* used here.
 
 ## Architecture
 
@@ -13,13 +13,13 @@ Selected via `--arch` (currently only one preset, `256x2-32-32`):
 ```
 HalfKP sparse input (125,388 dims, per perspective)
         │
-        │  L0 affine + SCReLU       ← shared between own / opponent perspectives
+        │  L0 affine + ClippedReLU       ← shared between own / opponent perspectives
         ▼
    accumulator (256 dims × 2 perspectives = 512 dims concatenated)
         │
-        │  L1 affine (512 → 32) + SCReLU
+        │  L1 affine (512 → 32) + ClippedReLU
         ▼
-        │  L2 affine (32 → 32) + SCReLU
+        │  L2 affine (32 → 32) + ClippedReLU
         ▼
         │  Out affine (32 → 1)
         ▼
@@ -77,7 +77,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 - L2: biases (i32 × L3), weights (i8 × L3 × pad32(L2), row-major)
 - Output: biases (i32 × 1), weights (i8 × 1 × pad32(L3), row-major)
 
-`pad32(n) = ceil(n/32) * 32` aligns each layer's input dim to 32 bytes for SIMD inference. Quantisation: L0 uses `qa = 255` (SCReLU output range), L1-Out use `qb = 64` for i8 weights.
+`pad32(n) = ceil(n/32) * 32` aligns each layer's input dim to 32 bytes for SIMD inference. Quantisation: L0 uses `qa = 127` (ClippedReLU output range is 0..127), L1-Out use `qb = 64` for i8 weights.
 
 ### Resume
 
@@ -98,4 +98,4 @@ If `--output` already contains numbered dirs with `state.bin`, `bulletou` automa
 | `--lr` / `--lr-gamma` / `--lr-step` | LR schedule | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | Linear WDL schedule | 0.0 / 1.0 |
 
-Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to SCReLU. These can be added as flags later if needed.
+Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to ClippedReLU (matching the original 2018 architecture). These can be added as flags later if needed.

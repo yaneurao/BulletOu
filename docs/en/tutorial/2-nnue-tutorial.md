@@ -8,25 +8,27 @@ This page assumes you have already completed [1. Quick Start](1-quickstart.md) �
 
 ## 2.1 What we will train
 
-`bulletou --eval-type NNUE_HALFKP` trains a classical NNUE with HalfKP input features and a 4-layer SCReLU network:
+`bulletou --eval-type NNUE_HALFKP` trains the original YaneuraOu NNUE eval (`halfkp_256x2-32-32`, introduced by Nasu-san in PR #75, 2018) — a classical HalfKP input + 4-layer ClippedReLU network:
 
 ```
 shogi position
        │
        ▼ HalfKP sparse input (125,388 dims × 2 perspectives)
        │
-       ▼ L0 affine + SCReLU       ← shared weights across own / opponent perspectives
+       ▼ L0 affine + ClippedReLU       ← shared weights across own / opponent perspectives
        │
        ▼ accumulator (256 dims × 2 perspectives = 512 dims concatenated)
        │
-       ▼ L1 affine (512 → 32) + SCReLU
-       ▼ L2 affine (32 → 32) + SCReLU
+       ▼ L1 affine (512 → 32) + ClippedReLU
+       ▼ L2 affine (32 → 32) + ClippedReLU
        ▼ Out affine (32 → 1)
        │
        ▼ eval (centipawn-ish scalar)
 ```
 
-The architecture is selected with `--arch` (only `256x2-32-32` for now — `x2` denotes dual-perspective, `256` is the accumulator size, `32-32` are the L2/L3 sizes). Equivalent to the small Stockfish-style NNUE.
+The architecture is selected with `--arch` (only `256x2-32-32` for now — `x2` denotes dual-perspective, `256` is the accumulator size, `32-32` are the L2/L3 sizes).
+
+(SqrClippedReLU / SCReLU is a separate activation introduced later in PR #311 (2026) for SFNNwoPSQT-1536 and is *not* used by `NNUE_HALFKP`.)
 
 This is not state of the art (which uses Layer Stack + threat features + a much larger FT), but it is enough to feel how training behaves and to plug into an engine for a sanity-check game.
 
@@ -71,7 +73,7 @@ Without `--superbatches` or `--max-epochs`, training runs through the teacher da
 While it runs, you should see:
 
 ```
-=== bulletou: running NNUE_HALFKP (256x2-32-32 SCReLU, dual-perspective) ===
+=== bulletou: running NNUE_HALFKP (256x2-32-32 ClippedReLU, dual-perspective) ===
 Training Preamble
 Net Name               : shogi_nnue_halfkp
 Batch Size             : 16384

@@ -4,7 +4,7 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_HALFKP` は古典的な Stockfish 系 NNUE を HalfKP 入力で学習する。dual-perspective (自玉・相手玉の Feature Transformer は重み共有) + 小さい全結合スタック。
+`--eval-type NNUE_HALFKP` は、やねうら王に最初に NNUE 系評価関数として入った `halfkp_256x2-32-32` (那須さんによる 2018 年の PR #75) を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。SqrClippedReLU (SCReLU) は別物 (2026 年の PR #311 で SFNNwoPSQT-1536 と一緒に導入された活性化関数) で、こちらでは使わない。
 
 ## アーキテクチャ
 
@@ -13,13 +13,13 @@
 ```
 HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
         │
-        │  L0 affine + SCReLU       ← 両 perspective で重み共有
+        │  L0 affine + ClippedReLU       ← 両 perspective で重み共有
         ▼
    accumulator (256 次元 × 2 perspective = 連結して 512 次元)
         │
-        │  L1 affine (512 → 32) + SCReLU
+        │  L1 affine (512 → 32) + ClippedReLU
         ▼
-        │  L2 affine (32 → 32) + SCReLU
+        │  L2 affine (32 → 32) + ClippedReLU
         ▼
         │  Out affine (32 → 1)
         ▼
@@ -77,7 +77,7 @@ checkpoints/my-halfkp/
 - L2: biases (i32 × L3)、weights (i8 × L3 × pad32(L2), row-major)
 - Output: biases (i32 × 1)、weights (i8 × 1 × pad32(L3), row-major)
 
-`pad32(n) = ceil(n/32) * 32` で各層の入力次元を SIMD 用に 32 バイトアライン。量子化: L0 は `qa = 255` (SCReLU の出力レンジ)、L1-Out は `qb = 64` で i8 重み。
+`pad32(n) = ceil(n/32) * 32` で各層の入力次元を SIMD 用に 32 バイトアライン。量子化: L0 は `qa = 127` (ClippedReLU の出力レンジ 0..127)、L1-Out は `qb = 64` で i8 重み。
 
 ### 中断・再開
 
@@ -98,4 +98,4 @@ checkpoints/my-halfkp/
 | `--lr` / `--lr-gamma` / `--lr-step` | LR scheduler | 0.001 / 0.1 / 8 |
 | `--start-wdl` / `--end-wdl` | 線形 WDL scheduler | 0.0 / 1.0 |
 
-loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は SCReLU に固定。必要になったら CLI フラグ化する余地はある。
+loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。

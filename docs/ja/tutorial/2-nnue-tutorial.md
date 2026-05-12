@@ -8,25 +8,27 @@
 
 ## 2.1 何を学習するか
 
-`bulletou --eval-type NNUE_HALFKP` で、HalfKP 入力 + SCReLU 4 層の古典的な NNUE を学習する:
+`bulletou --eval-type NNUE_HALFKP` で、やねうら王に最初に入った NNUE 評価関数 `halfkp_256x2-32-32` (那須さんの 2018 年 PR #75) と同じ構成 — HalfKP 入力 + 全層 ClippedReLU の 4 層 NNUE を学習する:
 
 ```
 将棋の局面
        │
        ▼ HalfKP sparse 特徴量 (125,388 次元、自玉 / 相手玉の 2 perspective)
        │
-       ▼ L0 affine + SCReLU       ← 両 perspective で重み共有
+       ▼ L0 affine + ClippedReLU       ← 両 perspective で重み共有
        │
        ▼ accumulator (256 次元 × 2 perspective = 連結して 512 次元)
        │
-       ▼ L1 affine (512 → 32) + SCReLU
-       ▼ L2 affine (32 → 32) + SCReLU
+       ▼ L1 affine (512 → 32) + ClippedReLU
+       ▼ L2 affine (32 → 32) + ClippedReLU
        ▼ Out affine (32 → 1)
        │
        ▼ eval (centipawn ベースのスカラー)
 ```
 
-アーキテクチャは `--arch` で選ぶが、本チュートリアル時点では `256x2-32-32` の 1 種類のみ (`x2` は dual-perspective、`256` は accumulator size、`32-32` は L2/L3 のサイズ)。Stockfish 系 NNUE の小型構成と同等。
+アーキテクチャは `--arch` で選ぶが、本チュートリアル時点では `256x2-32-32` の 1 種類のみ (`x2` は dual-perspective、`256` は accumulator size、`32-32` は L2/L3 のサイズ)。
+
+(SqrClippedReLU / SCReLU は別系統で、2026 年の PR #311 (SFNNwoPSQT-1536) で導入された新しい活性化関数。`NNUE_HALFKP` は使わない。)
 
 最強構成 (Layer Stack + threat 特徴量 + 大きい FT) には届かないが、学習の挙動を体感するのと、エンジンに繋いで対局確認するには十分。
 
@@ -73,7 +75,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 動いていれば以下のような出力が流れる:
 
 ```
-=== bulletou: running NNUE_HALFKP (256x2-32-32 SCReLU, dual-perspective) ===
+=== bulletou: running NNUE_HALFKP (256x2-32-32 ClippedReLU, dual-perspective) ===
 Training Preamble
 Net Name               : shogi_nnue_halfkp
 Batch Size             : 16384
