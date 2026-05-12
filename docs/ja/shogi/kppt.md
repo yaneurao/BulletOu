@@ -62,12 +62,13 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ```
 checkpoints/my-kppt/
+├── learn.log                          ← トップレベルの通算ログ (全 run / resume を連結)
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
 │   ├── state.bin                      ← resume 用の重み + Adam moments (3 component ぶん)
-│   └── learn.log                      ← 学習ログ (3 component の batch ごとの loss を CSV で連結)
+│   └── learn.log                      ← この save 時点の学習ログの snapshot
 ├── 0002/
 │   ├── ...
 ├── ...
@@ -79,7 +80,7 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` のフォーマット (3 component の bullet 既存 log.txt をセクションヘッダ付きで連結):
+各 save 配下の `learn.log` のフォーマット (3 component の bullet 既存 log.txt をセクションヘッダ付きで連結):
 
 ```
 # component: kk
@@ -95,6 +96,21 @@ checkpoints/my-kppt/
 ```
 
 各行は `<superbatch>,<curr_batch>,<loss>` の CSV。bullet は 32 batch ごとに 1 行記録する。
+
+トップレベルの `<output>/learn.log` には、1 run ごとに 1 section が追記される。section 頭にその run の wall-clock 時刻と生成された numbered dir の範囲が入る:
+
+```
+# === run @ 2026-05-12T15:30:00Z saved 0001/-0005/ ===
+# component: kk
+1,32,0.234
+...
+# === run @ 2026-05-12T18:42:00Z saved 0006/-0010/ ===
+# component: kk
+1,32,0.118
+...
+```
+
+resume すると superbatch カウンタは 1 から再開される (run ごとに LR scheduler が reset されるため)。トップレベルの learn.log ではセクションヘッダで run の境界を判別する。
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 

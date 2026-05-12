@@ -390,10 +390,83 @@ fn run_kppt_all(args: &Args) {
     // series `0001/`, `0002/`, ..., each containing the three `.bin` files
     // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
     // `kpp-*/` subdirs are removed after assembly.
-    if let Err(e) = assemble_numbered_dirs(&output_dir) {
-        eprintln!("error: failed to assemble numbered checkpoint dirs: {e}");
-        std::process::exit(1);
+    match assemble_numbered_dirs(&output_dir) {
+        Ok((first_idx, last_idx)) => {
+            // Append the new run's full loss history to a top-level
+            // `<output>/learn.log` so the user has a single growing file
+            // spanning all resumes. Per-save `<output>/0NNN/learn.log` files
+            // are kept as snapshots.
+            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to assemble numbered checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
     }
+}
+
+/// Format the current wall-clock time as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+/// Inlined gregorian conversion so we don't have to pull in `chrono`.
+fn current_utc_iso8601() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let tod = secs % 86400;
+    let hours = tod / 3600;
+    let minutes = (tod % 3600) / 60;
+    let seconds = tod % 60;
+    let mut y = 1970i64;
+    let mut remaining_days = days as i64;
+    loop {
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md as i64 {
+            m = i;
+            break;
+        }
+        remaining_days -= md as i64;
+    }
+    let d = remaining_days + 1;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, d, hours, minutes, seconds)
+}
+
+/// Append a "run section" to `<output>/learn.log`. The section header records
+/// the timestamp and the range of numbered dirs produced by this run, and the
+/// body is the contents of the latest dir's `learn.log` (= the full per-batch
+/// loss history of all three components for this run).
+fn append_to_top_level_log(
+    output_dir: &std::path::Path,
+    first_idx: usize,
+    last_idx: usize,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
+    let body = std::fs::read_to_string(&latest_log)?;
+    let timestamp = current_utc_iso8601();
+    let header = format!("# === run @ {timestamp} saved {first_idx:04}/-{last_idx:04}/ ===\n");
+    let top = output_dir.join("learn.log");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
+    file.write_all(header.as_bytes())?;
+    file.write_all(body.as_bytes())?;
+    if !body.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// List checkpoint subdirs for `net_id_prefix` under `output_dir`, sorted by
@@ -433,7 +506,11 @@ fn list_component_checkpoints_sorted(
 /// flat `<output>/0001/`, `0002/`, ... directories each containing the
 /// three `.bin` files. Removes the per-component subdirs after assembly so
 /// the user sees a clean numbered layout.
-fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<()> {
+///
+/// Returns `(first_idx, last_idx)` of the numbered dirs written in this run
+/// (1-based, inclusive). On resume the range starts above the previously
+/// existing count, so the caller can locate the latest dir to inspect.
+fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<(usize, usize)> {
     let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
     let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
     let kpp_dirs = list_component_checkpoints_sorted(output_dir, "kpp");
@@ -509,7 +586,7 @@ fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<()> {
         }
     }
 
-    Ok(())
+    Ok((existing_count + 1, existing_count + n))
 }
 
 // `Trainer<G, O, S>` の concrete type は bullet API として直接露出していないので、

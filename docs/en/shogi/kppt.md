@@ -62,12 +62,13 @@ When training finishes, the saved checkpoints are laid out as zero-padded number
 
 ```
 checkpoints/my-kppt/
+├── learn.log                          ← top-level cumulative log across all runs/resumes
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
 │   ├── state.bin                      ← resume data (weights + Adam moments for all 3 components)
-│   └── learn.log                      ← training log (per-batch loss for all 3 components)
+│   └── learn.log                      ← snapshot of the training log at this save point
 ├── 0002/
 │   ├── ...
 ├── ...
@@ -79,7 +80,7 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` format: bullet's existing per-component `log.txt` files concatenated with section headers:
+`learn.log` format (per-save snapshot): bullet's per-component `log.txt` files concatenated with section headers:
 
 ```
 # component: kk
@@ -95,6 +96,21 @@ checkpoints/my-kppt/
 ```
 
 Each row is `<superbatch>,<curr_batch>,<loss>` CSV. Bullet writes one row every 32 batches.
+
+The top-level `<output>/learn.log` accumulates one section per run, prefixed with a header that records the wall-clock time and the range of numbered dirs produced:
+
+```
+# === run @ 2026-05-12T15:30:00Z saved 0001/-0005/ ===
+# component: kk
+1,32,0.234
+...
+# === run @ 2026-05-12T18:42:00Z saved 0006/-0010/ ===
+# component: kk
+1,32,0.118
+...
+```
+
+On resume the superbatch counter restarts at 1 (the LR scheduler restarts each run); each section's header tells you which run the rows belong to.
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
