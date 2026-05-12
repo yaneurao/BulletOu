@@ -53,7 +53,12 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
                 panic!("Dataloader returned a batch with incorrect batch size!");
             }
 
-            sender.send(batch).unwrap();
+            // メインスレッドが既に学習を終えて receiver を drop している場合、
+            // sender.send は Err を返す。これはレース状況下の正常な終端なので
+            // unwrap で panic させず黙って抜ける。
+            if sender.send(batch).is_err() {
+                return true;
+            }
 
             batch_no += 1;
 
@@ -103,7 +108,10 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
     while batch_queued {
         if superbatch > steps.end_superbatch {
-            return Err(TrainerError::DataLoadingError(DataLoadingError::TooManyBatchesReceived));
+            // 学習は end_superbatch まで正常完了しており、その先に届く batch は
+            // double-buffer 化された dataloader の先読みによる余分。Err にして
+            // caller を panic させる必要はないので正常終了として break する。
+            break;
         }
 
         // ignore startup time from loading the first batch of data
