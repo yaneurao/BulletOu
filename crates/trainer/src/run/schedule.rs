@@ -14,7 +14,14 @@ impl TrainingSteps {
         println!("Batches / Superbatch   : {}", ansi(self.batches_per_superbatch, 31));
         println!("Positions / Superbatch : {}", ansi(self.batches_per_superbatch * self.batch_size, 31));
         println!("Start Superbatch       : {}", ansi(self.start_superbatch, 31));
-        println!("End Superbatch         : {}", ansi(self.end_superbatch, 31));
+        // `usize::MAX` is the sentinel for "no cap" (set when `--superbatches`
+        // is omitted). Showing the raw integer is just noise.
+        let end_label: String = if self.end_superbatch == usize::MAX {
+            "u64_max".to_string()
+        } else {
+            self.end_superbatch.to_string()
+        };
+        println!("End Superbatch         : {}", ansi(end_label, 31));
     }
 }
 
