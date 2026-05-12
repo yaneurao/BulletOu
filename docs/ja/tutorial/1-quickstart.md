@@ -131,6 +131,44 @@ rm -rf checkpoints target
 
 `target/` は次回 `cargo build` のときに再生成される。
 
+## 1.7 開発者向け補足
+
+ここから先は smoke test を超えて自分の用途に合わせて使う場合の補足。
+
+### 既存 example を自分用に編集する
+
+最も普通の使い方: リポジトリを clone して、[examples/](/examples) のいずれかを自分の目的に合わせて編集する。`shogi_simple.rs` や `bullet_ou_train.rs` を雛形に持つのが一般的。
+
+### 独自 example を登録する
+
+新しい example ファイルを `examples/` 配下に置いただけでは `cargo build --example xxx` で認識されない。`bullet_lib` の `Cargo.toml` に登録する必要がある:
+
+```toml
+# crates/bullet_lib/Cargo.toml の末尾に追加
+[[example]]
+name = "my_example"
+path = "../../examples/my_example.rs"
+```
+
+こうしておくと、上流からの `git pull` でファイルが消えにくく、独自実験を継続的に維持できる。
+
+### 他プロジェクトから `bullet_lib` を import する
+
+`bullet_lib` を crate として他プロジェクトから依存することもできる:
+
+```toml
+[dependencies]
+bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
+```
+
+### API ドキュメント
+
+詳細な API ドキュメントは Rust の docstring に書かれている。ローカルで生成・参照するには:
+
+```bash
+cargo doc --open
+```
+
 ---
 
 次へ: [2. NNUE チュートリアル](2-nnue-tutorial.md) — `.pack` データから実際に将棋 NNUE を学習する。

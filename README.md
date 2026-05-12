@@ -23,16 +23,6 @@ Target evaluation functions:
 
 For specification-level details such as training-data formats and output formats, see [docs/en/0-contents.md](docs/en/0-contents.md).
 
-Most users clone the repo and edit one of the [examples](/examples) to suit their needs. If you want a custom example file that survives upstream pulls, register it in [`bullet_lib`'s `Cargo.toml`](crates/bullet_lib/Cargo.toml).
-
-You can also import the `bullet_lib` crate from another project:
-
-```toml
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
-```
-
-Detailed API documentation lives in Rust's docstrings. Run `cargo doc` locally to browse it.
-
 ### Building
 
 ```bash

@@ -131,6 +131,44 @@ rm -rf checkpoints target
 
 The `target/` directory will be rebuilt next time you `cargo build`.
 
+## 1.7 Developer notes
+
+Beyond the smoke test, here are the bits you'll likely want when adapting BulletOu to your own training.
+
+### Editing an existing example
+
+The usual workflow: clone the repo and edit one of the files under [examples/](/examples) to your taste. `shogi_simple.rs` or `bullet_ou_train.rs` are common starting points.
+
+### Registering a custom example
+
+Just placing a new file under `examples/` is not enough — `cargo build --example xxx` will not find it until you register it in `bullet_lib`'s `Cargo.toml`:
+
+```toml
+# Append to crates/bullet_lib/Cargo.toml
+[[example]]
+name = "my_example"
+path = "../../examples/my_example.rs"
+```
+
+Once registered, the example survives `git pull` from upstream more easily, which helps when maintaining long-running custom experiments.
+
+### Importing `bullet_lib` from another project
+
+You can also depend on `bullet_lib` as a crate from a separate project:
+
+```toml
+[dependencies]
+bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
+```
+
+### API documentation
+
+Detailed API documentation lives in Rust's docstrings. To generate and open it locally:
+
+```bash
+cargo doc --open
+```
+
 ---
 
 Next: [2. NNUE Tutorial](2-nnue-tutorial.md) — train a real shogi NNUE from `.pack` data.
