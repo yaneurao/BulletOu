@@ -11,13 +11,48 @@ We are **not** trying to train a strong NNUE here — that comes in the next pag
 You need:
 
 - **A modern NVIDIA or AMD GPU.** CPU-only training is not supported (the GPU runtime is built into the design).
-- **Rust toolchain** (stable, 1.87 or later). Install via [rustup](https://www.rust-lang.org/tools/install).
+- **Rust toolchain** (stable, 1.87 or later). See §1.1.1 below for OS-specific install steps.
 - **CUDA Toolkit 12.x** (for NVIDIA GPUs) or **HIP SDK / ROCm** (for AMD GPUs).
 - About **10 GB of free disk space** for the build and test data.
 
 If you are on Windows and using NVIDIA, you also need the matching versions of cuDNN (and optionally TensorRT). See the [reference doc on Windows GPU setup](https://github.com/yaneurao/BulletOu) when in doubt.
 
 > **CPU-only?** There is a `mock` GPU backend in the source tree, but it is a type-checking stub — it cannot actually train. If you have no GPU, this tutorial is not going to work. Consider using a cloud GPU instance (e.g. Vast.ai, Lambda Labs, Paperspace, or Google Colab).
+
+### 1.1.1 Installing the Rust toolchain
+
+#### Windows
+
+1. Download **rustup-init.exe** from <https://rustup.rs/> (the "DOWNLOAD RUSTUP-INIT.EXE (64-BIT)" button) and run it.
+2. Accept the defaults:
+   - `Default host triple: x86_64-pc-windows-msvc` (the `msvc` target works best with CUDA EP)
+   - `Default toolchain: stable`
+   - `Profile: default`
+3. If rustup reports that MSVC C++ Build Tools are missing, follow its link to install **Visual Studio Build Tools** and check the **"Desktop development with C++"** workload.
+4. **Open a new PowerShell or cmd window** so the PATH update is picked up.
+
+One-line install via PowerShell (alternative):
+
+```powershell
+Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+.\rustup-init.exe -y --default-host x86_64-pc-windows-msvc --default-toolchain stable
+```
+
+#### Linux / macOS / WSL
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"   # or just open a new shell
+```
+
+#### Verify
+
+```bash
+cargo --version
+rustc --version
+```
+
+Both commands should print a version like `cargo 1.x.x ...`.
 
 ## 1.2 Get the source
 
