@@ -312,7 +312,7 @@ mod tests {
     ///     inbox/ref/sp_dr2-15K_20240210.hcpe3 \
     ///     inbox/ref/sp_dr2-15K_20240210.hcpe3.psv 0 1000000
     ///
-    /// XREF_COUNT=1000000 cargo test -p bullet_lib --lib \
+    /// XREF_COUNT=1000000 cargo test -p bulletou_lib --lib \
     ///     hcpe3::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
     /// ```
     ///

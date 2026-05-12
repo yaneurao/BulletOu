@@ -40,7 +40,7 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_compiler::tensor::TValue;
-use bullet_lib::{
+use bulletou_lib::{
     game::inputs::{
         ShogiHalfKA_hm, ShogiHalfKaHmHandCount, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
         ShogiHalfKaHmThreat, SparseInputType, ThreatProfile,
@@ -69,7 +69,7 @@ use bullet_trainer::model::save::ModelWeights;
 struct WeightView {
     values: Vec<f32>,
     #[allow(dead_code)]
-    shape: bullet_lib::nn::Shape,
+    shape: bulletou_lib::nn::Shape,
 }
 
 fn weight_view(weights: &ModelWeights, id: &str) -> WeightView {
@@ -1117,15 +1117,15 @@ mod psqt_material {
 /// packed BonaPiece (0..=1628、計 PIECE_INPUTS=1629 要素) → Material 値
 /// （centipawn、friend=+, enemy=-）のルックアップを構築
 ///
-/// BonaPiece レイアウト (bullet_lib::shogi::bona_piece)：
+/// BonaPiece レイアウト (bulletou_lib::shogi::bona_piece)：
 /// - 手駒: 1..=89 (未使用スロットあり)
 /// - 盤上駒: 90..=1547 (各駒種 × 2色 × 81マス)
 /// - 王: 1548..=1628 (friend/enemy は pack 後同一平面)
 ///
 /// pack_bonapiece 処理後の packed 値を想定：生の BonaPiece ではなく、
 /// shogi_halfka.rs::pack_bonapiece を通した後の値（E_KING は 1548 に丸め込まれる）。
-fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INPUTS] {
-    use bullet_lib::shogi::bona_piece::{
+fn build_packed_bp_material_table() -> [f32; bulletou_lib::game::inputs::PIECE_INPUTS] {
+    use bulletou_lib::shogi::bona_piece::{
         E_BISHOP, E_DRAGON, E_GOLD, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK,
         E_HAND_SILVER, E_HORSE, E_KNIGHT, E_LANCE, E_PAWN, E_ROOK, E_SILVER, F_BISHOP, F_DRAGON, F_GOLD, F_HAND_BISHOP,
         F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_HORSE, F_KNIGHT, F_LANCE,
@@ -1133,7 +1133,7 @@ fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INP
     };
     use psqt_material::*;
 
-    let mut table = [0.0f32; bullet_lib::game::inputs::PIECE_INPUTS];
+    let mut table = [0.0f32; bulletou_lib::game::inputs::PIECE_INPUTS];
 
     // 手駒スロット
     // friend の手駒: +material × 枚数分のスロットを連番で埋める
@@ -1202,7 +1202,7 @@ fn build_packed_bp_material_table() -> [f32; bullet_lib::game::inputs::PIECE_INP
 /// `nnue2score_scale` は centipawn → 内部スケールへの変換係数（通常 `args.wrm_nnue2score`、
 /// デフォルト 600.0）。これで割ることで float 重みが訓練時の net_output スケールに揃う。
 fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score_scale: f32) -> Vec<f32> {
-    use bullet_lib::game::inputs::PIECE_INPUTS;
+    use bulletou_lib::game::inputs::PIECE_INPUTS;
 
     assert!(input_size >= halfka_dim, "input_size must be >= halfka_dim");
     assert!(nnue2score_scale > 0.0, "nnue2score_scale must be positive");
@@ -1232,8 +1232,8 @@ fn compute_psqt_material_values(halfka_dim: usize, input_size: usize, nnue2score
 #[cfg(test)]
 mod psqt_material_tests {
     use super::*;
-    use bullet_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
-    use bullet_lib::shogi::bona_piece::{
+    use bulletou_lib::game::inputs::{HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS};
+    use bulletou_lib::shogi::bona_piece::{
         E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_PAWN,
         F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_KING,
         F_PAWN, F_ROOK,
@@ -1438,7 +1438,7 @@ fn build_layerstack_save_format(
     hand_threat: bool,
     hand_count_dense_dims: usize,
 ) -> Vec<SavedFormat> {
-    use bullet_lib::game::inputs::FEATURE_HASH_HM_V2;
+    use bulletou_lib::game::inputs::FEATURE_HASH_HM_V2;
 
     let l1_effective = l1_out - 1; // skip connection 分を除く
     let l2_in = l1_effective * 2; // sqr_crelu concat crelu
@@ -1890,7 +1890,7 @@ fn main() {
     };
 
     // L1 層の入力次元は FT 出力 + （HandCount 有効時は +14）
-    let hand_count_dense_dims: usize = if use_hand_count_dense { bullet_lib::game::inputs::HAND_COUNT_DIMS } else { 0 };
+    let hand_count_dense_dims: usize = if use_hand_count_dense { bulletou_lib::game::inputs::HAND_COUNT_DIMS } else { 0 };
     let l1_input_dim = ft_out + hand_count_dense_dims;
 
     let optimizer_name = match args.optimizer {

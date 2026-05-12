@@ -1,4 +1,4 @@
-use bullet_lib::{
+use bulletou_lib::{
     game::{inputs::Chess768, outputs::MaterialCount},
     nn::optimiser::AdamW,
     trainer::{

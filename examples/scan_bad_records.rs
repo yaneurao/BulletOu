@@ -8,7 +8,7 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 
-use bullet_lib::shogi::{
+use bulletou_lib::shogi::{
     ShogiBoard,
     packed_sfen::PackedSfenValue,
     types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, PieceType},

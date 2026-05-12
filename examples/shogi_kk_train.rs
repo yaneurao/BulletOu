@@ -26,7 +26,7 @@ Usage:
 
 use std::path::PathBuf;
 
-use bullet_lib::{
+use bulletou_lib::{
     game::inputs::ShogiKk,
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},

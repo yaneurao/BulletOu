@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bullet_lib::{
+use bulletou_lib::{
     game::outputs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs},
     shogi::PackedSfenValue,
 };

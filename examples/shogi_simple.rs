@@ -54,7 +54,7 @@ Examples:
 
 use std::{path::PathBuf, sync::OnceLock};
 
-use bullet_lib::{
+use bulletou_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
     nn::{
         ModelNode,
@@ -817,7 +817,7 @@ fn compute_fc_hash(l1_size: usize, l2_size: usize, l3_size: usize) -> u32 {
 
 /// 特徴量hash値を取得
 fn get_feature_hash(features: FeatureSet) -> u32 {
-    use bullet_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR};
+    use bulletou_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR};
     match features {
         FeatureSet::HalfKP => FEATURE_HASH,
         FeatureSet::HalfkaHm => FEATURE_HASH_HM_V2,

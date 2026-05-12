@@ -135,7 +135,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "bullet_lib"
+name = "bulletformat"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d171953264e8dc3aa62757255e602e507fdd358a94e3cdacb9e481ff3a1c6b0"
+
+[[package]]
+name = "bulletou_lib"
 version = "1.0.0"
 dependencies = [
  "bullet-compiler",
@@ -149,12 +155,6 @@ dependencies = [
  "sfbinpack",
  "viriformat",
 ]
-
-[[package]]
-name = "bulletformat"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d171953264e8dc3aa62757255e602e507fdd358a94e3cdacb9e481ff3a1c6b0"
 
 [[package]]
 name = "cfg-if"

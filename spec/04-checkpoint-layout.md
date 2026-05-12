@@ -37,7 +37,7 @@ resume 時は **既存番号の続きから連番**。例えば前回 `0005/` �
 └── learn.log
 ```
 
-3 ファイル組すべてを engine が要求する。詳細は `bullet_lib::value::yaneuraou_kppt` モジュール doc-comment。
+3 ファイル組すべてを engine が要求する。詳細は `bulletou_lib::value::yaneuraou_kppt` モジュール doc-comment。
 
 ### NNUE_HALFKP / NNUE_KP
 ```
@@ -82,7 +82,7 @@ record を必要なだけ連結したものが `state.bin`。
 
 ### 生成・展開 API
 
-`bullet_lib::value::yaneuraou_kppt` モジュール内 (歴史的経緯で KPPT モジュール下にあるが、API 自体は generic):
+`bulletou_lib::value::yaneuraou_kppt` モジュール内 (歴史的経緯で KPPT モジュール下にあるが、API 自体は generic):
 
 | 関数 | 用途 |
 |---|---|

@@ -62,7 +62,7 @@ using OutputLayer = AffineTransform<HiddenLayer2, 1>;
 
 ## BulletOu 側の実装契約
 
-- `bullet_lib::value::nnue_save::Activation` enum: `Crelu` / `Screlu` を持つ
+- `bulletou_lib::value::nnue_save::Activation` enum: `Crelu` / `Screlu` を持つ
 - `l1_bias_scale(activation, pairwise, qa, qb)` がスケールを返す (CReLU/SCReLU で値が違う、特に SCReLU は qa=255 でも 127 にスケールダウン)
 - `examples/bulletou.rs` の `run_halfkp` / `run_kp` は network builder で `.crelu()` を呼ぶ、`save_format` で `qa=127` を使う
 

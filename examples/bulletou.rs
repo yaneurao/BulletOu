@@ -49,7 +49,7 @@ Usage:
 
 use std::path::PathBuf;
 
-use bullet_lib::{
+use bulletou_lib::{
     game::inputs::{ShogiHalfKP, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp, ShogiKpp, SparseInputType},
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
@@ -225,7 +225,7 @@ const KPPT_KKP_DEFAULT_QUANT_SCALE: f32 = 4000.0;
 const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 
 // (teacher-path expansion and format inference live in
-//  `bullet_lib::teacher_path` so the single-component examples can share them.)
+//  `bulletou_lib::teacher_path` so the single-component examples can share them.)
 
 // ----- CLI ---------------------------------------------------------------
 
@@ -622,7 +622,7 @@ impl LogContext {
         }
     }
 
-    /// LR at a given superbatch — mirrors `bullet_lib::trainer::schedule::lr::StepLR`.
+    /// LR at a given superbatch — mirrors `bulletou_lib::trainer::schedule::lr::StepLR`.
     fn lr_at(&self, superbatch: usize) -> f32 {
         let steps = superbatch.saturating_sub(1) / self.lr_step;
         self.lr_start * self.lr_gamma.powi(steps as i32)

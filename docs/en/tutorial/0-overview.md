@@ -68,7 +68,7 @@ How the engine consumes the file depends on the engine; see its documentation.
 The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
-- [2. Using `bullet_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
+- [2. Using `bulletou_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
 - [3. Prepare training data](3-data.md) — choosing the eval type, plus pre-shuffling the teacher file
 - [4. Run the training](4-train.md) — invoking `bulletou`
 - [5. Stop and resume](5-resume.md) — auto-resume by re-running with the same `--output`

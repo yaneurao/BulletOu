@@ -24,7 +24,7 @@ use std::{
     path::PathBuf,
 };
 
-use bullet_lib::shogi::PackedSfenValue;
+use bulletou_lib::shogi::PackedSfenValue;
 use clap::Parser;
 
 const PSV_SIZE: usize = size_of::<PackedSfenValue>();

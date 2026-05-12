@@ -9,7 +9,7 @@ edition = "2024"
 [workspace]
 resolver = "2"
 members = [
-    "crates/bullet_lib",
+    "crates/bulletou_lib",
     "crates/compiler",
     "crates/gpu",
     "crates/trainer",

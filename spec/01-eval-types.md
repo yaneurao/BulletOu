@@ -29,7 +29,7 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 
 `--arch` の値は `<L1>x2-<L2>-<L3>` 表記 (Stockfish 慣習に準拠)。`x2` は dual-perspective を意味する固定リテラル。
 
-将来 `--arch` の値域を増やす場合は、`bullet_lib::value::nnue_save` の量子化スケール (qa=127 ClippedReLU 前提) と SIMD パディング規約 (pad32) を踏まえて L0 / L1 サイズを選ぶこと。詳細は [02-nnue-binary.md](02-nnue-binary.md)。
+将来 `--arch` の値域を増やす場合は、`bulletou_lib::value::nnue_save` の量子化スケール (qa=127 ClippedReLU 前提) と SIMD パディング規約 (pad32) を踏まえて L0 / L1 サイズを選ぶこと。詳細は [02-nnue-binary.md](02-nnue-binary.md)。
 
 ## デフォルト `--output` 規約
 

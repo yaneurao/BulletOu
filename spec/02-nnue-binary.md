@@ -2,7 +2,7 @@
 
 NNUE 系 eval-type (`NNUE_HALFKP` / `NNUE_KP`) が `<output>/000N/nn.bin` に書き出すバイナリの仕様。**nnue-pytorch / Stockfish / YaneuraOu の NNUE 形式と byte 単位で同一**。
 
-`bullet_lib::value::nnue_save` モジュール参照。
+`bulletou_lib::value::nnue_save` モジュール参照。
 
 ## 概観
 
@@ -122,7 +122,7 @@ layer += 0x538D24C7   # ClippedReLU
 | Out bias | 127 × qb = 8128 (i32) | 同上 |
 | Out weights | qb = 64 (i8) | row-major、pad32 |
 
-l1_bias_scale は活性化関数や pairwise 有無で変わる。`bullet_lib::value::nnue_save::l1_bias_scale()` 参照。
+l1_bias_scale は活性化関数や pairwise 有無で変わる。`bulletou_lib::value::nnue_save::l1_bias_scale()` 参照。
 
 ```
 CReLU      qa=127  → l1_bias = 127 × qb

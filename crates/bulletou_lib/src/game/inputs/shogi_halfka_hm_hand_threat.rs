@@ -658,13 +658,13 @@ mod tests {
     /// ```bash
     /// # 最適化前に baseline snapshot を取る
     /// cd /mnt/nvme1/development/bullet-shogi
-    /// cargo test -p bullet_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
+    /// cargo test -p bulletou_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
     /// cp /tmp/hand_threat_snapshot.txt /tmp/hand_threat_snapshot_before.txt
     ///
     /// # 最適化実装
     ///
     /// # 最適化後に snapshot を再生成して diff
-    /// cargo test -p bullet_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
+    /// cargo test -p bulletou_lib --release test_snapshot_hand_threat_corpus -- --ignored --nocapture
     /// diff /tmp/hand_threat_snapshot_before.txt /tmp/hand_threat_snapshot.txt
     /// # 差分が 0 行なら bit-exact 同一
     /// ```

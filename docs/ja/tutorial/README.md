@@ -8,7 +8,7 @@ BulletOu を初めて使う人向けの段階的ガイド。上から順に読�
 |---|---|---|
 | 0 | [概要](0-overview.md) | BulletOu が何を学習するか、どの評価関数に対応しているかを理解する |
 | 1 | [クイックスタート](1-quickstart.md) | 必要なものを揃えて BulletOu をビルドし、最小の学習を動かして動作確認する |
-| 2 | [`bullet_lib` を自分のコードから使う](2-bullet-lib.md) | 開発者向け補足 (独自 example の登録、外部からの import など。任意) |
+| 2 | [`bulletou_lib` を自分のコードから使う](2-bullet-lib.md) | 開発者向け補足 (独自 example の登録、外部からの import など。任意) |
 | 3 | [教師データを用意する](3-data.md) | eval-type を選び、教師データを用意・シャッフルする |
 | 4 | [学習を走らせる](4-train.md) | `bulletou` コマンドの実行 (eval-type / arch / 教師の渡し方) |
 | 5 | [中断・再開](5-resume.md) | `--output` 同じで自動 resume |

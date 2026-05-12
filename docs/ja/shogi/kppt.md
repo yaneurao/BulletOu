@@ -151,9 +151,9 @@ KPPT は歴史的に以下の組み合わせが多い:
 
 ## 関連
 
-- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kk.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kk.rs)
-- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kkp.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kkp.rs)
-- [BulletOu source: `crates/bullet_lib/src/game/inputs/shogi_kpp.rs`](../../../crates/bullet_lib/src/game/inputs/shogi_kpp.rs)
-- [BulletOu source: `crates/bullet_lib/src/value/yaneuraou_kppt.rs`](../../../crates/bullet_lib/src/value/yaneuraou_kppt.rs)
+- [BulletOu source: `crates/bulletou_lib/src/game/inputs/shogi_kk.rs`](../../../crates/bulletou_lib/src/game/inputs/shogi_kk.rs)
+- [BulletOu source: `crates/bulletou_lib/src/game/inputs/shogi_kkp.rs`](../../../crates/bulletou_lib/src/game/inputs/shogi_kkp.rs)
+- [BulletOu source: `crates/bulletou_lib/src/game/inputs/shogi_kpp.rs`](../../../crates/bulletou_lib/src/game/inputs/shogi_kpp.rs)
+- [BulletOu source: `crates/bulletou_lib/src/value/yaneuraou_kppt.rs`](../../../crates/bulletou_lib/src/value/yaneuraou_kppt.rs)
 - [YaneuraOu source: `source/eval/kppt/evaluate_kppt.h`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/kppt/evaluate_kppt.h)
 - [YaneuraOu source: `source/eval/kpp_kkpt/evaluate_kpp_kkpt.h`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/kpp_kkpt/evaluate_kpp_kkpt.h)

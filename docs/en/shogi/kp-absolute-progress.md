@@ -78,7 +78,7 @@ Key points:
 - **Edge case `p = 1.0`**: `floor(p * 8) = 8`, but `clamp(0, 7)` pushes it down to 7, keeping the bucket count at 8.
 - The lower clamp at 0 is rarely triggered (sigmoid output is always in `[0, 1]`), but it serves as a safety net against numerical errors and invalid positions.
 
-Implementation: the `OutputBuckets::bucket` method of `ShogiProgressKPAbs` in `crates/bullet_lib/src/game/outputs.rs`, namely `((p * 8.0).floor() as i32).clamp(0, 7) as u8`.
+Implementation: the `OutputBuckets::bucket` method of `ShogiProgressKPAbs` in `crates/bulletou_lib/src/game/outputs.rs`, namely `((p * 8.0).floor() as i32).clamp(0, 7) as u8`.
 
 #### Relationship between LayerStack's 9 buckets and Progress8KPAbs's 8 buckets
 
@@ -90,7 +90,7 @@ The `ShogiLayerStackBucket9` enum has `BUCKETS = 9`, so the **total LayerStack c
 
 BulletOu's BonaPiece definition conforms to YaneuraOu's and is **fully compatible**.
 
-**Reference:** the module-level doc comment at the top of `crates/bullet_lib/src/shogi/bona_piece.rs`.
+**Reference:** the module-level doc comment at the top of `crates/bulletou_lib/src/shogi/bona_piece.rs`.
 
 ### Hand (in-hand) piece region (indices 1..89)
 
@@ -127,7 +127,7 @@ BulletOu's BonaPiece definition conforms to YaneuraOu's and is **fully compatibl
 > **Note:** Pro-Pawn, Pro-Lance, Pro-Knight, and Pro-Silver share the **same** index range as Gold.
 > `PIECE_BASE[ProPawn][is_friend] == F_GOLD or E_GOLD`
 >
-> **Reference:** the `PIECE_BASE` table in `crates/bullet_lib/src/shogi/bona_piece.rs`.
+> **Reference:** the `PIECE_BASE` table in `crates/bulletou_lib/src/shogi/bona_piece.rs`.
 
 ### Square index (`Square::index`)
 
@@ -140,13 +140,13 @@ Square::index() = file * 9 + rank   (0-indexed)
 Mirroring to the white perspective:
 
 ```rust
-// crates/bullet_lib/src/shogi/types.rs
+// crates/bulletou_lib/src/shogi/types.rs
 pub const fn inverse(self) -> Self {
     Square(80 - self.0)   // 0 ↔ 80, 1 ↔ 79, ...
 }
 ```
 
-**Reference:** `Square::inverse` in `crates/bullet_lib/src/shogi/types.rs`.
+**Reference:** `Square::inverse` in `crates/bulletou_lib/src/shogi/types.rs`.
 
 ---
 
@@ -249,7 +249,7 @@ BulletOu (via bullet-shogi) contains multiple progress-estimator implementations
 | Expressiveness | Low (local details are washed out) | Medium | High (memorises king position × every piece placement) |
 | Origin | Hand-crafted, inspired by Gikou's progress features | Extension of the above | From YaneuraOu/tanuki- |
 
-Implementations are concentrated in `crates/bullet_lib/src/game/outputs.rs`. The choice of which to use during LayerStack training/inference is selected via `BucketMode` in `examples/shogi_layerstack.rs`.
+Implementations are concentrated in `crates/bulletou_lib/src/game/outputs.rs`. The choice of which to use during LayerStack training/inference is selected via `BucketMode` in `examples/shogi_layerstack.rs`.
 
 ---
 
@@ -259,7 +259,7 @@ Implementations are concentrated in `crates/bullet_lib/src/game/outputs.rs`. The
 
 `BonaPiece::from_piece_square` returns `BonaPiece::ZERO` for kings and empty squares. To avoid accumulating into the weight table at `index = 0`, the KP-Absolute summation loop must check `bp != BonaPiece::ZERO`.
 
-**Reference:** `BonaPiece::from_piece_square` in `crates/bullet_lib/src/shogi/bona_piece.rs` (returns `BonaPiece::ZERO` for kings and empty squares).
+**Reference:** `BonaPiece::from_piece_square` in `crates/bulletou_lib/src/shogi/bona_piece.rs` (returns `BonaPiece::ZERO` for kings and empty squares).
 
 ### 7-2. Inverting the white king
 
@@ -300,10 +300,10 @@ While integration into the YaneuraOu mainline was shelved, `nodchip/nnue-pytorch
 
 | File | Contents |
 |---|---|
-| `crates/bullet_lib/src/shogi/bona_piece.rs` | BonaPiece definition and index calculation |
-| `crates/bullet_lib/src/shogi/packed_sfen.rs` | PackedSfenValue / ShogiBoard definitions |
-| `crates/bullet_lib/src/shogi/types.rs` | `Square::inverse`, `BOARD_PIECE_TYPES`, etc. |
-| `crates/bullet_lib/src/game/outputs.rs` | All progress-estimator implementations (`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`) |
+| `crates/bulletou_lib/src/shogi/bona_piece.rs` | BonaPiece definition and index calculation |
+| `crates/bulletou_lib/src/shogi/packed_sfen.rs` | PackedSfenValue / ShogiBoard definitions |
+| `crates/bulletou_lib/src/shogi/types.rs` | `Square::inverse`, `BOARD_PIECE_TYPES`, etc. |
+| `crates/bulletou_lib/src/game/outputs.rs` | All progress-estimator implementations (`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`) |
 | `examples/shogi_layerstack.rs` | LayerStack training; impl switching via `BucketMode` |
 | `examples/shogi_progress_kpabs_train.rs` | `progress.bin` trainer (CPU version) |
 | `examples/shogi_progress_kpabs_train_cuda.rs` | `progress.bin` trainer (CUDA + parallel reader) |

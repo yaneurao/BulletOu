@@ -66,7 +66,7 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
 このチュートリアルの残り:
 
 - [1. クイックスタート](1-quickstart.md) — ツールチェーンを整えて、smoke test 用の最小学習を動かす
-- [2. `bullet_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向け補足 (任意)
+- [2. `bulletou_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向け補足 (任意)
 - [3. 教師データを用意する](3-data.md) — eval-type の選択と教師データの前処理 (シャッフル)
 - [4. 学習を走らせる](4-train.md) — `bulletou` コマンドの実行
 - [5. 中断・再開](5-resume.md) — `--output` 同じで自動 resume

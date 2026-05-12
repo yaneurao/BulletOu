@@ -1,4 +1,4 @@
-# 2. `bullet_lib` を自分のコードから使う (任意)
+# 2. `bulletou_lib` を自分のコードから使う (任意)
 
 <a href="../../en/tutorial/2-bullet-lib.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
@@ -10,10 +10,10 @@
 
 ## 2.2 独自 example を登録する
 
-新しい example ファイルを `examples/` 配下に置いただけでは `cargo build --example xxx` で認識されない。`bullet_lib` の `Cargo.toml` に登録する必要がある:
+新しい example ファイルを `examples/` 配下に置いただけでは `cargo build --example xxx` で認識されない。`bulletou_lib` の `Cargo.toml` に登録する必要がある:
 
 ```toml
-# crates/bullet_lib/Cargo.toml の末尾に追加
+# crates/bulletou_lib/Cargo.toml の末尾に追加
 [[example]]
 name = "my_example"
 path = "../../examples/my_example.rs"
@@ -21,13 +21,13 @@ path = "../../examples/my_example.rs"
 
 こうしておくと、上流からの `git pull` でファイルが消えにくく、独自実験を継続的に維持できる。
 
-## 2.3 他プロジェクトから `bullet_lib` を import する
+## 2.3 他プロジェクトから `bulletou_lib` を import する
 
-`bullet_lib` を crate として他プロジェクトから依存することもできる:
+`bulletou_lib` を crate として他プロジェクトから依存することもできる:
 
 ```toml
 [dependencies]
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
+bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bulletou_lib" }
 ```
 
 ## 2.4 API ドキュメント

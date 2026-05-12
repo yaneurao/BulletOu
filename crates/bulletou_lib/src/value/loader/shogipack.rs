@@ -716,7 +716,7 @@ fn expand_game(game: RawGameData) -> Vec<PackedSfenValue> {
 /// ## 使用例
 ///
 /// ```rust,ignore
-/// use bullet_lib::value::loader::shogipack::ShogiPackLoader;
+/// use bulletou_lib::value::loader::shogipack::ShogiPackLoader;
 ///
 /// let loader = ShogiPackLoader::new(
 ///     "data/train.pack",

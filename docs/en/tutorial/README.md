@@ -8,7 +8,7 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 |---|---|---|
 | 0 | [Overview](0-overview.md) | Understand what BulletOu trains and which evaluation function families are supported |
 | 1 | [Quick Start](1-quickstart.md) | Install prerequisites, build BulletOu, and run a tiny training session to verify everything works |
-| 2 | [Using `bullet_lib` from your own code](2-bullet-lib.md) | Developer notes (registering custom examples, importing as a crate). Optional |
+| 2 | [Using `bulletou_lib` from your own code](2-bullet-lib.md) | Developer notes (registering custom examples, importing as a crate). Optional |
 | 3 | [Prepare training data](3-data.md) | Choose the eval type and pre-process (shuffle) the teacher file |
 | 4 | [Run the training](4-train.md) | Invoke `bulletou` (eval-type / arch / teacher) |
 | 5 | [Stop and resume](5-resume.md) | Auto-resume by re-running with the same `--output` |

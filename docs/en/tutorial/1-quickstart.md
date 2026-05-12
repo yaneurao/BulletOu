@@ -134,5 +134,5 @@ The `target/` directory will be rebuilt next time you `cargo build`.
 ---
 
 Next:
-- [2. Using `bullet_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
+- [2. Using `bulletou_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
 - Or jump straight to [3. Prepare training data](3-data.md)

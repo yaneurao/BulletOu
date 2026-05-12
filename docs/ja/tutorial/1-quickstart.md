@@ -134,5 +134,5 @@ rm -rf checkpoints target
 ---
 
 次へ:
-- [2. `bullet_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向けの補足 (任意)
+- [2. `bulletou_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向けの補足 (任意)
 - 学習を進めたい場合は [3. 教師データを用意する](3-data.md) へ

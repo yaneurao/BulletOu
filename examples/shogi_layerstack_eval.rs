@@ -30,7 +30,7 @@ use std::{
 };
 
 use bullet_compiler::tensor::TValue;
-use bullet_lib::{
+use bulletou_lib::{
     game::{
         inputs::{
             ShogiHalfKA_hm, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive, ShogiHalfKaHmThreat,
@@ -55,7 +55,7 @@ use serde::Deserialize;
 /// 連続バッファとして走査したい箇所で使う。`TValue::I32` は想定外なので panic。
 struct WeightView {
     values: Vec<f32>,
-    shape: bullet_lib::nn::Shape,
+    shape: bulletou_lib::nn::Shape,
 }
 
 fn weight_view(weights: &ModelWeights, id: &str) -> WeightView {
@@ -210,8 +210,8 @@ struct ProgressCoeffV2 {
     runtime: ProgressRuntime,
 }
 
-fn piece_char(pt: bullet_lib::shogi::PieceType) -> Option<char> {
-    use bullet_lib::shogi::PieceType;
+fn piece_char(pt: bulletou_lib::shogi::PieceType) -> Option<char> {
+    use bulletou_lib::shogi::PieceType;
     match pt {
         PieceType::Pawn => Some('P'),
         PieceType::Lance => Some('L'),
@@ -231,8 +231,8 @@ fn piece_char(pt: bullet_lib::shogi::PieceType) -> Option<char> {
     }
 }
 
-fn is_promoted(pt: bullet_lib::shogi::PieceType) -> bool {
-    use bullet_lib::shogi::PieceType;
+fn is_promoted(pt: bulletou_lib::shogi::PieceType) -> bool {
+    use bulletou_lib::shogi::PieceType;
     matches!(
         pt,
         PieceType::ProPawn
@@ -248,8 +248,8 @@ fn is_promoted(pt: bullet_lib::shogi::PieceType) -> bool {
 ///
 /// レイアウト: `[stm 7 種 (pawn..rook), nstm 7 種 (pawn..rook)] = 14 元`。
 /// rshogi 側 `hand_count::extract_hand_count` と同一順序。
-fn hand_count_from_psv(psv: &bullet_lib::shogi::PackedSfenValue, hc_dims: usize) -> Vec<i16> {
-    use bullet_lib::shogi::{ShogiBoard, types::HAND_PIECE_TYPES};
+fn hand_count_from_psv(psv: &bulletou_lib::shogi::PackedSfenValue, hc_dims: usize) -> Vec<i16> {
+    use bulletou_lib::shogi::{ShogiBoard, types::HAND_PIECE_TYPES};
     assert_eq!(hc_dims, 2 * HAND_PIECE_TYPES.len(), "hc_dims は stm 7 + nstm 7 = 14 を想定 (got {hc_dims})");
     let board = ShogiBoard::from_packed_sfen(psv);
     let stm = board.side_to_move;
@@ -262,8 +262,8 @@ fn hand_count_from_psv(psv: &bullet_lib::shogi::PackedSfenValue, hc_dims: usize)
     out
 }
 
-fn hand_to_sfen(black_hand: &bullet_lib::shogi::Hand, white_hand: &bullet_lib::shogi::Hand) -> String {
-    use bullet_lib::shogi::PieceType;
+fn hand_to_sfen(black_hand: &bulletou_lib::shogi::Hand, white_hand: &bulletou_lib::shogi::Hand) -> String {
+    use bulletou_lib::shogi::PieceType;
 
     let order = [
         (PieceType::Rook, 'R', 'r'),
@@ -295,7 +295,7 @@ fn hand_to_sfen(black_hand: &bullet_lib::shogi::Hand, white_hand: &bullet_lib::s
     if out.is_empty() { "-".to_string() } else { out }
 }
 
-fn board_to_sfen(board: &bullet_lib::shogi::ShogiBoard, ply: u16) -> String {
+fn board_to_sfen(board: &bulletou_lib::shogi::ShogiBoard, ply: u16) -> String {
     let mut s = String::new();
 
     for rank in 0..9 {
@@ -303,7 +303,7 @@ fn board_to_sfen(board: &bullet_lib::shogi::ShogiBoard, ply: u16) -> String {
         for file in (0..9).rev() {
             let idx = file * 9 + rank;
             let pc = board.board[idx];
-            if pc.piece_type == bullet_lib::shogi::PieceType::None {
+            if pc.piece_type == bulletou_lib::shogi::PieceType::None {
                 empty += 1;
                 continue;
             }
@@ -315,7 +315,7 @@ fn board_to_sfen(board: &bullet_lib::shogi::ShogiBoard, ply: u16) -> String {
                 s.push('+');
             }
             if let Some(mut ch) = piece_char(pc.piece_type) {
-                if pc.color == bullet_lib::shogi::Color::White {
+                if pc.color == bulletou_lib::shogi::Color::White {
                     ch = ch.to_ascii_lowercase();
                 }
                 s.push(ch);
@@ -329,7 +329,7 @@ fn board_to_sfen(board: &bullet_lib::shogi::ShogiBoard, ply: u16) -> String {
         }
     }
 
-    let stm = if board.side_to_move == bullet_lib::shogi::Color::Black { 'b' } else { 'w' };
+    let stm = if board.side_to_move == bulletou_lib::shogi::Color::Black { 'b' } else { 'w' };
     let hand = hand_to_sfen(&board.black_hand, &board.white_hand);
     let move_no = if ply == 0 { 1 } else { ply };
     format!("{s} {stm} {hand} {move_no}")
@@ -1073,7 +1073,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let record_size = std::mem::size_of::<bullet_lib::shogi::PackedSfenValue>() as u64;
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64;
     let start = args.offset * record_size;
     if let Err(e) = file.seek(SeekFrom::Start(start)) {
         eprintln!("Error: Failed to seek pack file: {e}");
@@ -1100,7 +1100,7 @@ fn main() {
             break;
         }
 
-        let mut psv = bullet_lib::shogi::PackedSfenValue::default();
+        let mut psv = bulletou_lib::shogi::PackedSfenValue::default();
         psv.as_bytes_mut().copy_from_slice(&buf);
 
         let host_data = trainer.state.prepare(std::slice::from_ref(&psv), 1, 1.0, 1.0);
@@ -1301,11 +1301,11 @@ fn dump_float_intermediates(
 
     // Read one sample from pack file
     let mut file = File::open(pack_path).expect("Failed to open pack file");
-    let record_size = std::mem::size_of::<bullet_lib::shogi::PackedSfenValue>() as u64;
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64;
     file.seek(SeekFrom::Start(offset * record_size)).expect("Failed to seek");
     let mut buf = [0u8; 40];
     file.read_exact(&mut buf).expect("Failed to read");
-    let mut psv = bullet_lib::shogi::PackedSfenValue::default();
+    let mut psv = bulletou_lib::shogi::PackedSfenValue::default();
     psv.as_bytes_mut().copy_from_slice(&buf);
 
     println!("Evaluating sample at offset {}", offset);
@@ -1494,7 +1494,7 @@ fn dump_float_intermediates(
 
 /// Get active features for a position
 fn get_active_features(
-    psv: &bullet_lib::shogi::PackedSfenValue,
+    psv: &bulletou_lib::shogi::PackedSfenValue,
     threat_profile: Option<ThreatProfile>,
 ) -> (Vec<usize>, Vec<usize>) {
     let mut stm_features = Vec::new();
@@ -1820,7 +1820,7 @@ fn run_integer_forward(
         eprintln!("Error: Failed to open pack file: {e}");
         std::process::exit(1);
     });
-    let record_size = std::mem::size_of::<bullet_lib::shogi::PackedSfenValue>() as u64;
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64;
     file.seek(SeekFrom::Start(offset * record_size)).unwrap();
 
     println!("Architecture: {}", net.arch_str);
@@ -1832,7 +1832,7 @@ fn run_integer_forward(
         if file.read_exact(&mut buf).is_err() {
             break;
         }
-        let mut psv = bullet_lib::shogi::PackedSfenValue::default();
+        let mut psv = bulletou_lib::shogi::PackedSfenValue::default();
         psv.as_bytes_mut().copy_from_slice(&buf);
 
         let decoded = psv.decode();

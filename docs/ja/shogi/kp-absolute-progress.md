@@ -84,7 +84,7 @@ bucket = clamp(floor(p * 8), 0, 7)
 - 下限 0 のクランプは `sigmoid` 出力が常に `[0, 1]` に収まるため通常はトリガしないが、
   数値誤差・無効局面の保険として機能する
 
-実装: `crates/bullet_lib/src/game/outputs.rs` の `ShogiProgressKPAbs` の
+実装: `crates/bulletou_lib/src/game/outputs.rs` の `ShogiProgressKPAbs` の
 `OutputBuckets::bucket` メソッド（`((p * 8.0).floor() as i32).clamp(0, 7) as u8`）。
 
 #### LayerStack の 9 buckets と Progress8KPAbs の 8 buckets の関係
@@ -100,7 +100,7 @@ bucket 容量（9）は別の数値である点に注意。
 
 bullet-shogi の BonaPiece 定義は YaneuraOu に準拠しており、**完全に互換**。
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` 冒頭のモジュール docコメント
+**リファレンス元:** `crates/bulletou_lib/src/shogi/bona_piece.rs` 冒頭のモジュール docコメント
 
 ### 手駒領域（インデックス 1〜89）
 
@@ -137,7 +137,7 @@ bullet-shogi の BonaPiece 定義は YaneuraOu に準拠しており、**完全�
 > **注意:** 成歩・成香・成桂・成銀は金と**同じ**インデックス範囲を使う。
 > `PIECE_BASE[ProPawn][is_friend] == F_GOLD or E_GOLD`
 >
-> **リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` の `PIECE_BASE` テーブル
+> **リファレンス元:** `crates/bulletou_lib/src/shogi/bona_piece.rs` の `PIECE_BASE` テーブル
 
 ### マスのインデックス（Square::index）
 
@@ -150,13 +150,13 @@ Square::index() = file * 9 + rank   (0-indexed)
 後手視点への反転:
 
 ```rust
-// crates/bullet_lib/src/shogi/types.rs
+// crates/bulletou_lib/src/shogi/types.rs
 pub const fn inverse(self) -> Self {
     Square(80 - self.0)   // 0 ↔ 80、1 ↔ 79、...
 }
 ```
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/types.rs` の `Square::inverse`
+**リファレンス元:** `crates/bulletou_lib/src/shogi/types.rs` の `Square::inverse`
 
 ---
 
@@ -260,7 +260,7 @@ bullet-shogi には複数の進行度推定実装が存在し、LayerStack の b
 | 表現力 | 低（局面の細部が消える） | 中 | 高（玉位置と各駒配置を記憶） |
 | 由来 | 技巧（Gikou）の進行度特徴量を参考にした手作り | 同上の拡張 | YaneuraOu/tanuki- 由来 |
 
-実装は `crates/bullet_lib/src/game/outputs.rs` に集約されている。LayerStack 学習・推論で
+実装は `crates/bulletou_lib/src/game/outputs.rs` に集約されている。LayerStack 学習・推論で
 どの実装を使うかは `examples/shogi_layerstack.rs` の `BucketMode` で選択する。
 
 ---
@@ -273,7 +273,7 @@ bullet-shogi には複数の進行度推定実装が存在し、LayerStack の b
 を返す。重みテーブルの index=0 への加算を避けるため、KP絶対の積和ループでは
 `bp != BonaPiece::ZERO` のチェックが必要。
 
-**リファレンス元:** `crates/bullet_lib/src/shogi/bona_piece.rs` の `BonaPiece::from_piece_square`（玉および空マスで `BonaPiece::ZERO` を返す）
+**リファレンス元:** `crates/bulletou_lib/src/shogi/bona_piece.rs` の `BonaPiece::from_piece_square`（玉および空マスで `BonaPiece::ZERO` を返す）
 
 ### 7-2. 後手玉の反転
 
@@ -317,10 +317,10 @@ YaneuraOu 本体への組み込みは見送られたが、`nodchip/nnue-pytorch`
 
 | ファイル | 内容 |
 |---------|------|
-| `crates/bullet_lib/src/shogi/bona_piece.rs` | BonaPiece 定義・インデックス計算 |
-| `crates/bullet_lib/src/shogi/packed_sfen.rs` | PackedSfenValue・ShogiBoard 定義 |
-| `crates/bullet_lib/src/shogi/types.rs` | Square::inverse、BOARD_PIECE_TYPES 等 |
-| `crates/bullet_lib/src/game/outputs.rs` | 進行度推定の各種実装（`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`） |
+| `crates/bulletou_lib/src/shogi/bona_piece.rs` | BonaPiece 定義・インデックス計算 |
+| `crates/bulletou_lib/src/shogi/packed_sfen.rs` | PackedSfenValue・ShogiBoard 定義 |
+| `crates/bulletou_lib/src/shogi/types.rs` | Square::inverse、BOARD_PIECE_TYPES 等 |
+| `crates/bulletou_lib/src/game/outputs.rs` | 進行度推定の各種実装（`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`） |
 | `examples/shogi_layerstack.rs` | LayerStack 学習・`BucketMode` による実装切り替え |
 | `examples/shogi_progress_kpabs_train.rs` | progress.bin 学習ツール（CPU 版） |
 | `examples/shogi_progress_kpabs_train_cuda.rs` | progress.bin 学習ツール（CUDA + reader 並列版） |

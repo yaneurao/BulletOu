@@ -247,7 +247,7 @@ mod tests {
     ///     inbox/ref/sp_dr2-15K_20240210.hcpe \
     ///     inbox/ref/sp_dr2-15K_20240210.psv 1000000
     ///
-    /// XREF_COUNT=1000000 cargo test -p bullet_lib --lib \
+    /// XREF_COUNT=1000000 cargo test -p bulletou_lib --lib \
     ///     hcpe::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
     /// ```
     ///
@@ -344,12 +344,12 @@ mod tests {
     /// テストデータはローカルにしか存在しないので、`#[ignore]` を付けてある。
     /// 実行するには:
     /// ```bash
-    /// cargo test -p bullet_lib --lib hcpe -- --ignored --nocapture
+    /// cargo test -p bulletou_lib --lib hcpe -- --ignored --nocapture
     /// ```
     /// (テスト自体は GPU を使わない)
     ///
     /// パスは `CARGO_MANIFEST_DIR/../../inbox/ref/...` で workspace root 配下を
-    /// 指す。`cargo test` の CWD が crate ディレクトリ (`crates/bullet_lib`) であっても
+    /// 指す。`cargo test` の CWD が crate ディレクトリ (`crates/bulletou_lib`) であっても
     /// 同じファイルに辿り着けるようにしている。
     #[test]
     #[ignore]
@@ -398,7 +398,7 @@ mod tests {
     /// — would visibly truncate the count to ~420k instead of ~45.5M.
     ///
     /// `#[ignore]` because the input file lives outside the repo.
-    /// Run with: `cargo test -p bullet_lib --lib hcpe -- --ignored --nocapture`
+    /// Run with: `cargo test -p bulletou_lib --lib hcpe -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn reads_entire_file_when_callback_always_continues() {

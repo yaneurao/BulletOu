@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
 };
 
-use bullet_lib::{
+use bulletou_lib::{
     game::outputs::{
         OutputBuckets, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER, SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
         SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES, ShogiKingRankBucket, ShogiProgressBucket8,
@@ -150,7 +150,7 @@ fn board_non_king_count(board: &ShogiBoard) -> u8 {
         .board
         .iter()
         .filter(|p| {
-            p.piece_type != bullet_lib::shogi::PieceType::None && p.piece_type != bullet_lib::shogi::PieceType::King
+            p.piece_type != bulletou_lib::shogi::PieceType::None && p.piece_type != bulletou_lib::shogi::PieceType::King
         })
         .count() as u8
 }

@@ -8,10 +8,10 @@
 
 ### 一般的な使い方
 
-`bullet` (BulletOu 内の crate 名は本家由来のまま `bullet_lib`) を crate として使うことができる:
+`bullet` (BulletOu 内の crate 名は本家との衝突を避けるため `bulletou_lib` にリネーム済み) を crate として使うことができる:
 
 ```toml
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
+bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bulletou_lib" }
 ```
 
 または、[examples](../../examples) のいずれかを編集して実行する:

@@ -1,4 +1,4 @@
-use bullet_lib::{
+use bulletou_lib::{
     game::{
         inputs::{ChessBucketsMirrored, get_num_buckets},
         outputs::MaterialCount,

@@ -26,7 +26,7 @@ Usage:
         --output checkpoints/my-hcpe-net \
         --superbatches 40
 
-HCPE caveats (see crates/bullet_lib/src/value/loader/hcpe.rs for details):
+HCPE caveats (see crates/bulletou_lib/src/value/loader/hcpe.rs for details):
   - HCPE has no game_ply, so Layer Stack's ply9 bucket cannot be used.
     (kingrank9 / progress8* buckets are fine, but this minimal example
     uses no bucketing at all.)
@@ -35,7 +35,7 @@ HCPE caveats (see crates/bullet_lib/src/value/loader/hcpe.rs for details):
 
 use std::path::PathBuf;
 
-use bullet_lib::{
+use bulletou_lib::{
     game::inputs::ShogiHalfKA_hm,
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},

@@ -1,4 +1,4 @@
-# 2. Using `bullet_lib` from your own code (optional)
+# 2. Using `bulletou_lib` from your own code (optional)
 
 <a href="../../ja/tutorial/2-bullet-lib.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
@@ -10,10 +10,10 @@ The usual workflow: clone the repo and edit one of the files under [examples/](/
 
 ## 2.2 Registering a custom example
 
-Just placing a new file under `examples/` is not enough — `cargo build --example xxx` will not find it until you register it in `bullet_lib`'s `Cargo.toml`:
+Just placing a new file under `examples/` is not enough — `cargo build --example xxx` will not find it until you register it in `bulletou_lib`'s `Cargo.toml`:
 
 ```toml
-# Append to crates/bullet_lib/Cargo.toml
+# Append to crates/bulletou_lib/Cargo.toml
 [[example]]
 name = "my_example"
 path = "../../examples/my_example.rs"
@@ -21,13 +21,13 @@ path = "../../examples/my_example.rs"
 
 Once registered, the example survives `git pull` from upstream more easily, which helps when maintaining long-running custom experiments.
 
-## 2.3 Importing `bullet_lib` from another project
+## 2.3 Importing `bulletou_lib` from another project
 
-You can also depend on `bullet_lib` as a crate from a separate project:
+You can also depend on `bulletou_lib` as a crate from a separate project:
 
 ```toml
 [dependencies]
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
+bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bulletou_lib" }
 ```
 
 ## 2.4 API documentation

@@ -1,7 +1,7 @@
 //! Merge scores from two PackedSfenValue files by averaging.
 //!
 //! Usage:
-//!   cargo run --release -p bullet_lib --example merge_scores -- \
+//!   cargo run --release -p bulletou_lib --example merge_scores -- \
 //!     --dir-a data/DLSuisho15b \
 //!     --dir-b data/aobazero_kd_20240329 \
 //!     --prefix-a shuffled_ \
