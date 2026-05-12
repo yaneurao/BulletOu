@@ -550,6 +550,20 @@ macro_rules! run_training_inline {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
+        // Tracks whether bullet fired the save callback at least once across
+        // all epochs. If 教師 is smaller than a single superbatch (or any
+        // other reason no superbatch boundary is crossed), bullet writes no
+        // checkpoint at all and we'd end up with an empty output dir. After
+        // all epochs finish we check this flag and, if no save happened, do
+        // a final fallback save so at least the current trainer state is
+        // persisted. This is *not* an EOF-triggered save — it fires exactly
+        // once per training run and only as a last resort.
+        let saved_any = std::cell::Cell::new(false);
+        // Remember the last per-epoch net_id we used so the fallback save can
+        // reuse the same naming convention (so assembly pairs the dirs by
+        // sort order alongside any future numbered checkpoints).
+        let mut last_net_id_for_epoch: String = net_id_base.clone();
+
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -562,6 +576,7 @@ macro_rules! run_training_inline {
             } else {
                 net_id_base.clone()
             };
+            last_net_id_for_epoch = net_id_for_epoch.clone();
 
             let schedule = TrainingSchedule {
                 net_id: net_id_for_epoch.clone(),
@@ -579,7 +594,9 @@ macro_rules! run_training_inline {
 
             let net_id_for_cb = net_id_for_epoch.clone();
             let output_dir_for_cb = output_dir_buf.clone();
+            let saved_any_ref = &saved_any;
             let on_checkpoint_saved = move |superbatch: usize| {
+                saved_any_ref.set(true);
                 let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
                 match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
                     Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
@@ -617,6 +634,22 @@ macro_rules! run_training_inline {
                     let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
                     trainer.run(&schedule, &settings, &loader);
                 }
+            }
+        }
+
+        // End-of-training fallback save (see the comment on `saved_any`):
+        // executes only when bullet never crossed a superbatch boundary.
+        if !saved_any.get() {
+            let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
+            eprintln!(
+                "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
+                ckpt_dir.display()
+            );
+            let ckpt_dir_str = ckpt_dir.to_str().expect("checkpoint path is utf-8");
+            trainer.save_to_checkpoint(ckpt_dir_str);
+            match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
+                Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
+                Err(e) => eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display()),
             }
         }
     }};
