@@ -184,7 +184,24 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ## 2.6 中断・再開
 
-学習を途中で止めても、**同じ `--output` を指定してもう一度同じコマンドを走らせると自動的に最新 `000N/state.bin` から resume する** (新 save は `000(N+1)/` から続く)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
+学習途中で `Ctrl+C` で止めたり、マシンの再起動などで中断しても、**同じ `--output` で同じコマンドをもう一度実行するだけで、自動的に最新 `000N/state.bin` から学習が続行される**。
+
+```
+checkpoints/.../
+├── 0001/             ← 前回の最初の save
+├── 0002/
+├── 0003/             ← 中断時点で最新だった save
+├── 0004/             ← 再開後ここから書かれる
+└── 0005/
+```
+
+仕組み:
+- `bulletou` 起動時、`--output` 配下に番号付き dir + `state.bin` があれば検出
+- 最大番号の `state.bin` から重みと Adam moments を復元
+- 新 save は既存最大番号の次から書く (前例で `0003/` まであれば `0004/` から)
+- `learn.log` (累積版) には新 run 用の section が追記される (LR scheduler が reset されるため superbatch カウンタは 1 から再開)
+
+この挙動は eval-type 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP すべて同じ仕組み)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
 
 ## 2.7 エンジンに組み込む
 

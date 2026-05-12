@@ -114,11 +114,7 @@ On resume the superbatch counter restarts at 1 (the LR scheduler restarts each r
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-### Resume
-
-If `--output` already contains numbered dirs with `state.bin`, `bulletou` automatically resumes from the latest one. New saves continue the numbering (e.g. if the previous run produced `0001/`..`0005/`, the resumed run writes `0006/`, `0007/`, ...).
-
-Just re-running the same command picks up where it left off. To start fresh, point `--output` at a different directory or delete the existing one.
+Resume / restart behaviour is identical across every eval-type; see the [tutorial §2.6](../tutorial/2-training.md#26-resume) for details.
 
 ### KPP_KKPT (factorised)
 

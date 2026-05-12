@@ -81,10 +81,6 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 
 `pad32(n) = ceil(n/32) * 32` aligns each layer's input dim to 32 bytes for SIMD inference. Quantisation: L0 uses `qa = 127` (ClippedReLU output range is 0..127), L1-Out use `qb = 64` for i8 weights.
 
-### Resume
-
-If `--output` already contains numbered dirs with `state.bin`, `bulletou` automatically resumes from the latest one. New saves continue the numbering. Just re-running the same command picks up where it left off.
-
 ### Common CLI flags
 
 | Flag | Meaning | Default |
