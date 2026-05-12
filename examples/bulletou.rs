@@ -563,6 +563,10 @@ macro_rules! run_training_inline {
         // reuse the same naming convention (so assembly pairs the dirs by
         // sort order alongside any future numbered checkpoints).
         let mut last_net_id_for_epoch: String = net_id_base.clone();
+        // The error_record returned by the most recent `trainer.run` call.
+        // bullet writes `log.txt` itself at each save, but if zero saves
+        // happened we need to write it ourselves in the fallback path.
+        let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
@@ -614,27 +618,27 @@ macro_rules! run_training_inline {
                 on_checkpoint_saved: Some(&on_checkpoint_saved),
             };
 
-            match format {
+            last_error_record = match format {
                 DataFormat::Hcpe => {
                     let loader =
                         HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                    trainer.run(&schedule, &settings, &loader);
+                    trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Hcpe3 => {
                     let loader =
                         Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                    trainer.run(&schedule, &settings, &loader);
+                    trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Pack => {
                     let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
                         .with_single_epoch(true);
-                    trainer.run(&schedule, &settings, &loader);
+                    trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Psv => {
                     let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
-                    trainer.run(&schedule, &settings, &loader);
+                    trainer.run(&schedule, &settings, &loader)
                 }
-            }
+            };
         }
 
         // End-of-training fallback save (see the comment on `saved_any`):
@@ -647,12 +651,30 @@ macro_rules! run_training_inline {
             );
             let ckpt_dir_str = ckpt_dir.to_str().expect("checkpoint path is utf-8");
             trainer.save_to_checkpoint(ckpt_dir_str);
+            // bullet's save loop normally writes `log.txt` itself, but for the
+            // fallback path no save ever fired, so write the in-memory loss
+            // record (same `superbatch,batch,loss` CSV format) ourselves.
+            if let Err(e) = write_loss_csv(&ckpt_dir.join("log.txt"), &last_error_record) {
+                eprintln!("  WARN: failed to write log.txt in {}: {e}", ckpt_dir.display());
+            }
             match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
                 Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
                 Err(e) => eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display()),
             }
         }
     }};
+}
+
+/// Write loss records as CSV (`superbatch,batch,loss`), matching the format
+/// bullet writes to `log.txt` at each save. Used by the end-of-training
+/// fallback save path.
+fn write_loss_csv(path: &std::path::Path, records: &[(usize, usize, f32)]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for (sb, b, loss) in records {
+        writeln!(file, "{sb},{b},{loss}")?;
+    }
+    Ok(())
 }
 
 // ----- KPPT: KK ---------------------------------------------------------

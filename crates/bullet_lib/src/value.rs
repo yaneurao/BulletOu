@@ -114,12 +114,19 @@ where
     Inp::RequiredDataType: LoadableDataType,
     Out: OutputBuckets<Inp::RequiredDataType>,
 {
+    /// Run training to completion (or until the dataloader yields EOF, if it
+    /// is configured to do so). Returns the in-memory error-record produced
+    /// by the per-32-batch loss callback — same shape as the rows in the
+    /// `log.txt` that bullet writes at each save (`(superbatch, batch, loss)`).
+    /// Most callers ignore this value; it is exposed so a caller that wants to
+    /// persist a partial-superbatch log on its own (e.g. for a fallback save
+    /// when no superbatch boundary was crossed) can do so.
     pub fn run(
         &mut self,
         schedule: &TrainingSchedule<impl LrScheduler, impl WdlScheduler>,
         settings: &LocalSettings,
         dataloader: &impl loader::DataLoader<Inp::RequiredDataType>,
-    ) {
+    ) -> Vec<(usize, usize, f32)> {
         logger::clear_colours();
         println!("{}", logger::ansi("Training Preamble", "34;1"));
 
@@ -194,6 +201,8 @@ where
             },
         )
         .unwrap();
+
+        error_record.into_inner()
     }
 
     pub fn eval_raw_output(&mut self, fen: &str) -> Vec<f32>
