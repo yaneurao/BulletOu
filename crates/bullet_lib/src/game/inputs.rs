@@ -12,6 +12,7 @@ mod shogi_halfka_hm_threat;
 mod shogi_halfkp;
 mod shogi_kk;
 mod shogi_kkp;
+mod shogi_kp;
 mod shogi_kpp;
 pub mod shogi_threat_exclusion;
 
@@ -34,6 +35,7 @@ pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
 pub use shogi_halfkp::{FEATURE_HASH, ShogiHalfKP};
 pub use shogi_kk::{KK_INPUTS, KK_MAX_ACTIVE, ShogiKk};
 pub use shogi_kkp::{KKP_FE_END, KKP_INPUTS, KKP_MAX_ACTIVE, ShogiKkp};
+pub use shogi_kp::{FEATURE_HASH_KP, KP_DIMENSIONS, KP_MAX_ACTIVE, ShogiKp};
 pub use shogi_kpp::{KPP_FE_END, KPP_INPUTS, KPP_MAX_ACTIVE, ShogiKpp};
 pub use shogi_threat_exclusion::ThreatProfile;
 

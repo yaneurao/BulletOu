@@ -19,6 +19,7 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 | 評価関数 | 概要 |
 |---|---|
 | **NNUE HalfKP** | 玉位置 × 駒位置の sparse 特徴量 (古典的 NNUE)。`bulletou --eval-type NNUE_HALFKP` でやねうら王 / Stockfish 互換の `nn.bin` を生成。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) |
+| **NNUE K-P** | HalfKP と同じ 4 層 ClippedReLU だが入力が `FeatureSet<K, P>` — K と P を独立な特徴として並べる (1710 次元、HalfKP の 125,388 次元の約 1/70)。`bulletou --eval-type NNUE_KP`。詳細は [NNUE K-P 学習](../shogi/kp.md) |
 | **NNUE HalfKA** | HalfKP + 玉も特徴量に含める |
 | **NNUE Layer Stack** | 局面進行度 bucket に応じて出力サブネットを切替える構成 (KP 絶対進行度 bucket が典型) |
 | **NNUE + Threat** | 盤上駒の利き threat を追加した入力特徴量 |

@@ -10,6 +10,7 @@
 将棋固有:
 
 - [shogi/halfkp.md](shogi/halfkp.md) — NNUE HalfKP 評価関数の学習
+- [shogi/kp.md](shogi/kp.md) — NNUE K-P 評価関数の学習 (HalfKP と同じ NN、入力だけ違う版)
 - [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT 評価関数の学習
 - [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — KP 絶対値を用いた進行度推定
 - [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — `shogi_progress_kpabs_train` ツールの CLI 仕様

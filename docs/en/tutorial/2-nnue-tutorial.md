@@ -147,8 +147,9 @@ Place the trained `000N/nn.bin` where the YaneuraOu engine expects its eval file
 
 ## 2.8 Training other targets
 
+- **NNUE K-P** (same 4-layer ClippedReLU network as HalfKP but with a different, lighter input feature set): `--eval-type NNUE_KP`. See [NNUE K-P Training](../shogi/kp.md).
 - **KPPT** (the three-file `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` legacy eval): `--eval-type KPPT`, or `--eval-type KPP_KKPT` for the factorised variant. See [KPPT / KPP_KKPT Training](../shogi/kppt.md).
-- Other NNUE variants (HalfKA / KP / SFNN+ls9 ...) will be added to `--eval-type` over time.
+- Other NNUE variants (HalfKA / SFNN+ls9 ...) will be added to `--eval-type` over time.
 
 ## 2.9 Where to go next
 

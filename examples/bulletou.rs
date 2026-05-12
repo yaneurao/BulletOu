@@ -21,6 +21,7 @@ For NNUE eval types, the architecture is selected with `--arch`
 Stockfish nnue-pytorch-compatible `nn.bin`:
 
     bulletou --eval-type NNUE_HALFKP     classic HalfKP NNUE (--arch 256x2-32-32)
+    bulletou --eval-type NNUE_KP         classic K+P NNUE     (--arch 256x2-32-32)
 
 Teacher data is given via `--teacher`. The argument is either a single
 file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
@@ -40,7 +41,7 @@ Usage:
 use std::path::PathBuf;
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKP, ShogiKk, ShogiKkp, ShogiKpp, SparseInputType},
+    game::inputs::{ShogiHalfKP, ShogiKk, ShogiKkp, ShogiKp, ShogiKpp, SparseInputType},
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
@@ -89,6 +90,12 @@ enum EvalType {
     /// compatible `nn.bin` per save. Architecture is selected via `--arch`
     /// (default `256x2-32-32`).
     NnueHalfkp,
+    /// NNUE K-P. YaneuraOu kp_256x2-32-32 — same 4-layer ClippedReLU network
+    /// as halfkp_256x2-32-32, but the input is `FeatureSet<K, P>` (K = 162
+    /// king features, P = 1548 piece features per perspective; 1710 total)
+    /// instead of HalfKP's (king × piece) cross product. Architecture is
+    /// selected via `--arch` (default `256x2-32-32`).
+    NnueKp,
 }
 
 /// Pre-set NNUE architecture sizes. The textual value is `<L1>x2-<L2>-<L3>`.
@@ -118,6 +125,7 @@ impl EvalType {
             EvalType::KpptKpp => "shogi_kpp",
             EvalType::KppKkptKpp => "shogi_kpp_factorised",
             EvalType::NnueHalfkp => "shogi_nnue_halfkp",
+            EvalType::NnueKp => "shogi_nnue_kp",
         }
     }
 
@@ -130,6 +138,7 @@ impl EvalType {
             EvalType::KpptKpp => "checkpoints/shogi_kpp",
             EvalType::KppKkptKpp => "checkpoints/shogi_kpp_factorised",
             EvalType::NnueHalfkp => "checkpoints/shogi_nnue_halfkp",
+            EvalType::NnueKp => "checkpoints/shogi_nnue_kp",
         }
     }
 
@@ -141,7 +150,7 @@ impl EvalType {
         match self {
             EvalType::Kppt | EvalType::KppKkpt | EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
             EvalType::KpptKpp | EvalType::KppKkptKpp => 400.0,
-            EvalType::NnueHalfkp => 1.0, // unused
+            EvalType::NnueHalfkp | EvalType::NnueKp => 1.0, // unused
         }
     }
 
@@ -304,6 +313,7 @@ fn main() {
         // `args.kpp_format()`.
         EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args, None),
         EvalType::NnueHalfkp => run_halfkp(&args),
+        EvalType::NnueKp => run_kp(&args),
     }
 }
 
@@ -1085,8 +1095,18 @@ macro_rules! run_training_inline_nnue {
 /// `save_quantised`, produces a `quantised.bin` that is byte-identical to
 /// nnue-pytorch's NNUE file format (which YaneuraOu and Stockfish read).
 /// `convert_save_dir_to_nnue_layout` later renames that file to `nn.bin`.
-fn build_halfkp_save_format(l1_size: usize, l2_size: usize, l3_size: usize) -> Vec<SavedFormat> {
-    // Quantisation scales for the original HalfKP NNUE (Nasu-san PR #75,
+///
+/// The layer-stack architecture (L0 -> ClippedReLU -> L1 -> ClippedReLU ->
+/// L2 -> ClippedReLU -> Out) is shared across NNUE_HALFKP / NNUE_KP / ...,
+/// so only the feature set varies between them. Pass the matching
+/// [`NnueFeatureSet`] for the correct header / hash bytes.
+fn build_nnue_save_format(
+    feature_set: NnueFeatureSet,
+    l1_size: usize,
+    l2_size: usize,
+    l3_size: usize,
+) -> Vec<SavedFormat> {
+    // Quantisation scales for the original-style NNUE (Nasu-san PR #75,
     // 2018) which uses ClippedReLU throughout:
     // - L0 weights/biases use qa=127 (CReLU output range is 0..127).
     // - L1/L2/Out weights use qb=64 (i8 row-major after .transpose()).
@@ -1094,7 +1114,6 @@ fn build_halfkp_save_format(l1_size: usize, l2_size: usize, l3_size: usize) -> V
     // PR #311 (2026) for SFNNwoPSQT-1536 and is NOT used here.
     let qa: i16 = 127;
     let qb: i16 = 64;
-    let feature_set = NnueFeatureSet::HalfKp;
 
     let l1_input_dim = 2 * l1_size; // dual perspective concat
     let l1_bias = l1_bias_scale(NnueActivation::Crelu, /*pairwise=*/ false, qa, qb);
@@ -1191,7 +1210,7 @@ fn run_halfkp(args: &Args) {
         resume_root
     });
 
-    let save_format = build_halfkp_save_format(l1_size, l2_size, l3_size);
+    let save_format = build_nnue_save_format(NnueFeatureSet::HalfKp, l1_size, l2_size, l3_size);
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
@@ -1230,6 +1249,94 @@ fn run_halfkp(args: &Args) {
 
     // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
     // copy each dir's `log.txt` to `learn.log` so the layout matches KPPT.
+    match finalize_nnue_dirs(&output_dir, &args.net_id()) {
+        Ok((first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// NNUE K-P training entry point. Structurally identical to [`run_halfkp`]
+/// but uses YaneuraOu's `FeatureSet<K, P>` (`kp_256x2-32-32.h`) as input:
+/// K (162 dims, both kings) + P (1548 dims, non-king pieces) = 1710 dims
+/// per perspective. The network stack (L0 -> ClippedReLU -> L1 ->
+/// ClippedReLU -> L2 -> ClippedReLU -> Out) is the same as halfkp_256x2-32-32.
+fn run_kp(args: &Args) {
+    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let input_size = ShogiKp.num_inputs();
+    let l1_input_dim = 2 * l1_size;
+
+    eprintln!(
+        "=== bulletou: running NNUE_KP ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
+        l1_size, l2_size, l3_size
+    );
+
+    let output_dir = args.output_dir();
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
+        eprintln!("=== resume detected: {} ===", state_bin_path.display());
+        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+            std::process::exit(1);
+        });
+        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse state.bin: {e}");
+            std::process::exit(1);
+        });
+        let resume_root = output_dir.join(".bulletou_resume");
+        let _ = std::fs::remove_dir_all(&resume_root);
+        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
+            eprintln!("error: state.bin missing `nnue/*` records: {e}");
+            std::process::exit(1);
+        });
+        resume_root
+    });
+
+    let save_format = build_nnue_save_format(NnueFeatureSet::Kp, l1_size, l2_size, l3_size);
+
+    let mut builder = ValueTrainerBuilder::default()
+        .dual_perspective()
+        .optimiser(optimiser::AdamW)
+        .inputs(ShogiKp)
+        .save_format(&save_format)
+        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+
+    if args.score_drop_abs > 0 {
+        builder = builder.score_drop_abs(args.score_drop_abs);
+    }
+
+    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
+        let l0 = builder.new_affine("l0", input_size, l1_size);
+        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+        let l2 = builder.new_affine("l2", l2_size, l3_size);
+        let out = builder.new_affine("out", l3_size, 1);
+
+        let stm_hidden = l0.forward(stm_inputs).crelu();
+        let ntm_hidden = l0.forward(ntm_inputs).crelu();
+        let combined = stm_hidden.concat(ntm_hidden);
+        let hidden1 = l1.forward(combined).crelu();
+        let hidden2 = l2.forward(hidden1).crelu();
+        out.forward(hidden2)
+    });
+
+    if let Some(dir) = resume_dir.as_ref() {
+        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
+    run_training_inline_nnue!(args, &mut trainer);
+
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
+
     match finalize_nnue_dirs(&output_dir, &args.net_id()) {
         Ok((first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {

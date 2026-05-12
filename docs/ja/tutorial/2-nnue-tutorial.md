@@ -149,8 +149,9 @@ checkpoints/my-halfkp/
 
 ## 2.8 別のターゲットを学習したい場合
 
+- **NNUE K-P** (HalfKP と同じ 4 層 ClippedReLU で入力だけ違う、軽量モデル): `--eval-type NNUE_KP`。詳細は [NNUE K-P 学習](../shogi/kp.md)
 - **KPPT** (`KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` の 3 ファイル組): `--eval-type KPPT` または factorised 版の `--eval-type KPP_KKPT`。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md)
-- 他の NNUE バリアント (HalfKA / KP / SFNN+ls9 等) は順次 `--eval-type` に追加予定
+- 他の NNUE バリアント (HalfKA / SFNN+ls9 等) は順次 `--eval-type` に追加予定
 
 ## 2.9 次のステップ
 

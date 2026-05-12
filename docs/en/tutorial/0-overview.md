@@ -19,6 +19,7 @@ BulletOu does **not** play shogi itself. It is the part of the pipeline that **l
 | Family | Notes |
 |---|---|
 | **NNUE HalfKP** | King × piece sparse features (classical NNUE). `bulletou --eval-type NNUE_HALFKP` produces a YaneuraOu / Stockfish-compatible `nn.bin`. See [NNUE HalfKP Training](../shogi/halfkp.md). |
+| **NNUE K-P** | Same 4-layer ClippedReLU network as HalfKP but with `FeatureSet<K, P>` input — K and P are independent features instead of a cross product (1710 dims vs HalfKP's 125,388). `bulletou --eval-type NNUE_KP`. See [NNUE K-P Training](../shogi/kp.md). |
 | **NNUE HalfKA** | HalfKP plus the kings themselves as features |
 | **NNUE Layer Stack** | Output sub-network is selected by a game-progress bucket (KP-Absolute progress bucket is the typical pick) |
 | **NNUE + Threat** | Adds board-piece threat features to the input |
