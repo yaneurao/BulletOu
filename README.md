@@ -6,9 +6,14 @@
 
 </div>
 
-A domain-specific ML library for training NNUE-style value networks for **shogi (将棋)** engines, in particular for use with [YaneuraOu](https://github.com/yaneurao/YaneuraOu).
+A domain-specific ML library for training **shogi (将棋) evaluation functions**, designed for use with [YaneuraOu](https://github.com/yaneurao/YaneuraOu).
 
-BulletOu is yaneurao's fork of [bullet-shogi](https://github.com/SH11235/bullet-shogi), which is in turn a shogi-oriented fork of [bullet](https://github.com/jw1912/bullet) by jw1912. The original `bullet` is a Rust-based NNUE trainer with best-in-class GPU performance, widely used by top chess engines.
+Target evaluation function families:
+
+- **NNUE-style value networks** (currently supported via the upstream codebase: HalfKP / HalfKA / Layer Stack with KP-Absolute progress buckets)
+- **KPPT / KPP_KPPT** and other legacy YaneuraOu evaluation functions (support is planned; see the tutorial roadmap)
+
+BulletOu is yaneurao's fork of [bullet-shogi](https://github.com/SH11235/bullet-shogi), which is in turn a shogi-oriented fork of [bullet](https://github.com/jw1912/bullet) by jw1912. The original `bullet` is a Rust-based trainer with best-in-class GPU performance, widely used by top chess engines.
 
 ### Lineage / Upstream
 
@@ -16,9 +21,11 @@ BulletOu is yaneurao's fork of [bullet-shogi](https://github.com/SH11235/bullet-
 - **Upstream**: [SH11235/bullet-shogi](https://github.com/SH11235/bullet-shogi) — shogi support, PackedSfenValue loader, HalfKA / HalfKP / Threat / HandThreat features, Layer Stack with KP-Absolute progress buckets
 - **This repository**: [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) — yaneurao's adaptation for YaneuraOu
 
-### Usage for NNUE / Value Network Training
+### Usage
 
-Before using, read the documentation at [docs/en/0-contents.md](docs/en/0-contents.md), which covers building, managing training data, and the network output format.
+**First-time users** should start with the [tutorial](docs/en/tutorial/), which walks through installation, building, and running a first training session step by step.
+
+For specification-level details on the training pipeline (data formats, network output formats, etc.), see [docs/en/0-contents.md](docs/en/0-contents.md).
 
 Most users clone the repo and edit one of the [examples](/examples) to their taste. If you want a custom example file that survives upstream pulls, register it in [`bullet_lib`'s `Cargo.toml`](crates/bullet_lib/Cargo.toml).
 
