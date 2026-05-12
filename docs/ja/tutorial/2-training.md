@@ -43,15 +43,23 @@ teachers/
 
 ## 2.3 学習を走らせる
 
+### ビルド (1 回だけ)
+
+まず `bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK:
+
+```bash
+cargo build --release --features device-cuda --example bulletou
+```
+
+(AMD GPU なら `--features device-cuda` を `--features device-rocm` に。Windows の場合、生成されるバイナリは `.\target\release\examples\bulletou.exe`。以下のコマンド例は Unix 形式で書くので適宜読み替え。)
+
 ### 最小コマンド (NNUE HalfKP)
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --teacher teachers/
 ```
-
-(AMD GPU なら `--features device-cuda` を `--features device-rocm` に。)
 
 これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-256x2-32-32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
 
@@ -69,7 +77,7 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --arch 1024x2-8-64 \
     --teacher teachers/
@@ -84,7 +92,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 KPPT 系では `--arch` 不要 (architecture は固定):
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPPT \
     --teacher teachers/
 ```
@@ -143,7 +151,7 @@ superbatch 2   ...
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --teacher teachers/ \
     --superbatches 40

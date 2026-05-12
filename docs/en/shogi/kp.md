@@ -71,7 +71,7 @@ KP was introduced alongside HalfKP in the same architecture family, with the sam
 ### Command
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_KP \
     --teacher teachers/ \
     --output checkpoints/my-kp

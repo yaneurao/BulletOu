@@ -43,15 +43,23 @@ Before running on a huge dataset, you can try a smaller subset by generating a s
 
 ## 2.3 Run the training
 
+### Build (one-off)
+
+Build `bulletou` first. You only need this once, until the source changes:
+
+```bash
+cargo build --release --features device-cuda --example bulletou
+```
+
+(Use `--features device-rocm` instead of `cuda` for AMD GPUs. On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run commands below use Unix-style paths — translate as needed.)
+
 ### Minimal command (NNUE HalfKP)
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --teacher teachers/
 ```
-
-(Use `--features device-rocm` instead of `cuda` for AMD GPUs.)
 
 That's it — no further flags needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-256x2-32-32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
 
@@ -69,7 +77,7 @@ For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --arch 1024x2-8-64 \
     --teacher teachers/
@@ -84,7 +92,7 @@ Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` accepts the same preset
 For KPPT-family eval types the architecture is fixed and `--arch` is ignored:
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPPT \
     --teacher teachers/
 ```
@@ -141,7 +149,7 @@ Main flags:
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --teacher teachers/ \
     --superbatches 40

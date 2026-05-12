@@ -50,7 +50,7 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 `--eval-type KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
@@ -125,7 +125,7 @@ Just re-running the same command picks up where it left off. To start fresh, poi
 `--eval-type KPP_KKPT` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \

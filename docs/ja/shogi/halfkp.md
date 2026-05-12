@@ -38,7 +38,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 ### コマンド
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-halfkp

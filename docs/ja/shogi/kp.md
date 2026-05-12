@@ -71,7 +71,7 @@ K-P は HalfKP と並んで NNUE 系評価関数の最初期に追加された (
 ### コマンド
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type NNUE_KP \
     --teacher teachers/ \
     --output checkpoints/my-kp

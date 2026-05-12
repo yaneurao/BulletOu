@@ -50,7 +50,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 `--eval-type KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
@@ -125,7 +125,7 @@ resume すると superbatch カウンタは 1 から再開される (run ごと�
 `--eval-type KPP_KKPT` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
-cargo run --release --features device-cuda --example bulletou -- \
+./target/release/examples/bulletou \
     --eval-type KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \

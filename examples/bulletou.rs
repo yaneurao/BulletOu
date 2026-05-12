@@ -35,7 +35,11 @@ share the same extension.
 
 Usage:
 
-    cargo run --release --features device-cuda --example bulletou -- \
+    # Build once
+    cargo build --release --features device-cuda --example bulletou
+
+    # Then run
+    ./target/release/examples/bulletou \
         --eval-type KPPT \
         --teacher /data/shogi/train_set/ \
         --output checkpoints/my-kppt \
