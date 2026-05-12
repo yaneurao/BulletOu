@@ -16,6 +16,12 @@ To train a single component standalone (= for development / smoke testing):
     bulletou --eval-type KPPT_KPP        KPP only, KPPT layout
     bulletou --eval-type KPP_KKPT_KPP    KPP only, KPP_KKPT layout
 
+For NNUE eval types, the architecture is selected with `--arch`
+(currently `256x2-32-32` only). Each save produces a YaneuraOu /
+Stockfish nnue-pytorch-compatible `nn.bin`:
+
+    bulletou --eval-type NNUE_HALFKP     classic HalfKP NNUE (--arch 256x2-32-32)
+
 Teacher data is given via `--teacher`. The argument is either a single
 file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
 files (all matching files are concatenated), or a comma-separated list
@@ -34,7 +40,7 @@ Usage:
 use std::path::PathBuf;
 
 use bullet_lib::{
-    game::inputs::{ShogiKk, ShogiKkp, ShogiKpp},
+    game::inputs::{ShogiHalfKP, ShogiKk, ShogiKkp, ShogiKpp, SparseInputType},
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
@@ -45,6 +51,10 @@ use bullet_lib::{
     value::{
         ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
+        nnue_save::{
+            Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes,
+            l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd,
+        },
         yaneuraou_kppt::{
             KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
             unbundle_component_state,
@@ -73,6 +83,28 @@ enum EvalType {
     KpptKpp,
     /// KPP_KKPT KPP component only (no turn channel; ~388 MB).
     KppKkptKpp,
+    /// NNUE HalfKP. Classic Stockfish-style NNUE with HalfKP input features
+    /// and a 4-layer dual-perspective network. Writes a YaneuraOu / Stockfish
+    /// nnue-pytorch-compatible `nn.bin` per save. Architecture is selected
+    /// via `--arch` (default `256x2-32-32`, SCReLU activation).
+    NnueHalfkp,
+}
+
+/// Pre-set NNUE architecture sizes. The textual value is `<L1>x2-<L2>-<L3>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NnueArch {
+    /// L1=256, L2=32, L3=32 (the classic Stockfish NNUE preset).
+    #[clap(name = "256x2-32-32")]
+    Arch256x2_32_32,
+}
+
+impl NnueArch {
+    /// `(l1, l2, l3)` triple.
+    fn dims(self) -> (usize, usize, usize) {
+        match self {
+            NnueArch::Arch256x2_32_32 => (256, 32, 32),
+        }
+    }
 }
 
 impl EvalType {
@@ -84,6 +116,7 @@ impl EvalType {
             EvalType::KpptKkp => "shogi_kkp",
             EvalType::KpptKpp => "shogi_kpp",
             EvalType::KppKkptKpp => "shogi_kpp_factorised",
+            EvalType::NnueHalfkp => "shogi_nnue_halfkp",
         }
     }
 
@@ -95,22 +128,24 @@ impl EvalType {
             EvalType::KpptKkp => "checkpoints/shogi_kkp",
             EvalType::KpptKpp => "checkpoints/shogi_kpp",
             EvalType::KppKkptKpp => "checkpoints/shogi_kpp_factorised",
+            EvalType::NnueHalfkp => "checkpoints/shogi_nnue_halfkp",
         }
     }
 
-    /// Suggested f32 -> i{16,32} quantisation scale for the YaneuraOu writer.
+    /// Suggested f32 -> i{16,32} quantisation scale for the YaneuraOu KPPT writer.
     /// KK / KKP entries are i32 (large dynamic range) so 4000 = eval_scale * 10.
     /// KPP entries are i16 (smaller dynamic range) so the scale is an
-    /// order of magnitude smaller.
+    /// order of magnitude smaller. Unused for NNUE eval types.
     fn default_yaneuraou_quant_scale(self) -> f32 {
         match self {
             EvalType::Kppt | EvalType::KppKkpt | EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
             EvalType::KpptKpp | EvalType::KppKkptKpp => 400.0,
+            EvalType::NnueHalfkp => 1.0, // unused
         }
     }
 
-    /// On-disk KPP layout to write at checkpoint time. KK / KKP eval types
-    /// don't have a KPP file so this is ignored.
+    /// On-disk KPP layout to write at checkpoint time. KK / KKP / NNUE eval
+    /// types don't have a KPP file so this is ignored.
     fn kpp_format(self) -> KppFormat {
         match self {
             EvalType::KppKkpt | EvalType::KppKkptKpp => KppFormat::KppKkpt,
@@ -227,6 +262,12 @@ struct Args {
     /// stamps. Set to 0 to disable.
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
+
+    /// Network architecture preset for NNUE eval types. Format
+    /// `<L1>x2-<L2>-<L3>`. Only `256x2-32-32` is currently supported.
+    /// Ignored for KPPT / KPP_KKPT eval types.
+    #[arg(long, default_value = "256x2-32-32")]
+    arch: NnueArch,
 }
 
 impl Args {
@@ -261,6 +302,7 @@ fn main() {
         // only the writer differs, selected inside `run_training_inline!` via
         // `args.kpp_format()`.
         EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args, None),
+        EvalType::NnueHalfkp => run_halfkp(&args),
     }
 }
 
@@ -878,4 +920,364 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
     }
 
     run_training_inline!(args, &mut trainer);
+}
+
+// ----- NNUE HalfKP ------------------------------------------------------
+
+/// Convert a freshly-saved bullet checkpoint dir to the NNUE final layout:
+///
+/// - bundle `optimiser_state/{weights,momentum,velocity}.bin` into `state.bin`
+///   (under the `"nnue"` component label, reusing the helpers originally
+///   written for KPPT — they take a `component: &str` so they're generic),
+/// - rename `quantised.bin` -> `nn.bin` (the contents are already the
+///   YaneuraOu / Stockfish NNUE binary because the trainer's `save_format`
+///   includes the version header and component hashes),
+/// - delete the bullet-internal artefacts (`raw.bin`, original
+///   `quantised.bin`, `optimiser_state/`).
+///
+/// `log.txt` is left in place; the final assembly step (`finalize_nnue_dirs`)
+/// will rename it to `learn.log` alongside the dir's number-rename.
+fn convert_save_dir_to_nnue_layout(dir: &std::path::Path) -> std::io::Result<()> {
+    let optimiser_state = dir.join("optimiser_state");
+    let mut state_buf: Vec<u8> = Vec::new();
+    bundle_component_state(&mut state_buf, "nnue", &optimiser_state)?;
+    std::fs::write(dir.join("state.bin"), &state_buf)?;
+
+    let quantised = dir.join("quantised.bin");
+    let nn = dir.join("nn.bin");
+    std::fs::rename(&quantised, &nn)?;
+
+    let _ = std::fs::remove_file(dir.join("raw.bin"));
+    let _ = std::fs::remove_dir_all(&optimiser_state);
+    Ok(())
+}
+
+/// Inline training loop for single-component NNUE eval types. Same shape as
+/// `run_training_inline!` (epoch loop, `--max-epochs`, EOF-as-epoch boundary,
+/// fallback save when no superbatch completes, in-memory loss record
+/// returned by `trainer.run`), but with NNUE-specific save handling:
+/// the per-save callback converts each bullet save dir to the
+/// `nn.bin` + `state.bin` (+ `log.txt`) layout via
+/// `convert_save_dir_to_nnue_layout`.
+macro_rules! run_training_inline_nnue {
+    ($args:expr, $trainer:expr) => {{
+        let args: &Args = $args;
+        let trainer = $trainer;
+
+        let batches_per_superbatch =
+            args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+
+        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
+        let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
+
+        let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
+
+        let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
+        let net_id_base = args.net_id();
+        let output_dir_buf = args.output_dir();
+        let max_epochs = args.max_epochs.max(1);
+
+        let output_dir_str = args.output_dir();
+        let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
+
+        let saved_any = std::cell::Cell::new(false);
+        let mut last_net_id_for_epoch: String = net_id_base.clone();
+        let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
+
+        for epoch in 1..=max_epochs {
+            if max_epochs > 1 {
+                eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
+            }
+            let net_id_for_epoch = if max_epochs > 1 {
+                format!("{net_id_base}-e{epoch}")
+            } else {
+                net_id_base.clone()
+            };
+            last_net_id_for_epoch = net_id_for_epoch.clone();
+
+            let schedule = TrainingSchedule {
+                net_id: net_id_for_epoch.clone(),
+                eval_scale: args.scale as f32,
+                steps: TrainingSteps {
+                    batch_size: args.batch_size,
+                    batches_per_superbatch,
+                    start_superbatch: args.start_superbatch,
+                    end_superbatch,
+                },
+                wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
+                lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                save_rate: args.save_rate,
+            };
+
+            let net_id_for_cb = net_id_for_epoch.clone();
+            let output_dir_for_cb = output_dir_buf.clone();
+            let saved_any_ref = &saved_any;
+            let on_checkpoint_saved = move |superbatch: usize| {
+                saved_any_ref.set(true);
+                let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
+                match convert_save_dir_to_nnue_layout(&ckpt_dir) {
+                    Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display()),
+                    Err(e) => {
+                        eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display())
+                    }
+                }
+            };
+
+            let settings = LocalSettings {
+                threads: args.threads,
+                test_set: None,
+                output_directory: output_dir,
+                batch_queue_size: args.batch_queue_size,
+                on_checkpoint_saved: Some(&on_checkpoint_saved),
+            };
+
+            last_error_record = match format {
+                DataFormat::Hcpe => {
+                    let loader =
+                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    trainer.run(&schedule, &settings, &loader)
+                }
+                DataFormat::Hcpe3 => {
+                    let loader =
+                        Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    trainer.run(&schedule, &settings, &loader)
+                }
+                DataFormat::Pack => {
+                    let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                        .with_single_epoch(true);
+                    trainer.run(&schedule, &settings, &loader)
+                }
+                DataFormat::Psv => {
+                    let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                    trainer.run(&schedule, &settings, &loader)
+                }
+            };
+        }
+
+        if !saved_any.get() {
+            let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
+            eprintln!(
+                "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
+                ckpt_dir.display()
+            );
+            let ckpt_dir_str = ckpt_dir.to_str().expect("checkpoint path is utf-8");
+            trainer.save_to_checkpoint(ckpt_dir_str);
+            if let Err(e) = write_loss_csv(&ckpt_dir.join("log.txt"), &last_error_record) {
+                eprintln!("  WARN: failed to write log.txt in {}: {e}", ckpt_dir.display());
+            }
+            match convert_save_dir_to_nnue_layout(&ckpt_dir) {
+                Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display()),
+                Err(e) => eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display()),
+            }
+        }
+    }};
+}
+
+/// Build the NNUE Standard output `save_format` for the trainer. The
+/// returned vector, when consumed by `trainer.save_to_checkpoint` /
+/// `save_quantised`, produces a `quantised.bin` that is byte-identical to
+/// nnue-pytorch's NNUE file format (which YaneuraOu and Stockfish read).
+/// `convert_save_dir_to_nnue_layout` later renames that file to `nn.bin`.
+fn build_halfkp_save_format(l1_size: usize, l2_size: usize, l3_size: usize) -> Vec<SavedFormat> {
+    // Quantisation scales:
+    // - L0 weights/biases use qa=255 (SCReLU output is squared down to 127).
+    // - L1/L2/Out weights use qb=64 (i8 row-major after .transpose()).
+    let qa: i16 = 255;
+    let qb: i16 = 64;
+    let feature_set = NnueFeatureSet::HalfKp;
+
+    let l1_input_dim = 2 * l1_size; // dual perspective concat
+    let l1_bias = l1_bias_scale(NnueActivation::Screlu, /*pairwise=*/ false, qa, qb);
+
+    vec![
+        SavedFormat::custom(header_bytes(feature_set, l1_size, l2_size, l3_size)),
+        SavedFormat::custom(ft_hash_bytes(feature_set, l1_size)),
+        // L0: biases first, then weights (standard nnue-pytorch order).
+        SavedFormat::id("l0b").round().quantise::<i16>(qa),
+        SavedFormat::id("l0w").round().quantise::<i16>(qa),
+        // Network layer hash (between FT and the FC stack).
+        SavedFormat::custom(network_layer_hash_bytes(l1_size, l2_size, l3_size)),
+        // L1: bias i32, weights i8 (row-major, 32B-padded). Stockfish /
+        // YaneuraOu's SIMD inference pads each layer's input dim to a
+        // multiple of 32.
+        SavedFormat::id("l1b").round().quantise::<i32>(l1_bias),
+        SavedFormat::id("l1w")
+            .transpose()
+            .transform({
+                let out_dim = l2_size;
+                let in_dim = l1_input_dim;
+                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+            })
+            .round()
+            .quantise::<i8>(qb),
+        // L2: bias i32, weights i8 (row-major, padded). L2 input scale after
+        // crelu_i32_to_u8 is always 127.
+        SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
+        SavedFormat::id("l2w")
+            .transpose()
+            .transform({
+                let out_dim = l3_size;
+                let in_dim = l2_size;
+                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+            })
+            .round()
+            .quantise::<i8>(qb),
+        // Output: bias i32, weights i8 (row-major, padded).
+        SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
+        SavedFormat::id("outw")
+            .transpose()
+            .transform({
+                let out_dim = 1;
+                let in_dim = l3_size;
+                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+            })
+            .round()
+            .quantise::<i8>(qb),
+    ]
+}
+
+/// NNUE HalfKP training entry point.
+///
+/// Architecture (currently locked to `--arch 256x2-32-32`):
+/// - Dual-perspective HalfKP feature transformer -> L1 (SCReLU)
+/// - L1 -> L2 (SCReLU)
+/// - L2 -> L3 (SCReLU)
+/// - L3 -> 1 (eval scalar)
+///
+/// Per-save layout (after `convert_save_dir_to_nnue_layout`):
+///   `<output>/<net_id>-<sb>/{nn.bin, state.bin, log.txt}`
+/// then at end-of-training renamed to `<output>/0NNN/{nn.bin, state.bin, learn.log}`.
+fn run_halfkp(args: &Args) {
+    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let input_size = ShogiHalfKP.num_inputs();
+    let l1_input_dim = 2 * l1_size;
+
+    eprintln!(
+        "=== bulletou: running NNUE_HALFKP ({}x2-{}-{} SCReLU, dual-perspective) ===",
+        l1_size, l2_size, l3_size
+    );
+
+    // ---- Resume support -------------------------------------------------
+    let output_dir = args.output_dir();
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
+        eprintln!("=== resume detected: {} ===", state_bin_path.display());
+        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+            std::process::exit(1);
+        });
+        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse state.bin: {e}");
+            std::process::exit(1);
+        });
+        let resume_root = output_dir.join(".bulletou_resume");
+        let _ = std::fs::remove_dir_all(&resume_root);
+        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
+            eprintln!("error: state.bin missing `nnue/*` records: {e}");
+            std::process::exit(1);
+        });
+        resume_root
+    });
+
+    let save_format = build_halfkp_save_format(l1_size, l2_size, l3_size);
+
+    let mut builder = ValueTrainerBuilder::default()
+        .dual_perspective()
+        .optimiser(optimiser::AdamW)
+        .inputs(ShogiHalfKP)
+        .save_format(&save_format)
+        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+
+    if args.score_drop_abs > 0 {
+        builder = builder.score_drop_abs(args.score_drop_abs);
+    }
+
+    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
+        let l0 = builder.new_affine("l0", input_size, l1_size);
+        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+        let l2 = builder.new_affine("l2", l2_size, l3_size);
+        let out = builder.new_affine("out", l3_size, 1);
+
+        let stm_hidden = l0.forward(stm_inputs).screlu();
+        let ntm_hidden = l0.forward(ntm_inputs).screlu();
+        let combined = stm_hidden.concat(ntm_hidden);
+        let hidden1 = l1.forward(combined).screlu();
+        let hidden2 = l2.forward(hidden1).screlu();
+        out.forward(hidden2)
+    });
+
+    if let Some(dir) = resume_dir.as_ref() {
+        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
+    run_training_inline_nnue!(args, &mut trainer);
+
+    // Cleanup the scratch resume dir if it was used.
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
+
+    // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
+    // copy each dir's `log.txt` to `learn.log` so the layout matches KPPT.
+    match finalize_nnue_dirs(&output_dir, &args.net_id()) {
+        Ok((first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, first_idx, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Single-component analogue of `assemble_numbered_dirs`: list `<net_id>-*/`
+/// (or `<net_id>-e<epoch>-<sb>/` for multi-epoch) under `output_dir`, sort
+/// by (epoch, sb), rename them to `0NNN/` starting at `existing_count + 1`,
+/// and copy each dir's `log.txt` to `learn.log` so the per-save layout has
+/// the same `learn.log` name as KPPT does.
+fn finalize_nnue_dirs(output_dir: &std::path::Path, net_id_prefix: &str) -> std::io::Result<(usize, usize)> {
+    let src_dirs = list_component_checkpoints_sorted(output_dir, net_id_prefix);
+    let n = src_dirs.len();
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "no checkpoint subdirs under {} (prefix `{net_id_prefix}-`)",
+                output_dir.display()
+            ),
+        ));
+    }
+
+    let existing_count = count_existing_numbered_dirs(output_dir);
+
+    eprintln!(
+        "\n=== finalising {n} NNUE checkpoint dir(s) under {} (starting at #{}) ===",
+        output_dir.display(),
+        existing_count + 1
+    );
+    for (i, src) in src_dirs.iter().enumerate() {
+        let idx = existing_count + i + 1;
+        let dst = output_dir.join(format!("{idx:04}"));
+        std::fs::rename(src, &dst)?;
+        // Promote bullet's `log.txt` to `learn.log` to match KPPT layout.
+        let log_txt = dst.join("log.txt");
+        let learn_log = dst.join("learn.log");
+        if log_txt.is_file() {
+            std::fs::rename(&log_txt, &learn_log)?;
+        } else {
+            std::fs::write(&learn_log, "# (log.txt missing)\n")?;
+        }
+        eprintln!("  -> {}/", dst.display());
+    }
+    Ok((existing_count + 1, existing_count + n))
 }

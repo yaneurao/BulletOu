@@ -1,0 +1,101 @@
+# NNUE HalfKP 学習
+
+<a href="../../en/shogi/halfkp.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+
+[リファレンス目次へ戻る](../README.md)
+
+`--eval-type NNUE_HALFKP` は古典的な Stockfish 系 NNUE を HalfKP 入力で学習する。dual-perspective (自玉・相手玉の Feature Transformer は重み共有) + 小さい全結合スタック。
+
+## アーキテクチャ
+
+`--arch` で選択する (今は `256x2-32-32` のみ):
+
+```
+HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
+        │
+        │  L0 affine + SCReLU       ← 両 perspective で重み共有
+        ▼
+   accumulator (256 次元 × 2 perspective = 連結して 512 次元)
+        │
+        │  L1 affine (512 → 32) + SCReLU
+        ▼
+        │  L2 affine (32 → 32) + SCReLU
+        ▼
+        │  Out affine (32 → 1)
+        ▼
+      eval (centipawn ベースのスカラー)
+```
+
+## 実際の使い方
+
+### 必要なもの
+
+- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bulletou`)
+- 学習データ (`.hcpe` / `.hcpe3` / `.pack` / `.psv` のいずれか)
+
+### コマンド
+
+```bash
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type NNUE_HALFKP \
+    --teacher /path/to/train.hcpe \
+    --output checkpoints/my-halfkp
+```
+
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
+
+### 保存レイアウト
+
+```
+checkpoints/my-halfkp/
+├── learn.log                          ← トップレベルの通算ログ (全 run / resume を連結)
+├── 0001/
+│   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換の NNUE バイナリ
+│   ├── state.bin                      ← resume 用の重み + Adam moments
+│   └── learn.log                      ← この save 時点の学習ログ snapshot
+├── 0002/
+│   ├── ...
+├── ...
+└── 000N/                              ← 最新 (= 最後に保存された) save
+    ├── nn.bin
+    ├── state.bin
+    └── learn.log
+```
+
+最新の `000N/nn.bin` をやねうら王の HalfKP エンジンの eval ファイルとして指定すれば対局可能 (`state.bin` は engine からは無視される)。
+
+### `nn.bin` フォーマット
+
+中身は nnue-pytorch / Stockfish のバイナリ形式 (nnue-pytorch の `serialize.py` の出力と byte 単位で同一)。layout:
+
+- ヘッダー: `NNUE_VERSION` = `0x7AF32F16` (u32 LE)、`network_hash` (u32 LE)、`desc_len` (u32 LE)、`description` (UTF-8 bytes)
+- Feature Transformer レイヤーハッシュ (u32 LE)
+- L0 biases (i16 × L1)
+- L0 weights (i16 × INPUT × L1)
+- Network レイヤーハッシュ (u32 LE)
+- L1: biases (i32 × L2)、weights (i8 × L2 × pad32(L1×2), row-major)
+- L2: biases (i32 × L3)、weights (i8 × L3 × pad32(L2), row-major)
+- Output: biases (i32 × 1)、weights (i8 × 1 × pad32(L3), row-major)
+
+`pad32(n) = ceil(n/32) * 32` で各層の入力次元を SIMD 用に 32 バイトアライン。量子化: L0 は `qa = 255` (SCReLU の出力レンジ)、L1-Out は `qb = 64` で i8 重み。
+
+### 中断・再開
+
+`--output` で指定した dir に `0001/` 等の numbered dir + `state.bin` が既に存在する場合、起動時に自動的に **最新の `state.bin` から resume** する。新しい save は既存番号の続きから書かれる。同じコマンドを実行するだけで、前回の重みを引き継いで学習が続行される。
+
+### 主要 CLI フラグ
+
+| フラグ | 意味 | デフォルト |
+|---|---|---|
+| `--eval-type` | `NNUE_HALFKP` | (必須) |
+| `--arch` | `256x2-32-32` (当面これのみ) | `256x2-32-32` |
+| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/shogi_nnue_halfkp` |
+| `--max-epochs` | 教師データを何周するか | 1 |
+| `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
+| `--batches-per-superbatch` | superbatch あたりの mini-batch 数 | ≈ 100M 局面 |
+| `--save-rate` | N superbatch ごとに save | 1 |
+| `--lr` / `--lr-gamma` / `--lr-step` | LR scheduler | 0.001 / 0.1 / 8 |
+| `--start-wdl` / `--end-wdl` | 線形 WDL scheduler | 0.0 / 1.0 |
+
+loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は SCReLU に固定。必要になったら CLI フラグ化する余地はある。

@@ -1,6 +1,7 @@
 pub(crate) mod builder;
 mod dataloader;
 pub mod loader;
+pub mod nnue_save;
 mod save;
 pub mod yaneuraou_kppt;
 
