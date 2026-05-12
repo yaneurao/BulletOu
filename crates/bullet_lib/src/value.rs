@@ -2,6 +2,7 @@ pub(crate) mod builder;
 mod dataloader;
 pub mod loader;
 mod save;
+pub mod yaneuraou_kppt;
 
 use std::cell::RefCell;
 

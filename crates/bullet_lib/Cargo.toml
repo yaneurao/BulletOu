@@ -76,6 +76,10 @@ name = "shogi_kk_train"
 path = "../../examples/shogi_kk_train.rs"
 
 [[example]]
+name = "shogi_kk_kkp_train"
+path = "../../examples/shogi_kk_kkp_train.rs"
+
+[[example]]
 name = "shogi_layerstack"
 path = "../../examples/shogi_layerstack.rs"
 
