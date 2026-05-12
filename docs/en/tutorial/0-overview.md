@@ -18,16 +18,16 @@ BulletOu does **not** play shogi itself. It is the part of the pipeline that **l
 
 | Family | Notes |
 |---|---|
-| **NNUE HalfKP** | King × piece sparse features (classical NNUE). `bulletou --eval-type NNUE_HALFKP` produces a YaneuraOu / Stockfish-compatible `nn.bin`. See [NNUE HalfKP Training](../shogi/halfkp.md). |
-| **NNUE K-P** | Same 4-layer ClippedReLU network as HalfKP but with `FeatureSet<K, P>` input — K and P are independent features instead of a cross product (1710 dims vs HalfKP's 125,388). `bulletou --eval-type NNUE_KP`. See [NNUE K-P Training](../shogi/kp.md). |
-| **NNUE HalfKA** | HalfKP plus the kings themselves as features |
-| **NNUE Layer Stack** | Output sub-network is selected by a game-progress bucket (KP-Absolute progress bucket is the typical pick) |
-| **NNUE + Threat** | Adds board-piece threat features to the input |
-| **NNUE + HandThreat** | Adds drop-threat features for pieces in hand |
-| **NNUE + HandThreatDefensive** | Adds defensive drop-threat features (asymmetric emission) |
-| **NNUE + HandCount** | Adds hand-piece counts as a dense auxiliary input |
-| **KPPT** | `bulletou --eval-type KPPT` trains KK / KKP / KPP in one run and produces the three-file set (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). |
-| **KPP_KKPT (factorised variant)** | KK and KKP files are identical to KPPT; KPP is written without the turn channel. `bulletou --eval-type KPP_KKPT`. |
+Currently `bulletou` can train these four targets:
+
+| `--eval-type` | What it is | Output |
+|---|---|---|
+| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE (Nasu-san's 2018 PR #75). See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
+| `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
+| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
+
+Coming later (the input-feature Rust code exists but isn't wired into `bulletou` yet): HalfKA / HalfKA_hm / Threat / HandThreat / HandThreatDefensive / HandCount / SFNN + ls9 (NNUEwoSQPT1536), etc.
 
 ## Where the data comes from
 
@@ -67,5 +67,5 @@ How the engine consumes the file depends on the engine; see its documentation.
 The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
-- [2. NNUE Tutorial](2-nnue-tutorial.md) — a deeper walkthrough that trains a real NNUE
+- [2. Running a training](2-nnue-tutorial.md) — train a real evaluation function on actual data and load it into an engine
 - [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

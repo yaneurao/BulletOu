@@ -1,36 +1,25 @@
-# 2. NNUE チュートリアル — 将棋 NNUE を学習する
+# 2. 学習を走らせる — 実データで評価関数を作る
 
 <a href="../../en/tutorial/2-nnue-tutorial.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-ゴール: やねうら王互換エンジンが読み込める将棋 NNUE をエンドツーエンドで学習する。
+ゴール: やねうら王互換エンジンが読み込める評価関数バイナリを、実際の教師データから学習する。
 
 この章は [1. クイックスタート](1-quickstart.md) を完了している前提 — ツールチェーンが動き、smoke test の学習が成功した状態。
 
-## 2.1 何を学習するか
+本チュートリアルでは **NNUE HalfKP を例に** 解説するが、`--eval-type` を切り替えるだけで他のターゲット (NNUE K-P / KPPT / KPP_KKPT) も同じコマンド形式で学習できる。
 
-`bulletou --eval-type NNUE_HALFKP` で、やねうら王に最初に入った NNUE 評価関数 `halfkp_256x2-32-32` (那須さんの 2018 年 PR #75) と同じ構成 — HalfKP 入力 + 全層 ClippedReLU の 4 層 NNUE を学習する:
+## 2.1 学習対象を選ぶ
 
-```
-将棋の局面
-       │
-       ▼ HalfKP sparse 特徴量 (125,388 次元、自玉 / 相手玉の 2 perspective)
-       │
-       ▼ L0 affine + ClippedReLU       ← 両 perspective で重み共有
-       │
-       ▼ accumulator (256 次元 × 2 perspective = 連結して 512 次元)
-       │
-       ▼ L1 affine (512 → 32) + ClippedReLU
-       ▼ L2 affine (32 → 32) + ClippedReLU
-       ▼ Out affine (32 → 1)
-       │
-       ▼ eval (centipawn ベースのスカラー)
-```
+`bulletou --eval-type <X>` で学習する評価関数を選ぶ。現在公開されている `<X>`:
 
-アーキテクチャは `--arch` で選ぶが、本チュートリアル時点では `256x2-32-32` の 1 種類のみ (`x2` は dual-perspective、`256` は accumulator size、`32-32` は L2/L3 のサイズ)。
+| `--eval-type` | 何を学習するか | 出力ファイル (per save) | `--arch` を使うか |
+|---|---|---|---|
+| **`NNUE_HALFKP`** ★初心者はここから | 古典的 HalfKP NNUE (那須さん 2018 年 PR #75 と同等)。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` | 使う |
+| `NNUE_KP` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` | 使う |
+| `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | 使わない |
+| `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) | 使わない |
 
-(SqrClippedReLU / SCReLU は別系統で、2026 年の PR #311 (SFNNwoPSQT-1536) で導入された新しい活性化関数。`NNUE_HALFKP` は使わない。)
-
-最強構成 (Layer Stack + threat 特徴量 + 大きい FT) には届かないが、学習の挙動を体感するのと、エンジンに繋いで対局確認するには十分。
+将来 `--eval-type` に追加予定: HalfKA / SFNN + ls9 (NNUEwoSQPT1536) など。
 
 ## 2.2 学習データを用意する
 
@@ -52,7 +41,9 @@ teachers/
 
 巨大なデータセット (数十 GB) でいきなり動かす前に、小さなサブセットで試したいときは、`gensfen` 等で小さめのファイルを生成するか、`--batches-per-superbatch` を指定して 1 superbatch あたりの消費量を絞る (§2.4 参照)。
 
-## 2.3 NNUE 学習を走らせる
+## 2.3 学習を走らせる
+
+### 最小コマンド (NNUE HalfKP)
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
@@ -62,7 +53,34 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 (AMD GPU なら `--features device-cuda` を `--features device-rocm` に。)
 
-`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-256x2-32-32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の名前にしたい場合は `--output checkpoints/my-halfkp` のように明示する。
+これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-256x2-32-32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
+
+### `--arch` を指定する
+
+NNUE 系 eval-type ではアーキテクチャを `--arch` で選ぶ。現状サポートしているのは `256x2-32-32` のみ:
+
+```bash
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type NNUE_HALFKP \
+    --arch 256x2-32-32 \
+    --teacher teachers/
+```
+
+`--arch` を省略すると `256x2-32-32` がデフォルト適用される (= 上記最小コマンドと同じ)。将来 `512x2-32-32` 等の preset が増えると、ここで切替可能になる。
+
+### KPPT を学習する
+
+KPPT 系では `--arch` 不要 (architecture は固定):
+
+```bash
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type KPPT \
+    --teacher teachers/
+```
+
+デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--eval-type KPP_KKPT` に変えるだけ。
+
+### 教師データの渡し方
 
 `--teacher` には:
 - 1 つのファイル (`teachers/teacher.pack` のようなフルパス)
@@ -71,7 +89,11 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 のいずれも渡せる。
 
+### 学習がどこまで進むか
+
 `--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
+
+### 期待される出力
 
 動いていれば以下のような出力が流れる:
 
@@ -89,7 +111,9 @@ superbatch 2   ...
 
 `pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で数千万 pos/s 出る。下位 GPU では比例して低下。
 
-## 2.4 学習スケジュール
+## 2.4 学習スケジュール (必要になったら戻ってきて読む)
+
+**最初は全部デフォルト値で問題ない**。教師のサイズや学習リソースに応じて調整したくなったら、このセクションに戻る。
 
 ログに出てくる `superbatch` は **checkpoint や学習率を更新するためのまとまり**で、デフォルトで約 1 億局面ぶん。
 
@@ -118,7 +142,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ## 2.5 出力を確認する
 
-学習完了後、`checkpoints/NNUE_HALFKP-256x2-32-32/` 配下は以下のレイアウト:
+学習完了後、出力ディレクトリ (例: `checkpoints/NNUE_HALFKP-256x2-32-32/`) は以下のレイアウト:
 
 ```
 checkpoints/NNUE_HALFKP-256x2-32-32/
@@ -135,27 +159,57 @@ checkpoints/NNUE_HALFKP-256x2-32-32/
     └── learn.log
 ```
 
-最新の `000N/nn.bin` がやねうら王エンジンに渡すファイル。
+最新の `000N/` (= 最大番号のディレクトリ) がエンジンに渡す成果物が入ったフォルダ。
+
+KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` の 3 ファイル組が `000N/` 配下に入る (3 ファイル全部必要)。
 
 ## 2.6 中断・再開
 
-同じ `--output` を指定してもう一度同じコマンドを走らせると、`bulletou` は自動的に最新 `000N/state.bin` から resume する (新 save は `000(N+1)/` から続く)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
+学習を途中で止めても、**同じ `--output` を指定してもう一度同じコマンドを走らせると自動的に最新 `000N/state.bin` から resume する** (新 save は `000(N+1)/` から続く)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
 
 ## 2.7 エンジンに組み込む
 
-やねうら王エンジンが eval ファイルを探す場所 (通常 `eval/nn.bin`) に学習結果の `000N/nn.bin` を置き、エンジンを起動して `bench` や簡易対局でロードを確認する。具体的なファイル配置はエンジンの設定 (`EvalDir` 等) に依存するのでエンジン側のドキュメントを参照。
+学習結果をやねうら王エンジンで動作確認する最小手順。
 
-`state.bin` / `learn.log` はエンジンからは無視されるが、再学習や loss 推移の確認用に残しておくと便利。
+### NNUE 系 (`nn.bin`)
 
-## 2.8 別のターゲットを学習したい場合
+最新の `000N/nn.bin` をエンジンが探す場所に置く。やねうら王の場合、`EvalDir` オプションでパスを指定する:
 
-- **NNUE K-P** (HalfKP と同じ 4 層 ClippedReLU で入力だけ違う、軽量モデル): `--eval-type NNUE_KP`。詳細は [NNUE K-P 学習](../shogi/kp.md)
-- **KPPT** (`KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` の 3 ファイル組): `--eval-type KPPT` または factorised 版の `--eval-type KPP_KKPT`。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md)
-- 他の NNUE バリアント (HalfKA / SFNN+ls9 等) は順次 `--eval-type` に追加予定
+```
+# エンジン起動後、USI コマンドで:
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
+isready
+bench
+```
 
-## 2.9 次のステップ
+または、`eval/nn.bin` という相対パスでエンジン側に置く場合は、`000N/nn.bin` をそのファイル名で配置する。
+
+`isready` でロードが通れば学習結果が認識できている。`bench` の出力に nn.bin のハッシュが出るので、毎回違う数字になっていれば確かに違う重みを load していることが分かる。
+
+### KPPT 系 (`KK_synthesized.bin` 等の 3 ファイル組)
+
+最新 `000N/` ディレクトリそのものを `EvalDir` に指定する (3 ファイルが揃った状態のディレクトリを指す):
+
+```
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/KPPT/0005
+isready
+bench
+```
+
+3 ファイルすべてが揃っていない場合エンジンは load に失敗する点に注意。
+
+### 学習結果が弱いとき
+
+最初の学習は小さな教師で短い superbatch しか回していないので、評価の質はあまり期待しないこと。本格対局できるレベルにするには:
+- 教師サイズを増やす (1 億 → 10 億局面以上)
+- `--max-epochs 3` 程度で複数周回す
+- `--save-rate` を大きく (例: 10) して、後半の save だけを使う
+
+詳細なハイパーパラメータ調整は各 eval-type のリファレンス ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [kppt.md](../shogi/kppt.md)) を参照。
+
+## 2.8 次のステップ
 
 - [リファレンス: NNUE HalfKP 学習](../shogi/halfkp.md) — `nn.bin` のバイナリレイアウト、量子化、resume の詳細
-- [リファレンス: NNUE の基礎](../1-basics.md) — perspective NNUE の数式
-- [リファレンス: 学習済みネットワーク](../4-saved-networks.md) — checkpoint レイアウト、量子化、変換チェーン
+- [リファレンス: NNUE K-P 学習](../shogi/kp.md) — HalfKP との比較、入力 feature の構造
 - [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習
+- [仕様: spec/](../../../spec/) — eval-type 一覧 / バイナリレイアウト / hash 計算式

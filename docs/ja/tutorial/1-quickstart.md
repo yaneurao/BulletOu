@@ -131,9 +131,16 @@ rm -rf checkpoints target
 
 `target/` は次回 `cargo build` のときに再生成される。
 
-## 1.7 開発者向け補足
+---
 
-ここから先は smoke test を超えて自分の用途に合わせて使う場合の補足。
+次へ: [2. 学習を走らせる](2-nnue-tutorial.md) — 実データで評価関数を学習し、エンジンに繋ぐまでを通す。
+
+---
+
+<details>
+<summary>1.7 開発者向け補足 (任意)</summary>
+
+ここから先は smoke test を超えて、自分のコードに改造したい人向けの補足。**初回は読み飛ばして OK**。
 
 ### 既存 example を自分用に編集する
 
@@ -169,6 +176,4 @@ bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" 
 cargo doc --open
 ```
 
----
-
-次へ: [2. NNUE チュートリアル](2-nnue-tutorial.md) — `.pack` データから実際に将棋 NNUE を学習する。
+</details>

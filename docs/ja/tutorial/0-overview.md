@@ -16,18 +16,16 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 
 ## 対応する評価関数
 
-| 評価関数 | 概要 |
-|---|---|
-| **NNUE HalfKP** | 玉位置 × 駒位置の sparse 特徴量 (古典的 NNUE)。`bulletou --eval-type NNUE_HALFKP` でやねうら王 / Stockfish 互換の `nn.bin` を生成。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) |
-| **NNUE K-P** | HalfKP と同じ 4 層 ClippedReLU だが入力が `FeatureSet<K, P>` — K と P を独立な特徴として並べる (1710 次元、HalfKP の 125,388 次元の約 1/70)。`bulletou --eval-type NNUE_KP`。詳細は [NNUE K-P 学習](../shogi/kp.md) |
-| **NNUE HalfKA** | HalfKP + 玉も特徴量に含める |
-| **NNUE Layer Stack** | 局面進行度 bucket に応じて出力サブネットを切替える構成 (KP 絶対進行度 bucket が典型) |
-| **NNUE + Threat** | 盤上駒の利き threat を追加した入力特徴量 |
-| **NNUE + HandThreat** | 持ち駒 drop threat を追加した入力特徴量 |
-| **NNUE + HandThreatDefensive** | 防御的な持ち駒 drop threat を追加 (非対称 emission) |
-| **NNUE + HandCount** | 持ち駒枚数を dense aux input として追加 |
-| **KPPT** | `bulletou --eval-type KPPT` で KK / KKP / KPP を連続学習し、3 ファイル組を 1 コマンドで生成 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) |
-| **KPP_KKPT (factorise 版)** | KK / KKP は KPPT と共通、KPP のみ手番チャンネルなしで書く。`bulletou --eval-type KPP_KKPT` |
+現状 `bulletou` で学習できるのは以下の 4 種類:
+
+| `--eval-type` | 概要 | 出力 |
+|---|---|---|
+| **`NNUE_HALFKP`** ★初心者はここから | 古典的 HalfKP NNUE (那須さん 2018 年 PR #75 と同等)。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` |
+| `NNUE_KP` | HalfKP と同じ 4 層 ClippedReLU だが入力を K + P に分割した軽量版。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
+| `KPPT` | 旧来の KK + KKP + KPP の 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなしでサイズ半減) | 同上 (KPP の layout だけ違う) |
+
+将来サポート予定 (input feature の Rust 実装はあるが、`bulletou` からは未到達): HalfKA / HalfKA_hm / Threat / HandThreat / HandThreatDefensive / HandCount / SFNN + ls9 (NNUEwoSQPT1536) など。
 
 ## 学習データはどこから来るか
 
@@ -67,5 +65,5 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
 このチュートリアルの残り:
 
 - [1. クイックスタート](1-quickstart.md) — ツールチェーンを整えて、smoke test 用の最小学習を動かす
-- [2. NNUE チュートリアル](2-nnue-tutorial.md) — 実際の NNUE を学習する流れを詳しく
+- [2. 学習を走らせる](2-nnue-tutorial.md) — 実データで評価関数を学習し、エンジンに繋ぐまでを通す
 - [KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習方法 (リファレンス)

@@ -1,36 +1,25 @@
-# 2. NNUE Tutorial — Train a Shogi NNUE
+# 2. Running a training — make an evaluation function from real data
 
 <a href="../../ja/tutorial/2-nnue-tutorial.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-Goal: end-to-end, train a shogi NNUE that a YaneuraOu-compatible engine can load.
+Goal: produce a YaneuraOu-loadable evaluation function from real training data and verify it in an engine.
 
 This page assumes you have already completed [1. Quick Start](1-quickstart.md) — your toolchain works, and a smoke-test training succeeded.
 
-## 2.1 What we will train
+We use **NNUE HalfKP as the running example** in this tutorial, but the same command shape applies to the other targets (NNUE K-P / KPPT / KPP_KKPT) by switching `--eval-type`.
 
-`bulletou --eval-type NNUE_HALFKP` trains the original YaneuraOu NNUE eval (`halfkp_256x2-32-32`, introduced by Nasu-san in PR #75, 2018) — a classical HalfKP input + 4-layer ClippedReLU network:
+## 2.1 Choosing what to train
 
-```
-shogi position
-       │
-       ▼ HalfKP sparse input (125,388 dims × 2 perspectives)
-       │
-       ▼ L0 affine + ClippedReLU       ← shared weights across own / opponent perspectives
-       │
-       ▼ accumulator (256 dims × 2 perspectives = 512 dims concatenated)
-       │
-       ▼ L1 affine (512 → 32) + ClippedReLU
-       ▼ L2 affine (32 → 32) + ClippedReLU
-       ▼ Out affine (32 → 1)
-       │
-       ▼ eval (centipawn-ish scalar)
-```
+`bulletou --eval-type <X>` selects which evaluation function to train. The currently public choices:
 
-The architecture is selected with `--arch` (only `256x2-32-32` for now — `x2` denotes dual-perspective, `256` is the accumulator size, `32-32` are the L2/L3 sizes).
+| `--eval-type` | What it trains | Output (per save) | `--arch` used? |
+|---|---|---|---|
+| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE (matches Nasu-san's 2018 PR #75). See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` | yes |
+| `NNUE_KP` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` | yes |
+| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | no |
+| `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs | no |
 
-(SqrClippedReLU / SCReLU is a separate activation introduced later in PR #311 (2026) for SFNNwoPSQT-1536 and is *not* used by `NNUE_HALFKP`.)
-
-This is not state of the art (which uses Layer Stack + threat features + a much larger FT), but it is enough to feel how training behaves and to plug into an engine for a sanity-check game.
+Coming later: HalfKA, SFNN + ls9 (NNUEwoSQPT1536), and other variants.
 
 ## 2.2 Get training data
 
@@ -52,7 +41,9 @@ teachers/
 
 Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--batches-per-superbatch` so each superbatch consumes less data (see §2.4).
 
-## 2.3 Run NNUE training
+## 2.3 Run the training
+
+### Minimal command (NNUE HalfKP)
 
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
@@ -62,16 +53,47 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 (Use `--features device-rocm` instead of `cuda` for AMD GPUs.)
 
-With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-256x2-32-32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
+That's it — no further flags needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-256x2-32-32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
+
+### Specifying `--arch`
+
+For NNUE eval types, the architecture is selected with `--arch`. Only `256x2-32-32` is supported today:
+
+```bash
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type NNUE_HALFKP \
+    --arch 256x2-32-32 \
+    --teacher teachers/
+```
+
+Omitting `--arch` falls back to `256x2-32-32` (= same as the minimal command above). Future presets like `512x2-32-32` will be selectable through the same flag.
+
+### Training a KPPT eval
+
+For KPPT-family eval types the architecture is fixed and `--arch` is ignored:
+
+```bash
+cargo run --release --features device-cuda --example bulletou -- \
+    --eval-type KPPT \
+    --teacher teachers/
+```
+
+The default output dir is `checkpoints/KPPT/`. To get the factorised variant, swap to `--eval-type KPP_KKPT`.
+
+### Passing teacher data
 
 `--teacher` accepts:
 - a single file (e.g. `teachers/teacher.pack`),
 - a directory (above; all same-extension files inside are concatenated),
 - or a comma-separated combination of the two.
 
+### How long does training run
+
 Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). To run multiple passes, pass `--max-epochs N` — the LR scheduler restarts at the beginning of each epoch.
 
-While it runs, you should see:
+### What you should see
+
+While it runs:
 
 ```
 === bulletou: running NNUE_HALFKP (256x2-32-32 ClippedReLU, dual-perspective) ===
@@ -87,7 +109,9 @@ superbatch 2   ...
 
 `pos/s` (positions per second) is the rough training-speed indicator. On a single RTX 4090 expect tens of millions of pos/s; on slower GPUs proportionally less.
 
-## 2.4 Training schedule
+## 2.4 Training schedule (come back to this when you need to tune)
+
+**All flags default to sensible values; you can ignore this section on the first run.** Return when you want to tune for teacher size or available compute.
 
 The `superbatch` in the log is **the unit at which checkpoints and learning rate are updated**, about 100M positions by default.
 
@@ -116,7 +140,7 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower `-
 
 ## 2.5 Inspect the output
 
-After training finishes, `checkpoints/NNUE_HALFKP-256x2-32-32/` has the following layout:
+After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32/`) has the following layout:
 
 ```
 checkpoints/NNUE_HALFKP-256x2-32-32/
@@ -133,27 +157,57 @@ checkpoints/NNUE_HALFKP-256x2-32-32/
     └── learn.log
 ```
 
-The file you'll hand to the engine is `000N/nn.bin`.
+`000N/` (the highest-numbered dir) holds the artefacts to hand to the engine.
+
+For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three files `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` (all three are required together).
 
 ## 2.6 Resume
 
-Re-running the same command with the same `--output` automatically resumes from the latest `000N/state.bin` (new saves continue numbering from `000(N+1)/`). To start fresh, point `--output` at a different directory or delete the existing one.
+Stopping mid-training is fine: **re-run the exact same command with the same `--output` and `bulletou` automatically resumes from the latest `000N/state.bin`** (new saves continue from `000(N+1)/`). To start fresh, point `--output` at a different directory or delete the existing one.
 
-## 2.7 Wire into an engine
+## 2.7 Load into an engine
 
-Place the trained `000N/nn.bin` where the YaneuraOu engine expects its eval file (typically `eval/nn.bin`; the exact location is controlled by the `EvalDir` setting or similar — consult the engine's documentation), then launch the engine and confirm it loads with a quick `bench` or test game.
+A minimum walkthrough for verifying the trained weights in a YaneuraOu engine.
 
-`state.bin` / `learn.log` are ignored by the engine but are worth keeping around for re-training and inspecting the loss curve.
+### For NNUE evals (`nn.bin`)
 
-## 2.8 Training other targets
+Put the latest `000N/nn.bin` where the engine looks for its eval file. With YaneuraOu the path is set via the `EvalDir` USI option:
 
-- **NNUE K-P** (same 4-layer ClippedReLU network as HalfKP but with a different, lighter input feature set): `--eval-type NNUE_KP`. See [NNUE K-P Training](../shogi/kp.md).
-- **KPPT** (the three-file `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` legacy eval): `--eval-type KPPT`, or `--eval-type KPP_KKPT` for the factorised variant. See [KPPT / KPP_KKPT Training](../shogi/kppt.md).
-- Other NNUE variants (HalfKA / SFNN+ls9 ...) will be added to `--eval-type` over time.
+```
+# After the engine starts, in the USI command line:
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
+isready
+bench
+```
 
-## 2.9 Where to go next
+Alternatively, place `000N/nn.bin` as `eval/nn.bin` if your engine expects that relative path.
+
+`isready` succeeding means the engine loaded the file. `bench` prints the hash of the loaded `nn.bin`, so a different number on each re-trained model confirms you're really using different weights.
+
+### For KPPT-family evals (three-file set)
+
+Point `EvalDir` at the latest `000N/` directory directly (it must contain all three files):
+
+```
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/KPPT/0005
+isready
+bench
+```
+
+The engine refuses to load if any of the three files is missing.
+
+### If the result is weak
+
+The first training run uses a small teacher and few superbatches, so don't expect competitive strength. To get something usable in real play:
+- Increase teacher size (100M → 1B+ positions)
+- Run several epochs (e.g. `--max-epochs 3`)
+- Increase `--save-rate` (e.g. 10) and only use the later saves
+
+Per-eval-type hyperparameter advice lives in the reference docs ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [kppt.md](../shogi/kppt.md)).
+
+## 2.8 Where to go next
 
 - [Reference: NNUE HalfKP Training](../shogi/halfkp.md) — `nn.bin` binary layout, quantisation, resume details
-- [Reference: NNUE Basics](../1-basics.md) — the math behind perspective NNUE
-- [Reference: Saved Networks](../4-saved-networks.md) — checkpoint layout, quantisation, transformation chains
-- [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — training the legacy YaneuraOu evals
+- [Reference: NNUE K-P Training](../shogi/kp.md) — input feature comparison vs HalfKP
+- [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — legacy YaneuraOu evals
+- [Specifications: spec/](../../../spec/) — eval-type matrix, binary layout, hash derivations

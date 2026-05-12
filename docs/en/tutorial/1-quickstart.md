@@ -131,9 +131,16 @@ rm -rf checkpoints target
 
 The `target/` directory will be rebuilt next time you `cargo build`.
 
-## 1.7 Developer notes
+---
 
-Beyond the smoke test, here are the bits you'll likely want when adapting BulletOu to your own training.
+Next: [2. Running a training](2-nnue-tutorial.md) — train a real evaluation function on actual data and load it into an engine.
+
+---
+
+<details>
+<summary>1.7 Developer notes (optional)</summary>
+
+Material beyond the smoke test, for when you start adapting BulletOu to your own training. **Safe to skip on first read.**
 
 ### Editing an existing example
 
@@ -169,6 +176,4 @@ Detailed API documentation lives in Rust's docstrings. To generate and open it l
 cargo doc --open
 ```
 
----
-
-Next: [2. NNUE Tutorial](2-nnue-tutorial.md) — train a real shogi NNUE from `.pack` data.
+</details>
