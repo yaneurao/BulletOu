@@ -15,7 +15,7 @@
 - NNUE halfka1/halfka2
 - SFNN + ls9(NNUEwoSQPT1536)
 - KPPT
-- KPP_KPPT
+- KPP_KKPT
 
 ### 使い方
 
