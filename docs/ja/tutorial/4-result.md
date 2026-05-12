@@ -42,31 +42,33 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 ### CSV のサンプル
 
 ```csv
-eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.6234,0.001,1.0,524288,teachers/
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.5891,0.001,1.0,1048576,teachers/
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.5510,0.001,1.0,1572864,teachers/
+eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,nnue,1,1,32,0.6234,0.001,1.0,524288,teachers/
+NNUE_HALFKP,nnue,1,1,64,0.5891,0.001,1.0,1048576,teachers/
+NNUE_HALFKP,nnue,1,1,96,0.5510,0.001,1.0,1572864,teachers/
 ...
-NNUE_HALFKP,256x2-32-32,nnue,1,2,0.4523,0.001,1.0,100532224,teachers/
+NNUE_HALFKP,nnue,1,2,32,0.4523,0.001,1.0,100532224,teachers/
 ...
 ```
 
-bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--batches-per-superbatch ≒ 6104` なら、1 superbatch あたり約 191 行。
+bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--batches-per-superbatch ≒ 6104` なら、1 superbatch あたり約 191 行。`batch` 列が `batches_per_superbatch` (= 6104) に達すると `superbatch` が +1 されて `batch` は 1 から再開する。
 
 ### 列の意味
 
 | 列 | 意味 | 例 |
 |---|---|---|
-| `eval_type` | `--eval-type` の値 | `NNUE_HALFKP` |
-| `arch` | `--arch` の値 (NNUE 系のみ、KPPT 系は空) | `256x2-32-32` |
+| `eval` | `--eval-type` の値 | `NNUE_HALFKP` |
 | `component` | 学習 component | `nnue` (NNUE 系) / `kk` / `kkp` / `kpp` (KPPT 系) |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
-| `superbatch` | epoch 内 superbatch (1 始まり) | `1`, `2`, ... |
+| `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
+| `batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
 | `value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
 | `lr` | その時点の学習率 (StepLR 由来) | `0.001` |
 | `lambda` | `--lambda` 値 (1 run 内で定数) | `1.0` |
 | `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `524288` |
 | `teacher` | `--teacher` の値 | `teachers/` |
+
+`--arch` の値は CSV には含まれない (出力ディレクトリ名 `checkpoints/NNUE_HALFKP-256x2-32-32/` に含まれているので各行に重複させない)。
 
 正確な仕様は [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット) を参照。
 
@@ -100,6 +102,11 @@ print(df["value_loss"].describe())   # loss の統計
    - 1 superbatch 完了で約 1 億 (= `--batches-per-superbatch × --batch-size`)
    - 教師サイズと照らし合わせると「ちゃんと教師を全部読めているか」が分かる
 
+4. **`superbatch` がきちんと進んでいるか**
+   - 教師局面数が 1 億未満だと 1 周回しても `superbatch` は 1 のまま終わる (fallback save で 1 度だけ保存)。これは仕様
+   - 大きな教師なら `batch` が 6104 (デフォルト `--batches-per-superbatch`) に到達するごとに `superbatch` が +1 されているはず
+   - `superbatch` がいつまでも 1 のままで `batch` も小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
+
 ### 簡単なプロット
 
 ```python
@@ -115,7 +122,7 @@ plt.savefig("loss_curve.png")
 
 ### KPPT の場合 (kk / kkp / kpp 同時記録)
 
-KPPT 系では 1 save につき kk → kkp → kpp の 3 component のログが連続して書かれる。同じ `(epoch, superbatch, positions)` でも component が違うので、フィルタしてからプロット:
+KPPT 系では 1 save につき kk → kkp → kpp の 3 component のログが連続して書かれる。同じ `(epoch, superbatch, batch, positions)` でも component が違うので、フィルタしてからプロット:
 
 ```python
 for c in ["kk", "kkp", "kpp"]:

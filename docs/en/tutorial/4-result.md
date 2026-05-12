@@ -42,31 +42,33 @@ The loss trajectory of every run, both during training and afterwards, is record
 ### Sample CSV
 
 ```csv
-eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.6234,0.001,1.0,524288,teachers/
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.5891,0.001,1.0,1048576,teachers/
-NNUE_HALFKP,256x2-32-32,nnue,1,1,0.5510,0.001,1.0,1572864,teachers/
+eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP,nnue,1,1,32,0.6234,0.001,1.0,524288,teachers/
+NNUE_HALFKP,nnue,1,1,64,0.5891,0.001,1.0,1048576,teachers/
+NNUE_HALFKP,nnue,1,1,96,0.5510,0.001,1.0,1572864,teachers/
 ...
-NNUE_HALFKP,256x2-32-32,nnue,1,2,0.4523,0.001,1.0,100532224,teachers/
+NNUE_HALFKP,nnue,1,2,32,0.4523,0.001,1.0,100532224,teachers/
 ...
 ```
 
-Bullet writes **one row every 32 batches**. With the default `--batches-per-superbatch ≒ 6104`, that's about 191 rows per superbatch.
+Bullet writes **one row every 32 batches**. With the default `--batches-per-superbatch ≒ 6104`, that's about 191 rows per superbatch. Once `batch` reaches `batches_per_superbatch` (default 6104), `superbatch` increments by 1 and `batch` restarts from 1.
 
 ### Column meanings
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval_type` | the `--eval-type` value | `NNUE_HALFKP` |
-| `arch` | the `--arch` value (NNUE only; empty for KPPT) | `256x2-32-32` |
+| `eval` | the `--eval-type` value | `NNUE_HALFKP` |
 | `component` | training component | `nnue` (NNUE) / `kk` / `kkp` / `kpp` (KPPT) |
 | `epoch` | within-run epoch (1-indexed) | `1` |
-| `superbatch` | within-epoch superbatch (1-indexed) | `1`, `2`, ... |
+| `superbatch` | within-epoch superbatch (1-indexed). +1 every `--batches-per-superbatch` (default 6104) batches | `1`, `2`, ... |
+| `batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
 | `value_loss` | bullet's per-32-batch averaged loss | `0.234` |
 | `lr` | learning rate at that point (StepLR-derived) | `0.001` |
 | `lambda` | the `--lambda` value (constant per run) | `1.0` |
 | `positions` | cumulative teacher positions (**carries across resumes**) | `524288` |
 | `teacher` | the `--teacher` value | `teachers/` |
+
+The `--arch` value isn't in the CSV — it's encoded in the output directory name (`checkpoints/NNUE_HALFKP-256x2-32-32/`) instead, since it's constant for a run.
 
 Full spec: [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md#learnlog-フォーマット).
 
@@ -100,6 +102,11 @@ A healthy training run typically shows:
    - One completed superbatch ≒ 100M (= `--batches-per-superbatch × --batch-size`)
    - Cross-check against your teacher size to confirm "is all of the teacher being consumed?"
 
+4. **`superbatch` advances as expected**
+   - With a teacher smaller than 100M positions, `superbatch` stays at 1 for the whole run (fallback save fires once at the end). That's by design.
+   - With a larger teacher, `superbatch` should increment every time `batch` reaches 6104 (= `--batches-per-superbatch` default).
+   - If `superbatch` is stuck at 1 and `batch` plateaus far below `batches_per_superbatch`, the dataloader may be cut short (e.g. the old HCPE polarity bug).
+
 ### Quick plot
 
 ```python
@@ -115,7 +122,7 @@ plt.savefig("loss_curve.png")
 
 ### KPPT case (kk / kkp / kpp recorded side-by-side)
 
-For KPPT-family eval types, each save writes kk → kkp → kpp logs back-to-back. Their rows share `(epoch, superbatch, positions)` but differ in `component`, so filter before plotting:
+For KPPT-family eval types, each save writes kk → kkp → kpp logs back-to-back. Their rows share `(epoch, superbatch, batch, positions)` but differ in `component`, so filter before plotting:
 
 ```python
 for c in ["kk", "kkp", "kpp"]:

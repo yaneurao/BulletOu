@@ -556,13 +556,18 @@ fn run_kppt_all(args: &Args) {
 /// each per-save `0NNN/learn.log` start with this line followed by data
 /// rows. Column meanings (10 total):
 ///
-/// - `eval_type`: CLI `--eval-type` value (e.g. `NNUE_HALFKP`, `KPPT`).
-/// - `arch`: CLI `--arch` value for NNUE eval types (e.g. `256x2-32-32`),
-///   empty for KPPT-family eval types (which don't consume `--arch`).
+/// - `eval`: CLI `--eval-type` value (e.g. `NNUE_HALFKP`, `KPPT`).
+///   (The `--arch` value is recorded in the output directory name rather
+///   than in the CSV, to avoid duplicating the same constant on every row.)
 /// - `component`: training component identifier — `nnue` for the NNUE
 ///   eval types, `kk` / `kkp` / `kpp` for the KPPT family.
 /// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
 /// - `superbatch`: 1-indexed superbatch within the current epoch.
+///   Increments every `--batches-per-superbatch` batches (default 6104).
+/// - `batch`: 1-indexed batch counter within the current superbatch (= the
+///   `curr_batch` field bullet records every 32 batches: 32, 64, 96, ...).
+///   Combine with `superbatch` for "(superbatch − 1) × batches_per_superbatch
+///   + batch" to get the total batch count.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
 /// - `lr`: learning rate at that superbatch (StepLR-derived).
 /// - `lambda`: `--lambda` value at that point (constant per run).
@@ -575,7 +580,7 @@ fn run_kppt_all(args: &Args) {
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str =
-    "eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher";
+    "eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
@@ -583,7 +588,6 @@ const LEARN_LOG_HEADER: &str =
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
-    arch: &'static str,
     lr_start: f32,
     lr_gamma: f32,
     lr_step: usize,
@@ -597,10 +601,8 @@ impl LogContext {
     fn from_args(args: &Args) -> Self {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
-        let arch = if args.eval_type.uses_arch() { args.arch.cli_name() } else { "" };
         Self {
             eval_type: args.eval_type.cli_name(),
-            arch,
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
             lr_step: args.lr_step,
@@ -674,9 +676,8 @@ fn enrich_bullet_log_to_csv(
         let lr = ctx.lr_at(sb);
         let positions = ctx.positions_at(sb, b, position_offset);
         out.push_str(&format!(
-            "{eval_type},{arch},{component},{epoch},{sb},{loss},{lr},{lambda},{positions},{teacher}\n",
-            eval_type = ctx.eval_type,
-            arch = ctx.arch,
+            "{eval},{component},{epoch},{sb},{b},{loss},{lr},{lambda},{positions},{teacher}\n",
+            eval = ctx.eval_type,
             lambda = ctx.lambda,
             teacher = ctx.teacher_csv,
         ));
@@ -692,21 +693,21 @@ fn enrich_bullet_log_to_csv(
 ///
 /// The parser uses `splitn(10, ',')` so any commas inside the trailing
 /// `teacher` field (e.g. a comma-separated teacher list) don't disturb the
-/// first 9 columns. The component column index is 2 and the positions
-/// column index is 8 in the new 10-column layout.
+/// first 9 columns. The component column is at index 1 and positions is
+/// at index 8 in the 10-column layout.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("eval_type,") {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
         let parts: Vec<&str> = line.splitn(10, ',').collect();
         if parts.len() < 9 {
             continue;
         }
-        let component = parts[2];
+        let component = parts[1];
         let Ok(positions) = parts[8].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {

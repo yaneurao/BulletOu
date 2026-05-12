@@ -83,17 +83,17 @@ checkpoints/my-kppt/
 `learn.log` is a 10-column CSV with a header row, the same format used by every eval-type:
 
 ```
-eval_type,arch,component,epoch,superbatch,value_loss,lr,lambda,positions,teacher
-KPPT,,kk,1,1,0.234,0.001,1.0,524288,teachers/
-KPPT,,kk,1,1,0.232,0.001,1.0,1048576,teachers/
+eval,component,epoch,superbatch,batch,value_loss,lr,lambda,positions,teacher
+KPPT,kk,1,1,32,0.234,0.001,1.0,524288,teachers/
+KPPT,kk,1,1,64,0.232,0.001,1.0,1048576,teachers/
 ...
-KPPT,,kkp,1,1,0.156,0.001,1.0,524288,teachers/
+KPPT,kkp,1,1,32,0.156,0.001,1.0,524288,teachers/
 ...
-KPPT,,kpp,1,1,0.245,0.001,1.0,524288,teachers/
+KPPT,kpp,1,1,32,0.245,0.001,1.0,524288,teachers/
 ...
 ```
 
-The `arch` column is empty for KPPT-family eval types (which don't consume `--arch`); it is non-empty (e.g. `256x2-32-32`) for NNUE eval types.
+The `--arch` value is recorded in the output-directory name (e.g. `checkpoints/KPPT/`) rather than in the CSV — `arch` is constant within a run, so duplicating it on every row would just waste space.
 
 Per-save snapshot `0NNN/learn.log` and the top-level `<output>/learn.log` use the exact same format. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../../spec/04-checkpoint-layout.md).
 
