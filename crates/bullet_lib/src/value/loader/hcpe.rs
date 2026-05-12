@@ -229,6 +229,102 @@ mod tests {
         let _ = decode_hcpe_record(&rec);
     }
 
+    /// `inbox/ref/sp_dr2-15K_20240210.hcpe` (HCPE) と、cshogi 経由で同じ局面群を
+    /// PackedSfenValue 化した `sp_dr2-15K_20240210.psv` を **バイト単位で照合** する
+    /// クロスバリデーション。
+    ///
+    /// 前提として `tools/cshogi_xref/hcpe_to_psv.py` を使い、
+    /// `inbox/ref/sp_dr2-15K_20240210.psv` を事前に cshogi で生成しておくこと:
+    /// ```
+    /// python3 tools/cshogi_xref/hcpe_to_psv.py \
+    ///     inbox/ref/sp_dr2-15K_20240210.hcpe \
+    ///     inbox/ref/sp_dr2-15K_20240210.psv 10000
+    /// ```
+    ///
+    /// `decode_hcpe_record` (BulletOu の HCP デコーダー → PackedSfen 再エンコード) と
+    /// cshogi の `Board.set_hcp` → `Board.to_psfen` 経路が、結果として **完全に同一の
+    /// 40 byte PackedSfenValue** を生成することを検証する。
+    #[test]
+    #[ignore]
+    fn cross_validate_against_cshogi_psv() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let hcpe_path = format!("{manifest}/../../inbox/ref/sp_dr2-15K_20240210.hcpe");
+        let psv_path = format!("{manifest}/../../inbox/ref/sp_dr2-15K_20240210.psv");
+
+        if std::fs::metadata(&hcpe_path).is_err() {
+            eprintln!("skipping: hcpe sample not found at {hcpe_path}");
+            return;
+        }
+        if std::fs::metadata(&psv_path).is_err() {
+            eprintln!(
+                "skipping: psv reference not found at {psv_path}\n\
+                 (run: python3 /tmp/hcpe_to_psv.py {hcpe_path} {psv_path} 10000)"
+            );
+            return;
+        }
+
+        let hcpe_bytes = std::fs::read(&hcpe_path).expect("read hcpe");
+        let psv_bytes = std::fs::read(&psv_path).expect("read psv");
+
+        let n_hcpe = hcpe_bytes.len() / HCPE_RECORD_SIZE;
+        let n_psv = psv_bytes.len() / 40;
+        let n = n_hcpe.min(n_psv);
+        eprintln!("comparing {n} records (hcpe total = {n_hcpe}, psv total = {n_psv})");
+        assert!(n > 0, "need at least 1 record to compare");
+
+        let mut mismatches = 0usize;
+        let mut first_mismatch_dumped = false;
+
+        for i in 0..n {
+            let mut hcpe_rec = [0u8; HCPE_RECORD_SIZE];
+            hcpe_rec.copy_from_slice(&hcpe_bytes[i * HCPE_RECORD_SIZE..(i + 1) * HCPE_RECORD_SIZE]);
+
+            let mut psv_rec = [0u8; 40];
+            psv_rec.copy_from_slice(&psv_bytes[i * 40..(i + 1) * 40]);
+            let expected = PackedSfenValue::from_raw(psv_rec);
+
+            let decoded = match decode_hcpe_record(&hcpe_rec) {
+                Some(p) => p,
+                None => {
+                    eprintln!("record {i}: decode_hcpe_record returned None");
+                    mismatches += 1;
+                    continue;
+                }
+            };
+
+            if decoded.as_bytes() != expected.as_bytes() {
+                mismatches += 1;
+                if !first_mismatch_dumped {
+                    first_mismatch_dumped = true;
+                    eprintln!("first MISMATCH at record {i}:");
+                    eprintln!("  hcpe input:     {}", hex(&hcpe_rec));
+                    eprintln!("  ours (Rust):    {}", hex(decoded.as_bytes()));
+                    eprintln!("  cshogi (psv):   {}", hex(expected.as_bytes()));
+                    let diffs: Vec<usize> = (0..40)
+                        .filter(|&k| decoded.as_bytes()[k] != expected.as_bytes()[k])
+                        .collect();
+                    eprintln!("  diff offsets:   {diffs:?}");
+                }
+            }
+        }
+
+        if mismatches == 0 {
+            eprintln!("OK: all {n} records match byte-for-byte (BulletOu == cshogi)");
+        } else {
+            eprintln!("{mismatches} of {n} records mismatched");
+        }
+        assert_eq!(mismatches, 0, "{mismatches} of {n} hcpe records disagreed with cshogi-generated psv");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            use std::fmt::Write;
+            write!(&mut s, "{b:02x}").unwrap();
+        }
+        s
+    }
+
     /// inbox/ref に置かれたサンプル hcpe を読む実機テスト。
     ///
     /// テストデータはローカルにしか存在しないので、`#[ignore]` を付けてある。

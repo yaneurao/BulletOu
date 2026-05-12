@@ -553,7 +553,7 @@ impl MiniPosition {
 
 impl PackedSfenValue {
     /// 生のバイト配列から PackedSfenValue を構築
-    fn from_raw(data: [u8; 40]) -> Self {
+    pub(super) fn from_raw(data: [u8; 40]) -> Self {
         // Safety: PackedSfenValue は #[repr(C)] の [u8; 40] ラッパー
         // data フィールドへの直接アクセス手段が as_bytes_mut のみのため、
         // デフォルト値を生成してからコピーする
