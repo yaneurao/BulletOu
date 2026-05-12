@@ -234,19 +234,27 @@ mod tests {
     /// テストデータはローカルにしか存在しないので、`#[ignore]` を付けてある。
     /// 実行するには:
     /// ```bash
-    /// cargo test --features cuda -p bullet_lib hcpe -- --ignored
+    /// cargo test -p bullet_lib --lib hcpe -- --ignored --nocapture
     /// ```
-    /// (--features は build に必要なものを指定。テスト自体は GPU を使わない)
+    /// (テスト自体は GPU を使わない)
+    ///
+    /// パスは `CARGO_MANIFEST_DIR/../../inbox/ref/...` で workspace root 配下を
+    /// 指す。`cargo test` の CWD が crate ディレクトリ (`crates/bullet_lib`) であっても
+    /// 同じファイルに辿り着けるようにしている。
     #[test]
     #[ignore]
     fn smoke_test_decode_inbox_sample() {
-        let path = "inbox/ref/sp_dr2-15K_20240210.hcpe";
-        if std::fs::metadata(path).is_err() {
-            eprintln!("skipping: {path} not found");
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../inbox/ref/sp_dr2-15K_20240210.hcpe");
+        let path_str = path.to_string_lossy().to_string();
+
+        if std::fs::metadata(&path).is_err() {
+            eprintln!("skipping: {path_str} not found");
             return;
         }
+        eprintln!("loading: {path_str}");
 
-        let loader = HcpeDataLoader::new(path, 4, |_| true);
+        let loader = HcpeDataLoader::new(&path_str, 4, |_| true);
         let total = loader.count_positions().expect("count_positions");
         eprintln!("count_positions = {total}");
         assert!(total > 0);
