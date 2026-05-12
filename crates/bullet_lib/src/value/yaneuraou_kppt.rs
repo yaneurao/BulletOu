@@ -1,8 +1,18 @@
 //! YaneuraOu KPPT-format binary writer.
 //!
-//! Convert BulletOu's per-superbatch `raw.bin` (the f32 checkpoint dump) into
-//! YaneuraOu's `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin`
-//! files so the trained weights can be loaded by a YaneuraOu KPPT engine.
+//! Convert BulletOu's per-superbatch model dump into YaneuraOu's
+//! `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` files
+//! so the trained weights can be loaded by a YaneuraOu KPPT engine.
+//!
+//! ## Source file
+//!
+//! BulletOu writes two binaries per checkpoint:
+//! - `raw.bin`         — saved_format order, raw float bytes only (no IDs/lengths)
+//! - `optimiser_state/weights.bin` — IDs + lengths + float bytes (full self-describing)
+//!
+//! We read **`optimiser_state/weights.bin`** because it carries the IDs that we
+//! need to find `kkw` / `kkpw`. `raw.bin` does not, and would require us to
+//! also know the saved_format ordering and per-weight shape.
 //!
 //! ## File layout (KPPT32)
 //!
@@ -43,9 +53,9 @@ const FE_END: usize = 1548;
 const KK_TOTAL: usize = SQ_NB * SQ_NB; // 6561
 const KKP_TOTAL: usize = SQ_NB * SQ_NB * FE_END; // 10,156,428
 
-/// Parse a BulletOu `raw.bin` checkpoint file into a map of weight ID -> f32 vector.
+/// Parse BulletOu's `optimiser_state/weights.bin` into a map of weight ID -> f32 vector.
 ///
-/// `raw.bin` format (see `crates/trainer/src/model/utils.rs::write_to_byte_buffer`):
+/// Format (see `crates/trainer/src/model/utils.rs::write_to_byte_buffer`):
 ///
 /// ```text
 /// for each weight:
@@ -54,7 +64,10 @@ const KKP_TOTAL: usize = SQ_NB * SQ_NB * FE_END; // 10,156,428
 ///     <usize LE>           // number of f32 values that follow
 ///     <f32 LE> × N         // raw float weights
 /// ```
-pub fn parse_raw_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<f32>>> {
+///
+/// Note: this is **not** the format of the bare `raw.bin` file (which has no
+/// IDs or lengths; see the module-level doc).
+pub fn parse_model_weights_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<f32>>> {
     let mut map = BTreeMap::new();
     let mut offset = 0usize;
 
@@ -110,15 +123,16 @@ pub fn parse_raw_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<f32>>> {
     Ok(map)
 }
 
-/// Convert a checkpoint directory's `raw.bin` into YaneuraOu KPPT binaries
-/// alongside it. Only the components that are actually present in `raw.bin`
-/// are written: e.g. if the model has only `kkw` / `kkb` the KKP file is skipped.
+/// Convert a checkpoint directory's `optimiser_state/weights.bin` into YaneuraOu
+/// KPPT binaries placed alongside it. Only the components that are actually
+/// present are written: e.g. if the model has only `kkw` / `kkb`, the KKP file
+/// is skipped.
 ///
 /// `eval_scale` multiplies the f32 weight before rounding to i32.
 pub fn save_yaneuraou_kppt(checkpoint_dir: &Path, eval_scale: f32) -> io::Result<()> {
-    let raw_path = checkpoint_dir.join("raw.bin");
-    let bytes = std::fs::read(&raw_path)?;
-    let weights = parse_raw_bin(&bytes)?;
+    let weights_path = checkpoint_dir.join("optimiser_state").join("weights.bin");
+    let bytes = std::fs::read(&weights_path)?;
+    let weights = parse_model_weights_bin(&bytes)?;
 
     let mut wrote_any = false;
 
@@ -137,7 +151,7 @@ pub fn save_yaneuraou_kppt(checkpoint_dir: &Path, eval_scale: f32) -> io::Result
     if !wrote_any {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "raw.bin contains neither `kkw` nor `kkpw`; nothing to write",
+            "optimiser_state/weights.bin contains neither `kkw` nor `kkpw`; nothing to write",
         ));
     }
 
@@ -206,7 +220,8 @@ mod tests {
 
     #[test]
     fn parse_round_trip_minimal() {
-        // 手作りで raw.bin と同じレイアウトの 1 重み分のバイト列を作って parse できるか確認
+        // optimiser_state/weights.bin と同じレイアウトの 1 重み分のバイト列を
+        // 手作りして parse できるか確認
         let mut buf = Vec::new();
         buf.extend_from_slice(b"hello\n");
         let len: usize = 2;
@@ -214,7 +229,7 @@ mod tests {
         buf.extend_from_slice(&1.5f32.to_le_bytes());
         buf.extend_from_slice(&(-2.25f32).to_le_bytes());
 
-        let map = parse_raw_bin(&buf).unwrap();
+        let map = parse_model_weights_bin(&buf).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["hello"], vec![1.5, -2.25]);
     }
