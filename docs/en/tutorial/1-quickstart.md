@@ -4,7 +4,7 @@
 
 Goal of this page: from a fresh checkout, build BulletOu and run a short training session that produces a checkpoint file. If you reach the end, your toolchain is healthy.
 
-We are **not** trying to train a strong NNUE here — that comes in the next page. This is a smoke test.
+We are **not** trying to train a strong NNUE here — that comes later. This is a smoke test.
 
 ## 1.1 Prerequisites
 
@@ -108,7 +108,7 @@ superbatch 2 ...
 
 and a `checkpoints/` directory containing the trained output is created.
 
-> The `simple` example is **chess**, not shogi. It exists upstream and we keep it because it is the smallest end-to-end example. The shogi examples come next.
+> The `simple` example is **chess**, not shogi. It exists upstream and we keep it because it is the smallest end-to-end example. The shogi examples come later.
 
 ## 1.5 What just happened
 
@@ -119,7 +119,7 @@ You built BulletOu and ran a complete training session. The pipeline that ran is
 3. Trained for a few superbatches
 4. Wrote checkpoints
 
-In the next page, we replace the chess input feature with a **shogi** one and use a real `.pack` dataset. Same pipeline; different feature set and data loader.
+Later we'll swap the chess input feature for a **shogi** one and feed it a real `.pack` dataset. Same pipeline; different feature set and data loader.
 
 ## 1.6 Cleanup
 
@@ -133,47 +133,6 @@ The `target/` directory will be rebuilt next time you `cargo build`.
 
 ---
 
-Next: [2. Run a training](2-train.md) — train a real evaluation function on actual data.
-
----
-
-<details>
-<summary>1.7 Developer notes (optional)</summary>
-
-Material beyond the smoke test, for when you start adapting BulletOu to your own training. **Safe to skip on first read.**
-
-### Editing an existing example
-
-The usual workflow: clone the repo and edit one of the files under [examples/](/examples) to your taste. `shogi_simple.rs` or `bulletou.rs` are common starting points.
-
-### Registering a custom example
-
-Just placing a new file under `examples/` is not enough — `cargo build --example xxx` will not find it until you register it in `bullet_lib`'s `Cargo.toml`:
-
-```toml
-# Append to crates/bullet_lib/Cargo.toml
-[[example]]
-name = "my_example"
-path = "../../examples/my_example.rs"
-```
-
-Once registered, the example survives `git pull` from upstream more easily, which helps when maintaining long-running custom experiments.
-
-### Importing `bullet_lib` from another project
-
-You can also depend on `bullet_lib` as a crate from a separate project:
-
-```toml
-[dependencies]
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
-```
-
-### API documentation
-
-Detailed API documentation lives in Rust's docstrings. To generate and open it locally:
-
-```bash
-cargo doc --open
-```
-
-</details>
+Next:
+- [2. Using `bullet_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
+- Or jump straight to [3. Prepare training data](3-data.md)

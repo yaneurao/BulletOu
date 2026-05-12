@@ -8,8 +8,12 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 |---|---|---|
 | 0 | [Overview](0-overview.md) | Understand what BulletOu trains and which evaluation function families are supported |
 | 1 | [Quick Start](1-quickstart.md) | Install prerequisites, build BulletOu, and run a tiny training session to verify everything works |
-| 2 | [Run a training](2-train.md) | Train a real evaluation function from real data (eval-type / teacher / command) |
-| 3 | [Tune the training](3-tune.md) | Adjust the schedule (`--lr`, `--superbatches`) and the training target (`--lambda`) — optional |
-| 4 | [Inspect and use the result](4-result.md) | Output layout, reading `learn.log`, loading into an engine |
+| 2 | [Using `bullet_lib` from your own code](2-bullet-lib.md) | Developer notes (registering custom examples, importing as a crate). Optional |
+| 3 | [Prepare training data](3-data.md) | Choose the eval type and pre-process (shuffle) the teacher file |
+| 4 | [Run the training](4-train.md) | Invoke `bulletou` (eval-type / arch / teacher) |
+| 5 | [Stop and resume](5-resume.md) | Auto-resume by re-running with the same `--output` |
+| 6 | [Tune the training](6-tune.md) | Adjust the schedule (`--lr`, `--superbatches`) and `--lambda` (optional) |
+| 7 | [Inspect the result](7-result.md) | Output layout and reading `learn.log` |
+| 8 | [Load into an engine](8-engine.md) | Verify the trained weights in YaneuraOu |
 
 After finishing the tutorial, the [Reference docs](../) cover specifications and design details (data formats, network output formats, etc.).

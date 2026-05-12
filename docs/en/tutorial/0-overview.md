@@ -68,7 +68,11 @@ How the engine consumes the file depends on the engine; see its documentation.
 The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
-- [2. Run a training](2-train.md) — train a real evaluation function on actual data (eval-type / teacher / command)
-- [3. Tune the training](3-tune.md) — adjust the schedule and `--lambda` (optional)
-- [4. Inspect and use the result](4-result.md) — output layout, reading `learn.log`, loading into an engine
+- [2. Using `bullet_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
+- [3. Prepare training data](3-data.md) — choosing the eval type, plus pre-shuffling the teacher file
+- [4. Run the training](4-train.md) — invoking `bulletou`
+- [5. Stop and resume](5-resume.md) — auto-resume by re-running with the same `--output`
+- [6. Tune the training](6-tune.md) — adjust the schedule and `--lambda` (optional)
+- [7. Inspect the result](7-result.md) — output layout and reading `learn.log`
+- [8. Load into an engine](8-engine.md) — verify in YaneuraOu
 - [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

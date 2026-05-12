@@ -133,47 +133,6 @@ rm -rf checkpoints target
 
 ---
 
-次へ: [2. 学習を走らせる](2-train.md) — 実データで評価関数を学習する。
-
----
-
-<details>
-<summary>1.7 開発者向け補足 (任意)</summary>
-
-ここから先は smoke test を超えて、自分のコードに改造したい人向けの補足。**初回は読み飛ばして OK**。
-
-### 既存 example を自分用に編集する
-
-最も普通の使い方: リポジトリを clone して、[examples/](/examples) のいずれかを自分の目的に合わせて編集する。`shogi_simple.rs` や `bulletou.rs` を雛形に持つのが一般的。
-
-### 独自 example を登録する
-
-新しい example ファイルを `examples/` 配下に置いただけでは `cargo build --example xxx` で認識されない。`bullet_lib` の `Cargo.toml` に登録する必要がある:
-
-```toml
-# crates/bullet_lib/Cargo.toml の末尾に追加
-[[example]]
-name = "my_example"
-path = "../../examples/my_example.rs"
-```
-
-こうしておくと、上流からの `git pull` でファイルが消えにくく、独自実験を継続的に維持できる。
-
-### 他プロジェクトから `bullet_lib` を import する
-
-`bullet_lib` を crate として他プロジェクトから依存することもできる:
-
-```toml
-[dependencies]
-bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bullet_lib" }
-```
-
-### API ドキュメント
-
-詳細な API ドキュメントは Rust の docstring に書かれている。ローカルで生成・参照するには:
-
-```bash
-cargo doc --open
-```
-
-</details>
+次へ:
+- [2. `bullet_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向けの補足 (任意)
+- 学習を進めたい場合は [3. 教師データを用意する](3-data.md) へ

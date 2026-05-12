@@ -1,10 +1,10 @@
-# 3. Tune the training — schedule and training target
+# 6. Tune the training — schedule and training target
 
-<a href="../../ja/tutorial/3-tune.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/6-tune.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-Once a default-config run from [2. Run a training](2-train.md) is working, this page covers **the flags for tuning the training**. **The defaults are fine for a first run.** Come back here when you need to adjust things.
+Once a default-config run from [4. Run the training](4-train.md) is working, this page covers **the flags for tuning the training**. **The defaults are fine for a first run.** Come back here when you need to adjust things.
 
-## 3.1 Training schedule
+## 6.1 Training schedule
 
 The `superbatch` in the log is **the unit at which checkpoints and learning rate are updated**, about 100M positions by default.
 
@@ -18,7 +18,7 @@ Main flags:
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` / `--lr-gamma` / `--lr-step` | StepLR (multiply by `lr-gamma` every `lr-step` superbatches) | 0.001 / 0.1 / 8 |
-| `--lambda` | Blend weight between teacher eval and W/D/L (see [§3.2](#32-training-target-lambda)) | 1.0 (= pure eval) |
+| `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -43,7 +43,7 @@ With `--lr 0.001 --lr-gamma 0.1 --lr-step 8` (defaults):
 | 25 - 32 | 0.000001 |
 | ... | ... |
 
-You can verify the actual LR after the run by inspecting `learn.log`'s `lr` column ([§4.2 Reading the training log](4-result.md#42-reading-the-training-log-learnlog)).
+You can verify the actual LR after the run by inspecting `learn.log`'s `lr` column ([§7.2 Reading the training log](7-result.md#72-reading-the-training-log-learnlog)).
 
 ### Multi-epoch training
 
@@ -53,7 +53,7 @@ You can verify the actual LR after the run by inspecting `learn.log`'s `lr` colu
 
 Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training).
 
-## 3.2 Training target (`--lambda`)
+## 6.2 Training target (`--lambda`)
 
 Each teacher position carries **two labels**:
 
@@ -89,6 +89,6 @@ Lower `--lambda` to mix in the W/D/L game result. Pure-result training (`--lambd
 
 ---
 
-Next: [4. Inspect and use the result](4-result.md) — check the output, read the log, load into an engine
+Next: [7. Inspect the result](7-result.md) — check the output and read the training log
 
-Previous: [2. Run a training](2-train.md)
+Previous: [4. Run the training](4-train.md)

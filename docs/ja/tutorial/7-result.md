@@ -1,13 +1,14 @@
-# 4. 結果を確認・活用する — 出力ファイル / 学習ログ / エンジン投入
+# 7. 結果を確認する — 出力ファイルと学習ログ
 
-<a href="../../en/tutorial/4-result.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/tutorial/7-result.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 学習が終わったあと (もしくは学習中) にやることをまとめる:
 - 出力ディレクトリの中身を確認
 - 学習ログ (`learn.log`) を読んで学習が正常に進んでいるかチェック
-- 出力された評価関数ファイルをエンジンに読み込ませて動作確認
 
-## 4.1 出力を確認する
+(学習結果をエンジンに組み込んで動作確認する手順は [8. エンジンに組み込む](8-engine.md) を参照。)
+
+## 7.1 出力を確認する
 
 学習完了後、出力ディレクトリ (例: `checkpoints/NNUE_HALFKP-256x2-32-32/`) は以下のレイアウト:
 
@@ -30,7 +31,7 @@ checkpoints/NNUE_HALFKP-256x2-32-32/
 
 KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` の 3 ファイル組が `000N/` 配下に入る (3 ファイル全部必要)。
 
-## 4.2 学習ログ (`learn.log`) の読み方
+## 7.2 学習ログ (`learn.log`) の読み方
 
 学習中・終了後の loss 推移は `<output>/learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。どちらも **同じ 9 列 CSV** フォーマット。
 
@@ -92,7 +93,7 @@ print(df["value_loss"].describe())   # loss の統計
    - 学習開始直後は急に下がり、徐々に減衰
    - 1 superbatch を消化するごとに目に見えて下がるのが理想
    - 1 superbatch まわっても下がらない場合は `--lr` が大きすぎる、または教師サイズが学習器のキャパに対して小さすぎる可能性
-   - **periodic な loss スパイク** (= 数百 batch ごとに急に跳ねる) が見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。shuffle buffer の境界 (デフォルト 256MB buffer ≒ 約 410 batch ごと) で分布が突然変わって起きる。対処は [§2.2 教師ファイルは事前にシャッフルしておく](2-train.md#教師ファイルは事前にシャッフルしておく) を参照
+   - **periodic な loss スパイク** (= 数百 batch ごとに急に跳ねる) が見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。shuffle buffer の境界 (デフォルト 256MB buffer ≒ 約 410 batch ごと) で分布が突然変わって起きる。対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
 
 2. **`lr` が `--lr-step` 周期で `--lr-gamma` 倍されている**
    - 例: `--lr 0.001 --lr-gamma 0.1 --lr-step 8` なら superbatch 1-8 で 0.001、9-16 で 0.0001、...
@@ -151,48 +152,9 @@ resume すると新 run の行が学習ログにそのまま追記される。�
 
 `epoch` / `superbatch` は run 内のカウンタなので、resume を跨ぐと同じ番号が複数回出現する。run の境界を判別したい場合は、`positions` が突然小さくならない (= 単調) ことを確認しつつ、`(epoch, superbatch)` がリセットされた行を見つける。
 
-## 4.3 エンジンに組み込む
+## 7.3 次のステップ
 
-学習結果をやねうら王エンジンで動作確認する最小手順。
-
-### NNUE 系 (`nn.bin`)
-
-最新の `000N/nn.bin` をエンジンが探す場所に置く。やねうら王の場合、`EvalDir` オプションでパスを指定する:
-
-```
-# エンジン起動後、USI コマンドで:
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
-isready
-bench
-```
-
-または、`eval/nn.bin` という相対パスでエンジン側に置く場合は、`000N/nn.bin` をそのファイル名で配置する。
-
-`isready` でロードが通れば学習結果が認識できている。`bench` の出力に nn.bin のハッシュが出るので、毎回違う数字になっていれば確かに違う重みを load していることが分かる。
-
-### KPPT 系 (`KK_synthesized.bin` 等の 3 ファイル組)
-
-最新 `000N/` ディレクトリそのものを `EvalDir` に指定する (3 ファイルが揃った状態のディレクトリを指す):
-
-```
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/KPPT/0005
-isready
-bench
-```
-
-3 ファイルすべてが揃っていない場合エンジンは load に失敗する点に注意。
-
-### 学習結果が弱いとき
-
-最初の学習は小さな教師で短い superbatch しか回していないので、評価の質はあまり期待しないこと。本格対局できるレベルにするには:
-- 教師サイズを増やす (1 億 → 10 億局面以上)
-- `--max-epochs 3` 程度で複数周回す
-- `--save-rate` を大きく (例: 10) して、後半の save だけを使う
-
-詳細なハイパーパラメータ調整は各 eval-type のリファレンス ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [halfkpe9.md](../shogi/halfkpe9.md) / [kppt.md](../shogi/kppt.md)) を参照。
-
-## 4.4 次のステップ
-
+- [8. エンジンに組み込む](8-engine.md) — 学習結果をやねうら王エンジンで動作確認する
 - [リファレンス: NNUE HalfKP 学習](../shogi/halfkp.md) — `nn.bin` のバイナリレイアウト、量子化、resume の詳細
 - [リファレンス: NNUE K-P 学習](../shogi/kp.md) — HalfKP との比較、入力 feature の構造
 - [リファレンス: NNUE HalfKPE9 学習](../shogi/halfkpe9.md) — 利き数情報拡張版
@@ -201,4 +163,4 @@ bench
 
 ---
 
-前へ: [3. 学習をチューニング](3-tune.md)
+前へ: [6. 学習をチューニング](6-tune.md)

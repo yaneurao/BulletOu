@@ -1,13 +1,14 @@
-# 4. Inspect and use the result — output files, training log, engine integration
+# 7. Inspect the result — output files and training log
 
-<a href="../../ja/tutorial/4-result.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/7-result.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 What to do after (or during) training:
 - check what's in the output directory
 - read `learn.log` to confirm training is healthy
-- load the trained eval into a YaneuraOu engine
 
-## 4.1 Inspect the output
+(Loading the trained eval into a YaneuraOu engine is covered in [8. Load into an engine](8-engine.md).)
+
+## 7.1 Inspect the output
 
 After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32/`) has the following layout:
 
@@ -30,7 +31,7 @@ checkpoints/NNUE_HALFKP-256x2-32-32/
 
 For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three files `KK_synthesized.bin` / `KKP_synthesized.bin` / `KPP_synthesized.bin` (all three are required together).
 
-## 4.2 Reading the training log (`learn.log`)
+## 7.2 Reading the training log (`learn.log`)
 
 The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). Both are the **same 9-column CSV** format.
 
@@ -92,7 +93,7 @@ A healthy training run typically shows:
    - Drops sharply at first, then slowly tapers
    - You should see a visible drop per superbatch consumed
    - No drop after a full superbatch ⇒ `--lr` may be too large, or the teacher is too small for the model
-   - **Periodic loss spikes** (jumping sharply every few hundred batches) almost always mean the teacher file wasn't pre-shuffled. The shuffle buffer crosses a region boundary (default 256MB buffer ≒ every ~410 batches), and the distribution shifts. Fix: see [§2.2 Pre-shuffle the teacher file](2-train.md#pre-shuffle-the-teacher-file)
+   - **Periodic loss spikes** (jumping sharply every few hundred batches) almost always mean the teacher file wasn't pre-shuffled. The shuffle buffer crosses a region boundary (default 256MB buffer ≒ every ~410 batches), and the distribution shifts. Fix: see [§3.2 Pre-shuffle the teacher file](3-data.md#pre-shuffle-the-teacher-file)
 
 2. **`lr` drops on the `--lr-step` cadence by `--lr-gamma`**
    - With `--lr 0.001 --lr-gamma 0.1 --lr-step 8`: 0.001 for superbatches 1-8, 0.0001 for 9-16, ...
@@ -151,48 +152,9 @@ Using `positions` as the time axis gives you a continuous loss curve across resu
 
 `epoch` / `superbatch` are within-run counters, so the same numbers appear multiple times after a resume. To find a run boundary, look for a row where `(epoch, superbatch)` resets back to a low value while `positions` keeps going up.
 
-## 4.3 Load into an engine
+## 7.3 Where to go next
 
-A minimum walkthrough for verifying the trained weights in a YaneuraOu engine.
-
-### For NNUE evals (`nn.bin`)
-
-Put the latest `000N/nn.bin` where the engine looks for its eval file. With YaneuraOu the path is set via the `EvalDir` USI option:
-
-```
-# After the engine starts, in the USI command line:
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
-isready
-bench
-```
-
-Alternatively, place `000N/nn.bin` as `eval/nn.bin` if your engine expects that relative path.
-
-`isready` succeeding means the engine loaded the file. `bench` prints the hash of the loaded `nn.bin`, so a different number on each re-trained model confirms you're really using different weights.
-
-### For KPPT-family evals (three-file set)
-
-Point `EvalDir` at the latest `000N/` directory directly (it must contain all three files):
-
-```
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/KPPT/0005
-isready
-bench
-```
-
-The engine refuses to load if any of the three files is missing.
-
-### If the result is weak
-
-The first training run uses a small teacher and few superbatches, so don't expect competitive strength. To get something usable in real play:
-- Increase teacher size (100M → 1B+ positions)
-- Run several epochs (e.g. `--max-epochs 3`)
-- Increase `--save-rate` (e.g. 10) and only use the later saves
-
-Per-eval-type hyperparameter advice lives in the reference docs ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [halfkpe9.md](../shogi/halfkpe9.md) / [kppt.md](../shogi/kppt.md)).
-
-## 4.4 Where to go next
-
+- [8. Load into an engine](8-engine.md) — verify the trained weights in a YaneuraOu engine
 - [Reference: NNUE HalfKP Training](../shogi/halfkp.md) — `nn.bin` binary layout, quantisation, resume details
 - [Reference: NNUE K-P Training](../shogi/kp.md) — comparison vs HalfKP, input feature structure
 - [Reference: NNUE HalfKPE9 Training](../shogi/halfkpe9.md) — HalfKP with attacker-count buckets
@@ -201,4 +163,4 @@ Per-eval-type hyperparameter advice lives in the reference docs ([halfkp.md](../
 
 ---
 
-Previous: [3. Tune the training](3-tune.md)
+Previous: [6. Tune the training](6-tune.md)
