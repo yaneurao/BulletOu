@@ -22,6 +22,7 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 |---|---|---|
 | **`NNUE_HALFKP`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` |
 | `NNUE_KP` | HalfKP と同じ 4 層 ClippedReLU だが入力を K + P に分割した軽量版。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
+| `NNUE_HALFKPE9` | HalfKP に「駒のマスに対する自軍/敵軍の利き数 (0/1/2 にクリップ、9 通り)」を多重化した拡張版 (1,128,492 次元、HalfKP × 9)。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
 | `KPPT` | 旧来の KK + KKP + KPP の 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなしでサイズ半減) | 同上 (KPP の layout だけ違う) |
 

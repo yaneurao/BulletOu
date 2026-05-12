@@ -10,7 +10,9 @@
 //! 参考実装: `examples/shogi_simple.rs` の `OutputFormat::Standard` 経路。
 //! ここに切り出すことで `bulletou` などの統合 CLI からも再利用できる。
 
-use crate::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR};
+use crate::game::inputs::{
+    FEATURE_HASH, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HM_V2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
+};
 
 /// YaneuraOu / Stockfish 互換 NNUE バイナリのバージョンマジック。
 pub const NNUE_VERSION: u32 = 0x7AF32F16;
@@ -28,6 +30,11 @@ pub enum NnueFeatureSet {
     /// K-P(Friend) — YaneuraOu の `FeatureSet<K, P>` (`k-p_256x2-32-32.h`)。
     /// K (玉 2 個, 162 次元) + P (玉以外, 1548 次元) = 1710 次元 / perspective。
     Kp,
+    /// HalfKPE9(Friend) — YaneuraOu の `halfkpe9_*` 系。HalfKP の
+    /// `(king_sq, piece)` ペアに、その駒のマスの利き数情報を
+    /// 9 通り (= 自軍 0/1/2 × 敵軍 0/1/2) ぶん多重化。
+    /// 1,128,492 次元 / perspective。
+    HalfKpe9,
 }
 
 impl NnueFeatureSet {
@@ -38,6 +45,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKa => FEATURE_HASH_NONMIRROR,
             NnueFeatureSet::HalfKaHm => FEATURE_HASH_HM_V2,
             NnueFeatureSet::Kp => FEATURE_HASH_KP,
+            NnueFeatureSet::HalfKpe9 => FEATURE_HASH_HALFKPE9,
         }
     }
 
@@ -48,6 +56,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKa => 138_510,
             NnueFeatureSet::HalfKaHm => 73_305,
             NnueFeatureSet::Kp => 1_710,
+            NnueFeatureSet::HalfKpe9 => 1_128_492,
         }
     }
 
@@ -62,6 +71,8 @@ impl NnueFeatureSet {
             // 慣習に従って "K-P(Friend)" 表記とする。engine 側が description を
             // 厳密検証しない限り、network_hash が一致すれば load 可能。
             NnueFeatureSet::Kp => "K-P(Friend)",
+            // YaneuraOu features/half_kpe9.h の kName と一致 (大文字 "E")。
+            NnueFeatureSet::HalfKpe9 => "HalfKPE9(Friend)",
         }
     }
 }

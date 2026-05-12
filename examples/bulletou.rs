@@ -15,6 +15,7 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_HALFKP                    classic HalfKP NNUE (default --arch 256x2-32-32)
     bulletou --eval-type NNUE_HALFKP --arch 1024x2-8-64 larger HalfKP NNUE
     bulletou --eval-type NNUE_KP                        K+P NNUE (default --arch 256x2-32-32)
+    bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
 
 Supported `--arch` presets (matching the per-arch directories under
 YaneuraOu's NNUE engine binary distribution):
@@ -49,7 +50,7 @@ Usage:
 use std::path::PathBuf;
 
 use bullet_lib::{
-    game::inputs::{ShogiHalfKP, ShogiKk, ShogiKkp, ShogiKp, ShogiKpp, SparseInputType},
+    game::inputs::{ShogiHalfKP, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp, ShogiKpp, SparseInputType},
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
@@ -98,6 +99,13 @@ enum EvalType {
     /// instead of HalfKP's (king × piece) cross product. Architecture is
     /// selected via `--arch` (default `256x2-32-32`).
     NnueKp,
+    /// NNUE HalfKPE9. YaneuraOu halfkpe9_* — HalfKP × 9 effect-count buckets
+    /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3×3=9
+    /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP ×
+    /// 9). Same 4-layer ClippedReLU network as halfkp / kp. Requires
+    /// piece-effect computation, which BulletOu's threat module already
+    /// provides.
+    NnueHalfkpe9,
 }
 
 /// Pre-set NNUE architecture sizes — `<L1>x2-<L2>-<L3>` in the textual CLI
@@ -164,6 +172,7 @@ impl EvalType {
             EvalType::KppKkpt => "shogi_kpp_kkpt",
             EvalType::NnueHalfkp => "shogi_nnue_halfkp",
             EvalType::NnueKp => "shogi_nnue_kp",
+            EvalType::NnueHalfkpe9 => "shogi_nnue_halfkpe9",
         }
     }
 
@@ -173,7 +182,7 @@ impl EvalType {
     fn uses_arch(self) -> bool {
         match self {
             EvalType::Kppt | EvalType::KppKkpt => false,
-            EvalType::NnueHalfkp | EvalType::NnueKp => true,
+            EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::NnueHalfkpe9 => true,
         }
     }
 
@@ -187,6 +196,7 @@ impl EvalType {
             EvalType::KppKkpt => "KPP_KKPT",
             EvalType::NnueHalfkp => "NNUE_HALFKP",
             EvalType::NnueKp => "NNUE_KP",
+            EvalType::NnueHalfkpe9 => "NNUE_HALFKPE9",
         }
     }
 
@@ -396,6 +406,7 @@ fn main() {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         EvalType::NnueHalfkp => run_halfkp(&args),
         EvalType::NnueKp => run_kp(&args),
+        EvalType::NnueHalfkpe9 => run_halfkpe9(&args),
     }
 }
 
@@ -1494,6 +1505,97 @@ fn run_kp(args: &Args) {
         .dual_perspective()
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKp)
+        .save_format(&save_format)
+        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+
+    if args.score_drop_abs > 0 {
+        builder = builder.score_drop_abs(args.score_drop_abs);
+    }
+
+    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
+        let l0 = builder.new_affine("l0", input_size, l1_size);
+        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+        let l2 = builder.new_affine("l2", l2_size, l3_size);
+        let out = builder.new_affine("out", l3_size, 1);
+
+        let stm_hidden = l0.forward(stm_inputs).crelu();
+        let ntm_hidden = l0.forward(ntm_inputs).crelu();
+        let combined = stm_hidden.concat(ntm_hidden);
+        let hidden1 = l1.forward(combined).crelu();
+        let hidden2 = l2.forward(hidden1).crelu();
+        out.forward(hidden2)
+    });
+
+    if let Some(dir) = resume_dir.as_ref() {
+        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
+    run_training_inline_nnue!(args, &mut trainer);
+
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
+
+    let ctx = LogContext::from_args(args);
+    let top_level_log = output_dir.join("learn.log");
+    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
+    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        Ok((_first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
+/// HalfKP / K-P, but the input is `ShogiHalfKpe9` (1,128,492 dims per
+/// perspective = HalfKP × 9 effect-count buckets). The effect-count
+/// computation is done once per training position by `ShogiHalfKpe9`'s
+/// `map_features` using the threat module's `for_each_attack`.
+fn run_halfkpe9(args: &Args) {
+    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let input_size = ShogiHalfKpe9.num_inputs();
+    let l1_input_dim = 2 * l1_size;
+
+    eprintln!(
+        "=== bulletou: running NNUE_HALFKPE9 ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
+        l1_size, l2_size, l3_size
+    );
+
+    let output_dir = args.output_dir();
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
+        eprintln!("=== resume detected: {} ===", state_bin_path.display());
+        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+            std::process::exit(1);
+        });
+        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse state.bin: {e}");
+            std::process::exit(1);
+        });
+        let resume_root = output_dir.join(".bulletou_resume");
+        let _ = std::fs::remove_dir_all(&resume_root);
+        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
+            eprintln!("error: state.bin missing `nnue/*` records: {e}");
+            std::process::exit(1);
+        });
+        resume_root
+    });
+
+    let save_format = build_nnue_save_format(NnueFeatureSet::HalfKpe9, l1_size, l2_size, l3_size);
+
+    let mut builder = ValueTrainerBuilder::default()
+        .dual_perspective()
+        .optimiser(optimiser::AdamW)
+        .inputs(ShogiHalfKpe9)
         .save_format(&save_format)
         .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
 

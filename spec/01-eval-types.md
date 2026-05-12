@@ -10,6 +10,7 @@
 | `KPP_KKPT` | KPPT (factorised) | 同上だが KPP のみ手番チャンネルなしの int16 (約半サイズ) | ○ |
 | `NNUE_HALFKP` | NNUE | `nn.bin` 単独 | ○ |
 | `NNUE_KP` | NNUE | `nn.bin` 単独 | ○ |
+| `NNUE_HALFKPE9` | NNUE | `nn.bin` 単独 | ○ |
 
 すべての eval-type で、save dir には別途 `state.bin` (resume 用) と `learn.log` (loss snapshot) が一緒に書かれる。詳細は [04-checkpoint-layout.md](04-checkpoint-layout.md)。
 
@@ -24,7 +25,7 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 | `--eval-type` | `--arch` を使うか | 現状サポートする `--arch` 値 |
 |---|---|---|
 | `KPPT` / `KPP_KKPT` | 使わない (固定 architecture) | n/a |
-| `NNUE_HALFKP` / `NNUE_KP` | 使う | `256x2-32-32` (default)<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64`<br>(やねうら王が `NNUE_halfkp_*` で配布している全 preset と一致) |
+| `NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` | 使う | `256x2-32-32` (default)<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64`<br>(やねうら王が `NNUE_halfkp_*` で配布している全 preset と一致) |
 
 `--arch` の値は `<L1>x2-<L2>-<L3>` 表記 (Stockfish 慣習に準拠)。`x2` は dual-perspective を意味する固定リテラル。
 
@@ -40,6 +41,7 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 | `KPP_KKPT` | `checkpoints/KPP_KKPT` |
 | `NNUE_HALFKP` | `checkpoints/NNUE_HALFKP-256x2-32-32` |
 | `NNUE_KP` | `checkpoints/NNUE_KP-256x2-32-32` |
+| `NNUE_HALFKPE9` | `checkpoints/NNUE_HALFKPE9-256x2-32-32` |
 
 NNUE 系は `<eval-type>-<arch>`、KPPT 系は `<eval-type>` のみ。`<eval-type>` と `<arch>` はそれぞれ CLI でユーザーが入力する値 (SCREAMING_SNAKE_CASE / `256x2-32-32` 表記) をそのまま使う。
 

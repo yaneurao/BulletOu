@@ -116,6 +116,57 @@ active index 配置 (`FeatureSet<K, P>` の Head=K, Tail=P 合成則より):
 
 詳細は `crates/bullet_lib/src/game/inputs/shogi_kp.rs`。
 
+## HalfKPE9
+
+YaneuraOu の `Features::HalfKPE9` (`features/half_kpe9.{h,cpp}`) 相当。HalfKP の input に「**駒のいるマスへの利き数情報**」を 9 通り掛けた変種。
+
+| 項目 | 値 |
+|---|---|
+| dim | 81 × 1548 × 9 = **1,128,492** (= HalfKP × 9) |
+| max_active | 38 (HalfKP と同じ、玉以外の駒) |
+| FEATURE_HASH | **`0x5D69D5B8`** (HalfKP と同値) |
+| 識別子 (description) | `HalfKPE9(Friend)` |
+
+active index 計算式 (`MakeIndex` 由来):
+
+```
+index = fe_end × king_sq + bonapiece
+      + fe_end × SQ_NB × (effect1 × 3 + effect2)
+```
+
+- `effect1` = perspective から見た自軍がそのマスに与えている利き数 (0/1/2 にクリップ)
+- `effect2` = 同じく敵軍の利き数
+- `effect bucket = effect1 × 3 + effect2`、0..8 の 9 通り
+
+bucket index 配置:
+
+| `effect1, effect2` | bucket | index 範囲 |
+|---|---|---|
+| (0, 0) | 0 | `0 .. 125,387` (= HalfKP と同じ index) |
+| (0, 1) | 1 | `125,388 .. 250,775` |
+| (0, 2) | 2 | `250,776 .. 376,163` |
+| (1, 0) | 3 | ... |
+| ... | ... | ... |
+| (2, 2) | 8 | `1,003,104 .. 1,128,491` |
+
+### 利き計算
+
+各教師局面について、81 マス × 2 色 = 162 セルの利き数 table を作成する (`bullet_lib::game::inputs::shogi_halfkpe9::compute_effect_counts`)。玉を含む全駒種について `for_each_attack` で利き先マスを列挙 → 該当セルをインクリメント (上限 2)。slider 駒 (角・飛・馬・竜) は遮蔽考慮で正しく扱われる。
+
+### 手駒の扱い
+
+手駒は盤上 sq を持たないので `effect1 = effect2 = 0` 固定。`effect bucket = 0` に発火 (= HalfKP と同じ index 領域)。
+
+### FEATURE_HASH の collision
+
+YaneuraOu の `kHashValue` 定義:
+```cpp
+static constexpr std::uint32_t kHashValue =
+    0x5D69D5B9u ^ (AssociatedKing == Side::kFriend);
+```
+
+これは HalfKP の kHashValue と **完全に同じ値**。エンジン側は `kHashValue` だけでは HalfKP / HalfKPE9 を判別できず、description 文字列 (`HalfKPE9(Friend)`) と入力次元の違いで判別する。
+
 ## HalfKP vs K-P 設計比較
 
 | | HalfKP | K-P |
