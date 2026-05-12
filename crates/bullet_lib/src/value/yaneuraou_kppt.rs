@@ -34,6 +34,20 @@
 //! the diagonal `p1 == p2` is never updated (and stays at the initialised
 //! value of 0).
 //!
+//! ## KPPT vs KPP_KKPT
+//!
+//! Two file-format variants are supported via [`KppFormat`]:
+//!
+//! - [`KppFormat::Kppt`] (default): KPP is `int16_t × 2` per entry (740 MB).
+//!   `[0]` = turn-independent, `[1]` = turn-dependent. Used by the standard
+//!   YaneuraOu KPPT eval (e.g. elmo(WCSC27)).
+//! - [`KppFormat::KppKkpt`]: KPP is `int16_t` per entry (388 MB; *no* turn
+//!   channel). The "factorised" variant where the turn term lives only in
+//!   KK / KKP, not in KPP. Used by older YaneuraOu KPP_KKPT evals.
+//!
+//! KK and KKP file layouts are **identical** between the two variants (both
+//! are `int32_t × 2`). Only the KPP file differs.
+//!
 //! ## Coordinate mapping
 //!
 //! BulletOu's `ShogiKk` / `ShogiKkp` produce a `stm_idx = my_king * 81 + inverse(opp_king)`
@@ -63,6 +77,18 @@ const FE_END: usize = 1548;
 const KK_TOTAL: usize = SQ_NB * SQ_NB; // 6561
 const KKP_TOTAL: usize = SQ_NB * SQ_NB * FE_END; // 10,156,428
 const KPP_TOTAL: usize = SQ_NB * FE_END * FE_END; // 194,100,624
+
+/// Which on-disk KPP binary layout to write.
+///
+/// See the module-level doc for the distinction between the two variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KppFormat {
+    /// `int16_t kpp[81][1548][1548][2]` — KPPT (with turn channel). 740 MB.
+    #[default]
+    Kppt,
+    /// `int16_t kpp[81][1548][1548]` — KPP_KKPT (no turn channel). 388 MB.
+    KppKkpt,
+}
 
 /// Parse BulletOu's `optimiser_state/weights.bin` into a map of weight ID -> f32 vector.
 ///
@@ -139,8 +165,20 @@ pub fn parse_model_weights_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<
 /// present are written: e.g. if the model has only `kkw` / `kkb`, the KKP file
 /// is skipped.
 ///
-/// `eval_scale` multiplies the f32 weight before rounding to i32.
+/// `eval_scale` multiplies the f32 weight before rounding to i{32,16}.
+/// Equivalent to [`save_yaneuraou_eval`] with `KppFormat::Kppt`.
 pub fn save_yaneuraou_kppt(checkpoint_dir: &Path, eval_scale: f32) -> io::Result<()> {
+    save_yaneuraou_eval(checkpoint_dir, eval_scale, KppFormat::Kppt)
+}
+
+/// Variant of [`save_yaneuraou_kppt`] that selects the on-disk KPP layout
+/// (`KppFormat::Kppt` for standard KPPT, `KppFormat::KppKkpt` for the
+/// factorised KPP_KKPT). KK and KKP outputs are identical in either case.
+pub fn save_yaneuraou_eval(
+    checkpoint_dir: &Path,
+    eval_scale: f32,
+    kpp_format: KppFormat,
+) -> io::Result<()> {
     let weights_path = checkpoint_dir.join("optimiser_state").join("weights.bin");
     let bytes = std::fs::read(&weights_path)?;
     let weights = parse_model_weights_bin(&bytes)?;
@@ -161,7 +199,10 @@ pub fn save_yaneuraou_kppt(checkpoint_dir: &Path, eval_scale: f32) -> io::Result
 
     if let Some(kppw) = weights.get("kppw") {
         let kpp_path = checkpoint_dir.join("KPP_synthesized.bin");
-        write_kpp_bin(&kpp_path, kppw, eval_scale)?;
+        match kpp_format {
+            KppFormat::Kppt => write_kpp_bin(&kpp_path, kppw, eval_scale)?,
+            KppFormat::KppKkpt => write_kpp_bin_factorised(&kpp_path, kppw, eval_scale)?,
+        }
         wrote_any = true;
     }
 
@@ -244,7 +285,7 @@ fn write_kkp_bin(path: &Path, kkpw: &[f32], scale: f32) -> io::Result<()> {
     std::fs::write(path, &buf)
 }
 
-/// `KPP_synthesized.bin` = `int16_t kpp[81][1548][1548][2]` (約 740 MB)。
+/// `KPP_synthesized.bin` (KPPT) = `int16_t kpp[81][1548][1548][2]` (約 740 MB)。
 ///
 /// 訓練側 (`ShogiKpp`) は p1 < p2 の canonical な三角行列のみ学習している
 /// ので、各 `(k, p1, p2)` で `p1 != p2` のとき `kpp[k][p1][p2]` と
@@ -272,6 +313,37 @@ fn write_kpp_bin(path: &Path, kppw: &[f32], scale: f32) -> io::Result<()> {
                 let v0 = quantise_to_i16(kppw[bullet_idx], scale);
                 writer.write_all(&v0.to_le_bytes())?; // [stm_independent]
                 writer.write_all(&0i16.to_le_bytes())?; // [stm_dependent]
+            }
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// `KPP_synthesized.bin` (KPP_KKPT factorised) = `int16_t kpp[81][1548][1548]`
+/// (約 388 MB)。
+///
+/// KPPT との唯一の違いは末尾の `[2]` (手番チャンネル) が無いこと。
+/// 学習側 (`ShogiKpp`) は元々 `[0]` (手番無関係項) のみを学習しているので、
+/// 出力で `[1]` を省くだけで KPP_KKPT 形式になる。`(p1, p2)` の対称コピーは
+/// KPPT と同じ。
+fn write_kpp_bin_factorised(path: &Path, kppw: &[f32], scale: f32) -> io::Result<()> {
+    if kppw.len() != KPP_TOTAL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("kppw size {} != expected {}", kppw.len(), KPP_TOTAL),
+        ));
+    }
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    for k in 0..SQ_NB {
+        for p1 in 0..FE_END {
+            for p2 in 0..FE_END {
+                let (lo, hi) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+                let bullet_idx = k * FE_END * FE_END + lo * FE_END + hi;
+                let v0 = quantise_to_i16(kppw[bullet_idx], scale);
+                writer.write_all(&v0.to_le_bytes())?; // single i16, no turn channel
             }
         }
     }
@@ -357,6 +429,33 @@ mod tests {
         assert_eq!(read_entry(0, 2, 2), 0);
         // 別の k は 0
         assert_eq!(read_entry(1, 2, 5), 0);
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn write_kpp_factorised_half_size_and_symmetric() {
+        // KPP_KKPT 形式は KPPT の半分のサイズ (手番チャンネルなし)、
+        // 対称性は維持されることを確認する。
+        let mut kppw = vec![0.0f32; KPP_TOTAL];
+        kppw[0 * FE_END * FE_END + 2 * FE_END + 5] = 1.0;
+
+        let tmp = std::env::temp_dir().join("bulletou_test_kpp_factorised.bin");
+        write_kpp_bin_factorised(&tmp, &kppw, 100.0).unwrap();
+
+        let meta = std::fs::metadata(&tmp).unwrap();
+        // expected: 81 * 1548 * 1548 * 2 = 388,201,248 byte (i16 × 1 channel)
+        assert_eq!(meta.len(), (KPP_TOTAL * 2) as u64);
+
+        let data = std::fs::read(&tmp).unwrap();
+        let read_entry = |k: usize, p1: usize, p2: usize| -> i16 {
+            let off = (k * FE_END * FE_END + p1 * FE_END + p2) * 2; // *2 (i16), no channel
+            i16::from_le_bytes([data[off], data[off + 1]])
+        };
+        assert_eq!(read_entry(0, 2, 5), 100, "(0, 2, 5) should be 100");
+        assert_eq!(read_entry(0, 5, 2), 100, "(0, 5, 2) should be 100 by symmetry");
+        assert_eq!(read_entry(0, 2, 2), 0); // diagonal
+        assert_eq!(read_entry(1, 2, 5), 0); // different king
 
         let _ = std::fs::remove_file(tmp);
     }

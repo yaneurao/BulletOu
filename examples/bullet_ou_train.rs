@@ -46,7 +46,7 @@ use bullet_lib::{
     value::{
         ValueTrainerBuilder,
         loader::{Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
-        yaneuraou_kppt::save_yaneuraou_kppt,
+        yaneuraou_kppt::{KppFormat, save_yaneuraou_eval},
     },
 };
 use clap::{Parser, ValueEnum};
@@ -59,8 +59,14 @@ enum EvalType {
     KpptKk,
     /// KPPT Phase 2: train only the KKP term, write KKP_synthesized.bin.
     KpptKkp,
-    /// KPPT Phase 3: train only the KPP term, write KPP_synthesized.bin.
+    /// KPPT Phase 3: train only the KPP term, write KPP_synthesized.bin
+    /// (with turn channel — int16 × 2).
     KpptKpp,
+    /// KPP_KKPT (factorised KPPT): train the KPP term and write
+    /// `KPP_synthesized.bin` *without* the turn channel (int16 × 1, ~388 MB).
+    /// KK and KKP for the KPP_KKPT family are identical to `kppt-kk` /
+    /// `kppt-kkp` — use those for the other two components.
+    KppKkptKpp,
 }
 
 impl EvalType {
@@ -69,6 +75,7 @@ impl EvalType {
             EvalType::KpptKk => "shogi_kk_phase1",
             EvalType::KpptKkp => "shogi_kk_kkp_phase2",
             EvalType::KpptKpp => "shogi_kpp_phase3",
+            EvalType::KppKkptKpp => "shogi_kpp_kpp_kkpt",
         }
     }
 
@@ -77,16 +84,27 @@ impl EvalType {
             EvalType::KpptKk => "checkpoints/shogi_kk_phase1",
             EvalType::KpptKkp => "checkpoints/shogi_kk_kkp_phase2",
             EvalType::KpptKpp => "checkpoints/shogi_kpp_phase3",
+            EvalType::KppKkptKpp => "checkpoints/shogi_kpp_kpp_kkpt",
         }
     }
 
     /// Suggested f32 -> i{16,32} quantisation scale for the YaneuraOu writer.
     /// KK / KKP are i32 (large dynamic range) so default 4000 = eval_scale * 10.
-    /// KPP is i16 (small dynamic range) so default is an order of magnitude smaller.
+    /// KPP and KPP_KKPT KPP are i16 (small dynamic range) so default is an
+    /// order of magnitude smaller.
     fn default_yaneuraou_quant_scale(self) -> f32 {
         match self {
             EvalType::KpptKk | EvalType::KpptKkp => 4000.0,
-            EvalType::KpptKpp => 400.0,
+            EvalType::KpptKpp | EvalType::KppKkptKpp => 400.0,
+        }
+    }
+
+    /// On-disk KPP layout to write at checkpoint time. KK / KKP eval types
+    /// don't have a KPP file so this is ignored.
+    fn kpp_format(self) -> KppFormat {
+        match self {
+            EvalType::KppKkptKpp => KppFormat::KppKkpt,
+            _ => KppFormat::Kppt,
         }
     }
 }
@@ -230,6 +248,10 @@ impl Args {
     fn yaneuraou_scale(&self) -> f32 {
         self.yaneuraou_quant_scale.unwrap_or_else(|| self.eval_type.default_yaneuraou_quant_scale())
     }
+
+    fn kpp_format(&self) -> KppFormat {
+        self.eval_type.kpp_format()
+    }
 }
 
 // ----- dispatch ----------------------------------------------------------
@@ -239,7 +261,11 @@ fn main() {
     match args.eval_type {
         EvalType::KpptKk => run_kppt_kk(&args),
         EvalType::KpptKkp => run_kppt_kkp(&args),
-        EvalType::KpptKpp => run_kppt_kpp(&args),
+        // Phase 3 trains the same network (KPP-only standalone) regardless of
+        // whether the on-disk file is the KPPT (with turn channel) or
+        // KPP_KKPT (factorised) variant. Only the writer differs, and that's
+        // decided inside `run_training_inline!` via `args.kpp_format()`.
+        EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args),
     }
 }
 
@@ -274,12 +300,13 @@ macro_rules! run_training_inline {
         let net_id = args.net_id();
         let output_dir_buf = args.output_dir();
         let yaneuraou_scale = args.yaneuraou_scale();
+        let kpp_format = args.kpp_format();
         let on_checkpoint_saved = move |superbatch: usize| {
             let ckpt_dir = output_dir_buf.join(format!("{net_id}-{superbatch}"));
-            match save_yaneuraou_kppt(&ckpt_dir, yaneuraou_scale) {
-                Ok(()) => eprintln!("  also wrote YaneuraOu KPPT binary in {}", ckpt_dir.display()),
+            match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
+                Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
                 Err(e) => {
-                    eprintln!("  WARN: failed to write YaneuraOu KPPT binary in {}: {e}", ckpt_dir.display())
+                    eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display())
                 }
             }
         };
