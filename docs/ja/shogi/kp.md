@@ -113,6 +113,6 @@ L1 / L2 / Output 層は同じ `--arch` preset の下で HalfKP と byte-identica
 | `--eval-type` | `NNUE_KP` | (必須) |
 | `--arch` | `256x2-32-32` (当面これのみ) | `256x2-32-32` |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/shogi_nnue_kp` |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KP-256x2-32-32`) |
 
 全フラグ一覧は [HalfKP 学習](halfkp.md) を参照 (NNUE_HALFKP と NNUE_KP で同じ)。

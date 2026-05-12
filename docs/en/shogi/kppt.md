@@ -151,7 +151,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 |---|---|---|
 | `--eval-type` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (required) |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
-| `--output` | Checkpoint parent directory | per-eval-type default |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` |

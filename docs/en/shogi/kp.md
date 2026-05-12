@@ -113,6 +113,6 @@ L1 / L2 / Output layers are byte-identical between HalfKP and KP for the same `-
 | `--eval-type` | `NNUE_KP` | (required) |
 | `--arch` | `256x2-32-32` (only preset for now) | `256x2-32-32` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/shogi_nnue_kp` |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-256x2-32-32`) |
 
 See [HalfKP Training](halfkp.md) for the full flag list (it is identical between NNUE_HALFKP and NNUE_KP).

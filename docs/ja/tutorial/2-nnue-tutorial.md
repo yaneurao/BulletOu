@@ -57,11 +57,12 @@ teachers/
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
-    --teacher teachers/ \
-    --output checkpoints/my-halfkp
+    --teacher teachers/
 ```
 
 (AMD GPU なら `--features device-cuda` を `--features device-rocm` に。)
+
+`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-256x2-32-32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の名前にしたい場合は `--output checkpoints/my-halfkp` のように明示する。
 
 `--teacher` には:
 - 1 つのファイル (`teachers/teacher.pack` のようなフルパス)
@@ -110,7 +111,6 @@ superbatch 2   ...
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
     --teacher teachers/ \
-    --output checkpoints/my-halfkp \
     --superbatches 40
 ```
 
@@ -118,10 +118,10 @@ cargo run --release --features device-cuda --example bulletou -- \
 
 ## 2.5 出力を確認する
 
-学習完了後、`checkpoints/my-halfkp/` 配下は以下のレイアウト:
+学習完了後、`checkpoints/NNUE_HALFKP-256x2-32-32/` 配下は以下のレイアウト:
 
 ```
-checkpoints/my-halfkp/
+checkpoints/NNUE_HALFKP-256x2-32-32/
 ├── learn.log                          ← 全 run / resume を連結した累積ログ
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ

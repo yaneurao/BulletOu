@@ -151,7 +151,7 @@ cargo run --release --features device-cuda --example bulletou -- \
 |---|---|---|
 | `--eval-type` | `KPPT` (3 component 連続学習) / `KPP_KKPT` (factorised 版) / `KPPT_KK` / `KPPT_KKP` / `KPPT_KPP` / `KPP_KKPT_KPP` | (必須) |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
-| `--output` | チェックポイント親ディレクトリ | eval-type 別自動 |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch の mini-batch 数 | `ceil(100M / batch-size)` |

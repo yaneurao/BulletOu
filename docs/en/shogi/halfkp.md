@@ -90,7 +90,7 @@ If `--output` already contains numbered dirs with `state.bin`, `bulletou` automa
 | `--eval-type` | `NNUE_HALFKP` | (required) |
 | `--arch` | `256x2-32-32` (only preset for now) | `256x2-32-32` |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/shogi_nnue_halfkp` |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32`) |
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--superbatches` | Cap superbatches per epoch | unlimited |
 | `--batches-per-superbatch` | Mini-batches per superbatch | ≈ 100M positions |

@@ -57,11 +57,12 @@ Before running on a huge dataset, you can try a smaller subset by generating a s
 ```bash
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
-    --teacher teachers/ \
-    --output checkpoints/my-halfkp
+    --teacher teachers/
 ```
 
 (Use `--features device-rocm` instead of `cuda` for AMD GPUs.)
+
+With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-256x2-32-32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
 
 `--teacher` accepts:
 - a single file (e.g. `teachers/teacher.pack`),
@@ -108,7 +109,6 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
 cargo run --release --features device-cuda --example bulletou -- \
     --eval-type NNUE_HALFKP \
     --teacher teachers/ \
-    --output checkpoints/my-halfkp \
     --superbatches 40
 ```
 
@@ -116,10 +116,10 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower `-
 
 ## 2.5 Inspect the output
 
-After training finishes, `checkpoints/my-halfkp/` has the following layout:
+After training finishes, `checkpoints/NNUE_HALFKP-256x2-32-32/` has the following layout:
 
 ```
-checkpoints/my-halfkp/
+checkpoints/NNUE_HALFKP-256x2-32-32/
 ├── learn.log                          ← top-level cumulative log across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary

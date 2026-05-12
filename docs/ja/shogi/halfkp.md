@@ -90,7 +90,7 @@ checkpoints/my-halfkp/
 | `--eval-type` | `NNUE_HALFKP` | (必須) |
 | `--arch` | `256x2-32-32` (当面これのみ) | `256x2-32-32` |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/shogi_nnue_halfkp` |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-256x2-32-32`) |
 | `--max-epochs` | 教師データを何周するか | 1 |
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--batches-per-superbatch` | superbatch あたりの mini-batch 数 | ≈ 100M 局面 |

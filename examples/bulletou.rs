@@ -113,6 +113,15 @@ impl NnueArch {
             NnueArch::Arch256x2_32_32 => (256, 32, 32),
         }
     }
+
+    /// The arch's CLI value as the user types it (e.g. `256x2-32-32`).
+    /// Must stay in sync with the `#[clap(name = ...)]` attribute on each
+    /// variant of [`NnueArch`].
+    fn cli_name(self) -> &'static str {
+        match self {
+            NnueArch::Arch256x2_32_32 => "256x2-32-32",
+        }
+    }
 }
 
 impl EvalType {
@@ -129,16 +138,35 @@ impl EvalType {
         }
     }
 
-    fn default_output(self) -> &'static str {
+    /// Does this eval type actually consume `--arch`? KPPT-family eval types
+    /// (KK/KKP/KPP individual components or the full family) have a fixed
+    /// architecture and ignore `--arch`; NNUE eval types use it.
+    fn uses_arch(self) -> bool {
         match self {
-            EvalType::Kppt => "checkpoints/shogi_kppt",
-            EvalType::KppKkpt => "checkpoints/shogi_kpp_kkpt",
-            EvalType::KpptKk => "checkpoints/shogi_kk",
-            EvalType::KpptKkp => "checkpoints/shogi_kkp",
-            EvalType::KpptKpp => "checkpoints/shogi_kpp",
-            EvalType::KppKkptKpp => "checkpoints/shogi_kpp_factorised",
-            EvalType::NnueHalfkp => "checkpoints/shogi_nnue_halfkp",
-            EvalType::NnueKp => "checkpoints/shogi_nnue_kp",
+            EvalType::Kppt
+            | EvalType::KppKkpt
+            | EvalType::KpptKk
+            | EvalType::KpptKkp
+            | EvalType::KpptKpp
+            | EvalType::KppKkptKpp => false,
+            EvalType::NnueHalfkp | EvalType::NnueKp => true,
+        }
+    }
+
+    /// The eval-type's CLI value as the user typed it (e.g. `NNUE_HALFKP`).
+    /// Used to derive the default `--output` directory name. Must stay in
+    /// sync with the `#[clap(rename_all = "SCREAMING_SNAKE_CASE")]`
+    /// attribute on [`EvalType`].
+    fn cli_name(self) -> &'static str {
+        match self {
+            EvalType::Kppt => "KPPT",
+            EvalType::KppKkpt => "KPP_KKPT",
+            EvalType::KpptKk => "KPPT_KK",
+            EvalType::KpptKkp => "KPPT_KKP",
+            EvalType::KpptKpp => "KPPT_KPP",
+            EvalType::KppKkptKpp => "KPP_KKPT_KPP",
+            EvalType::NnueHalfkp => "NNUE_HALFKP",
+            EvalType::NnueKp => "NNUE_KP",
         }
     }
 
@@ -281,8 +309,27 @@ struct Args {
 }
 
 impl Args {
+    /// Resolve the checkpoint output directory.
+    ///
+    /// - `--output PATH` honours the user's choice as-is.
+    /// - Otherwise the default is `checkpoints/<eval-type>-<arch>` for eval
+    ///   types that consume `--arch` (the NNUE family), and
+    ///   `checkpoints/<eval-type>` for the KPPT family (which doesn't).
+    ///
+    /// `<eval-type>` and `<arch>` are the literal CLI values the user
+    /// would type (e.g. `NNUE_HALFKP`, `256x2-32-32`) so the dir name
+    /// stays in sync with the flags.
     fn output_dir(&self) -> PathBuf {
-        self.output.clone().unwrap_or_else(|| PathBuf::from(self.eval_type.default_output()))
+        if let Some(p) = &self.output {
+            return p.clone();
+        }
+        let mut path = PathBuf::from("checkpoints");
+        if self.eval_type.uses_arch() {
+            path.push(format!("{}-{}", self.eval_type.cli_name(), self.arch.cli_name()));
+        } else {
+            path.push(self.eval_type.cli_name());
+        }
+        path
     }
 
     fn net_id(&self) -> String {
