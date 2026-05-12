@@ -160,6 +160,94 @@ pub fn parse_model_weights_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<
     Ok(map)
 }
 
+/// Serialise an iterator of `(id, weights)` pairs into the same
+/// "id\n<usize LE><f32 LE × N>" record stream that
+/// [`parse_model_weights_bin`] reads. Returns the in-memory byte buffer.
+pub fn write_model_weights_bin<'a>(
+    records: impl IntoIterator<Item = (&'a str, &'a [f32])>,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (id, values) in records {
+        buf.extend_from_slice(id.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(&values.len().to_le_bytes());
+        for v in values {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Bundle one component's `optimiser_state/{weights,momentum,velocity}.bin`
+/// files at `optimiser_state_dir` into the running combined-state buffer
+/// `out`, with every record's ID prefixed by
+/// `<component>/<section>/` so the three components do not clash on shared
+/// IDs (e.g. all components have `outw`).
+///
+/// `component` is `"kk"` / `"kkp"` / `"kpp"`. `section` selects which
+/// optimiser file: `"weights"`, `"momentum"`, or `"velocity"`.
+pub fn bundle_component_state(
+    out: &mut Vec<u8>,
+    component: &str,
+    optimiser_state_dir: &Path,
+) -> io::Result<()> {
+    for section in ["weights", "momentum", "velocity"] {
+        let path = optimiser_state_dir.join(format!("{section}.bin"));
+        let bytes = std::fs::read(&path)?;
+        let parsed = parse_model_weights_bin(&bytes)?;
+        let mut records: Vec<(String, &[f32])> = parsed.iter().map(|(k, v)| {
+            (format!("{component}/{section}/{k}"), v.as_slice())
+        }).collect();
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), *v)));
+        out.extend_from_slice(&chunk);
+    }
+    Ok(())
+}
+
+/// Extract one component's records from a `state.bin` buffer parsed by
+/// [`parse_model_weights_bin`]. Returns a map from un-prefixed weight ID
+/// (e.g. `kkw`) to its f32 buffer, for the requested `section` (one of
+/// `"weights"`, `"momentum"`, `"velocity"`) of the requested `component`
+/// (`"kk"` / `"kkp"` / `"kpp"`).
+pub fn extract_component_section(
+    state_records: &BTreeMap<String, Vec<f32>>,
+    component: &str,
+    section: &str,
+) -> BTreeMap<String, Vec<f32>> {
+    let prefix = format!("{component}/{section}/");
+    state_records
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|tail| (tail.to_string(), v.clone())))
+        .collect()
+}
+
+/// Write a single component's `weights.bin` / `momentum.bin` /
+/// `velocity.bin` triplet to `optimiser_state_dir` from the bundled
+/// `state.bin` buffer, so a freshly-built bullet trainer can pick it up
+/// via `Optimiser::load_from_checkpoint(<dir>)`. Returns an error if the
+/// component's records are missing from `state_records`.
+pub fn unbundle_component_state(
+    state_records: &BTreeMap<String, Vec<f32>>,
+    component: &str,
+    optimiser_state_dir: &Path,
+) -> io::Result<()> {
+    std::fs::create_dir_all(optimiser_state_dir)?;
+    for section in ["weights", "momentum", "velocity"] {
+        let extracted = extract_component_section(state_records, component, section);
+        if extracted.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("state.bin: no `{component}/{section}/*` records"),
+            ));
+        }
+        let records: Vec<(&str, &[f32])> = extracted.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let chunk = write_model_weights_bin(records.into_iter());
+        std::fs::write(optimiser_state_dir.join(format!("{section}.bin")), chunk)?;
+    }
+    Ok(())
+}
+
 /// Convert a checkpoint directory's `optimiser_state/weights.bin` into YaneuraOu
 /// KPPT binaries placed alongside it. Only the components that are actually
 /// present are written: e.g. if the model has only `kkw` / `kkb`, the KKP file
@@ -431,6 +519,57 @@ mod tests {
         assert_eq!(read_entry(1, 2, 5), 0);
 
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn bundle_and_unbundle_state_round_trip() {
+        // 3 component 分の optimiser_state を作って bundle → unbundle で
+        // 戻ることを確認。
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("bulletou_state_roundtrip");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Synthesise per-component optimiser_state dirs with three sections each.
+        for comp in ["kk", "kkp", "kpp"] {
+            let dir = tmp.join(format!("{comp}_orig")).join("optimiser_state");
+            fs::create_dir_all(&dir).unwrap();
+            for section in ["weights", "momentum", "velocity"] {
+                let id_a = format!("{comp}_idA");
+                let id_b = format!("{comp}_idB");
+                let bytes = write_model_weights_bin(
+                    [
+                        (id_a.as_str(), [1.0f32, 2.0, 3.0].as_slice()),
+                        (id_b.as_str(), [4.0f32, 5.0].as_slice()),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k, v)),
+                );
+                fs::write(dir.join(format!("{section}.bin")), bytes).unwrap();
+            }
+        }
+
+        // Bundle
+        let mut bundled: Vec<u8> = Vec::new();
+        for comp in ["kk", "kkp", "kpp"] {
+            bundle_component_state(&mut bundled, comp, &tmp.join(format!("{comp}_orig/optimiser_state")))
+                .unwrap();
+        }
+
+        // Re-parse and unbundle each component back to its own dir
+        let parsed = parse_model_weights_bin(&bundled).unwrap();
+        for comp in ["kk", "kkp", "kpp"] {
+            let dst = tmp.join(format!("{comp}_restored")).join("optimiser_state");
+            unbundle_component_state(&parsed, comp, &dst).unwrap();
+            for section in ["weights", "momentum", "velocity"] {
+                let orig =
+                    fs::read(tmp.join(format!("{comp}_orig/optimiser_state/{section}.bin"))).unwrap();
+                let restored = fs::read(dst.join(format!("{section}.bin"))).unwrap();
+                assert_eq!(orig, restored, "{comp}/{section}: round-trip mismatch");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

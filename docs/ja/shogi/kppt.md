@@ -65,17 +65,25 @@ checkpoints/my-kppt/
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
-│   └── KPP_synthesized.bin
+│   ├── KPP_synthesized.bin
+│   └── state.bin                      ← resume 用の重み + Adam moments (3 component ぶん)
 ├── 0002/
 │   ├── ...
 ├── ...
 └── 000N/                              ← 最新 (= 最後に保存された) save
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
-    └── KPP_synthesized.bin
+    ├── KPP_synthesized.bin
+    └── state.bin
 ```
 
-最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能。
+最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
+
+### 中断・再開
+
+`--output` で指定した dir に `0001/` 等の numbered dir + `state.bin` が既に存在する場合、起動時に自動的に **最新の `state.bin` から resume** します。新しい save は既存番号の続きから書かれる (例: 前回 5 個保存していたら新規 save は `0006/` から)。
+
+同じコマンドを実行するだけで、前回の重みを引き継いで学習が続行されます。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除してください。
 
 ### KPP_KKPT (factorised)
 

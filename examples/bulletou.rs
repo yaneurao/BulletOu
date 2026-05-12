@@ -45,7 +45,10 @@ use bullet_lib::{
     value::{
         ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
-        yaneuraou_kppt::{KppFormat, save_yaneuraou_eval},
+        yaneuraou_kppt::{
+            KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
+            unbundle_component_state,
+        },
     },
 };
 use clap::{Parser, ValueEnum};
@@ -249,13 +252,53 @@ fn main() {
     let args = Args::parse();
     match args.eval_type {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
-        EvalType::KpptKk => run_kppt_kk(&args),
-        EvalType::KpptKkp => run_kppt_kkp(&args),
+        // Single-component eval-types do not currently auto-resume. (For
+        // resume, drive the full family with `--eval-type kppt` / `kpp-kkpt`.)
+        EvalType::KpptKk => run_kppt_kk(&args, None),
+        EvalType::KpptKkp => run_kppt_kkp(&args, None),
         // KPP trains the same network for both the KPPT and KPP_KKPT layouts;
         // only the writer differs, selected inside `run_training_inline!` via
         // `args.kpp_format()`.
-        EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args),
+        EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&args, None),
     }
+}
+
+/// Count numbered subdirectories under `output_dir` whose names parse as
+/// `usize`. Used so a resumed run extends the numbering rather than
+/// overwriting the previous run's checkpoint dirs.
+fn count_existing_numbered_dirs(output_dir: &std::path::Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(output_dir) else { return 0 };
+    rd.flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.parse::<usize>().is_ok())
+        .count()
+}
+
+/// Find the latest numbered subdirectory under `output_dir` (4-or-more-digit
+/// name parsable as `usize`) whose `state.bin` exists. Returns `None` if no
+/// resumable checkpoint is found.
+fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut latest: Option<(usize, std::path::PathBuf)> = None;
+    let rd = std::fs::read_dir(output_dir).ok()?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Ok(n) = name.parse::<usize>() else { continue };
+        let state_bin = path.join("state.bin");
+        if !state_bin.is_file() {
+            continue;
+        }
+        match &latest {
+            None => latest = Some((n, state_bin)),
+            Some((m, _)) if n > *m => latest = Some((n, state_bin)),
+            _ => {}
+        }
+    }
+    latest.map(|(_, p)| p)
 }
 
 // ----- KPPT family: KK + KKP + KPP sequential dispatch -------------------
@@ -281,10 +324,46 @@ fn run_kppt_all(args: &Args) {
         _ => unreachable!(),
     });
 
-    for (label, child_eval_type, net_id) in [
-        ("KK", EvalType::KpptKk, "kk"),
-        ("KKP", EvalType::KpptKkp, "kkp"),
-        ("KPP", kpp_eval_type, "kpp"),
+    // ---- Resume support -------------------------------------------------
+    // If `<output>` already contains a numbered dir with a `state.bin`,
+    // unbundle each component's records into a per-component
+    // `optimiser_state/` triplet under `<output>/.bulletou_resume/<comp>/`,
+    // and let each child run_kppt_* call `trainer.load_from_checkpoint(<comp>)`
+    // immediately after building its trainer.
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dirs: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> =
+        resume_state_bin.as_ref().map(|state_bin_path| {
+            eprintln!("=== resume detected: {} ===", state_bin_path.display());
+            let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+                eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+                std::process::exit(1);
+            });
+            let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+                eprintln!("error: failed to parse state.bin: {e}");
+                std::process::exit(1);
+            });
+            let resume_root = output_dir.join(".bulletou_resume");
+            // Fresh extraction each run; old contents may correspond to a
+            // different save point.
+            let _ = std::fs::remove_dir_all(&resume_root);
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            for comp in ["kk", "kkp", "kpp"] {
+                let comp_dir = resume_root.join(comp);
+                unbundle_component_state(&records, comp, &comp_dir.join("optimiser_state")).unwrap_or_else(
+                    |e| {
+                        eprintln!("error: state.bin missing `{comp}/*` records: {e}");
+                        std::process::exit(1);
+                    },
+                );
+                paths.push(comp_dir);
+            }
+            (paths[0].clone(), paths[1].clone(), paths[2].clone())
+        });
+
+    for (label, child_eval_type, net_id, resume_dir) in [
+        ("KK", EvalType::KpptKk, "kk", resume_dirs.as_ref().map(|d| d.0.clone())),
+        ("KKP", EvalType::KpptKkp, "kkp", resume_dirs.as_ref().map(|d| d.1.clone())),
+        ("KPP", kpp_eval_type, "kpp", resume_dirs.as_ref().map(|d| d.2.clone())),
     ] {
         eprintln!("\n=== [{label}] training ===");
         let mut child = args.clone();
@@ -296,12 +375,15 @@ fn run_kppt_all(args: &Args) {
             child.yaneuraou_quant_scale = Some(child_eval_type.default_yaneuraou_quant_scale());
         }
         match child_eval_type {
-            EvalType::KpptKk => run_kppt_kk(&child),
-            EvalType::KpptKkp => run_kppt_kkp(&child),
-            EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&child),
+            EvalType::KpptKk => run_kppt_kk(&child, resume_dir.as_deref()),
+            EvalType::KpptKkp => run_kppt_kkp(&child, resume_dir.as_deref()),
+            EvalType::KpptKpp | EvalType::KppKkptKpp => run_kppt_kpp(&child, resume_dir.as_deref()),
             _ => unreachable!(),
         }
     }
+
+    // Cleanup the scratch resume dir if it was used.
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     // Re-organise per-component checkpoint subdirs into a flat, zero-padded
     // series `0001/`, `0002/`, ..., each containing the three `.bin` files
@@ -377,14 +459,30 @@ fn assemble_numbered_dirs(output_dir: &std::path::Path) -> std::io::Result<()> {
         );
     }
 
-    eprintln!("\n=== assembling {n} checkpoint dir(s) under {} ===", output_dir.display());
+    // When resuming, do not overwrite the previous run's numbered dirs --
+    // start at `existing_count + 1` so new saves extend the series.
+    let existing_count = count_existing_numbered_dirs(output_dir);
+
+    eprintln!(
+        "\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===",
+        output_dir.display(),
+        existing_count + 1
+    );
     for i in 0..n {
-        let idx = i + 1;
+        let idx = existing_count + i + 1;
         let dst = output_dir.join(format!("{idx:04}"));
         std::fs::create_dir_all(&dst)?;
+        // engine-facing quantised .bin files
         std::fs::copy(kk_dirs[i].join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
         std::fs::copy(kkp_dirs[i].join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
         std::fs::copy(kpp_dirs[i].join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
+        // bundle the three components' resume state (Adam weights + momentum + velocity)
+        // into a single `state.bin` so the dir holds everything needed to resume.
+        let mut state_buf: Vec<u8> = Vec::new();
+        bundle_component_state(&mut state_buf, "kk", &kk_dirs[i].join("optimiser_state"))?;
+        bundle_component_state(&mut state_buf, "kkp", &kkp_dirs[i].join("optimiser_state"))?;
+        bundle_component_state(&mut state_buf, "kpp", &kpp_dirs[i].join("optimiser_state"))?;
+        std::fs::write(dst.join("state.bin"), &state_buf)?;
         eprintln!("  -> {}/", dst.display());
     }
 
@@ -510,7 +608,7 @@ macro_rules! run_training_inline {
 
 // ----- KPPT: KK ---------------------------------------------------------
 
-fn run_kppt_kk(args: &Args) {
+fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -542,12 +640,17 @@ fn run_kppt_kk(args: &Args) {
         out.forward(combined)
     });
 
+    if let Some(dir) = resume_dir {
+        eprintln!("  [KK] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
     run_training_inline!(args, &mut trainer);
 }
 
 // ----- KPPT: KKP --------------------------------------------------------
 
-fn run_kppt_kkp(args: &Args) {
+fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -579,12 +682,17 @@ fn run_kppt_kkp(args: &Args) {
         out.forward(combined)
     });
 
+    if let Some(dir) = resume_dir {
+        eprintln!("  [KKP] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
     run_training_inline!(args, &mut trainer);
 }
 
 // ----- KPPT: KPP --------------------------------------------------------
 
-fn run_kppt_kpp(args: &Args) {
+fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -615,6 +723,11 @@ fn run_kppt_kpp(args: &Args) {
         let combined = stm_eval.concat(ntm_eval);
         out.forward(combined)
     });
+
+    if let Some(dir) = resume_dir {
+        eprintln!("  [KPP] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
 
     run_training_inline!(args, &mut trainer);
 }

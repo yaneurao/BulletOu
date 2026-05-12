@@ -65,17 +65,25 @@ checkpoints/my-kppt/
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
-│   └── KPP_synthesized.bin
+│   ├── KPP_synthesized.bin
+│   └── state.bin                      ← resume data (weights + Adam moments for all 3 components)
 ├── 0002/
 │   ├── ...
 ├── ...
 └── 000N/                              ← the most recent save
     ├── KK_synthesized.bin
     ├── KKP_synthesized.bin
-    └── KPP_synthesized.bin
+    ├── KPP_synthesized.bin
+    └── state.bin
 ```
 
-Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`).
+Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
+
+### Resume
+
+If `--output` already contains numbered dirs with `state.bin`, `bulletou` automatically resumes from the latest one. New saves continue the numbering (e.g. if the previous run produced `0001/`..`0005/`, the resumed run writes `0006/`, `0007/`, ...).
+
+Just re-running the same command picks up where it left off. To start fresh, point `--output` at a different directory or delete the existing one.
 
 ### KPP_KKPT (factorised)
 
