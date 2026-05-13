@@ -17,6 +17,9 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_KP                        K+P NNUE (default --arch 256x2-32-32)
     bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
+    bulletou --eval-type SFNN_HALFKA2HM --arch 1536x2-15-32 --layerstack king3-by-king3
+                                                        SFNN-1536 with HalfKA_hm2 + 9 LayerStacks
+                                                        (= YaneuraOu YANEURAOU_ENGINE_NNUE_SFNNwoP1536)
 
 Supported `--arch` presets (matching the per-arch directories under
 YaneuraOu's NNUE engine binary distribution):
@@ -113,6 +116,20 @@ enum EvalType {
     /// buckets × 1548 piece inputs). Same 4-layer ClippedReLU network as
     /// the rest of the NNUE family.
     NnueHalfkpvm,
+    /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
+    /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
+    /// MLP (FT → fc_0(L1+1 PSQT-shortcut) → CReLU + SqrCReLU concat →
+    /// fc_1 → fc_2 → +PSQT bypass). Bucketing chosen via `--layerstack`.
+    /// `--arch 1536x2-15-32` matches YaneuraOu's `sfnnwop-1536.h`; that
+    /// is the only preset YaneuraOu currently ships, but other sizes
+    /// can be trained for ablation (not engine-loadable).
+    SfnnHalfka1hm,
+    /// SFNN-1536 with `HalfKA_hm2` input (= strict v2, enemy king
+    /// collapsed onto friend plane, 73,305 dim). This is the variant
+    /// YaneuraOu's `YANEURAOU_ENGINE_NNUE_SFNNwoP1536` build actually
+    /// uses. Identical network topology to `SFNN_HALFKA1HM`, only the
+    /// input feature differs.
+    SfnnHalfka2hm,
 }
 
 /// Pre-set NNUE architecture sizes — `<L1>x2-<L2>-<L3>` in the textual CLI
@@ -142,6 +159,11 @@ enum NnueArch {
     /// L1=1024, L2=8, L3=64.
     #[clap(name = "1024x2-8-64")]
     Arch1024x2_8_64,
+    /// L1=1536, L2=15, L3=32. SFNN-1536 preset matching YaneuraOu's
+    /// `architectures/sfnnwop-1536.h`. L2=15 + 1 PSQT-shortcut neuron
+    /// is added automatically inside the SFNN trainer.
+    #[clap(name = "1536x2-15-32")]
+    Arch1536x2_15_32,
 }
 
 impl NnueArch {
@@ -154,6 +176,7 @@ impl NnueArch {
             NnueArch::Arch768x2_16_64 => (768, 16, 64),
             NnueArch::Arch1024x2_8_32 => (1024, 8, 32),
             NnueArch::Arch1024x2_8_64 => (1024, 8, 64),
+            NnueArch::Arch1536x2_15_32 => (1536, 15, 32),
         }
     }
 
@@ -168,6 +191,51 @@ impl NnueArch {
             NnueArch::Arch768x2_16_64 => "768x2-16-64",
             NnueArch::Arch1024x2_8_32 => "1024x2-8-32",
             NnueArch::Arch1024x2_8_64 => "1024x2-8-64",
+            NnueArch::Arch1536x2_15_32 => "1536x2-15-32",
+        }
+    }
+}
+
+/// LayerStack bucketing scheme for the SFNN family. Selects which
+/// per-position bucket index is used to choose the active MLP stack
+/// from the LayerStacks array, and implicitly determines the **stack
+/// count** (the network model uses one bucket per stack).
+///
+/// - `king3-by-king3`: 3 friend-king-rank buckets × 3 enemy-king-rank
+///   buckets = 9 stacks. Matches YaneuraOu's `stack_index_for_nnue`
+///   and is the **only YaneuraOu-loadable scheme**.
+/// - `ply9`: 9 buckets by move count (`SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS`).
+///   Also 9 stacks so the resulting `nn.bin` is dimensionally engine-
+///   loadable, but the bucket-selection logic differs from the engine's
+///   king-rank logic → strength will not match what was trained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum LayerStackMode {
+    /// 3 × 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
+    /// Matches YaneuraOu `stack_index_for_nnue` byte-for-byte.
+    #[default]
+    #[clap(name = "king3-by-king3")]
+    Kingrank3by3,
+    /// 9 stacks indexed by move count via `SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS`.
+    /// Dimensionally compatible with YaneuraOu (9 stacks) but engine-side
+    /// bucket selection differs.
+    #[clap(name = "ply9")]
+    Ply9,
+}
+
+impl LayerStackMode {
+    /// CLI value as the user types it.
+    fn cli_name(self) -> &'static str {
+        match self {
+            LayerStackMode::Kingrank3by3 => "king3-by-king3",
+            LayerStackMode::Ply9 => "ply9",
+        }
+    }
+
+    /// Number of LayerStacks this bucketing scheme produces.
+    #[allow(dead_code)] // Used by `run_sfnn_1536` (added in a follow-up commit).
+    fn num_stacks(self) -> usize {
+        match self {
+            LayerStackMode::Kingrank3by3 | LayerStackMode::Ply9 => 9,
         }
     }
 }
@@ -181,17 +249,31 @@ impl EvalType {
             EvalType::NnueKp => "shogi_nnue_kp",
             EvalType::NnueHalfkpe9 => "shogi_nnue_halfkpe9",
             EvalType::NnueHalfkpvm => "shogi_nnue_halfkpvm",
+            EvalType::SfnnHalfka1hm => "shogi_sfnn_halfka1hm",
+            EvalType::SfnnHalfka2hm => "shogi_sfnn_halfka2hm",
         }
     }
 
     /// Does this eval type actually consume `--arch`? KPPT family eval
-    /// types have a fixed architecture and ignore `--arch`; NNUE eval
-    /// types use it.
+    /// types have a fixed architecture and ignore `--arch`; NNUE / SFNN
+    /// eval types use it.
     fn uses_arch(self) -> bool {
         match self {
             EvalType::Kppt | EvalType::KppKkpt => false,
-            EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::NnueHalfkpe9 | EvalType::NnueHalfkpvm => true,
+            EvalType::NnueHalfkp
+            | EvalType::NnueKp
+            | EvalType::NnueHalfkpe9
+            | EvalType::NnueHalfkpvm
+            | EvalType::SfnnHalfka1hm
+            | EvalType::SfnnHalfka2hm => true,
         }
+    }
+
+    /// Does this eval type consume `--layerstack`? Only the SFNN family
+    /// (LayerStacks-based architectures) does; the rest of the NNUE
+    /// family is single-stack.
+    fn uses_layerstack(self) -> bool {
+        matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm)
     }
 
     /// The eval-type's CLI value as the user typed it (e.g. `NNUE_HALFKP`).
@@ -206,6 +288,8 @@ impl EvalType {
             EvalType::NnueKp => "NNUE_KP",
             EvalType::NnueHalfkpe9 => "NNUE_HALFKPE9",
             EvalType::NnueHalfkpvm => "NNUE_HALFKPVM",
+            EvalType::SfnnHalfka1hm => "SFNN_HALFKA1HM",
+            EvalType::SfnnHalfka2hm => "SFNN_HALFKA2HM",
         }
     }
 
@@ -355,10 +439,21 @@ struct Args {
     /// `<L1>x2-<L2>-<L3>`. Supported values mirror the per-arch
     /// directories under YaneuraOu's NNUE binary distribution
     /// (`256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`,
-    /// `1024x2-8-32`, `1024x2-8-64`). Ignored for KPPT / KPP_KKPT
-    /// eval types.
+    /// `1024x2-8-32`, `1024x2-8-64`). Plus `1536x2-15-32` for the SFNN
+    /// family (matches `architectures/sfnnwop-1536.h`). Ignored for
+    /// KPPT / KPP_KKPT eval types.
     #[arg(long, default_value = "256x2-32-32")]
     arch: NnueArch,
+
+    /// LayerStack bucketing scheme for the SFNN family. Only consulted
+    /// when `--eval-type` is `SFNN_HALFKA1HM` or `SFNN_HALFKA2HM`.
+    /// `king3-by-king3` matches YaneuraOu's `stack_index_for_nnue`
+    /// (3 friend-king-rank × 3 enemy-king-rank = 9 stacks) and is the
+    /// **only YaneuraOu-loadable scheme**. `ply9` produces 9 stacks
+    /// indexed by move count — dimensionally compatible but engine-side
+    /// bucket selection differs.
+    #[arg(long, default_value = "king3-by-king3")]
+    layerstack: LayerStackMode,
 }
 
 impl Args {
@@ -377,11 +472,16 @@ impl Args {
             return p.clone();
         }
         let mut path = PathBuf::from("checkpoints");
+        let mut name = self.eval_type.cli_name().to_string();
         if self.eval_type.uses_arch() {
-            path.push(format!("{}-{}", self.eval_type.cli_name(), self.arch.cli_name()));
-        } else {
-            path.push(self.eval_type.cli_name());
+            name.push('-');
+            name.push_str(self.arch.cli_name());
         }
+        if self.eval_type.uses_layerstack() {
+            name.push('-');
+            name.push_str(self.layerstack.cli_name());
+        }
+        path.push(name);
         path
     }
 
@@ -417,6 +517,15 @@ fn main() {
         EvalType::NnueKp => run_kp(&args),
         EvalType::NnueHalfkpe9 => run_halfkpe9(&args),
         EvalType::NnueHalfkpvm => run_halfkpvm(&args),
+        EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm => {
+            eprintln!(
+                "error: --eval-type {} is wired in the CLI but its training entry point\n\
+                 is not yet implemented (Phase 3 of the SFNN-1536 work). Use\n\
+                 `examples/shogi_layerstack.rs` for now if you need LayerStacks training.",
+                args.eval_type.cli_name()
+            );
+            std::process::exit(2);
+        }
     }
 }
 
