@@ -26,8 +26,8 @@ Currently `bulletou` can train these four targets:
 | `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
 | `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
 | `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
-| `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536 family: HalfKA_hm2 + LayerStacks=9 + SqrCReLU + PSQT shortcut. See [SFNN-1536 training](9-sfnn-1536.md). | `nn.bin` |
-| `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1, no enemy-king collapse) for ablation. | `nn.bin` |
+| `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536-build LayerStacks evaluation (HalfKA_hm2 input). Full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md); user-level usage in [§9 LayerStack](9-layerstack.md). | `nn.bin` |
+| `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1) for ablation. | `nn.bin` |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
 
@@ -78,5 +78,5 @@ The rest of the tutorial:
 - [6. Tune the training](6-tune.md) — adjust the schedule and `--lambda` (optional)
 - [7. Inspect the result](7-result.md) — output layout and reading `learn.log`
 - [8. Load into an engine](8-engine.md) — verify in YaneuraOu
-- [9. Training SFNN-1536 (NNUEwoSQPT1536)](9-sfnn-1536.md) — training for YaneuraOu's SFNNwoP LayerStacks=9 build
+- [9. LayerStack](9-layerstack.md) — bucket-selected per-position sub-networks (applies to the SFNN family)
 - [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)

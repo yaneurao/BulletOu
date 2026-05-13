@@ -17,5 +17,6 @@ Shogi-specific:
 - [shogi/halfkpe9.md](shogi/halfkpe9.md) — NNUE HalfKPE9 evaluation function training (HalfKP plus per-square attacker-count buckets)
 - [shogi/kp.md](shogi/kp.md) — NNUE K-P evaluation function training (same network as HalfKP with a different input)
 - [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT evaluation function training
+- [shogi/sfnn-1536.md](shogi/sfnn-1536.md) — Full SFNN-1536 spec for YaneuraOu's NNUEwoSQPT1536 build (LayerStacks=9)
 - [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — game-progress estimation using KP-Absolute features
 - [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — CLI spec of the `shogi_progress_kpabs_train` tool

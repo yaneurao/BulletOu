@@ -46,11 +46,23 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
     --teacher teachers/
 ```
 
-`--arch` を省略するとデフォルト `256x2-32-32` が適用される。`NNUE_KP` / `NNUE_HALFKPE9` でも同じ preset 群が指定可能。
+`--arch` を省略するとデフォルト `256x2-32-32` が適用される。`NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` でも同じ preset 群が指定可能。
 
-(`halfkpvm` のように **入力特徴量自体が違う variant** は別 `--eval-type` (`NNUE_HALFKPVM`) として用意してある。`SFNNwoPSQT1536` は今後追加予定。`--arch` だけでは到達できない。)
+## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 
-## 4.4 KPPT を学習する
+やねうら王の **`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` ビルド** に load させる評価関数を学習したい場合は、専用の `--eval-type` を使う:
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch 1536x2-15-32 \
+    --layerstack king3-by-king3 \
+    --teacher teachers/
+```
+
+通常の NNUE と違って **9 個のサブネットを局面ごとに使い分ける** (LayerStacks=9) ので `--layerstack` フラグが要る点だけ毛色が違う。使い方の説明は [§9 LayerStack](9-layerstack.md)、アーキテクチャ / 量子化 / `nn.bin` レイアウトの仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)。
+
+## 4.5 KPPT を学習する
 
 KPPT 系では `--arch` 不要 (architecture は固定):
 
@@ -62,7 +74,7 @@ KPPT 系では `--arch` 不要 (architecture は固定):
 
 デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--eval-type KPP_KKPT` に変えるだけ。
 
-## 4.5 教師データの渡し方
+## 4.6 教師データの渡し方
 
 `--teacher` には:
 - 1 つのファイル (`teachers/teacher.pack` のようなフルパス)
@@ -71,11 +83,11 @@ KPPT 系では `--arch` 不要 (architecture は固定):
 
 のいずれも渡せる。
 
-## 4.6 学習がどこまで進むか
+## 4.7 学習がどこまで進むか
 
 `--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
 
-## 4.7 期待される出力
+## 4.8 期待される出力
 
 動いていれば以下のような出力が流れる:
 

@@ -46,11 +46,23 @@ For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`
     --teacher teachers/
 ```
 
-Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` / `NNUE_HALFKPE9` accept the same preset list.
+Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` accept the same preset list.
 
-(`halfkpvm` — a different *input feature set* — is exposed as its own `--eval-type NNUE_HALFKPVM`. `SFNNwoPSQT1536` is still tracked as a future `--eval-type` value. None of these are reachable through `--arch` alone.)
+## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
-## 4.4 Training a KPPT eval
+If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` build**, use its dedicated `--eval-type`:
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch 1536x2-15-32 \
+    --layerstack king3-by-king3 \
+    --teacher teachers/
+```
+
+The only thing that's different from the rest of the NNUE family is the `--layerstack` flag (the network uses 9 sub-networks selected per position — see [§9 LayerStack](9-layerstack.md) for an explanation). The full architecture, quantisation, and `nn.bin` layout spec lives in [the SFNN-1536 reference](../shogi/sfnn-1536.md).
+
+## 4.5 Training a KPPT eval
 
 For KPPT-family eval types the architecture is fixed and `--arch` is ignored:
 
@@ -62,18 +74,18 @@ For KPPT-family eval types the architecture is fixed and `--arch` is ignored:
 
 The default output dir is `checkpoints/KPPT/`. To get the factorised variant, swap to `--eval-type KPP_KKPT`.
 
-## 4.5 Passing teacher data
+## 4.6 Passing teacher data
 
 `--teacher` accepts:
 - a single file (e.g. `teachers/teacher.pack`),
 - a directory (above; all same-extension files inside are concatenated),
 - or a comma-separated combination of the two.
 
-## 4.6 How long does training run
+## 4.7 How long does training run
 
 Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). To run multiple passes, pass `--max-epochs N` — the LR scheduler restarts at the beginning of each epoch.
 
-## 4.7 What you should see
+## 4.8 What you should see
 
 While it runs:
 

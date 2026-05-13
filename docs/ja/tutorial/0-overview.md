@@ -24,8 +24,8 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 | `NNUE_KP` | HalfKP と同じ 4 層 ClippedReLU だが入力を K + P に分割した軽量版。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
 | `NNUE_HALFKPE9` | HalfKP に「駒のマスに対する自軍/敵軍の利き数 (0/1/2 にクリップ、9 通り)」を多重化した拡張版 (1,128,492 次元、HalfKP × 9)。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
 | `NNUE_HALFKPVM` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー、69,660 次元、HalfKP の約 1/2) | `nn.bin` |
-| `SFNN_HALFKA2HM` | やねうら王 NNUEwoSQPT1536 用。HalfKA_hm2 + LayerStacks=9 + SqrCReLU + PSQT shortcut の構成。詳細は [SFNN-1536 学習](9-sfnn-1536.md) | `nn.bin` |
-| `SFNN_HALFKA1HM` | ↑ の HalfKA_hm1 (v1、後手玉 collapse なし) アブレーション版 | `nn.bin` |
+| `SFNN_HALFKA2HM` | やねうら王 NNUEwoSQPT1536 ビルド用の LayerStacks 系評価関数 (HalfKA_hm2 入力)。詳細は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md)、使い方は [§9 LayerStack](9-layerstack.md) | `nn.bin` |
+| `SFNN_HALFKA1HM` | ↑ の HalfKA_hm1 (v1) を使ったアブレーション用 | `nn.bin` |
 | `KPPT` | 旧来の KK + KKP + KPP の 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなしでサイズ半減) | 同上 (KPP の layout だけ違う) |
 
@@ -76,5 +76,5 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
 - [6. 学習をチューニング](6-tune.md) — スケジュールと教師ターゲット (`--lambda`) の調整 (任意)
 - [7. 結果を確認する](7-result.md) — 出力レイアウト、`learn.log` の読み方
 - [8. エンジンに組み込む](8-engine.md) — やねうら王で動作確認
-- [9. SFNN-1536 (NNUEwoSQPT1536) を学習する](9-sfnn-1536.md) — LayerStacks=9 のやねうら王 SFNNwoP ビルド向け学習
+- [9. LayerStack](9-layerstack.md) — 局面ごとに別サブネットを使い分ける評価関数 (SFNN 系) の使い方
 - [KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習方法 (リファレンス)
