@@ -21,8 +21,13 @@ Target evaluation functions:
 - NNUE_KP
 - NNUE_HALFKPE9
 - NNUE_HALFKPVM
-- SFNN_HALFKA1HM / SFNN_HALFKA2HM
-- LayerStack king3-by-king3 / ..
+- SFNN_HALFKA1HM
+- SFNN_HALFKA2HM
+
+Target LayerStacks:
+
+- king3-by-king3
+
 
 ### Usage
 

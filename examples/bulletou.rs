@@ -58,7 +58,7 @@ use bulletou_lib::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp,
         ShogiKpp, SparseInputType,
     },
-    game::outputs::{SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, ShogiLayerStackBucket9},
+    game::outputs::ShogiLayerStackBucket9,
     nn::{Affine, InitSettings, Shape, optimiser},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
@@ -73,6 +73,7 @@ use bulletou_lib::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes,
             l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd,
         },
+        nnue_save_sfnn1536::{Sfnn1536SaveParams, build_sfnn_1536_save_format},
         yaneuraou_kppt::{
             KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
             unbundle_component_state,
@@ -205,13 +206,13 @@ impl NnueArch {
 /// from the LayerStacks array, and implicitly determines the **stack
 /// count** (the network model uses one bucket per stack).
 ///
-/// - `king3-by-king3`: 3 friend-king-rank buckets × 3 enemy-king-rank
-///   buckets = 9 stacks. Matches YaneuraOu's `stack_index_for_nnue`
-///   and is the **only YaneuraOu-loadable scheme**.
-/// - `ply9`: 9 buckets by move count (`SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS`).
-///   Also 9 stacks so the resulting `nn.bin` is dimensionally engine-
-///   loadable, but the bucket-selection logic differs from the engine's
-///   king-rank logic → strength will not match what was trained.
+/// Currently `king3-by-king3` is the only choice — it matches YaneuraOu's
+/// `stack_index_for_nnue` so the trained `nn.bin` is engine-loadable
+/// and evaluation matches between training and inference. Other
+/// schemes implemented in `bulletou_lib::game::outputs::ShogiLayerStackBucket9`
+/// (e.g. `Ply9`, `Progress8*`) are intentionally not exposed here
+/// because they cannot be used with YaneuraOu's engine; they remain
+/// available to `examples/shogi_layerstack.rs` for rshogi-style research.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 enum LayerStackMode {
     /// 3 × 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
@@ -219,11 +220,6 @@ enum LayerStackMode {
     #[default]
     #[clap(name = "king3-by-king3")]
     Kingrank3by3,
-    /// 9 stacks indexed by move count via `SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS`.
-    /// Dimensionally compatible with YaneuraOu (9 stacks) but engine-side
-    /// bucket selection differs.
-    #[clap(name = "ply9")]
-    Ply9,
 }
 
 impl LayerStackMode {
@@ -231,15 +227,13 @@ impl LayerStackMode {
     fn cli_name(self) -> &'static str {
         match self {
             LayerStackMode::Kingrank3by3 => "king3-by-king3",
-            LayerStackMode::Ply9 => "ply9",
         }
     }
 
     /// Number of LayerStacks this bucketing scheme produces.
-    #[allow(dead_code)] // Used by `run_sfnn_1536` (added in a follow-up commit).
     fn num_stacks(self) -> usize {
         match self {
-            LayerStackMode::Kingrank3by3 | LayerStackMode::Ply9 => 9,
+            LayerStackMode::Kingrank3by3 => 9,
         }
     }
 }
@@ -451,11 +445,10 @@ struct Args {
 
     /// LayerStack bucketing scheme for the SFNN family. Only consulted
     /// when `--eval-type` is `SFNN_HALFKA1HM` or `SFNN_HALFKA2HM`.
-    /// `king3-by-king3` matches YaneuraOu's `stack_index_for_nnue`
-    /// (3 friend-king-rank × 3 enemy-king-rank = 9 stacks) and is the
-    /// **only YaneuraOu-loadable scheme**. `ply9` produces 9 stacks
-    /// indexed by move count — dimensionally compatible but engine-side
-    /// bucket selection differs.
+    /// Currently only `king3-by-king3` is supported — it matches
+    /// YaneuraOu's `stack_index_for_nnue` (3 friend-king-rank ×
+    /// 3 enemy-king-rank = 9 stacks) so the trained `nn.bin` is
+    /// loadable and evaluation matches between training and inference.
     #[arg(long, default_value = "king3-by-king3")]
     layerstack: LayerStackMode,
 }
@@ -2000,18 +1993,20 @@ where
     // `stack_index_for_nnue` (3×3 = 9 buckets by king ranks).
     let bucket_impl = match args.layerstack {
         LayerStackMode::Kingrank3by3 => ShogiLayerStackBucket9::KingRank9,
-        LayerStackMode::Ply9 => ShogiLayerStackBucket9::Ply9(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS),
     };
 
-    // Phase 3 placeholder save format: empty so the trainer writes only
-    // `state.bin` (= optimiser state, useful for resume) and skips the
-    // user-facing `nn.bin`. The full SFNN-1536 / LayerStacks save layout
-    // (per-stack {fc_0, ac_0, ac_sqr_0, fc_1, ac_1, fc_2} blocks +
-    // PSQT shortcut header, yaneuraou-loadable) lands in Phase 4.
-    // `feature_set` is held onto so the Phase 4 follow-up doesn't need to
-    // change this function's signature.
-    let _ = feature_set;
-    let save_format: Vec<SavedFormat> = Vec::new();
+    // YaneuraOu SFNNwoP1536 互換 nn.bin の save format。`Sfnn1536SaveParams`
+    // で feature set / 各層のサイズ / LayerStacks 数を受け、`bulletou_lib::value::nnue_save_sfnn1536`
+    // が組み立てた `SavedFormat` 列を渡す。出力は `EvalDir` で yaneuraou
+    // (`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` ビルド) が load できる layout。
+    let save_format = build_sfnn_1536_save_format(Sfnn1536SaveParams {
+        feature_set,
+        input_size,
+        ft_size,
+        l1_hidden,
+        l2_size,
+        num_stacks,
+    });
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
@@ -2104,9 +2099,9 @@ where
     }
 
     eprintln!(
-        "note: Phase 3 produced a non-LayerStack `nn.bin` skeleton in each save dir.\n\
-         YaneuraOu-loadable LayerStacks `nn.bin` layout lands in Phase 4 of the\n\
-         SFNN-1536 work; do not point YaneuraOu's EvalDir at these saves yet."
+        "note: nn.bin in each save dir targets YaneuraOu's SFNNwoP1536 build.\n\
+         Load via `setoption name EvalDir value <output>/000N` and verify with `isready`+`bench`.\n\
+         A non-fatal `info string Warning: NNUE hash mismatch` is expected (engine warns but loads)."
     );
 }
 

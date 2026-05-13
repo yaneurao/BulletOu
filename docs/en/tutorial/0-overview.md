@@ -26,8 +26,8 @@ Currently `bulletou` can train these four targets:
 | `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
 | `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
 | `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
-| `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536 family: HalfKA_hm2 + LayerStacks=9 + SqrCReLU + PSQT shortcut. See [SFNN-1536 training](9-sfnn-1536.md). | `nn.bin` (Phase 4 in progress) |
-| `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1, no enemy-king collapse) for ablation. | `nn.bin` (same) |
+| `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536 family: HalfKA_hm2 + LayerStacks=9 + SqrCReLU + PSQT shortcut. See [SFNN-1536 training](9-sfnn-1536.md). | `nn.bin` |
+| `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1, no enemy-king collapse) for ablation. | `nn.bin` |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
 

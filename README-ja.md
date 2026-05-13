@@ -21,8 +21,13 @@
 - NNUE_KP
 - NNUE_HALFKPE9
 - NNUE_HALFKPVM
-- NNUE halfka1 / halfka2
-- SFNN + halfka2 + ls9 (NNUEwoSQPT1536)
+- SFNN_HALFKA1HM
+- SFNN_HALFKA2HM
+
+対応するLayerStack:
+
+- king3-by-king3
+
 
 ### 使い方
 
