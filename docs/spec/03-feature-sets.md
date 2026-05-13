@@ -205,6 +205,65 @@ static constexpr std::uint32_t kHashValue =
 
 詳細は `crates/bulletou_lib/src/game/inputs/shogi_halfkpvm.rs`。
 
+## HalfKA_hm1 (strict v1)
+
+`Features::HalfKA_hm1` (`features/half_ka_hm1.{h,cpp}`) 相当。HalfKA + 左右対称ミラー、**両玉を別 plane に区別して** 含める。SFNN-1536 / SFNN_HALFKA1HM (ablation 用途) で使用。
+
+| 項目 | 値 |
+|---|---|
+| dim | 45 × 1710 = **76,950** |
+| max_active | 40 (`PIECE_NUMBER_NB`、両玉含む全駒) |
+| FEATURE_HASH_HALFKA_HM1 | `0x7f134cb8` (= `0x7f134cb9 ^ 1` for `Side::kFriend`) |
+| 識別子 (description) | `HalfKA_hm1(Friend)` |
+| 駒入力数 (= `fe_end2` = `e_king + SQ_NB`) | 1710 |
+
+active index 計算式 (`MakeIndex` 由来):
+
+```
+sq_k_eff = (king_file >= 5) ? Mir(king_sq) : king_sq
+bp_eff   = (king_file >= 5 && bp >= fe_hand_end)          // 盤上駒・王のみ
+              ? FE_HAND_END + piece_idx * SQ_NB + Mir(sq) // sq だけミラー
+              : bp                                        // 持駒は不変
+index = fe_end2 × sq_k_eff + bp_eff                       // 玉は別 plane、collapse なし
+```
+
+詳細は `crates/bulletou_lib/src/game/inputs/shogi_halfka_hm1.rs`。
+
+## HalfKA_hm2 (strict v2)
+
+`Features::HalfKA_hm2` (`features/half_ka_hm2.{h,cpp}`) 相当。HalfKA_hm1 の dim 圧縮版で、**後手玉 BonaPiece を自玉 plane に collapse** することで入力次元を ~4.7% 削減。やねうら王 `YANEURAOU_ENGINE_NNUE_SFNNwoP1536` ビルドが実際に使うのはこちら。
+
+| 項目 | 値 |
+|---|---|
+| dim | 45 × 1629 = **73,305** |
+| max_active | 40 (HalfKA_hm1 と同じ) |
+| FEATURE_HASH_HALFKA_HM2 | `0x7f234cb8` (= `0x7f234cb9 ^ 1` for `Side::kFriend`) |
+| 識別子 (description) | `HalfKA_hm2(Friend)` |
+| 駒入力数 (= `e_king`、後手玉を自玉 plane に collapse) | 1629 |
+
+active index 計算式 (`MakeIndex` 由来):
+
+```
+sq_k_eff = (king_file >= 5) ? Mir(king_sq) : king_sq      // HalfKA_hm1 と同じ
+bp_eff   = (king_file >= 5 && bp >= fe_hand_end)
+              ? FE_HAND_END + piece_idx * SQ_NB + Mir(sq)
+              : bp
+// 2 段階目: 後手王 (>= e_king) を自玉 plane に collapse
+bp_eff   = bp_eff >= e_king ? bp_eff - SQ_NB : bp_eff
+index = e_king × sq_k_eff + bp_eff                        // dim = 5 × 9 × e_king
+```
+
+詳細は `crates/bulletou_lib/src/game/inputs/shogi_halfka_hm2.rs`。
+
+### v1 / v2 の使い分け
+
+| 用途 | 推奨 |
+|---|---|
+| やねうら王 SFNNwoP1536 ビルドに投入する | **`HalfKA_hm2`** (= 唯一 engine-loadable な variant) |
+| 両玉を別 plane で持ったときの強さ比較 (ablation) | `HalfKA_hm1` |
+
+`bulletou_lib::game::inputs::ShogiHalfKA_hm` (= 既存実装、`shogi_halfka.rs`) は **アルゴリズムは v2 (collapse あり)** だが **hash 値は v1 (`0x7f134cb8`)** を返すというプリエクストの不整合がある。これは `examples/shogi_layerstack.rs` の rshogi 互換出力で消費されているため後方互換のため触らない。やねうら王互換 nn.bin を作る経路では上記の strict v1 / v2 (`ShogiHalfKaHm1` / `ShogiHalfKaHm2`) を使うこと。
+
 ## HalfKP vs K-P 設計比較
 
 | | HalfKP | K-P |
