@@ -5,6 +5,8 @@ mod chess_buckets;
 mod chess_buckets_mk;
 mod factorised;
 mod shogi_halfka;
+mod shogi_halfka_hm1;
+mod shogi_halfka_hm2;
 mod shogi_halfka_hm_hand_count;
 mod shogi_halfka_hm_hand_threat;
 mod shogi_halfka_hm_hand_threat_defensive;
@@ -30,6 +32,8 @@ pub use shogi_halfka::{
     FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA,
     ShogiHalfKA_hm,
 };
+pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
+pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
 pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;

@@ -11,8 +11,8 @@
 //! ここに切り出すことで `bulletou` などの統合 CLI からも再利用できる。
 
 use crate::game::inputs::{
-    FEATURE_HASH, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HALFKPVM, FEATURE_HASH_HM_V2, FEATURE_HASH_KP,
-    FEATURE_HASH_NONMIRROR,
+    FEATURE_HASH, FEATURE_HASH_HALFKA_HM1, FEATURE_HASH_HALFKA_HM2, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HALFKPVM,
+    FEATURE_HASH_HM_V2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
 };
 
 /// YaneuraOu / Stockfish 互換 NNUE バイナリのバージョンマジック。
@@ -40,6 +40,14 @@ pub enum NnueFeatureSet {
     /// (5 筋以降) を file-mirror して左右対称性を畳んだ版。
     /// 入力次元は 45 × 1548 = 69,660 (= HalfKP の約 1/2)。
     HalfKpvm,
+    /// HalfKA_hm1(Friend) — YaneuraOu の `Features::HalfKA_hm1` 厳密互換。
+    /// HalfKA + file-mirror、両玉を別 plane に保持。SFNN_HALFKA1HM の入力。
+    /// 入力次元 76,950 (= 45 × 1710)。
+    HalfKaHm1,
+    /// HalfKA_hm2(Friend) — YaneuraOu の `Features::HalfKA_hm2` 厳密互換。
+    /// HalfKA + file-mirror、後手玉を自玉 plane に collapse。SFNNwoP-1536 の入力。
+    /// 入力次元 73,305 (= 45 × 1629)。
+    HalfKaHm2,
 }
 
 impl NnueFeatureSet {
@@ -52,6 +60,8 @@ impl NnueFeatureSet {
             NnueFeatureSet::Kp => FEATURE_HASH_KP,
             NnueFeatureSet::HalfKpe9 => FEATURE_HASH_HALFKPE9,
             NnueFeatureSet::HalfKpvm => FEATURE_HASH_HALFKPVM,
+            NnueFeatureSet::HalfKaHm1 => FEATURE_HASH_HALFKA_HM1,
+            NnueFeatureSet::HalfKaHm2 => FEATURE_HASH_HALFKA_HM2,
         }
     }
 
@@ -64,6 +74,8 @@ impl NnueFeatureSet {
             NnueFeatureSet::Kp => 1_710,
             NnueFeatureSet::HalfKpe9 => 1_128_492,
             NnueFeatureSet::HalfKpvm => 69_660,
+            NnueFeatureSet::HalfKaHm1 => 76_950,
+            NnueFeatureSet::HalfKaHm2 => 73_305,
         }
     }
 
@@ -82,6 +94,9 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKpe9 => "HalfKPE9(Friend)",
             // YaneuraOu features/half_kp_vm.h の kName と一致。
             NnueFeatureSet::HalfKpvm => "HalfKP_vm(Friend)",
+            // YaneuraOu features/half_ka_hm1.h / half_ka_hm2.h の kName と一致。
+            NnueFeatureSet::HalfKaHm1 => "HalfKA_hm1(Friend)",
+            NnueFeatureSet::HalfKaHm2 => "HalfKA_hm2(Friend)",
         }
     }
 }
