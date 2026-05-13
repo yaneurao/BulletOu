@@ -15,5 +15,6 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 | 6 | [Tune the training](6-tune.md) | Adjust the schedule (`--lr`, `--superbatches`) and `--lambda` (optional) |
 | 7 | [Inspect the result](7-result.md) | Output layout and reading `learn.log` |
 | 8 | [Load into an engine](8-engine.md) | Verify the trained weights in YaneuraOu |
+| 9 | [Training SFNN-1536 (NNUEwoSQPT1536)](9-sfnn-1536.md) | Training for YaneuraOu's SFNNwoP LayerStacks=9 build |
 
 After finishing the tutorial, the [Reference docs](../) cover specifications and design details (data formats, network output formats, etc.).

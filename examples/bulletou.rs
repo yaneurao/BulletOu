@@ -54,8 +54,12 @@ Usage:
 use std::path::PathBuf;
 
 use bulletou_lib::{
-    game::inputs::{ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp, ShogiKpp, SparseInputType},
-    nn::optimiser,
+    game::inputs::{
+        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp,
+        ShogiKpp, SparseInputType,
+    },
+    game::outputs::{SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS, ShogiLayerStackBucket9},
+    nn::{Affine, InitSettings, Shape, optimiser},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::{
         save::SavedFormat,
@@ -517,15 +521,8 @@ fn main() {
         EvalType::NnueKp => run_kp(&args),
         EvalType::NnueHalfkpe9 => run_halfkpe9(&args),
         EvalType::NnueHalfkpvm => run_halfkpvm(&args),
-        EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm => {
-            eprintln!(
-                "error: --eval-type {} is wired in the CLI but its training entry point\n\
-                 is not yet implemented (Phase 3 of the SFNN-1536 work). Use\n\
-                 `examples/shogi_layerstack.rs` for now if you need LayerStacks training.",
-                args.eval_type.cli_name()
-            );
-            std::process::exit(2);
-        }
+        EvalType::SfnnHalfka1hm => run_sfnn_1536(&args, ShogiHalfKaHm1, NnueFeatureSet::HalfKaHm1),
+        EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
     }
 }
 
@@ -1923,6 +1920,194 @@ fn run_halfkpvm(args: &Args) {
             std::process::exit(1);
         }
     }
+}
+
+/// SFNN-1536 / LayerStacks training entry point (= `SFNN_HALFKA1HM` and
+/// `SFNN_HALFKA2HM`). Generic over the input feature so v1 (`HalfKA_hm1`,
+/// 76,950 dim) and v2 (`HalfKA_hm2`, 73,305 dim) share the entire
+/// training pipeline — only the `input` and `feature_set` arguments
+/// differ between the two callers.
+///
+/// Network topology mirrors YaneuraOu `architectures/sfnnwop-1536.h`:
+/// per-perspective FT (`l0`, 1536 dim) → CReLU → pairwise-mul → concat
+/// across perspectives → bucket-specific L1 (= 16 = 15 hidden + 1 PSQT
+/// shortcut neuron) → split off the PSQT neuron as a residual bypass
+/// → `[SqrCReLU; CReLU]` concat → L2 (32 dim) → CReLU → L3 (scalar)
+/// → add PSQT residual.
+///
+/// The bucket-specific layers `l1` and `l2` use the LayerStacks pattern:
+/// the weight tensor is `(NUM_STACKS × out_dim, in_dim)` and a
+/// `.select(output_buckets)` per forward pass picks the active slice
+/// based on `ShogiLayerStackBucket9` (= `--layerstack`).
+///
+/// **Note**: the `nn.bin` written by this commit uses the standard
+/// non-LayerStack `build_nnue_save_format` and is **not** YaneuraOu-
+/// loadable yet. The LayerStacks-aware save layout (Phase 4) lands
+/// in a follow-up commit.
+fn run_sfnn_1536<I>(args: &Args, input: I, feature_set: NnueFeatureSet)
+where
+    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
+{
+    let (ft_size, l1_hidden, l2_size) = args.arch.dims();
+    if ft_size != 1536 || l1_hidden != 15 || l2_size != 32 {
+        eprintln!(
+            "warning: --arch {} is being trained as an SFNN, but YaneuraOu only ships\n\
+             1536x2-15-32 for the SFNNwoP family. The resulting nn.bin will not be\n\
+             engine-loadable. Continuing for ablation purposes.",
+            args.arch.cli_name()
+        );
+    }
+    // L1 output = effective hidden + 1 PSQT-shortcut neuron (matches
+    // yaneuraou `kHidden1Dims + 1` in sfnnwop-1536.h).
+    let l1_out = l1_hidden + 1;
+    let l1_effective = l1_hidden;
+    let l2_in = l1_effective * 2; // [SqrCReLU; CReLU] concat
+    let num_stacks = args.layerstack.num_stacks();
+    let input_size = input.num_inputs();
+
+    eprintln!(
+        "=== bulletou: running {} ({}x2-{}-{} CReLU+SqrCReLU, dual-perspective, LayerStacks={} via {}) ===",
+        args.eval_type.cli_name(),
+        ft_size,
+        l1_hidden,
+        l2_size,
+        num_stacks,
+        args.layerstack.cli_name()
+    );
+
+    let output_dir = args.output_dir();
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
+        eprintln!("=== resume detected: {} ===", state_bin_path.display());
+        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+            std::process::exit(1);
+        });
+        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse state.bin: {e}");
+            std::process::exit(1);
+        });
+        let resume_root = output_dir.join(".bulletou_resume");
+        let _ = std::fs::remove_dir_all(&resume_root);
+        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
+            eprintln!("error: state.bin missing `nnue/*` records: {e}");
+            std::process::exit(1);
+        });
+        resume_root
+    });
+
+    // LayerStack bucket selector. `Kingrank9` matches YaneuraOu's
+    // `stack_index_for_nnue` (3×3 = 9 buckets by king ranks).
+    let bucket_impl = match args.layerstack {
+        LayerStackMode::Kingrank3by3 => ShogiLayerStackBucket9::KingRank9,
+        LayerStackMode::Ply9 => ShogiLayerStackBucket9::Ply9(SHOGI_PLY_BUCKET9_DEFAULT_BOUNDS),
+    };
+
+    // Phase 3 placeholder save format: empty so the trainer writes only
+    // `state.bin` (= optimiser state, useful for resume) and skips the
+    // user-facing `nn.bin`. The full SFNN-1536 / LayerStacks save layout
+    // (per-stack {fc_0, ac_0, ac_sqr_0, fc_1, ac_1, fc_2} blocks +
+    // PSQT shortcut header, yaneuraou-loadable) lands in Phase 4.
+    // `feature_set` is held onto so the Phase 4 follow-up doesn't need to
+    // change this function's signature.
+    let _ = feature_set;
+    let save_format: Vec<SavedFormat> = Vec::new();
+
+    let mut builder = ValueTrainerBuilder::default()
+        .dual_perspective()
+        .optimiser(optimiser::AdamW)
+        .inputs(input)
+        .output_buckets(bucket_impl)
+        .save_format(&save_format)
+        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+
+    if args.score_drop_abs > 0 {
+        builder = builder.score_drop_abs(args.score_drop_abs);
+    }
+
+    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
+        let l0 = builder.new_affine("l0", input_size, ft_size);
+        l0.init_with_effective_input_size(32);
+
+        // L1: bucket-specific weights (zero-init) + shared factorised
+        // counterpart `l1f`. Bullet's LayerStacks pattern keeps training
+        // stable in the early epochs because `l1` starts at zero — all
+        // bucket outputs are equal to `l1f` until per-bucket signal develops.
+        let l1 = Affine {
+            weights: builder.new_weights(
+                "l1w",
+                Shape::new(num_stacks * l1_out, ft_size),
+                InitSettings::Zeroed,
+            ),
+            bias: builder.new_weights("l1b", Shape::new(num_stacks * l1_out, 1), InitSettings::Zeroed),
+        };
+        let l1f = builder.new_affine("l1f", ft_size, l1_out);
+        let l2 = builder.new_affine("l2", l2_in, num_stacks * l2_size);
+        let l3 = builder.new_affine("l3", l2_size, num_stacks);
+
+        // Per-perspective FT → CReLU → pairwise-mul → concat. After the
+        // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it
+        // back to ft_size (matching `kInputDims = kTransformedFeatureDimensions`
+        // in sfnnwop-1536.h).
+        let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
+        let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
+        let combined = stm.concat(ntm);
+
+        // L1 = bucket-selected + shared. The shared term is added to all
+        // buckets so the model can learn before per-bucket signal accumulates.
+        let l1_out_t = l1.forward(combined).select(output_buckets) + l1f.forward(combined);
+
+        // Split the L1 output: rows 0..l1_effective are the hidden, the
+        // last row is the PSQT shortcut neuron that bypasses everything
+        // and adds straight into the final scalar.
+        let l1_main = l1_out_t.slice_rows(0, l1_effective);
+        let l1_skip = l1_out_t.slice_rows(l1_effective, l1_out);
+
+        // [SqrCReLU; CReLU] pair, matching yaneuraou's
+        // `memcpy(ac_sqr_0_out + kHidden1Dims, ac_0_out, ...)` concat layout.
+        let l1_sqr = l1_main.abs_pow(2.0) * (127.0 / 128.0);
+        let l2_input = l1_sqr.concat(l1_main).crelu();
+
+        let l2_out_t = l2.forward(l2_input).select(output_buckets).crelu();
+        let l3_out = l3.forward(l2_out_t).select(output_buckets);
+
+        // PSQT bypass: final = L3(bucket) + PSQT shortcut neuron, matching
+        // yaneuraou's `buf.fc_2_out[0] += buf.fc_0_out[kHidden1Dims]`.
+        l3_out + l1_skip
+    });
+
+    if let Some(dir) = resume_dir.as_ref() {
+        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
+    run_training_inline_nnue!(args, &mut trainer);
+
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
+
+    let ctx = LogContext::from_args(args);
+    let top_level_log = output_dir.join("learn.log");
+    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
+    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        Ok((_first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!(
+        "note: Phase 3 produced a non-LayerStack `nn.bin` skeleton in each save dir.\n\
+         YaneuraOu-loadable LayerStacks `nn.bin` layout lands in Phase 4 of the\n\
+         SFNN-1536 work; do not point YaneuraOu's EvalDir at these saves yet."
+    );
 }
 
 /// Single-component analogue of `assemble_numbered_dirs`: list `<net_id>-*/`
