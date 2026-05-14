@@ -12,7 +12,7 @@
 
 use crate::game::inputs::{
     FEATURE_HASH, FEATURE_HASH_HALFKA_HM1, FEATURE_HASH_HALFKA_HM2, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HALFKPVM,
-    FEATURE_HASH_HM_V2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
+    FEATURE_HASH_HM_V2, FEATURE_HASH_KA2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
 };
 
 /// YaneuraOu / Stockfish 互換 NNUE バイナリのバージョンマジック。
@@ -48,6 +48,10 @@ pub enum NnueFeatureSet {
     /// HalfKA + file-mirror、後手玉を自玉 plane に collapse。SFNNwoP-1536 の入力。
     /// 入力次元 73,305 (= 45 × 1629)。
     HalfKaHm2,
+    /// K-A2(Friend) — YaneuraOu `FeatureSet<K, A2>` (`SFNNwoPSQT_ka2_*`)。
+    /// K (玉 2 個, 162 次元) + A2 (玉含む全駒, 後手玉を自玉 plane に collapse, 1629 次元)
+    /// = 1791 次元 / perspective。
+    Ka2,
 }
 
 impl NnueFeatureSet {
@@ -62,6 +66,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKpvm => FEATURE_HASH_HALFKPVM,
             NnueFeatureSet::HalfKaHm1 => FEATURE_HASH_HALFKA_HM1,
             NnueFeatureSet::HalfKaHm2 => FEATURE_HASH_HALFKA_HM2,
+            NnueFeatureSet::Ka2 => FEATURE_HASH_KA2,
         }
     }
 
@@ -76,6 +81,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKpvm => 69_660,
             NnueFeatureSet::HalfKaHm1 => 76_950,
             NnueFeatureSet::HalfKaHm2 => 73_305,
+            NnueFeatureSet::Ka2 => 1_791,
         }
     }
 
@@ -97,6 +103,9 @@ impl NnueFeatureSet {
             // YaneuraOu features/half_ka_hm1.h / half_ka_hm2.h の kName と一致。
             NnueFeatureSet::HalfKaHm1 => "HalfKA_hm1(Friend)",
             NnueFeatureSet::HalfKaHm2 => "HalfKA_hm2(Friend)",
+            // FeatureSet<K, A2>::GetName() = "K+A2" (feature_set.h の "+" 結合) だが、
+            // K-P と同じく description では (Friend) suffix を付ける。
+            NnueFeatureSet::Ka2 => "K-A2(Friend)",
         }
     }
 }

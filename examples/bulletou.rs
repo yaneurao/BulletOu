@@ -18,6 +18,7 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
     bulletou --eval-type SFNN_HALFKA2HM --arch 1536x2-15-32 --layerstack king3-by-king3
+    bulletou --eval-type SFNN_KA2       --arch 1536x2-15-32 --layerstack king3-by-king3
                                                         SFNN-1536 with HalfKA_hm2 + 9 LayerStacks
                                                         (= YaneuraOu YANEURAOU_ENGINE_NNUE_SFNNwoP1536)
 
@@ -55,8 +56,8 @@ use std::path::PathBuf;
 
 use bulletou_lib::{
     game::inputs::{
-        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKk, ShogiKkp, ShogiKp,
-        ShogiKpp, SparseInputType,
+        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk, ShogiKkp,
+        ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::ShogiLayerStackBucket9,
     nn::{Affine, InitSettings, Shape, optimiser},
@@ -135,6 +136,15 @@ enum EvalType {
     /// uses. Identical network topology to `SFNN_HALFKA1HM`, only the
     /// input feature differs.
     SfnnHalfka2hm,
+    /// SFNN-1536 with `K + A2` input (= YaneuraOu `FeatureSet<K, A2>`,
+    /// 1791 dim). K (162 king features) + A2 (1629 piece features,
+    /// kings collapsed onto friend plane). No file-mirror, so input
+    /// dimension is much smaller than HalfKA_hm2 but representation
+    /// is also weaker (no king-anchor cross product). Matches
+    /// YaneuraOu's `YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_*` build.
+    /// Identical network topology and LayerStacks bucketing as the
+    /// other SFNN variants.
+    SfnnKa2,
 }
 
 /// Pre-set NNUE architecture sizes — `<L1>x2-<L2>-<L3>` in the textual CLI
@@ -249,6 +259,7 @@ impl EvalType {
             EvalType::NnueHalfkpvm => "shogi_nnue_halfkpvm",
             EvalType::SfnnHalfka1hm => "shogi_sfnn_halfka1hm",
             EvalType::SfnnHalfka2hm => "shogi_sfnn_halfka2hm",
+            EvalType::SfnnKa2 => "shogi_sfnn_ka2",
         }
     }
 
@@ -263,7 +274,8 @@ impl EvalType {
             | EvalType::NnueHalfkpe9
             | EvalType::NnueHalfkpvm
             | EvalType::SfnnHalfka1hm
-            | EvalType::SfnnHalfka2hm => true,
+            | EvalType::SfnnHalfka2hm
+            | EvalType::SfnnKa2 => true,
         }
     }
 
@@ -271,7 +283,10 @@ impl EvalType {
     /// (LayerStacks-based architectures) does; the rest of the NNUE
     /// family is single-stack.
     fn uses_layerstack(self) -> bool {
-        matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm)
+        matches!(
+            self,
+            EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnKa2
+        )
     }
 
     /// The eval-type's CLI value as the user typed it (e.g. `NNUE_HALFKP`).
@@ -288,6 +303,7 @@ impl EvalType {
             EvalType::NnueHalfkpvm => "NNUE_HALFKPVM",
             EvalType::SfnnHalfka1hm => "SFNN_HALFKA1HM",
             EvalType::SfnnHalfka2hm => "SFNN_HALFKA2HM",
+            EvalType::SfnnKa2 => "SFNN_KA2",
         }
     }
 
@@ -444,7 +460,7 @@ struct Args {
     arch: NnueArch,
 
     /// LayerStack bucketing scheme for the SFNN family. Only consulted
-    /// when `--eval-type` is `SFNN_HALFKA1HM` or `SFNN_HALFKA2HM`.
+    /// when `--eval-type` is `SFNN_HALFKA1HM`, `SFNN_HALFKA2HM`, or `SFNN_KA2`.
     /// Currently only `king3-by-king3` is supported — it matches
     /// YaneuraOu's `stack_index_for_nnue` (3 friend-king-rank ×
     /// 3 enemy-king-rank = 9 stacks) so the trained `nn.bin` is
@@ -516,6 +532,7 @@ fn main() {
         EvalType::NnueHalfkpvm => run_halfkpvm(&args),
         EvalType::SfnnHalfka1hm => run_sfnn_1536(&args, ShogiHalfKaHm1, NnueFeatureSet::HalfKaHm1),
         EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
+        EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
     }
 }
 
