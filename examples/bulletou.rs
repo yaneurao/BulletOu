@@ -1256,6 +1256,18 @@ struct LogContext {
     /// rounds. Otherwise 0. The LR formula is positions-based and
     /// does not consult this field — the offset is purely for display.
     sb_offset: usize,
+    /// Offset added to bullet's local epoch counter when emitting the
+    /// `epoch` column in `learn.log`. Bullet's `for epoch in 1..=N`
+    /// counter resets to 1 at every new `bulletou` invocation, so
+    /// without an offset a continued-training run would write `epoch=1`
+    /// rows after the previous run had already finished `epoch=3`.
+    /// Set to: `max_epoch_in_summary_log` when starting a fresh epoch
+    /// (= teacher changed / previous run completed cleanly / auto-resume
+    /// crossed an epoch boundary), or `max_epoch_in_summary_log - 1`
+    /// when resuming mid-epoch (so the resuming rows continue to display
+    /// the *same* epoch number as the previous run's last partial save).
+    /// 0 for fresh first runs.
+    epoch_offset: usize,
     /// Which LR schedule the trainer is running. Switches the
     /// enrich-path lr formula between `PositionsLR::lr_at_positions`
     /// (step / geometric) and `CosineLR::lr_at_positions` (cos).
@@ -1303,6 +1315,7 @@ impl LogContext {
             batches_per_superbatch,
             teacher_csv: csv_escape(&resolve_teacher_for_log(&args.teacher)),
             sb_offset: 0,
+            epoch_offset: 0,
             lr_schedule: args.lr_schedule,
             lr_period: lr_period_override,
             lr_min: args.lr_min,
@@ -1407,6 +1420,11 @@ fn enrich_bullet_log_to_csv(
         // resume, `ctx.sb_offset` shifts the displayed sb to the
         // continuation point so the column stays monotonic.
         let absolute_sb = local_sb + ctx.sb_offset;
+        // Absolute epoch: bullet's `for epoch in 1..=max_epochs` counter
+        // is local within the current run. `ctx.epoch_offset` carries
+        // the cumulative completed-epoch count from previous runs so
+        // continued-training rows display monotonically.
+        let absolute_epoch = epoch + ctx.epoch_offset;
         // `positions` keeps using bullet's local sb because position_offset
         // already carries the cumulative count from prior runs — the
         // formula then adds (local_sb-1)*sb_size + b*batch_size to the
@@ -1456,6 +1474,7 @@ fn enrich_bullet_log_to_csv(
         out.push_str(&format!(
             "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr:.6},{lambda:.6},{positions},{teacher}\n",
             eval = eval_field,
+            epoch = absolute_epoch,
             sb = absolute_sb,
             ta = test_acc_field,
             tl = test_loss_field,
@@ -1505,6 +1524,32 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
         }
     }
     map
+}
+
+/// Read the maximum value of the `epoch` column (index 1) from the
+/// top-level summary log. Used to compute `LogContext.epoch_offset` so
+/// continued-training rows display monotonic epoch numbers rather than
+/// resetting to 1 each bulletou invocation.
+///
+/// Returns `None` if the file does not exist or no row has a parseable
+/// epoch — which collapses to "no previous epochs to carry forward" at
+/// the call site.
+fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option<usize> {
+    let content = std::fs::read_to_string(top_level_log).ok()?;
+    let mut max_epoch: Option<usize> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, ',').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(epoch) = parts[1].parse::<usize>() else { continue };
+        max_epoch = Some(max_epoch.map_or(epoch, |m| m.max(epoch)));
+    }
+    max_epoch
 }
 
 /// Detect the latest saved superbatch number from the highest-numbered
@@ -2441,6 +2486,31 @@ macro_rules! run_training_inline_nnue {
             (1usize, 0)
         };
         cb_ctx.sb_offset = sb_offset_for_display;
+        // Epoch display offset for continued-training runs. Bullet's
+        // per-invocation `for epoch in 1..=max_epochs` resets to 1, so
+        // without this offset the second run after "3 epochs done"
+        // would write `epoch=1` over the top of `epoch=3` rows.
+        //
+        // - Fresh first run (no top-level log): offset = 0.
+        // - Clean continuation (previous run finished its last epoch,
+        //   teacher unchanged): offset = max_epoch (so new local
+        //   epoch=1 displays as max_epoch+1).
+        // - Teacher changed (new epoch against new data): same as
+        //   clean continuation — offset = max_epoch.
+        // - Mid-epoch resume (previous run died inside epoch K, this
+        //   run finishes that same epoch K from last_sb+1): offset
+        //   = max_epoch - 1, so this run's local epoch=1 displays as
+        //   K (same as the previous partial save), and its local
+        //   epoch=2 displays as K+1.
+        let max_epoch_in_log = read_latest_epoch_in_top_level_log(&cb_top_level_log).unwrap_or(0);
+        let mid_epoch_resume = !teacher_changed
+            && !prev_run_completed_epoch
+            && auto_resume_sb_raw.is_some();
+        cb_ctx.epoch_offset = if mid_epoch_resume {
+            max_epoch_in_log.saturating_sub(1)
+        } else {
+            max_epoch_in_log
+        };
         // The LR column is derived from `positions` (= prior + per-row
         // offset within this run), so we always need the cumulative
         // carry-over from the existing top-level log here so the enrich
@@ -3858,6 +3928,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
@@ -3996,6 +4067,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
@@ -4128,6 +4200,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/c.hcpe".to_string(),
             sb_offset: 0,
+            epoch_offset: 0,
             lr_schedule: LrScheduleKind::Cos,
             lr_period: 100_000_000,
             lr_min: 0.0,
@@ -4159,6 +4232,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/round2.hcpe".to_string(),
             sb_offset: 1, // = "round 1 saved sb 1, this run is the round 2 continuation"
+            epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 800_000_000,
             lr_min: 0.00001,
@@ -4181,6 +4255,64 @@ mod tests {
             "step lr at 60.5M of 800M period should be ~0.000706, got {lr_val}"
         );
         assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
+    }
+
+    /// `LogContext.epoch_offset` が enrich の epoch 列に正しく加算され、
+    /// 追加学習 run (= 前回の max_epoch を引き継ぐ) で epoch 表示が連続する
+    /// ことを確認。bullet 側の local epoch counter は invocation ごとに 1 から
+    /// 始まるので、offset を足さないと 1 にリセットされてしまうのが背景。
+    #[test]
+    fn enrich_with_epoch_offset_emits_absolute_epoch() {
+        let ctx = LogContext {
+            eval_type: "NNUE_HALFKP",
+            arch: "256x2-32-32".to_string(),
+            lr_start: 0.001,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/foo.hcpe".to_string(),
+            sb_offset: 0,
+            epoch_offset: 3, // = "previous run completed epoch 1..3 cleanly"
+            lr_schedule: LrScheduleKind::Step,
+            lr_period: 100_000_000,
+            lr_min: 0.00001,
+        };
+        let raw = "1,32,0.07\n";
+        // local epoch=1 + offset 3 → display epoch=4
+        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", 0, None);
+        let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
+        assert_eq!(cols[1], "4", "absolute epoch (= local 1 + offset 3)");
+    }
+
+    /// `read_latest_epoch_in_top_level_log` が summary-learn.log の epoch 列
+    /// (= index 1) の最大値を拾うことを確認。複数行を読んで max を返す。
+    #[test]
+    fn read_latest_epoch_picks_max() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-epoch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("summary-learn.log");
+
+        // 存在しない → None
+        assert_eq!(read_latest_epoch_in_top_level_log(&log), None);
+
+        // header + 3 行 (epoch 1, 2, 3) → max = 3
+        std::fs::write(
+            &log,
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher\n\
+             NNUE,1,6,-,-,0.1,0.001,1.0,100000000,t.hcpe\n\
+             NNUE,2,6,-,-,0.1,0.001,1.0,200000000,t.hcpe\n\
+             NNUE,3,6,-,-,0.1,0.001,1.0,300000000,t.hcpe\n",
+        ).unwrap();
+        assert_eq!(read_latest_epoch_in_top_level_log(&log), Some(3));
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `read_latest_saved_superbatch` が `<NNNN>/learn.log` の sb 列を
@@ -4315,6 +4447,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
