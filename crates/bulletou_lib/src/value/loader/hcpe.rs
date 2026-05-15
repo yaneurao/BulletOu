@@ -37,7 +37,7 @@
 //! Policy 蒸留や policy 教師を使いたい場合は HCPE3 を使う。
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 use crate::shogi::PackedSfenValue;
@@ -196,7 +196,6 @@ where
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
         let mut rng = SimpleRand::with_seed();
-        let mut skipped = 0usize;
 
         // 初回 buffer fill 中だけ進捗を stderr に出す。
         let fill_started_at = Instant::now();
@@ -212,7 +211,39 @@ where
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
+        // Resume support via byte-level seek. HCPE は 38-byte 固定長レコード
+        // なので、`start_position` レコードぶん読み捨てるのではなく
+        // 全ファイル合計で `start_position * HCPE_RECORD_SIZE` byte 先まで
+        // ファイル列挙順に seek するだけで再開できる。`expand_teacher` が
+        // 既に決定的な (sorted) 順序でファイルを並べるので、隣の run でも
+        // 同じ enumerate 順 → 同じ byte offset = 同じ局面、で一貫する。
+        //
+        // 注意: 厳密には、`filter` が一部 record を reject する設定だと
+        // 「filter 通過数 = start_position」と「読み捨てた disk record 数」
+        // が一致しなくなって少し過大 skip になる。BulletOu の現状の HCPE
+        // ローダーは `|_| true` (= 全採用) 固定で使われており実害無し。
+        let mut bytes_to_skip = (start_position as u64) * HCPE_RECORD_SIZE as u64;
+        if bytes_to_skip > 0 {
+            eprintln!(
+                "  seeking past {:.1}M records ({:.2} GB) via fixed-length record seek...",
+                start_position as f64 / 1.0e6,
+                (bytes_to_skip as f64) / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+
         for path in &file_paths {
+            // この path の全体サイズ。`bytes_to_skip` がこれより大きければ
+            // ファイル全体をスキップ (open しない)。
+            let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let in_file_skip = if bytes_to_skip >= file_size {
+                bytes_to_skip -= file_size;
+                continue;
+            } else {
+                let off = bytes_to_skip;
+                bytes_to_skip = 0;
+                off
+            };
+
             let file = match File::open(path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -221,6 +252,12 @@ where
                 }
             };
             let mut reader = BufReader::new(file);
+            if in_file_skip > 0 {
+                if let Err(e) = reader.seek(SeekFrom::Start(in_file_skip)) {
+                    eprintln!("[HcpeDataLoader] seek error in {path}: {e}");
+                    continue;
+                }
+            }
 
             loop {
                 // 完全レコード境界で読み出すため `read` を繰り返して埋める。
@@ -285,34 +322,10 @@ where
                     });
 
                 // 順序保ったまま shuffle buffer に追加。`start_position` の
-                // skip は ここで適用 (filter 通過 record 数で数える)。
-                // 進捗報告は skip phase と fill phase の両方で出す:
-                //   skip phase: "skipping start_position records: X/Y"
-                //   fill phase: "filling shuffle buffer: X/Y records"
-                // どちらも `\r` で同じ行を上書き。500ms ごとに更新。
+                // skip はファイル冒頭の byte-seek で済んでいるので、ここでは
+                // skip 判定不要。
                 for partial in decoded {
                     for psv in partial {
-                        if skipped < start_position {
-                            skipped += 1;
-                            if first_fill_in_progress {
-                                let now = Instant::now();
-                                if now.duration_since(last_report_at).as_millis()
-                                    >= 500
-                                {
-                                    let pct = 100.0 * skipped as f64
-                                        / start_position.max(1) as f64;
-                                    let _ = write!(
-                                        std::io::stderr(),
-                                        "\r  skipping {:.1}M / {:.1}M records (resume start_position, {pct:.1}%)   ",
-                                        skipped as f64 / 1.0e6,
-                                        start_position as f64 / 1.0e6,
-                                    );
-                                    let _ = std::io::stderr().flush();
-                                    last_report_at = now;
-                                }
-                            }
-                            continue;
-                        }
                         buffer.push(psv);
 
                         if first_fill_in_progress {
