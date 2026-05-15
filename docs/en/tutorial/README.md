@@ -12,6 +12,7 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 | 3 | [Prepare training data](3-data.md) | Choose the eval type and pre-process (shuffle) the teacher file |
 | 4 | [Run the training](4-train.md) | Invoke `bulletou` (eval-type / arch / teacher) |
 | 5 | [Stop and resume](5-resume.md) | Auto-resume by re-running with the same `--output` |
+| 5.5 | [Continued training](5b-additional-training.md) | Add more epochs to a finished run; swap teacher, batch_size, LR, etc. |
 | 6 | [Tune the training](6-tune.md) | Adjust the schedule (`--lr`, `--superbatches`) and `--lambda` (optional) |
 | 7 | [Inspect the result](7-result.md) | Output layout and reading `learn.log` |
 | 8 | [Load into an engine](8-engine.md) | Verify the trained weights in YaneuraOu |

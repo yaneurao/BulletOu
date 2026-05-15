@@ -24,6 +24,7 @@ checkpoints/.../
 ---
 
 次へ:
+- [5.5 追加学習の仕方](5b-additional-training.md) — 完走後にもっと回したい / 設定を変えて続行したい
 - [6. 学習をチューニング](6-tune.md) — `--lambda`、`--lr`、`--superbatches` 等で学習を調整する (任意)
 - 学習結果がもう手元にあるなら [7. 結果を確認](7-result.md) へ
 

@@ -24,6 +24,7 @@ This behaviour is identical for every eval-type (KPPT / KPP_KKPT / NNUE_HALFKP /
 ---
 
 Next:
+- [5.5 Continued training](5b-additional-training.md) — add more epochs to a finished run, or change settings mid-stream
 - [6. Tune the training](6-tune.md) — adjust `--lambda`, `--lr`, `--superbatches`, etc. (optional)
 - If you already have a trained model, jump to [7. Inspect the result](7-result.md)
 

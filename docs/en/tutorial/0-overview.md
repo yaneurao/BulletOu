@@ -77,6 +77,7 @@ The rest of the tutorial:
 - [3. Prepare training data](3-data.md) — choosing the eval type, plus pre-shuffling the teacher file
 - [4. Run the training](4-train.md) — invoking `bulletou`
 - [5. Stop and resume](5-resume.md) — auto-resume by re-running with the same `--output`
+- [5.5 Continued training](5b-additional-training.md) — add more epochs to a finished run, swap batch_size or teacher
 - [6. Tune the training](6-tune.md) — adjust the schedule and `--lambda` (optional)
 - [7. Inspect the result](7-result.md) — output layout and reading `learn.log`
 - [8. Load into an engine](8-engine.md) — verify in YaneuraOu

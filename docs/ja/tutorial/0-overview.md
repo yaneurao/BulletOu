@@ -75,6 +75,7 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
 - [3. 教師データを用意する](3-data.md) — eval-type の選択と教師データの前処理 (シャッフル)
 - [4. 学習を走らせる](4-train.md) — `bulletou` コマンドの実行
 - [5. 中断・再開](5-resume.md) — `--output` 同じで自動 resume
+- [5.5 追加学習の仕方](5b-additional-training.md) — 完走後にさらに epoch を積む / batch_size や教師を変えて続行
 - [6. 学習をチューニング](6-tune.md) — スケジュールと教師ターゲット (`--lambda`) の調整 (任意)
 - [7. 結果を確認する](7-result.md) — 出力レイアウト、`learn.log` の読み方
 - [8. エンジンに組み込む](8-engine.md) — やねうら王で動作確認
