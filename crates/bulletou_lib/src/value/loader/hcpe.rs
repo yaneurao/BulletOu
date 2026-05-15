@@ -92,6 +92,17 @@ pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// HCP → PSV デコードに使う worker スレッド数。`None` のとき
     /// `std::thread::available_parallelism()` (= 論理コア数) で自動決定。
     loader_threads: Option<usize>,
+    /// 再開時の seek 位置 (= 全ファイル連結ストリームの先頭からの byte
+    /// offset)。`with_resume_offset` で外部から指定する。0 のときは
+    /// `map_chunks` の `start_position` 引数 × `HCPE_RECORD_SIZE` を
+    /// fallback として使う (= 旧 API 互換)。
+    resume_offset: u64,
+    /// 学習側 (= `f(&buffer)`) が「ここまでは確実に処理した」ことを表す
+    /// byte offset。Producer が buffer を送出する際に attach した
+    /// offset を、Consumer が `f` 完了後に書き込む。Save callback から
+    /// この値を読み出して checkpoint dir に書き出すと、次回起動時に
+    /// `with_resume_offset` で渡せば「先読み分の取りこぼし無し」で再開できる。
+    consumed_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
@@ -110,6 +121,8 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
             buffer_size: buffer_size_mb.saturating_mul(1024 * 1024) / 40,
             filter,
             loader_threads: None,
+            resume_offset: 0,
+            consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -118,6 +131,22 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
     pub fn with_loader_threads(mut self, n: usize) -> Self {
         self.loader_threads = if n == 0 { None } else { Some(n) };
         self
+    }
+
+    /// 再開時に最初に seek する byte offset を指定する。`expand_teacher` の
+    /// 出力ファイル列挙順に連結したストリームの先頭からの累積 byte 数。
+    /// 0 を渡すと旧来通り `start_position` 由来の skip ロジックに falls back。
+    pub fn with_resume_offset(mut self, offset: u64) -> Self {
+        self.resume_offset = offset;
+        self
+    }
+
+    /// 学習側が「ここまで処理した」を書き込む `AtomicU64` のハンドル。
+    /// Save callback からこれを `.load()` して checkpoint dir に書き出し、
+    /// 次回起動時に `with_resume_offset` で渡せば、先読み分のロスなく
+    /// 厳密に再開できる。
+    pub fn consumed_offset_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.consumed_offset.clone()
     }
 }
 
@@ -159,18 +188,32 @@ where
         let file_paths = self.file_paths.clone();
         let filter = self.filter.clone();
         let loader_threads = self.loader_threads;
+        // resume_offset (= 外部から指定) が 0 のとき、後方互換で
+        // start_position 由来の skip を計算する (= 旧 API)。
+        // HCPE は 38-byte 固定長なので `start_position × 38` で正しい。
+        let resume_offset = if self.resume_offset > 0 {
+            self.resume_offset
+        } else {
+            (start_position as u64) * HCPE_RECORD_SIZE as u64
+        };
+        let consumed_offset = self.consumed_offset.clone();
         let (tx, rx) =
-            std::sync::mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
+            std::sync::mpsc::sync_channel::<(Vec<PackedSfenValue>, u64)>(0);
 
         let producer = std::thread::spawn(move || {
-            Self::produce_buffers(file_paths, buffer_size, filter, start_position, loader_threads, tx);
+            Self::produce_buffers(file_paths, buffer_size, filter, resume_offset, loader_threads, tx);
         });
 
-        // コンシューマループ: buffer を受け取って f() に渡す。
-        // f() が true (= stop) を返したら受信側 (rx) を drop することで
-        // プロデューサ側の次の send が SendError を返して終了する。
-        while let Ok(buf) = rx.recv() {
-            if f(&buf) {
+        // コンシューマループ: (buffer, offset_at_send) を受け取り、buffer を
+        // `f()` に流し、終わったら attached offset を `consumed_offset` に
+        // 書き込む = 「ここまで処理済み」のしるし。Save callback がこの
+        // 値を `0NNN/dataloader_pos.txt` に書き出すと、次回起動時に
+        // `with_resume_offset` で渡して厳密再開できる。
+        use std::sync::atomic::Ordering;
+        while let Ok((buf, offset_at_send)) = rx.recv() {
+            let stop = f(&buf);
+            consumed_offset.store(offset_at_send, Ordering::Release);
+            if stop {
                 break;
             }
         }
@@ -190,9 +233,9 @@ where
         file_paths: Vec<String>,
         buffer_size: usize,
         filter: T,
-        start_position: usize,
+        resume_offset: u64,
         loader_threads: Option<usize>,
-        tx: std::sync::mpsc::SyncSender<Vec<PackedSfenValue>>,
+        tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64)>,
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
         let mut rng = SimpleRand::with_seed();
@@ -211,29 +254,31 @@ where
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
-        // Resume support via byte-level seek. HCPE は 38-byte 固定長レコード
-        // なので、`start_position` レコードぶん読み捨てるのではなく
-        // 全ファイル合計で `start_position * HCPE_RECORD_SIZE` byte 先まで
-        // ファイル列挙順に seek するだけで再開できる。`expand_teacher` が
-        // 既に決定的な (sorted) 順序でファイルを並べるので、隣の run でも
-        // 同じ enumerate 順 → 同じ byte offset = 同じ局面、で一貫する。
-        //
-        // 注意: 厳密には、`filter` が一部 record を reject する設定だと
-        // 「filter 通過数 = start_position」と「読み捨てた disk record 数」
-        // が一致しなくなって少し過大 skip になる。BulletOu の現状の HCPE
-        // ローダーは `|_| true` (= 全採用) 固定で使われており実害無し。
-        let mut bytes_to_skip = (start_position as u64) * HCPE_RECORD_SIZE as u64;
+        // Resume support: `resume_offset` byte だけ全ファイル連結ストリーム
+        // を先に進めてから読み始める。固定長レコード前提ではなく、単に
+        // 「前回ここまで処理した」を表す byte offset。次の seek 量を
+        // 残しながらファイルを順に walk して、該当するファイルにきたら
+        // `seek(SeekFrom::Start(...))` する。
+        let mut bytes_to_skip = resume_offset;
         if bytes_to_skip > 0 {
             eprintln!(
-                "  seeking past {:.1}M records ({:.2} GB) via fixed-length record seek...",
-                start_position as f64 / 1.0e6,
-                (bytes_to_skip as f64) / (1024.0 * 1024.0 * 1024.0),
+                "  resuming from byte offset {} ({:.2} GB)...",
+                bytes_to_skip,
+                bytes_to_skip as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
+        // 「読み終わって send したぶんを含めた、ストリーム先頭からの
+        // 累積 byte 数」。バッファ送出時に同梱して、Consumer 側で
+        // `consumed_offset` に書き込まれる。次回起動時はこの offset を
+        // `with_resume_offset` で渡せば、Producer の先読みぶんも含めて
+        // 「Consumer が処理し終わった点」から再開できる。
+        let mut bytes_read_total: u64 = resume_offset;
 
         for path in &file_paths {
             // この path の全体サイズ。`bytes_to_skip` がこれより大きければ
-            // ファイル全体をスキップ (open しない)。
+            // ファイル全体をスキップ (open しない)。スキップした分も
+            // `bytes_read_total` に含めることで、ストリーム上の絶対 offset を
+            // 維持する。
             let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             let in_file_skip = if bytes_to_skip >= file_size {
                 bytes_to_skip -= file_size;
@@ -277,6 +322,11 @@ where
                     break;
                 }
                 let records_in_chunk = filled / HCPE_RECORD_SIZE;
+                // ストリーム上の絶対 byte offset を進める。次の send 時に
+                // この時点の `bytes_read_total` を attach することで、
+                // Consumer 側が「この buffer まで処理完了 = ここまで読まれた」
+                // を知れる。
+                bytes_read_total += (records_in_chunk * HCPE_RECORD_SIZE) as u64;
 
                 // この chunk を n_workers で均等に分割して並列デコード。
                 // 各 worker は自分のスライスをデコード → 返す Vec<PSV> を
@@ -366,7 +416,7 @@ where
                                 &mut buffer,
                                 Vec::with_capacity(buffer_size),
                             );
-                            if tx.send(taken).is_err() {
+                            if tx.send((taken, bytes_read_total)).is_err() {
                                 // コンシューマが drop した → 終了
                                 return;
                             }
@@ -395,7 +445,7 @@ where
                 let k = (rng.rng() as usize) % (j + 1);
                 buffer.swap(j, k);
             }
-            let _ = tx.send(buffer);
+            let _ = tx.send((buffer, bytes_read_total));
         }
     }
 }

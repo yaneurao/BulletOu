@@ -1368,6 +1368,30 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     max_sb
 }
 
+/// Read the highest-numbered `<output_dir>/<NNNN>/dataloader_pos.txt`
+/// (= the dataloader's "I have processed up to this byte offset"
+/// marker, written at each save). Returns the saved byte offset, or
+/// `None` if no such file exists.
+///
+/// This lets the HCPE loader resume at the EXACT point the previous
+/// run left off — no read-and-discard of a record prefix, and no
+/// dependence on the (record_size × record_count) formula.
+fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<u64> {
+    let mut latest_idx: Option<usize> = None;
+    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(n) = name.parse::<usize>() else { continue };
+        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
+    }
+    let n = latest_idx?;
+    let pos_file = output_dir.join(format!("{n:04}")).join("dataloader_pos.txt");
+    let content = std::fs::read_to_string(&pos_file).ok()?;
+    content.trim().parse::<u64>().ok()
+}
+
 /// Detect the teacher path recorded in the highest-numbered
 /// `<output_dir>/<NNNN>/learn.log`. Used to decide whether
 /// auto-resume's `start_superbatch` skip-ahead is safe: bullet's
@@ -2178,6 +2202,16 @@ macro_rules! run_training_inline_nnue {
             .copied()
             .unwrap_or(0);
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
+        // HCPE データローダー再開用 byte offset。最新の checkpoint dir に
+        // `dataloader_pos.txt` があればそこから読み、なければ 0 (= 先頭から)。
+        // 教師が変わった場合は 0 にリセット (新教師の先頭から)。
+        let cb_dataloader_resume_offset = std::cell::Cell::new(
+            if teacher_changed {
+                0u64
+            } else {
+                read_latest_dataloader_pos(&output_dir_buf).unwrap_or(0)
+            }
+        );
 
         if !user_set_start {
             if teacher_changed {
@@ -2320,11 +2354,20 @@ macro_rules! run_training_inline_nnue {
                     on_checkpoint_saved: Some(&on_checkpoint_saved),
                 };
 
+                // HCPE 専用: 「ここまで処理した」を保存する handle。
+                // trainer.run 後にこの値を読んで dataloader_pos.txt に書き出す。
+                // 教師変更時 (teacher_changed) は cb_dataloader_resume_offset
+                // を 0 にリセットしてあるので、HCPE の seek も 0 から。
+                let hcpe_consumed_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
+                    std::cell::Cell::new(None);
+
                 last_error_record = match format {
                     DataFormat::Hcpe => {
                         let loader =
                             HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_loader_threads(args.loader_threads);
+                                .with_loader_threads(args.loader_threads)
+                                .with_resume_offset(cb_dataloader_resume_offset.get());
+                        hcpe_consumed_handle.set(Some(loader.consumed_offset_handle()));
                         trainer.run(&schedule, &settings, &loader)
                     }
                     DataFormat::Hcpe3 => {
@@ -2342,6 +2385,16 @@ macro_rules! run_training_inline_nnue {
                         trainer.run(&schedule, &settings, &loader)
                     }
                 };
+
+                // HCPE: trainer.run 終了後に Consumer が書いた offset を
+                // 読み出し、次 chunk 用 resume_offset として保持しておく。
+                // ファイル書き出しは finalize_one_nnue_dir 成功後にやる。
+                let hcpe_consumed_value = hcpe_consumed_handle.take().map(|arc| {
+                    arc.load(std::sync::atomic::Ordering::Acquire)
+                });
+                if let Some(off) = hcpe_consumed_value {
+                    cb_dataloader_resume_offset.set(off);
+                }
 
                 // Closure dropped → its borrow of saved_dir_in_chunk released.
                 let saved_ckpt_dir = saved_dir_in_chunk.into_inner();
@@ -2376,6 +2429,20 @@ macro_rules! run_training_inline_nnue {
                                 "  WARN: failed to update {}: {e}",
                                 output_dir_buf.join("learn.log").display()
                             );
+                        }
+                        // HCPE 専用: Consumer が「ここまで処理した」を表す
+                        // byte offset を `dataloader_pos.txt` に書く。次回
+                        // 起動時に `read_latest_dataloader_pos` で読み出して
+                        // `with_resume_offset` に渡せば、先読みぶんを含めて
+                        // 厳密にここから再開できる。
+                        if let Some(off) = hcpe_consumed_value {
+                            let pos_file = dst.join("dataloader_pos.txt");
+                            if let Err(e) = std::fs::write(&pos_file, format!("{off}\n")) {
+                                eprintln!(
+                                    "  WARN: failed to write {}: {e}",
+                                    pos_file.display()
+                                );
+                            }
                         }
                         eprintln!("  -> {}/", dst.display());
                     }
