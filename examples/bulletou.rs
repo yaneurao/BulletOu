@@ -1369,14 +1369,20 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
 }
 
 /// Read the highest-numbered `<output_dir>/<NNNN>/dataloader_pos.txt`
-/// (= the dataloader's "I have processed up to this byte offset"
-/// marker, written at each save). Returns the saved byte offset, or
-/// `None` if no such file exists.
+/// (= the dataloader's "I have processed up to this position" marker,
+/// written at each save). Returns `(byte_offset, plies_within_unit)`.
 ///
-/// This lets the HCPE loader resume at the EXACT point the previous
-/// run left off — no read-and-discard of a record prefix, and no
-/// dependence on the (record_size × record_count) formula.
-fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<u64> {
+/// Format on disk: `<byte_offset>,<plies>` (single line). For loaders
+/// over fixed-length records (HCPE / PSV) the `plies` part is always
+/// 0. For game-structured loaders (HCPE3 / pack), the pair points to
+/// the start of a game header at `byte_offset` and the ply index
+/// within that game where the next position to be expanded sits — so
+/// resume seeks to the header, parses it, then fast-skips `plies`
+/// MoveInfo entries before re-entering the normal expansion loop.
+///
+/// Backward-compatible with the legacy single-number format (= just
+/// `<byte_offset>` on the line, plies inferred 0).
+fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usize)> {
     let mut latest_idx: Option<usize> = None;
     for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
         if !entry.path().is_dir() {
@@ -1389,7 +1395,15 @@ fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<u64> {
     let n = latest_idx?;
     let pos_file = output_dir.join(format!("{n:04}")).join("dataloader_pos.txt");
     let content = std::fs::read_to_string(&pos_file).ok()?;
-    content.trim().parse::<u64>().ok()
+    let line = content.trim();
+    if let Some((off, plies)) = line.split_once(',') {
+        let off = off.trim().parse::<u64>().ok()?;
+        let plies = plies.trim().parse::<usize>().ok()?;
+        Some((off, plies))
+    } else {
+        let off = line.parse::<u64>().ok()?;
+        Some((off, 0))
+    }
 }
 
 /// Detect the teacher path recorded in the highest-numbered
@@ -2205,11 +2219,14 @@ macro_rules! run_training_inline_nnue {
         // HCPE データローダー再開用 byte offset。最新の checkpoint dir に
         // `dataloader_pos.txt` があればそこから読み、なければ 0 (= 先頭から)。
         // 教師が変わった場合は 0 にリセット (新教師の先頭から)。
+        // (byte_offset, plies_within_unit) のペアで保持する。HCPE / PSV
+        // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
+        // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
         let cb_dataloader_resume_offset = std::cell::Cell::new(
             if teacher_changed {
-                0u64
+                (0u64, 0usize)
             } else {
-                read_latest_dataloader_pos(&output_dir_buf).unwrap_or(0)
+                read_latest_dataloader_pos(&output_dir_buf).unwrap_or((0, 0))
             }
         );
 
@@ -2354,46 +2371,64 @@ macro_rules! run_training_inline_nnue {
                     on_checkpoint_saved: Some(&on_checkpoint_saved),
                 };
 
-                // HCPE 専用: 「ここまで処理した」を保存する handle。
-                // trainer.run 後にこの値を読んで dataloader_pos.txt に書き出す。
-                // 教師変更時 (teacher_changed) は cb_dataloader_resume_offset
-                // を 0 にリセットしてあるので、HCPE の seek も 0 から。
-                let hcpe_consumed_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
+                // Resume pointer: 「ここまで処理した」を Consumer 側が書く
+                // (offset, plies) のハンドル。trainer.run 後にこのペアを読んで
+                // dataloader_pos.txt に書き出す。HCPE / PSV のような固定長
+                // フォーマットでは plies は常に 0、HCPE3 / pack のような
+                // 棋譜フォーマットでは ply 単位の正確な位置になる。
+                let dl_offset_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
+                    std::cell::Cell::new(None);
+                let dl_plies_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
                     std::cell::Cell::new(None);
 
                 last_error_record = match format {
                     DataFormat::Hcpe => {
+                        let (resume_off, _resume_plies) = cb_dataloader_resume_offset.get();
                         let loader =
                             HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
                                 .with_loader_threads(args.loader_threads)
-                                .with_resume_offset(cb_dataloader_resume_offset.get());
-                        hcpe_consumed_handle.set(Some(loader.consumed_offset_handle()));
+                                .with_resume_offset(resume_off);
+                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
                         trainer.run(&schedule, &settings, &loader)
                     }
                     DataFormat::Hcpe3 => {
+                        let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader =
-                            Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                            Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                                .with_resume_offset(resume_off, resume_plies);
+                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
+                        dl_plies_handle.set(Some(loader.consumed_plies_handle()));
                         trainer.run(&schedule, &settings, &loader)
                     }
                     DataFormat::Pack => {
+                        let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_single_epoch(true);
+                            .with_single_epoch(true)
+                            .with_resume_offset(resume_off, resume_plies);
+                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
+                        dl_plies_handle.set(Some(loader.consumed_plies_handle()));
                         trainer.run(&schedule, &settings, &loader)
                     }
                     DataFormat::Psv => {
+                        // PSV is fixed 40-byte; DirectSequentialDataLoader
+                        // already byte-seeks via `start_position * 40`, so
+                        // no `dataloader_pos.txt` write is needed.
                         let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
                         trainer.run(&schedule, &settings, &loader)
                     }
                 };
 
-                // HCPE: trainer.run 終了後に Consumer が書いた offset を
-                // 読み出し、次 chunk 用 resume_offset として保持しておく。
-                // ファイル書き出しは finalize_one_nnue_dir 成功後にやる。
-                let hcpe_consumed_value = hcpe_consumed_handle.take().map(|arc| {
+                // Consumer が「ここまで処理した」を表す (offset, plies) を
+                // 読み出し、次 chunk 用 resume として保持しておく。ファイル
+                // 書き出しは finalize_one_nnue_dir 成功後にやる。
+                let consumed_offset_val = dl_offset_handle.take().map(|arc| {
                     arc.load(std::sync::atomic::Ordering::Acquire)
                 });
-                if let Some(off) = hcpe_consumed_value {
-                    cb_dataloader_resume_offset.set(off);
+                let consumed_plies_val = dl_plies_handle.take().map(|arc| {
+                    arc.load(std::sync::atomic::Ordering::Acquire)
+                });
+                if let Some(off) = consumed_offset_val {
+                    cb_dataloader_resume_offset.set((off, consumed_plies_val.unwrap_or(0)));
                 }
 
                 // Closure dropped → its borrow of saved_dir_in_chunk released.
@@ -2430,14 +2465,15 @@ macro_rules! run_training_inline_nnue {
                                 output_dir_buf.join("learn.log").display()
                             );
                         }
-                        // HCPE 専用: Consumer が「ここまで処理した」を表す
-                        // byte offset を `dataloader_pos.txt` に書く。次回
-                        // 起動時に `read_latest_dataloader_pos` で読み出して
-                        // `with_resume_offset` に渡せば、先読みぶんを含めて
-                        // 厳密にここから再開できる。
-                        if let Some(off) = hcpe_consumed_value {
+                        // Consumer が「ここまで処理した」を表す pair を
+                        // `dataloader_pos.txt` に書く (`<offset>,<plies>` 形式)。
+                        // HCPE / PSV のような固定長レコードでは plies=0、HCPE3
+                        // / pack のような棋譜単位なら ply 内の位置まで含めて
+                        // 厳密に再開できる。
+                        if let Some(off) = consumed_offset_val {
+                            let plies = consumed_plies_val.unwrap_or(0);
                             let pos_file = dst.join("dataloader_pos.txt");
-                            if let Err(e) = std::fs::write(&pos_file, format!("{off}\n")) {
+                            if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
                                 eprintln!(
                                     "  WARN: failed to write {}: {e}",
                                     pos_file.display()

@@ -21,7 +21,7 @@
 //! 4. Batch:   batch_size に分割してコールバックへ
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::sync::mpsc;
 
 use crate::shogi::packed_sfen::PackedSfenValue;
@@ -594,14 +594,30 @@ impl PackedSfenValue {
 /// .pack ファイルのバイト列カーソル
 /// .pack ファイルを逐次的に読むカーソル。
 /// 多 GB 規模の corpus でも全量メモリにロードしないようストリーム読み出しする。
+///
+/// `bytes_consumed` は連結ファイル列全体の先頭からの累積 byte 数を返す。
+/// 1 つの PackCursor は 1 ファイル分なので、複数ファイルを跨ぐ場合は
+/// 呼び出し側が prior file size を `set_initial_offset` で渡す。
 struct PackCursor {
     reader: BufReader<File>,
     eof: bool,
+    /// このカーソルが進んだ累積 byte 数 (= 連結ファイル列の先頭からの累積)。
+    /// 初期値は呼び出し側が `set_initial_offset` で指定 (resume seek 後の
+    /// 絶対 offset に揃えるため)。
+    bytes_consumed: u64,
 }
 
 impl PackCursor {
     fn new(reader: BufReader<File>) -> Self {
-        Self { reader, eof: false }
+        Self { reader, eof: false, bytes_consumed: 0 }
+    }
+
+    fn set_initial_offset(&mut self, offset: u64) {
+        self.bytes_consumed = offset;
+    }
+
+    fn bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
     }
 
     /// 次の 1 byte を peek してファイル終端かを判定する。
@@ -621,22 +637,34 @@ impl PackCursor {
 
     fn read_u8(&mut self) -> Option<u8> {
         let mut buf = [0u8; 1];
-        self.reader.read_exact(&mut buf).ok().map(|_| buf[0])
+        self.reader.read_exact(&mut buf).ok().map(|_| {
+            self.bytes_consumed += 1;
+            buf[0]
+        })
     }
 
     fn read_u16(&mut self) -> Option<u16> {
         let mut buf = [0u8; 2];
-        self.reader.read_exact(&mut buf).ok().map(|_| u16::from_le_bytes(buf))
+        self.reader.read_exact(&mut buf).ok().map(|_| {
+            self.bytes_consumed += 2;
+            u16::from_le_bytes(buf)
+        })
     }
 
     fn read_i16(&mut self) -> Option<i16> {
         let mut buf = [0u8; 2];
-        self.reader.read_exact(&mut buf).ok().map(|_| i16::from_le_bytes(buf))
+        self.reader.read_exact(&mut buf).ok().map(|_| {
+            self.bytes_consumed += 2;
+            i16::from_le_bytes(buf)
+        })
     }
 
     fn read_bytes_32(&mut self) -> Option<[u8; 32]> {
         let mut buf = [0u8; 32];
-        self.reader.read_exact(&mut buf).ok().map(|_| buf)
+        self.reader.read_exact(&mut buf).ok().map(|_| {
+            self.bytes_consumed += 32;
+            buf
+        })
     }
 }
 
@@ -679,8 +707,10 @@ struct RawGameData {
     pack_game_result: u8,
 }
 
-/// .pack カーソルから1対局を読み取る
-fn read_one_game(cursor: &mut PackCursor) -> Option<RawGameData> {
+/// .pack カーソルから1対局を読み取る。
+/// 戻り値は (game header の絶対 byte offset, game data)。
+fn read_one_game(cursor: &mut PackCursor) -> Option<(u64, RawGameData)> {
+    let header_offset = cursor.bytes_consumed();
     let start_flag = cursor.read_u8()?;
 
     let start_pos = match start_flag {
@@ -707,7 +737,7 @@ fn read_one_game(cursor: &mut PackCursor) -> Option<RawGameData> {
         moves.push((move16, eval));
     }
 
-    Some(RawGameData { start_pos, moves, pack_game_result })
+    Some((header_offset, RawGameData { start_pos, moves, pack_game_result }))
 }
 
 /// 1対局を PackedSfenValue のリストに展開
@@ -755,6 +785,14 @@ pub struct ShogiPackLoader<T: Fn(&PackedSfenValue) -> bool> {
     buffer_size: usize,
     filter: T,
     single_epoch: bool,
+    /// 連結ファイル列の先頭からの累積 byte で、ここに居る game header から
+    /// 再開する。0 のとき先頭から。
+    resume_offset: u64,
+    /// `resume_offset` の game の中で最初に push する ply の index (0-indexed)。
+    /// 0..resume_plies の手は読まれ・do_move で局面に反映されるが PSV は push されない。
+    resume_plies: usize,
+    consumed_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    consumed_plies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
@@ -770,6 +808,10 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
             buffer_size: buffer_size_mb * 1024 * 1024 / std::mem::size_of::<PackedSfenValue>() / 2,
             filter,
             single_epoch: false,
+            resume_offset: 0,
+            resume_plies: 0,
+            consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            consumed_plies: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -779,6 +821,22 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
     pub fn with_single_epoch(mut self, enabled: bool) -> Self {
         self.single_epoch = enabled;
         self
+    }
+
+    /// 再開位置の (byte offset, plies) を指定。`byte_offset` の位置に
+    /// game header (= read_one_game の `start_flag` byte) があることが前提。
+    pub fn with_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
+        self.resume_offset = byte_offset;
+        self.resume_plies = plies;
+        self
+    }
+
+    pub fn consumed_offset_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.consumed_offset.clone()
+    }
+
+    pub fn consumed_plies_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.consumed_plies.clone()
     }
 }
 
@@ -799,72 +857,114 @@ where
         let buffer_size = self.buffer_size;
         let filter = self.filter.clone();
         let single_epoch = self.single_epoch;
+        let resume_offset = self.resume_offset;
+        let resume_plies = self.resume_plies;
+        let consumed_offset = self.consumed_offset.clone();
+        let consumed_plies = self.consumed_plies.clone();
 
-        // ===== Resume support (consume-and-drop, best-effort) =====
-        //
-        // .pack は (1) 可変長レコード (2) caller 提供 filter (3) shuffle buffer の
-        // 3 要素により bit-exact な seek が原理的に不可能。本実装は expander 段で
-        // start_position 個の filter 通過 position を input 順序で
-        // 読み飛ばす "best-effort consume-and-drop" を採用している。
-        //
-        // **既知の限界**: shuffle buffer (= buffer_size 個の position) 単位で見ると、
-        // fresh run は buffer 内の random subset を emit しているのに対し、
-        // resume run は buffer の先頭 N 個を input 順序で drop する。このため
-        // 境界 1 shuffle window 分の position について、
-        //   - fresh で emit 済み (= 学習済み) のうち一部が resume でも emit される (重複学習)
-        //   - fresh で未 emit のうち一部が resume の skip 対象に入って drop される (永久 skip)
-        // という現象が起きる。影響は最大 1 shuffle buffer 分 (~256k〜数 M position) に
-        // 限定され、データセット全体の 0.01〜0.1% スケールのため学習結果への影響は
-        // 軽微 (NN にとってはノイズ未満) と判断して受容している。
-        //
-        // **完全な bit-exact resume が必要な場合**: .pack を事前に .psv に展開して
-        // DirectSequentialDataLoader (固定長レコード前提なので byte 単位で seek 可) で
-        // 読むこと。これが現在の主要な学習パスでもある。
-        //
-        // **本 loader を実学習で多用するなら**: shuffle 段の RNG seed を引数化して
-        // post-shuffle skip に切り替える、もしくは shuffle window 境界で checkpoint
-        // を保存する設計に refactor する必要がある。詳細議論は PR #12 review thread 参照。
-        let positions_to_skip = start_position;
+        // resume_offset > 0 のときは `(byte_offset, plies)` 形式の正確な
+        // 再開を使う (= 前回 save 時に Consumer が書き込んだ位置から再開)。
+        // 0 のときは legacy 互換で `start_position` 個の filter 通過 position
+        // を expander で読み飛ばす (best-effort consume-and-drop)。
+        let legacy_skip_mode = resume_offset == 0 && resume_plies == 0;
+        let positions_to_skip = if legacy_skip_mode { start_position } else { 0 };
         if positions_to_skip > 0 {
             eprintln!(
-                "[ShogiPackLoader] WARNING: start_position={start_position} (skip {positions_to_skip} positions). \n\
-                .pack resume is BEST-EFFORT, NOT bit-exact: ~1 shuffle buffer worth of positions \n\
-                near the resume boundary will be partially replayed and partially never seen. \n\
-                For bit-exact resume, preprocess .pack to .psv and use DirectSequentialDataLoader.",
+                "[ShogiPackLoader] WARNING: legacy start_position={start_position} skip. \
+                 dataloader_pos.txt-based exact resume preferred for new runs.",
             );
         }
 
-        // ----- Stage 1: Reader (ファイル → RawGameData バッチ) -----
-        // 空の Vec は "1 sweep 完了 (= 全ファイル一周)" のマーカーとして downstream に流れ、
-        // shuffle 段の tail flush をトリガーする。
+        // ----- Stage 1: Reader -----
+        // ファイル列 → `Vec<(game_header_offset, RawGameData)>` バッチ。
+        // 空 Vec は sweep 終了マーカー (shuffle 段の tail flush 用)。
+        // 初回 sweep のみ resume_offset で開始ファイル + 開始 offset を決める。
         let reader_buffer_size = 256;
-        let (reader_tx, reader_rx) = mpsc::sync_channel::<Vec<RawGameData>>(8);
+        let (reader_tx, reader_rx) =
+            mpsc::sync_channel::<Vec<(u64, RawGameData)>>(8);
         let (reader_stop_tx, reader_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
-            let mut buffer = Vec::with_capacity(reader_buffer_size);
+            let mut buffer: Vec<(u64, RawGameData)> = Vec::with_capacity(reader_buffer_size);
+            // 初回 sweep だけ resume を適用するための flag
+            let mut first_sweep = true;
 
             'dataloading: loop {
-                for file_path in &file_paths {
-                    // データセット指定ミス (パス typo / 権限なし) は fail-fast。
-                    // silent な continue だと reader loop が無限化し、学習スレッドが
-                    // batch を永遠に待ってハングするため。
+                // 初回 sweep の場合は resume_offset を含むファイルを探す。
+                let (first_file_idx_this_sweep, in_file_seek_this_sweep) =
+                    if first_sweep && resume_offset > 0 {
+                        let mut cumulative: u64 = 0;
+                        let mut idx = file_paths.len();
+                        let mut seek_off: u64 = 0;
+                        for (i, p) in file_paths.iter().enumerate() {
+                            let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                            if cumulative + sz > resume_offset {
+                                idx = i;
+                                seek_off = resume_offset - cumulative;
+                                break;
+                            }
+                            cumulative += sz;
+                        }
+                        if idx >= file_paths.len() {
+                            // resume_offset がすべてのファイルサイズの合計を超え →
+                            // sweep 終わりとして downstream に sweep 終了マーカーだけ
+                            // 流して終了 (single_epoch なら break、それ以外も break)。
+                            let _ = reader_tx.send(Vec::new());
+                            break 'dataloading;
+                        }
+                        (idx, seek_off)
+                    } else {
+                        (0usize, 0u64)
+                    };
+
+                // ファイル列を順に walk。current_global_offset は連結ストリーム
+                // 上の絶対 byte offset。各 game の (offset, data) を buffer に
+                // 詰めて reader_tx に流す。
+                let mut current_global_offset: u64 = {
+                    // 開始ファイルより前のファイルサイズ合計を加算しておく
+                    let mut acc = 0u64;
+                    for p in &file_paths[..first_file_idx_this_sweep] {
+                        acc += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                    }
+                    acc + in_file_seek_this_sweep
+                };
+
+                for (idx, file_path) in file_paths.iter().enumerate() {
+                    if idx < first_file_idx_this_sweep {
+                        continue;
+                    }
                     let file = File::open(file_path).unwrap_or_else(|e| {
                         panic!("Failed to open .pack file {file_path:?}: {e}");
                     });
-                    // 多 GB のコーパスでも OOM しないよう BufReader 経由で逐次読みする。
                     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
                     let mut cursor = PackCursor::new(reader);
+                    cursor.set_initial_offset(current_global_offset);
+
+                    // 初回 sweep の最初のファイルだけ seek する
+                    if idx == first_file_idx_this_sweep && in_file_seek_this_sweep > 0 {
+                        // BufReader 内部の Seek 経由
+                        // (`seek` は trait method なのでフィールドアクセス必要)
+                        if let Err(e) =
+                            cursor.reader.seek(std::io::SeekFrom::Start(in_file_seek_this_sweep))
+                        {
+                            eprintln!("[ShogiPackLoader] seek error in {file_path}: {e}");
+                            continue;
+                        }
+                    }
 
                     while !cursor.eof() {
                         let game = match read_one_game(&mut cursor) {
                             Some(g) => g,
-                            None => break, // 可変長のため位置復帰不可
+                            None => break,
                         };
+                        // 次のファイル / EOF まで読んだあとの cursor 位置を反映
+                        current_global_offset = cursor.bytes_consumed();
                         buffer.push(game);
 
                         if buffer.len() >= reader_buffer_size {
-                            if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err() {
+                            if reader_stop_rx.try_recv().unwrap_or(false)
+                                || reader_tx.send(buffer).is_err()
+                            {
                                 break 'dataloading;
                             }
                             buffer = Vec::with_capacity(reader_buffer_size);
@@ -872,42 +972,41 @@ where
                     }
                 }
 
-                // 1 sweep 完了。残りバッファを送信。
                 if !buffer.is_empty() {
-                    if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err() {
+                    if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err()
+                    {
                         break;
                     }
                     buffer = Vec::with_capacity(reader_buffer_size);
                 }
-                // sweep 終了マーカー (空 Vec)。小規模 corpus でも shuffle buffer が
-                // flush されるよう downstream に通知する。
-                if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err() {
+                if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err()
+                {
                     break;
                 }
 
-                // single_epoch モードでは 1 sweep 完了で打ち切る (= downstream に
-                // も EOF を伝播させて学習を 1 epoch で終わらせる)。
+                first_sweep = false;
                 if single_epoch {
                     break;
                 }
             }
         });
 
-        // ----- Stage 2: Expander (RawGameData → PackedSfenValue, フィルタ適用) -----
-        // 空 Vec の sweep 終了マーカーは expand せずそのまま downstream へ転送する。
-        // resume の skip カウンタもここで管理する。
-        let (expand_tx, expand_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(16);
+        // ----- Stage 2: Expander -----
+        // `(game_offset, RawGameData)` を受けて PSV に expand。最初の game
+        // (初回 sweep のみ) は resume_plies 個の ply を skip。各 push 後に
+        // `next_after_push = (current_game_offset, ply+1)` を更新し、Vec<PSV>
+        // と共に shuffle 段に送る。
+        let (expand_tx, expand_rx) =
+            mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(16);
         let (expand_stop_tx, expand_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
-            let mut skipped: usize = 0;
-            // filter 全弾き等で「filter を通過する position が 0 の sweep」が連続したら
-            // 設定ミス or 空データセットと判断し panic で fail-fast。silent な hang は
-            // debug 不能なため。"filter 通過数" で判定するので resume の skip 中
-            // (positions_to_skip 消化中) でも誤発火しない。
+            let mut skipped_legacy: usize = 0;
             let mut filter_accepted_in_sweep: usize = 0;
             let mut consecutive_empty_sweeps: usize = 0;
             const MAX_EMPTY_SWEEPS: usize = 2;
+            let mut first_game_in_first_sweep = resume_offset > 0 || resume_plies > 0;
+            let mut next_after_push: (u64, usize) = (resume_offset, resume_plies);
 
             'dataloading: while let Ok(games) = reader_rx.recv() {
                 if expand_stop_rx.try_recv().unwrap_or(false) {
@@ -917,24 +1016,38 @@ where
 
                 let is_sweep_end = games.is_empty();
                 let mut positions = Vec::new();
-                for game in games {
+                for (game_offset, game) in games {
+                    let move_num = game.moves.len();
+                    let initial_skip = if first_game_in_first_sweep {
+                        first_game_in_first_sweep = false;
+                        resume_plies.min(move_num)
+                    } else {
+                        0
+                    };
                     let expanded = expand_game(game);
-                    for psv in expanded {
+                    for (i, psv) in expanded.into_iter().enumerate() {
+                        if i < initial_skip {
+                            continue;
+                        }
                         if !filter(&psv) {
                             continue;
                         }
                         filter_accepted_in_sweep += 1;
-                        if skipped < positions_to_skip {
-                            skipped += 1;
+                        if legacy_skip_mode && skipped_legacy < positions_to_skip {
+                            skipped_legacy += 1;
                             continue;
                         }
                         positions.push(psv);
+                        next_after_push = (game_offset, i + 1);
                     }
                 }
 
-                // sweep 終了マーカーは空でも必ず流す (shuffle 段の tail flush 用)。
                 let send_needed = is_sweep_end || !positions.is_empty();
-                if send_needed && expand_tx.send(positions).is_err() {
+                if send_needed
+                    && expand_tx
+                        .send((positions, next_after_push.0, next_after_push.1))
+                        .is_err()
+                {
                     reader_stop_tx.send(true).ok();
                     break 'dataloading;
                 }
@@ -956,18 +1069,23 @@ where
             }
         });
 
-        // ----- Stage 3: Shuffle (バッファ蓄積 → Fisher-Yates シャッフル) -----
-        // 通常はバッファが buffer_size に達した時点で flush するが、
-        // 1 sweep 全体で buffer_size に満たない小規模 corpus の場合に学習が
-        // ハングしないよう、sweep 終了マーカー (空 Vec) を受けたら残バッファを flush する。
-        let (shuffle_tx, shuffle_rx) = mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
+        // ----- Stage 3: Shuffle -----
+        // Vec<PSV> + 最新 (offset, plies) を受け、shuffle buffer に蓄積。
+        // buffer_size に達したら shuffle して `(buf, latest_offset, latest_plies)`
+        // を送る。latest は「buffer 蓄積中に最後に受信した値」(= input order
+        // の最後の push に対応)。
+        let (shuffle_tx, shuffle_rx) =
+            mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
         let (shuffle_stop_tx, shuffle_stop_rx) = mpsc::sync_channel::<bool>(1);
 
-        // Note: filter 全弾きの fail-fast 検知は expander 段で行う (filter 通過数で判定するため)。
         std::thread::spawn(move || {
             let mut shuffle_buffer = Vec::with_capacity(buffer_size);
+            let mut latest_attached: (u64, usize) = (0, 0);
 
-            'dataloading: while let Ok(positions) = expand_rx.recv() {
+            'dataloading: while let Ok((positions, next_off, next_plies)) = expand_rx.recv() {
+                if !positions.is_empty() {
+                    latest_attached = (next_off, next_plies);
+                }
                 let is_sweep_end = positions.is_empty();
                 for entry in positions {
                     shuffle_buffer.push(entry);
@@ -975,7 +1093,11 @@ where
                     if shuffle_buffer.len() >= buffer_size {
                         shuffle(&mut shuffle_buffer);
 
-                        if shuffle_stop_rx.try_recv().unwrap_or(false) || shuffle_tx.send(shuffle_buffer).is_err() {
+                        if shuffle_stop_rx.try_recv().unwrap_or(false)
+                            || shuffle_tx
+                                .send((shuffle_buffer, latest_attached.0, latest_attached.1))
+                                .is_err()
+                        {
                             expand_stop_tx.send(true).ok();
                             break 'dataloading;
                         }
@@ -984,11 +1106,14 @@ where
                     }
                 }
 
-                // tail flush: 1 sweep 通しても buffer_size に満たないケース対応。
                 if is_sweep_end && !shuffle_buffer.is_empty() {
                     shuffle(&mut shuffle_buffer);
 
-                    if shuffle_stop_rx.try_recv().unwrap_or(false) || shuffle_tx.send(shuffle_buffer).is_err() {
+                    if shuffle_stop_rx.try_recv().unwrap_or(false)
+                        || shuffle_tx
+                            .send((shuffle_buffer, latest_attached.0, latest_attached.1))
+                            .is_err()
+                    {
                         expand_stop_tx.send(true).ok();
                         break 'dataloading;
                     }
@@ -998,12 +1123,14 @@ where
             }
         });
 
-        // ----- Stage 4: Flush (shuffle buffer → コールバック) -----
-        // shuffle buffer 全体を 1 chunk として callback `f` に渡す。
-        // batch 単位の分割は `DataLoader::map_chunks` の caller (load_and_map_batches)
-        // が `chunks_exact(batch_size)` で行うため、ここでは行わない。
-        'dataloading: while let Ok(shuffle_buffer) = shuffle_rx.recv() {
-            if f(&shuffle_buffer) {
+        // ----- Stage 4: Flush -----
+        // shuffle buffer を `f` に渡し、終了後に consumed_offset/plies を更新。
+        use std::sync::atomic::Ordering;
+        'dataloading: while let Ok((shuffle_buffer, next_off, next_plies)) = shuffle_rx.recv() {
+            let stop = f(&shuffle_buffer);
+            consumed_offset.store(next_off, Ordering::Release);
+            consumed_plies.store(next_plies, Ordering::Release);
+            if stop {
                 shuffle_stop_tx.send(true).ok();
                 break 'dataloading;
             }
