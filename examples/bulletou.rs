@@ -1075,6 +1075,52 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     max_sb
 }
 
+/// Detect the teacher path recorded in the highest-numbered
+/// `<output_dir>/<NNNN>/learn.log`. Used to decide whether
+/// auto-resume's `start_superbatch` skip-ahead is safe: bullet's
+/// dataloader skips `(start_sb - 1) * batches_per_sb` records at
+/// startup, which only makes sense if the resume run uses the same
+/// teacher file as the previous run. If the teacher changed, the new
+/// (smaller) file may have fewer records than the requested skip,
+/// causing `NoBatchesReceived` panic. We use the comparison result to
+/// fall back to `start_superbatch=1` in the changed-teacher case while
+/// still honouring the model+optimizer load from `state.bin`.
+///
+/// Returns the **trimmed** teacher field of the **last (= bottom) row**
+/// in the latest dir's learn.log (which is the most recent `--teacher`
+/// arg used for that save). Returns `None` if no row could be parsed.
+fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
+    let mut latest_idx: Option<usize> = None;
+    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(n) = name.parse::<usize>() else { continue };
+        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
+    }
+    let n = latest_idx?;
+    let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
+    let content = std::fs::read_to_string(&learn_log).ok()?;
+    // Same 11-column layout as read_latest_saved_superbatch. teacher
+    // is the trailing field (index 10). splitn(11, ',') keeps any
+    // commas inside teacher (= comma-separated `--teacher` list)
+    // as a single CSV field.
+    let mut last_teacher: Option<String> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(11, ',').collect();
+        if parts.len() < 11 {
+            continue;
+        }
+        last_teacher = Some(parts[10].trim().to_string());
+    }
+    last_teacher
+}
+
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 11-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
 /// the top-level `<output>/learn.log`, writing the CSV header on first
@@ -1722,7 +1768,25 @@ macro_rules! run_training_inline_nnue {
         // sum forward from the existing top-level learn.log.
         let cb_ctx = LogContext::from_args(args);
         let cb_top_level_log = output_dir_buf.join("learn.log");
-        let auto_resume_sb = read_latest_saved_superbatch(&output_dir_buf);
+        let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
+        // Teacher-change detection: bullet's dataloader skips
+        // `(start_sb - 1) * batches_per_sb` records at startup, which
+        // assumes the resume run uses the same teacher data. If the
+        // teacher path changed (e.g. the user is doing yane-distill
+        // round-2 training on a new chunk), the new file may not have
+        // enough records to reach the skip target → trainer.run hits
+        // EOF before any batch is delivered → `NoBatchesReceived`
+        // panic. Detect this by comparing the recorded teacher in the
+        // latest <NNNN>/learn.log with the current --teacher arg, and
+        // disable auto-resume (= reset sb to 1) when they differ. The
+        // model and optimiser load from state.bin still happens — only
+        // the dataloader skip and the LR schedule restart.
+        let prev_teacher = read_latest_saved_teacher(&output_dir_buf);
+        let teacher_changed = match prev_teacher.as_deref() {
+            Some(prev) => prev.trim() != args.teacher.trim(),
+            None => false,
+        };
+        let auto_resume_sb = if teacher_changed { None } else { auto_resume_sb_raw };
         let effective_start_superbatch = args
             .start_superbatch
             .unwrap_or_else(|| auto_resume_sb.map(|n| n + 1).unwrap_or(1));
@@ -1734,7 +1798,17 @@ macro_rules! run_training_inline_nnue {
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
 
         if args.start_superbatch.is_none() {
-            if let Some(last_sb) = auto_resume_sb {
+            if teacher_changed {
+                if let (Some(prev), Some(_last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
+                    eprintln!(
+                        "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
+                         resetting LR schedule to sb=1 to avoid bullet dataloader skip-ahead beyond EOF.\n  \
+                         model + optimiser are still loaded from the latest state.bin.\n  \
+                         pass --start-superbatch <N> to override.",
+                        args.teacher
+                    );
+                }
+            } else if let Some(last_sb) = auto_resume_sb {
                 eprintln!(
                     "  auto-resuming from superbatch {} (last saved: {}); LR schedule continues. \
                      pass --start-superbatch to override.",
@@ -3095,6 +3169,64 @@ mod tests {
         // 不正 dir 名 (foo/) は無視
         std::fs::create_dir(tmp.join("foo")).unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `read_latest_saved_teacher` が `<NNNN>/learn.log` の teacher 列
+    /// (= 11-列の最終フィールド) を取り、auto-resume の教師変更検出に
+    /// 使えることを確認。
+    #[test]
+    fn read_latest_saved_teacher_picks_last_teacher() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-resume-teacher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 空 dir → None
+        assert_eq!(read_latest_saved_teacher(&tmp), None);
+
+        // 0001 だけあって learn.log 無し → None
+        let d1 = tmp.join("0001");
+        std::fs::create_dir(&d1).unwrap();
+        assert_eq!(read_latest_saved_teacher(&tmp), None);
+
+        // 11-列 row が 1 つあれば teacher が拾える
+        std::fs::write(
+            d1.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,1,32,-,-,0.1,0.001,1.000,524288,foo.hcpe\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
+
+        // 0004 を追加して bar.hcpe にしたら、最新 dir の teacher が返る
+        let d4 = tmp.join("0004");
+        std::fs::create_dir(&d4).unwrap();
+        std::fs::write(
+            d4.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,4,32,0.6,0.05,0.06,0.001,1.000,2097152,bar.hcpe\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("bar.hcpe".to_string()));
+
+        // 9-列のレガシー row は無視される (parts.len() < 11 で skip)
+        let d5 = tmp.join("0005");
+        std::fs::create_dir(&d5).unwrap();
+        std::fs::write(
+            d5.join("learn.log"),
+            format!("{LEARN_LOG_HEADER}\nNNUE_KP,1,5,32,0.5,0.001,1.000,3000,legacy.hcpe\n"),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_teacher(&tmp), None, "legacy 9-col row should be skipped");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
