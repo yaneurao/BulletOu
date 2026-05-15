@@ -503,7 +503,7 @@ struct Args {
     /// Number of epochs to train. One epoch = one full pass through the
     /// teacher data (= one dataloader EOF). After each epoch the dataloader
     /// is rebuilt from scratch and the LR scheduler restarts at superbatch
-    /// 1, so for example `--lr-step 8` applies independently within each
+    /// 1, so for example `--lr-step 1` applies independently within each
     /// epoch. Default 1.
     #[arg(long, default_value = "1")]
     max_epochs: usize,
@@ -528,12 +528,16 @@ struct Args {
     lr: f32,
 
     /// LR gamma (multiplicative drop applied every `lr_step` superbatches).
-    #[arg(long, default_value = "0.1")]
+    /// The default `0.9` (combined with `--lr-step 1`) gives a gentle
+    /// per-superbatch decay suited to long-running NNUE training; pass
+    /// e.g. `0.1` for the older aggressive 10× drop.
+    #[arg(long, default_value = "0.9")]
     lr_gamma: f32,
 
     /// LR step: apply `lr_gamma` every N superbatches. Ignored when
-    /// `--lr-step-positions` is set.
-    #[arg(long, default_value = "8")]
+    /// `--lr-step-positions` is set. Default `1` = decay every
+    /// superbatch (with `--lr-gamma 0.9` ⇒ ~10× over 22 sb).
+    #[arg(long, default_value = "1")]
     lr_step: usize,
 
     /// LR step in *positions* (cumulative across rounds) instead of
