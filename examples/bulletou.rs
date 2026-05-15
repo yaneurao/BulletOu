@@ -382,6 +382,35 @@ const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 enum AdjustableStepLR {
     Plain(lr::StepLR),
     Offset { inner: lr::StepLR, offset: usize },
+    /// Positions-based step: drops LR by `gamma` every
+    /// `positions_per_step` cumulative positions trained (across
+    /// rounds, including `prior_positions` carried over from the
+    /// existing top-level learn.log). The current (batch, sb)
+    /// arguments only contribute the in-this-run positions; the
+    /// scheduler is responsible for combining them with the prior
+    /// carry-over to compute the absolute count.
+    Positions {
+        start: f32,
+        gamma: f32,
+        positions_per_step: u64,
+        prior_positions: u64,
+        batch_size: usize,
+        batches_per_superbatch: usize,
+    },
+}
+
+impl AdjustableStepLR {
+    /// Compute LR for an absolute position count. Used by both bullet's
+    /// `lr(batch, sb)` callback and the enrich path's `learn.log` lr
+    /// column so they always agree.
+    fn lr_at_positions(start: f32, gamma: f32, step: u64, total: u64) -> f32 {
+        if step == 0 {
+            // Defensive: a 0-step would divide by zero. Treat as "never drop".
+            return start;
+        }
+        let n = (total / step) as i32;
+        start * gamma.powi(n)
+    }
 }
 
 impl LrScheduler for AdjustableStepLR {
@@ -389,6 +418,19 @@ impl LrScheduler for AdjustableStepLR {
         match self {
             Self::Plain(s) => s.lr(batch, superbatch),
             Self::Offset { inner, offset } => inner.lr(batch, superbatch + offset),
+            Self::Positions {
+                start,
+                gamma,
+                positions_per_step,
+                prior_positions,
+                batch_size,
+                batches_per_superbatch,
+            } => {
+                let in_run = ((superbatch.saturating_sub(1) * batches_per_superbatch + batch) as u64)
+                    * (*batch_size as u64);
+                let total = prior_positions + in_run;
+                Self::lr_at_positions(*start, *gamma, *positions_per_step, total)
+            }
         }
     }
 
@@ -396,6 +438,11 @@ impl LrScheduler for AdjustableStepLR {
         match self {
             Self::Plain(s) => s.colourful(),
             Self::Offset { inner, offset } => format!("{} (sb offset +{})", inner.colourful(), offset),
+            Self::Positions {
+                start, gamma, positions_per_step, prior_positions, ..
+            } => format!(
+                "start {start} gamma {gamma} drop every {positions_per_step} positions (cumulative, prior {prior_positions})"
+            ),
         }
     }
 }
@@ -484,9 +531,29 @@ struct Args {
     #[arg(long, default_value = "0.1")]
     lr_gamma: f32,
 
-    /// LR step: apply `lr_gamma` every N superbatches.
+    /// LR step: apply `lr_gamma` every N superbatches. Ignored when
+    /// `--lr-step-positions` is set.
     #[arg(long, default_value = "8")]
     lr_step: usize,
+
+    /// LR step in *positions* (cumulative across rounds) instead of
+    /// superbatches. When set, `lr_gamma` is applied every N
+    /// teacher positions actually trained, regardless of how many
+    /// superbatches that took. Useful for round-per-file workflows
+    /// where each round may train fewer than 1 superbatch's worth
+    /// of positions — the sb-based `--lr-step` would step too
+    /// quickly because each round increments the sb counter even
+    /// when the round was partial.
+    ///
+    /// Example: `--lr-step-positions 800000000` drops LR every 800M
+    /// positions. With save-rate=1 and a full 100M-positions
+    /// superbatch, this matches `--lr-step 8` (8 × 100M = 800M).
+    /// With 60M-positions teachers (= round-per-file), LR drops
+    /// after ~13 rounds (= 800M / 60M).
+    ///
+    /// When omitted (default), the sb-based `--lr-step` is used.
+    #[arg(long)]
+    lr_step_positions: Option<u64>,
 
     /// Lambda — weight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
@@ -908,6 +975,13 @@ struct LogContext {
     /// keep the dataloader fresh, but the LR / display sb stays
     /// monotonic across rounds). Otherwise 0.
     sb_offset: usize,
+    /// When set, the `learn.log` `lr` column uses positions-based
+    /// step (= drops `lr_gamma` every `lr_step_positions` cumulative
+    /// positions) instead of the sb-based `lr_step`. Mirrors the
+    /// `--lr-step-positions` CLI flag and the `AdjustableStepLR
+    /// ::Positions` variant so the enriched log matches what the
+    /// trainer actually used.
+    lr_step_positions: Option<u64>,
 }
 
 impl LogContext {
@@ -925,6 +999,7 @@ impl LogContext {
             batches_per_superbatch,
             teacher_csv: csv_escape(&args.teacher),
             sb_offset: 0,
+            lr_step_positions: args.lr_step_positions,
         }
     }
 
@@ -1016,12 +1091,19 @@ fn enrich_bullet_log_to_csv(
         // resume, `ctx.sb_offset` shifts the displayed sb to the
         // continuation point so the column stays monotonic.
         let absolute_sb = local_sb + ctx.sb_offset;
-        let lr = ctx.lr_at(absolute_sb);
         // `positions` keeps using bullet's local sb because position_offset
         // already carries the cumulative count from prior runs — the
         // formula then adds (local_sb-1)*sb_size + b*batch_size to the
         // carry-over to give an honest cumulative position count.
         let positions = ctx.positions_at(local_sb, b, position_offset);
+        // LR: when `lr_step_positions` is set, drop based on the
+        // cumulative `positions` count above (= matches the trainer's
+        // `AdjustableStepLR::Positions` variant). Otherwise fall back
+        // to the sb-based formula keyed by absolute_sb.
+        let lr = match ctx.lr_step_positions {
+            Some(step) => AdjustableStepLR::lr_at_positions(ctx.lr_start, ctx.lr_gamma, step, positions as u64),
+            None => ctx.lr_at(absolute_sb),
+        };
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
         // `/<component>` suffix for multi-component eval types (KPPT
         // family). NNUE rows are single-component so the slash is
@@ -1879,10 +1961,19 @@ macro_rules! run_training_inline_nnue {
         // sb_offset (= teacher-changed case) or when the user explicitly
         // overrode start_superbatch, sb is local-to-this-run so we need
         // the cumulative carry-over from the existing top-level log.
-        let cb_prior_position = if !user_set_start && !teacher_changed && auto_resume_sb_raw.is_some() {
-            0
-        } else {
+        //
+        // For positions-based LR (`--lr-step-positions`), the `lr` column
+        // is derived from the `positions` value directly, so we always
+        // need the cumulative carry-over here so the enrich path's
+        // `positions` matches what `AdjustableStepLR::Positions` saw.
+        let want_cumulative_prior = user_set_start
+            || teacher_changed
+            || auto_resume_sb_raw.is_none()
+            || args.lr_step_positions.is_some();
+        let cb_prior_position = if want_cumulative_prior {
             read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
+        } else {
+            0
         };
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
 
@@ -1907,12 +1998,28 @@ macro_rules! run_training_inline_nnue {
             }
         }
 
-        // Build the LR scheduler: plain when bullet's sb is already
-        // absolute (= no shift needed), Offset when we shifted to
-        // sb_offset (= teacher-changed case). The shift-aware variant
-        // returns the LR for the absolute sb regardless of bullet's
-        // local sb counter.
-        let lr_scheduler_for_run = if sb_offset_for_lr == 0 {
+        // Build the LR scheduler:
+        // - `--lr-step-positions <N>` if set: positions-based, decoupled
+        //   from sb. Carries `prior_positions` (= cumulative trained
+        //   across previous rounds) so the count is absolute.
+        // - else: sb-based. `Plain` when bullet's sb is already
+        //   absolute (= same-teacher resume / fresh run), `Offset`
+        //   when we shifted to sb_offset (= teacher-changed case so
+        //   bullet's local sb starts at 1 but the LR continues).
+        let lr_scheduler_for_run = if let Some(positions_per_step) = args.lr_step_positions {
+            let prior_positions = read_prior_positions(&cb_top_level_log)
+                .get("nnue")
+                .copied()
+                .unwrap_or(0) as u64;
+            AdjustableStepLR::Positions {
+                start: args.lr,
+                gamma: args.lr_gamma,
+                positions_per_step,
+                prior_positions,
+                batch_size: args.batch_size,
+                batches_per_superbatch,
+            }
+        } else if sb_offset_for_lr == 0 {
             AdjustableStepLR::Plain(lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step })
         } else {
             AdjustableStepLR::Offset {
@@ -3074,6 +3181,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            lr_step_positions: None,
         };
 
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None)
@@ -3211,6 +3319,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            lr_step_positions: None,
         };
         let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
@@ -3225,6 +3334,40 @@ mod tests {
             assert_eq!(cols[5], "0.051200", "test_value_loss should be the metric");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `LogContext.lr_step_positions` を設定すると、enrich の lr 列が
+    /// positions-based formula で計算され、sb / lr_step とは独立に
+    /// cumulative positions に応じて drop することを確認。
+    #[test]
+    fn enrich_with_lr_step_positions_uses_positions_based_formula() {
+        let ctx = LogContext {
+            eval_type: "NNUE_KP",
+            arch: "256x2-32-32".to_string(),
+            lr_start: 0.001,
+            lr_gamma: 0.1,
+            lr_step: 8, // sb-based, but should be ignored
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/round.hcpe".to_string(),
+            sb_offset: 0,
+            lr_step_positions: Some(800_000_000),
+        };
+        // batch=32 with prior=0: positions = 32*16384 = 524,288 → step 0 → lr 0.001
+        // batch=6000 with prior=0: positions = 6000*16384 = 98,304,000 → step 0 → lr 0.001
+        let raw = "1,32,0.07\n1,6000,0.06\n";
+        let body = enrich_bullet_log_to_csv(raw, &ctx, 1, "nnue", 0, None);
+        for row in body.lines() {
+            let cols: Vec<&str> = row.split(',').collect();
+            let lr: f32 = cols[7].parse().unwrap();
+            assert!((lr - 0.001).abs() < 1e-7, "lr should still be 0.001, got {lr} from row {row}");
+        }
+        // Push position_offset to 800M; lr drops to 0.0001 once positions ≥ 800M
+        let body2 = enrich_bullet_log_to_csv("1,32,0.05\n", &ctx, 1, "nnue", 800_000_000, None);
+        let cols: Vec<&str> = body2.lines().next().unwrap().split(',').collect();
+        let lr: f32 = cols[7].parse().unwrap();
+        assert!((lr - 0.0001).abs() < 1e-7, "lr should drop to 0.0001 past 800M, got {lr}");
     }
 
     /// `LogContext.sb_offset` が enrich の sb / lr 列に正しく反映され、
@@ -3242,6 +3385,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/round2.hcpe".to_string(),
             sb_offset: 1, // = "round 1 saved sb 1, this run is the round 2 continuation"
+            lr_step_positions: None,
         };
         // bullet's local sb in raw log is 1 (= first sb of round 2). With
         // sb_offset=1, the enriched row should display sb=2 and pull the
@@ -3406,6 +3550,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
+            lr_step_positions: None,
         };
         let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
         assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
