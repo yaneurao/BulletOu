@@ -527,37 +527,36 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// LR gamma (multiplicative drop applied every `lr_step` superbatches).
-    /// The default `0.9` (combined with `--lr-step 1`) gives a gentle
-    /// per-superbatch decay suited to long-running NNUE training; pass
-    /// e.g. `0.1` for the older aggressive 10× drop.
+    /// LR gamma (multiplicative drop applied every `lr_step_positions`
+    /// positions, or every `lr_step` superbatches when --lr-step is
+    /// explicitly given). Default `0.9` gives a gentle per-100M-positions
+    /// decay (≒ 10× drop over ~2.2B trained positions); pass e.g. `0.1`
+    /// for the aggressive 10× per step.
     #[arg(long, default_value = "0.9")]
     lr_gamma: f32,
 
-    /// LR step: apply `lr_gamma` every N superbatches. Ignored when
-    /// `--lr-step-positions` is set. Default `1` = decay every
-    /// superbatch (with `--lr-gamma 0.9` ⇒ ~10× over 22 sb).
-    #[arg(long, default_value = "1")]
-    lr_step: usize,
+    /// LR step in *positions* (cumulative across rounds, independent
+    /// of bullet's superbatch counter). LR drops by `lr_gamma` every
+    /// N teacher positions actually trained. Default `100000000`
+    /// (= 100M) so a full 100M-positions superbatch triggers one
+    /// drop, but partial-superbatch round-per-file workflows still
+    /// step at the right cumulative position count instead of every
+    /// round regardless of size.
+    ///
+    /// Pass `--lr-step <N>` to opt out and use the legacy sb-based
+    /// step instead.
+    #[arg(long, default_value = "100000000")]
+    lr_step_positions: u64,
 
-    /// LR step in *positions* (cumulative across rounds) instead of
-    /// superbatches. When set, `lr_gamma` is applied every N
-    /// teacher positions actually trained, regardless of how many
-    /// superbatches that took. Useful for round-per-file workflows
-    /// where each round may train fewer than 1 superbatch's worth
-    /// of positions — the sb-based `--lr-step` would step too
-    /// quickly because each round increments the sb counter even
-    /// when the round was partial.
-    ///
-    /// Example: `--lr-step-positions 800000000` drops LR every 800M
-    /// positions. With save-rate=1 and a full 100M-positions
-    /// superbatch, this matches `--lr-step 8` (8 × 100M = 800M).
-    /// With 60M-positions teachers (= round-per-file), LR drops
-    /// after ~13 rounds (= 800M / 60M).
-    ///
-    /// When omitted (default), the sb-based `--lr-step` is used.
+    /// LR step in superbatches (= bullet's sb counter). When set,
+    /// overrides `--lr-step-positions` and uses the legacy sb-based
+    /// decay: drop by `lr_gamma` every N superbatches. Default is
+    /// unset (= positions-based mode is used). For round-per-file
+    /// workflows, the positions-based default is usually what you
+    /// want; pass this only if you specifically want the LR schedule
+    /// keyed off the sb counter.
     #[arg(long)]
-    lr_step_positions: Option<u64>,
+    lr_step: Option<usize>,
 
     /// Lambda — weight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
@@ -992,18 +991,24 @@ impl LogContext {
     fn from_args(args: &Args) -> Self {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        // Mode resolution: if the user explicitly passed `--lr-step`, use
+        // sb-based decay (legacy). Otherwise default to positions-based
+        // with `--lr-step-positions` (default 100M).
+        let positions_based = args.lr_step.is_none();
         Self {
             eval_type: args.eval_type.cli_name(),
             arch: if args.eval_type.uses_arch() { args.arch.cli_name() } else { String::new() },
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
-            lr_step: args.lr_step,
+            // Only consulted when positions-based mode is off; pick a
+            // safe placeholder otherwise.
+            lr_step: args.lr_step.unwrap_or(1),
             lambda: args.lambda,
             batch_size: args.batch_size,
             batches_per_superbatch,
             teacher_csv: csv_escape(&args.teacher),
             sb_offset: 0,
-            lr_step_positions: args.lr_step_positions,
+            lr_step_positions: if positions_based { Some(args.lr_step_positions) } else { None },
         }
     }
 
@@ -1550,7 +1555,14 @@ macro_rules! run_training_inline {
                     end_superbatch,
                 },
                 wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                // KPPT family stays sb-based; positions-based LR is only
+                // wired into the NNUE macro. Use --lr-step (legacy default
+                // = 1 if user opts in) or 8 as a fallback.
+                lr_scheduler: lr::StepLR {
+                    start: args.lr,
+                    gamma: args.lr_gamma,
+                    step: args.lr_step.unwrap_or(8),
+                },
                 save_rate: args.save_rate,
             };
 
@@ -1966,14 +1978,16 @@ macro_rules! run_training_inline_nnue {
         // overrode start_superbatch, sb is local-to-this-run so we need
         // the cumulative carry-over from the existing top-level log.
         //
-        // For positions-based LR (`--lr-step-positions`), the `lr` column
-        // is derived from the `positions` value directly, so we always
-        // need the cumulative carry-over here so the enrich path's
-        // `positions` matches what `AdjustableStepLR::Positions` saw.
+        // For positions-based LR (= the default unless --lr-step is set),
+        // the `lr` column is derived from the `positions` value directly,
+        // so we always need the cumulative carry-over here so the enrich
+        // path's `positions` matches what `AdjustableStepLR::Positions`
+        // saw.
+        let positions_based_lr = args.lr_step.is_none();
         let want_cumulative_prior = user_set_start
             || teacher_changed
             || auto_resume_sb_raw.is_none()
-            || args.lr_step_positions.is_some();
+            || positions_based_lr;
         let cb_prior_position = if want_cumulative_prior {
             read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
         } else {
@@ -2003,14 +2017,15 @@ macro_rules! run_training_inline_nnue {
         }
 
         // Build the LR scheduler:
-        // - `--lr-step-positions <N>` if set: positions-based, decoupled
-        //   from sb. Carries `prior_positions` (= cumulative trained
-        //   across previous rounds) so the count is absolute.
-        // - else: sb-based. `Plain` when bullet's sb is already
-        //   absolute (= same-teacher resume / fresh run), `Offset`
-        //   when we shifted to sb_offset (= teacher-changed case so
-        //   bullet's local sb starts at 1 but the LR continues).
-        let lr_scheduler_for_run = if let Some(positions_per_step) = args.lr_step_positions {
+        // - Positions-based (= default when --lr-step is not given):
+        //   decoupled from bullet's sb counter. Carries `prior_positions`
+        //   (= cumulative trained across previous rounds) so the count
+        //   is absolute.
+        // - sb-based (when --lr-step is given): `Plain` when bullet's
+        //   sb is already absolute (= same-teacher resume / fresh run),
+        //   `Offset` when we shifted to sb_offset (= teacher-changed
+        //   case so bullet's local sb starts at 1 but the LR continues).
+        let lr_scheduler_for_run = if positions_based_lr {
             let prior_positions = read_prior_positions(&cb_top_level_log)
                 .get("nnue")
                 .copied()
@@ -2018,17 +2033,20 @@ macro_rules! run_training_inline_nnue {
             AdjustableStepLR::Positions {
                 start: args.lr,
                 gamma: args.lr_gamma,
-                positions_per_step,
+                positions_per_step: args.lr_step_positions,
                 prior_positions,
                 batch_size: args.batch_size,
                 batches_per_superbatch,
             }
-        } else if sb_offset_for_lr == 0 {
-            AdjustableStepLR::Plain(lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step })
         } else {
-            AdjustableStepLR::Offset {
-                inner: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
-                offset: sb_offset_for_lr,
+            let step = args.lr_step.expect("checked by positions_based_lr branch above");
+            if sb_offset_for_lr == 0 {
+                AdjustableStepLR::Plain(lr::StepLR { start: args.lr, gamma: args.lr_gamma, step })
+            } else {
+                AdjustableStepLR::Offset {
+                    inner: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step },
+                    offset: sb_offset_for_lr,
+                }
             }
         };
 
