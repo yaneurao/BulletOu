@@ -1088,23 +1088,18 @@ struct LogContext {
     lr_min: f32,
 }
 
-/// Expand `args.teacher` (which may be a directory, a single file, or a
-/// comma-separated list of either) into the comma-joined list of actual
-/// teacher file paths, suitable for the `teacher` column of `learn.log`.
+/// Return `args.teacher` verbatim for the `teacher` column of `learn.log`.
 ///
-/// When `--teacher` points to a directory, the log row would otherwise
-/// only record the directory name — which is ambiguous if the directory
-/// contents change between runs. Recording the resolved file list pins
-/// down exactly which teacher files were used.
-///
-/// On expansion failure (path doesn't exist yet, permission error,
-/// etc.), falls back to the raw input so the row still gets *something*
-/// and the trainer's own error message will surface the real problem.
+/// Earlier this expanded a directory `--teacher` into the comma-joined
+/// list of actual files used, but for a 50-file teacher dir this made
+/// every row of the log absurdly wide while not actually identifying
+/// which file the last batch came from (the shuffle buffer mixes
+/// positions from many files, so "the last batch's teacher" is not a
+/// well-defined notion). Just record what the user typed and let them
+/// scroll back through tag.txt / shell history if they need the
+/// individual filenames.
 fn resolve_teacher_for_log(teacher: &str) -> String {
-    match expand_teacher(teacher) {
-        Ok(paths) => paths.join(","),
-        Err(_) => teacher.to_string(),
-    }
+    teacher.to_string()
 }
 
 impl LogContext {
