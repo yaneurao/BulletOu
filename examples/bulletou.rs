@@ -2315,31 +2315,40 @@ macro_rules! run_training_inline_nnue {
              the NVIDIA driver is compiling."
         );
 
-        // HCPE 専用: persistent loader を chunk loop の外で 1 度だけ生成。
-        // bullet の `trainer.run` は chunk_size (= save_rate, デフォルト 1)
-        // sb ごとに呼ばれるが、HcpeDataLoader 内部の producer thread は
-        // 複数の trainer.run 呼び出しを跨いで生き続け、次の buffer を
-        // 先読みし続ける (= 真の pre-fetch)。HCPE3 / pack / PSV は現状
-        // chunk loop 内で生成 (= producer は chunk 毎に restart)。
-        let persistent_hcpe_loader: Option<
+        // HCPE 専用: persistent loader。Producer thread を chunk loop の外で
+        // 立ち上げ、複数 trainer.run 呼び出しを跨いで pre-fetch を継続する。
+        // 各 epoch 開始時に新しい loader を spawn し直す: 前 epoch の producer は
+        // ファイル末尾に達して exit しているので、同じ loader を持ち越すと
+        // 空 channel → `NoBatchesReceived` panic になるため。Epoch 1 だけは
+        // 外側からの resume offset を使い、epoch 2 以降は教師頭から (offset=0)。
+        let new_hcpe_loader = |resume_off: u64| -> Option<
             HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>,
-        > = if matches!(format, DataFormat::Hcpe) {
-            let (resume_off, _resume_plies) = cb_dataloader_resume_offset.get();
-            let loader = HcpeDataLoader::new_concat_multiple(
-                &data_files_ref,
-                args.buffer_mb,
-                (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
-            )
-            .with_loader_threads(args.loader_threads)
-            .with_resume_offset(resume_off);
-            Some(loader)
-        } else {
-            None
+        > {
+            if matches!(format, DataFormat::Hcpe) {
+                Some(
+                    HcpeDataLoader::new_concat_multiple(
+                        &data_files_ref,
+                        args.buffer_mb,
+                        (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
+                    )
+                    .with_loader_threads(args.loader_threads)
+                    .with_resume_offset(resume_off),
+                )
+            } else {
+                None
+            }
         };
+        let mut persistent_hcpe_loader = new_hcpe_loader(cb_dataloader_resume_offset.get().0);
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
+            }
+            // Epoch boundary (epoch >= 2): drop the previous epoch's loader
+            // (its producer thread already finished at EOF), spawn a fresh one
+            // that reads the teacher from the start.
+            if epoch > 1 && matches!(format, DataFormat::Hcpe) {
+                persistent_hcpe_loader = new_hcpe_loader(0);
             }
             let net_id_for_epoch = if max_epochs > 1 {
                 format!("{net_id_base}-e{epoch}")
