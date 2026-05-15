@@ -103,6 +103,35 @@ pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// この値を読み出して checkpoint dir に書き出すと、次回起動時に
     /// `with_resume_offset` で渡せば「先読み分の取りこぼし無し」で再開できる。
     consumed_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Persistent producer thread の状態。lazy 初期化される (= 最初の
+    /// `map_chunks` 呼び出しで spawn)。Loader が drop されるまで生き続け、
+    /// 複数 `map_chunks` 呼び出し (= bullet の複数 `trainer.run` calls)
+    /// を跨いで同じ channel を共有する。これにより `trainer.run` を抜けても
+    /// producer は次の buffer を満たし続けるので、次の trainer.run が
+    /// すぐに buffer を受け取れる (= 真の pre-fetch)。
+    inner: std::sync::Arc<std::sync::Mutex<Option<HcpeLoaderInner>>>,
+}
+
+/// Persistent producer state. Lazy spawned, drops on loader drop.
+struct HcpeLoaderInner {
+    rx: Option<std::sync::mpsc::Receiver<(Vec<PackedSfenValue>, u64)>>,
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    producer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for HcpeLoaderInner {
+    fn drop(&mut self) {
+        // 1) Producer に「終了して」と通知
+        self.stop_flag.store(true, std::sync::atomic::Ordering::Release);
+        // 2) Receiver を drop して channel を閉じる → Producer の次の send が
+        //    SendError を返して exit する。Producer が send 待ち状態だった
+        //    場合も即座に解除される。
+        self.rx.take();
+        // 3) Producer thread の終了を待つ
+        if let Some(handle) = self.producer.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
@@ -123,6 +152,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
             loader_threads: None,
             resume_offset: 0,
             consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -170,46 +200,72 @@ where
     }
 
     fn map_chunks<F: FnMut(&[PackedSfenValue]) -> bool>(&self, start_position: usize, mut f: F) {
-        // 大きな shuffle buffer を 1 個満たすのに HCP → PSV のデコードが
-        // ボトルネックで、シングルスレッドだと数百秒かかる。アーキテクチャ:
+        // **Persistent producer 戦略**:
         //
-        // - **プロデューサスレッド** (1 個、std::thread::spawn): ファイルを
-        //   `CHUNK_RECORDS` 単位で読み、内部で更に `std::thread::scope` の
-        //   並列 worker で HCP→PSV デコードを cores 数だけ分担、shuffle buffer
-        //   に貯まったら Fisher-Yates して `sync_channel(0)` で送り出す。
-        // - **コンシューマ** (現スレッド): channel から buffer を受け取り
-        //   `f(&buffer)` を呼ぶ。GPU 学習はここで進む。
+        // bullet の trainer.run は (chunk_size = save_rate) sb 単位で呼ばれ、
+        // 各呼び出しが map_chunks を 1 回起動する。素朴な実装だと map_chunks
+        // 終了時に producer thread を畳んでしまい、次の trainer.run が
+        // 始まったときに buffer 1 個分の fill 時間を待たされる (= GPU 遊ぶ)。
         //
-        // `sync_channel(0)` (rendezvous) を使うことで、メモリピークは
-        // 2 × buffer_size (= 1 個埋めてる + 1 個 GPU が消費中) で済む。
-        // それでも生産が消費より速い場合はプロデューサが send で待機する。
+        // 本実装は `self.inner` に producer thread の handle / channel を
+        // 保持し、map_chunks 終了後も producer を生かし続ける。次の trainer.run
+        // が map_chunks を呼んだとき、producer は既に次の buffer (の一部) を
+        // 埋め終えているので、consumer は即座に受け取れる = 真の pre-fetch。
+        //
+        // Producer はファイル末尾に達した時点で自動 exit (= EOF)。Loader が
+        // drop されたとき stop_flag + rx drop で signaling して producer thread
+        // を停止する (HcpeLoaderInner::drop 参照)。
+        //
+        // スレッド構造:
+        // - producer thread (1 個): ファイル read + 並列 HCP decode + shuffle
+        // - 内部 std::thread::scope worker (N 個): producer 内の per-chunk
+        //   並列 decode
+        // - consumer (= 呼び出し元 thread): map_chunks 内で channel を pump
 
-        let buffer_size = self.buffer_size.max(1);
-        let file_paths = self.file_paths.clone();
-        let filter = self.filter.clone();
-        let loader_threads = self.loader_threads;
-        // resume_offset (= 外部から指定) が 0 のとき、後方互換で
-        // start_position 由来の skip を計算する (= 旧 API)。
-        // HCPE は 38-byte 固定長なので `start_position × 38` で正しい。
-        let resume_offset = if self.resume_offset > 0 {
-            self.resume_offset
-        } else {
-            (start_position as u64) * HCPE_RECORD_SIZE as u64
-        };
-        let consumed_offset = self.consumed_offset.clone();
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<(Vec<PackedSfenValue>, u64)>(0);
-
-        let producer = std::thread::spawn(move || {
-            Self::produce_buffers(file_paths, buffer_size, filter, resume_offset, loader_threads, tx);
-        });
-
-        // コンシューマループ: (buffer, offset_at_send) を受け取り、buffer を
-        // `f()` に流し、終わったら attached offset を `consumed_offset` に
-        // 書き込む = 「ここまで処理済み」のしるし。Save callback がこの
-        // 値を `0NNN/dataloader_pos.txt` に書き出すと、次回起動時に
-        // `with_resume_offset` で渡して厳密再開できる。
         use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+
+        // ----- Lazy: 最初の map_chunks 呼び出しで producer を spawn -----
+        {
+            let mut guard = self.inner.lock().expect("HcpeLoaderInner mutex poisoned");
+            if guard.is_none() {
+                let buffer_size = self.buffer_size.max(1);
+                let file_paths = self.file_paths.clone();
+                let filter = self.filter.clone();
+                let loader_threads = self.loader_threads;
+                let resume_offset = if self.resume_offset > 0 {
+                    self.resume_offset
+                } else {
+                    (start_position as u64) * HCPE_RECORD_SIZE as u64
+                };
+                let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_flag_for_producer = stop_flag.clone();
+                let (tx, rx) = mpsc::sync_channel::<(Vec<PackedSfenValue>, u64)>(0);
+                let producer = std::thread::spawn(move || {
+                    Self::produce_buffers(
+                        file_paths,
+                        buffer_size,
+                        filter,
+                        resume_offset,
+                        loader_threads,
+                        stop_flag_for_producer,
+                        tx,
+                    );
+                });
+                *guard = Some(HcpeLoaderInner {
+                    rx: Some(rx),
+                    stop_flag,
+                    producer: Some(producer),
+                });
+            }
+        }
+
+        // ----- Pump buffers from producer until `f` returns true -----
+        let consumed_offset = self.consumed_offset.clone();
+        let guard = self.inner.lock().expect("HcpeLoaderInner mutex poisoned");
+        let inner = guard.as_ref().expect("inner just initialised");
+        let rx = inner.rx.as_ref().expect("rx held until drop");
+
         while let Ok((buf, offset_at_send)) = rx.recv() {
             let stop = f(&buf);
             consumed_offset.store(offset_at_send, Ordering::Release);
@@ -217,8 +273,9 @@ where
                 break;
             }
         }
-        drop(rx);
-        let _ = producer.join();
+        // map_chunks 終了時: rx は drop しない (= producer は次の send を
+        // 試みて block するだけ。次の map_chunks 呼び出しがその buffer を
+        // 受け取る)。Loader 自体が drop されたときに Inner::drop で停止。
     }
 }
 
@@ -235,6 +292,7 @@ where
         filter: T,
         resume_offset: u64,
         loader_threads: Option<usize>,
+        stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64)>,
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
@@ -305,6 +363,10 @@ where
             }
 
             loop {
+                // Loader が drop されると stop_flag が立つ → producer は即終了。
+                if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 // 完全レコード境界で読み出すため `read` を繰り返して埋める。
                 let mut filled = 0usize;
                 while filled < chunk_buf.len() {

@@ -1740,6 +1740,14 @@ macro_rules! run_training_inline {
              the NVIDIA driver is compiling."
         );
 
+        // KPPT macro: persistent HCPE loader hoisting is NOT applied here
+        // (= no cb_dataloader_resume_offset in scope, this code path doesn't
+        // wire the saved-pointer resume). KPPT-with-HCPE is rare; the per-chunk
+        // loader creation remains.
+        let persistent_hcpe_loader: Option<
+            HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>,
+        > = None;
+
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -1817,6 +1825,10 @@ macro_rules! run_training_inline {
 
             last_error_record = match format {
                 DataFormat::Hcpe => {
+                    // KPPT path: chunk-local loader (no persistent producer
+                    // hoisting here; the macro lacks the resume-offset wiring
+                    // that the NNUE macro has).
+                    let _ = &persistent_hcpe_loader; // suppress unused
                     let loader =
                         HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
                             .with_loader_threads(args.loader_threads);
@@ -2303,6 +2315,28 @@ macro_rules! run_training_inline_nnue {
              the NVIDIA driver is compiling."
         );
 
+        // HCPE 専用: persistent loader を chunk loop の外で 1 度だけ生成。
+        // bullet の `trainer.run` は chunk_size (= save_rate, デフォルト 1)
+        // sb ごとに呼ばれるが、HcpeDataLoader 内部の producer thread は
+        // 複数の trainer.run 呼び出しを跨いで生き続け、次の buffer を
+        // 先読みし続ける (= 真の pre-fetch)。HCPE3 / pack / PSV は現状
+        // chunk loop 内で生成 (= producer は chunk 毎に restart)。
+        let persistent_hcpe_loader: Option<
+            HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>,
+        > = if matches!(format, DataFormat::Hcpe) {
+            let (resume_off, _resume_plies) = cb_dataloader_resume_offset.get();
+            let loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                args.buffer_mb,
+                (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
+            )
+            .with_loader_threads(args.loader_threads)
+            .with_resume_offset(resume_off);
+            Some(loader)
+        } else {
+            None
+        };
+
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -2378,13 +2412,14 @@ macro_rules! run_training_inline_nnue {
 
                 last_error_record = match format {
                     DataFormat::Hcpe => {
-                        let (resume_off, _resume_plies) = cb_dataloader_resume_offset.get();
-                        let loader =
-                            HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                                .with_loader_threads(args.loader_threads)
-                                .with_resume_offset(resume_off);
+                        // Persistent loader: chunk loop の外で 1 度だけ生成済み。
+                        // 内部の producer thread が複数の trainer.run 呼び出しを
+                        // 跨いで pre-fetch を継続する。
+                        let loader = persistent_hcpe_loader
+                            .as_ref()
+                            .expect("persistent_hcpe_loader initialised for DataFormat::Hcpe");
                         dl_offset_handle.set(Some(loader.consumed_offset_handle()));
-                        trainer.run(&schedule, &settings, &loader)
+                        trainer.run(&schedule, &settings, loader)
                     }
                     DataFormat::Hcpe3 => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
