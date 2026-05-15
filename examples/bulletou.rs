@@ -2218,7 +2218,17 @@ macro_rules! run_training_inline_nnue {
         // offset within this run), so we always need the cumulative
         // carry-over from the existing top-level log here so the enrich
         // path's `positions` matches what `PositionsLR` saw.
-        let cb_prior_position = read_prior_positions(&cb_top_level_log)
+        // この変数は `cb_top_level_log` (= `<output>/learn.log`) の最大
+        // positions 値を保持する。enrich path で「この run の sb 1 が始まる
+        // 前までに何局面学習されたか」を表し、各 save 行の positions 列に
+        // `prior + (sb-1)*sb_size + b*batch_size` で書き込まれる。
+        //
+        // bullet の sb counter は trainer.run 呼び出し毎にリセットされる
+        // (= 各 epoch / 各 chunk で 1 から始まる) ので、epoch を跨ぐと
+        // positions も sb counter と一緒にリセットされてしまう。これを
+        // 防ぐため、各 epoch 開始時にこの値を learn.log から再読み込み
+        // して累積を反映させる。`mut` で更新される。
+        let mut cb_prior_position = read_prior_positions(&cb_top_level_log)
             .get("nnue")
             .copied()
             .unwrap_or(0);
@@ -2265,24 +2275,10 @@ macro_rules! run_training_inline_nnue {
         // call (= per epoch / chunk) which makes the effective in-run
         // position offset restart, giving the per-epoch reset
         // (sawtooth for `step`, warm-restart for `cos`).
-        let lr_scheduler_for_run = match args.lr_schedule {
-            LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
-                start: args.lr,
-                gamma: args.lr_gamma,
-                positions_per_step: args.lr_step_positions,
-                prior_positions: cb_prior_position as u64,
-                batch_size: args.batch_size,
-                batches_per_superbatch,
-            }),
-            LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
-                start: args.lr,
-                min: args.lr_min,
-                period_positions: args.lr_cosine_period,
-                prior_positions: cb_prior_position as u64,
-                batch_size: args.batch_size,
-                batches_per_superbatch,
-            }),
-        };
+        // Note: lr_scheduler_for_run は each-epoch で再構築する
+        // (`for epoch in 1..=max_epochs` 内)。`cb_prior_position` が epoch
+        // を跨いで前 epoch の累積を反映するため、各 epoch で正しい LR
+        // を計算できる。
 
         // Per-save validation cache: load test positions ONCE up front
         // (random-pick happens here), then reuse the same positions for
@@ -2350,6 +2346,36 @@ macro_rules! run_training_inline_nnue {
             if epoch > 1 && matches!(format, DataFormat::Hcpe) {
                 persistent_hcpe_loader = new_hcpe_loader(0);
             }
+            // Epoch >= 2: re-read the top-level learn.log so `cb_prior_position`
+            // picks up the cumulative positions across the previous epoch(s).
+            // Without this, bullet's sb counter reset at trainer.run boundary
+            // would also reset the `positions` column.
+            if epoch > 1 {
+                cb_prior_position = read_prior_positions(&cb_top_level_log)
+                    .get("nnue")
+                    .copied()
+                    .unwrap_or(cb_prior_position);
+            }
+            // LR scheduler is rebuilt per-epoch so its `prior_positions`
+            // reflects the updated cumulative count.
+            let lr_scheduler_for_run = match args.lr_schedule {
+                LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
+                    start: args.lr,
+                    gamma: args.lr_gamma,
+                    positions_per_step: args.lr_step_positions,
+                    prior_positions: cb_prior_position as u64,
+                    batch_size: args.batch_size,
+                    batches_per_superbatch,
+                }),
+                LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
+                    start: args.lr,
+                    min: args.lr_min,
+                    period_positions: args.lr_cosine_period,
+                    prior_positions: cb_prior_position as u64,
+                    batch_size: args.batch_size,
+                    batches_per_superbatch,
+                }),
+            };
             let net_id_for_epoch = if max_epochs > 1 {
                 format!("{net_id_base}-e{epoch}")
             } else {
