@@ -1865,6 +1865,43 @@ macro_rules! run_training_inline_nnue {
                 Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display()),
                 Err(e) => eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display()),
             }
+            // The fallback path bypasses the per-chunk callback flow, so
+            // run validation here too (when --test-teacher is set) and
+            // finalise the dir directly. Without this, the leftover dir
+            // gets enriched by the post-macro `finalize_nnue_dirs` call
+            // with `None` test_metrics, causing test_value_* columns to
+            // come out as "-" even though --test-teacher was given.
+            let test_metrics = test_cache.as_ref().map(|cache| {
+                let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
+                run_one_test_pass(cache, args, outputs)
+            });
+            let idx = cb_next_idx.get();
+            match finalize_one_nnue_dir(
+                &output_dir_buf,
+                &ckpt_dir,
+                &cb_ctx,
+                /*epoch=*/ max_epochs,
+                idx,
+                cb_prior_position,
+                test_metrics,
+            ) {
+                Ok(dst) => {
+                    cb_next_idx.set(idx + 1);
+                    if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
+                        eprintln!(
+                            "  WARN: failed to update {}: {e}",
+                            output_dir_buf.join("learn.log").display()
+                        );
+                    }
+                    eprintln!("  -> {}/", dst.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  WARN: failed to finalise fallback save dir {} into NNNN/: {e}",
+                        ckpt_dir.display()
+                    );
+                }
+            }
         }
     }};
 }
