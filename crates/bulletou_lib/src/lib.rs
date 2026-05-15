@@ -20,6 +20,10 @@ pub mod value;
 /// Teacher-path resolution helpers shared by the trainer example binaries.
 pub mod teacher_path;
 
+/// Held-out test set validation (sign-agreement accuracy) for trained
+/// value networks.
+pub mod validate;
+
 // TODO: Remove these re-exports as they are exported in the `trainer` module
 pub use trainer::{
     schedule::{TrainingSchedule, TrainingSteps, lr, wdl},

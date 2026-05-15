@@ -52,7 +52,7 @@ const CHUNK_RECORDS: usize = 4096;
 ///
 /// HCP のデコードに失敗した場合 (不正レコード) は `None` を返す。
 /// caller は不正レコードをスキップして次に進める想定。
-fn decode_hcpe_record(rec: &[u8; HCPE_RECORD_SIZE]) -> Option<PackedSfenValue> {
+pub(crate) fn decode_hcpe_record(rec: &[u8; HCPE_RECORD_SIZE]) -> Option<PackedSfenValue> {
     let mut hcp = [0u8; 32];
     hcp.copy_from_slice(&rec[0..32]);
     let eval = i16::from_le_bytes([rec[32], rec[33]]);

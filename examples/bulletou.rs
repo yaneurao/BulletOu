@@ -63,6 +63,7 @@ use bulletou_lib::{
     game::outputs::ShogiLayerStackBucket9,
     nn::{Affine, InitSettings, Shape, optimiser},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    validate::{AccuracyReport, compute_sign_accuracy, read_random_hcpe_positions},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -509,6 +510,39 @@ struct Args {
     /// loadable and evaluation matches between training and inference.
     #[arg(long, default_value = "king3-by-king3")]
     layerstack: LayerStackMode,
+
+    /// Held-out test set (.hcpe only) for sign-agreement validation
+    /// after training. When set, the trainer pulls
+    /// `--validate-positions` random positions from this file, runs
+    /// them through the trained model, and reports the fraction whose
+    /// raw network output and the teacher centipawn score share the
+    /// same sign (= both predict side-to-move winning, or both predict
+    /// losing). Result is printed to stderr and appended to
+    /// `<output>/validate.log`. Positions whose teacher score is 0
+    /// (draw stamp) or `|score| >= --score-drop-abs` (mate stamp) are
+    /// excluded from the accuracy denominator.
+    ///
+    /// Only NNUE / SFNN eval types are supported (the network's raw
+    /// output is a single scalar). KPPT family is skipped.
+    #[arg(long)]
+    validate_teacher: Option<PathBuf>,
+
+    /// Number of positions to sample from `--validate-teacher` for the
+    /// accuracy report.
+    #[arg(long, default_value = "100000")]
+    validate_positions: usize,
+
+    /// GPU batch size for the validation forward pass. Larger is faster
+    /// but uses more VRAM. Independent of `--batch-size` (which
+    /// controls training).
+    #[arg(long, default_value = "1024")]
+    validate_batch_size: usize,
+
+    /// Seed for the random sampler in `--validate-teacher`. `0`
+    /// (default) means "use a time-based seed" (= different sample
+    /// each run). Pass any non-zero value for a reproducible sample.
+    #[arg(long, default_value = "0")]
+    validate_seed: u64,
 }
 
 impl Args {
@@ -1445,6 +1479,138 @@ fn convert_save_dir_to_nnue_layout(dir: &std::path::Path) -> std::io::Result<()>
 /// Inline training loop for single-component NNUE eval types. Same shape as
 /// `run_training_inline!` (epoch loop, `--max-epochs`, EOF-as-epoch boundary,
 /// fallback save when no superbatch completes, in-memory loss record
+/// CSV header for `<output>/validate.log`. One row appended per
+/// `--validate-teacher` invocation. The columns are: ISO-8601 UTC
+/// timestamp; eval-type CLI name; arch CLI name (empty for KPPT);
+/// teacher path; positions sampled; sampler seed (`0` = time-based);
+/// `score_drop_abs` cap (`0` = disabled); `compared` (= positions
+/// included in accuracy denominator); `sign_matches` (= numerator);
+/// `accuracy` (= matches/compared, `nan` when compared is 0);
+/// `draws_in_teacher` (= teacher score == 0, excluded);
+/// `filtered_by_score_cap` (= |score| >= cap, excluded).
+const VALIDATE_LOG_HEADER: &str = "timestamp,eval,arch,teacher,sampled,seed,score_drop_abs,compared,sign_matches,accuracy,draws_in_teacher,filtered_by_score_cap";
+
+/// Append one validation row to `<output>/validate.log` (writing the
+/// CSV header on first creation) and pretty-print the result to
+/// stderr.
+fn print_and_save_validation_report(
+    args: &Args,
+    output_dir: &std::path::Path,
+    teacher_path: &str,
+    sampled: usize,
+    decoded: usize,
+    report: &AccuracyReport,
+) {
+    let arch_text = if args.eval_type.uses_arch() { args.arch.cli_name() } else { String::new() };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    eprintln!();
+    eprintln!("=== validation report ===");
+    eprintln!("  positions sampled    : {sampled}");
+    eprintln!("  positions decoded    : {decoded}{}",
+        if decoded < sampled { format!(" ({} invalid records skipped)", sampled - decoded) } else { String::new() });
+    eprintln!("  excluded (mate cap)  : {} (score_drop_abs={})",
+        report.filtered_by_score_cap, args.score_drop_abs);
+    eprintln!("  excluded (draw)      : {} (teacher score == 0)", report.draws_in_teacher);
+    eprintln!("  compared             : {}", report.compared);
+    eprintln!("  sign matches         : {}", report.sign_matches);
+    eprintln!("  ----------------------------------------");
+    if report.compared == 0 {
+        eprintln!("  ACCURACY             : N/A (no positions compared)");
+    } else {
+        eprintln!("  ACCURACY             : {:.4}% ({}/{})",
+            report.accuracy() * 100.0, report.sign_matches, report.compared);
+    }
+    eprintln!("  ----------------------------------------");
+
+    use std::io::Write;
+    let log_path = output_dir.join("validate.log");
+    let log_existed = log_path.is_file();
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(mut f) => {
+            if !log_existed {
+                let _ = writeln!(f, "{VALIDATE_LOG_HEADER}");
+            }
+            let acc_str = if report.compared == 0 {
+                "nan".to_string()
+            } else {
+                format!("{:.6}", report.accuracy())
+            };
+            let teacher_csv = csv_escape(teacher_path);
+            if let Err(e) = writeln!(
+                f,
+                "{ts},{eval},{arch},{teacher},{sampled},{seed},{cap},{cmp},{matches},{acc},{draws},{filt}",
+                ts = timestamp,
+                eval = args.eval_type.cli_name(),
+                arch = arch_text,
+                teacher = teacher_csv,
+                sampled = sampled,
+                seed = args.validate_seed,
+                cap = args.score_drop_abs,
+                cmp = report.compared,
+                matches = report.sign_matches,
+                acc = acc_str,
+                draws = report.draws_in_teacher,
+                filt = report.filtered_by_score_cap,
+            ) {
+                eprintln!("  WARN: failed to write {}: {e}", log_path.display());
+            } else {
+                eprintln!("  appended to: {}", log_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("  WARN: failed to open {}: {e}", log_path.display());
+        }
+    }
+}
+
+/// `--validate-teacher <path>` 後処理: random-pick → forward → 符号
+/// 一致 accuracy 計算 → stdout + `<output>/validate.log` に出力。
+/// NNUE / SFNN の `run_*` 関数の末尾で `&mut trainer` を渡して呼ぶ。
+/// `--validate-teacher` 未指定なら何もしない。
+macro_rules! run_validation_inline_nnue {
+    ($args:expr, $trainer:expr) => {{
+        let args: &Args = $args;
+        if let Some(test_path) = args.validate_teacher.as_ref() {
+            if let Some(test_path_str) = test_path.to_str() {
+                eprintln!(
+                    "\n=== validation: sampling up to {} positions from {} (seed={}) ===",
+                    args.validate_positions, test_path_str, args.validate_seed
+                );
+                match read_random_hcpe_positions(test_path_str, args.validate_positions, args.validate_seed) {
+                    Ok(positions) => {
+                        let decoded = positions.len();
+                        eprintln!(
+                            "  decoded {decoded} positions, running forward pass (batch={})...",
+                            args.validate_batch_size
+                        );
+                        let outputs = $trainer.eval_packed_batch(&positions, args.validate_batch_size);
+                        let scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+                        let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
+                        let report = compute_sign_accuracy(&outputs, &scores, cap);
+                        print_and_save_validation_report(
+                            args,
+                            &args.output_dir(),
+                            test_path_str,
+                            args.validate_positions,
+                            decoded,
+                            &report,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  WARN: failed to read validation set {test_path_str}: {e}");
+                    }
+                }
+            } else {
+                eprintln!("  WARN: --validate-teacher path is not valid UTF-8, skipping validation");
+            }
+        }
+    }};
+}
+
 /// returned by `trainer.run`), but with NNUE-specific save handling:
 /// the per-save callback converts each bullet save dir to the
 /// `nn.bin` + `state.bin` (+ `log.txt`) layout via
@@ -1821,6 +1987,8 @@ fn run_halfkp(args: &Args) {
             std::process::exit(1);
         }
     }
+
+    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE K-P training entry point. Structurally identical to [`run_halfkp`]
@@ -1916,6 +2084,8 @@ fn run_kp(args: &Args) {
             std::process::exit(1);
         }
     }
+
+    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE K-A2 training entry point. Mirrors `run_kp` exactly, only the input
@@ -2011,6 +2181,8 @@ fn run_nnue_ka2(args: &Args) {
             std::process::exit(1);
         }
     }
+
+    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
@@ -2106,6 +2278,8 @@ fn run_halfkpe9(args: &Args) {
             std::process::exit(1);
         }
     }
+
+    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE HalfKP_vm training entry point. Identical wiring to `run_halfkp`,
@@ -2200,6 +2374,8 @@ fn run_halfkpvm(args: &Args) {
             std::process::exit(1);
         }
     }
+
+    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// SFNN-1536 / LayerStacks training entry point (= `SFNN_HALFKA1HM` and

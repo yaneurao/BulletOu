@@ -250,6 +250,48 @@ where
         }
     }
 
+    /// Run a forward pass on a slice of pre-decoded positions, splitting into
+    /// chunks of `batch_size` so the GPU can process many positions per kernel
+    /// launch. Returns the raw scalar output of the network for each input
+    /// position (= sigmoid logit for value-network checkpoints), in input
+    /// order.
+    ///
+    /// Use this for offline validation against a held-out test set: skipping
+    /// the `FromStr` step in [`eval_raw_output`] avoids per-position FEN
+    /// round-tripping and the larger batch fully utilises the GPU.
+    pub fn eval_packed_batch(
+        &mut self,
+        positions: &[Inp::RequiredDataType],
+        batch_size: usize,
+    ) -> Vec<f32>
+    where
+        Inp::RequiredDataType: LoadableDataType,
+    {
+        assert!(batch_size > 0, "batch_size must be > 0");
+        let mut out = Vec::with_capacity(positions.len());
+        for chunk in positions.chunks(batch_size) {
+            let n = chunk.len();
+            self.0.optimiser.model.set_fwd_batch_size(n).unwrap();
+            // eval_scale / blend factors are loss-side only; both default 1.0
+            // is fine here because we never feed the prepared batch into the
+            // loss path — we only read the raw forward output.
+            let host_data = self.state.prepare(chunk, n, 1.0, 1.0);
+            let model = &self.optimiser.model;
+            let device = model.device();
+            let stream = device.new_stream().unwrap();
+            let inputs = host_data.to_device(&device).unwrap();
+            let outputs = model.make_forward_output_tensors(n).unwrap();
+            model.forward(&stream, &inputs, &outputs).unwrap().value().unwrap();
+            let output = outputs.get("outputs/output").unwrap().clone();
+            let TValue::F32(values) = output.to_host().unwrap() else { panic!() };
+            // For scalar-output value networks the tensor shape is (n, 1) and
+            // `to_host()` already returns it row-major flattened, so we can
+            // append directly.
+            out.extend_from_slice(&values);
+        }
+        out
+    }
+
     pub fn measure_max_cpu_throughput(
         &self,
         schedule: &TrainingSchedule<impl LrScheduler, impl WdlScheduler>,
