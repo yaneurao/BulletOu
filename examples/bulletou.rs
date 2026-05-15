@@ -937,6 +937,25 @@ struct LogContext {
     lr_step_positions: u64,
 }
 
+/// Expand `args.teacher` (which may be a directory, a single file, or a
+/// comma-separated list of either) into the comma-joined list of actual
+/// teacher file paths, suitable for the `teacher` column of `learn.log`.
+///
+/// When `--teacher` points to a directory, the log row would otherwise
+/// only record the directory name — which is ambiguous if the directory
+/// contents change between runs. Recording the resolved file list pins
+/// down exactly which teacher files were used.
+///
+/// On expansion failure (path doesn't exist yet, permission error,
+/// etc.), falls back to the raw input so the row still gets *something*
+/// and the trainer's own error message will surface the real problem.
+fn resolve_teacher_for_log(teacher: &str) -> String {
+    match expand_teacher(teacher) {
+        Ok(paths) => paths.join(","),
+        Err(_) => teacher.to_string(),
+    }
+}
+
 impl LogContext {
     fn from_args(args: &Args) -> Self {
         let batches_per_superbatch =
@@ -949,7 +968,7 @@ impl LogContext {
             lambda: args.lambda,
             batch_size: args.batch_size,
             batches_per_superbatch,
-            teacher_csv: csv_escape(&args.teacher),
+            teacher_csv: csv_escape(&resolve_teacher_for_log(&args.teacher)),
             sb_offset: 0,
             lr_step_positions: args.lr_step_positions,
         }
@@ -1935,9 +1954,13 @@ macro_rules! run_training_inline_nnue {
         // reset on its own. `cb_ctx.sb_offset` shifts the displayed sb
         // column in the enriched `learn.log` so the time-series stays
         // monotonic for the user.
+        // Compare the *resolved* (= expanded file list) form on both
+        // sides — `from_args` writes the resolved list to the log, so
+        // raw `args.teacher` would never match a stored directory.
         let prev_teacher = read_latest_saved_teacher(&output_dir_buf);
+        let resolved_now = resolve_teacher_for_log(&args.teacher);
         let teacher_changed = match prev_teacher.as_deref() {
-            Some(prev) => prev.trim() != args.teacher.trim(),
+            Some(prev) => prev.trim() != resolved_now.trim(),
             None => false,
         };
         let user_set_start = args.start_superbatch.is_some();
