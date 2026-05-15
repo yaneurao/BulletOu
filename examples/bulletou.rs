@@ -493,7 +493,8 @@ impl LrScheduler for LrSchedulerImpl {
 
 /// Which LR schedule the trainer should follow. `Step` is stepwise
 /// `gamma`-decay (current behaviour); `Cos` is SGDR-style cosine
-/// annealing with warm restarts at `--lr-cosine-period`.
+/// annealing with one cycle per epoch (period auto-computed; see
+/// `Args::lr_min` doc).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[clap(rename_all = "lowercase")]
 enum LrScheduleKind {
@@ -612,22 +613,25 @@ struct Args {
 
     /// LR schedule kind. `step` (default) = stepwise `gamma`-decay
     /// every `--lr-step-positions` positions. `cos` = SGDR-style
-    /// cosine annealing with one cycle per `--lr-cosine-period`
-    /// positions, sweeping from `--lr` (start) to `--lr-min` and
-    /// then warm-restarting back to `--lr` at each cycle boundary.
+    /// cosine annealing with one cycle per epoch, sweeping from
+    /// `--lr` (start) to `--lr-min` and then warm-restarting back
+    /// to `--lr` at each epoch boundary. The cycle period is
+    /// auto-computed (see `--lr-min` doc).
     #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
-
-    /// (cos only) Length of one cosine cycle in cumulative trained
-    /// positions. Default `500000000` (= 500M positions per cycle).
-    /// Set equal to a single epoch's position count to get exactly
-    /// one full cosine sweep per epoch.
-    #[arg(long, default_value = "500000000")]
-    lr_cosine_period: u64,
 
     /// (cos only) Floor LR reached at the end of each cosine cycle
     /// (= the value of LR just before the warm restart back to
     /// `--lr`). Default `0.0` (= cosine touches zero at cycle end).
+    ///
+    /// The cycle period itself is auto-computed and is **not** a
+    /// separate CLI flag: when `--superbatches N` is set, period
+    /// equals one epoch (= `N * batches_per_superbatch * batch_size`)
+    /// so lr_min lands exactly at sb N's end. For HCPE / PSV with
+    /// no `--superbatches`, period falls back to the teacher's
+    /// total position count (computed from file sizes). HCPE3 / pack
+    /// without `--superbatches` is rejected because their teacher
+    /// size is unknown without walking.
     #[arg(long, default_value = "0.0")]
     lr_min: f32,
 
@@ -821,6 +825,61 @@ impl Args {
         self.eval_type
             .expect("--eval-type required (clap should have validated)")
     }
+}
+
+// ----- cosine period -----------------------------------------------------
+
+/// Compute the cosine annealing cycle period (in positions) for the
+/// current run.
+///
+/// Semantics:
+/// - If `--superbatches N` is set, period = `N * batches_per_superbatch
+///   * batch_size`. This is the most common case: 1 cycle per epoch,
+///   with `lr_min` landing exactly at sb N's end.
+/// - Otherwise (= unlimited sb cap), fall back to the teacher's total
+///   position count. For HCPE / PSV (fixed-length records) we just
+///   read `file_size / record_size` per file. HCPE3 / pack (variable
+///   length) would need to walk every game so this combination is
+///   rejected — the user is expected to set `--superbatches` for
+///   variable-length teachers.
+fn auto_cosine_period(
+    args: &Args,
+    format: DataFormat,
+    data_files: &[String],
+    batches_per_superbatch: usize,
+) -> Result<u64, String> {
+    let sb_size = (batches_per_superbatch as u64) * (args.batch_size as u64);
+    if let Some(superbatches) = args.superbatches {
+        return Ok(sb_size * (superbatches as u64));
+    }
+    let record_size: u64 = match format {
+        DataFormat::Hcpe => 38,
+        DataFormat::Psv => 40,
+        DataFormat::Hcpe3 | DataFormat::Pack => {
+            return Err(format!(
+                "--lr-schedule cos with variable-length teacher format \
+                 ({format:?}) requires --superbatches to be set so the \
+                 cosine cycle period is well-defined (no way to compute \
+                 epoch length without walking the file). Use \
+                 --count-teacher on an equivalent HCPE / PSV teacher \
+                 to estimate the right --superbatches value."
+            ));
+        }
+    };
+    let mut total: u64 = 0;
+    for p in data_files {
+        let size = std::fs::metadata(p)
+            .map_err(|e| format!("stat {p}: {e}"))?
+            .len();
+        if size % record_size != 0 {
+            return Err(format!(
+                "{p}: size {size} not a multiple of {record_size} byte — \
+                 possibly corrupted / truncated"
+            ));
+        }
+        total += size / record_size;
+    }
+    Ok(total)
 }
 
 // ----- count-teacher -----------------------------------------------------
@@ -1102,7 +1161,7 @@ fn run_kppt_all(args: &Args) {
     // series `0001/`, `0002/`, ..., each containing the three `.bin` files
     // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
     // `kpp-*/` subdirs are removed after assembly.
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
     match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions) {
         Ok((_first_idx, last_idx)) => {
@@ -1227,7 +1286,13 @@ fn resolve_teacher_for_log(teacher: &str) -> String {
 }
 
 impl LogContext {
-    fn from_args(args: &Args) -> Self {
+    /// `lr_cosine_period_override` is the cosine cycle period in
+    /// positions, pre-computed by [`auto_cosine_period`] when the
+    /// trainer is about to run with `--lr-schedule cos`. For
+    /// non-training callers (post-training log enrich paths), pass
+    /// 0; the lr column in enrich is only meaningful when the
+    /// schedule actually used cosine.
+    fn from_args(args: &Args, lr_cosine_period_override: u64) -> Self {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
@@ -1242,7 +1307,7 @@ impl LogContext {
             sb_offset: 0,
             lr_step_positions: args.lr_step_positions,
             lr_schedule: args.lr_schedule,
-            lr_cosine_period: args.lr_cosine_period,
+            lr_cosine_period: lr_cosine_period_override,
             lr_min: args.lr_min,
         }
     }
@@ -1858,6 +1923,18 @@ macro_rules! run_training_inline {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
+        // Cosine annealing cycle period: auto-derive from --superbatches
+        // (or teacher size for HCPE/PSV when unlimited). 0 for step mode.
+        let lr_cosine_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Cos) {
+            auto_cosine_period(args, format, &data_files_owned, batches_per_superbatch)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                })
+        } else {
+            0
+        };
+
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
         // other reason no superbatch boundary is crossed), bullet writes no
@@ -1937,7 +2014,7 @@ macro_rules! run_training_inline {
                     LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
                         start: args.lr,
                         min: args.lr_min,
-                        period_positions: args.lr_cosine_period,
+                        period_positions: lr_cosine_period,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -2292,6 +2369,19 @@ macro_rules! run_training_inline_nnue {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
+        // Cosine annealing cycle period: auto-derive from --superbatches
+        // (or teacher size for HCPE/PSV when unlimited). 0 for step mode
+        // (PositionsLR doesn't read it).
+        let lr_cosine_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Cos) {
+            auto_cosine_period(args, format, &data_files_owned, batches_per_superbatch)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                })
+        } else {
+            0
+        };
+
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
@@ -2307,7 +2397,7 @@ macro_rules! run_training_inline_nnue {
         // explicitly passes --start-superbatch (signalling "reset sb to N"),
         // fall back to the legacy behaviour of carrying the prior position
         // sum forward from the existing top-level learn.log.
-        let mut cb_ctx = LogContext::from_args(args);
+        let mut cb_ctx = LogContext::from_args(args, lr_cosine_period);
         let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
         let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
         // Teacher-change detection: bullet's dataloader skips
@@ -2515,7 +2605,7 @@ macro_rules! run_training_inline_nnue {
                 LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
                     start: args.lr,
                     min: args.lr_min,
-                    period_positions: args.lr_cosine_period,
+                    period_positions: lr_cosine_period,
                     prior_positions: cb_prior_position as u64,
                     batch_size: args.batch_size,
                     batches_per_superbatch,
@@ -2964,7 +3054,7 @@ fn run_halfkp(args: &Args) {
 
     // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
     // enrich each dir's bullet `log.txt` into the 7-column `learn.log`.
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
@@ -3060,7 +3150,7 @@ fn run_kp(args: &Args) {
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
@@ -3156,7 +3246,7 @@ fn run_nnue_ka2(args: &Args) {
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
@@ -3252,7 +3342,7 @@ fn run_halfkpe9(args: &Args) {
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
@@ -3347,7 +3437,7 @@ fn run_halfkpvm(args: &Args) {
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
@@ -3541,7 +3631,7 @@ where
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
-    let ctx = LogContext::from_args(args);
+    let ctx = LogContext::from_args(args, 0);
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
