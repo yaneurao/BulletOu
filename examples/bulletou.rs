@@ -583,22 +583,7 @@ struct Args {
     #[arg(long, default_value = "1")]
     max_epochs: usize,
 
-    /// Starting superbatch counter for the LR scheduler and the trainer's
-    /// internal superbatch numbering.
-    ///
-    /// When omitted (the normal case), it auto-resumes from the latest
-    /// saved superbatch found under `--output`: the next run continues
-    /// the LR schedule from `last_saved_sb + 1` instead of restarting at
-    /// 1. If no saved checkpoints exist, training starts from sb 1 as
-    /// before.
-    ///
-    /// Pass an explicit value to override (e.g. `--start-superbatch 1` to
-    /// force the LR schedule to restart from the beginning even when
-    /// resuming from a state.bin).
-    #[arg(long)]
-    start_superbatch: Option<usize>,
-
-    /// Initial Adam learning rate.
+/// Initial Adam learning rate.
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
@@ -1605,15 +1590,15 @@ fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usiz
 }
 
 /// Detect the teacher path recorded in the highest-numbered
-/// `<output_dir>/<NNNN>/learn.log`. Used to decide whether
-/// auto-resume's `start_superbatch` skip-ahead is safe: bullet's
-/// dataloader skips `(start_sb - 1) * batches_per_sb` records at
-/// startup, which only makes sense if the resume run uses the same
-/// teacher file as the previous run. If the teacher changed, the new
-/// (smaller) file may have fewer records than the requested skip,
-/// causing `NoBatchesReceived` panic. We use the comparison result to
-/// fall back to `start_superbatch=1` in the changed-teacher case while
-/// still honouring the model+optimizer load from `state.bin`.
+/// `<output_dir>/<NNNN>/learn.log`. Used to decide whether auto-resume's
+/// dataloader skip-ahead is safe: bullet's dataloader skips
+/// `(start_sb - 1) * batches_per_sb` records at startup, which only
+/// makes sense if the resume run uses the same teacher file as the
+/// previous run. If the teacher changed, the new (smaller) file may
+/// have fewer records than the requested skip, causing
+/// `NoBatchesReceived` panic. We use the comparison result to fall back
+/// to a fresh `start_sb=1` read in the changed-teacher case while still
+/// honouring the model+optimizer load from `state.bin`.
 ///
 /// Returns the **trimmed** teacher field of the **last (= bottom) row**
 /// in the latest dir's learn.log (which is the most recent `--teacher`
@@ -2000,9 +1985,8 @@ macro_rules! run_training_inline {
                     batch_size: args.batch_size,
                     batches_per_superbatch,
                     // KPPT family does not get auto-resume yet (the 3-component
-                    // assembly makes the bookkeeping non-trivial). Treat
-                    // `--start-superbatch` as a plain default-1 flag for now.
-                    start_superbatch: args.start_superbatch.unwrap_or(1),
+                    // assembly makes the bookkeeping non-trivial); always starts at sb=1.
+                    start_superbatch: 1,
                     end_superbatch,
                 },
                 wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
@@ -2390,17 +2374,10 @@ macro_rules! run_training_inline_nnue {
         let mut last_net_id_for_epoch: String = net_id_base.clone();
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
-        // Auto-resume: if --start-superbatch is unspecified and a previous
-        // run left numbered checkpoint dirs under output_dir, continue the
-        // sb counter (and therefore the LR schedule) from the last saved
-        // superbatch + 1 instead of silently restarting at sb=1.
-        //
-        // When sb is auto-continued, `positions_at(sb, b, 0)` already gives
-        // the correct cumulative position count (sb itself encodes the
-        // history), so the prior-position offset is 0. When the user
-        // explicitly passes --start-superbatch (signalling "reset sb to N"),
-        // fall back to the legacy behaviour of carrying the prior position
-        // sum forward from the existing top-level learn.log.
+        // Auto-resume: if a previous run left numbered checkpoint dirs
+        // under output_dir, continue the sb counter (and therefore the LR
+        // schedule) from the last saved superbatch + 1 instead of silently
+        // restarting at sb=1.
         let mut cb_ctx = LogContext::from_args(args, lr_period);
         let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
         let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
@@ -2429,12 +2406,16 @@ macro_rules! run_training_inline_nnue {
             Some(prev) => prev.trim() != resolved_now.trim(),
             None => false,
         };
-        let user_set_start = args.start_superbatch.is_some();
-        let (effective_start_superbatch, sb_offset_for_display) = if user_set_start {
-            // Explicit user value wins for the dataloader skip; assume
-            // the user wants the displayed sb to match.
-            (args.start_superbatch.unwrap(), 0usize)
-        } else if teacher_changed {
+        // "Previous run cleanly completed its --superbatches target": the
+        // last saved sb (per-epoch counter) already reached end_superbatch.
+        // Treat the new invocation as "add more epochs" — start the next
+        // epoch from sb=1 with a fresh dataloader, instead of trying to
+        // resume sb=last_sb+1 (which would skip past end_superbatch and
+        // train zero batches).
+        let prev_run_completed_epoch = auto_resume_sb_raw
+            .map(|last_sb| last_sb >= end_superbatch)
+            .unwrap_or(false);
+        let (effective_start_superbatch, sb_offset_for_display) = if teacher_changed {
             if let Some(last_sb) = auto_resume_sb_raw {
                 // Keep dataloader fresh (start_sb=1) but shift the
                 // displayed sb so the time-series stays monotonic.
@@ -2443,10 +2424,17 @@ macro_rules! run_training_inline_nnue {
                 // Teacher changed but no prior dirs → fresh run.
                 (1usize, 0)
             }
+        } else if prev_run_completed_epoch {
+            // Same teacher, previous run completed its epoch(s) cleanly:
+            // start the next epoch from sb=1. The cumulative `positions`
+            // column stays continuous via `cb_prior_position`; the
+            // displayed sb is shifted by the previous run's last_sb so
+            // the time-series in learn.log remains monotonic.
+            (1usize, auto_resume_sb_raw.unwrap())
         } else if let Some(last_sb) = auto_resume_sb_raw {
-            // Same teacher: let bullet's dataloader skip ahead so
-            // training picks up where the previous run left off in the
-            // SAME file. Bullet's local sb is already absolute.
+            // Same teacher, previous run died mid-epoch: let bullet's
+            // dataloader skip ahead so this epoch finishes from
+            // last_sb+1. Epoch≥2 will reset to sb=1 in the chunk loop.
             (last_sb + 1, 0)
         } else {
             // First run.
@@ -2479,32 +2467,45 @@ macro_rules! run_training_inline_nnue {
         // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
         // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
         let cb_dataloader_resume_offset = std::cell::Cell::new(
-            if teacher_changed {
+            if teacher_changed || prev_run_completed_epoch {
+                // Continued-training case (= add more epochs after a
+                // completed run): read the teacher from byte 0 of the
+                // first new epoch, otherwise we'd start near EOF (where
+                // the previous run's final epoch ended) and hit early
+                // EOF instead of training.
                 (0u64, 0usize)
             } else {
                 read_latest_dataloader_pos(&output_dir_buf).unwrap_or((0, 0))
             }
         );
 
-        if !user_set_start {
-            if teacher_changed {
-                if let (Some(prev), Some(last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
-                    eprintln!(
-                        "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
-                         dataloader will read the new file from the beginning (start_sb=1); display sb\n  \
-                         continues from {} (model + optimiser are loaded from the latest state.bin as\n  \
-                         usual). Pass --start-superbatch <N> to override.",
-                        args.teacher,
-                        last_sb + 1
-                    );
-                }
-            } else if let Some(last_sb) = auto_resume_sb_raw {
+        if teacher_changed {
+            if let (Some(prev), Some(last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
                 eprintln!(
-                    "  auto-resuming from superbatch {} (last saved: {}). \
-                     pass --start-superbatch to override.",
-                    effective_start_superbatch, last_sb
+                    "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
+                     dataloader will read the new file from the beginning (start_sb=1); display sb\n  \
+                     continues from {} (model + optimiser are loaded from the latest state.bin as\n  \
+                     usual).",
+                    args.teacher,
+                    last_sb + 1
                 );
             }
+        } else if prev_run_completed_epoch {
+            let last_sb = auto_resume_sb_raw.unwrap();
+            eprintln!(
+                "  previous run completed {} superbatch{} cleanly; \
+                 continuing as additional epoch(s) — each new epoch starts from sb=1 \
+                 reading the teacher from the beginning. \
+                 Display sb in learn.log is shifted by {} for monotonic time-series.",
+                last_sb,
+                if last_sb == 1 { "" } else { "es" },
+                last_sb
+            );
+        } else if let Some(last_sb) = auto_resume_sb_raw {
+            eprintln!(
+                "  auto-resuming from superbatch {} (last saved: {}).",
+                effective_start_superbatch, last_sb
+            );
         }
 
         // Build the LR scheduler. Positions-based for both kinds:
@@ -2625,7 +2626,13 @@ macro_rules! run_training_inline_nnue {
             // Run the epoch in chunks of `save_rate` superbatches. Each
             // chunk ends at a save boundary, after which we validate (if
             // requested) and finalise the saved dir with the test metrics.
-            let mut chunk_start = effective_start_superbatch;
+            //
+            // chunk_start: epoch 1 honours the auto-resume / user-set
+            // start sb so an interrupted previous epoch picks up where it
+            // left off. Epoch≥2 always starts at sb=1 — otherwise the new
+            // epoch would skip sb 1..effective_start_superbatch-1, which
+            // is wrong: each new epoch is a fresh pass over the teacher.
+            let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
             let chunk_size = args.save_rate.max(1);
             'epoch: loop {
                 if chunk_start > end_superbatch { break; }
