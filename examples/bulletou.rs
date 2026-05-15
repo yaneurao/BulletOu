@@ -15,6 +15,7 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_HALFKP                    classic HalfKP NNUE (default --arch 256x2-32-32)
     bulletou --eval-type NNUE_HALFKP --arch 1024x2-8-64 larger HalfKP NNUE
     bulletou --eval-type NNUE_KP                        K+P NNUE (default --arch 256x2-32-32)
+    bulletou --eval-type NNUE_KA2 --arch 256x2-64-64    K+A2 NNUE (e.g. wider hidden layers)
     bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
     bulletou --eval-type SFNN_HALFKA2HM --arch 1536x2-15-32 --layerstack king3-by-king3
@@ -109,6 +110,15 @@ enum EvalType {
     /// instead of HalfKP's (king × piece) cross product. Architecture is
     /// selected via `--arch` (default `256x2-32-32`).
     NnueKp,
+    /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>` — same 4-layer ClippedReLU
+    /// network as kp_256x2-32-32, but the piece feature is A2 (1629 dims,
+    /// kings collapsed onto friend plane via v2 encoding) so both kings
+    /// participate in the piece feature in addition to K (162 dims). Input
+    /// total = 1791 dims per perspective. Same architecture knob (`--arch`)
+    /// as NNUE_KP / NNUE_HALFKP. Matches YaneuraOu's
+    /// `YANEURAOU_ENGINE_NNUE_ka2_*` build (single LayerStack, no SFNN
+    /// post-FT structure).
+    NnueKa2,
     /// NNUE HalfKPE9. YaneuraOu halfkpe9_* — HalfKP × 9 effect-count buckets
     /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3×3=9
     /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP ×
@@ -147,67 +157,81 @@ enum EvalType {
     SfnnKa2,
 }
 
-/// Pre-set NNUE architecture sizes — `<L1>x2-<L2>-<L3>` in the textual CLI
-/// form. The set matches the per-arch directories YaneuraOu ships its NNUE
-/// engine binaries under (`NNUE_halfkp_256x2_32_32`, `NNUE_halfkp_512x2_8_64`,
-/// …): network structure is fixed (4-layer ClippedReLU, dual-perspective);
-/// only `(L1, L2, L3)` vary. The same arch presets are usable from both
-/// `--eval-type NNUE_HALFKP` and `--eval-type NNUE_KP`; YaneuraOu's KP build
-/// currently only ships `256x2_32_32`, but the trainer doesn't restrict you.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum NnueArch {
-    /// L1=256, L2=32, L3=32 (classic Stockfish-style NNUE preset).
-    #[clap(name = "256x2-32-32")]
-    Arch256x2_32_32,
-    /// L1=384, L2=8, L3=96.
-    #[clap(name = "384x2-8-96")]
-    Arch384x2_8_96,
-    /// L1=512, L2=8, L3=64.
-    #[clap(name = "512x2-8-64")]
-    Arch512x2_8_64,
-    /// L1=768, L2=16, L3=64.
-    #[clap(name = "768x2-16-64")]
-    Arch768x2_16_64,
-    /// L1=1024, L2=8, L3=32.
-    #[clap(name = "1024x2-8-32")]
-    Arch1024x2_8_32,
-    /// L1=1024, L2=8, L3=64.
-    #[clap(name = "1024x2-8-64")]
-    Arch1024x2_8_64,
-    /// L1=1536, L2=15, L3=32. SFNN-1536 preset matching YaneuraOu's
-    /// `architectures/sfnnwop-1536.h`. L2=15 + 1 PSQT-shortcut neuron
-    /// is added automatically inside the SFNN trainer.
-    #[clap(name = "1536x2-15-32")]
-    Arch1536x2_15_32,
+/// NNUE architecture size — `<L1>x2-<L2>-<L3>` in the textual CLI form.
+///
+/// Network structure is fixed (4-layer ClippedReLU, dual-perspective for the
+/// non-SFNN family; SFNN family uses a fixed sfnnwop-1536-style topology),
+/// only `(L1, L2, L3)` vary. Free-form: any positive `(L1, L2, L3)` triple
+/// is accepted as long as `L1 % 32 == 0` (SIMD-alignment requirement of
+/// the FT padding).
+///
+/// Common presets that are known to work:
+/// - `256x2-32-32`  (classic Stockfish-style NNUE; YaneuraOu KP / HalfKP default)
+/// - `512x2-8-64`, `768x2-16-64`, `1024x2-8-64`  (larger HalfKP variants
+///   matching YaneuraOu's NNUE binary directories)
+/// - `1536x2-15-32` (SFNN-1536, matches `architectures/sfnnwop-1536.h`;
+///   L2=15 + 1 PSQT-shortcut neuron is added automatically inside the
+///   SFNN trainer)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NnueArch {
+    l1: usize,
+    l2: usize,
+    l3: usize,
 }
 
 impl NnueArch {
     /// `(l1, l2, l3)` triple.
     fn dims(self) -> (usize, usize, usize) {
-        match self {
-            NnueArch::Arch256x2_32_32 => (256, 32, 32),
-            NnueArch::Arch384x2_8_96 => (384, 8, 96),
-            NnueArch::Arch512x2_8_64 => (512, 8, 64),
-            NnueArch::Arch768x2_16_64 => (768, 16, 64),
-            NnueArch::Arch1024x2_8_32 => (1024, 8, 32),
-            NnueArch::Arch1024x2_8_64 => (1024, 8, 64),
-            NnueArch::Arch1536x2_15_32 => (1536, 15, 32),
-        }
+        (self.l1, self.l2, self.l3)
     }
 
     /// The arch's CLI value as the user types it (e.g. `256x2-32-32`).
-    /// Must stay in sync with the `#[clap(name = ...)]` attribute on each
-    /// variant of [`NnueArch`].
-    fn cli_name(self) -> &'static str {
-        match self {
-            NnueArch::Arch256x2_32_32 => "256x2-32-32",
-            NnueArch::Arch384x2_8_96 => "384x2-8-96",
-            NnueArch::Arch512x2_8_64 => "512x2-8-64",
-            NnueArch::Arch768x2_16_64 => "768x2-16-64",
-            NnueArch::Arch1024x2_8_32 => "1024x2-8-32",
-            NnueArch::Arch1024x2_8_64 => "1024x2-8-64",
-            NnueArch::Arch1536x2_15_32 => "1536x2-15-32",
+    fn cli_name(self) -> String {
+        format!("{}x2-{}-{}", self.l1, self.l2, self.l3)
+    }
+}
+
+impl std::fmt::Display for NnueArch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x2-{}-{}", self.l1, self.l2, self.l3)
+    }
+}
+
+impl std::str::FromStr for NnueArch {
+    type Err = String;
+
+    /// Parse `<L1>x2-<L2>-<L3>` (e.g. `256x2-32-32`). The middle `x2`
+    /// is required (it stands for the dual-perspective concat) and rejected
+    /// otherwise. `L1` must be a positive multiple of 32 (FT SIMD alignment);
+    /// `L2`, `L3` must be positive.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "invalid arch `{s}`: expected `<L1>x2-<L2>-<L3>` (e.g. `256x2-32-32`)"
+            ));
         }
+        let l1_part = parts[0]
+            .strip_suffix("x2")
+            .ok_or_else(|| format!("invalid arch `{s}`: `{}` must end with `x2`", parts[0]))?;
+        let l1: usize = l1_part
+            .parse()
+            .map_err(|_| format!("invalid arch `{s}`: L1 `{l1_part}` is not a positive integer"))?;
+        let l2: usize = parts[1]
+            .parse()
+            .map_err(|_| format!("invalid arch `{s}`: L2 `{}` is not a positive integer", parts[1]))?;
+        let l3: usize = parts[2]
+            .parse()
+            .map_err(|_| format!("invalid arch `{s}`: L3 `{}` is not a positive integer", parts[2]))?;
+        if l1 == 0 || l2 == 0 || l3 == 0 {
+            return Err(format!("invalid arch `{s}`: L1/L2/L3 must all be > 0"));
+        }
+        if l1 % 32 != 0 {
+            return Err(format!(
+                "invalid arch `{s}`: L1 (= {l1}) must be a multiple of 32 (FT SIMD-padding requirement)"
+            ));
+        }
+        Ok(NnueArch { l1, l2, l3 })
     }
 }
 
@@ -255,6 +279,7 @@ impl EvalType {
             EvalType::KppKkpt => "shogi_kpp_kkpt",
             EvalType::NnueHalfkp => "shogi_nnue_halfkp",
             EvalType::NnueKp => "shogi_nnue_kp",
+            EvalType::NnueKa2 => "shogi_nnue_ka2",
             EvalType::NnueHalfkpe9 => "shogi_nnue_halfkpe9",
             EvalType::NnueHalfkpvm => "shogi_nnue_halfkpvm",
             EvalType::SfnnHalfka1hm => "shogi_sfnn_halfka1hm",
@@ -271,6 +296,7 @@ impl EvalType {
             EvalType::Kppt | EvalType::KppKkpt => false,
             EvalType::NnueHalfkp
             | EvalType::NnueKp
+            | EvalType::NnueKa2
             | EvalType::NnueHalfkpe9
             | EvalType::NnueHalfkpvm
             | EvalType::SfnnHalfka1hm
@@ -299,6 +325,7 @@ impl EvalType {
             EvalType::KppKkpt => "KPP_KKPT",
             EvalType::NnueHalfkp => "NNUE_HALFKP",
             EvalType::NnueKp => "NNUE_KP",
+            EvalType::NnueKa2 => "NNUE_KA2",
             EvalType::NnueHalfkpe9 => "NNUE_HALFKPE9",
             EvalType::NnueHalfkpvm => "NNUE_HALFKPVM",
             EvalType::SfnnHalfka1hm => "SFNN_HALFKA1HM",
@@ -449,13 +476,17 @@ struct Args {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
-    /// Network architecture preset for NNUE eval types. Format
-    /// `<L1>x2-<L2>-<L3>`. Supported values mirror the per-arch
-    /// directories under YaneuraOu's NNUE binary distribution
-    /// (`256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`,
-    /// `1024x2-8-32`, `1024x2-8-64`). Plus `1536x2-15-32` for the SFNN
-    /// family (matches `architectures/sfnnwop-1536.h`). Ignored for
-    /// KPPT / KPP_KKPT eval types.
+    /// Network architecture for NNUE eval types. Free-form format
+    /// `<L1>x2-<L2>-<L3>` where `L1` is the per-perspective FT size
+    /// (must be a multiple of 32 for SIMD alignment) and `L2`, `L3`
+    /// are hidden-layer sizes. Common YaneuraOu-shipped sizes:
+    /// `256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`,
+    /// `1024x2-8-32`, `1024x2-8-64`, plus `1536x2-15-32` for the
+    /// SFNN family (matches `architectures/sfnnwop-1536.h`). Any
+    /// other valid triple (e.g. `256x2-64-64`) is also accepted for
+    /// experimentation, though only the YaneuraOu-shipped sizes can
+    /// be loaded by stock engine builds. Ignored for KPPT / KPP_KKPT
+    /// eval types.
     #[arg(long, default_value = "256x2-32-32")]
     arch: NnueArch,
 
@@ -488,7 +519,7 @@ impl Args {
         let mut name = self.eval_type.cli_name().to_string();
         if self.eval_type.uses_arch() {
             name.push('-');
-            name.push_str(self.arch.cli_name());
+            name.push_str(&self.arch.cli_name());
         }
         if self.eval_type.uses_layerstack() {
             name.push('-');
@@ -528,6 +559,7 @@ fn main() {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         EvalType::NnueHalfkp => run_halfkp(&args),
         EvalType::NnueKp => run_kp(&args),
+        EvalType::NnueKa2 => run_nnue_ka2(&args),
         EvalType::NnueHalfkpe9 => run_halfkpe9(&args),
         EvalType::NnueHalfkpvm => run_halfkpvm(&args),
         EvalType::SfnnHalfka1hm => run_sfnn_1536(&args, ShogiHalfKaHm1, NnueFeatureSet::HalfKaHm1),
@@ -721,7 +753,7 @@ struct LogContext {
     /// KPPT-family eval types since they ignore `--arch`. When non-empty it is
     /// joined into the `eval` column as `<eval-type>-<arch>`, matching the
     /// output-dir naming.
-    arch: &'static str,
+    arch: String,
     lr_start: f32,
     lr_gamma: f32,
     lr_step: usize,
@@ -737,7 +769,7 @@ impl LogContext {
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
             eval_type: args.eval_type.cli_name(),
-            arch: if args.eval_type.uses_arch() { args.arch.cli_name() } else { "" },
+            arch: if args.eval_type.uses_arch() { args.arch.cli_name() } else { String::new() },
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
             lr_step: args.lr_step,
@@ -1751,6 +1783,97 @@ fn run_kp(args: &Args) {
     }
 }
 
+/// NNUE K-A2 training entry point. Mirrors `run_kp` exactly, only the input
+/// feature differs: K (162 dims) + A2 (1629 dims, kings collapsed onto friend
+/// plane via v2 encoding) = 1791 dims per perspective. Network topology is
+/// the same 4-layer ClippedReLU as halfkp_256x2-32-32 / kp_256x2-32-32.
+/// Architecture is selected via `--arch` (default `256x2-32-32`).
+fn run_nnue_ka2(args: &Args) {
+    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let input_size = ShogiKa2.num_inputs();
+    let l1_input_dim = 2 * l1_size;
+
+    eprintln!(
+        "=== bulletou: running NNUE_KA2 ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
+        l1_size, l2_size, l3_size
+    );
+
+    let output_dir = args.output_dir();
+    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
+        eprintln!("=== resume detected: {} ===", state_bin_path.display());
+        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
+            std::process::exit(1);
+        });
+        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse state.bin: {e}");
+            std::process::exit(1);
+        });
+        let resume_root = output_dir.join(".bulletou_resume");
+        let _ = std::fs::remove_dir_all(&resume_root);
+        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
+            eprintln!("error: state.bin missing `nnue/*` records: {e}");
+            std::process::exit(1);
+        });
+        resume_root
+    });
+
+    let save_format = build_nnue_save_format(NnueFeatureSet::Ka2, l1_size, l2_size, l3_size);
+
+    let mut builder = ValueTrainerBuilder::default()
+        .dual_perspective()
+        .optimiser(optimiser::AdamW)
+        .inputs(ShogiKa2)
+        .save_format(&save_format)
+        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+
+    if args.score_drop_abs > 0 {
+        builder = builder.score_drop_abs(args.score_drop_abs);
+    }
+
+    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
+        let l0 = builder.new_affine("l0", input_size, l1_size);
+        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+        let l2 = builder.new_affine("l2", l2_size, l3_size);
+        let out = builder.new_affine("out", l3_size, 1);
+
+        let stm_hidden = l0.forward(stm_inputs).crelu();
+        let ntm_hidden = l0.forward(ntm_inputs).crelu();
+        let combined = stm_hidden.concat(ntm_hidden);
+        let hidden1 = l1.forward(combined).crelu();
+        let hidden2 = l2.forward(hidden1).crelu();
+        out.forward(hidden2)
+    });
+
+    if let Some(dir) = resume_dir.as_ref() {
+        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
+        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
+    }
+
+    run_training_inline_nnue!(args, &mut trainer);
+
+    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
+
+    let ctx = LogContext::from_args(args);
+    let top_level_log = output_dir.join("learn.log");
+    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
+    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        Ok((_first_idx, last_idx)) => {
+            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
+                eprintln!(
+                    "warning: failed to update {}: {e}",
+                    output_dir.join("learn.log").display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
 /// HalfKP / K-P, but the input is `ShogiHalfKpe9` (1,128,492 dims per
 /// perspective = HalfKP × 9 effect-count buckets). The effect-count
@@ -2170,4 +2293,58 @@ fn finalize_nnue_dirs(
         eprintln!("  -> {}/", dst.display());
     }
     Ok((existing_count + 1, existing_count + n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn nnue_arch_parse_known_presets() {
+        assert_eq!(NnueArch::from_str("256x2-32-32").unwrap().dims(), (256, 32, 32));
+        assert_eq!(NnueArch::from_str("384x2-8-96").unwrap().dims(), (384, 8, 96));
+        assert_eq!(NnueArch::from_str("512x2-8-64").unwrap().dims(), (512, 8, 64));
+        assert_eq!(NnueArch::from_str("768x2-16-64").unwrap().dims(), (768, 16, 64));
+        assert_eq!(NnueArch::from_str("1024x2-8-32").unwrap().dims(), (1024, 8, 32));
+        assert_eq!(NnueArch::from_str("1024x2-8-64").unwrap().dims(), (1024, 8, 64));
+        assert_eq!(NnueArch::from_str("1536x2-15-32").unwrap().dims(), (1536, 15, 32));
+    }
+
+    #[test]
+    fn nnue_arch_parse_freeform_sizes() {
+        // 新しい自由なサイズも受理される。
+        assert_eq!(NnueArch::from_str("256x2-64-64").unwrap().dims(), (256, 64, 64));
+        assert_eq!(NnueArch::from_str("2048x2-32-64").unwrap().dims(), (2048, 32, 64));
+    }
+
+    #[test]
+    fn nnue_arch_cli_name_roundtrip() {
+        for s in ["256x2-32-32", "1536x2-15-32", "256x2-64-64", "2048x2-32-64"] {
+            let parsed = NnueArch::from_str(s).unwrap();
+            assert_eq!(parsed.cli_name(), s);
+            assert_eq!(parsed.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn nnue_arch_parse_rejects_bad_format() {
+        assert!(NnueArch::from_str("").is_err());
+        assert!(NnueArch::from_str("256-32-32").is_err()); // x2 missing
+        assert!(NnueArch::from_str("256x3-32-32").is_err()); // x3 not allowed
+        assert!(NnueArch::from_str("256x2-32").is_err()); // L3 missing
+        assert!(NnueArch::from_str("256x2-32-32-32").is_err()); // too many parts
+        assert!(NnueArch::from_str("abcx2-32-32").is_err());
+    }
+
+    #[test]
+    fn nnue_arch_parse_rejects_bad_dims() {
+        // 0 dims はNG
+        assert!(NnueArch::from_str("0x2-32-32").is_err());
+        assert!(NnueArch::from_str("256x2-0-32").is_err());
+        assert!(NnueArch::from_str("256x2-32-0").is_err());
+        // L1 が 32 の倍数でない
+        assert!(NnueArch::from_str("100x2-32-32").is_err());
+        assert!(NnueArch::from_str("257x2-32-32").is_err());
+    }
 }
