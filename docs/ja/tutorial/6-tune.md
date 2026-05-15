@@ -17,7 +17,10 @@
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし (= EOF まで) |
 | `--max-epochs` | 教師データを何周するか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
-| `--lr` / `--lr-gamma` / `--lr-step` | StepLR (`lr-step` superbatch ごとに `lr-gamma` 倍) | 0.001 / 0.1 / 8 |
+| `--lr` | 初期学習率 (lr_max) | 0.001 |
+| `--lr-schedule` | `step` (= 指数減衰) または `cos` (= cosine annealing + warm restart) | `step` |
+| `--lr-gamma` / `--lr-step-positions` | (step only) `lr-step-positions` 局面ごとに `lr-gamma` 倍 | 0.9 / 100000000 |
+| `--lr-cosine-period` / `--lr-min` | (cos only) `lr-cosine-period` 局面を 1 cycle として `--lr` → `--lr-min` を滑らかに往復 | 500000000 / 0.0 |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
@@ -31,27 +34,74 @@
 
 教師ファイルが 1 superbatch 未満 (≒ 1 億局面未満) しか無い場合は `--batches-per-superbatch` を小さくする (例: `1024` で 1 superbatch ≒ 1670 万局面) と、何回も save が走るようになる。
 
-### 学習率の動き
+### 学習率の動き — `--lr-schedule step` (デフォルト)
 
-`--lr 0.001 --lr-gamma 0.1 --lr-step 8` (デフォルト) の場合の学習率推移:
+`--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` (デフォルト) の場合、**累積学習局面数** が 100M を超えるごとに lr を 0.9 倍する:
 
-| superbatch | lr |
+| 累積局面 | lr |
 |---|---|
-| 1 - 8 | 0.001 |
-| 9 - 16 | 0.0001 |
-| 17 - 24 | 0.00001 |
-| 25 - 32 | 0.000001 |
-| ... | ... |
+| 0 〜 100M | 0.001 |
+| 100M 〜 200M | 0.000900 |
+| 200M 〜 300M | 0.000810 |
+| 500M | 0.000591 |
+| 1G | 0.000349 |
+| 2.2G | 0.0001 (≒ 初期値の 1/10) |
+
+`--lr-gamma 0.1` のような攻撃的な値を指定すると 100M ごとに 10× drop。長く回すなら `0.9` 系の緩い設定が普通。
 
 学習が走った後で実際の lr 推移を確認するには、`learn.log` の `lr` 列を見れば良い ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。
+
+### 学習率の動き — `--lr-schedule cos` (cosine annealing)
+
+`--lr-schedule cos` を指定すると、stepwise の代わりに **cosine annealing + warm restart** (SGDR) スケジュールになる:
+
+```
+t  = (累積局面 mod cosine_period) / cosine_period
+lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
+```
+
+`--lr-cosine-period 500000000 --lr-min 0.00001` の場合の挙動:
+
+| cycle 内位置 | t | lr |
+|---|---|---|
+| 0M (cycle 開始) | 0.0 | 0.001 (= `--lr`、lr_max) |
+| 125M | 0.25 | 0.000856 |
+| 250M | 0.5 | 0.000505 (midpoint) |
+| 375M | 0.75 | 0.000155 |
+| 500M (cycle 末) | 1.0 | 0.00001 (= `--lr-min`、lr_min) |
+| 500M + 1 | 0.0 (次 cycle) | **0.001** ← warm restart |
+
+500M 局面 = 1 epoch ぶんに `--lr-cosine-period` を合わせれば、各 epoch がきれいに 1 cycle = lr_max → lr_min を 1 回スイープしてリセット、を繰り返す。
+
+#### `step` vs `cos` を比較したい
+
+同じ教師・同じ arch で 2 回 run して `learn.log` を並べると、どちらが効くかすぐ分かる。`--tag` で出力先を分けるのがコツ:
+
+```bash
+# stepwise
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --max-epochs 10 --tag 5G-step \
+    --lr-schedule step --lr-step-positions 100000000 --lr-gamma 0.9
+
+# cosine (epoch ごとに 1 cycle)
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --max-epochs 10 --tag 5G-cos \
+    --lr-schedule cos --lr-cosine-period 500000000 --lr-min 0.00001
+```
+
+出力先がそれぞれ `checkpoints/NNUE_KP-256x2-32-32-5G-step/` と `-5G-cos/` に分かれる。`learn.log` の `test_value_accuracy` / `test_value_loss` 列を pandas / Excel で重ねれば比較完了。
 
 ### 複数 epoch 回す
 
 `--max-epochs N` を指定すると教師データを N 周する。各 epoch 開始時に:
-- LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る)
+- LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る — `step` でも `cos` でも同じ)
 - データローダーが先頭にシークし直す
 
-つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。
+つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--lr-cosine-period = epoch_size` を指定するのが典型的な SGDR-style 用法。
 
 ## 6.2 教師ターゲット (`--lambda`)
 

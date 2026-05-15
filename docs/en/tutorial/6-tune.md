@@ -17,7 +17,10 @@ Main flags:
 | `--superbatches` | Cap superbatches per epoch | unlimited (= run until EOF) |
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
-| `--lr` / `--lr-gamma` / `--lr-step` | StepLR (multiply by `lr-gamma` every `lr-step` superbatches) | 0.001 / 0.1 / 8 |
+| `--lr` | Starting LR (lr_max) | 0.001 |
+| `--lr-schedule` | `step` (exponential decay) or `cos` (cosine annealing + warm restart) | `step` |
+| `--lr-gamma` / `--lr-step-positions` | (step only) multiply LR by `lr-gamma` every `lr-step-positions` cumulative positions | 0.9 / 100000000 |
+| `--lr-cosine-period` / `--lr-min` | (cos only) one cosine cycle sweeps `--lr` → `--lr-min` over `--lr-cosine-period` positions, then warm-restarts | 500000000 / 0.0 |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
@@ -31,27 +34,74 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
 
 If your teacher file is smaller than one superbatch (< 100M positions), lower `--batches-per-superbatch` (e.g. `1024` ⇒ 1 superbatch ≒ 16.78M positions) so multiple saves fire.
 
-### Learning-rate evolution
+### Learning-rate evolution — `--lr-schedule step` (default)
 
-With `--lr 0.001 --lr-gamma 0.1 --lr-step 8` (defaults):
+With `--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` (defaults), the LR drops by 0.9× every 100M **cumulative trained positions**:
 
-| superbatch | lr |
+| Cumulative positions | lr |
 |---|---|
-| 1 - 8 | 0.001 |
-| 9 - 16 | 0.0001 |
-| 17 - 24 | 0.00001 |
-| 25 - 32 | 0.000001 |
-| ... | ... |
+| 0 – 100M | 0.001 |
+| 100M – 200M | 0.000900 |
+| 200M – 300M | 0.000810 |
+| 500M | 0.000591 |
+| 1G | 0.000349 |
+| 2.2G | 0.0001 (≒ 1/10 of starting LR) |
+
+Pass an aggressive value like `--lr-gamma 0.1` for a 10× drop every 100M. For long runs the gentler `0.9`-class default is more typical.
 
 You can verify the actual LR after the run by inspecting `learn.log`'s `lr` column ([§7.2 Reading the training log](7-result.md#72-reading-the-training-log-learnlog)).
+
+### Learning-rate evolution — `--lr-schedule cos` (cosine annealing)
+
+Pass `--lr-schedule cos` to use **cosine annealing with warm restart** (SGDR) instead of the stepwise schedule:
+
+```
+t  = (cumulative_positions mod cosine_period) / cosine_period
+lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
+```
+
+Example with `--lr-cosine-period 500000000 --lr-min 0.00001`:
+
+| Position within cycle | t | lr |
+|---|---|---|
+| 0M (cycle start) | 0.0 | 0.001 (= `--lr`, lr_max) |
+| 125M | 0.25 | 0.000856 |
+| 250M | 0.5 | 0.000505 (midpoint) |
+| 375M | 0.75 | 0.000155 |
+| 500M (cycle end) | 1.0 | 0.00001 (= `--lr-min`, lr_min) |
+| 500M + 1 | 0.0 (next cycle) | **0.001** ← warm restart |
+
+Set `--lr-cosine-period` equal to one epoch's worth of positions to get exactly one full cosine sweep per epoch, with the warm restart aligned to the epoch boundary.
+
+#### Comparing `step` vs `cos`
+
+Run twice on the same teacher / same architecture and overlay the `learn.log` curves. Use `--tag` to keep the output directories distinct:
+
+```bash
+# stepwise
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --max-epochs 10 --tag 5G-step \
+    --lr-schedule step --lr-step-positions 100000000 --lr-gamma 0.9
+
+# cosine (one cycle per epoch)
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --max-epochs 10 --tag 5G-cos \
+    --lr-schedule cos --lr-cosine-period 500000000 --lr-min 0.00001
+```
+
+The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. Load each `learn.log` in pandas / Excel and compare the `test_value_accuracy` / `test_value_loss` columns to see which schedule helps more on your teacher.
 
 ### Multi-epoch training
 
 `--max-epochs N` runs through the teacher data N times. At each epoch boundary:
-- The LR scheduler resets (superbatch counter back to 1, `lr = --lr`).
+- The LR scheduler resets (superbatch counter back to 1, `lr = --lr`) — applies to both `step` and `cos`.
 - The dataloader rewinds to the beginning of the data.
 
-Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training).
+Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--lr-cosine-period = epoch_size` is the canonical SGDR setup.
 
 ## 6.2 Training target (`--lambda`)
 

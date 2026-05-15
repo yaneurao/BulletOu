@@ -93,7 +93,7 @@ checkpoints/my-halfkp/
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--batches-per-superbatch` | superbatch あたりの mini-batch 数 | ≈ 100M 局面 |
 | `--save-rate` | N superbatch ごとに save | 1 |
-| `--lr` / `--lr-gamma` / `--lr-step` | LR scheduler | 0.001 / 0.1 / 8 |
+| `--lr` / `--lr-schedule` / `--lr-gamma` / `--lr-step-positions` | LR スケジューラ (`step` または `cos`、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.001 / `step` / 0.9 / 100000000 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 
 loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。

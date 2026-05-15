@@ -126,7 +126,7 @@ KPPT/kpp,1,1,32,0.245,0.001,1.000,524288,teachers/
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
 | `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
-| `--lr` / `--lr-gamma` / `--lr-step` | StepLR スケジューラ | 0.001 / 0.1 / 8 |
+| `--lr` / `--lr-schedule` / `--lr-gamma` / `--lr-step-positions` | LR スケジューラ (`step` または `cos`、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.001 / `step` / 0.9 / 100000000 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
