@@ -3,9 +3,22 @@
 //! Used by the `bulletou` example to compute "value-sign agreement"
 //! accuracy after training: random-pick N positions from a test
 //! `.hcpe`, run them through the trained model, then for each one
-//! check whether the network's raw output and the teacher's
-//! centipawn score have the same sign (= both predict the side-to-
-//! move winning, or both predict losing).
+//! check whether the network's raw output and the actual **game
+//! result** (win/loss for the side to move) have the same sign.
+//!
+//! Game result (= the outcome of the game the position came from) is
+//! used rather than the teacher's centipawn score because the trainer's
+//! loss target is itself derived from the score: comparing the model's
+//! output sign against the score sign would mostly measure how well the
+//! model fits the teacher rather than how well it predicts wins. Sign
+//! agreement against the actual game result is harder and a more
+//! honest measure of value-network quality.
+//!
+//! Drawn games (`game_result == 0`) are excluded from the accuracy
+//! count because "win" / "loss" doesn't apply. Mate stamps (positions
+//! whose teacher score abs ≥ `score_drop_abs`) are also excluded so
+//! the accuracy and loss subsets stay consistent with the trainer's
+//! `score_drop_abs` filter.
 //!
 //! This is a pure-Rust module that does **no GPU work** — it only
 //! reads bytes, decodes them into `PackedSfenValue`, and computes the
@@ -22,21 +35,27 @@ use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
 /// Outcome of a sign-agreement validation pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AccuracyReport {
-    /// Number of positions actually compared (= sampled minus
-    /// `score_drop_abs`-filtered minus draws-in-teacher).
+    /// Number of positions actually used for the accuracy comparison
+    /// (= sampled minus `score_drop_abs`-filtered minus drawn games).
     pub compared: usize,
-    /// Of the compared positions, how many had matching sign.
+    /// Of the compared positions, how many had matching sign between
+    /// the model's output and the game result.
     pub sign_matches: usize,
-    /// Number of sampled positions whose teacher score was 0
-    /// (draw/stalemate sentinel) and were skipped from sign checks.
-    pub draws_in_teacher: usize,
+    /// Number of sampled positions whose game ended in a draw
+    /// (`game_result == 0`); skipped from accuracy because there is no
+    /// "winning side" to agree with. Still included in the loss subset.
+    pub drawn_games: usize,
     /// Number of sampled positions whose teacher score's absolute
     /// value was at or above the `score_drop_abs` threshold (mate
-    /// stamps) and were skipped.
+    /// stamps); excluded from BOTH accuracy and loss.
     pub filtered_by_score_cap: usize,
-    /// Mean test-set loss over the same `compared` subset as accuracy.
-    /// `None` when the caller didn't pass game results (= loss not
-    /// requested) or when `compared == 0`.
+    /// Number of positions used in the loss average (= sampled minus
+    /// `score_drop_abs`-filtered, **including** drawn games so the
+    /// metric is directly comparable to the trainer's training loss).
+    pub loss_sampled: usize,
+    /// Mean test-set loss over the `loss_sampled` subset. `None` when
+    /// the caller didn't pass game results (= loss not requested) or
+    /// when `loss_sampled == 0`.
     pub test_loss: Option<f32>,
 }
 
@@ -58,34 +77,38 @@ fn sigmoid(x: f32) -> f32 {
 /// `model_outputs[i]` is the raw network output for position `i`; its
 /// **sign** says which side the model prefers (positive = side-to-move
 /// winning, after the canonical `out.sigmoid().squared_error(tgt)`
-/// loss). `teacher_scores[i]` is the centipawn score from the test set,
-/// likewise sign-encodes the teacher's preference.
+/// loss). `teacher_results[i]` is the actual game outcome from the
+/// position's STM perspective: `+1` (STM won), `0` (draw), `-1` (STM
+/// lost).
 ///
-/// `score_drop_abs == Some(cap)` filters out positions with
-/// `|teacher_score| >= cap` (= mate stamps such as ±32000).
-/// `score_drop_abs == None` keeps all positions.
+/// **Accuracy subset**: positions with `score_drop_abs`-filtered or
+/// drawn (`teacher_results[i] == 0`) games are skipped. The remaining
+/// positions are compared sign-vs-sign: model output > 0 should agree
+/// with `teacher_results[i] > 0`. This measures how well the model
+/// predicts the actual winner of the game, not how well it mimics the
+/// teacher's score (which would be a much easier target).
 ///
-/// Positions whose teacher score is exactly `0` are also skipped (the
-/// "no opinion" case is undefined for sign agreement).
-///
-/// `test_loss` is set when the caller also passes parallel
-/// `teacher_results` (1=STM win, 0=draw, -1=STM loss) plus `lambda`
-/// and `eval_scale`. The formula matches the trainer's loss target
-/// (`bullet_lib::value::loader::DefaultDataLoader::prepare`):
+/// **Loss subset**: same as the trainer — `score_drop_abs`-filtered
+/// positions are skipped, drawn games are **kept**. The formula
+/// matches `bullet_lib::value::loader::DefaultDataLoader::prepare`:
 ///
 /// ```text
 ///   blend  = 1 - lambda
-///   target = blend * (result/2 + 0.5) + (1 - blend) * sigmoid(score / scale)
+///   result_norm = result == +1 ? 1.0 : result == -1 ? 0.0 : 0.5
+///   target = blend * result_norm + (1 - blend) * sigmoid(score / scale)
 ///   loss   = (sigmoid(model_out) - target)^2
 /// ```
 ///
-/// averaged over the same subset that accuracy uses (so the two
-/// metrics are directly comparable). `teacher_results[i]` is the i8
-/// game result from STM perspective: `+1` (STM win), `0` (draw),
-/// `-1` (STM loss).
+/// `score_drop_abs == Some(cap)` filters out positions with
+/// `|teacher_score| >= cap` (= mate stamps such as ±32000); these are
+/// excluded from BOTH accuracy and loss. `score_drop_abs == None`
+/// keeps all positions.
 ///
-/// When `teacher_results.is_empty()`, only accuracy is computed and
-/// `test_loss` stays `None`.
+/// When `teacher_results.is_empty()`, accuracy falls back to comparing
+/// model output sign vs `teacher_scores[i]` sign (the legacy "score
+/// agreement" metric, kept only so the unit tests can exercise the
+/// loop without mocking game results). Production callers always
+/// supply `teacher_results`.
 pub fn compute_sign_accuracy(
     model_outputs: &[f32],
     teacher_scores: &[i16],
@@ -99,8 +122,8 @@ pub fn compute_sign_accuracy(
         teacher_scores.len(),
         "model_outputs and teacher_scores length mismatch"
     );
-    let want_loss = !teacher_results.is_empty();
-    if want_loss {
+    let have_results = !teacher_results.is_empty();
+    if have_results {
         assert_eq!(
             model_outputs.len(),
             teacher_results.len(),
@@ -118,23 +141,33 @@ pub fn compute_sign_accuracy(
                 continue;
             }
         }
-        if s == 0 {
-            report.draws_in_teacher += 1;
-            continue;
-        }
-        report.compared += 1;
-        // Both signs positive or both negative → match.
+        // Accuracy: sign(model) vs sign(game_result), skipping draws.
+        // When teacher_results is empty (test-only path), fall back to
+        // sign(score) so the function still reports a number.
         let model_sign_positive = *m > 0.0;
-        let teacher_sign_positive = s > 0;
-        if model_sign_positive == teacher_sign_positive {
-            report.sign_matches += 1;
+        if have_results {
+            let r = teacher_results[i];
+            if r == 0 {
+                report.drawn_games += 1;
+            } else {
+                report.compared += 1;
+                let result_sign_positive = r > 0;
+                if model_sign_positive == result_sign_positive {
+                    report.sign_matches += 1;
+                }
+            }
+        } else if s == 0 {
+            report.drawn_games += 1;
+        } else {
+            report.compared += 1;
+            if model_sign_positive == (s > 0) {
+                report.sign_matches += 1;
+            }
         }
-        if want_loss {
-            // Mirror DefaultDataLoader::prepare's target formula:
-            //   target = blend * result_norm + (1 - blend) * sigmoid(s / scale)
-            // result is i8 with -1/0/+1 from STM perspective; the trainer
-            // maps it to {0.0, 0.5, 1.0} via `(result_idx) / 2` where
-            // result_idx is 0=Loss / 1=Draw / 2=Win.
+        // Loss: include drawn games (matches the trainer's loss
+        // averaging), exclude only mate stamps (already `continue`d
+        // above).
+        if have_results {
             let result_norm = match teacher_results[i].signum() {
                 1 => 1.0,
                 -1 => 0.0,
@@ -145,10 +178,11 @@ pub fn compute_sign_accuracy(
             let model_p = sigmoid(*m);
             let diff = model_p - target;
             loss_sum += diff * diff;
+            report.loss_sampled += 1;
         }
     }
-    if want_loss && report.compared > 0 {
-        report.test_loss = Some(loss_sum / report.compared as f32);
+    if have_results && report.loss_sampled > 0 {
+        report.test_loss = Some(loss_sum / report.loss_sampled as f32);
     }
     report
 }
@@ -280,13 +314,33 @@ mod tests {
     }
 
     #[test]
-    fn accuracy_skips_teacher_draws() {
+    fn accuracy_skips_drawn_games() {
+        // game_result-driven path: positions whose game ended in a
+        // draw are skipped from accuracy regardless of their score.
+        let m = [0.5, 0.3, 1.2];
+        let t = [200i16, -150, 800];
+        let game = [1i8, 0, 0]; // first decisive (STM win), other two drawn
+        let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
+        assert_eq!(r.compared, 1, "two drawn games skipped from accuracy");
+        assert_eq!(r.sign_matches, 1, "model output > 0 agrees with STM win");
+        assert_eq!(r.drawn_games, 2);
+        // Loss is still computed across all 3 (draws contribute too).
+        assert_eq!(r.loss_sampled, 3);
+        assert!(r.test_loss.is_some(), "loss should be computed when results provided");
+    }
+
+    #[test]
+    fn accuracy_falls_back_to_score_sign_when_no_results() {
+        // Legacy path (no teacher_results): the function falls back to
+        // comparing model sign vs teacher score sign and skipping
+        // score==0 positions. Used only in unit tests.
         let m = [0.5, 0.3, 1.2];
         let t = [200i16, 0, 0];
         let r = compute_sign_accuracy(&m, &t, &[], None, 1.0, 400.0);
         assert_eq!(r.compared, 1, "two zero-score positions skipped");
         assert_eq!(r.sign_matches, 1);
-        assert_eq!(r.draws_in_teacher, 2);
+        assert_eq!(r.drawn_games, 2);
+        assert_eq!(r.loss_sampled, 0, "no results → no loss");
     }
 
     #[test]
@@ -297,7 +351,7 @@ mod tests {
         assert_eq!(r.compared, 2);
         assert_eq!(r.sign_matches, 2);
         assert_eq!(r.filtered_by_score_cap, 2);
-        assert_eq!(r.draws_in_teacher, 0);
+        assert_eq!(r.drawn_games, 0);
     }
 
     #[test]

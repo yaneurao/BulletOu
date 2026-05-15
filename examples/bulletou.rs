@@ -1849,13 +1849,14 @@ fn run_one_test_pass(
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
     eprintln!(
-        "  test: accuracy={:.4}% ({}/{}, draws={}, mate={}), loss={:.6}",
+        "  test: accuracy={:.4}% ({}/{} decisive, draws={}, mate={}), loss={:.6} (n={})",
         accuracy * 100.0,
         report.sign_matches,
         report.compared,
-        report.draws_in_teacher,
+        report.drawn_games,
         report.filtered_by_score_cap,
         loss,
+        report.loss_sampled,
     );
     TestMetrics { accuracy, loss }
 }
