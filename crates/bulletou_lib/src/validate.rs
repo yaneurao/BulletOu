@@ -34,6 +34,10 @@ pub struct AccuracyReport {
     /// value was at or above the `score_drop_abs` threshold (mate
     /// stamps) and were skipped.
     pub filtered_by_score_cap: usize,
+    /// Mean test-set loss over the same `compared` subset as accuracy.
+    /// `None` when the caller didn't pass game results (= loss not
+    /// requested) or when `compared == 0`.
+    pub test_loss: Option<f32>,
 }
 
 impl AccuracyReport {
@@ -43,7 +47,13 @@ impl AccuracyReport {
     }
 }
 
-/// Compute sign-agreement accuracy from parallel arrays.
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Compute sign-agreement accuracy AND the matching test-set loss
+/// from parallel arrays.
 ///
 /// `model_outputs[i]` is the raw network output for position `i`; its
 /// **sign** says which side the model prefers (positive = side-to-move
@@ -57,18 +67,51 @@ impl AccuracyReport {
 ///
 /// Positions whose teacher score is exactly `0` are also skipped (the
 /// "no opinion" case is undefined for sign agreement).
+///
+/// `test_loss` is set when the caller also passes parallel
+/// `teacher_results` (1=STM win, 0=draw, -1=STM loss) plus `lambda`
+/// and `eval_scale`. The formula matches the trainer's loss target
+/// (`bullet_lib::value::loader::DefaultDataLoader::prepare`):
+///
+/// ```text
+///   blend  = 1 - lambda
+///   target = blend * (result/2 + 0.5) + (1 - blend) * sigmoid(score / scale)
+///   loss   = (sigmoid(model_out) - target)^2
+/// ```
+///
+/// averaged over the same subset that accuracy uses (so the two
+/// metrics are directly comparable). `teacher_results[i]` is the i8
+/// game result from STM perspective: `+1` (STM win), `0` (draw),
+/// `-1` (STM loss).
+///
+/// When `teacher_results.is_empty()`, only accuracy is computed and
+/// `test_loss` stays `None`.
 pub fn compute_sign_accuracy(
     model_outputs: &[f32],
     teacher_scores: &[i16],
+    teacher_results: &[i8],
     score_drop_abs: Option<u16>,
+    lambda: f32,
+    eval_scale: f32,
 ) -> AccuracyReport {
     assert_eq!(
         model_outputs.len(),
         teacher_scores.len(),
         "model_outputs and teacher_scores length mismatch"
     );
+    let want_loss = !teacher_results.is_empty();
+    if want_loss {
+        assert_eq!(
+            model_outputs.len(),
+            teacher_results.len(),
+            "model_outputs and teacher_results length mismatch"
+        );
+    }
     let mut report = AccuracyReport::default();
-    for (m, &s) in model_outputs.iter().zip(teacher_scores.iter()) {
+    let blend = 1.0 - lambda;
+    let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
+    let mut loss_sum = 0.0f32;
+    for (i, (m, &s)) in model_outputs.iter().zip(teacher_scores.iter()).enumerate() {
         if let Some(cap) = score_drop_abs {
             if s.unsigned_abs() >= cap {
                 report.filtered_by_score_cap += 1;
@@ -86,6 +129,26 @@ pub fn compute_sign_accuracy(
         if model_sign_positive == teacher_sign_positive {
             report.sign_matches += 1;
         }
+        if want_loss {
+            // Mirror DefaultDataLoader::prepare's target formula:
+            //   target = blend * result_norm + (1 - blend) * sigmoid(s / scale)
+            // result is i8 with -1/0/+1 from STM perspective; the trainer
+            // maps it to {0.0, 0.5, 1.0} via `(result_idx) / 2` where
+            // result_idx is 0=Loss / 1=Draw / 2=Win.
+            let result_norm = match teacher_results[i].signum() {
+                1 => 1.0,
+                -1 => 0.0,
+                _ => 0.5,
+            };
+            let score_norm = sigmoid(inv_scale * f32::from(s));
+            let target = blend * result_norm + (1.0 - blend) * score_norm;
+            let model_p = sigmoid(*m);
+            let diff = model_p - target;
+            loss_sum += diff * diff;
+        }
+    }
+    if want_loss && report.compared > 0 {
+        report.test_loss = Some(loss_sum / report.compared as f32);
     }
     report
 }
@@ -198,10 +261,11 @@ mod tests {
     fn accuracy_all_match() {
         let m = [0.5, -0.3, 1.2, -0.01];
         let t = [200i16, -150, 800, -10];
-        let r = compute_sign_accuracy(&m, &t, None);
+        let r = compute_sign_accuracy(&m, &t, &[], None, 1.0, 400.0);
         assert_eq!(r.compared, 4);
         assert_eq!(r.sign_matches, 4);
         assert!((r.accuracy() - 1.0).abs() < 1e-6);
+        assert_eq!(r.test_loss, None, "no results → no loss");
     }
 
     #[test]
@@ -209,7 +273,7 @@ mod tests {
         let m = [0.5, -0.3, 1.2, -0.01];
         // first 2 match, last 2 flipped
         let t = [200i16, -150, -800, 10];
-        let r = compute_sign_accuracy(&m, &t, None);
+        let r = compute_sign_accuracy(&m, &t, &[], None, 1.0, 400.0);
         assert_eq!(r.compared, 4);
         assert_eq!(r.sign_matches, 2);
         assert!((r.accuracy() - 0.5).abs() < 1e-6);
@@ -219,7 +283,7 @@ mod tests {
     fn accuracy_skips_teacher_draws() {
         let m = [0.5, 0.3, 1.2];
         let t = [200i16, 0, 0];
-        let r = compute_sign_accuracy(&m, &t, None);
+        let r = compute_sign_accuracy(&m, &t, &[], None, 1.0, 400.0);
         assert_eq!(r.compared, 1, "two zero-score positions skipped");
         assert_eq!(r.sign_matches, 1);
         assert_eq!(r.draws_in_teacher, 2);
@@ -229,7 +293,7 @@ mod tests {
     fn accuracy_score_drop_filters_mate_stamps() {
         let m = [0.5, 0.3, 1.2, -0.5];
         let t = [200i16, 32000, -32000, -10];
-        let r = compute_sign_accuracy(&m, &t, Some(32000));
+        let r = compute_sign_accuracy(&m, &t, &[], Some(32000), 1.0, 400.0);
         assert_eq!(r.compared, 2);
         assert_eq!(r.sign_matches, 2);
         assert_eq!(r.filtered_by_score_cap, 2);
@@ -238,9 +302,37 @@ mod tests {
 
     #[test]
     fn accuracy_zero_when_empty() {
-        let r = compute_sign_accuracy(&[], &[], None);
+        let r = compute_sign_accuracy(&[], &[], &[], None, 1.0, 400.0);
         assert_eq!(r.compared, 0);
         assert!(r.accuracy().is_nan());
+        assert_eq!(r.test_loss, None);
+    }
+
+    #[test]
+    fn test_loss_pure_eval_target() {
+        // lambda=1.0, blend=0 → target = sigmoid(score/scale) only
+        let m = [0.0, 0.0]; // sigmoid(0) = 0.5
+        let t = [400i16, -400]; // sigmoid(±1) ≈ 0.731 / 0.269
+        let r = compute_sign_accuracy(&m, &t, &[1, -1], None, 1.0, 400.0);
+        assert_eq!(r.compared, 2);
+        let loss = r.test_loss.expect("loss requested");
+        // expected: ((0.5 - 0.731)^2 + (0.5 - 0.269)^2) / 2 ≈ 0.0533
+        assert!((loss - 0.0533).abs() < 1e-3, "loss={loss}");
+    }
+
+    #[test]
+    fn test_loss_pure_wdl_target() {
+        // lambda=0.0, blend=1 → target = result/2 mapping (Win=1, Loss=0, Draw=0.5)
+        let m = [0.0, 0.0, 0.0]; // sigmoid(0) = 0.5
+        // results: +1 (win), -1 (loss), 0 (draw)
+        let r = compute_sign_accuracy(&m, &[100i16, -100, 100], &[1, -1, 0], None, 0.0, 400.0);
+        // draw position has teacher_score=100 (not 0) so accuracy still includes it,
+        // but here we just check loss.
+        // Targets: 1.0, 0.0, 0.5
+        // Losses:  0.25, 0.25, 0.0
+        // Mean: 0.1667
+        let loss = r.test_loss.expect("loss requested");
+        assert!((loss - 0.1666666).abs() < 1e-3, "loss={loss}");
     }
 
     #[test]

@@ -63,7 +63,7 @@ use bulletou_lib::{
     game::outputs::ShogiLayerStackBucket9,
     nn::{Affine, InitSettings, Shape, optimiser},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
-    validate::{AccuracyReport, compute_sign_accuracy, read_random_hcpe_positions},
+    validate::{compute_sign_accuracy, read_random_hcpe_positions},
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
@@ -512,37 +512,37 @@ struct Args {
     layerstack: LayerStackMode,
 
     /// Held-out test set (.hcpe only) for sign-agreement validation
-    /// after training. When set, the trainer pulls
-    /// `--validate-positions` random positions from this file, runs
-    /// them through the trained model, and reports the fraction whose
-    /// raw network output and the teacher centipawn score share the
-    /// same sign (= both predict side-to-move winning, or both predict
-    /// losing). Result is printed to stderr and appended to
-    /// `<output>/validate.log`. Positions whose teacher score is 0
-    /// (draw stamp) or `|score| >= --score-drop-abs` (mate stamp) are
-    /// excluded from the accuracy denominator.
+    /// during training. When set, the trainer runs validation after
+    /// each save event (= every `--save-rate` superbatches): random-
+    /// picks `--test-positions` positions from this file, runs them
+    /// through the model, and emits per-superbatch
+    /// `test_value_accuracy` and `test_value_loss` columns into
+    /// `learn.log`. Positions whose teacher score is 0 (draw stamp)
+    /// or `|score| >= --score-drop-abs` (mate stamp) are excluded
+    /// from both metrics.
     ///
     /// Only NNUE / SFNN eval types are supported (the network's raw
     /// output is a single scalar). KPPT family is skipped.
     #[arg(long)]
-    validate_teacher: Option<PathBuf>,
+    test_teacher: Option<PathBuf>,
 
-    /// Number of positions to sample from `--validate-teacher` for the
-    /// accuracy report.
+    /// Number of positions to sample from `--test-teacher` per save
+    /// event.
     #[arg(long, default_value = "100000")]
-    validate_positions: usize,
+    test_positions: usize,
 
     /// GPU batch size for the validation forward pass. Larger is faster
     /// but uses more VRAM. Independent of `--batch-size` (which
     /// controls training).
     #[arg(long, default_value = "1024")]
-    validate_batch_size: usize,
+    test_batch_size: usize,
 
-    /// Seed for the random sampler in `--validate-teacher`. `0`
+    /// Seed for the random sampler in `--test-teacher`. `0`
     /// (default) means "use a time-based seed" (= different sample
-    /// each run). Pass any non-zero value for a reproducible sample.
+    /// each save event). Pass any non-zero value for a reproducible
+    /// sample (same positions every time).
     #[arg(long, default_value = "0")]
-    validate_seed: u64,
+    test_seed: u64,
 }
 
 impl Args {
@@ -786,11 +786,11 @@ fn run_kppt_all(args: &Args) {
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str =
-    "eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher";
+    "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
-/// 9-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
+/// 11-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
@@ -861,18 +861,40 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Per-superbatch validation result attached to a single save dir's
+/// enriched `learn.log`. When `Some`, every row of that dir gets the
+/// same `test_value_accuracy` / `test_value_loss` (validation runs once
+/// per save event, so all rows in one save share the same metric).
+/// When `None`, both columns are emitted as `-`.
+#[derive(Clone, Copy, Debug)]
+struct TestMetrics {
+    accuracy: f32,
+    loss: f32,
+}
+
 /// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
-/// per line) into the enriched 9-column CSV body (no header). The header
+/// per line) into the enriched 11-column CSV body (no header). The header
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
 /// body can be concatenated under a single header by `assemble_numbered_dirs`.
+///
+/// The `train_value_loss` column carries bullet's loss (= the third field
+/// of `log.txt`, which is the running average of training-loss over the
+/// last 32 batches). `test_value_accuracy` and `test_value_loss` are the
+/// per-superbatch held-out validation result from `--test-teacher`; both
+/// are `-` when the caller passes `test_metrics = None`.
 fn enrich_bullet_log_to_csv(
     raw: &str,
     ctx: &LogContext,
     epoch: usize,
     component: &str,
     position_offset: usize,
+    test_metrics: Option<TestMetrics>,
 ) -> String {
     let mut out = String::new();
+    let (test_acc_field, test_loss_field): (String, String) = match test_metrics {
+        Some(m) => (format!("{:.6}", m.accuracy), format!("{:.6}", m.loss)),
+        None => ("-".to_string(), "-".to_string()),
+    };
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -884,7 +906,7 @@ fn enrich_bullet_log_to_csv(
         }
         let Ok(sb) = parts[0].parse::<usize>() else { continue };
         let Ok(b) = parts[1].parse::<usize>() else { continue };
-        let loss = parts[2];
+        let train_loss = parts[2];
         let lr = ctx.lr_at(sb);
         let positions = ctx.positions_at(sb, b, position_offset);
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
@@ -902,8 +924,11 @@ fn enrich_bullet_log_to_csv(
             std::borrow::Cow::Owned(format!("{}/{}", head, component))
         };
         out.push_str(&format!(
-            "{eval},{epoch},{sb},{b},{loss},{lr},{lambda:.3},{positions},{teacher}\n",
+            "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr},{lambda:.3},{positions},{teacher}\n",
             eval = eval_field,
+            ta = test_acc_field,
+            tl = test_loss_field,
+            train = train_loss,
             lambda = ctx.lambda,
             teacher = ctx.teacher_csv,
         ));
@@ -917,13 +942,15 @@ fn enrich_bullet_log_to_csv(
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
-/// The parser uses `splitn(9, ',')` so any commas inside the trailing
+/// The parser uses `splitn(11, ',')` so any commas inside the trailing
 /// `teacher` field (e.g. a comma-separated teacher list) don't disturb
-/// the first 8 columns. Component is extracted from the `eval` column at
-/// index 0: a slash-suffix (e.g. `KPPT/kk`) names the component
+/// the first 10 columns. Component is extracted from the `eval` column
+/// at index 0: a slash-suffix (e.g. `KPPT/kk`) names the component
 /// explicitly; absence of a slash means a single-component NNUE eval
 /// type, which maps to the `"nnue"` component key. The `positions`
-/// column is at index 7 in the 9-column layout.
+/// column is at index 9 in the 11-column layout
+/// (eval, epoch, superbatch, curr_batch, test_value_accuracy,
+/// test_value_loss, train_value_loss, lr, lambda, **positions**, teacher).
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
@@ -932,13 +959,13 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(9, ',').collect();
-        if parts.len() < 8 {
+        let parts: Vec<&str> = line.splitn(11, ',').collect();
+        if parts.len() < 10 {
             continue;
         }
         let eval = parts[0];
         let component = eval.split_once('/').map(|(_, c)| c).unwrap_or("nnue");
-        let Ok(positions) = parts[7].parse::<usize>() else { continue };
+        let Ok(positions) = parts[9].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {
             *entry = positions;
@@ -969,11 +996,12 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     let n = latest_idx?;
     let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
     let content = std::fs::read_to_string(&learn_log).ok()?;
-    // 9-column rows: eval, epoch, sb, batch, loss, lr, lambda, positions, teacher.
-    // sb is at column index 2. All rows in a single per-superbatch dir share the
-    // same sb (bullet flushes log.txt at save time and the dir captures one save
-    // event), so taking the max is robust whether the schedule is save_rate=1
-    // or larger.
+    // 11-column rows: eval, epoch, sb, batch, test_value_accuracy,
+    // test_value_loss, train_value_loss, lr, lambda, positions, teacher.
+    // sb is at column index 2. All rows in a single per-save dir share the
+    // same sb (bullet flushes log.txt at save time and the dir captures one
+    // save event), so taking the max is robust whether the schedule is
+    // save_rate=1 or larger.
     let mut max_sb: Option<usize> = None;
     for line in content.lines() {
         let line = line.trim();
@@ -991,16 +1019,54 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
 }
 
 /// Append the body of the latest save dir's `learn.log` (already enriched
-/// 7-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
+/// 11-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
 /// the top-level `<output>/learn.log`, writing the CSV header on first
 /// file creation. The result is a single pure CSV — no section headers,
 /// no separators — that pandas / Excel can load directly.
+///
+/// If the existing top-level `learn.log` was written by an older version
+/// of `bulletou` (= a different header line than the current
+/// [`LEARN_LOG_HEADER`]), this returns `InvalidData` so the caller can
+/// alert the user to clear the old file rather than silently mixing
+/// schemas in the same CSV.
 fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std::io::Result<()> {
     use std::io::Write;
     let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
     let top = output_dir.join("learn.log");
     let top_existed = top.is_file();
+
+    // Detect schema mismatch on existing file. The existing file is
+    // assumed to start with a header line followed by data rows. If the
+    // header doesn't match, refuse to mix formats.
+    if top_existed {
+        let mut head_buf = String::new();
+        if let Ok(mut f) = std::fs::File::open(&top) {
+            use std::io::Read as _;
+            // Header is at most ~200 bytes; reading 1KB is plenty.
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = f.read(&mut buf) {
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    if let Some(first_line) = s.lines().next() {
+                        head_buf = first_line.to_string();
+                    }
+                }
+            }
+        }
+        if !head_buf.is_empty() && head_buf != LEARN_LOG_HEADER {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: existing learn.log header has a different schema than this build expects.\n  \
+                     existing: {head_buf}\n  expected: {LEARN_LOG_HEADER}\n  \
+                     This build added/changed columns (e.g. test_value_accuracy / test_value_loss).\n  \
+                     Rename or delete the old file (and the per-dir <NNNN>/learn.log if you want a clean restart) and re-run.",
+                    top.display()
+                ),
+            ));
+        }
+    }
+
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
     let body_no_header = body
         .strip_prefix(LEARN_LOG_HEADER)
@@ -1136,7 +1202,10 @@ fn assemble_numbered_dirs(
             ("kpp", *kpp_epoch, kpp_dir, prior_kpp),
         ] {
             let raw = std::fs::read_to_string(dir.join("log.txt")).unwrap_or_default();
-            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior));
+            // KPPT family does not run --test-teacher validation (out tensor
+            // shape doesn't match the single-scalar assumption); always emit
+            // `-` for the test_value_* columns by passing None.
+            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior, None));
         }
         std::fs::write(dst.join("learn.log"), log_buf)?;
         eprintln!("  -> {}/", dst.display());
@@ -1476,139 +1545,76 @@ fn convert_save_dir_to_nnue_layout(dir: &std::path::Path) -> std::io::Result<()>
     Ok(())
 }
 
-/// Inline training loop for single-component NNUE eval types. Same shape as
-/// `run_training_inline!` (epoch loop, `--max-epochs`, EOF-as-epoch boundary,
-/// fallback save when no superbatch completes, in-memory loss record
-/// CSV header for `<output>/validate.log`. One row appended per
-/// `--validate-teacher` invocation. The columns are: ISO-8601 UTC
-/// timestamp; eval-type CLI name; arch CLI name (empty for KPPT);
-/// teacher path; positions sampled; sampler seed (`0` = time-based);
-/// `score_drop_abs` cap (`0` = disabled); `compared` (= positions
-/// included in accuracy denominator); `sign_matches` (= numerator);
-/// `accuracy` (= matches/compared, `nan` when compared is 0);
-/// `draws_in_teacher` (= teacher score == 0, excluded);
-/// `filtered_by_score_cap` (= |score| >= cap, excluded).
-const VALIDATE_LOG_HEADER: &str = "timestamp,eval,arch,teacher,sampled,seed,score_drop_abs,compared,sign_matches,accuracy,draws_in_teacher,filtered_by_score_cap";
+/// Cache of test-set positions used for per-save validation. Loaded
+/// once at the start of training (when `--test-teacher` is set) and
+/// reused for every subsequent validation forward pass — the random
+/// sampling happens once at load time, not on each save.
+struct TestPositionsCache {
+    positions: Vec<bulletou_lib::shogi::PackedSfenValue>,
+    teacher_scores: Vec<i16>,
+    teacher_results: Vec<i8>,
+}
 
-/// Append one validation row to `<output>/validate.log` (writing the
-/// CSV header on first creation) and pretty-print the result to
-/// stderr.
-fn print_and_save_validation_report(
-    args: &Args,
-    output_dir: &std::path::Path,
-    teacher_path: &str,
-    sampled: usize,
-    decoded: usize,
-    report: &AccuracyReport,
-) {
-    let arch_text = if args.eval_type.uses_arch() { args.arch.cli_name() } else { String::new() };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    eprintln!();
-    eprintln!("=== validation report ===");
-    eprintln!("  positions sampled    : {sampled}");
-    eprintln!("  positions decoded    : {decoded}{}",
-        if decoded < sampled { format!(" ({} invalid records skipped)", sampled - decoded) } else { String::new() });
-    eprintln!("  excluded (mate cap)  : {} (score_drop_abs={})",
-        report.filtered_by_score_cap, args.score_drop_abs);
-    eprintln!("  excluded (draw)      : {} (teacher score == 0)", report.draws_in_teacher);
-    eprintln!("  compared             : {}", report.compared);
-    eprintln!("  sign matches         : {}", report.sign_matches);
-    eprintln!("  ----------------------------------------");
-    if report.compared == 0 {
-        eprintln!("  ACCURACY             : N/A (no positions compared)");
-    } else {
-        eprintln!("  ACCURACY             : {:.4}% ({}/{})",
-            report.accuracy() * 100.0, report.sign_matches, report.compared);
-    }
-    eprintln!("  ----------------------------------------");
-
-    use std::io::Write;
-    let log_path = output_dir.join("validate.log");
-    let log_existed = log_path.is_file();
-    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(mut f) => {
-            if !log_existed {
-                let _ = writeln!(f, "{VALIDATE_LOG_HEADER}");
+impl TestPositionsCache {
+    /// `args.test_teacher` is `Some` and we successfully sampled
+    /// positions: `Some(cache)`. Otherwise `None` (= no validation).
+    fn try_load(args: &Args) -> Option<Self> {
+        let test_path = args.test_teacher.as_ref()?;
+        let path = match test_path.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!("  WARN: --test-teacher path is not valid UTF-8, skipping validation");
+                return None;
             }
-            let acc_str = if report.compared == 0 {
-                "nan".to_string()
-            } else {
-                format!("{:.6}", report.accuracy())
-            };
-            let teacher_csv = csv_escape(teacher_path);
-            if let Err(e) = writeln!(
-                f,
-                "{ts},{eval},{arch},{teacher},{sampled},{seed},{cap},{cmp},{matches},{acc},{draws},{filt}",
-                ts = timestamp,
-                eval = args.eval_type.cli_name(),
-                arch = arch_text,
-                teacher = teacher_csv,
-                sampled = sampled,
-                seed = args.validate_seed,
-                cap = args.score_drop_abs,
-                cmp = report.compared,
-                matches = report.sign_matches,
-                acc = acc_str,
-                draws = report.draws_in_teacher,
-                filt = report.filtered_by_score_cap,
-            ) {
-                eprintln!("  WARN: failed to write {}: {e}", log_path.display());
-            } else {
-                eprintln!("  appended to: {}", log_path.display());
+        };
+        eprintln!(
+            "  loading {} test positions from {} (seed={}) for per-superbatch validation...",
+            args.test_positions, path, args.test_seed
+        );
+        match read_random_hcpe_positions(&path, args.test_positions, args.test_seed) {
+            Ok(positions) => {
+                let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+                let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
+                eprintln!("  ...{} test positions ready", positions.len());
+                Some(Self { positions, teacher_scores, teacher_results })
             }
-        }
-        Err(e) => {
-            eprintln!("  WARN: failed to open {}: {e}", log_path.display());
+            Err(e) => {
+                eprintln!("  WARN: failed to read --test-teacher {path}: {e}; per-superbatch validation disabled");
+                None
+            }
         }
     }
 }
 
-/// `--validate-teacher <path>` 後処理: random-pick → forward → 符号
-/// 一致 accuracy 計算 → stdout + `<output>/validate.log` に出力。
-/// NNUE / SFNN の `run_*` 関数の末尾で `&mut trainer` を渡して呼ぶ。
-/// `--validate-teacher` 未指定なら何もしない。
-macro_rules! run_validation_inline_nnue {
-    ($args:expr, $trainer:expr) => {{
-        let args: &Args = $args;
-        if let Some(test_path) = args.validate_teacher.as_ref() {
-            if let Some(test_path_str) = test_path.to_str() {
-                eprintln!(
-                    "\n=== validation: sampling up to {} positions from {} (seed={}) ===",
-                    args.validate_positions, test_path_str, args.validate_seed
-                );
-                match read_random_hcpe_positions(test_path_str, args.validate_positions, args.validate_seed) {
-                    Ok(positions) => {
-                        let decoded = positions.len();
-                        eprintln!(
-                            "  decoded {decoded} positions, running forward pass (batch={})...",
-                            args.validate_batch_size
-                        );
-                        let outputs = $trainer.eval_packed_batch(&positions, args.validate_batch_size);
-                        let scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
-                        let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
-                        let report = compute_sign_accuracy(&outputs, &scores, cap);
-                        print_and_save_validation_report(
-                            args,
-                            &args.output_dir(),
-                            test_path_str,
-                            args.validate_positions,
-                            decoded,
-                            &report,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("  WARN: failed to read validation set {test_path_str}: {e}");
-                    }
-                }
-            } else {
-                eprintln!("  WARN: --validate-teacher path is not valid UTF-8, skipping validation");
-            }
-        }
-    }};
+/// Run validation on the cached test positions and produce per-save
+/// `TestMetrics`. Caller must already hold `&mut trainer` (= called
+/// outside `trainer.run`).
+fn run_one_test_pass(
+    cache: &TestPositionsCache,
+    args: &Args,
+    trainer_outputs: Vec<f32>,
+) -> TestMetrics {
+    let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
+    let report = compute_sign_accuracy(
+        &trainer_outputs,
+        &cache.teacher_scores,
+        &cache.teacher_results,
+        cap,
+        args.lambda,
+        args.scale as f32,
+    );
+    let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
+    let loss = report.test_loss.unwrap_or(f32::NAN);
+    eprintln!(
+        "  test: accuracy={:.4}% ({}/{}, draws={}, mate={}), loss={:.6}",
+        accuracy * 100.0,
+        report.sign_matches,
+        report.compared,
+        report.draws_in_teacher,
+        report.filtered_by_score_cap,
+        loss,
+    );
+    TestMetrics { accuracy, loss }
 }
 
 /// returned by `trainer.run`), but with NNUE-specific save handling:
@@ -1680,11 +1686,18 @@ macro_rules! run_training_inline_nnue {
             }
         }
 
-        // Per-superbatch incremental finalize: rename `<net_id>-<sb>` →
-        // `<NNNN>/`, generate per-dir `learn.log`, append to top-level
-        // `learn.log` — done inside `on_checkpoint_saved` so that killing
-        // training mid-run still leaves a clean numbered layout and a
-        // resumable top-level log.
+        // Per-save validation cache: load test positions ONCE up front
+        // (random-pick happens here), then reuse the same positions for
+        // every save event. `None` if --test-teacher unset or load failed.
+        let test_cache = TestPositionsCache::try_load(args);
+
+        // Per-save incremental finalize: rename `<net_id>-<sb>` →
+        // `<NNNN>/`, generate per-dir `learn.log` (with per-save test
+        // metrics), append to top-level `learn.log`. Done OUTSIDE
+        // `trainer.run` (= once per save chunk) so we can call
+        // `trainer.eval_packed_batch` for validation between chunks.
+        // Killing training mid-run still leaves a clean numbered layout
+        // and a resumable top-level log.
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
@@ -1697,51 +1710,112 @@ macro_rules! run_training_inline_nnue {
             };
             last_net_id_for_epoch = net_id_for_epoch.clone();
 
-            let schedule = TrainingSchedule {
-                net_id: net_id_for_epoch.clone(),
-                eval_scale: args.scale as f32,
-                steps: TrainingSteps {
-                    batch_size: args.batch_size,
-                    batches_per_superbatch,
-                    // Auto-resumed sb (or user-provided override) from the
-                    // pre-loop computation above. Same value across epochs
-                    // because the LR schedule is global, not per-epoch.
-                    start_superbatch: effective_start_superbatch,
-                    end_superbatch,
-                },
-                wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
-                save_rate: args.save_rate,
-            };
+            // Run the epoch in chunks of `save_rate` superbatches. Each
+            // chunk ends at a save boundary, after which we validate (if
+            // requested) and finalise the saved dir with the test metrics.
+            let mut chunk_start = effective_start_superbatch;
+            let chunk_size = args.save_rate.max(1);
+            'epoch: loop {
+                if chunk_start > end_superbatch { break; }
+                let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
 
-            let net_id_for_cb = net_id_for_epoch.clone();
-            let output_dir_for_cb = output_dir_buf.clone();
-            let saved_any_ref = &saved_any;
-            let cb_ctx_ref = &cb_ctx;
-            let cb_next_idx_ref = &cb_next_idx;
-            let on_checkpoint_saved = move |superbatch: usize| {
-                saved_any_ref.set(true);
-                let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
-                if let Err(e) = convert_save_dir_to_nnue_layout(&ckpt_dir) {
-                    eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display());
-                    return;
-                }
-                eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display());
-                let idx = cb_next_idx_ref.get();
+                let schedule = TrainingSchedule {
+                    net_id: net_id_for_epoch.clone(),
+                    eval_scale: args.scale as f32,
+                    steps: TrainingSteps {
+                        batch_size: args.batch_size,
+                        batches_per_superbatch,
+                        start_superbatch: chunk_start,
+                        end_superbatch: chunk_end,
+                    },
+                    wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
+                    lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                    save_rate: args.save_rate,
+                };
+
+                // Per-chunk callback only records that the save happened
+                // (no in-callback finalize). The actual rename + enrich
+                // runs outside `trainer.run` so it can take per-save test
+                // metrics computed via `trainer.eval_packed_batch`.
+                let net_id_for_cb = net_id_for_epoch.clone();
+                let output_dir_for_cb = output_dir_buf.clone();
+                let saved_any_ref = &saved_any;
+                let saved_dir_in_chunk: std::cell::RefCell<Option<std::path::PathBuf>> =
+                    std::cell::RefCell::new(None);
+                let saved_dir_ref = &saved_dir_in_chunk;
+                let on_checkpoint_saved = move |superbatch: usize| {
+                    saved_any_ref.set(true);
+                    let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
+                    if let Err(e) = convert_save_dir_to_nnue_layout(&ckpt_dir) {
+                        eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display());
+                        return;
+                    }
+                    eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display());
+                    *saved_dir_ref.borrow_mut() = Some(ckpt_dir);
+                };
+
+                let settings = LocalSettings {
+                    threads: args.threads,
+                    test_set: None,
+                    output_directory: output_dir,
+                    batch_queue_size: args.batch_queue_size,
+                    on_checkpoint_saved: Some(&on_checkpoint_saved),
+                };
+
+                last_error_record = match format {
+                    DataFormat::Hcpe => {
+                        let loader =
+                            HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                        trainer.run(&schedule, &settings, &loader)
+                    }
+                    DataFormat::Hcpe3 => {
+                        let loader =
+                            Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                        trainer.run(&schedule, &settings, &loader)
+                    }
+                    DataFormat::Pack => {
+                        let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                            .with_single_epoch(true);
+                        trainer.run(&schedule, &settings, &loader)
+                    }
+                    DataFormat::Psv => {
+                        let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                        trainer.run(&schedule, &settings, &loader)
+                    }
+                };
+
+                // Closure dropped → its borrow of saved_dir_in_chunk released.
+                let saved_ckpt_dir = saved_dir_in_chunk.into_inner();
+                let Some(ckpt_dir) = saved_ckpt_dir else {
+                    // Save did not fire in this chunk → either EOF before
+                    // crossing the save boundary, or chunk_size > available
+                    // remaining sb. Either way the epoch is over.
+                    break 'epoch;
+                };
+
+                // Per-save validation (if --test-teacher cached positions).
+                let test_metrics = test_cache.as_ref().map(|cache| {
+                    let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
+                    run_one_test_pass(cache, args, outputs)
+                });
+
+                // Finalise this saved dir into <NNNN>/ with the test metrics.
+                let idx = cb_next_idx.get();
                 match finalize_one_nnue_dir(
-                    &output_dir_for_cb,
+                    &output_dir_buf,
                     &ckpt_dir,
-                    cb_ctx_ref,
+                    &cb_ctx,
                     epoch,
                     idx,
                     cb_prior_position,
+                    test_metrics,
                 ) {
                     Ok(dst) => {
-                        cb_next_idx_ref.set(idx + 1);
-                        if let Err(e) = append_to_top_level_log(&output_dir_for_cb, idx) {
+                        cb_next_idx.set(idx + 1);
+                        if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
                             eprintln!(
                                 "  WARN: failed to update {}: {e}",
-                                output_dir_for_cb.join("learn.log").display()
+                                output_dir_buf.join("learn.log").display()
                             );
                         }
                         eprintln!("  -> {}/", dst.display());
@@ -1753,37 +1827,9 @@ macro_rules! run_training_inline_nnue {
                         );
                     }
                 }
-            };
 
-            let settings = LocalSettings {
-                threads: args.threads,
-                test_set: None,
-                output_directory: output_dir,
-                batch_queue_size: args.batch_queue_size,
-                on_checkpoint_saved: Some(&on_checkpoint_saved),
-            };
-
-            last_error_record = match format {
-                DataFormat::Hcpe => {
-                    let loader =
-                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Hcpe3 => {
-                    let loader =
-                        Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Pack => {
-                    let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_single_epoch(true);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Psv => {
-                    let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-            };
+                chunk_start = chunk_end + 1;
+            }
         }
 
         if !saved_any.get() {
@@ -1988,7 +2034,6 @@ fn run_halfkp(args: &Args) {
         }
     }
 
-    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE K-P training entry point. Structurally identical to [`run_halfkp`]
@@ -2085,7 +2130,6 @@ fn run_kp(args: &Args) {
         }
     }
 
-    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE K-A2 training entry point. Mirrors `run_kp` exactly, only the input
@@ -2182,7 +2226,6 @@ fn run_nnue_ka2(args: &Args) {
         }
     }
 
-    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
@@ -2279,7 +2322,6 @@ fn run_halfkpe9(args: &Args) {
         }
     }
 
-    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// NNUE HalfKP_vm training entry point. Identical wiring to `run_halfkp`,
@@ -2375,7 +2417,6 @@ fn run_halfkpvm(args: &Args) {
         }
     }
 
-    run_validation_inline_nnue!(args, &mut trainer);
 }
 
 /// SFNN-1536 / LayerStacks training entry point (= `SFNN_HALFKA1HM` and
@@ -2625,13 +2666,14 @@ fn finalize_one_nnue_dir(
     epoch: usize,
     idx: usize,
     prior_position: usize,
+    test_metrics: Option<TestMetrics>,
 ) -> std::io::Result<std::path::PathBuf> {
     let dst = output_dir.join(format!("{idx:04}"));
     std::fs::rename(src, &dst)?;
     let log_txt = dst.join("log.txt");
     let learn_log = dst.join("learn.log");
     let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
-    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position);
+    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics);
     let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
     content.push_str(LEARN_LOG_HEADER);
     content.push('\n');
@@ -2671,7 +2713,10 @@ fn finalize_nnue_dirs(
     );
     for (i, (epoch, _sb, src)) in src_dirs.iter().enumerate() {
         let idx = existing_count + i + 1;
-        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position)?;
+        // Leftover dirs were not finalised by the per-save callback so we
+        // also have no test metrics for them (validation runs in the
+        // training loop, not in this fallback path).
+        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position, None)?;
         eprintln!("  -> {}/", dst.display());
     }
     Ok((existing_count + 1, existing_count + n))
@@ -2763,7 +2808,7 @@ mod tests {
             teacher_csv: "teachers/foo.hcpe".to_string(),
         };
 
-        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0)
+        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None)
             .expect("finalize ok");
 
         // src is gone, dst is `0005/`
@@ -2779,12 +2824,64 @@ mod tests {
         assert!(learn.starts_with(LEARN_LOG_HEADER), "learn.log should start with header");
         let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
         assert_eq!(body_lines.len(), 2, "two body rows expected");
-        // each row has 9 comma-separated fields
+        // each row has 11 comma-separated fields (= LEARN_LOG_HEADER columns)
+        // and the two test_value_* columns are "-" because we passed None.
         for row in &body_lines {
-            assert_eq!(row.split(',').count(), 9, "row `{row}` should be 9 columns");
+            assert_eq!(row.split(',').count(), 11, "row `{row}` should be 11 columns");
             assert!(row.starts_with("SFNN_KA2-1536x2-15-32,"));
+            // Columns: eval, epoch, sb, batch, test_value_accuracy,
+            // test_value_loss, train_value_loss, lr, lambda, positions, teacher
+            // → indexes 4 and 5 should be "-"
+            let cols: Vec<&str> = row.split(',').collect();
+            assert_eq!(cols[4], "-", "test_value_accuracy should be '-' when no test_metrics");
+            assert_eq!(cols[5], "-", "test_value_loss should be '-' when no test_metrics");
         }
         // cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values
+    /// in the test_value_* columns rather than `-`.
+    #[test]
+    fn finalize_one_nnue_dir_emits_test_metrics_when_provided() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-finalize-with-metrics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("shogi_sfnn_ka2-7");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("nn.bin"), b"dummy").unwrap();
+        std::fs::write(src.join("state.bin"), b"dummy").unwrap();
+        std::fs::write(src.join("log.txt"), "7,32,0.111\n7,64,0.099\n").unwrap();
+
+        let ctx = LogContext {
+            eval_type: "NNUE_KA2",
+            arch: "256x2-32-32".to_string(),
+            lr_start: 0.001,
+            lr_gamma: 0.1,
+            lr_step: 8,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/foo.hcpe".to_string(),
+        };
+        let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
+        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
+        let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
+        let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(body_lines.len(), 2);
+        for row in &body_lines {
+            let cols: Vec<&str> = row.split(',').collect();
+            assert_eq!(cols.len(), 11);
+            // Expect formatted floats (6 decimal places per impl)
+            assert_eq!(cols[4], "0.876500", "test_value_accuracy should be the metric");
+            assert_eq!(cols[5], "0.051200", "test_value_loss should be the metric");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
