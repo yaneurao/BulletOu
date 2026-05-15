@@ -63,6 +63,7 @@ use bulletou_lib::{
     game::outputs::ShogiLayerStackBucket9,
     nn::{Affine, InitSettings, Shape, optimiser},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    trainer::schedule::lr::LrScheduler,
     validate::{compute_sign_accuracy, read_random_hcpe_positions},
     trainer::{
         save::SavedFormat,
@@ -361,6 +362,43 @@ const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 
 // (teacher-path expansion and format inference live in
 //  `bulletou_lib::teacher_path` so the single-component examples can share them.)
+
+/// LR scheduler wrapper with an optional superbatch offset. Used to
+/// decouple bullet's dataloader skip-ahead (which uses
+/// `start_superbatch` to seek through the teacher data) from the LR
+/// schedule (which should track the cumulative training progress
+/// across rounds, even when each round uses a fresh teacher file).
+///
+/// - `Plain(s)`: behaves exactly like `s` — `lr(b, sb)` calls
+///   `s.lr(b, sb)`. Used in the no-resume / same-teacher cases where
+///   bullet's `start_superbatch` already represents the absolute sb.
+/// - `Offset { inner, offset }`: shifts the sb input by `offset` so
+///   `lr(b, sb)` returns `inner.lr(b, sb + offset)`. Used in the
+///   teacher-changed resume case: `start_superbatch=1` (= dataloader
+///   reads the new file from the beginning) plus `offset=last_sb`
+///   keeps the LR schedule aligned with the cumulative training step
+///   instead of restarting at the initial LR.
+#[derive(Clone, Debug)]
+enum AdjustableStepLR {
+    Plain(lr::StepLR),
+    Offset { inner: lr::StepLR, offset: usize },
+}
+
+impl LrScheduler for AdjustableStepLR {
+    fn lr(&self, batch: usize, superbatch: usize) -> f32 {
+        match self {
+            Self::Plain(s) => s.lr(batch, superbatch),
+            Self::Offset { inner, offset } => inner.lr(batch, superbatch + offset),
+        }
+    }
+
+    fn colourful(&self) -> String {
+        match self {
+            Self::Plain(s) => s.colourful(),
+            Self::Offset { inner, offset } => format!("{} (sb offset +{})", inner.colourful(), offset),
+        }
+    }
+}
 
 // ----- CLI ---------------------------------------------------------------
 
@@ -863,6 +901,13 @@ struct LogContext {
     batch_size: usize,
     batches_per_superbatch: usize,
     teacher_csv: String,
+    /// Offset added to bullet's local sb counter when computing the
+    /// "absolute" superbatch shown in `learn.log` and used for LR
+    /// lookup. Set to `last_saved_sb` when auto-resume runs into a
+    /// changed `--teacher` (so bullet's local sb starts back at 1 to
+    /// keep the dataloader fresh, but the LR / display sb stays
+    /// monotonic across rounds). Otherwise 0.
+    sb_offset: usize,
 }
 
 impl LogContext {
@@ -879,6 +924,7 @@ impl LogContext {
             batch_size: args.batch_size,
             batches_per_superbatch,
             teacher_csv: csv_escape(&args.teacher),
+            sb_offset: 0,
         }
     }
 
@@ -961,11 +1007,21 @@ fn enrich_bullet_log_to_csv(
         if parts.len() != 3 {
             continue;
         }
-        let Ok(sb) = parts[0].parse::<usize>() else { continue };
+        let Ok(local_sb) = parts[0].parse::<usize>() else { continue };
         let Ok(b) = parts[1].parse::<usize>() else { continue };
         let train_loss = parts[2];
-        let lr = ctx.lr_at(sb);
-        let positions = ctx.positions_at(sb, b, position_offset);
+        // Absolute (= cumulative across rounds) sb. Bullet's `log.txt`
+        // carries its own internal sb counter (= local within the run);
+        // when the macro had to reset bullet's sb=1 for a teacher-changed
+        // resume, `ctx.sb_offset` shifts the displayed sb to the
+        // continuation point so the column stays monotonic.
+        let absolute_sb = local_sb + ctx.sb_offset;
+        let lr = ctx.lr_at(absolute_sb);
+        // `positions` keeps using bullet's local sb because position_offset
+        // already carries the cumulative count from prior runs — the
+        // formula then adds (local_sb-1)*sb_size + b*batch_size to the
+        // carry-over to give an honest cumulative position count.
+        let positions = ctx.positions_at(local_sb, b, position_offset);
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
         // `/<component>` suffix for multi-component eval types (KPPT
         // family). NNUE rows are single-component so the slash is
@@ -983,6 +1039,7 @@ fn enrich_bullet_log_to_csv(
         out.push_str(&format!(
             "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr},{lambda:.3},{positions},{teacher}\n",
             eval = eval_field,
+            sb = absolute_sb,
             ta = test_acc_field,
             tl = test_loss_field,
             train = train_loss,
@@ -1766,7 +1823,7 @@ macro_rules! run_training_inline_nnue {
         // explicitly passes --start-superbatch (signalling "reset sb to N"),
         // fall back to the legacy behaviour of carrying the prior position
         // sum forward from the existing top-level learn.log.
-        let cb_ctx = LogContext::from_args(args);
+        let mut cb_ctx = LogContext::from_args(args);
         let cb_top_level_log = output_dir_buf.join("learn.log");
         let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
         // Teacher-change detection: bullet's dataloader skips
@@ -1776,39 +1833,72 @@ macro_rules! run_training_inline_nnue {
         // round-2 training on a new chunk), the new file may not have
         // enough records to reach the skip target → trainer.run hits
         // EOF before any batch is delivered → `NoBatchesReceived`
-        // panic. Detect this by comparing the recorded teacher in the
-        // latest <NNNN>/learn.log with the current --teacher arg, and
-        // disable auto-resume (= reset sb to 1) when they differ. The
-        // model and optimiser load from state.bin still happens — only
-        // the dataloader skip and the LR schedule restart.
+        // panic.
+        //
+        // Resolution: keep the LR schedule continuous (so the user does
+        // not see LR jump back to start when they swap teacher files
+        // mid-experiment), but tell bullet `start_superbatch=1` so the
+        // dataloader reads the new file from the beginning.
+        // `AdjustableStepLR::Offset` handles the LR side by shifting
+        // the sb input by `last_saved_sb`. `cb_ctx.sb_offset` carries
+        // the same shift through to the enriched `learn.log`'s sb /
+        // lr columns so the displayed time-series stays monotonic.
         let prev_teacher = read_latest_saved_teacher(&output_dir_buf);
         let teacher_changed = match prev_teacher.as_deref() {
             Some(prev) => prev.trim() != args.teacher.trim(),
             None => false,
         };
-        let auto_resume_sb = if teacher_changed { None } else { auto_resume_sb_raw };
-        let effective_start_superbatch = args
-            .start_superbatch
-            .unwrap_or_else(|| auto_resume_sb.map(|n| n + 1).unwrap_or(1));
-        let cb_prior_position = if args.start_superbatch.is_none() && auto_resume_sb.is_some() {
+        let user_set_start = args.start_superbatch.is_some();
+        let (effective_start_superbatch, sb_offset_for_lr) = if user_set_start {
+            // Explicit user value wins for both dataloader skip and LR.
+            (args.start_superbatch.unwrap(), 0usize)
+        } else if teacher_changed {
+            if let Some(last_sb) = auto_resume_sb_raw {
+                // Keep dataloader fresh (start_sb=1) but shift LR by
+                // last_sb so the schedule continues from the correct
+                // step. cb_ctx.sb_offset mirrors this shift in the log.
+                (1usize, last_sb)
+            } else {
+                // Teacher changed but no prior dirs → fresh run.
+                (1usize, 0)
+            }
+        } else if let Some(last_sb) = auto_resume_sb_raw {
+            // Same teacher: legacy behaviour — let bullet's dataloader
+            // skip ahead so training picks up where the previous run
+            // left off in the SAME file.
+            (last_sb + 1, 0)
+        } else {
+            // First run.
+            (1usize, 0)
+        };
+        cb_ctx.sb_offset = sb_offset_for_lr;
+        // When the LR scheduler is `AdjustableStepLR::Plain` and bullet's
+        // sb already encodes the absolute step (= same-teacher resume or
+        // fresh run), positions_at(sb, b, 0) gives the correct cumulative
+        // count and prior_position should be 0. When we shifted via
+        // sb_offset (= teacher-changed case) or when the user explicitly
+        // overrode start_superbatch, sb is local-to-this-run so we need
+        // the cumulative carry-over from the existing top-level log.
+        let cb_prior_position = if !user_set_start && !teacher_changed && auto_resume_sb_raw.is_some() {
             0
         } else {
             read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
         };
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
 
-        if args.start_superbatch.is_none() {
+        if !user_set_start {
             if teacher_changed {
-                if let (Some(prev), Some(_last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
+                if let (Some(prev), Some(last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
                     eprintln!(
                         "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
-                         resetting LR schedule to sb=1 to avoid bullet dataloader skip-ahead beyond EOF.\n  \
-                         model + optimiser are still loaded from the latest state.bin.\n  \
-                         pass --start-superbatch <N> to override.",
-                        args.teacher
+                         dataloader will read the new file from the beginning (start_sb=1) but the LR\n  \
+                         schedule continues from sb {} (model + optimiser are loaded from the latest\n  \
+                         state.bin as usual). Pass --start-superbatch <N> to override.",
+                        args.teacher,
+                        last_sb + 1
                     );
                 }
-            } else if let Some(last_sb) = auto_resume_sb {
+            } else if let Some(last_sb) = auto_resume_sb_raw {
                 eprintln!(
                     "  auto-resuming from superbatch {} (last saved: {}); LR schedule continues. \
                      pass --start-superbatch to override.",
@@ -1816,6 +1906,20 @@ macro_rules! run_training_inline_nnue {
                 );
             }
         }
+
+        // Build the LR scheduler: plain when bullet's sb is already
+        // absolute (= no shift needed), Offset when we shifted to
+        // sb_offset (= teacher-changed case). The shift-aware variant
+        // returns the LR for the absolute sb regardless of bullet's
+        // local sb counter.
+        let lr_scheduler_for_run = if sb_offset_for_lr == 0 {
+            AdjustableStepLR::Plain(lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step })
+        } else {
+            AdjustableStepLR::Offset {
+                inner: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                offset: sb_offset_for_lr,
+            }
+        };
 
         // Per-save validation cache: load test positions ONCE up front
         // (random-pick happens here), then reuse the same positions for
@@ -1860,7 +1964,7 @@ macro_rules! run_training_inline_nnue {
                         end_superbatch: chunk_end,
                     },
                     wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                    lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
+                    lr_scheduler: lr_scheduler_for_run.clone(),
                     save_rate: args.save_rate,
                 };
 
@@ -2969,6 +3073,7 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
+            sb_offset: 0,
         };
 
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None)
@@ -3105,6 +3210,7 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
+            sb_offset: 0,
         };
         let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
@@ -3119,6 +3225,51 @@ mod tests {
             assert_eq!(cols[5], "0.051200", "test_value_loss should be the metric");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `LogContext.sb_offset` が enrich の sb / lr 列に正しく反映され、
+    /// 教師変更による start_sb=1 reset でも sb 表示と LR が連続するか確認。
+    #[test]
+    fn enrich_with_sb_offset_emits_absolute_sb_and_shifted_lr() {
+        let mut ctx = LogContext {
+            eval_type: "NNUE_KP",
+            arch: "256x2-32-32".to_string(),
+            lr_start: 0.001,
+            lr_gamma: 0.1,
+            lr_step: 8,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/round2.hcpe".to_string(),
+            sb_offset: 1, // = "round 1 saved sb 1, this run is the round 2 continuation"
+        };
+        // bullet's local sb in raw log is 1 (= first sb of round 2). With
+        // sb_offset=1, the enriched row should display sb=2 and pull the
+        // lr at sb=2 (= still 0.001 since 2/8 = 0).
+        let raw = "1,32,0.07\n1,64,0.06\n";
+        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None);
+        let rows: Vec<&str> = body.lines().collect();
+        assert_eq!(rows.len(), 2);
+        // Each row: eval, epoch, sb, batch, ta, tl, train, lr, lambda, positions, teacher
+        let cols0: Vec<&str> = rows[0].split(',').collect();
+        assert_eq!(cols0[2], "2", "absolute sb (= 1 + offset 1)");
+        assert_eq!(cols0[7], "0.001", "lr at absolute sb 2 (no decay yet)");
+        // positions column: 60M (prior) + 0*sb_size + 32*16384 = 60_524_288
+        assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
+
+        // Cross a real LR boundary: sb_offset=8 puts absolute sb at 9 = past
+        // step boundary, lr should drop by gamma (0.001 * 0.1 = 0.0001).
+        ctx.sb_offset = 8;
+        let body2 = enrich_bullet_log_to_csv(&"1,32,0.05\n", &ctx, 1, "nnue", 0, None);
+        let cols: Vec<&str> = body2.lines().next().unwrap().split(',').collect();
+        assert_eq!(cols[2], "9", "absolute sb (= 1 + offset 8)");
+        // lr_at(9): steps = (9-1)/8 = 1 → 0.001 * 0.1^1 ≈ 0.0001 (f32 rounding)
+        let lr_value: f32 = cols[7].parse().expect("lr column is a float");
+        assert!(
+            (lr_value - 0.0001).abs() < 1e-7,
+            "expected lr ≈ 0.0001 at absolute sb 9, got {lr_value} (raw: {})",
+            cols[7]
+        );
     }
 
     /// `read_latest_saved_superbatch` が `<NNNN>/learn.log` の sb 列を
@@ -3254,6 +3405,7 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
+            sb_offset: 0,
         };
         let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
         assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
