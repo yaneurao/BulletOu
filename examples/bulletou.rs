@@ -384,6 +384,16 @@ struct Args {
     #[arg(long)]
     output: Option<PathBuf>,
 
+    /// Suffix appended to the auto-derived output directory name. Useful
+    /// for running multiple experiments with the same network /
+    /// architecture but different hyperparameters: each run lands in
+    /// its own directory like
+    /// `checkpoints/<eval-type>-<arch>[-<layerstack>]-<tag>`.
+    /// Ignored when `--output` is set explicitly (the user-provided
+    /// path wins).
+    #[arg(long)]
+    tag: Option<String>,
+
     /// Net identifier (prefix of the saved checkpoint subdirectory).
     /// Defaults to a per-eval-type name.
     #[arg(long)]
@@ -558,6 +568,8 @@ impl Args {
     /// stays in sync with the flags.
     fn output_dir(&self) -> PathBuf {
         if let Some(p) = &self.output {
+            // Explicit --output wins; --tag is ignored to keep the
+            // user-provided path verbatim.
             return p.clone();
         }
         let mut path = PathBuf::from("checkpoints");
@@ -569,6 +581,12 @@ impl Args {
         if self.eval_type.uses_layerstack() {
             name.push('-');
             name.push_str(self.layerstack.cli_name());
+        }
+        if let Some(tag) = &self.tag {
+            if !tag.is_empty() {
+                name.push('-');
+                name.push_str(tag);
+            }
         }
         path.push(name);
         path
@@ -2838,6 +2856,79 @@ mod tests {
         }
         // cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `--tag` を指定すると、自動命名された出力フォルダ名の末尾に
+    /// `-<tag>` が付くこと、`--output` 指定時は `--tag` が無視されて
+    /// ユーザー指定パスがそのまま使われることを確認。
+    #[test]
+    fn output_dir_applies_tag_suffix() {
+        use clap::Parser as _;
+
+        // Baseline (no --tag, no --output): default name only.
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type", "NNUE_KP",
+            "--teacher", "/dev/null",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32"),
+        );
+
+        // --tag appends `-<tag>` to the auto-derived name.
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type", "NNUE_KP",
+            "--teacher", "/dev/null",
+            "--tag", "lr0.001",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32-lr0.001"),
+        );
+
+        // --tag with SFNN: applied after the layerstack segment.
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type", "SFNN_KA2",
+            "--arch", "1536x2-15-32",
+            "--teacher", "/dev/null",
+            "--tag", "exp7",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from(
+                "checkpoints/SFNN_KA2-1536x2-15-32-king3-by-king3-exp7"
+            ),
+        );
+
+        // Explicit --output wins; --tag is ignored.
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type", "NNUE_KP",
+            "--teacher", "/dev/null",
+            "--output", "/custom/path",
+            "--tag", "ignored",
+        ])
+        .unwrap();
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("/custom/path"));
+
+        // Empty --tag is treated as no tag (no trailing dash).
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type", "NNUE_KP",
+            "--teacher", "/dev/null",
+            "--tag", "",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32"),
+        );
     }
 
     /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values
