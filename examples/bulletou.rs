@@ -549,13 +549,16 @@ struct Args {
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
-    /// Loader shuffle buffer size in megabytes. HCPE 1 record = 40 byte
-    /// なので `--buffer-mb 512` で 13.4M 局面、`--buffer-mb 4096` で
-    /// 107M 局面が buffer 内でシャッフル対象になる。教師ファイルが
-    /// game レベルで並んでいる場合 (= 連続局面が同じ対局由来) は
-    /// この window を超える相関は混ざらないので、教師サイズに対して
-    /// この値が小さすぎないか注意。
-    #[arg(long, default_value = "512")]
+    /// Loader shuffle buffer size in megabytes. PSV 1 record = 40 byte
+    /// なので `--buffer-mb 4096` で 107M 局面 (= 約 1 superbatch 分) が
+    /// buffer 内でシャッフル対象になる。教師ファイルが game レベルで
+    /// 並んでいる場合 (= 連続局面が同じ対局由来) はこの window を
+    /// 超える相関は混ざらないので、教師サイズに対してこの値が
+    /// 小さすぎないか注意。
+    ///
+    /// RAM 消費: buffer のみで `buffer_mb` MB。学習中の他の構造
+    /// (model / optimiser / batch queue) と合わせて peak はこの 2 倍弱を見込む。
+    #[arg(long, default_value = "4096")]
     buffer_mb: usize,
 
     /// Drop positions whose |score| >= this. Useful to exclude ±32000 mate

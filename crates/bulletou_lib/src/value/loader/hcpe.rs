@@ -37,7 +37,8 @@
 //! Policy 蒸留や policy 教師を使いたい場合は HCPE3 を使う。
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
+use std::time::Instant;
 
 use crate::shogi::PackedSfenValue;
 
@@ -137,6 +138,14 @@ where
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
+        // 初回 buffer fill 中だけ進捗を stderr に表示する。学習開始前に GPU
+        // が何分も遊んでいるように見えないようにするのが目的。2 回目以降の
+        // fill は GPU 学習と並行して走るのでログ汚しを避ける。
+        let fill_started_at = Instant::now();
+        let mut first_fill_in_progress = true;
+        let mut last_report_at = fill_started_at;
+        let target_records = self.buffer_size;
+
         for path in &self.file_paths {
             let file = match File::open(path) {
                 Ok(f) => f,
@@ -187,7 +196,32 @@ where
 
                     buffer.push(psv);
 
+                    if first_fill_in_progress {
+                        let now = Instant::now();
+                        if now.duration_since(last_report_at).as_millis() >= 500 {
+                            let pct = 100.0 * buffer.len() as f64 / target_records.max(1) as f64;
+                            let _ = write!(
+                                std::io::stderr(),
+                                "\r  filling shuffle buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
+                                buffer.len() as f64 / 1.0e6,
+                                target_records as f64 / 1.0e6,
+                            );
+                            let _ = std::io::stderr().flush();
+                            last_report_at = now;
+                        }
+                    }
+
                     if buffer.len() >= self.buffer_size {
+                        if first_fill_in_progress {
+                            let elapsed = fill_started_at.elapsed();
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "\r  shuffle buffer ready: {:.1}M records in {:.1}s                ",
+                                buffer.len() as f64 / 1.0e6,
+                                elapsed.as_secs_f64(),
+                            );
+                            first_fill_in_progress = false;
+                        }
                         for j in (1..buffer.len()).rev() {
                             let k = (rng.rng() as usize) % (j + 1);
                             buffer.swap(j, k);
@@ -214,6 +248,15 @@ where
 
         // 残った buffer を flush
         if !buffer.is_empty() {
+            if first_fill_in_progress {
+                let elapsed = fill_started_at.elapsed();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\r  shuffle buffer ready: {:.1}M records in {:.1}s (teacher smaller than buffer)   ",
+                    buffer.len() as f64 / 1.0e6,
+                    elapsed.as_secs_f64(),
+                );
+            }
             for j in (1..buffer.len()).rev() {
                 let k = (rng.rng() as usize) % (j + 1);
                 buffer.swap(j, k);
