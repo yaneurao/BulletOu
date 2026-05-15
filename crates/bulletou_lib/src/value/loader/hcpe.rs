@@ -286,10 +286,31 @@ where
 
                 // 順序保ったまま shuffle buffer に追加。`start_position` の
                 // skip は ここで適用 (filter 通過 record 数で数える)。
+                // 進捗報告は skip phase と fill phase の両方で出す:
+                //   skip phase: "skipping start_position records: X/Y"
+                //   fill phase: "filling shuffle buffer: X/Y records"
+                // どちらも `\r` で同じ行を上書き。500ms ごとに更新。
                 for partial in decoded {
                     for psv in partial {
                         if skipped < start_position {
                             skipped += 1;
+                            if first_fill_in_progress {
+                                let now = Instant::now();
+                                if now.duration_since(last_report_at).as_millis()
+                                    >= 500
+                                {
+                                    let pct = 100.0 * skipped as f64
+                                        / start_position.max(1) as f64;
+                                    let _ = write!(
+                                        std::io::stderr(),
+                                        "\r  skipping {:.1}M / {:.1}M records (resume start_position, {pct:.1}%)   ",
+                                        skipped as f64 / 1.0e6,
+                                        start_position as f64 / 1.0e6,
+                                    );
+                                    let _ = std::io::stderr().flush();
+                                    last_report_at = now;
+                                }
+                            }
                             continue;
                         }
                         buffer.push(psv);
