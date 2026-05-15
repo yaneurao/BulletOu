@@ -572,14 +572,17 @@ struct Args {
     #[arg(long, default_value = "256x2-32-32")]
     arch: NnueArch,
 
-    /// LayerStack bucketing scheme for the SFNN family. Only consulted
-    /// when `--eval-type` is `SFNN_HALFKA1HM`, `SFNN_HALFKA2HM`, or `SFNN_KA2`.
+    /// LayerStack bucketing scheme for the SFNN family. Only valid
+    /// when `--eval-type` is `SFNN_HALFKA1HM`, `SFNN_HALFKA2HM`, or
+    /// `SFNN_KA2`. Passing it with a non-SFNN eval type is rejected at
+    /// startup so the flag's effect is never silently dropped.
     /// Currently only `king3-by-king3` is supported — it matches
     /// YaneuraOu's `stack_index_for_nnue` (3 friend-king-rank ×
     /// 3 enemy-king-rank = 9 stacks) so the trained `nn.bin` is
     /// loadable and evaluation matches between training and inference.
-    #[arg(long, default_value = "king3-by-king3")]
-    layerstack: LayerStackMode,
+    /// When omitted for an SFNN eval type, defaults to `king3-by-king3`.
+    #[arg(long)]
+    layerstack: Option<LayerStackMode>,
 
     /// Held-out test set (.hcpe only) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
@@ -640,7 +643,7 @@ impl Args {
         }
         if self.eval_type.uses_layerstack() {
             name.push('-');
-            name.push_str(self.layerstack.cli_name());
+            name.push_str(self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3).cli_name());
         }
         if let Some(tag) = &self.tag {
             if !tag.is_empty() {
@@ -678,6 +681,18 @@ impl Args {
 
 fn main() {
     let args = Args::parse();
+    // Reject `--layerstack` on eval types that have no LayerStacks
+    // topology — silently ignoring the flag would mislead the user
+    // into thinking it had an effect.
+    if args.layerstack.is_some() && !args.eval_type.uses_layerstack() {
+        eprintln!(
+            "error: --layerstack is only valid with the SFNN family \
+             (SFNN_HALFKA1HM / SFNN_HALFKA2HM / SFNN_KA2). \
+             --eval-type {} has no LayerStacks topology; drop the flag.",
+            args.eval_type.cli_name()
+        );
+        std::process::exit(2);
+    }
     if let Err(e) = record_invocation_to_tag_txt(&args) {
         eprintln!(
             "warning: failed to write tag.txt under {}: {e}",
@@ -2843,7 +2858,12 @@ where
     let l1_out = l1_hidden + 1;
     let l1_effective = l1_hidden;
     let l2_in = l1_effective * 2; // [SqrCReLU; CReLU] concat
-    let num_stacks = args.layerstack.num_stacks();
+    // SFNN paths default to `Kingrank3by3` when `--layerstack` is omitted
+    // (the only currently-supported scheme). The startup validator rejects
+    // explicit `--layerstack` for non-SFNN eval types, so SFNN code never
+    // sees an "intended for some other arch" setting here.
+    let layerstack = args.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
+    let num_stacks = layerstack.num_stacks();
     let input_size = input.num_inputs();
 
     eprintln!(
@@ -2853,7 +2873,7 @@ where
         l1_hidden,
         l2_size,
         num_stacks,
-        args.layerstack.cli_name()
+        layerstack.cli_name()
     );
 
     let output_dir = args.output_dir();
@@ -2879,7 +2899,7 @@ where
 
     // LayerStack bucket selector. `Kingrank9` matches YaneuraOu's
     // `stack_index_for_nnue` (3×3 = 9 buckets by king ranks).
-    let bucket_impl = match args.layerstack {
+    let bucket_impl = match layerstack {
         LayerStackMode::Kingrank3by3 => ShogiLayerStackBucket9::KingRank9,
     };
 
