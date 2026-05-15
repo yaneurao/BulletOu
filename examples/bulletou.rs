@@ -1698,6 +1698,15 @@ macro_rules! run_training_inline {
         // happened we need to write it ourselves in the fallback path.
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
+        // First-time CUDA setup heads-up: see comment in the NNUE macro
+        // for the full story. Same warning applies to KPPT training.
+        eprintln!(
+            "  note: first-batch run will trigger CUDA JIT-compile of GPU kernels\n  \
+             (≈30–60s on first run for this GPU model; cached afterwards). \
+             If both CPU and\n  GPU look idle for a minute, that is expected — \
+             the NVIDIA driver is compiling."
+        );
+
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -2229,6 +2238,24 @@ macro_rules! run_training_inline_nnue {
         // `trainer.eval_packed_batch` for validation between chunks.
         // Killing training mid-run still leaves a clean numbered layout
         // and a resumable top-level log.
+
+        // First-time CUDA setup heads-up: bullet's display ends with
+        // "Training on <GPU>" and the very next thing is the first batch
+        // run, which triggers cuBLAS handle init + JIT-compilation of the
+        // PTX kernels into SASS for the local GPU's compute capability.
+        // On a fresh machine / fresh `~/.nv/ComputeCache` this can take
+        // ~30–60s during which both CPU and GPU look idle — the work is
+        // happening inside the NVIDIA driver and is not always visible
+        // to Task Manager / nvidia-smi. Subsequent invocations reuse the
+        // cached SASS and skip this delay. We can't progress-report on
+        // the driver-side work itself, but at least telling the user it
+        // is expected.
+        eprintln!(
+            "  note: first-batch run will trigger CUDA JIT-compile of GPU kernels\n  \
+             (≈30–60s on first run for this GPU model; cached afterwards). \
+             If both CPU and\n  GPU look idle for a minute, that is expected — \
+             the NVIDIA driver is compiling."
+        );
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
