@@ -549,8 +549,13 @@ struct Args {
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
-    /// Loader shuffle buffer size in megabytes.
-    #[arg(long, default_value = "256")]
+    /// Loader shuffle buffer size in megabytes. HCPE 1 record = 40 byte
+    /// なので `--buffer-mb 512` で 13.4M 局面、`--buffer-mb 4096` で
+    /// 107M 局面が buffer 内でシャッフル対象になる。教師ファイルが
+    /// game レベルで並んでいる場合 (= 連続局面が同じ対局由来) は
+    /// この window を超える相関は混ざらないので、教師サイズに対して
+    /// この値が小さすぎないか注意。
+    #[arg(long, default_value = "512")]
     buffer_mb: usize,
 
     /// Drop positions whose |score| >= this. Useful to exclude ±32000 mate
