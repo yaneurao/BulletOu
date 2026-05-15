@@ -670,6 +670,15 @@ struct Args {
     #[arg(long, default_value = "4096")]
     buffer_mb: usize,
 
+    /// HCPE デコード並列度。`0` (デフォルト) で auto =
+    /// `available_parallelism()` (= 論理コア数)。学習中に他プロセスへ
+    /// CPU を譲りたいときなどに `--loader-threads 8` 等で上限を絞れる。
+    /// 起動時に `shuffle buffer ready: ... (N decode threads)` で
+    /// 実際に使われた値が表示される。
+    /// 現状 HCPE ローダーのみ反映 (HCPE3 / .pack / .psv は未対応)。
+    #[arg(long, default_value = "0")]
+    loader_threads: usize,
+
     /// Drop positions whose |score| >= this. Useful to exclude ±32000 mate
     /// stamps. Set to 0 to disable.
     #[arg(long, default_value = "32000")]
@@ -1767,7 +1776,8 @@ macro_rules! run_training_inline {
             last_error_record = match format {
                 DataFormat::Hcpe => {
                     let loader =
-                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                            .with_loader_threads(args.loader_threads);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Hcpe3 => {
@@ -2286,7 +2296,8 @@ macro_rules! run_training_inline_nnue {
                 last_error_record = match format {
                     DataFormat::Hcpe => {
                         let loader =
-                            HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                            HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                            .with_loader_threads(args.loader_threads);
                         trainer.run(&schedule, &settings, &loader)
                     }
                     DataFormat::Hcpe3 => {

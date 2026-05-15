@@ -89,6 +89,9 @@ pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// shuffle buffer に貯める PackedSfenValue の最大個数
     buffer_size: usize,
     filter: T,
+    /// HCP → PSV デコードに使う worker スレッド数。`None` のとき
+    /// `std::thread::available_parallelism()` (= 論理コア数) で自動決定。
+    loader_threads: Option<usize>,
 }
 
 impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
@@ -106,7 +109,15 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
             file_paths: paths.iter().map(|x| (*x).to_string()).collect(),
             buffer_size: buffer_size_mb.saturating_mul(1024 * 1024) / 40,
             filter,
+            loader_threads: None,
         }
+    }
+
+    /// HCP → PSV 並列デコードの worker 数を上書きする。`0` または `None` を
+    /// 渡すと auto detection (= `available_parallelism()`) のまま。
+    pub fn with_loader_threads(mut self, n: usize) -> Self {
+        self.loader_threads = if n == 0 { None } else { Some(n) };
+        self
     }
 }
 
@@ -147,11 +158,12 @@ where
         let buffer_size = self.buffer_size.max(1);
         let file_paths = self.file_paths.clone();
         let filter = self.filter.clone();
+        let loader_threads = self.loader_threads;
         let (tx, rx) =
             std::sync::mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
 
         let producer = std::thread::spawn(move || {
-            Self::produce_buffers(file_paths, buffer_size, filter, start_position, tx);
+            Self::produce_buffers(file_paths, buffer_size, filter, start_position, loader_threads, tx);
         });
 
         // コンシューマループ: buffer を受け取って f() に渡す。
@@ -179,6 +191,7 @@ where
         buffer_size: usize,
         filter: T,
         start_position: usize,
+        loader_threads: Option<usize>,
         tx: std::sync::mpsc::SyncSender<Vec<PackedSfenValue>>,
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
@@ -191,10 +204,11 @@ where
         let mut last_report_at = fill_started_at;
         let target_records = buffer_size;
 
-        let n_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .max(1);
+        let n_workers = loader_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        }).max(1);
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
