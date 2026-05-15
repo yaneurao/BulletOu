@@ -17,10 +17,9 @@
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし (= EOF まで) |
 | `--max-epochs` | 教師データを何周するか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
-| `--lr` | 初期学習率 (lr_max) | 0.001 |
-| `--lr-schedule` | `step` (= 指数減衰) または `cos` (= cosine annealing + warm restart) | `step` |
-| `--lr-gamma` / `--lr-step-positions` | (step only) `lr-step-positions` 局面ごとに `lr-gamma` 倍 | 0.9 / 100000000 |
-| `--lr-min` | (cos only) cycle 末で到達する最小 lr。cycle 長は `--superbatches` / 教師サイズから自動算出 | 0.0 |
+| `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
+| `--lr-schedule` | `step` (= geometric/対数線形) または `cos` (= cosine annealing)。両方とも 1 epoch で warm restart | `step` |
+| `--lr-min` | cycle 末で到達する最小 lr。cycle 長は `--superbatches` / 教師サイズから自動算出。step では `> 0` 必須 | 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
@@ -34,33 +33,18 @@
 
 教師ファイルが 1 superbatch 未満 (≒ 1 億局面未満) しか無い場合は `--batches-per-superbatch` を小さくする (例: `1024` で 1 superbatch ≒ 1670 万局面) と、何回も save が走るようになる。
 
-### 学習率の動き — `--lr-schedule step` (デフォルト)
+### 学習率の動き
 
-`--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` (デフォルト) の場合、**累積学習局面数** が 100M を超えるごとに lr を 0.9 倍する:
+`step` と `cos` の **両方** が、1 epoch をかけて `--lr` (lr_max) から `--lr-min` (lr_min) へ滑らかに減衰、epoch 境界で warm restart して lr_max に戻る形になります。違いは曲線の形だけ:
 
-| 累積局面 | lr |
-|---|---|
-| 0 〜 100M | 0.001 |
-| 100M 〜 200M | 0.000900 |
-| 200M 〜 300M | 0.000810 |
-| 500M | 0.000591 |
-| 1G | 0.000349 |
-| 2.2G | 0.0001 (≒ 初期値の 1/10) |
+| schedule | 式 | 形 |
+|---|---|---|
+| `step` (default) | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | 対数線形 — batch ごとに一定倍率で下がる |
+| `cos` | `lr(t) = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(πt))` | 先頭と末尾は緩やか、中盤で最も急 |
 
-`--lr-gamma 0.1` のような攻撃的な値を指定すると 100M ごとに 10× drop。長く回すなら `0.9` 系の緩い設定が普通。
+`t = (累積局面 mod period) / period`、`period = 1 epoch ぶんの局面数` (= 自動算出)。
 
-学習が走った後で実際の lr 推移を確認するには、`learn.log` の `lr` 列を見れば良い ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。
-
-### 学習率の動き — `--lr-schedule cos` (cosine annealing)
-
-`--lr-schedule cos` を指定すると、stepwise の代わりに **cosine annealing + warm restart** (SGDR) スケジュールになる:
-
-```
-t  = (累積局面 mod cosine_period) / cosine_period
-lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
-```
-
-**`cosine_period` は自動算出**: 別途 `--lr-cosine-period` を指定する必要はない (= 削除されたフラグ)。決定ルールは:
+**period 決定ルール**:
 
 | 状況 | period |
 |---|---|
@@ -68,30 +52,34 @@ lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
 | `--superbatches` 未指定 AND HCPE / PSV 教師 | 教師全体の局面数 (file size から自動計算) |
 | `--superbatches` 未指定 AND HCPE3 / pack 教師 | エラー (= 可変長レコードなので教師サイズ不明、明示が必要) |
 
-たとえば `--superbatches 4 --lr-schedule cos --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M 局面) の場合の lr 推移:
+たとえば `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M 局面) の lr 推移:
 
-| cycle 内位置 | t | lr |
-|---|---|---|
-| 0M (sb 1 頭) | 0.0 | 0.001 (= `--lr`、lr_max) |
-| 100M (sb 2 頭) | 0.25 | 0.000856 |
-| 200M (sb 3 頭) | 0.5 | 0.000505 (midpoint) |
-| 300M (sb 4 頭) | 0.75 | 0.000155 |
-| 400M (sb 4 末) | 1.0 | 0.00001 (= `--lr-min`、lr_min) |
-| 次 epoch sb 1 頭 | 0.0 | **0.001** ← warm restart |
+| cycle 内位置 | t | step (geometric) | cos (cosine) |
+|---|---|---|---|
+| 0M (sb 1 頭) | 0.0 | 0.001 | 0.001 |
+| 100M (sb 2 頭) | 0.25 | 0.000316 | 0.000856 |
+| 200M (sb 3 頭) | 0.5 | 0.000100 | 0.000505 (midpoint) |
+| 300M (sb 4 頭) | 0.75 | 0.0000316 | 0.000155 |
+| 400M (sb 4 末) | 1.0 | 0.00001 | 0.00001 |
+| 次 epoch sb 1 頭 | 0.0 | **0.001** ← warm restart | **0.001** ← warm restart |
 
-epoch 跨ぎで cycle がきれいに重なるよう `--superbatches` を選ぶのがコツ ([§6.1.x 教師を数えて --superbatches を決める](#教師を数えて---superbatches-を決める) 参照)。
+step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)` ≒ `0.99987` 倍ずつ下がる、超滑らかな指数減衰です。
+
+⚠️ **`--lr-min` は step では必ず `> 0`**: geometric の式 `lr_max × (lr_min/lr_max)^t` が `lr_min = 0` だと t > 0 で即 0 になり破綻するため、CLI 起動時にエラーになります。`1e-5` 〜 `1e-6` あたりが典型。cos は 0 でも数学的に動きますが、警告は出ます。
+
+実際の lr 推移は `<NNNN>/learn.log` の `lr` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
 
 #### `step` vs `cos` を比較したい
 
-同じ教師・同じ arch で 2 回 run して `learn.log` を並べると、どちらが効くかすぐ分かる。`--tag` で出力先を分けるのがコツ:
+同じ教師・同じ arch で 2 回 run して `summary-learn.log` を並べると、どちらが効くかすぐ分かる。両方とも同じ `--lr-min` 値を共有できるので apples-to-apples 比較しやすい:
 
 ```bash
-# stepwise
+# stepwise (geometric decay)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type NNUE_KP --arch 256x2-32-32 \
-    --max-epochs 10 --tag 5G-step \
-    --lr-schedule step --lr-step-positions 100000000 --lr-gamma 0.9
+    --max-epochs 10 --superbatches 4 --tag 5G-step \
+    --lr-schedule step --lr-min 0.00001
 
 # cosine (epoch ごとに 1 cycle)
 ./target/release/examples/bulletou \
@@ -105,7 +93,7 @@ epoch 跨ぎで cycle がきれいに重なるよう `--superbatches` を選ぶ�
 
 ### 教師を数えて `--superbatches` を決める
 
-`--lr-schedule cos` で cycle を 1 epoch ぴったりに揃えるには、まず **教師の総局面数** を知る必要がある。BulletOu には専用フラグ `--count-teacher` があり、`std::fs::metadata` でファイルサイズを読むだけなので **数百 GB の教師でも一瞬で完了** する (中身は read しない):
+`step` / `cos` どちらでも cycle を 1 epoch ぴったりに揃えるには、まず **教師の総局面数** を知る必要がある。BulletOu には専用フラグ `--count-teacher` があり、`std::fs::metadata` でファイルサイズを読むだけなので **数百 GB の教師でも一瞬で完了** する (中身は read しない):
 
 ```bash
 ./target/release/examples/bulletou --count-teacher --teacher teachers/

@@ -17,10 +17,9 @@ Main flags:
 | `--superbatches` | Cap superbatches per epoch | unlimited (= run until EOF) |
 | `--max-epochs` | Number of full passes through the teacher | 1 |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
-| `--lr` | Starting LR (lr_max) | 0.001 |
-| `--lr-schedule` | `step` (exponential decay) or `cos` (cosine annealing + warm restart) | `step` |
-| `--lr-gamma` / `--lr-step-positions` | (step only) multiply LR by `lr-gamma` every `lr-step-positions` cumulative positions | 0.9 / 100000000 |
-| `--lr-min` | (cos only) floor LR reached at cycle end. Cycle length is auto-computed from `--superbatches` / teacher size | 0.0 |
+| `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
+| `--lr-schedule` | `step` (= geometric / log-linear decay) or `cos` (= cosine annealing); both sweep `--lr` → `--lr-min` over one epoch with warm restart | `step` |
+| `--lr-min` | Floor LR reached at end of each cycle. Cycle length auto-computed from `--superbatches` / teacher size. Must be `> 0` for step | 0.00001 |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
@@ -34,33 +33,18 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
 
 If your teacher file is smaller than one superbatch (< 100M positions), lower `--batches-per-superbatch` (e.g. `1024` ⇒ 1 superbatch ≒ 16.78M positions) so multiple saves fire.
 
-### Learning-rate evolution — `--lr-schedule step` (default)
+### Learning-rate evolution
 
-With `--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` (defaults), the LR drops by 0.9× every 100M **cumulative trained positions**:
+**Both** `step` and `cos` schedules sweep from `--lr` (lr_max) down to `--lr-min` over one epoch, then warm-restart back to lr_max at the next epoch's start. They differ only in the curve shape:
 
-| Cumulative positions | lr |
-|---|---|
-| 0 – 100M | 0.001 |
-| 100M – 200M | 0.000900 |
-| 200M – 300M | 0.000810 |
-| 500M | 0.000591 |
-| 1G | 0.000349 |
-| 2.2G | 0.0001 (≒ 1/10 of starting LR) |
+| schedule | formula | shape |
+|---|---|---|
+| `step` (default) | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | Log-linear — constant multiplicative drop per batch |
+| `cos` | `lr(t) = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(πt))` | Gentle at start/end, steepest in the middle |
 
-Pass an aggressive value like `--lr-gamma 0.1` for a 10× drop every 100M. For long runs the gentler `0.9`-class default is more typical.
+`t = (cumulative_positions mod period) / period`, `period = one epoch's positions` (auto-derived).
 
-You can verify the actual LR after the run by inspecting `learn.log`'s `lr` column ([§7.2 Reading the training log](7-result.md#72-reading-the-training-log-learnlog)).
-
-### Learning-rate evolution — `--lr-schedule cos` (cosine annealing)
-
-Pass `--lr-schedule cos` to use **cosine annealing with warm restart** (SGDR) instead of the stepwise schedule:
-
-```
-t  = (cumulative_positions mod cosine_period) / cosine_period
-lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
-```
-
-**`cosine_period` is auto-derived** — there's no separate `--lr-cosine-period` flag (it was removed). The rules:
+**Period rules**:
 
 | Situation | period |
 |---|---|
@@ -68,30 +52,34 @@ lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
 | Unlimited sb AND HCPE / PSV teacher | Total teacher position count (read from file sizes) |
 | Unlimited sb AND HCPE3 / pack teacher | Error — variable-length format, set `--superbatches` explicitly |
 
-Example: `--superbatches 4 --lr-schedule cos --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M positions):
+Example with `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M positions):
 
-| Position within cycle | t | lr |
-|---|---|---|
-| 0M (sb 1 start) | 0.0 | 0.001 (= `--lr`, lr_max) |
-| 100M (sb 2 start) | 0.25 | 0.000856 |
-| 200M (sb 3 start) | 0.5 | 0.000505 (midpoint) |
-| 300M (sb 4 start) | 0.75 | 0.000155 |
-| 400M (sb 4 end) | 1.0 | 0.00001 (= `--lr-min`, lr_min) |
-| Next epoch sb 1 | 0.0 | **0.001** ← warm restart |
+| Position within cycle | t | step (geometric) | cos (cosine) |
+|---|---|---|---|
+| 0M (sb 1 start) | 0.0 | 0.001 | 0.001 |
+| 100M (sb 2 start) | 0.25 | 0.000316 | 0.000856 |
+| 200M (sb 3 start) | 0.5 | 0.000100 | 0.000505 (midpoint) |
+| 300M (sb 4 start) | 0.75 | 0.0000316 | 0.000155 |
+| 400M (sb 4 end) | 1.0 | 0.00001 | 0.00001 |
+| Next epoch sb 1 | 0.0 | **0.001** ← warm restart | **0.001** ← warm restart |
 
-Pick `--superbatches` so each epoch is a clean cosine cycle — see [§6.1.x Count the teacher to pick --superbatches](#count-the-teacher-to-pick---superbatches) below.
+The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_max)^(1/batches_per_epoch)` ≒ `0.99987`, a very smooth exponential decay.
+
+⚠️ **`--lr-min` must be `> 0` for step**: the geometric formula `lr_max × (lr_min/lr_max)^t` collapses to 0 at any t>0 when `lr_min = 0`; the CLI rejects this at startup. `1e-5`–`1e-6` is typical. `cos` accepts 0 mathematically (with a warning).
+
+Inspect `<NNNN>/learn.log`'s `lr` column to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
 
 #### Comparing `step` vs `cos`
 
-Run twice on the same teacher / same architecture and overlay the `summary-learn.log` curves. Use `--tag` to keep the output directories distinct:
+Run twice on the same teacher / same architecture and overlay the `summary-learn.log` curves. Both schedules share the same `--lr-min`, which makes apples-to-apples comparison easy:
 
 ```bash
-# stepwise
+# stepwise (geometric decay)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type NNUE_KP --arch 256x2-32-32 \
-    --max-epochs 10 --tag 5G-step \
-    --lr-schedule step --lr-step-positions 100000000 --lr-gamma 0.9
+    --max-epochs 10 --superbatches 4 --tag 5G-step \
+    --lr-schedule step --lr-min 0.00001
 
 # cosine (one cycle per epoch)
 ./target/release/examples/bulletou \
@@ -105,7 +93,7 @@ The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. 
 
 ### Count the teacher to pick `--superbatches`
 
-To align cosine cycles to epoch boundaries, you need to know the teacher's total position count. BulletOu has a dedicated flag for that: `--count-teacher`. It reads `std::fs::metadata` only (no actual file content), so it's **instant even for hundreds of GB**:
+For both `step` and `cos` schedules, you'll want one epoch to fit the teacher cleanly. That means knowing the teacher's total position count. BulletOu has a dedicated flag for that: `--count-teacher`. It reads `std::fs::metadata` only (no actual file content), so it's **instant even for hundreds of GB**:
 
 ```bash
 ./target/release/examples/bulletou --count-teacher --teacher teachers/

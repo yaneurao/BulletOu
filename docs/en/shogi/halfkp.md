@@ -93,7 +93,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--superbatches` | Cap superbatches per epoch | unlimited |
 | `--batches-per-superbatch` | Mini-batches per superbatch | ≈ 100M positions |
 | `--save-rate` | Save every N superbatches | 1 |
-| `--lr` / `--lr-schedule` / `--lr-gamma` / `--lr-step-positions` | LR schedule (`step` or `cos`, full details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.001 / `step` / 0.9 / 100000000 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = geometric / `cos` = cosine; both sweep `--lr` → `--lr-min` over one epoch with warm restart, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.001 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 
 Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to ClippedReLU (matching the original 2018 architecture). These can be added as flags later if needed.

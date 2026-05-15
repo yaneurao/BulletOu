@@ -126,7 +126,7 @@ Resume / restart behaviour is identical across every eval-type; see [tutorial 5.
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |
 | `--max-epochs` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
 | `--save-rate` | Save every N superbatches | 1 |
-| `--lr` / `--lr-schedule` / `--lr-gamma` / `--lr-step-positions` | LR scheduler (`step` or `cos`, full details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.001 / `step` / 0.9 / 100000000 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR scheduler (`step` = geometric / `cos` = cosine; both sweep `--lr` → `--lr-min` over one epoch with warm restart, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.001 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |

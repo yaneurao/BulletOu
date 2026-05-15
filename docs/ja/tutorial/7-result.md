@@ -96,7 +96,7 @@ print(df["value_loss"].describe())   # loss の統計
    - **periodic な loss スパイク** (= 数百 batch ごとに急に跳ねる) が見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。shuffle buffer の境界 (デフォルト 256MB buffer ≒ 約 410 batch ごと) で分布が突然変わって起きる。対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
 
 2. **`lr` がスケジュール通りに動いている**
-   - `--lr-schedule step` (デフォルト): `--lr-step-positions` 局面ごとに `--lr-gamma` 倍。例: `--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` なら 100M ごとに 0.9 倍 (0.001 → 0.0009 → 0.00081 → …)
+   - `--lr-schedule step` (デフォルト): 1 epoch (= `--superbatches × sb_size` 局面) で `--lr` (lr_max) → `--lr-min` を **geometric** (= 対数線形) に減衰、epoch 末で warm restart して lr_max に戻る
    - `--lr-schedule cos`: cosine annealing で `--lr` (lr_max) → `--lr-min` を 1 epoch (= `--superbatches × sb_size` 局面) で 1 周期。各 cycle 末 (= epoch 末) で warm restart して `--lr` に戻る
    - 期待通り変化していないなら lr 系フラグの値を見直す ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)
 

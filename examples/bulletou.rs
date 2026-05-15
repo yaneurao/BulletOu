@@ -378,8 +378,8 @@ const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 #[derive(Clone, Debug)]
 struct PositionsLR {
     start: f32,
-    gamma: f32,
-    positions_per_step: u64,
+    min: f32,
+    period_positions: u64,
     prior_positions: u64,
     batch_size: usize,
     batches_per_superbatch: usize,
@@ -389,13 +389,23 @@ impl PositionsLR {
     /// Pure formula: LR for a given total cumulative position count.
     /// Used by both `LrScheduler::lr` and the `learn.log` enrich path
     /// so the trainer's LR and the logged LR always agree.
-    fn lr_at_positions(start: f32, gamma: f32, step: u64, total: u64) -> f32 {
-        if step == 0 {
-            // Defensive: a 0-step would divide by zero. Treat as "never drop".
+    ///
+    /// `lr(t) = start * (min/start)^t` where `t = (total % period) /
+    /// period`. Geometric interpolation in log space: at t=0 → start
+    /// (lr_max), t=1 → min (lr_min). Warm restart at cycle boundary
+    /// (= each `period_positions`), mirroring `CosineLR`.
+    fn lr_at_positions(start: f32, min: f32, period: u64, total: u64) -> f32 {
+        if period == 0 {
             return start;
         }
-        let n = (total / step) as i32;
-        start * gamma.powi(n)
+        let in_cycle = (total % period) as f64;
+        let t = in_cycle / period as f64;
+        let s = start as f64;
+        // min > 0 should be validated at CLI parse; clamp here defensively so
+        // (min/start)^t doesn't degenerate to 0 for any t>0.
+        let m = (min as f64).max(1e-12);
+        let lr = s * (m / s).powf(t);
+        lr as f32
     }
 }
 
@@ -404,13 +414,13 @@ impl LrScheduler for PositionsLR {
         let in_run = ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64)
             * (self.batch_size as u64);
         let total = self.prior_positions + in_run;
-        Self::lr_at_positions(self.start, self.gamma, self.positions_per_step, total)
+        Self::lr_at_positions(self.start, self.min, self.period_positions, total)
     }
 
     fn colourful(&self) -> String {
         format!(
-            "start {} gamma {} drop every {} positions (cumulative, prior {})",
-            self.start, self.gamma, self.positions_per_step, self.prior_positions
+            "step (exp): start {} min {} period {} positions (cumulative, prior {})",
+            self.start, self.min, self.period_positions, self.prior_positions
         )
     }
 }
@@ -592,47 +602,32 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// LR gamma — multiplicative drop applied every
-    /// `lr_step_positions` positions trained. Default `0.9` gives a
-    /// gentle per-100M-positions decay (≒ 10× drop over ~2.2B
-    /// trained positions); pass e.g. `0.1` for an aggressive 10×
-    /// per step.
-    #[arg(long, default_value = "0.9")]
-    lr_gamma: f32,
-
-    /// LR step in *positions* (cumulative across rounds, independent
-    /// of bullet's superbatch counter). LR drops by `lr_gamma` every
-    /// N teacher positions actually trained. Default `100000000`
-    /// (= 100M positions per drop). Round-per-file workflows step
-    /// at the right cumulative position count regardless of how
-    /// many positions each round trained.
+    /// LR schedule kind. Both kinds sweep `--lr` (lr_max) → `--lr-min`
+    /// over **one epoch**, warm-restarting to `--lr` at each epoch
+    /// boundary. They differ only in the curve shape:
     ///
-    /// Only consulted when `--lr-schedule step` (= default).
-    #[arg(long, default_value = "100000000")]
-    lr_step_positions: u64,
-
-    /// LR schedule kind. `step` (default) = stepwise `gamma`-decay
-    /// every `--lr-step-positions` positions. `cos` = SGDR-style
-    /// cosine annealing with one cycle per epoch, sweeping from
-    /// `--lr` (start) to `--lr-min` and then warm-restarting back
-    /// to `--lr` at each epoch boundary. The cycle period is
-    /// auto-computed (see `--lr-min` doc).
+    /// - `step` (default) = geometric (= exponential in log space):
+    ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
+    ///   "fraction of one epoch completed". Constant multiplicative
+    ///   decay per batch.
+    /// - `cos` = cosine annealing (SGDR-style):
+    ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
+    ///   Slower descent at the start and end, fastest in the middle.
+    ///
+    /// Epoch length is set by `--superbatches N` (period =
+    /// `N * sb_size`). For HCPE / PSV with no `--superbatches`,
+    /// falls back to the teacher's total position count. HCPE3 /
+    /// pack without `--superbatches` is rejected (teacher size
+    /// unknown without walking).
     #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
 
-    /// (cos only) Floor LR reached at the end of each cosine cycle
-    /// (= the value of LR just before the warm restart back to
-    /// `--lr`). Default `0.0` (= cosine touches zero at cycle end).
-    ///
-    /// The cycle period itself is auto-computed and is **not** a
-    /// separate CLI flag: when `--superbatches N` is set, period
-    /// equals one epoch (= `N * batches_per_superbatch * batch_size`)
-    /// so lr_min lands exactly at sb N's end. For HCPE / PSV with
-    /// no `--superbatches`, period falls back to the teacher's
-    /// total position count (computed from file sizes). HCPE3 / pack
-    /// without `--superbatches` is rejected because their teacher
-    /// size is unknown without walking.
-    #[arg(long, default_value = "0.0")]
+    /// Floor LR reached at the end of each epoch (= the value of
+    /// LR just before the warm restart back to `--lr`). Must be
+    /// strictly positive for `--lr-schedule step` (the geometric
+    /// formula can't reach 0 in finite t); cosine can use 0 but
+    /// 1e-5 or 1e-6 is more typical.
+    #[arg(long, default_value = "0.00001")]
     lr_min: f32,
 
     /// Lambda — weight on the teacher's evaluation score (vs the actual
@@ -827,10 +822,10 @@ impl Args {
     }
 }
 
-// ----- cosine period -----------------------------------------------------
+// ----- epoch period ------------------------------------------------------
 
-/// Compute the cosine annealing cycle period (in positions) for the
-/// current run.
+/// Compute the warm-restart cycle period (= one epoch's positions),
+/// shared by both `step` and `cos` schedules.
 ///
 /// Semantics:
 /// - If `--superbatches N` is set, period = `N * batches_per_superbatch
@@ -842,7 +837,7 @@ impl Args {
 ///   length) would need to walk every game so this combination is
 ///   rejected — the user is expected to set `--superbatches` for
 ///   variable-length teachers.
-fn auto_cosine_period(
+fn auto_epoch_period(
     args: &Args,
     format: DataFormat,
     data_files: &[String],
@@ -974,6 +969,29 @@ fn main() {
             Err(e) => {
                 eprintln!("error: --count-teacher failed: {e}");
                 std::process::exit(2);
+            }
+        }
+    }
+    // Both `step` and `cos` schedules sweep from `--lr` (lr_max) down to
+    // `--lr-min`; `--lr-min` must be > 0 for step (geometric formula
+    // `start*(min/start)^t` can't reach 0 in finite t). For cos, 0 is fine
+    // but unusual; warn rather than reject.
+    if args.lr_min <= 0.0 {
+        match args.lr_schedule {
+            LrScheduleKind::Step => {
+                eprintln!(
+                    "error: --lr-min must be > 0 for --lr-schedule step \
+                     (the geometric decay formula degenerates at 0). \
+                     1e-5 or 1e-6 is typical."
+                );
+                std::process::exit(2);
+            }
+            LrScheduleKind::Cos => {
+                eprintln!(
+                    "  note: --lr-min 0.0 with --lr-schedule cos means lr \
+                     literally touches 0 at each epoch end; 1e-5 or 1e-6 is \
+                     usually preferred."
+                );
             }
         }
     }
@@ -1241,7 +1259,6 @@ struct LogContext {
     /// output-dir naming.
     arch: String,
     lr_start: f32,
-    lr_gamma: f32,
     lambda: f32,
     batch_size: usize,
     batches_per_superbatch: usize,
@@ -1254,20 +1271,15 @@ struct LogContext {
     /// rounds. Otherwise 0. The LR formula is positions-based and
     /// does not consult this field — the offset is purely for display.
     sb_offset: usize,
-    /// LR step in positions — drops `lr_gamma` every this many
-    /// cumulative trained positions. Mirrors `--lr-step-positions`
-    /// so the enriched `learn.log` `lr` column agrees with what
-    /// `PositionsLR` computed in the trainer. Consulted only when
-    /// `lr_schedule == Step`.
-    lr_step_positions: u64,
     /// Which LR schedule the trainer is running. Switches the
     /// enrich-path lr formula between `PositionsLR::lr_at_positions`
-    /// (step) and `CosineLR::lr_at_positions` (cos).
+    /// (step / geometric) and `CosineLR::lr_at_positions` (cos).
     lr_schedule: LrScheduleKind,
-    /// (cos only) Cosine cycle length in positions. Mirrors
-    /// `--lr-cosine-period`.
-    lr_cosine_period: u64,
-    /// (cos only) Cosine floor LR. Mirrors `--lr-min`.
+    /// Period of one warm-restart cycle (= one epoch's worth of
+    /// positions), shared by both schedules. Computed via
+    /// [`auto_epoch_period`] at training start.
+    lr_period: u64,
+    /// Floor LR reached at end of each cycle. Mirrors `--lr-min`.
     lr_min: f32,
 }
 
@@ -1287,27 +1299,27 @@ fn resolve_teacher_for_log(teacher: &str) -> String {
 
 impl LogContext {
     /// `lr_cosine_period_override` is the cosine cycle period in
-    /// positions, pre-computed by [`auto_cosine_period`] when the
-    /// trainer is about to run with `--lr-schedule cos`. For
-    /// non-training callers (post-training log enrich paths), pass
-    /// 0; the lr column in enrich is only meaningful when the
-    /// schedule actually used cosine.
-    fn from_args(args: &Args, lr_cosine_period_override: u64) -> Self {
+    /// positions, pre-computed by [`auto_epoch_period`] when the
+    /// `lr_period_override` is the warm-restart cycle period (= one
+    /// epoch's positions), pre-computed by [`auto_epoch_period`] when
+    /// training is about to run. Both step and cos schedules share
+    /// the same period. For non-training callers (post-training log
+    /// enrich paths), pass 0; the lr column in enrich is only
+    /// meaningful when we know what the trainer actually used.
+    fn from_args(args: &Args, lr_period_override: u64) -> Self {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
             eval_type: args.eval_type().cli_name(),
             arch: if args.eval_type().uses_arch() { args.arch.cli_name() } else { String::new() },
             lr_start: args.lr,
-            lr_gamma: args.lr_gamma,
             lambda: args.lambda,
             batch_size: args.batch_size,
             batches_per_superbatch,
             teacher_csv: csv_escape(&resolve_teacher_for_log(&args.teacher)),
             sb_offset: 0,
-            lr_step_positions: args.lr_step_positions,
             lr_schedule: args.lr_schedule,
-            lr_cosine_period: lr_cosine_period_override,
+            lr_period: lr_period_override,
             lr_min: args.lr_min,
         }
     }
@@ -1422,14 +1434,14 @@ fn enrich_bullet_log_to_csv(
         let lr = match ctx.lr_schedule {
             LrScheduleKind::Step => PositionsLR::lr_at_positions(
                 ctx.lr_start,
-                ctx.lr_gamma,
-                ctx.lr_step_positions,
+                ctx.lr_min,
+                ctx.lr_period,
                 positions as u64,
             ),
             LrScheduleKind::Cos => CosineLR::lr_at_positions(
                 ctx.lr_start,
                 ctx.lr_min,
-                ctx.lr_cosine_period,
+                ctx.lr_period,
                 positions as u64,
             ),
         };
@@ -1923,17 +1935,14 @@ macro_rules! run_training_inline {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Cosine annealing cycle period: auto-derive from --superbatches
-        // (or teacher size for HCPE/PSV when unlimited). 0 for step mode.
-        let lr_cosine_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Cos) {
-            auto_cosine_period(args, format, &data_files_owned, batches_per_superbatch)
+        // Warm-restart cycle period = one epoch's positions. Both `step`
+        // (geometric) and `cos` (cosine) schedules use this same period.
+        let lr_period: u64 =
+            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch)
                 .unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(2);
-                })
-        } else {
-            0
-        };
+                });
 
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
@@ -1997,7 +2006,6 @@ macro_rules! run_training_inline {
                     end_superbatch,
                 },
                 wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                // KPPT family stays sb-based; positions-based LR is only
                 // KPPT family uses positions-based LR for consistency
                 // with the NNUE family, but does not currently track
                 // cumulative `prior_positions` across resumes (KPPT
@@ -2005,8 +2013,8 @@ macro_rules! run_training_inline {
                 lr_scheduler: match args.lr_schedule {
                     LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
                         start: args.lr,
-                        gamma: args.lr_gamma,
-                        positions_per_step: args.lr_step_positions,
+                        min: args.lr_min,
+                        period_positions: lr_period,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -2014,7 +2022,7 @@ macro_rules! run_training_inline {
                     LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
                         start: args.lr,
                         min: args.lr_min,
-                        period_positions: lr_cosine_period,
+                        period_positions: lr_period,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -2369,18 +2377,14 @@ macro_rules! run_training_inline_nnue {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Cosine annealing cycle period: auto-derive from --superbatches
-        // (or teacher size for HCPE/PSV when unlimited). 0 for step mode
-        // (PositionsLR doesn't read it).
-        let lr_cosine_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Cos) {
-            auto_cosine_period(args, format, &data_files_owned, batches_per_superbatch)
+        // Warm-restart cycle period = one epoch's positions. Both `step`
+        // (geometric) and `cos` (cosine) schedules use this same period.
+        let lr_period: u64 =
+            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch)
                 .unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(2);
-                })
-        } else {
-            0
-        };
+                });
 
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
@@ -2397,7 +2401,7 @@ macro_rules! run_training_inline_nnue {
         // explicitly passes --start-superbatch (signalling "reset sb to N"),
         // fall back to the legacy behaviour of carrying the prior position
         // sum forward from the existing top-level learn.log.
-        let mut cb_ctx = LogContext::from_args(args, lr_cosine_period);
+        let mut cb_ctx = LogContext::from_args(args, lr_period);
         let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
         let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
         // Teacher-change detection: bullet's dataloader skips
@@ -2596,8 +2600,8 @@ macro_rules! run_training_inline_nnue {
             let lr_scheduler_for_run = match args.lr_schedule {
                 LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
                     start: args.lr,
-                    gamma: args.lr_gamma,
-                    positions_per_step: args.lr_step_positions,
+                    min: args.lr_min,
+                    period_positions: lr_period,
                     prior_positions: cb_prior_position as u64,
                     batch_size: args.batch_size,
                     batches_per_superbatch,
@@ -2605,7 +2609,7 @@ macro_rules! run_training_inline_nnue {
                 LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
                     start: args.lr,
                     min: args.lr_min,
-                    period_positions: lr_cosine_period,
+                    period_positions: lr_period,
                     prior_positions: cb_prior_position as u64,
                     batch_size: args.batch_size,
                     batches_per_superbatch,
@@ -3842,16 +3846,14 @@ mod tests {
             eval_type: "SFNN_KA2",
             arch: "1536x2-15-32".to_string(),
             lr_start: 0.001,
-            lr_gamma: 0.1,
             lambda: 1.0,
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
-            lr_step_positions: 100_000_000,
             lr_schedule: LrScheduleKind::Step,
-            lr_cosine_period: 500_000_000,
-            lr_min: 0.0,
+            lr_period: 500_000_000,
+            lr_min: 0.00001,
         };
 
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None)
@@ -3982,16 +3984,14 @@ mod tests {
             eval_type: "NNUE_KA2",
             arch: "256x2-32-32".to_string(),
             lr_start: 0.001,
-            lr_gamma: 0.1,
             lambda: 1.0,
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
-            lr_step_positions: 100_000_000,
             lr_schedule: LrScheduleKind::Step,
-            lr_cosine_period: 500_000_000,
-            lr_min: 0.0,
+            lr_period: 500_000_000,
+            lr_min: 0.00001,
         };
         let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
@@ -4060,38 +4060,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// enrich の lr 列が cumulative positions に応じて drop することを確認。
+    /// 新 step (geometric) schedule の検証: 1 epoch 末で lr_min、cycle 跨ぎで
+    /// warm restart して lr_max に戻る。
     #[test]
-    fn enrich_with_lr_step_positions_uses_positions_based_formula() {
-        let ctx = LogContext {
-            eval_type: "NNUE_KP",
-            arch: "256x2-32-32".to_string(),
-            lr_start: 0.001,
-            lr_gamma: 0.1,
-            lambda: 1.0,
-            batch_size: 16384,
-            batches_per_superbatch: 6104,
-            teacher_csv: "teachers/round.hcpe".to_string(),
-            sb_offset: 0,
-            lr_step_positions: 800_000_000,
-            lr_schedule: LrScheduleKind::Step,
-            lr_cosine_period: 500_000_000,
-            lr_min: 0.0,
-        };
-        // batch=32 with prior=0: positions = 32*16384 = 524,288 → step 0 → lr 0.001
-        // batch=6000 with prior=0: positions = 6000*16384 = 98,304,000 → step 0 → lr 0.001
-        let raw = "1,32,0.07\n1,6000,0.06\n";
-        let body = enrich_bullet_log_to_csv(raw, &ctx, 1, "nnue", 0, None);
-        for row in body.lines() {
-            let cols: Vec<&str> = row.split(',').collect();
-            let lr: f32 = cols[7].parse().unwrap();
-            assert!((lr - 0.001).abs() < 1e-7, "lr should still be 0.001, got {lr} from row {row}");
-        }
-        // Push position_offset to 800M; lr drops to 0.0001 once positions ≥ 800M
-        let body2 = enrich_bullet_log_to_csv("1,32,0.05\n", &ctx, 1, "nnue", 800_000_000, None);
-        let cols: Vec<&str> = body2.lines().next().unwrap().split(',').collect();
-        let lr: f32 = cols[7].parse().unwrap();
-        assert!((lr - 0.0001).abs() < 1e-7, "lr should drop to 0.0001 past 800M, got {lr}");
+    fn step_lr_geometric_warm_restart() {
+        let max = 0.001f32;
+        let min = 0.00001f32;
+        let period = 500_000_000u64;
+        // t=0 → lr_max
+        let lr = PositionsLR::lr_at_positions(max, min, period, 0);
+        assert!((lr - max).abs() < 1e-7, "t=0 should be lr_max, got {lr}");
+        // t=0.5 → log-space midpoint = sqrt(max * min)
+        let lr = PositionsLR::lr_at_positions(max, min, period, period / 2);
+        let geomean = (max as f64 * min as f64).sqrt() as f32;
+        assert!((lr - geomean).abs() < 1e-6, "t=0.5 should be geomean {geomean}, got {lr}");
+        // Just before cycle end → near lr_min
+        let lr = PositionsLR::lr_at_positions(max, min, period, period - 1);
+        assert!(lr < min * 1.1, "near t=1 should approach lr_min, got {lr}");
+        // Exact cycle boundary → warm restart to lr_max
+        let lr = PositionsLR::lr_at_positions(max, min, period, period);
+        assert!((lr - max).abs() < 1e-7, "cycle boundary should warm-restart to lr_max, got {lr}");
     }
 
     /// CosineLR の式: lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt)) が
@@ -4128,15 +4116,13 @@ mod tests {
             eval_type: "NNUE_KP",
             arch: "256x2-32-32".to_string(),
             lr_start: 0.001,
-            lr_gamma: 0.9, // ignored for Cos
             lambda: 1.0,
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/c.hcpe".to_string(),
             sb_offset: 0,
-            lr_step_positions: 100_000_000, // ignored for Cos
             lr_schedule: LrScheduleKind::Cos,
-            lr_cosine_period: 100_000_000,
+            lr_period: 100_000_000,
             lr_min: 0.0,
         };
         // batch=32, prior=0 → positions = 524,288 → t ≈ 0.00524 → lr ≈ lr_max
@@ -4161,16 +4147,14 @@ mod tests {
             eval_type: "NNUE_KP",
             arch: "256x2-32-32".to_string(),
             lr_start: 0.001,
-            lr_gamma: 0.1,
             lambda: 1.0,
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/round2.hcpe".to_string(),
             sb_offset: 1, // = "round 1 saved sb 1, this run is the round 2 continuation"
-            lr_step_positions: 800_000_000,
             lr_schedule: LrScheduleKind::Step,
-            lr_cosine_period: 500_000_000,
-            lr_min: 0.0,
+            lr_period: 800_000_000,
+            lr_min: 0.00001,
         };
         // bullet's local sb in raw log is 1 (= first sb of round 2). With
         // sb_offset=1, the enriched row should display sb=2.
@@ -4182,8 +4166,13 @@ mod tests {
         let cols0: Vec<&str> = rows[0].split(',').collect();
         assert_eq!(cols0[2], "2", "absolute sb (= 1 + offset 1)");
         // positions = prior 60M + b*batch_size = 60M + 32*16384 = 60_524_288
-        // 60.5M < 800M → still on step 0, so lr stays at start
-        assert_eq!(cols0[7], "0.001000", "lr at 60.5M positions (still pre-step, 6-decimal format)");
+        // With step (geometric) schedule, lr decays smoothly from positions 0.
+        // At 60.5M / 800M = t≈0.0756, lr ≈ 0.001 * (1e-5/1e-3)^0.0756 ≈ 0.000706.
+        let lr_val: f32 = cols0[7].parse().expect("lr col is a float");
+        assert!(
+            (lr_val - 0.000706).abs() < 1e-5,
+            "step lr at 60.5M of 800M period should be ~0.000706, got {lr_val}"
+        );
         assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 
@@ -4314,16 +4303,14 @@ mod tests {
             eval_type: "NNUE_KA2",
             arch: "256x2-32-32".to_string(),
             lr_start: 0.001,
-            lr_gamma: 0.1,
             lambda: 1.0,
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             sb_offset: 0,
-            lr_step_positions: 100_000_000,
             lr_schedule: LrScheduleKind::Step,
-            lr_cosine_period: 500_000_000,
-            lr_min: 0.0,
+            lr_period: 500_000_000,
+            lr_min: 0.00001,
         };
         let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
         assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
