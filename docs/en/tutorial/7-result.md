@@ -97,7 +97,7 @@ A healthy training run typically shows:
 
 2. **`lr` follows the configured schedule**
    - `--lr-schedule step` (default): multiplied by `--lr-gamma` every `--lr-step-positions` positions. E.g. `--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` decays 0.001 → 0.0009 → 0.00081 → … every 100M cumulative positions.
-   - `--lr-schedule cos`: cosine annealing sweeping `--lr` (lr_max) → `--lr-min` per `--lr-cosine-period`, then warm-restarts.
+   - `--lr-schedule cos`: cosine annealing sweeping `--lr` (lr_max) → `--lr-min` over one epoch (= `--superbatches × sb_size` positions), then warm-restarts to `--lr` at each epoch boundary.
    - If it isn't moving as expected, double-check the LR flags ([§6.1 Training schedule](6-tune.md#61-training-schedule)).
 
 3. **`positions` is monotonically increasing** (within a run and across resumes)

@@ -90,6 +90,15 @@ KPPT 系では `--arch` 不要 (architecture は固定):
 
 `--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
 
+教師サイズが事前にわかっていると `--superbatches N` で「1 epoch = N sb」を明示できる ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)。教師の総局面数を一瞬で数える `--count-teacher` フラグがある:
+
+```bash
+./target/release/examples/bulletou --count-teacher --teacher teachers/
+# → "Total: 461373440 positions, suggested --superbatches 4"
+```
+
+cosine annealing (`--lr-schedule cos`) を使うときは特に重要 — 1 cycle が 1 epoch とぴったり合うように `--superbatches` を選ぶと、各 epoch 末で lr_min に着地、次 epoch 頭で lr_max に warm restart、というきれいなサイクルになる。
+
 ## 4.8 期待される出力
 
 動いていれば以下のような出力が流れる:

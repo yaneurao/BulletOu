@@ -97,7 +97,7 @@ print(df["value_loss"].describe())   # loss の統計
 
 2. **`lr` がスケジュール通りに動いている**
    - `--lr-schedule step` (デフォルト): `--lr-step-positions` 局面ごとに `--lr-gamma` 倍。例: `--lr 0.001 --lr-gamma 0.9 --lr-step-positions 100000000` なら 100M ごとに 0.9 倍 (0.001 → 0.0009 → 0.00081 → …)
-   - `--lr-schedule cos`: cosine annealing で `--lr` (lr_max) → `--lr-min` を `--lr-cosine-period` 局面で 1 周期。各 cycle 末で warm restart
+   - `--lr-schedule cos`: cosine annealing で `--lr` (lr_max) → `--lr-min` を 1 epoch (= `--superbatches × sb_size` 局面) で 1 周期。各 cycle 末 (= epoch 末) で warm restart して `--lr` に戻る
    - 期待通り変化していないなら lr 系フラグの値を見直す ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)
 
 3. **`positions` が単調増加** (run 内、resume 跨いでも)

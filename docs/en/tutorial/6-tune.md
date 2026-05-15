@@ -20,7 +20,7 @@ Main flags:
 | `--lr` | Starting LR (lr_max) | 0.001 |
 | `--lr-schedule` | `step` (exponential decay) or `cos` (cosine annealing + warm restart) | `step` |
 | `--lr-gamma` / `--lr-step-positions` | (step only) multiply LR by `lr-gamma` every `lr-step-positions` cumulative positions | 0.9 / 100000000 |
-| `--lr-cosine-period` / `--lr-min` | (cos only) one cosine cycle sweeps `--lr` → `--lr-min` over `--lr-cosine-period` positions, then warm-restarts | 500000000 / 0.0 |
+| `--lr-min` | (cos only) floor LR reached at cycle end. Cycle length is auto-computed from `--superbatches` / teacher size | 0.0 |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
@@ -60,22 +60,30 @@ t  = (cumulative_positions mod cosine_period) / cosine_period
 lr = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(π · t))
 ```
 
-Example with `--lr-cosine-period 500000000 --lr-min 0.00001`:
+**`cosine_period` is auto-derived** — there's no separate `--lr-cosine-period` flag (it was removed). The rules:
+
+| Situation | period |
+|---|---|
+| `--superbatches N` set | `N × sb_size` (= one epoch, the **recommended** setup) |
+| Unlimited sb AND HCPE / PSV teacher | Total teacher position count (read from file sizes) |
+| Unlimited sb AND HCPE3 / pack teacher | Error — variable-length format, set `--superbatches` explicitly |
+
+Example: `--superbatches 4 --lr-schedule cos --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M positions):
 
 | Position within cycle | t | lr |
 |---|---|---|
-| 0M (cycle start) | 0.0 | 0.001 (= `--lr`, lr_max) |
-| 125M | 0.25 | 0.000856 |
-| 250M | 0.5 | 0.000505 (midpoint) |
-| 375M | 0.75 | 0.000155 |
-| 500M (cycle end) | 1.0 | 0.00001 (= `--lr-min`, lr_min) |
-| 500M + 1 | 0.0 (next cycle) | **0.001** ← warm restart |
+| 0M (sb 1 start) | 0.0 | 0.001 (= `--lr`, lr_max) |
+| 100M (sb 2 start) | 0.25 | 0.000856 |
+| 200M (sb 3 start) | 0.5 | 0.000505 (midpoint) |
+| 300M (sb 4 start) | 0.75 | 0.000155 |
+| 400M (sb 4 end) | 1.0 | 0.00001 (= `--lr-min`, lr_min) |
+| Next epoch sb 1 | 0.0 | **0.001** ← warm restart |
 
-Set `--lr-cosine-period` equal to one epoch's worth of positions to get exactly one full cosine sweep per epoch, with the warm restart aligned to the epoch boundary.
+Pick `--superbatches` so each epoch is a clean cosine cycle — see [§6.1.x Count the teacher to pick --superbatches](#count-the-teacher-to-pick---superbatches) below.
 
 #### Comparing `step` vs `cos`
 
-Run twice on the same teacher / same architecture and overlay the `learn.log` curves. Use `--tag` to keep the output directories distinct:
+Run twice on the same teacher / same architecture and overlay the `summary-learn.log` curves. Use `--tag` to keep the output directories distinct:
 
 ```bash
 # stepwise
@@ -89,11 +97,51 @@ Run twice on the same teacher / same architecture and overlay the `learn.log` cu
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type NNUE_KP --arch 256x2-32-32 \
-    --max-epochs 10 --tag 5G-cos \
-    --lr-schedule cos --lr-cosine-period 500000000 --lr-min 0.00001
+    --max-epochs 10 --tag 5G-cos --superbatches 4 \
+    --lr-schedule cos --lr-min 0.00001
 ```
 
-The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. Load each `learn.log` in pandas / Excel and compare the `test_value_accuracy` / `test_value_loss` columns to see which schedule helps more on your teacher.
+The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. Load each `summary-learn.log` in pandas / Excel and compare the `test_value_accuracy` / `test_value_loss` columns to see which schedule helps more on your teacher.
+
+### Count the teacher to pick `--superbatches`
+
+To align cosine cycles to epoch boundaries, you need to know the teacher's total position count. BulletOu has a dedicated flag for that: `--count-teacher`. It reads `std::fs::metadata` only (no actual file content), so it's **instant even for hundreds of GB**:
+
+```bash
+./target/release/examples/bulletou --count-teacher --teacher teachers/
+```
+
+Example output:
+```
+Counting Hcpe teacher files (38 byte/record)...
+        92274688 positions  ( 3340.66 MB)  teachers/yane-distill-0001.hcpe
+        92274688 positions  ( 3340.66 MB)  teachers/yane-distill-0002.hcpe
+        92274688 positions  ( 3340.66 MB)  teachers/yane-distill-0003.hcpe
+        92274688 positions  ( 3340.66 MB)  teachers/yane-distill-0004.hcpe
+        92274688 positions  ( 3340.66 MB)  teachers/yane-distill-0005.hcpe
+---
+Total: 461373440 positions  (16.71 GB)  across 5 file(s)
+Per-default-sb (= 100M positions): 4 full sb + 0.61 partial sb
+Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftover ...)
+```
+
+Then `--superbatches 4` gives:
+- 1 epoch = 4 sb = 400M positions
+- cos period = 400M (= exactly 1 epoch)
+- `lr_min` lands at end of sb 4; warm restart to `lr_max` at sb 1 of the next epoch
+
+The trailing 61M of teacher is not used (= each epoch re-shuffles the same first 400M). A small amount of waste is usually preferable to ragged cosine cycles.
+
+#### Supported formats
+
+| Format | Record size | `--count-teacher` |
+|---|---|---|
+| HCPE | 38 byte fixed | ✅ instant |
+| PSV  | 40 byte fixed | ✅ instant |
+| HCPE3 | variable (game-structured) | ❌ not yet (would need to walk every game header) |
+| pack | variable (game-structured) | ❌ same |
+
+For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` manually.
 
 ### Multi-epoch training
 
@@ -101,7 +149,7 @@ The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. 
 - The LR scheduler resets (superbatch counter back to 1, `lr = --lr`) — applies to both `step` and `cos`.
 - The dataloader rewinds to the beginning of the data.
 
-Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--lr-cosine-period = epoch_size` is the canonical SGDR setup.
+Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup).
 
 ## 6.2 Training target (`--lambda`)
 
