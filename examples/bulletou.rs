@@ -1082,13 +1082,22 @@ fn enrich_bullet_log_to_csv(
         } else {
             std::borrow::Cow::Owned(format!("{}/{}", head, component))
         };
+        // All numeric float columns are formatted at fixed 6 decimals
+        // for readability. `train` arrives as bullet's raw string (e.g.
+        // "0.07035521"); reparse and re-format if possible, otherwise
+        // pass through unchanged so a future schema change in bullet's
+        // log doesn't silently lose data.
+        let train_field: std::borrow::Cow<'_, str> = match train_loss.parse::<f32>() {
+            Ok(v) => std::borrow::Cow::Owned(format!("{v:.6}")),
+            Err(_) => std::borrow::Cow::Borrowed(train_loss),
+        };
         out.push_str(&format!(
-            "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr},{lambda:.3},{positions},{teacher}\n",
+            "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr:.6},{lambda:.6},{positions},{teacher}\n",
             eval = eval_field,
             sb = absolute_sb,
             ta = test_acc_field,
             tl = test_loss_field,
-            train = train_loss,
+            train = train_field,
             lambda = ctx.lambda,
             teacher = ctx.teacher_csv,
         ));
@@ -3414,7 +3423,7 @@ mod tests {
         assert_eq!(cols0[2], "2", "absolute sb (= 1 + offset 1)");
         // positions = prior 60M + b*batch_size = 60M + 32*16384 = 60_524_288
         // 60.5M < 800M → still on step 0, so lr stays at start
-        assert_eq!(cols0[7], "0.001", "lr at 60.5M positions (still pre-step)");
+        assert_eq!(cols0[7], "0.001000", "lr at 60.5M positions (still pre-step, 6-decimal format)");
         assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 
