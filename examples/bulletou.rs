@@ -412,9 +412,20 @@ struct Args {
     #[arg(long, default_value = "1")]
     max_epochs: usize,
 
-    /// Starting superbatch counter (>1 to resume / extend).
-    #[arg(long, default_value = "1")]
-    start_superbatch: usize,
+    /// Starting superbatch counter for the LR scheduler and the trainer's
+    /// internal superbatch numbering.
+    ///
+    /// When omitted (the normal case), it auto-resumes from the latest
+    /// saved superbatch found under `--output`: the next run continues
+    /// the LR schedule from `last_saved_sb + 1` instead of restarting at
+    /// 1. If no saved checkpoints exist, training starts from sb 1 as
+    /// before.
+    ///
+    /// Pass an explicit value to override (e.g. `--start-superbatch 1` to
+    /// force the LR schedule to restart from the beginning even when
+    /// resuming from a state.bin).
+    #[arg(long)]
+    start_superbatch: Option<usize>,
 
     /// Initial Adam learning rate.
     #[arg(long, default_value = "0.001")]
@@ -902,6 +913,49 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
     map
 }
 
+/// Detect the latest saved superbatch number from the highest-numbered
+/// `<output_dir>/<NNNN>/learn.log`. Used to auto-resume the LR scheduler
+/// (and the trainer's internal sb counter) at `last_sb + 1` instead of
+/// silently restarting from sb=1 when the user re-runs the same command
+/// after Ctrl+C.
+///
+/// Returns `None` if there is no numbered dir, no `learn.log`, or no
+/// parseable sb column — which collapses to "treat as a fresh run" by
+/// the caller.
+fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
+    let mut latest_idx: Option<usize> = None;
+    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(n) = name.parse::<usize>() else { continue };
+        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
+    }
+    let n = latest_idx?;
+    let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
+    let content = std::fs::read_to_string(&learn_log).ok()?;
+    // 9-column rows: eval, epoch, sb, batch, loss, lr, lambda, positions, teacher.
+    // sb is at column index 2. All rows in a single per-superbatch dir share the
+    // same sb (bullet flushes log.txt at save time and the dir captures one save
+    // event), so taking the max is robust whether the schedule is save_rate=1
+    // or larger.
+    let mut max_sb: Option<usize> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(9, ',').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(sb) = parts[2].parse::<usize>() else { continue };
+        max_sb = Some(max_sb.map_or(sb, |m| m.max(sb)));
+    }
+    max_sb
+}
+
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 7-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
 /// the top-level `<output>/learn.log`, writing the CSV header on first
@@ -1140,7 +1194,10 @@ macro_rules! run_training_inline {
                 steps: TrainingSteps {
                     batch_size: args.batch_size,
                     batches_per_superbatch,
-                    start_superbatch: args.start_superbatch,
+                    // KPPT family does not get auto-resume yet (the 3-component
+                    // assembly makes the bookkeeping non-trivial). Treat
+                    // `--start-superbatch` as a plain default-1 flag for now.
+                    start_superbatch: args.start_superbatch.unwrap_or(1),
                     end_superbatch,
                 },
                 wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
@@ -1423,16 +1480,45 @@ macro_rules! run_training_inline_nnue {
         let mut last_net_id_for_epoch: String = net_id_base.clone();
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
+        // Auto-resume: if --start-superbatch is unspecified and a previous
+        // run left numbered checkpoint dirs under output_dir, continue the
+        // sb counter (and therefore the LR schedule) from the last saved
+        // superbatch + 1 instead of silently restarting at sb=1.
+        //
+        // When sb is auto-continued, `positions_at(sb, b, 0)` already gives
+        // the correct cumulative position count (sb itself encodes the
+        // history), so the prior-position offset is 0. When the user
+        // explicitly passes --start-superbatch (signalling "reset sb to N"),
+        // fall back to the legacy behaviour of carrying the prior position
+        // sum forward from the existing top-level learn.log.
+        let cb_ctx = LogContext::from_args(args);
+        let cb_top_level_log = output_dir_buf.join("learn.log");
+        let auto_resume_sb = read_latest_saved_superbatch(&output_dir_buf);
+        let effective_start_superbatch = args
+            .start_superbatch
+            .unwrap_or_else(|| auto_resume_sb.map(|n| n + 1).unwrap_or(1));
+        let cb_prior_position = if args.start_superbatch.is_none() && auto_resume_sb.is_some() {
+            0
+        } else {
+            read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
+        };
+        let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
+
+        if args.start_superbatch.is_none() {
+            if let Some(last_sb) = auto_resume_sb {
+                eprintln!(
+                    "  auto-resuming from superbatch {} (last saved: {}); LR schedule continues. \
+                     pass --start-superbatch to override.",
+                    effective_start_superbatch, last_sb
+                );
+            }
+        }
+
         // Per-superbatch incremental finalize: rename `<net_id>-<sb>` →
         // `<NNNN>/`, generate per-dir `learn.log`, append to top-level
         // `learn.log` — done inside `on_checkpoint_saved` so that killing
         // training mid-run still leaves a clean numbered layout and a
         // resumable top-level log.
-        let cb_ctx = LogContext::from_args(args);
-        let cb_top_level_log = output_dir_buf.join("learn.log");
-        let cb_prior_position =
-            read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0);
-        let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
@@ -1451,7 +1537,10 @@ macro_rules! run_training_inline_nnue {
                 steps: TrainingSteps {
                     batch_size: args.batch_size,
                     batches_per_superbatch,
-                    start_superbatch: args.start_superbatch,
+                    // Auto-resumed sb (or user-provided override) from the
+                    // pre-loop computation above. Same value across epochs
+                    // because the LR schedule is global, not per-epoch.
+                    start_superbatch: effective_start_superbatch,
                     end_superbatch,
                 },
                 wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
@@ -2484,6 +2573,58 @@ mod tests {
             assert!(row.starts_with("SFNN_KA2-1536x2-15-32,"));
         }
         // cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `read_latest_saved_superbatch` が `<NNNN>/learn.log` の sb 列を
+    /// 正しく拾うことを確認。auto-resume の出発点。
+    #[test]
+    fn read_latest_saved_superbatch_picks_max_sb() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-resume-sb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 空 dir → None
+        assert_eq!(read_latest_saved_superbatch(&tmp), None);
+
+        // 0001/ だけあって learn.log 無し → None
+        let d1 = tmp.join("0001");
+        std::fs::create_dir(&d1).unwrap();
+        assert_eq!(read_latest_saved_superbatch(&tmp), None);
+
+        // 0001/learn.log の sb 列が 1 → 1 が返る
+        std::fs::write(
+            d1.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,1,32,0.1,0.001,1.000,524288,t.hcpe\n\
+                 NNUE_KP-256x2-32-32,1,1,64,0.09,0.001,1.000,1048576,t.hcpe\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_superbatch(&tmp), Some(1));
+
+        // 0004/ も追加 (sb=4 のログ) → 最高番号 dir の sb が返る
+        let d4 = tmp.join("0004");
+        std::fs::create_dir(&d4).unwrap();
+        std::fs::write(
+            d4.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,4,32,0.06,0.001,1.000,2097152,t.hcpe\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
+
+        // 不正 dir 名 (foo/) は無視
+        std::fs::create_dir(tmp.join("foo")).unwrap();
+        assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
