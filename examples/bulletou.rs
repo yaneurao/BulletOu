@@ -986,10 +986,11 @@ fn csv_escape(s: &str) -> String {
 }
 
 /// Per-superbatch validation result attached to a single save dir's
-/// enriched `learn.log`. When `Some`, every row of that dir gets the
-/// same `test_value_accuracy` / `test_value_loss` (validation runs once
-/// per save event, so all rows in one save share the same metric).
-/// When `None`, both columns are emitted as `-`.
+/// enriched `learn.log`. When `Some`, only the LAST row of each
+/// superbatch in that dir carries the metric (validation runs once per
+/// save, so per-batch rows that are not at the sb boundary should not
+/// claim a value they did not measure); other rows emit `-`. When the
+/// caller passes `None`, every row's two metric columns are `-`.
 #[derive(Clone, Copy, Debug)]
 struct TestMetrics {
     accuracy: f32,
@@ -1015,22 +1016,37 @@ fn enrich_bullet_log_to_csv(
     test_metrics: Option<TestMetrics>,
 ) -> String {
     let mut out = String::new();
-    let (test_acc_field, test_loss_field): (String, String) = match test_metrics {
+    let (test_acc_filled, test_loss_filled): (String, String) = match test_metrics {
         Some(m) => (format!("{:.6}", m.accuracy), format!("{:.6}", m.loss)),
         None => ("-".to_string(), "-".to_string()),
     };
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.splitn(3, ',').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let Ok(local_sb) = parts[0].parse::<usize>() else { continue };
-        let Ok(b) = parts[1].parse::<usize>() else { continue };
-        let train_loss = parts[2];
+    // Pre-parse so we can identify the last raw row of each superbatch.
+    // Validation runs once per sb save, so the metric only applies to
+    // the row that closes the sb; intermediate per-batch rows show `-`.
+    let parsed: Vec<(usize, usize, &str)> = raw
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let parts: Vec<&str> = line.splitn(3, ',').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            let sb = parts[0].parse::<usize>().ok()?;
+            let b = parts[1].parse::<usize>().ok()?;
+            Some((sb, b, parts[2]))
+        })
+        .collect();
+    let n = parsed.len();
+    for (i, &(local_sb, b, train_loss)) in parsed.iter().enumerate() {
+        let is_sb_boundary = i + 1 == n || parsed[i + 1].0 != local_sb;
+        let (test_acc_field, test_loss_field) = if is_sb_boundary {
+            (test_acc_filled.as_str(), test_loss_filled.as_str())
+        } else {
+            ("-", "-")
+        };
         // Absolute (= cumulative across rounds) sb. Bullet's `log.txt`
         // carries its own internal sb counter (= local within the run);
         // when the macro had to reset bullet's sb=1 for a teacher-changed
@@ -1214,6 +1230,12 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
 /// file creation. The result is a single pure CSV — no section headers,
 /// no separators — that pandas / Excel can load directly.
 ///
+/// To keep the top-level file readable as a sb-level summary (rather
+/// than a per-batch dump), only the **last row** of each (eval, sb)
+/// group from the per-dir log is appended — exactly one row per
+/// superbatch save per component. The full per-batch series is still
+/// available in each `<NNNN>/learn.log`.
+///
 /// If the existing top-level `learn.log` was written by an older version
 /// of `bulletou` (= a different header line than the current
 /// [`LEARN_LOG_HEADER`]), this returns `InvalidData` so the caller can
@@ -1266,9 +1288,28 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
         // first time: write the header before the first data block
         writeln!(file, "{LEARN_LOG_HEADER}")?;
     }
-    file.write_all(body_no_header.as_bytes())?;
-    if !body_no_header.ends_with('\n') {
-        file.write_all(b"\n")?;
+    // Filter to the last row of each (eval column, sb column) group.
+    // Rows in the per-dir log are emitted in (component, sb, batch)
+    // order, so a row is "last in its group" iff the next row's
+    // (eval, sb) pair differs (or there is no next row).
+    let lines: Vec<&str> = body_no_header.lines().filter(|l| !l.is_empty()).collect();
+    let key_of = |line: &str| -> Option<(String, String)> {
+        let parts: Vec<&str> = line.splitn(11, ',').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        Some((parts[0].to_string(), parts[2].to_string()))
+    };
+    for (i, line) in lines.iter().enumerate() {
+        let Some(here) = key_of(line) else { continue };
+        let next_differs = match lines.get(i + 1) {
+            Some(next) => key_of(next).map(|k| k != here).unwrap_or(true),
+            None => true,
+        };
+        if next_differs {
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
     }
     Ok(())
 }
@@ -3255,13 +3296,60 @@ mod tests {
         let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
         let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
         assert_eq!(body_lines.len(), 2);
-        for row in &body_lines {
-            let cols: Vec<&str> = row.split(',').collect();
-            assert_eq!(cols.len(), 11);
-            // Expect formatted floats (6 decimal places per impl)
-            assert_eq!(cols[4], "0.876500", "test_value_accuracy should be the metric");
-            assert_eq!(cols[5], "0.051200", "test_value_loss should be the metric");
-        }
+        // Validation runs once per superbatch, so only the LAST row of
+        // each sb (here: the second of two rows for sb=7) carries the
+        // metric. Earlier rows show `-` for the test_value_* columns.
+        let cols0: Vec<&str> = body_lines[0].split(',').collect();
+        assert_eq!(cols0.len(), 11);
+        assert_eq!(cols0[4], "-", "non-boundary row's test_value_accuracy should be `-`");
+        assert_eq!(cols0[5], "-", "non-boundary row's test_value_loss should be `-`");
+        let cols1: Vec<&str> = body_lines[1].split(',').collect();
+        assert_eq!(cols1.len(), 11);
+        assert_eq!(cols1[4], "0.876500", "sb-boundary row carries test_value_accuracy");
+        assert_eq!(cols1[5], "0.051200", "sb-boundary row carries test_value_loss");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `append_to_top_level_log` should keep only the LAST row of each
+    /// (eval, sb) group so the top-level summary stays sb-granularity
+    /// even though per-dir `learn.log` is per-batch granularity.
+    #[test]
+    fn append_to_top_level_log_keeps_only_sb_boundary_rows() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-toplog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.join("0001");
+        std::fs::create_dir(&dir).unwrap();
+        // Per-dir learn.log: 3 rows for sb=1, 2 rows for sb=2.
+        let body = format!(
+            "{header}\n\
+             E,1,1,32,-,-,0.10,0.001,1.000,524288,t.hcpe\n\
+             E,1,1,64,-,-,0.09,0.001,1.000,1048576,t.hcpe\n\
+             E,1,1,96,0.50,0.30,0.08,0.001,1.000,1572864,t.hcpe\n\
+             E,1,2,32,-,-,0.07,0.001,1.000,2097152,t.hcpe\n\
+             E,1,2,64,0.55,0.28,0.06,0.001,1.000,2621440,t.hcpe\n",
+            header = LEARN_LOG_HEADER,
+        );
+        std::fs::write(dir.join("learn.log"), body).unwrap();
+        append_to_top_level_log(&tmp, 1).unwrap();
+        let top = std::fs::read_to_string(tmp.join("learn.log")).unwrap();
+        let lines: Vec<&str> = top.lines().collect();
+        assert_eq!(lines[0], LEARN_LOG_HEADER, "first line is header");
+        // Two data rows: the sb=1 boundary row (b=96) and the sb=2
+        // boundary row (b=64); the three intermediate rows are dropped.
+        assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
+        let cols1: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(cols1[2], "1", "first kept row is sb=1");
+        assert_eq!(cols1[3], "96", "...specifically the last batch of sb=1");
+        let cols2: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(cols2[2], "2", "second kept row is sb=2");
+        assert_eq!(cols2[3], "64", "...specifically the last batch of sb=2");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
