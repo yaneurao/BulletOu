@@ -618,6 +618,12 @@ impl Args {
 
 fn main() {
     let args = Args::parse();
+    if let Err(e) = record_invocation_to_tag_txt(&args) {
+        eprintln!(
+            "warning: failed to write tag.txt under {}: {e}",
+            args.output_dir().display()
+        );
+    }
     match args.eval_type {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         EvalType::NnueHalfkp => run_halfkp(&args),
@@ -629,6 +635,39 @@ fn main() {
         EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
         EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
     }
+}
+
+/// Record this process's argv into `<output>/tag.txt` so that, weeks
+/// later, the user can recall which CLI invocation produced this
+/// checkpoint directory. Always appends; one line per invocation
+/// `<unix_ts>\t<arg0> <arg1> ...`. Resumes accumulate a history.
+///
+/// Failures are non-fatal — if we can't even create the output dir
+/// here (permissions, broken path, …), the training step itself will
+/// likely report the same problem in a clearer context, so we just
+/// log a warning and let the run continue.
+fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
+    use std::io::Write;
+    let output_dir = args.output_dir();
+    std::fs::create_dir_all(&output_dir)?;
+    let tag_path = output_dir.join("tag.txt");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // argv joined with single spaces; quoting/escaping is intentionally
+    // not applied — the line is for human eyeballing, not for re-execution.
+    // (clap-parsed values are mostly path/identifier strings without
+    // spaces; if the user did pass a quoted path, the original quoting
+    // is lost by the time we see std::env::args, so reconstructing it is
+    // best-effort regardless.)
+    let cmdline: String = std::env::args().collect::<Vec<_>>().join(" ");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&tag_path)?;
+    writeln!(f, "{ts}\t{cmdline}")?;
+    Ok(())
 }
 
 /// Count numbered subdirectories under `output_dir` whose names parse as
