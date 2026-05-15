@@ -13,15 +13,18 @@ impl TrainingSteps {
         println!("Batch Size             : {}", ansi(self.batch_size, 31));
         println!("Batches / Superbatch   : {}", ansi(self.batches_per_superbatch, 31));
         println!("Positions / Superbatch : {}", ansi(self.batches_per_superbatch * self.batch_size, 31));
-        println!("Start Superbatch       : {}", ansi(self.start_superbatch, 31));
         // `usize::MAX` is the sentinel for "no cap" (set when `--superbatches`
-        // is omitted). Showing the raw integer is just noise.
-        let end_label: String = if self.end_superbatch == usize::MAX {
-            "u64_max".to_string()
+        // is omitted). When start == end (the common case for save_rate=1
+        // chunks), collapse to a single line; otherwise show the inclusive
+        // range. Either way, one line replaces the old "Start / End" pair.
+        let sb_label: String = if self.end_superbatch == usize::MAX {
+            format!("{}.. (no cap)", self.start_superbatch)
+        } else if self.start_superbatch == self.end_superbatch {
+            self.start_superbatch.to_string()
         } else {
-            self.end_superbatch.to_string()
+            format!("{}..={}", self.start_superbatch, self.end_superbatch)
         };
-        println!("End Superbatch         : {}", ansi(end_label, 31));
+        println!("Superbatch             : {}", ansi(sb_label, 31));
     }
 }
 
