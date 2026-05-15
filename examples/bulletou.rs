@@ -1423,6 +1423,17 @@ macro_rules! run_training_inline_nnue {
         let mut last_net_id_for_epoch: String = net_id_base.clone();
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
+        // Per-superbatch incremental finalize: rename `<net_id>-<sb>` →
+        // `<NNNN>/`, generate per-dir `learn.log`, append to top-level
+        // `learn.log` — done inside `on_checkpoint_saved` so that killing
+        // training mid-run still leaves a clean numbered layout and a
+        // resumable top-level log.
+        let cb_ctx = LogContext::from_args(args);
+        let cb_top_level_log = output_dir_buf.join("learn.log");
+        let cb_prior_position =
+            read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0);
+        let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
+
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -1451,13 +1462,40 @@ macro_rules! run_training_inline_nnue {
             let net_id_for_cb = net_id_for_epoch.clone();
             let output_dir_for_cb = output_dir_buf.clone();
             let saved_any_ref = &saved_any;
+            let cb_ctx_ref = &cb_ctx;
+            let cb_next_idx_ref = &cb_next_idx;
             let on_checkpoint_saved = move |superbatch: usize| {
                 saved_any_ref.set(true);
                 let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
-                match convert_save_dir_to_nnue_layout(&ckpt_dir) {
-                    Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display()),
+                if let Err(e) = convert_save_dir_to_nnue_layout(&ckpt_dir) {
+                    eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display());
+                    return;
+                }
+                eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display());
+                let idx = cb_next_idx_ref.get();
+                match finalize_one_nnue_dir(
+                    &output_dir_for_cb,
+                    &ckpt_dir,
+                    cb_ctx_ref,
+                    epoch,
+                    idx,
+                    cb_prior_position,
+                ) {
+                    Ok(dst) => {
+                        cb_next_idx_ref.set(idx + 1);
+                        if let Err(e) = append_to_top_level_log(&output_dir_for_cb, idx) {
+                            eprintln!(
+                                "  WARN: failed to update {}: {e}",
+                                output_dir_for_cb.join("learn.log").display()
+                            );
+                        }
+                        eprintln!("  -> {}/", dst.display());
+                    }
                     Err(e) => {
-                        eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display())
+                        eprintln!(
+                            "  WARN: failed to finalise {} into NNNN/: {e}",
+                            ckpt_dir.display()
+                        );
                     }
                 }
             };
@@ -1677,6 +1715,10 @@ fn run_halfkp(args: &Args) {
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -1768,6 +1810,10 @@ fn run_kp(args: &Args) {
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -1859,6 +1905,10 @@ fn run_nnue_ka2(args: &Args) {
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -1950,6 +2000,10 @@ fn run_halfkpe9(args: &Args) {
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -2040,6 +2094,10 @@ fn run_halfkpvm(args: &Args) {
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -2224,6 +2282,10 @@ where
     let top_level_log = output_dir.join("learn.log");
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
+        // (0, 0) = nothing left to do (per-superbatch callback already
+        // finalised everything during training). Top-level learn.log was
+        // appended incrementally too, so skip the extra append here.
+        Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
@@ -2250,6 +2312,43 @@ where
 /// by (epoch, sb), rename them to `0NNN/` starting at `existing_count + 1`,
 /// and enrich each dir's bullet-format `log.txt` into the 7-column CSV
 /// `learn.log` shared with KPPT.
+/// Single-dir version of [`finalize_nnue_dirs`]: rename `src` to
+/// `output_dir/<idx:04>/` and convert its raw `log.txt` to the enriched
+/// `learn.log` in the new location. Used by the per-superbatch save callback
+/// in [`run_training_inline_nnue`] so that `learn.log` and the `0001/`
+/// numbered layout are in place even if training is killed mid-run.
+fn finalize_one_nnue_dir(
+    output_dir: &std::path::Path,
+    src: &std::path::Path,
+    ctx: &LogContext,
+    epoch: usize,
+    idx: usize,
+    prior_position: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    let dst = output_dir.join(format!("{idx:04}"));
+    std::fs::rename(src, &dst)?;
+    let log_txt = dst.join("log.txt");
+    let learn_log = dst.join("learn.log");
+    let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
+    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position);
+    let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
+    content.push_str(LEARN_LOG_HEADER);
+    content.push('\n');
+    content.push_str(&body);
+    std::fs::write(&learn_log, content)?;
+    let _ = std::fs::remove_file(&log_txt);
+    Ok(dst)
+}
+
+/// Sweep any remaining bullet-named (`<net_id>-<sb>`) checkpoint dirs that
+/// were not finalised incrementally by the per-superbatch callback in
+/// [`run_training_inline_nnue`]. In normal flow this is empty (the callback
+/// finalises each dir as it is written); the only case where it has work
+/// to do is the "教師 < 1 superbatch" fallback save, which writes its
+/// bullet-named dir AFTER the training loop and so misses the callback.
+///
+/// Returns `(first_idx, last_idx)` of dirs finalised here, both `0` when
+/// nothing was left to do.
 fn finalize_nnue_dirs(
     output_dir: &std::path::Path,
     ctx: &LogContext,
@@ -2259,37 +2358,19 @@ fn finalize_nnue_dirs(
     let src_dirs = list_component_checkpoints_sorted(output_dir, net_id_prefix);
     let n = src_dirs.len();
     if n == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "no checkpoint subdirs under {} (prefix `{net_id_prefix}-`)",
-                output_dir.display()
-            ),
-        ));
+        return Ok((0, 0));
     }
 
     let existing_count = count_existing_numbered_dirs(output_dir);
 
     eprintln!(
-        "\n=== finalising {n} NNUE checkpoint dir(s) under {} (starting at #{}) ===",
+        "\n=== finalising {n} leftover NNUE checkpoint dir(s) under {} (starting at #{}) ===",
         output_dir.display(),
         existing_count + 1
     );
     for (i, (epoch, _sb, src)) in src_dirs.iter().enumerate() {
         let idx = existing_count + i + 1;
-        let dst = output_dir.join(format!("{idx:04}"));
-        std::fs::rename(src, &dst)?;
-        // Enrich bullet's `log.txt` (raw 3-col CSV) into 7-col `learn.log`.
-        let log_txt = dst.join("log.txt");
-        let learn_log = dst.join("learn.log");
-        let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
-        let body = enrich_bullet_log_to_csv(&raw, ctx, *epoch, "nnue", prior_position);
-        let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
-        content.push_str(LEARN_LOG_HEADER);
-        content.push('\n');
-        content.push_str(&body);
-        std::fs::write(&learn_log, content)?;
-        let _ = std::fs::remove_file(&log_txt);
+        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position)?;
         eprintln!("  -> {}/", dst.display());
     }
     Ok((existing_count + 1, existing_count + n))
@@ -2346,5 +2427,92 @@ mod tests {
         // L1 が 32 の倍数でない
         assert!(NnueArch::from_str("100x2-32-32").is_err());
         assert!(NnueArch::from_str("257x2-32-32").is_err());
+    }
+
+    /// `finalize_one_nnue_dir` が bullet 形式の checkpoint dir を `<NNNN>/`
+    /// に rename し、`log.txt` を 9-column の `learn.log` に変換することを確認。
+    /// per-superbatch save callback で呼ばれた場合の単発動作と等価。
+    #[test]
+    fn finalize_one_nnue_dir_renames_and_enriches() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-finalize-one-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("shogi_nnue_ka2-3");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("nn.bin"), b"dummy").unwrap();
+        std::fs::write(src.join("state.bin"), b"dummy").unwrap();
+        // bullet's raw 3-column log.txt (superbatch, batch, loss)
+        std::fs::write(src.join("log.txt"), "3,32,0.123\n3,64,0.099\n").unwrap();
+
+        let ctx = LogContext {
+            eval_type: "SFNN_KA2",
+            arch: "1536x2-15-32".to_string(),
+            lr_start: 0.001,
+            lr_gamma: 0.1,
+            lr_step: 8,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/foo.hcpe".to_string(),
+        };
+
+        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0)
+            .expect("finalize ok");
+
+        // src is gone, dst is `0005/`
+        assert!(!src.exists(), "src dir should have been renamed away");
+        assert_eq!(dst, tmp.join("0005"));
+        assert!(dst.is_dir());
+        // contents preserved
+        assert!(dst.join("nn.bin").is_file());
+        assert!(dst.join("state.bin").is_file());
+        // log.txt removed, learn.log written with header + 2 rows
+        assert!(!dst.join("log.txt").exists(), "log.txt should be deleted");
+        let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
+        assert!(learn.starts_with(LEARN_LOG_HEADER), "learn.log should start with header");
+        let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(body_lines.len(), 2, "two body rows expected");
+        // each row has 9 comma-separated fields
+        for row in &body_lines {
+            assert_eq!(row.split(',').count(), 9, "row `{row}` should be 9 columns");
+            assert!(row.starts_with("SFNN_KA2-1536x2-15-32,"));
+        }
+        // cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `finalize_nnue_dirs` がレガシー (= callback 未通過) dir をまとめて
+    /// 処理し、空のときは `(0, 0)` を返すことを確認。
+    #[test]
+    fn finalize_nnue_dirs_handles_empty_gracefully() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-finalize-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ctx = LogContext {
+            eval_type: "NNUE_KA2",
+            arch: "256x2-32-32".to_string(),
+            lr_start: 0.001,
+            lr_gamma: 0.1,
+            lr_step: 8,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/foo.hcpe".to_string(),
+        };
+        let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
+        assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
