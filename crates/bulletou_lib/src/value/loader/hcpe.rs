@@ -49,8 +49,11 @@ use super::DataLoader;
 /// HCPE 1 レコードのバイト数
 pub const HCPE_RECORD_SIZE: usize = 38;
 
-/// 1 度に読むディスクチャンクのレコード数 (`HCPE_RECORD_SIZE` × CHUNK_RECORDS バイト)
-const CHUNK_RECORDS: usize = 4096;
+/// 1 度に読むディスクチャンクのレコード数 (`HCPE_RECORD_SIZE` × CHUNK_RECORDS バイト)。
+/// 並列デコード worker に切り分けるロット単位でもあるので、worker 数 ×
+/// (1 worker が短時間で処理できるレコード数) に収まる程度の大きさが理想。
+/// 65536 × 38 ≒ 2.4 MB。
+const CHUNK_RECORDS: usize = 65536;
 
 /// 1 レコードを PackedSfenValue にデコード
 ///
@@ -127,26 +130,75 @@ where
     }
 
     fn map_chunks<F: FnMut(&[PackedSfenValue]) -> bool>(&self, start_position: usize, mut f: F) {
-        // shuffle buffer: PackedSfenValue を貯めて Fisher-Yates してから callback へ渡す。
-        let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(self.buffer_size.max(1));
-        let mut rng = SimpleRand::with_seed();
+        // 大きな shuffle buffer を 1 個満たすのに HCP → PSV のデコードが
+        // ボトルネックで、シングルスレッドだと数百秒かかる。アーキテクチャ:
+        //
+        // - **プロデューサスレッド** (1 個、std::thread::spawn): ファイルを
+        //   `CHUNK_RECORDS` 単位で読み、内部で更に `std::thread::scope` の
+        //   並列 worker で HCP→PSV デコードを cores 数だけ分担、shuffle buffer
+        //   に貯まったら Fisher-Yates して `sync_channel(0)` で送り出す。
+        // - **コンシューマ** (現スレッド): channel から buffer を受け取り
+        //   `f(&buffer)` を呼ぶ。GPU 学習はここで進む。
+        //
+        // `sync_channel(0)` (rendezvous) を使うことで、メモリピークは
+        // 2 × buffer_size (= 1 個埋めてる + 1 個 GPU が消費中) で済む。
+        // それでも生産が消費より速い場合はプロデューサが send で待機する。
 
-        // resume サポート (best-effort consume-and-drop):
-        // start_position 個の filter 通過 record を input 順序で読み飛ばす。
-        // shuffle buffer 単位の境界では fresh run と完全一致しないため best-effort 扱い。
+        let buffer_size = self.buffer_size.max(1);
+        let file_paths = self.file_paths.clone();
+        let filter = self.filter.clone();
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Vec<PackedSfenValue>>(0);
+
+        let producer = std::thread::spawn(move || {
+            Self::produce_buffers(file_paths, buffer_size, filter, start_position, tx);
+        });
+
+        // コンシューマループ: buffer を受け取って f() に渡す。
+        // f() が true (= stop) を返したら受信側 (rx) を drop することで
+        // プロデューサ側の次の send が SendError を返して終了する。
+        while let Ok(buf) = rx.recv() {
+            if f(&buf) {
+                break;
+            }
+        }
+        drop(rx);
+        let _ = producer.join();
+    }
+}
+
+impl<T> HcpeDataLoader<T>
+where
+    T: Fn(&PackedSfenValue) -> bool + Clone + Send + Sync + 'static,
+{
+    /// プロデューサスレッド本体。`file_paths` を順次読み、各チャンクを
+    /// `std::thread::scope` で並列デコードしてから shuffle buffer に集約。
+    /// buffer_size に達するごとに shuffle して `tx` に送る。
+    fn produce_buffers(
+        file_paths: Vec<String>,
+        buffer_size: usize,
+        filter: T,
+        start_position: usize,
+        tx: std::sync::mpsc::SyncSender<Vec<PackedSfenValue>>,
+    ) {
+        let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
+        let mut rng = SimpleRand::with_seed();
         let mut skipped = 0usize;
 
-        let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
-
-        // 初回 buffer fill 中だけ進捗を stderr に表示する。学習開始前に GPU
-        // が何分も遊んでいるように見えないようにするのが目的。2 回目以降の
-        // fill は GPU 学習と並行して走るのでログ汚しを避ける。
+        // 初回 buffer fill 中だけ進捗を stderr に出す。
         let fill_started_at = Instant::now();
         let mut first_fill_in_progress = true;
         let mut last_report_at = fill_started_at;
-        let target_records = self.buffer_size;
+        let target_records = buffer_size;
 
-        for path in &self.file_paths {
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+
+        let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
+
+        for path in &file_paths {
             let file = match File::open(path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -157,8 +209,7 @@ where
             let mut reader = BufReader::new(file);
 
             loop {
-                // 完全なレコード境界に揃った読み出しを行うため、CHUNK_RECORDS 単位で読む。
-                // BufReader::read は read_exact ではないので、`read` を繰り返して埋める。
+                // 完全レコード境界で読み出すため `read` を繰り返して埋める。
                 let mut filled = 0usize;
                 while filled < chunk_buf.len() {
                     match reader.read(&mut chunk_buf[filled..]) {
@@ -174,72 +225,107 @@ where
                 if filled == 0 {
                     break;
                 }
-
                 let records_in_chunk = filled / HCPE_RECORD_SIZE;
-                for i in 0..records_in_chunk {
-                    let off = i * HCPE_RECORD_SIZE;
-                    let mut rec = [0u8; HCPE_RECORD_SIZE];
-                    rec.copy_from_slice(&chunk_buf[off..off + HCPE_RECORD_SIZE]);
 
-                    let psv = match decode_hcpe_record(&rec) {
-                        Some(p) => p,
-                        None => continue, // 不正レコードはスキップ
-                    };
-                    if !(self.filter)(&psv) {
-                        continue;
-                    }
-
-                    if skipped < start_position {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    buffer.push(psv);
-
-                    if first_fill_in_progress {
-                        let now = Instant::now();
-                        if now.duration_since(last_report_at).as_millis() >= 500 {
-                            let pct = 100.0 * buffer.len() as f64 / target_records.max(1) as f64;
-                            let _ = write!(
-                                std::io::stderr(),
-                                "\r  filling shuffle buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
-                                buffer.len() as f64 / 1.0e6,
-                                target_records as f64 / 1.0e6,
-                            );
-                            let _ = std::io::stderr().flush();
-                            last_report_at = now;
+                // この chunk を n_workers で均等に分割して並列デコード。
+                // 各 worker は自分のスライスをデコード → 返す Vec<PSV> を
+                // 元の順番で連結することで、resume の start_position
+                // セマンティクスを壊さない。
+                let per_worker = records_in_chunk.div_ceil(n_workers);
+                let chunk_slice = &chunk_buf[..records_in_chunk * HCPE_RECORD_SIZE];
+                let filter_ref = &filter;
+                let decoded: Vec<Vec<PackedSfenValue>> =
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(n_workers);
+                        for tid in 0..n_workers {
+                            let start = tid * per_worker;
+                            if start >= records_in_chunk {
+                                break;
+                            }
+                            let end =
+                                ((tid + 1) * per_worker).min(records_in_chunk);
+                            let part = &chunk_slice[start * HCPE_RECORD_SIZE
+                                ..end * HCPE_RECORD_SIZE];
+                            handles.push(s.spawn(move || {
+                                let n = end - start;
+                                let mut out = Vec::with_capacity(n);
+                                for i in 0..n {
+                                    let off = i * HCPE_RECORD_SIZE;
+                                    let rec_bytes =
+                                        &part[off..off + HCPE_RECORD_SIZE];
+                                    let rec: &[u8; HCPE_RECORD_SIZE] =
+                                        rec_bytes.try_into().unwrap();
+                                    if let Some(psv) = decode_hcpe_record(rec) {
+                                        if filter_ref(&psv) {
+                                            out.push(psv);
+                                        }
+                                    }
+                                }
+                                out
+                            }));
                         }
-                    }
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap())
+                            .collect()
+                    });
 
-                    if buffer.len() >= self.buffer_size {
+                // 順序保ったまま shuffle buffer に追加。`start_position` の
+                // skip は ここで適用 (filter 通過 record 数で数える)。
+                for partial in decoded {
+                    for psv in partial {
+                        if skipped < start_position {
+                            skipped += 1;
+                            continue;
+                        }
+                        buffer.push(psv);
+
                         if first_fill_in_progress {
-                            let elapsed = fill_started_at.elapsed();
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "\r  shuffle buffer ready: {:.1}M records in {:.1}s                ",
-                                buffer.len() as f64 / 1.0e6,
-                                elapsed.as_secs_f64(),
+                            let now = Instant::now();
+                            if now.duration_since(last_report_at).as_millis()
+                                >= 500
+                            {
+                                let pct = 100.0 * buffer.len() as f64
+                                    / target_records.max(1) as f64;
+                                let _ = write!(
+                                    std::io::stderr(),
+                                    "\r  filling shuffle buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
+                                    buffer.len() as f64 / 1.0e6,
+                                    target_records as f64 / 1.0e6,
+                                );
+                                let _ = std::io::stderr().flush();
+                                last_report_at = now;
+                            }
+                        }
+
+                        if buffer.len() >= buffer_size {
+                            if first_fill_in_progress {
+                                let elapsed = fill_started_at.elapsed();
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "\r  shuffle buffer ready: {:.1}M records in {:.1}s ({} decode threads)   ",
+                                    buffer.len() as f64 / 1.0e6,
+                                    elapsed.as_secs_f64(),
+                                    n_workers,
+                                );
+                                first_fill_in_progress = false;
+                            }
+                            for j in (1..buffer.len()).rev() {
+                                let k = (rng.rng() as usize) % (j + 1);
+                                buffer.swap(j, k);
+                            }
+                            let taken = std::mem::replace(
+                                &mut buffer,
+                                Vec::with_capacity(buffer_size),
                             );
-                            first_fill_in_progress = false;
+                            if tx.send(taken).is_err() {
+                                // コンシューマが drop した → 終了
+                                return;
+                            }
                         }
-                        for j in (1..buffer.len()).rev() {
-                            let k = (rng.rng() as usize) % (j + 1);
-                            buffer.swap(j, k);
-                        }
-                        // Convention (same as shogipack / direct loaders): `f`
-                        // returns `true` to signal "stop, no more data needed"
-                        // and `false` for "continue, send more". The previous
-                        // `!f(...)` was inverted, causing a single buffer's
-                        // worth of records to be flushed and then the loader
-                        // to exit prematurely on every HCPE training run.
-                        if f(&buffer) {
-                            return;
-                        }
-                        buffer.clear();
                     }
                 }
 
-                // chunk が満たなかった (= EOF 近辺) なら次ファイルへ
                 if filled < chunk_buf.len() {
                     break;
                 }
@@ -261,7 +347,7 @@ where
                 let k = (rng.rng() as usize) % (j + 1);
                 buffer.swap(j, k);
             }
-            f(&buffer);
+            let _ = tx.send(buffer);
         }
     }
 }
