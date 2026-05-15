@@ -9,8 +9,11 @@
 //! bytes  0..32: HuffmanCodedPos (HCP) — Apery 系 Huffman で圧縮された局面 32 byte
 //! bytes 32..34: eval        (i16, little-endian) — 評価値 (centipawn)
 //! bytes 34..36: bestMove16  (i16, little-endian) — cshogi 形式 move16
-//! byte      36: gameResult  (i8) — 0=Draw, 1=BlackWin, 2=WhiteWin (cshogi 慣例)
+//! byte      36: gameResult  (u8) — 0=Draw, 1=BlackWin, 2=WhiteWin (cshogi 慣例、絶対色基準)
 //! byte      37: dummy       (u8) — padding
+//!
+//! `decode_hcpe_record` 内で gameResult は局面の手番に応じて **STM 視点**
+//! (1=win, 0=draw, -1=loss) に変換され、PSV byte 38 に書き込まれる。
 //! ```
 //!
 //! ## 設計方針
@@ -39,7 +42,7 @@ use std::io::{BufReader, Read};
 use crate::shogi::PackedSfenValue;
 
 use super::rng::SimpleRand;
-use super::shogipack::MiniPosition;
+use super::shogipack::{convert_game_result, MiniPosition};
 use super::DataLoader;
 
 /// HCPE 1 レコードのバイト数
@@ -52,15 +55,20 @@ const CHUNK_RECORDS: usize = 4096;
 ///
 /// HCP のデコードに失敗した場合 (不正レコード) は `None` を返す。
 /// caller は不正レコードをスキップして次に進める想定。
+///
+/// HCPE の game_result は **絶対色基準** (0=Draw, 1=BlackWin, 2=WhiteWin)
+/// なので、PSV の **STM 視点** (1=win, 0=draw, -1=loss) に変換する必要がある。
+/// `.pack` ローダーが `convert_game_result` で行っているのと同じ変換。
 pub(crate) fn decode_hcpe_record(rec: &[u8; HCPE_RECORD_SIZE]) -> Option<PackedSfenValue> {
     let mut hcp = [0u8; 32];
     hcp.copy_from_slice(&rec[0..32]);
     let eval = i16::from_le_bytes([rec[32], rec[33]]);
     let best_move16 = i16::from_le_bytes([rec[34], rec[35]]);
-    let game_result = rec[36] as i8;
+    let pack_game_result = rec[36];
 
     // game_ply は HCPE には情報がないので 0 で埋める。
     let pos = MiniPosition::from_hcp(&hcp, 0)?;
+    let game_result = convert_game_result(pack_game_result, pos.side_to_move());
     Some(pos.to_packed_sfen_value(eval, best_move16 as u16, game_result))
 }
 
@@ -223,6 +231,55 @@ mod tests {
     #[test]
     fn hcpe_record_size_is_38() {
         assert_eq!(HCPE_RECORD_SIZE, 38);
+    }
+
+    /// HCPE の `gameResult` byte は **絶対色基準** (1=BlackWin, 2=WhiteWin, 0=Draw)
+    /// で書かれているので、`decode_hcpe_record` は局面の手番に応じて PSV の
+    /// **STM 視点** (1=win, -1=loss, 0=draw) に変換しなければならない。
+    /// 以前は変換漏れで PSV.game_result() に絶対色基準の値がそのまま入っていて、
+    /// 後手番で BlackWin の局面が「STM の勝ち」扱いになるバグがあった。
+    #[test]
+    fn decode_converts_game_result_to_stm_perspective() {
+        use crate::shogi::Color;
+        use super::super::shogipack::MiniPosition;
+
+        // hirate (STM = Black) で BlackWin → STM win → +1
+        let pos = MiniPosition::hirate_for_tests();
+        let hcp = pos.pack_to_hcp();
+        let mut rec = [0u8; HCPE_RECORD_SIZE];
+        rec[0..32].copy_from_slice(&hcp);
+        rec[36] = 1; // BlackWin
+        let psv = decode_hcpe_record(&rec).expect("decode hirate");
+        assert_eq!(psv.game_result(), 1, "BlackWin + STM Black → STM win = +1");
+
+        // hirate (STM = Black) で WhiteWin → STM loss → -1
+        rec[36] = 2;
+        let psv = decode_hcpe_record(&rec).expect("decode hirate");
+        assert_eq!(psv.game_result(), -1, "WhiteWin + STM Black → STM loss = -1");
+
+        // hirate (STM = Black) で Draw → 0
+        rec[36] = 0;
+        let psv = decode_hcpe_record(&rec).expect("decode hirate");
+        assert_eq!(psv.game_result(), 0, "Draw → 0 (perspective-independent)");
+
+        // STM を White に反転して同じことを検証 (反転後の HCP を使用)
+        let mut pos = MiniPosition::hirate_for_tests();
+        pos.flip_stm_for_tests();
+        let hcp = pos.pack_to_hcp();
+        let mut rec = [0u8; HCPE_RECORD_SIZE];
+        rec[0..32].copy_from_slice(&hcp);
+
+        rec[36] = 1; // BlackWin
+        let psv = decode_hcpe_record(&rec).expect("decode hirate-flipped");
+        assert_eq!(psv.game_result(), -1, "BlackWin + STM White → STM loss = -1");
+
+        rec[36] = 2; // WhiteWin
+        let psv = decode_hcpe_record(&rec).expect("decode hirate-flipped");
+        assert_eq!(psv.game_result(), 1, "WhiteWin + STM White → STM win = +1");
+
+        // Color enum is referenced just to ensure the import compiles in the
+        // same way the production code uses it.
+        let _ = Color::Black;
     }
 
     #[test]

@@ -276,6 +276,30 @@ pub(super) struct MiniPosition {
 }
 
 impl MiniPosition {
+    /// この局面の手番 (Color::Black / Color::White)
+    pub(super) fn side_to_move(&self) -> Color {
+        self.side_to_move
+    }
+
+    /// 平手初期局面 (テスト用、`pub(super)`)
+    #[cfg(test)]
+    pub(super) fn hirate_for_tests() -> Self {
+        Self::hirate()
+    }
+
+    /// HCP (Huffman Coded Position) 32 byte エンコード (テスト用)。
+    /// PSV の先頭 32 byte と同一エンコーディング。
+    #[cfg(test)]
+    pub(super) fn pack_to_hcp(&self) -> [u8; 32] {
+        self.pack_to_psfen()
+    }
+
+    /// 1 手進める (テスト用) — 手番を反転する。指し手の合法性検査はしない。
+    #[cfg(test)]
+    pub(super) fn flip_stm_for_tests(&mut self) {
+        self.side_to_move = self.side_to_move.opponent();
+    }
+
     /// 平手初期局面
     fn hirate() -> Self {
         let mut pos =
@@ -623,9 +647,9 @@ fn is_end_marker(move16: u16) -> bool {
     to == from
 }
 
-/// .pack の game_result (0=draw, 1=black_win, 2=white_win) を
+/// .pack / HCPE の game_result (0=draw, 1=black_win, 2=white_win) を
 /// PSV の per-STM game_result (1=win, -1=loss, 0=draw) に変換
-fn convert_game_result(pack_result: u8, stm: Color) -> i8 {
+pub(super) fn convert_game_result(pack_result: u8, stm: Color) -> i8 {
     match pack_result {
         1 => {
             if stm == Color::Black {
