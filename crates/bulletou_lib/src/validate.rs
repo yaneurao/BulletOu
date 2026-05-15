@@ -14,11 +14,21 @@
 //! agreement against the actual game result is harder and a more
 //! honest measure of value-network quality.
 //!
-//! Drawn games (`game_result == 0`) are excluded from the accuracy
-//! count because "win" / "loss" doesn't apply. Mate stamps (positions
-//! whose teacher score abs ≥ `score_drop_abs`) are also excluded so
-//! the accuracy and loss subsets stay consistent with the trainer's
-//! `score_drop_abs` filter.
+//! The accuracy definition matches dlshogi's `binary_accuracy`
+//! (`dlshogi/train.py`) so the two trainers' value accuracy numbers
+//! are directly comparable:
+//!
+//! ```text
+//!     pred  = model_output >= 0       (= P(STM win) ≥ 0.5)
+//!     truth = game_result  >= 0       (= STM did not lose: Win or Draw)
+//!     match = pred == truth
+//! ```
+//!
+//! Drawn games are bucketed with wins (`truth = true`) — the model is
+//! "correct on a draw" iff it predicts ≥ 0. This is asymmetric but is
+//! dlshogi's convention. Mate stamps (positions whose teacher score
+//! abs ≥ `score_drop_abs`) are excluded from BOTH accuracy and loss,
+//! consistent with the trainer's own `score_drop_abs` filter.
 //!
 //! This is a pure-Rust module that does **no GPU work** — it only
 //! reads bytes, decodes them into `PackedSfenValue`, and computes the
@@ -36,22 +46,24 @@ use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AccuracyReport {
     /// Number of positions actually used for the accuracy comparison
-    /// (= sampled minus `score_drop_abs`-filtered minus drawn games).
+    /// (= sampled minus `score_drop_abs`-filtered). Drawn games ARE
+    /// included here, matching dlshogi's `binary_accuracy`.
     pub compared: usize,
-    /// Of the compared positions, how many had matching sign between
-    /// the model's output and the game result.
+    /// Of the compared positions, how many had `(model_out >= 0) ==
+    /// (game_result >= 0)` (= dlshogi's `binary_accuracy` formula).
     pub sign_matches: usize,
     /// Number of sampled positions whose game ended in a draw
-    /// (`game_result == 0`); skipped from accuracy because there is no
-    /// "winning side" to agree with. Still included in the loss subset.
+    /// (`game_result == 0`). For information only — drawn games are
+    /// counted in `compared` and treated as "STM did not lose" for the
+    /// accuracy comparison.
     pub drawn_games: usize,
     /// Number of sampled positions whose teacher score's absolute
     /// value was at or above the `score_drop_abs` threshold (mate
     /// stamps); excluded from BOTH accuracy and loss.
     pub filtered_by_score_cap: usize,
     /// Number of positions used in the loss average (= sampled minus
-    /// `score_drop_abs`-filtered, **including** drawn games so the
-    /// metric is directly comparable to the trainer's training loss).
+    /// `score_drop_abs`-filtered, including drawn games — matches the
+    /// trainer's training loss subset).
     pub loss_sampled: usize,
     /// Mean test-set loss over the `loss_sampled` subset. `None` when
     /// the caller didn't pass game results (= loss not requested) or
@@ -74,23 +86,29 @@ fn sigmoid(x: f32) -> f32 {
 /// Compute sign-agreement accuracy AND the matching test-set loss
 /// from parallel arrays.
 ///
-/// `model_outputs[i]` is the raw network output for position `i`; its
-/// **sign** says which side the model prefers (positive = side-to-move
-/// winning, after the canonical `out.sigmoid().squared_error(tgt)`
-/// loss). `teacher_results[i]` is the actual game outcome from the
-/// position's STM perspective: `+1` (STM won), `0` (draw), `-1` (STM
-/// lost).
+/// `model_outputs[i]` is the raw network output for position `i` (=
+/// the logit, before `sigmoid` is applied by the loss head).
+/// `teacher_results[i]` is the actual game outcome from the position's
+/// STM perspective: `+1` (STM won), `0` (draw), `-1` (STM lost).
 ///
-/// **Accuracy subset**: positions with `score_drop_abs`-filtered or
-/// drawn (`teacher_results[i] == 0`) games are skipped. The remaining
-/// positions are compared sign-vs-sign: model output > 0 should agree
-/// with `teacher_results[i] > 0`. This measures how well the model
-/// predicts the actual winner of the game, not how well it mimics the
-/// teacher's score (which would be a much easier target).
+/// **Accuracy** uses dlshogi's `binary_accuracy` definition (= `pred
+/// = y >= 0`, `truth = result >= 0.5`, in our int8 encoding `truth =
+/// result >= 0`):
+///
+/// ```text
+///   pred  = model_output >= 0
+///   truth = game_result  >= 0       (Win or Draw → true; Loss → false)
+///   match = pred == truth
+/// ```
+///
+/// Drawn games are included in the count (treated as "STM did not
+/// lose"). This is asymmetric — a model that always outputs ≥ 0 gets
+/// `(W + D) / (W + D + L)` accuracy — but matches dlshogi's choice so
+/// the two trainers' value accuracy numbers are directly comparable.
 ///
 /// **Loss subset**: same as the trainer — `score_drop_abs`-filtered
-/// positions are skipped, drawn games are **kept**. The formula
-/// matches `bullet_lib::value::loader::DefaultDataLoader::prepare`:
+/// positions are skipped, drawn games are kept. The formula matches
+/// `bullet_lib::value::loader::DefaultDataLoader::prepare`:
 ///
 /// ```text
 ///   blend  = 1 - lambda
@@ -141,26 +159,27 @@ pub fn compute_sign_accuracy(
                 continue;
             }
         }
-        // Accuracy: sign(model) vs sign(game_result), skipping draws.
-        // When teacher_results is empty (test-only path), fall back to
-        // sign(score) so the function still reports a number.
-        let model_sign_positive = *m > 0.0;
+        // Accuracy: dlshogi's `binary_accuracy(y, t) = (y>=0) == (t>=0.5)`.
+        // In our int8 encoding `t >= 0.5` ↔ `result >= 0` (Win or
+        // Draw). Draws are bucketed with wins ("STM did not lose") and
+        // count toward `compared`. When teacher_results is empty
+        // (test-only path), fall back to sign(score) and skip score==0.
+        let pred = *m >= 0.0;
         if have_results {
             let r = teacher_results[i];
             if r == 0 {
                 report.drawn_games += 1;
-            } else {
-                report.compared += 1;
-                let result_sign_positive = r > 0;
-                if model_sign_positive == result_sign_positive {
-                    report.sign_matches += 1;
-                }
+            }
+            report.compared += 1;
+            let truth = r >= 0;
+            if pred == truth {
+                report.sign_matches += 1;
             }
         } else if s == 0 {
             report.drawn_games += 1;
         } else {
             report.compared += 1;
-            if model_sign_positive == (s > 0) {
+            if pred == (s > 0) {
                 report.sign_matches += 1;
             }
         }
@@ -314,19 +333,24 @@ mod tests {
     }
 
     #[test]
-    fn accuracy_skips_drawn_games() {
-        // game_result-driven path: positions whose game ended in a
-        // draw are skipped from accuracy regardless of their score.
-        let m = [0.5, 0.3, 1.2];
-        let t = [200i16, -150, 800];
-        let game = [1i8, 0, 0]; // first decisive (STM win), other two drawn
+    fn accuracy_buckets_draws_with_wins_dlshogi_style() {
+        // dlshogi's binary_accuracy bucket: Draw + Win counted as
+        // "truth=true", Loss as "truth=false". Model is correct on a
+        // draw iff it predicts ≥ 0.
+        let m = [0.5, -0.1, 0.3, -0.2];
+        let t = [200i16, 100, 0, -50]; // teacher scores (unused for
+                                       // accuracy when results given)
+        let game = [1i8, 0, 0, -1]; // Win, Draw, Draw, Loss
         let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
-        assert_eq!(r.compared, 1, "two drawn games skipped from accuracy");
-        assert_eq!(r.sign_matches, 1, "model output > 0 agrees with STM win");
-        assert_eq!(r.drawn_games, 2);
-        // Loss is still computed across all 3 (draws contribute too).
-        assert_eq!(r.loss_sampled, 3);
-        assert!(r.test_loss.is_some(), "loss should be computed when results provided");
+        // i=0: pred=true, truth=true → match
+        // i=1: pred=false, truth=true (draw) → mismatch
+        // i=2: pred=true,  truth=true (draw) → match
+        // i=3: pred=false, truth=false → match
+        assert_eq!(r.compared, 4, "all positions count toward accuracy");
+        assert_eq!(r.sign_matches, 3, "i=1 (draw + neg pred) is the only miss");
+        assert_eq!(r.drawn_games, 2, "drawn_games is informational only");
+        assert_eq!(r.loss_sampled, 4);
+        assert!(r.test_loss.is_some());
     }
 
     #[test]
