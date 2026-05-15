@@ -2472,11 +2472,48 @@ macro_rules! run_training_inline_nnue {
 
                 // Closure dropped → its borrow of saved_dir_in_chunk released.
                 let saved_ckpt_dir = saved_dir_in_chunk.into_inner();
-                let Some(ckpt_dir) = saved_ckpt_dir else {
-                    // Save did not fire in this chunk → either EOF before
-                    // crossing the save boundary, or chunk_size > available
-                    // remaining sb. Either way the epoch is over.
-                    break 'epoch;
+                // 教師が sb 境界を跨がず途中で EOF した場合、bullet の save
+                // callback は発火しない (= `saved_ckpt_dir` is None) が、
+                // last_error_record には partial sb のロスが残っている。この
+                // 場合は手動で trainer.save_to_checkpoint + log.txt 書き出し
+                // を行い、partial sb 分も `0NNN/` ディレクトリ + learn.log
+                // に残す。bullet が batch 0 個でも返ってきた (`last_error_record`
+                // 空) ケースだけ「やることない、epoch 終了」で break する。
+                let (ckpt_dir, is_partial_save) = match saved_ckpt_dir {
+                    Some(dir) => (dir, false),
+                    None => {
+                        if last_error_record.is_empty() {
+                            break 'epoch;
+                        }
+                        let partial_dir = output_dir_buf
+                            .join(format!("{net_id_for_epoch}-{chunk_start}"));
+                        eprintln!(
+                            "  partial superbatch {} (teacher EOF mid-sb); \
+                             saving partial state to {}",
+                            chunk_start,
+                            partial_dir.display(),
+                        );
+                        let s = partial_dir.to_str().expect("checkpoint path is utf-8");
+                        trainer.save_to_checkpoint(s);
+                        if let Err(e) = write_loss_csv(&partial_dir.join("log.txt"), &last_error_record) {
+                            eprintln!(
+                                "  WARN: failed to write log.txt in {}: {e}",
+                                partial_dir.display()
+                            );
+                        }
+                        match convert_save_dir_to_nnue_layout(&partial_dir) {
+                            Ok(()) => eprintln!(
+                                "  wrote NNUE nn.bin + state.bin in {}",
+                                partial_dir.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "  WARN: failed to convert save dir {}: {e}",
+                                partial_dir.display()
+                            ),
+                        }
+                        saved_any.set(true);
+                        (partial_dir, true)
+                    }
                 };
 
                 // Per-save validation (if --test-teacher cached positions).
@@ -2527,6 +2564,12 @@ macro_rules! run_training_inline_nnue {
                             ckpt_dir.display()
                         );
                     }
+                }
+
+                // Partial save (= 教師 EOF mid-sb) was just finalised. No more
+                // data in this epoch — break to the next epoch (or end).
+                if is_partial_save {
+                    break 'epoch;
                 }
 
                 chunk_start = chunk_end + 1;
