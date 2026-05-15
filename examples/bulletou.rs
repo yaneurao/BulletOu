@@ -507,9 +507,10 @@ enum LrScheduleKind {
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 struct Args {
-    /// Evaluation function type to train.
-    #[arg(long, value_enum)]
-    eval_type: EvalType,
+    /// Evaluation function type to train. Required for training; not
+    /// needed (and ignored) when `--count-teacher` is used.
+    #[arg(long, value_enum, required_unless_present = "count_teacher")]
+    eval_type: Option<EvalType>,
 
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
@@ -518,6 +519,17 @@ struct Args {
     /// extension.
     #[arg(long)]
     teacher: String,
+
+    /// Count teacher positions and exit without training. For fixed-record
+    /// formats (HCPE / PSV) this just reads `file_size / record_size` per
+    /// file (instant). HCPE3 / pack are variable-length and would need to
+    /// walk every game; not yet supported by this flag.
+    ///
+    /// Use the printed total to pick `--superbatches N` such that one
+    /// epoch ≈ (or ≤) the teacher size. With cosine annealing, period
+    /// auto-aligns to `--superbatches` so no extra flag is needed.
+    #[arg(long)]
+    count_teacher: bool,
 
     /// Checkpoint output directory. Defaults to a per-eval-type path.
     #[arg(long)]
@@ -762,12 +774,12 @@ impl Args {
             return p.clone();
         }
         let mut path = PathBuf::from("checkpoints");
-        let mut name = self.eval_type.cli_name().to_string();
-        if self.eval_type.uses_arch() {
+        let mut name = self.eval_type().cli_name().to_string();
+        if self.eval_type().uses_arch() {
             name.push('-');
             name.push_str(&self.arch.cli_name());
         }
-        if self.eval_type.uses_layerstack() {
+        if self.eval_type().uses_layerstack() {
             name.push('-');
             name.push_str(self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3).cli_name());
         }
@@ -782,7 +794,7 @@ impl Args {
     }
 
     fn net_id(&self) -> String {
-        self.net_id.clone().unwrap_or_else(|| self.eval_type.default_net_id().to_string())
+        self.net_id.clone().unwrap_or_else(|| self.eval_type().default_net_id().to_string())
     }
 
     /// YaneuraOu integer-quantisation scale to multiply into f32 weights at
@@ -799,23 +811,122 @@ impl Args {
     }
 
     fn kpp_format(&self) -> KppFormat {
-        self.eval_type.kpp_format()
+        self.eval_type().kpp_format()
     }
+
+    /// Unwrap `eval_type`. clap's `required_unless_present = "count_teacher"`
+    /// guarantees it's `Some` whenever training (= non-count_teacher) is
+    /// taking place; if it isn't, there is a clap-side bug, not user error.
+    fn eval_type(&self) -> EvalType {
+        self.eval_type
+            .expect("--eval-type required (clap should have validated)")
+    }
+}
+
+// ----- count-teacher -----------------------------------------------------
+
+/// `--count-teacher` 実装: `--teacher` の指す全ファイルの局面数を集計して
+/// stdout に出す。HCPE (38 byte 固定長) / PSV (40 byte 固定長) は file size
+/// から即計算。HCPE3 / pack は可変長なので拒否 (= 別途 walker が必要)。
+///
+/// 1 sb ≒ 100M 局面に対して `--superbatches N` を選ぶための補助。
+fn run_count_teacher(teacher: &str) -> Result<(), String> {
+    let paths = expand_teacher(teacher)?;
+    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let format = infer_data_format(&path_refs)?;
+    let record_size: u64 = match format {
+        DataFormat::Hcpe => 38,
+        DataFormat::Psv => 40,
+        DataFormat::Hcpe3 | DataFormat::Pack => {
+            return Err(format!(
+                "format {format:?} is variable-length; --count-teacher only supports \
+                 fixed-length records (HCPE / PSV) currently. For HCPE3/pack you'd need \
+                 to walk every game header."
+            ));
+        }
+    };
+
+    eprintln!(
+        "Counting {format:?} teacher files ({} byte/record)...",
+        record_size
+    );
+
+    let mut total_positions: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    for path in &paths {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("failed to stat {path}: {e}"))?;
+        let size = meta.len();
+        if size % record_size != 0 {
+            return Err(format!(
+                "{path}: size {size} is not a multiple of {record_size} byte — \
+                 possibly corrupted / truncated"
+            ));
+        }
+        let positions = size / record_size;
+        total_positions += positions;
+        total_bytes += size;
+        println!(
+            "  {:>14} positions  ({:>8.2} MB)  {path}",
+            positions,
+            size as f64 / (1024.0 * 1024.0),
+        );
+    }
+    println!("---");
+    println!(
+        "Total: {total_positions} positions  ({:.2} GB)  across {} file(s)",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        paths.len(),
+    );
+
+    // Estimate sb count for default settings (batch_size=16384, sb≈100M).
+    let default_batch_size: u64 = 16384;
+    let default_sb_size: u64 = (100_000_000u64 / default_batch_size + 1) * default_batch_size;
+    // = ceil(100M / batch_size) * batch_size = 100,007,936 for batch_size=16384.
+    let full_sbs = total_positions / default_sb_size;
+    let remainder = total_positions % default_sb_size;
+    let partial_sb_fraction = remainder as f64 / default_sb_size as f64;
+    println!(
+        "Per-default-sb (= {:.0}M positions): {} full sb + {:.2} partial sb",
+        default_sb_size as f64 / 1.0e6,
+        full_sbs,
+        partial_sb_fraction,
+    );
+    println!(
+        "Suggested `--superbatches`: {} (= use {} full sb per epoch; ~{:.0}M positions leftover \
+         carried to next epoch if loader wraps)",
+        full_sbs.max(1),
+        full_sbs.max(1),
+        remainder as f64 / 1.0e6,
+    );
+
+    Ok(())
 }
 
 // ----- dispatch ----------------------------------------------------------
 
 fn main() {
     let args = Args::parse();
+    // `--count-teacher` operates standalone (no training): print position
+    // counts for the supplied teacher path(s) and exit.
+    if args.count_teacher {
+        match run_count_teacher(&args.teacher) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: --count-teacher failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     // Reject `--layerstack` on eval types that have no LayerStacks
     // topology — silently ignoring the flag would mislead the user
     // into thinking it had an effect.
-    if args.layerstack.is_some() && !args.eval_type.uses_layerstack() {
+    if args.layerstack.is_some() && !args.eval_type().uses_layerstack() {
         eprintln!(
             "error: --layerstack is only valid with the SFNN family \
              (SFNN_HALFKA1HM / SFNN_HALFKA2HM / SFNN_KA2). \
              --eval-type {} has no LayerStacks topology; drop the flag.",
-            args.eval_type.cli_name()
+            args.eval_type().cli_name()
         );
         std::process::exit(2);
     }
@@ -825,7 +936,7 @@ fn main() {
             args.output_dir().display()
         );
     }
-    match args.eval_type {
+    match args.eval_type() {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
         EvalType::NnueHalfkp => run_halfkp(&args),
         EvalType::NnueKp => run_kp(&args),
@@ -920,7 +1031,7 @@ fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::Path
 fn run_kppt_all(args: &Args) {
     let output_dir = args.output_dir();
 
-    eprintln!("=== bulletou: running {} family (3 components) ===", args.eval_type.cli_name());
+    eprintln!("=== bulletou: running {} family (3 components) ===", args.eval_type().cli_name());
 
     // ---- Resume support -------------------------------------------------
     // If `<output>` already contains a numbered dir with a `state.bin`,
@@ -1120,8 +1231,8 @@ impl LogContext {
         let batches_per_superbatch =
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
-            eval_type: args.eval_type.cli_name(),
-            arch: if args.eval_type.uses_arch() { args.arch.cli_name() } else { String::new() },
+            eval_type: args.eval_type().cli_name(),
+            arch: if args.eval_type().uses_arch() { args.arch.cli_name() } else { String::new() },
             lr_start: args.lr,
             lr_gamma: args.lr_gamma,
             lambda: args.lambda,
@@ -3310,7 +3421,7 @@ where
 
     eprintln!(
         "=== bulletou: running {} ({}x2-{}-{} CReLU+SqrCReLU, dual-perspective, LayerStacks={} via {}) ===",
-        args.eval_type.cli_name(),
+        args.eval_type().cli_name(),
         ft_size,
         l1_hidden,
         l2_size,
