@@ -992,17 +992,17 @@ fn run_kppt_all(args: &Args) {
     // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
     // `kpp-*/` subdirs are removed after assembly.
     let ctx = LogContext::from_args(args);
-    let prior_positions = read_prior_positions(&output_dir.join("learn.log"));
+    let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
     match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions) {
         Ok((_first_idx, last_idx)) => {
-            // Append the new run's full loss history to a top-level
-            // `<output>/learn.log` so the user has a single growing file
-            // spanning all resumes. Per-save `<output>/0NNN/learn.log` files
-            // are kept as snapshots.
+            // Append the new run's per-sb summary rows to a top-level
+            // `<output>/summary-learn.log` so the user has a single
+            // growing file spanning all resumes. Per-save
+            // `<output>/0NNN/learn.log` files are kept as snapshots.
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -1045,6 +1045,19 @@ fn run_kppt_all(args: &Args) {
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str =
     "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher";
+
+/// Schema for the top-level `<output>/summary-learn.log`. Same as
+/// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
+/// the summary file holds only one row per superbatch (the closing
+/// row), where `curr_batch` is always the last batch index of that sb
+/// (= `batches_per_superbatch` rounded down) and conveys no info.
+const SUMMARY_LEARN_LOG_HEADER: &str =
+    "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher";
+
+/// Filename of the top-level summary log inside `<output>/`. Per-save
+/// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
+/// the summary lives next to them so they don't shadow each other.
+const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
@@ -1287,15 +1300,17 @@ fn enrich_bullet_log_to_csv(
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
-/// The parser uses `splitn(11, ',')` so any commas inside the trailing
-/// `teacher` field (e.g. a comma-separated teacher list) don't disturb
-/// the first 10 columns. Component is extracted from the `eval` column
-/// at index 0: a slash-suffix (e.g. `KPPT/kk`) names the component
-/// explicitly; absence of a slash means a single-component NNUE eval
-/// type, which maps to the `"nnue"` component key. The `positions`
-/// column is at index 9 in the 11-column layout
-/// (eval, epoch, superbatch, curr_batch, test_value_accuracy,
-/// test_value_loss, train_value_loss, lr, lambda, **positions**, teacher).
+/// Reads the **summary** log [`SUMMARY_LEARN_LOG_NAME`] (`<output>/
+/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (10
+/// columns, NO `curr_batch`):
+///
+///   eval, epoch, superbatch, test_value_accuracy, test_value_loss,
+///   train_value_loss, lr, lambda, **positions**, teacher
+///
+/// `positions` is at index 8. `splitn(10, ',')` so any commas inside
+/// the trailing `teacher` field are preserved. Component is extracted
+/// from the `eval` column at index 0: a slash-suffix (e.g. `KPPT/kk`)
+/// names the component explicitly; absence of a slash maps to `"nnue"`.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
@@ -1304,13 +1319,13 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(11, ',').collect();
-        if parts.len() < 10 {
+        let parts: Vec<&str> = line.splitn(10, ',').collect();
+        if parts.len() < 9 {
             continue;
         }
         let eval = parts[0];
         let component = eval.split_once('/').map(|(_, c)| c).unwrap_or("nnue");
-        let Ok(positions) = parts[9].parse::<usize>() else { continue };
+        let Ok(positions) = parts[8].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {
             *entry = positions;
@@ -1456,29 +1471,30 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
 /// To keep the top-level file readable as a sb-level summary (rather
 /// than a per-batch dump), only the **last row** of each (eval, sb)
 /// group from the per-dir log is appended — exactly one row per
-/// superbatch save per component. The full per-batch series is still
-/// available in each `<NNNN>/learn.log`.
+/// superbatch save per component. The `curr_batch` column is also
+/// dropped (the summary file uses [`SUMMARY_LEARN_LOG_HEADER`]) because
+/// for sb-boundary rows it conveys no info (always the last batch
+/// index of that sb). The full per-batch series is still available in
+/// each `<NNNN>/learn.log`.
 ///
-/// If the existing top-level `learn.log` was written by an older version
-/// of `bulletou` (= a different header line than the current
-/// [`LEARN_LOG_HEADER`]), this returns `InvalidData` so the caller can
-/// alert the user to clear the old file rather than silently mixing
-/// schemas in the same CSV.
+/// If the existing summary file was written by an older version of
+/// `bulletou` with a different header, returns `InvalidData` so the
+/// caller can alert the user to clear the old file rather than
+/// silently mixing schemas.
 fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std::io::Result<()> {
     use std::io::Write;
     let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
-    let top = output_dir.join("learn.log");
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed = top.is_file();
 
-    // Detect schema mismatch on existing file. The existing file is
-    // assumed to start with a header line followed by data rows. If the
-    // header doesn't match, refuse to mix formats.
+    // Detect schema mismatch on existing file. The summary file is
+    // assumed to start with [`SUMMARY_LEARN_LOG_HEADER`] followed by
+    // 10-col data rows.
     if top_existed {
         let mut head_buf = String::new();
         if let Ok(mut f) = std::fs::File::open(&top) {
             use std::io::Read as _;
-            // Header is at most ~200 bytes; reading 1KB is plenty.
             let mut buf = [0u8; 1024];
             if let Ok(n) = f.read(&mut buf) {
                 if let Ok(s) = std::str::from_utf8(&buf[..n]) {
@@ -1488,13 +1504,12 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
                 }
             }
         }
-        if !head_buf.is_empty() && head_buf != LEARN_LOG_HEADER {
+        if !head_buf.is_empty() && head_buf != SUMMARY_LEARN_LOG_HEADER {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "{}: existing learn.log header has a different schema than this build expects.\n  \
-                     existing: {head_buf}\n  expected: {LEARN_LOG_HEADER}\n  \
-                     This build added/changed columns (e.g. test_value_accuracy / test_value_loss).\n  \
+                    "{}: existing summary log header has a different schema than this build expects.\n  \
+                     existing: {head_buf}\n  expected: {SUMMARY_LEARN_LOG_HEADER}\n  \
                      Rename or delete the old file (and the per-dir <NNNN>/learn.log if you want a clean restart) and re-run.",
                     top.display()
                 ),
@@ -1503,18 +1518,17 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
     }
 
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
+    // Per-dir learn.log is 11-col (includes curr_batch); strip its
+    // header before filtering data rows.
     let body_no_header = body
         .strip_prefix(LEARN_LOG_HEADER)
         .and_then(|rest| rest.strip_prefix('\n').or(Some(rest)))
         .unwrap_or(body.as_str());
     if !top_existed {
-        // first time: write the header before the first data block
-        writeln!(file, "{LEARN_LOG_HEADER}")?;
+        writeln!(file, "{SUMMARY_LEARN_LOG_HEADER}")?;
     }
-    // Filter to the last row of each (eval column, sb column) group.
-    // Rows in the per-dir log are emitted in (component, sb, batch)
-    // order, so a row is "last in its group" iff the next row's
-    // (eval, sb) pair differs (or there is no next row).
+    // Keep only the last row of each (eval, sb) group and drop the
+    // `curr_batch` column (= index 3 in the 11-col per-dir layout).
     let lines: Vec<&str> = body_no_header.lines().filter(|l| !l.is_empty()).collect();
     let key_of = |line: &str| -> Option<(String, String)> {
         let parts: Vec<&str> = line.splitn(11, ',').collect();
@@ -1523,6 +1537,25 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
         }
         Some((parts[0].to_string(), parts[2].to_string()))
     };
+    let drop_curr_batch = |line: &str| -> Option<String> {
+        // Split with splitn(11, ',') so the trailing `teacher` field
+        // keeps any commas. Drop index 3 (`curr_batch`).
+        let parts: Vec<&str> = line.splitn(11, ',').collect();
+        if parts.len() < 11 {
+            return None;
+        }
+        let mut out = String::with_capacity(line.len());
+        for (i, p) in parts.iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(p);
+        }
+        Some(out)
+    };
     for (i, line) in lines.iter().enumerate() {
         let Some(here) = key_of(line) else { continue };
         let next_differs = match lines.get(i + 1) {
@@ -1530,7 +1563,8 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
             None => true,
         };
         if next_differs {
-            file.write_all(line.as_bytes())?;
+            let Some(summary_row) = drop_curr_batch(line) else { continue };
+            file.write_all(summary_row.as_bytes())?;
             file.write_all(b"\n")?;
         }
     }
@@ -2163,7 +2197,7 @@ macro_rules! run_training_inline_nnue {
         // fall back to the legacy behaviour of carrying the prior position
         // sum forward from the existing top-level learn.log.
         let mut cb_ctx = LogContext::from_args(args);
-        let cb_top_level_log = output_dir_buf.join("learn.log");
+        let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
         let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
         // Teacher-change detection: bullet's dataloader skips
         // `(start_sb - 1) * batches_per_sb` records at startup, which
@@ -2564,7 +2598,7 @@ macro_rules! run_training_inline_nnue {
                         if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
                             eprintln!(
                                 "  WARN: failed to update {}: {e}",
-                                output_dir_buf.join("learn.log").display()
+                                output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
                             );
                         }
                         // Consumer が「ここまで処理した」を表す pair を
@@ -2642,7 +2676,7 @@ macro_rules! run_training_inline_nnue {
                     if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
                         eprintln!(
                             "  WARN: failed to update {}: {e}",
-                            output_dir_buf.join("learn.log").display()
+                            output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
                         );
                     }
                     eprintln!("  -> {}/", dst.display());
@@ -2820,7 +2854,7 @@ fn run_halfkp(args: &Args) {
     // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
     // enrich each dir's bullet `log.txt` into the 7-column `learn.log`.
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -2831,7 +2865,7 @@ fn run_halfkp(args: &Args) {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -2916,7 +2950,7 @@ fn run_kp(args: &Args) {
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -2927,7 +2961,7 @@ fn run_kp(args: &Args) {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -3012,7 +3046,7 @@ fn run_nnue_ka2(args: &Args) {
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -3023,7 +3057,7 @@ fn run_nnue_ka2(args: &Args) {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -3108,7 +3142,7 @@ fn run_halfkpe9(args: &Args) {
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -3119,7 +3153,7 @@ fn run_halfkpe9(args: &Args) {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -3203,7 +3237,7 @@ fn run_halfkpvm(args: &Args) {
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -3214,7 +3248,7 @@ fn run_halfkpvm(args: &Args) {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -3397,7 +3431,7 @@ where
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 
     let ctx = LogContext::from_args(args);
-    let top_level_log = output_dir.join("learn.log");
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
     match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
         // (0, 0) = nothing left to do (per-superbatch callback already
@@ -3408,7 +3442,7 @@ where
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
                 eprintln!(
                     "warning: failed to update {}: {e}",
-                    output_dir.join("learn.log").display()
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
                 );
             }
         }
@@ -3805,18 +3839,23 @@ mod tests {
         );
         std::fs::write(dir.join("learn.log"), body).unwrap();
         append_to_top_level_log(&tmp, 1).unwrap();
-        let top = std::fs::read_to_string(tmp.join("learn.log")).unwrap();
+        let top =
+            std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let lines: Vec<&str> = top.lines().collect();
-        assert_eq!(lines[0], LEARN_LOG_HEADER, "first line is header");
+        assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER, "first line is summary header (no curr_batch)");
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
-        // boundary row (b=64); the three intermediate rows are dropped.
+        // boundary row (b=64); intermediate rows dropped, and the
+        // curr_batch column itself is also stripped — leaving 10 cols.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(cols1.len(), 10, "summary row has 10 cols (no curr_batch)");
         assert_eq!(cols1[2], "1", "first kept row is sb=1");
-        assert_eq!(cols1[3], "96", "...specifically the last batch of sb=1");
+        // Index 3 is now `test_value_accuracy` (was `curr_batch`).
+        assert_eq!(cols1[3], "0.50", "col 3 is test_value_accuracy (curr_batch dropped)");
         let cols2: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(cols2.len(), 10);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
-        assert_eq!(cols2[3], "64", "...specifically the last batch of sb=2");
+        assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
