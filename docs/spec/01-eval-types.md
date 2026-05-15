@@ -10,10 +10,12 @@
 | `KPP_KKPT` | KPPT (factorised) | 同上だが KPP のみ手番チャンネルなしの int16 (約半サイズ) | ○ |
 | `NNUE_HALFKP` | NNUE | `nn.bin` 単独 | ○ |
 | `NNUE_KP` | NNUE | `nn.bin` 単独 | ○ |
+| `NNUE_KA2` | NNUE | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_NNUE_ka2_*` ビルド) |
 | `NNUE_HALFKPE9` | NNUE | `nn.bin` 単独 | ○ |
 | `NNUE_HALFKPVM` | NNUE | `nn.bin` 単独 | ○ |
 | `SFNN_HALFKA1HM` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `SFNNwoP1536` ビルド) |
 | `SFNN_HALFKA2HM` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (同上、これが標準) |
+| `SFNN_KA2` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_*` ビルド) |
 
 すべての eval-type で、save dir には別途 `state.bin` (resume 用) と `learn.log` (loss snapshot) が一緒に書かれる。詳細は [04-checkpoint-layout.md](04-checkpoint-layout.md)。
 

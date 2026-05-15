@@ -24,10 +24,12 @@ Currently `bulletou` can train these four targets:
 |---|---|---|
 | **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
 | `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
+| `NNUE_KA2` | Same 4-layer ClippedReLU network as NNUE_KP but with A2 (kings included, v2 collapse) instead of P. Both kings appear inside the piece feature too. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
 | `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
 | `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
 | `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536-build LayerStacks evaluation (HalfKA_hm2 input). Full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md); user-level usage in [§9 LayerStack](9-layerstack.md). | `nn.bin` |
 | `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1) for ablation. | `nn.bin` |
+| `SFNN_KA2` | Same SFNN-1536 LayerStacks topology as the others, but input is `K + A2` (1791 dims). Lightweight ablation; loss plateaus higher than HalfKA_hm2 because the input layer no longer encodes king × piece interactions. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
 

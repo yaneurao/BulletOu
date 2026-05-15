@@ -28,7 +28,9 @@ That's it — no further flags needed. With `--output` omitted, checkpoints land
 
 ## 4.3 Specifying `--arch`
 
-For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`. The set mirrors the per-arch directories under YaneuraOu's NNUE engine binary distribution (`NNUE_halfkp_*`):
+For NNUE eval types, the layer sizes are specified with `--arch <L1>x2-<L2>-<L3>` as a free-form triple. `L1` (the per-perspective accumulator size) must be a positive multiple of 32 (FT SIMD-padding requirement); `L2` and `L3` (hidden-layer sizes) must be positive integers. Any valid triple is accepted.
+
+Common YaneuraOu-shipped sizes (selectable directly because the matching engine binary exists):
 
 | `--arch` | L1 (accumulator) | L2 | L3 | Notes |
 |---|---|---|---|---|
@@ -38,6 +40,7 @@ For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`
 | `768x2-16-64` | 768 | 16 | 64 | |
 | `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
+| `1536x2-15-32` | 1536 | 15 | 32 | SFNN-1536 (matches `architectures/sfnnwop-1536.h`) |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -46,7 +49,7 @@ For NNUE eval types, the layer sizes are selected with `--arch <L1>x2-<L2>-<L3>`
     --teacher teachers/
 ```
 
-Omitting `--arch` falls back to `256x2-32-32`. `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` accept the same preset list.
+Omitting `--arch` falls back to `256x2-32-32`. The same `--arch` flag applies to all NNUE / SFNN eval types (`NNUE_HALFKP`, `NNUE_KP`, `NNUE_KA2`, `NNUE_HALFKPE9`, `NNUE_HALFKPVM`, `SFNN_*`). Sizes outside the table above (e.g. `--arch 256x2-64-64`) are also accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches that triple — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 

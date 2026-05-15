@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-`--arch` で L1 / L2 / L3 サイズを選択 (NNUE_HALFKP と同じ preset 群):
+`--arch <L1>x2-<L2>-<L3>` で L1 / L2 / L3 サイズを選択 (自由形式、NNUE_HALFKP と同じよく使われるサイズ。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する)):
 
 ```
 将棋の局面

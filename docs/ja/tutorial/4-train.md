@@ -28,7 +28,9 @@ cargo build --release --features device-cuda --example bulletou
 
 ## 4.3 `--arch` を指定する
 
-NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<L3>` で選ぶ。やねうら王が配布しているエンジンバイナリのディレクトリ名 (`NNUE_halfkp_*` のサフィックス) に揃えてあり、以下が選択可能:
+NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<L3>` で **自由に**指定できる。`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。
+
+やねうら王が配布しているエンジンバイナリのディレクトリ名 (`NNUE_halfkp_*` のサフィックス) と一致するよく使われるサイズは以下:
 
 | `--arch` | L1 (accumulator) | L2 | L3 | 用途の目安 |
 |---|---|---|---|---|
@@ -38,6 +40,7 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 | `768x2-16-64` | 768 | 16 | 64 | |
 | `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
+| `1536x2-15-32` | 1536 | 15 | 32 | SFNN-1536 (`architectures/sfnnwop-1536.h` 一致) |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -46,7 +49,7 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
     --teacher teachers/
 ```
 
-`--arch` を省略するとデフォルト `256x2-32-32` が適用される。`NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` でも同じ preset 群が指定可能。
+`--arch` を省略するとデフォルト `256x2-32-32` が適用される。同じ `--arch` フラグが全ての NNUE / SFNN eval-type (`NNUE_HALFKP`, `NNUE_KP`, `NNUE_KA2`, `NNUE_HALFKPE9`, `NNUE_HALFKPVM`, `SFNN_*`) で使える。上記の表に無いサイズ (例: `--arch 256x2-64-64`) も実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ triple のアーキテクチャヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 

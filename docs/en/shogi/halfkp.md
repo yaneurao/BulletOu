@@ -10,7 +10,7 @@ The activation-function history (why ClippedReLU and not SCReLU) is documented i
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch`. Supported presets (matching the per-arch directories under YaneuraOu's NNUE binary distribution): `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch <L1>x2-<L2>-<L3>` (free-form; `L1` must be a multiple of 32). Common YaneuraOu-shipped sizes: `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. See [§4.3](../tutorial/4-train.md#43-specifying---arch) for the full description. Below shows the default:
 
 ```
 HalfKP sparse input (125,388 dims, per perspective)

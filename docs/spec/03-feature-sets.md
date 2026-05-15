@@ -116,6 +116,53 @@ active index 配置 (`FeatureSet<K, P>` の Head=K, Tail=P 合成則より):
 
 詳細は `crates/bulletou_lib/src/game/inputs/shogi_kp.rs`。
 
+## A2 (玉含む全駒、v2 collapse)
+
+`Features::A2` (`features/a2.h`) 相当。`ShogiKa2` の構成要素。P を「玉も含めた全駒」に拡張し、後手玉 BonaPiece (`E_KING..fe_end2`) を自玉 plane (`F_KING..E_KING`) に collapse する v2 エンコーディングを使う (HalfKA_hm2 と同じ collapse 規則を非 anchored 版で適用したもの)。
+
+| 項目 | 値 |
+|---|---|
+| dim | 1,629 (= `E_KING`) |
+| max_active | 40 (= `PIECE_NUMBER_NB`、玉含む全駒) |
+| FEATURE_HASH (a2.h::kHashValue) | `0xA20DCB9B` |
+| 内訳 | `0..1547` 玉以外 BonaPiece (P と同じ範囲) + `1548..1628` 自玉 plane (両玉が collapse) |
+
+active index = `bp >= E_KING ? bp - SQ_NB : bp` (後手玉を自玉 plane へ移動)。
+
+`refresh trigger` は持たない (anchor 無しなので玉が動いても全計算不要)。差分更新は dirtyPiece を全部処理 (P と違って kings をスキップしない)。
+
+## ShogiKa2 (= K-A2)
+
+YaneuraOu の `RawFeatures = FeatureSet<Features::K, Features::A2>` (`SFNNwoPSQT_ka2_*` および `ka2_*x2-*-*`) 相当。BulletOu では `bulletou_lib::game::inputs::ShogiKa2` として単一の SparseInputType に統合実装。
+
+| 項目 | 値 |
+|---|---|
+| dim | 1,791 (= 162 + 1629) |
+| max_active | 42 (= 2 + 40。玉が K と A2 で「2 重カウント」される、`FeatureSet<K, A2>` の意図通り) |
+| FEATURE_HASH_KA2 | `0x97D5765E` |
+
+`FEATURE_HASH_KA2` の導出:
+```
+FEATURE_HASH_KA2
+  = K::kHashValue ^ (A2::kHashValue << 1) ^ (A2::kHashValue >> 31)
+  = 0xD3CEE169 ^ (0xA20DCB9B << 1) ^ (0xA20DCB9B >> 31)
+  = 0xD3CEE169 ^ 0x441B9736 ^ 0x00000001
+  = 0x97D5765E
+```
+
+active index 配置 (`FeatureSet<K, A2>` の Head=K, Tail=A2 合成則より):
+
+| index 範囲 | 意味 |
+|---|---|
+| `0..1547` | A2 玉以外 BonaPiece 値 (P 領域と同じ) |
+| `1548..1628` | A2 玉 plane (両玉が collapse、自玉も後手玉もここに発火) |
+| `1629..1709` | K 自玉 (= 1629 + perspective から見た自玉 sq 0..80) |
+| `1710..1790` | K 相手玉 (= 1629 + 81 + perspective から見た相手玉 sq 0..80) |
+
+「玉が K と A2 で 2 重に発火」の意味: 自玉が square s にあるとき、K 領域では `1629 + s` に、A2 領域では `1548 + s` (collapse 後) にそれぞれ index 1 が立つ。同じ物理的な玉から 2 つ active feature が出るので、K-P (max_active=40) より max_active が 2 増えて 42。
+
+詳細は `crates/bulletou_lib/src/game/inputs/shogi_ka2.rs`。
+
 ## HalfKPE9
 
 YaneuraOu の `Features::HalfKPE9` (`features/half_kpe9.{h,cpp}`) 相当。HalfKP の input に「**駒のいるマスへの利き数情報**」を 9 通り掛けた変種。
