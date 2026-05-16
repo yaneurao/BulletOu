@@ -1248,14 +1248,6 @@ struct LogContext {
     batch_size: usize,
     batches_per_superbatch: usize,
     teacher_csv: String,
-    /// Offset added to bullet's local sb counter when computing the
-    /// "absolute" superbatch shown in `learn.log`. Set to
-    /// `last_saved_sb` when auto-resume runs into a changed
-    /// `--teacher` so bullet's local sb starts back at 1 (= keeps the
-    /// dataloader fresh) but the displayed sb stays monotonic across
-    /// rounds. Otherwise 0. The LR formula is positions-based and
-    /// does not consult this field — the offset is purely for display.
-    sb_offset: usize,
     /// Offset added to bullet's local epoch counter when emitting the
     /// `epoch` column in `learn.log`. Bullet's `for epoch in 1..=N`
     /// counter resets to 1 at every new `bulletou` invocation, so
@@ -1314,7 +1306,6 @@ impl LogContext {
             batch_size: args.batch_size,
             batches_per_superbatch,
             teacher_csv: csv_escape(&resolve_teacher_for_log(&args.teacher)),
-            sb_offset: 0,
             epoch_offset: 0,
             lr_schedule: args.lr_schedule,
             lr_period: lr_period_override,
@@ -1414,12 +1405,6 @@ fn enrich_bullet_log_to_csv(
         } else {
             ("-", "-")
         };
-        // Absolute (= cumulative across rounds) sb. Bullet's `log.txt`
-        // carries its own internal sb counter (= local within the run);
-        // when the macro had to reset bullet's sb=1 for a teacher-changed
-        // resume, `ctx.sb_offset` shifts the displayed sb to the
-        // continuation point so the column stays monotonic.
-        let absolute_sb = local_sb + ctx.sb_offset;
         // Absolute epoch: bullet's `for epoch in 1..=max_epochs` counter
         // is local within the current run. `ctx.epoch_offset` carries
         // the cumulative completed-epoch count from previous runs so
@@ -1475,7 +1460,7 @@ fn enrich_bullet_log_to_csv(
             "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr:.6},{lambda:.6},{positions},{teacher}\n",
             eval = eval_field,
             epoch = absolute_epoch,
-            sb = absolute_sb,
+            sb = local_sb,
             ta = test_acc_field,
             tl = test_loss_field,
             train = train_field,
@@ -2439,9 +2424,7 @@ macro_rules! run_training_inline_nnue {
         // reads the new file from the beginning. The LR schedule is
         // already positions-based and uses `prior_positions` (carried
         // from the top-level log) for continuity, so it survives the sb
-        // reset on its own. `cb_ctx.sb_offset` shifts the displayed sb
-        // column in the enriched `learn.log` so the time-series stays
-        // monotonic for the user.
+        // reset on its own.
         // Compare the *resolved* (= expanded file list) form on both
         // sides — `from_args` writes the resolved list to the log, so
         // raw `args.teacher` would never match a stored directory.
@@ -2460,32 +2443,26 @@ macro_rules! run_training_inline_nnue {
         let prev_run_completed_epoch = auto_resume_sb_raw
             .map(|last_sb| last_sb >= end_superbatch)
             .unwrap_or(false);
-        let (effective_start_superbatch, sb_offset_for_display) = if teacher_changed {
-            if let Some(last_sb) = auto_resume_sb_raw {
-                // Keep dataloader fresh (start_sb=1) but shift the
-                // displayed sb so the time-series stays monotonic.
-                (1usize, last_sb)
-            } else {
-                // Teacher changed but no prior dirs → fresh run.
-                (1usize, 0)
-            }
+        // Displayed sb in `learn.log` is intrinsically per-epoch (= 1..N
+        // each epoch), so no cross-run offset is applied. Only the
+        // dataloader's bullet-internal start_sb differs by case below.
+        let effective_start_superbatch = if teacher_changed {
+            // Teacher changed: dataloader fresh (start_sb=1) so the
+            // skip-ahead doesn't run past EOF of the new file.
+            1usize
         } else if prev_run_completed_epoch {
             // Same teacher, previous run completed its epoch(s) cleanly:
-            // start the next epoch from sb=1. The cumulative `positions`
-            // column stays continuous via `cb_prior_position`; the
-            // displayed sb is shifted by the previous run's last_sb so
-            // the time-series in learn.log remains monotonic.
-            (1usize, auto_resume_sb_raw.unwrap())
+            // start the next epoch from sb=1.
+            1usize
         } else if let Some(last_sb) = auto_resume_sb_raw {
             // Same teacher, previous run died mid-epoch: let bullet's
             // dataloader skip ahead so this epoch finishes from
             // last_sb+1. Epoch≥2 will reset to sb=1 in the chunk loop.
-            (last_sb + 1, 0)
+            last_sb + 1
         } else {
             // First run.
-            (1usize, 0)
+            1usize
         };
-        cb_ctx.sb_offset = sb_offset_for_display;
         // Epoch display offset for continued-training runs. Bullet's
         // per-invocation `for epoch in 1..=max_epochs` resets to 1, so
         // without this offset the second run after "3 epochs done"
@@ -2550,14 +2527,12 @@ macro_rules! run_training_inline_nnue {
         );
 
         if teacher_changed {
-            if let (Some(prev), Some(last_sb)) = (prev_teacher.as_deref(), auto_resume_sb_raw) {
+            if let Some(prev) = prev_teacher.as_deref() {
                 eprintln!(
                     "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
-                     dataloader will read the new file from the beginning (start_sb=1); display sb\n  \
-                     continues from {} (model + optimiser are loaded from the latest state.bin as\n  \
-                     usual).",
+                     dataloader will read the new file from the beginning; new epochs start at sb=1.\n  \
+                     model + optimiser are loaded from the latest state.bin as usual.",
                     args.teacher,
-                    last_sb + 1
                 );
             }
         } else if prev_run_completed_epoch {
@@ -2565,11 +2540,9 @@ macro_rules! run_training_inline_nnue {
             eprintln!(
                 "  previous run completed {} superbatch{} cleanly; \
                  continuing as additional epoch(s) — each new epoch starts from sb=1 \
-                 reading the teacher from the beginning. \
-                 Display sb in learn.log is shifted by {} for monotonic time-series.",
+                 reading the teacher from the beginning.",
                 last_sb,
                 if last_sb == 1 { "" } else { "es" },
-                last_sb
             );
         } else if let Some(last_sb) = auto_resume_sb_raw {
             eprintln!(
@@ -3927,7 +3900,6 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
-            sb_offset: 0,
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
@@ -4066,7 +4038,6 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
-            sb_offset: 0,
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
@@ -4199,7 +4170,6 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/c.hcpe".to_string(),
-            sb_offset: 0,
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Cos,
             lr_period: 100_000_000,
@@ -4217,12 +4187,11 @@ mod tests {
         assert!((lr - 0.0005).abs() < 1e-4, "midpoint should be ~0.0005, got {lr}");
     }
 
-    /// `LogContext.sb_offset` が enrich の sb 列に正しく加算され、教師変更
-    /// による start_sb=1 reset でも sb 表示が連続することを確認。LR は
-    /// positions-based なので cumulative positions のみで決まる (sb には
-    /// 依存しない)。
+    /// enrich の sb 列が bullet の local sb をそのまま表示すること、および
+    /// LR / positions 列が prior_positions オフセット込みで計算されることを
+    /// 確認。継続学習 run (= 前回までの positions を carry-over) の整合性。
     #[test]
-    fn enrich_with_sb_offset_emits_absolute_sb() {
+    fn enrich_emits_local_sb_with_prior_positions_offset() {
         let ctx = LogContext {
             eval_type: "NNUE_KP",
             arch: "256x2-32-32".to_string(),
@@ -4231,21 +4200,20 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/round2.hcpe".to_string(),
-            sb_offset: 1, // = "round 1 saved sb 1, this run is the round 2 continuation"
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 800_000_000,
             lr_min: 0.00001,
         };
-        // bullet's local sb in raw log is 1 (= first sb of round 2). With
-        // sb_offset=1, the enriched row should display sb=2.
+        // bullet's local sb in raw log is 1; enrich displays the local sb
+        // verbatim (no cross-run shift — sb is per-epoch by design).
         let raw = "1,32,0.07\n1,64,0.06\n";
         let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None);
         let rows: Vec<&str> = body.lines().collect();
         assert_eq!(rows.len(), 2);
         // Each row: eval, epoch, sb, batch, ta, tl, train, lr, lambda, positions, teacher
         let cols0: Vec<&str> = rows[0].split(',').collect();
-        assert_eq!(cols0[2], "2", "absolute sb (= 1 + offset 1)");
+        assert_eq!(cols0[2], "1", "sb column = bullet's local sb");
         // positions = prior 60M + b*batch_size = 60M + 32*16384 = 60_524_288
         // With step (geometric) schedule, lr decays smoothly from positions 0.
         // At 60.5M / 800M = t≈0.0756, lr ≈ 0.001 * (1e-5/1e-3)^0.0756 ≈ 0.000706.
@@ -4271,7 +4239,6 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
-            sb_offset: 0,
             epoch_offset: 3, // = "previous run completed epoch 1..3 cleanly"
             lr_schedule: LrScheduleKind::Step,
             lr_period: 100_000_000,
@@ -4446,7 +4413,6 @@ mod tests {
             batch_size: 16384,
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
-            sb_offset: 0,
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
