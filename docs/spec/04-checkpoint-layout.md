@@ -6,16 +6,18 @@
 
 ```
 <output>/
-├── learn.log                          ← トップレベル累積ログ (全 run / resume を連結)
+├── summary-learn.log                  ← トップレベル累積ログ (= 全 run の sb 境界行だけを連結)
 ├── 0001/                              ← 1 個目の save
 │   ├── (eval-type specific files)
 │   ├── state.bin                      ← resume 用 (重み + Adam moments)
-│   └── learn.log                      ← この save 時点の loss snapshot
+│   ├── dataloader_pos.txt             ← HCPE/HCPE3/pack の byte offset resume 用 (= 同教師継続再開)
+│   └── learn.log                      ← この save 時点までの per-batch loss snapshot
 ├── 0002/
 ├── ...
 └── 000N/                              ← 最新の save (resume 元、engine が指すべき dir)
     ├── (eval-type specific files)
     ├── state.bin
+    ├── dataloader_pos.txt
     └── learn.log
 ```
 
@@ -23,7 +25,11 @@
 
 resume 時は **既存番号の続きから連番**。例えば前回 `0005/` まで存在する dir に対して再実行すると、新規 save は `0006/`, `0007/`, ... となる。
 
+トップレベル log の名前が `summary-learn.log` なのは per-save 配下の `learn.log` (= per-batch 行を含む詳細版) と区別するため。`summary-learn.log` には各 sb の最終行 (= sb 境界の代表行) のみ抽出されて連結される。
+
 `learn.log` (各 save 配下) は **その save 時点までの loss 履歴 snapshot**。同一 run 内では cumulative。run を跨ぐ (resume する) と loss snapshot はその run 単位で start し直す。
+
+`dataloader_pos.txt` は HCPE / HCPE3 / pack の byte offset 再開用。各 save の callback で「consumer がここまで処理した」位置を `<byte_offset>,<plies_within_unit>` 形式 1 行で書く (固定長 HCPE / PSV では plies は常に 0)。auto-resume は最新 dir のこのファイルを読み、bullet の dataloader を該当 offset から再開させる (= 同教師継続再開時)。教師が変わった場合 / 完走後継続学習の場合は無視して頭から読む。
 
 ## eval-type 別の per-save ファイル
 
@@ -92,7 +98,7 @@ record を必要なだけ連結したものが `state.bin`。
 
 ## resume プロトコル
 
-`bulletou` 起動時、`--output` に既に numbered dir + `state.bin` が存在する場合に自動 resume する。
+`bulletou` 起動時、`--output` に既に numbered dir + `state.bin` が存在する場合に自動 resume する。**ユーザー側に override flag は無い** (旧 `--start-superbatch` は v1.0 で削除済み)。
 
 ### 検出
 
@@ -115,46 +121,86 @@ record を必要なだけ連結したものが `state.bin`。
 
 実装: `count_existing_numbered_dirs(output_dir)` で既存数 N をカウントし、新 save の番号を `N + 1, N + 2, ...` とする。
 
-## `learn.log` フォーマット
+### 起動時の自動分岐 (3 ケース)
 
-各 save dir の `learn.log` も、トップレベル `<output>/learn.log` も、**同じ 9 列 CSV (ヘッダ行つき)**。pandas / Excel でそのまま load 可能。区切りやセクションヘッダは入らない。
+`bulletou` 起動時、auto-resume は前回 run の状態を読んで以下のいずれかに分岐する。bullet 内部の `start_superbatch` と HCPE dataloader の byte offset がケースごとに変わる。LR scheduler は positions-based なので、いずれも `cb_prior_position` (= `summary-learn.log` の最大 positions) を carry-over するだけで連続性を保つ。
+
+| ケース | 検出条件 | bullet `start_sb` | dataloader offset | log 表示 |
+|---|---|---|---|---|
+| **mid-epoch resume** | 教師同じ & 前回 last_sb < `--superbatches` | `last_sb + 1` | `dataloader_pos.txt` から | sb 列 = `last_sb+1..N` で再開、次 epoch 以降 sb=1..N |
+| **clean continuation** | 教師同じ & 前回 last_sb >= `--superbatches` (= 完走後の追加学習) | `1` | `0` (= 頭から) | sb 列 = 1..N (= 新 epoch の自然なカウント) |
+| **teacher-changed** | 教師パス変更 (= `summary-learn.log` 最終行と現 `--teacher` 不一致) | `1` | `0` | sb 列 = 1..N |
+| **fresh first run** | numbered dir 無し | `1` | `0` | sb 列 = 1..N |
+
+各 epoch の chunk loop 開始時、bullet `start_sb` は **epoch 1 のみ** 上記の値、**epoch 2 以降は常に 1** にリセットされる (= 新 epoch は教師頭から sb=1..N で走る)。
+
+### epoch カウンタの cross-run 連続化
+
+bullet 内部の `for epoch in 1..=max_epochs` は invocation ごとに 1 にリセットされる。継続学習で表示 epoch 列が `1, 2, 3, ...` に戻ると視認性が悪いため、`LogContext.epoch_offset` で表示時のみシフトする:
+
+| ケース | `epoch_offset` |
+|---|---|
+| fresh first run | `0` |
+| clean continuation / teacher-changed | `max_epoch_in_summary_log` (= 新 local epoch=1 が表示 max+1) |
+| mid-epoch resume | `max_epoch_in_summary_log - 1` (= 中断 epoch の続きは同じ epoch 番号で表示、次 epoch から +1) |
+
+これは **表示のみ**の補正で、`positions` 列や lr 計算には影響しない。
+
+### sb カウンタの per-epoch 性質
+
+sb 列は intrinsic に **per-epoch カウンタ** (= 各 epoch で 1..`--superbatches`)。cross-run の累積カウンタではない。継続学習でも各 epoch は sb=1 から表示される。
+
+(歴史的経緯: `--max-epochs` 導入前の v0.x では sb は invocation を跨ぐ累積カウンタで、cross-run の `sb_offset` 補正が必要だった。v1.0 で sb は per-epoch 化され、`sb_offset` 補正は削除された。)
+
+## `learn.log` / `summary-learn.log` フォーマット
+
+2 種類の CSV ログがあり、列数が違う。両方ともヘッダ行つき、区切り文字はカンマ、行ごとの末尾改行あり。pandas / Excel でそのまま load 可能。
+
+### per-save `<output>/000N/learn.log` (= 11 列、per-batch snapshot)
 
 ```
-eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-256x2-32-32,1,1,32,0.234,0.001,1.000,524288,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,64,0.231,0.001,1.000,1048576,teachers/
+eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP-256x2-32-32,1,1,32,-,-,0.234,0.000934,1.000000,524288,teachers/
+NNUE_HALFKP-256x2-32-32,1,1,64,-,-,0.231,0.000934,1.000000,1048576,teachers/
 ...
-KPPT/kk,1,1,32,0.234,0.001,0.500,524288,teachers/
-KPPT/kkp,1,1,32,0.156,0.001,0.500,524288,teachers/
-KPPT/kpp,1,1,32,0.245,0.001,0.500,524288,teachers/
-...
+NNUE_HALFKP-256x2-32-32,1,1,6104,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
 ```
+
+bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= `--batches-per-superbatch` ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
+
+### top-level `<output>/summary-learn.log` (= 10 列、sb 境界のみ抽出)
+
+```
+eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
+NNUE_HALFKP-256x2-32-32,1,1,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
+NNUE_HALFKP-256x2-32-32,1,2,0.583300,0.174947,0.077046,0.000753,1.000000,199622656,teachers/
+```
+
+per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
 
 ### 列の意味
 
 | 列 | 意味 |
 |---|---|
 | `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` を付加。NNUE 系 (シングル component、`--arch` を使う) は `NNUE_HALFKP-256x2-32-32` のように eval-type と arch を `-` で結合。KPPT 系 (`--arch` を使わない、3 component 連続学習) は `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録 |
-| `epoch` | この run 内の 1 始まり epoch カウンタ (`--max-epochs`) |
-| `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される |
-| `curr_batch` | 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
-| `value_loss` | bullet が 32 batch ごとに計算する loss 値 |
-| `lr` | その superbatch における学習率 (StepLR 由来) |
-| `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 3 桁固定** で出力 (`1.000`、`0.500` など) |
-| `positions` | この component で消費した累計教師局面数。**resume 跨ぎで累積される** (run 開始時に既存トップレベル `learn.log` の最大値を読み取って続きから書く)。multi-epoch (`--max-epochs > 1`) 内では epoch 境界で reset する (v1 制限) |
+| `epoch` | この save の epoch 番号。継続学習を跨いで連続化される (= `LogContext.epoch_offset` 補正後の値)。1 始まり |
+| `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される。**per-epoch カウンタ**で、cross-run 累積ではない。新 epoch ごとに 1 にリセット |
+| `curr_batch` | (per-save 版のみ) 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
+| `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。sb 境界行のみ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
+| `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。sb 境界行のみ実値、それ以外は `-` |
+| `train_value_loss` | bullet が最後の 32 batch で観測した training loss (移動平均ではなく 32 batch ウィンドウの即値) |
+| `lr` | その時点の学習率 (positions-based なので `cb_prior_position + 各 batch までの累積` から再計算可能) |
+| `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |
+| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。常に単調増加 |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
-
-### 行の頻度
-
-bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト `--batches-per-superbatch ≒ 6104` だと、1 superbatch あたり約 191 行。
 
 ### 累積ロジック
 
-- 1 run 内で各 component が消費する局面数は単調増加: `positions = (superbatch − 1) × batches_per_superbatch × batch_size + curr_batch × batch_size + prior_offset`
-- `prior_offset` は run 開始時に `read_prior_positions()` で既存トップレベル `learn.log` から取得する (component 別の最大 `positions`)
+- 1 run 内で各 component が消費する局面数: `positions = cb_prior_position + (local_superbatch − 1) × batches_per_superbatch × batch_size + curr_batch × batch_size`
+- `cb_prior_position` は run 開始時 + 各 epoch 境界で `read_prior_positions()` から再ロードされる (= component 別の最大 `positions`)
 - 各 save dir の `0NNN/learn.log` は「**その save 時点までの累積**」(bullet が log.txt を逐次更新するため)。最新番号 dir の `learn.log` を読めばその run の全貌が分かる
-- トップレベル `<output>/learn.log` は run 終了時に最新 dir の内容を **ヘッダ行を除いて** 追記 (新規作成時のみ 1 度ヘッダを書く)。結果として 1 ファイル内のヘッダは常に 1 行のみ
-- resume を跨ぐと `superbatch` カウンタは 1 から再開するが、`epoch` も 1 から始まる。`positions` だけが累積を保つので、Pandas で sort key にすれば順序を保てる
+- トップレベル `<output>/summary-learn.log` は各 save の callback で sb 境界行を 1 行ずつ追記する (新規作成時のみ 1 度ヘッダを書く)。ファイル内のヘッダは常に 1 行のみ
+- resume を跨いでも `epoch` / `superbatch` / `positions` 全部が連続表示される (= `epoch_offset` + 自然な per-epoch sb + `cb_prior_position` のおかげ)。Pandas で `positions` を sort key にすれば確実に時系列順
 
 ## ファイル名規約 (一時)
 
