@@ -75,9 +75,12 @@ use bulletou_lib::{
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes,
-            l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd,
+            l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
         },
-        nnue_save_sfnn1536::{Sfnn1536SaveParams, build_sfnn_1536_save_format},
+        nnue_save_sfnn1536::{
+            LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION, Sfnn1536SaveParams,
+            build_sfnn_1536_save_format,
+        },
         yaneuraou_kppt::{
             KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
             unbundle_component_state,
@@ -256,6 +259,139 @@ enum LayerStackMode {
     #[default]
     #[clap(name = "king3-by-king3")]
     Kingrank3by3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "SCREAMING_SNAKE_CASE")]
+enum NerfEvalType {
+    /// Generic SFNNwoPSQT layout. The concrete input feature does not affect
+    /// nerf offsets because this command leaves the FeatureTransformer intact.
+    Sfnn,
+    /// SFNN with HalfKA_hm1 input.
+    SfnnHalfka1hm,
+    /// SFNN with HalfKA_hm2 input.
+    SfnnHalfka2hm,
+    /// SFNN with HalfKA2 input, used by dynamic YaneuraOu
+    /// `SFNNwoPSQT_HALFKA2_*` builds.
+    SfnnHalfka2,
+    /// SFNN with K+A2 input.
+    SfnnKa2,
+}
+
+impl Default for NerfEvalType {
+    fn default() -> Self {
+        NerfEvalType::Sfnn
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NerfLayerSet {
+    fc0: bool,
+    fc1: bool,
+    fc2: bool,
+}
+
+impl Default for NerfLayerSet {
+    fn default() -> Self {
+        Self {
+            fc0: false,
+            fc1: true,
+            fc2: true,
+        }
+    }
+}
+
+impl std::str::FromStr for NerfLayerSet {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut set = Self {
+            fc0: false,
+            fc1: false,
+            fc2: false,
+        };
+        for raw in s.split(',') {
+            let token = raw.trim().to_ascii_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            match token.as_str() {
+                "all" => {
+                    set.fc0 = true;
+                    set.fc1 = true;
+                    set.fc2 = true;
+                }
+                "fc0" | "l1" => set.fc0 = true,
+                "fc1" | "l2" => set.fc1 = true,
+                "fc2" | "out" | "output" => set.fc2 = true,
+                _ => {
+                    return Err(format!(
+                        "invalid --layers token `{raw}`: expected comma-separated fc0,fc1,fc2 or all"
+                    ));
+                }
+            }
+        }
+        if !(set.fc0 || set.fc1 || set.fc2) {
+            return Err("--layers must select at least one of fc0,fc1,fc2".to_string());
+        }
+        Ok(set)
+    }
+}
+
+impl std::fmt::Display for NerfLayerSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if self.fc0 {
+            parts.push("fc0");
+        }
+        if self.fc1 {
+            parts.push("fc1");
+        }
+        if self.fc2 {
+            parts.push("fc2");
+        }
+        write!(f, "{}", parts.join(","))
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou nerf")]
+#[command(about = "Post-process a YaneuraOu nn.bin by adding reproducible ±1 noise to selected i8 weights")]
+struct NerfArgs {
+    /// Input YaneuraOu-compatible `nn.bin`.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output path for the nerfed `nn.bin`.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Evaluation file layout. Currently only SFNN-style layouts are
+    /// supported; standard NNUE layouts can be added later.
+    #[arg(long, value_enum, default_value = "SFNN")]
+    eval_type: NerfEvalType,
+
+    /// Network architecture in `<FT>x2-<H1>-<H2>` form, e.g.
+    /// `1024x2-7-64` for `SFNNwoPSQT_HALFKA2_1024_7_64`.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// LayerStack bucketing scheme for SFNN layouts. Must match the engine build.
+    #[arg(long, value_enum, default_value = "king3-by-king3")]
+    layerstack: LayerStackMode,
+
+    /// Comma-separated layer list. Only i8 weights are changed; biases,
+    /// FeatureTransformer, hashes, and padding weights are left intact.
+    #[arg(long, default_value = "fc2,fc1")]
+    layers: NerfLayerSet,
+
+    /// Number of distinct weight entries to randomly select and modify.
+    #[arg(long)]
+    count: usize,
+
+    /// RNG seed. Defaults to 1 for reproducible output.
+    #[arg(long, default_value = "1")]
+    seed: u64,
 }
 
 impl LayerStackMode {
@@ -517,6 +653,7 @@ enum LrScheduleKind {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
+#[command(after_help = "Subcommands:\n  nerf    Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n\nRun `bulletou nerf --help` for nerf-specific options.")]
 struct Args {
     /// Evaluation function type to train. Required for training; not
     /// needed (and ignored) when `--count-teacher` is used.
@@ -942,9 +1079,332 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ----- nerf ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NerfLayerId {
+    Fc0,
+    Fc1,
+    Fc2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NerfCandidate {
+    offset: usize,
+    layer: NerfLayerId,
+}
+
+#[derive(Default, Debug, Clone)]
+struct NerfReport {
+    candidate_weights: usize,
+    fc0_candidates: usize,
+    fc1_candidates: usize,
+    fc2_candidates: usize,
+    selected: usize,
+    changed: usize,
+    saturated_noops: usize,
+}
+
+#[derive(Clone, Debug)]
+struct NerfRng(u64);
+
+impl NerfRng {
+    fn from_seed(seed: u64) -> Self {
+        Self(if seed == 0 {
+            // Keep state non-zero even if the user explicitly passes 0.
+            0xA076_1D64_78BD_642F
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn gen_index(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next_u64() as usize) % upper
+    }
+
+    fn gen_delta(&mut self) -> i16 {
+        if self.next_u64() & 1 == 0 {
+            -1
+        } else {
+            1
+        }
+    }
+}
+
+fn read_u32_le(bytes: &[u8], pos: usize, label: &str) -> Result<u32, String> {
+    let end = pos
+        .checked_add(4)
+        .ok_or_else(|| format!("{label}: offset overflow"))?;
+    let slice = bytes
+        .get(pos..end)
+        .ok_or_else(|| format!("{label}: truncated at byte {pos}"))?;
+    Ok(u32::from_le_bytes(slice.try_into().expect("slice len checked")))
+}
+
+fn skip_leb128_block(bytes: &[u8], pos: usize, label: &str) -> Result<usize, String> {
+    let magic_end = pos
+        .checked_add(LEB128_MAGIC.len())
+        .ok_or_else(|| format!("{label}: offset overflow"))?;
+    if bytes.get(pos..magic_end) != Some(LEB128_MAGIC) {
+        return Err(format!(
+            "{label}: missing LEB128 magic at byte {pos}; this command currently expects an SFNNwoPSQT nn.bin"
+        ));
+    }
+    let size_pos = magic_end;
+    let payload_size = read_u32_le(bytes, size_pos, label)? as usize;
+    let payload_start = size_pos + 4;
+    let payload_end = payload_start
+        .checked_add(payload_size)
+        .ok_or_else(|| format!("{label}: payload size overflow"))?;
+    if payload_end > bytes.len() {
+        return Err(format!(
+            "{label}: payload claims {payload_size} byte(s) at byte {payload_start}, beyond file size {}",
+            bytes.len()
+        ));
+    }
+    Ok(payload_end)
+}
+
+fn sfnn_network_base_offset(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() < 12 {
+        return Err("input is too small to contain an NNUE header".to_string());
+    }
+    let version = read_u32_le(bytes, 0, "NNUE header")?;
+    if version != SFNN_NNUE_VERSION {
+        return Err(format!(
+            "NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}"
+        ));
+    }
+    let desc_len = read_u32_le(bytes, 8, "NNUE header desc_len")? as usize;
+    let desc_start = 12usize;
+    let desc_end = desc_start
+        .checked_add(desc_len)
+        .ok_or_else(|| "NNUE header desc_len overflow".to_string())?;
+    if desc_end > bytes.len() {
+        return Err(format!(
+            "NNUE header description claims {desc_len} byte(s), beyond file size {}",
+            bytes.len()
+        ));
+    }
+
+    let ft_hash_pos = desc_end;
+    let mut pos = ft_hash_pos
+        .checked_add(4)
+        .ok_or_else(|| "FeatureTransformer hash offset overflow".to_string())?;
+    if pos > bytes.len() {
+        return Err("truncated before FeatureTransformer hash".to_string());
+    }
+    pos = skip_leb128_block(bytes, pos, "FeatureTransformer biases")?;
+    pos = skip_leb128_block(bytes, pos, "FeatureTransformer weights")?;
+    Ok(pos)
+}
+
+fn collect_sfnn_nerf_candidates(
+    bytes: &[u8],
+    arch: NnueArch,
+    layerstack: LayerStackMode,
+    layers: NerfLayerSet,
+) -> Result<(Vec<NerfCandidate>, NerfReport), String> {
+    let network_base = sfnn_network_base_offset(bytes)?;
+    let (ft_size, hidden1, hidden2) = arch.dims();
+    let l1_out = hidden1 + 1;
+    let fc0_pad_in = nnue_pad32(ft_size);
+    let fc1_real_in = hidden1 * 2;
+    let fc1_pad_in = nnue_pad32(fc1_real_in);
+    let fc2_pad_in = nnue_pad32(hidden2);
+    let stack_count = layerstack.num_stacks();
+
+    let fc0_bias_bytes = l1_out * 4;
+    let fc0_weight_bytes = l1_out * fc0_pad_in;
+    let fc1_bias_bytes = hidden2 * 4;
+    let fc1_weight_bytes = hidden2 * fc1_pad_in;
+    let fc2_bias_bytes = 4;
+    let fc2_weight_bytes = fc2_pad_in;
+    let stack_bytes =
+        4 + fc0_bias_bytes + fc0_weight_bytes + fc1_bias_bytes + fc1_weight_bytes + fc2_bias_bytes + fc2_weight_bytes;
+    let expected_len = network_base
+        .checked_add(stack_bytes * stack_count)
+        .ok_or_else(|| "SFNN network byte count overflow".to_string())?;
+    if expected_len != bytes.len() {
+        return Err(format!(
+            "SFNN payload size mismatch for --arch {arch} / --layerstack {}: expected file size {expected_len}, got {}. \
+             Check that --arch matches the engine architecture.",
+            layerstack.cli_name(),
+            bytes.len()
+        ));
+    }
+
+    let mut out = Vec::new();
+    let mut report = NerfReport::default();
+
+    for stack in 0..stack_count {
+        let mut pos = network_base + stack * stack_bytes;
+        pos += 4; // Network hash.
+
+        pos += fc0_bias_bytes;
+        let fc0_weights = pos;
+        if layers.fc0 {
+            for o in 0..l1_out {
+                for i in 0..ft_size {
+                    out.push(NerfCandidate {
+                        offset: fc0_weights + o * fc0_pad_in + i,
+                        layer: NerfLayerId::Fc0,
+                    });
+                    report.fc0_candidates += 1;
+                }
+            }
+        }
+        pos += fc0_weight_bytes;
+
+        pos += fc1_bias_bytes;
+        let fc1_weights = pos;
+        if layers.fc1 {
+            for o in 0..hidden2 {
+                for i in 0..fc1_real_in {
+                    out.push(NerfCandidate {
+                        offset: fc1_weights + o * fc1_pad_in + i,
+                        layer: NerfLayerId::Fc1,
+                    });
+                    report.fc1_candidates += 1;
+                }
+            }
+        }
+        pos += fc1_weight_bytes;
+
+        pos += fc2_bias_bytes;
+        let fc2_weights = pos;
+        if layers.fc2 {
+            for i in 0..hidden2 {
+                out.push(NerfCandidate {
+                    offset: fc2_weights + i,
+                    layer: NerfLayerId::Fc2,
+                });
+                report.fc2_candidates += 1;
+            }
+        }
+        pos += fc2_weight_bytes;
+
+        debug_assert_eq!(pos, network_base + (stack + 1) * stack_bytes);
+    }
+
+    report.candidate_weights = out.len();
+    Ok((out, report))
+}
+
+fn nerf_sfnn_bytes(mut bytes: Vec<u8>, args: &NerfArgs) -> Result<(Vec<u8>, NerfReport), String> {
+    let (mut candidates, mut report) =
+        collect_sfnn_nerf_candidates(&bytes, args.arch, args.layerstack, args.layers)?;
+    if args.count > candidates.len() {
+        return Err(format!(
+            "--count {} exceeds candidate weight count {} for --layers {}. \
+             Choose fewer edits or include more layers.",
+            args.count,
+            candidates.len(),
+            args.layers
+        ));
+    }
+
+    let mut rng = NerfRng::from_seed(args.seed);
+    for i in 0..args.count {
+        let j = i + rng.gen_index(candidates.len() - i);
+        candidates.swap(i, j);
+        let candidate = candidates[i];
+        match candidate.layer {
+            NerfLayerId::Fc0 | NerfLayerId::Fc1 | NerfLayerId::Fc2 => {}
+        }
+        let old = bytes[candidate.offset] as i8;
+        let delta = rng.gen_delta();
+        let new = ((old as i16) + delta).clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+        if new == old {
+            report.saturated_noops += 1;
+        } else {
+            bytes[candidate.offset] = new as u8;
+            report.changed += 1;
+        }
+    }
+    report.selected = args.count;
+    Ok((bytes, report))
+}
+
+fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
+    if args.input == args.output {
+        return Err("--input and --output must be different paths".to_string());
+    }
+    if args.output.exists() {
+        let input_canon = std::fs::canonicalize(&args.input)
+            .map_err(|e| format!("failed to canonicalize {}: {e}", args.input.display()))?;
+        let output_canon = std::fs::canonicalize(&args.output)
+            .map_err(|e| format!("failed to canonicalize {}: {e}", args.output.display()))?;
+        if input_canon == output_canon {
+            return Err("--input and --output resolve to the same file".to_string());
+        }
+    }
+    if args.count == 0 {
+        eprintln!("note: --count 0 copies the input without changing weights");
+    }
+
+    let bytes = std::fs::read(&args.input)
+        .map_err(|e| format!("failed to read {}: {e}", args.input.display()))?;
+    let (nerfed, report) = nerf_sfnn_bytes(bytes, args)?;
+
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(&args.output, nerfed)
+        .map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
+
+    Ok(report)
+}
+
 // ----- dispatch ----------------------------------------------------------
 
 fn main() {
+    let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("nerf"))
+    {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou nerf");
+        }
+        let args = NerfArgs::parse_from(raw_args);
+        match run_nerf(&args) {
+            Ok(report) => {
+                println!("nerf complete:");
+                println!("  input              = {}", args.input.display());
+                println!("  output             = {}", args.output.display());
+                println!("  eval_type          = {:?}", args.eval_type);
+                println!("  arch               = {}", args.arch);
+                println!("  layerstack         = {}", args.layerstack.cli_name());
+                println!("  layers             = {}", args.layers);
+                println!("  candidate_weights  = {}", report.candidate_weights);
+                println!("    fc0              = {}", report.fc0_candidates);
+                println!("    fc1              = {}", report.fc1_candidates);
+                println!("    fc2              = {}", report.fc2_candidates);
+                println!("  selected           = {}", report.selected);
+                println!("  changed            = {}", report.changed);
+                println!("  saturated_noops    = {}", report.saturated_noops);
+            }
+            Err(e) => {
+                eprintln!("error: nerf failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     let args = Args::parse();
     // `--count-teacher` operates standalone (no training): print position
     // counts for the supplied teacher path(s) and exit.
@@ -4421,5 +4881,100 @@ mod tests {
         let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
         assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn empty_leb128_block() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(LEB128_MAGIC);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    fn fake_sfnn_nn_bin(arch: NnueArch, stacks: usize) -> Vec<u8> {
+        let (ft_size, hidden1, hidden2) = arch.dims();
+        let mut bytes = Vec::new();
+        let desc = b"test-sfnn";
+        bytes.extend_from_slice(&SFNN_NNUE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0x3C20_3B32u32.to_le_bytes());
+        bytes.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(desc);
+        bytes.extend_from_slice(&0x5F13_4AB8u32.to_le_bytes());
+        bytes.extend_from_slice(&empty_leb128_block());
+        bytes.extend_from_slice(&empty_leb128_block());
+
+        let l1_out = hidden1 + 1;
+        let fc0_pad_in = nnue_pad32(ft_size);
+        let fc1_real_in = hidden1 * 2;
+        let fc1_pad_in = nnue_pad32(fc1_real_in);
+        let fc2_pad_in = nnue_pad32(hidden2);
+        for _ in 0..stacks {
+            bytes.extend_from_slice(&0x6333_718Au32.to_le_bytes());
+            bytes.resize(bytes.len() + l1_out * 4, 0);
+            bytes.resize(bytes.len() + l1_out * fc0_pad_in, 0);
+            bytes.resize(bytes.len() + hidden2 * 4, 0);
+            bytes.resize(bytes.len() + hidden2 * fc1_pad_in, 0);
+            bytes.resize(bytes.len() + 4, 0);
+            bytes.resize(bytes.len() + fc2_pad_in, 0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn nerf_layer_set_parses_comma_list() {
+        let layers: NerfLayerSet = "fc2,fc1".parse().unwrap();
+        assert!(!layers.fc0);
+        assert!(layers.fc1);
+        assert!(layers.fc2);
+
+        let layers: NerfLayerSet = "all".parse().unwrap();
+        assert!(layers.fc0);
+        assert!(layers.fc1);
+        assert!(layers.fc2);
+
+        assert!("fc3".parse::<NerfLayerSet>().is_err());
+    }
+
+    #[test]
+    fn sfnn_nerf_collects_only_real_weight_bytes() {
+        let arch = NnueArch { l1: 32, l2: 1, l3: 4 };
+        let bytes = fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks());
+        let (candidates, report) = collect_sfnn_nerf_candidates(
+            &bytes,
+            arch,
+            LayerStackMode::Kingrank3by3,
+            "fc1,fc2".parse().unwrap(),
+        )
+        .unwrap();
+
+        // fc1: 9 stacks * hidden2(4) * real input(hidden1*2 = 2)
+        // fc2: 9 stacks * hidden2(4)
+        assert_eq!(report.fc0_candidates, 0);
+        assert_eq!(report.fc1_candidates, 9 * 4 * 2);
+        assert_eq!(report.fc2_candidates, 9 * 4);
+        assert_eq!(candidates.len(), report.fc1_candidates + report.fc2_candidates);
+    }
+
+    #[test]
+    fn sfnn_nerf_changes_requested_number_of_unique_weights() {
+        let arch = NnueArch { l1: 32, l2: 1, l3: 4 };
+        let input = fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks());
+        let args = NerfArgs {
+            input: PathBuf::from("in.nn"),
+            output: PathBuf::from("out.nn"),
+            eval_type: NerfEvalType::Sfnn,
+            arch,
+            layerstack: LayerStackMode::Kingrank3by3,
+            layers: "fc2".parse().unwrap(),
+            count: 5,
+            seed: 123,
+        };
+        let (output, report) = nerf_sfnn_bytes(input.clone(), &args).unwrap();
+        assert_eq!(report.fc2_candidates, 9 * 4);
+        assert_eq!(report.selected, 5);
+        assert_eq!(report.changed, 5);
+        assert_eq!(report.saturated_noops, 0);
+
+        let diffs = input.iter().zip(output.iter()).filter(|(a, b)| a != b).count();
+        assert_eq!(diffs, 5, "zero-valued i8 weights should change by exactly five bytes");
     }
 }
