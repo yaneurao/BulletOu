@@ -385,7 +385,8 @@ struct NerfArgs {
     #[arg(long, default_value = "fc2,fc1")]
     layers: NerfLayerSet,
 
-    /// Number of distinct weight entries to randomly select and modify.
+    /// Number of random +/-1 mutation attempts. The same weight may be
+    /// selected multiple times.
     #[arg(long)]
     count: usize,
 
@@ -1300,23 +1301,18 @@ fn collect_sfnn_nerf_candidates(
 }
 
 fn nerf_sfnn_bytes(mut bytes: Vec<u8>, args: &NerfArgs) -> Result<(Vec<u8>, NerfReport), String> {
-    let (mut candidates, mut report) =
+    let (candidates, mut report) =
         collect_sfnn_nerf_candidates(&bytes, args.arch, args.layerstack, args.layers)?;
-    if args.count > candidates.len() {
+    if args.count > 0 && candidates.is_empty() {
         return Err(format!(
-            "--count {} exceeds candidate weight count {} for --layers {}. \
-             Choose fewer edits or include more layers.",
-            args.count,
-            candidates.len(),
+            "--layers {} produced no candidate weights; choose at least one weight layer",
             args.layers
         ));
     }
 
     let mut rng = NerfRng::from_seed(args.seed);
-    for i in 0..args.count {
-        let j = i + rng.gen_index(candidates.len() - i);
-        candidates.swap(i, j);
-        let candidate = candidates[i];
+    for _ in 0..args.count {
+        let candidate = candidates[rng.gen_index(candidates.len())];
         match candidate.layer {
             NerfLayerId::Fc0 | NerfLayerId::Fc1 | NerfLayerId::Fc2 => {}
         }
@@ -1393,7 +1389,7 @@ fn main() {
                 println!("    fc0              = {}", report.fc0_candidates);
                 println!("    fc1              = {}", report.fc1_candidates);
                 println!("    fc2              = {}", report.fc2_candidates);
-                println!("  selected           = {}", report.selected);
+                println!("  mutation_attempts  = {}", report.selected);
                 println!("  changed            = {}", report.changed);
                 println!("  saturated_noops    = {}", report.saturated_noops);
             }
@@ -4955,7 +4951,7 @@ mod tests {
     }
 
     #[test]
-    fn sfnn_nerf_changes_requested_number_of_unique_weights() {
+    fn sfnn_nerf_allows_repeated_weight_edits() {
         let arch = NnueArch { l1: 32, l2: 1, l3: 4 };
         let input = fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks());
         let args = NerfArgs {
@@ -4965,16 +4961,24 @@ mod tests {
             arch,
             layerstack: LayerStackMode::Kingrank3by3,
             layers: "fc2".parse().unwrap(),
-            count: 5,
+            count: 50,
             seed: 123,
         };
         let (output, report) = nerf_sfnn_bytes(input.clone(), &args).unwrap();
         assert_eq!(report.fc2_candidates, 9 * 4);
-        assert_eq!(report.selected, 5);
-        assert_eq!(report.changed, 5);
+        assert!(
+            report.selected > report.fc2_candidates,
+            "test should exercise repeated selection"
+        );
+        assert_eq!(report.selected, 50);
+        assert_eq!(report.changed, 50);
         assert_eq!(report.saturated_noops, 0);
 
         let diffs = input.iter().zip(output.iter()).filter(|(a, b)| a != b).count();
-        assert_eq!(diffs, 5, "zero-valued i8 weights should change by exactly five bytes");
+        assert!(
+            diffs <= report.fc2_candidates,
+            "final differing bytes cannot exceed the candidate set"
+        );
+        assert!(diffs > 0, "at least one byte should differ after repeated edits");
     }
 }

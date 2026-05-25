@@ -42,13 +42,13 @@ cargo run -p bulletou_lib --release --example bulletou -- nerf \
 | `--arch` | Architecture in `<FT>x2-<H1>-<H2>` form, for example `1024x2-7-64` |
 | `--layerstack` | LayerStack bucketing mode. Currently `king3-by-king3` |
 | `--layers` | Target layers: comma-separated `fc0` / `fc1` / `fc2` / `all` |
-| `--count` | Number of weights to select randomly |
+| `--count` | Number of random `+1` / `-1` mutation attempts. The same weight may be selected multiple times |
 | `--seed` | RNG seed. The same input and seed produce the same output |
 
 The default `--layers` value is `fc2,fc1`. The command does not modify the Feature Transformer, biases, hashes, or SIMD padding weights.
 
 ## Mutation
 
-The command selects `--count` candidate weights without replacement and adds either `+1` or `-1` to each selected i8 value. Values are clamped to the i8 range, so an already saturated `127` or `-128` weight may remain unchanged.
+The command performs `--count` mutation attempts. Each attempt randomly selects one candidate weight and adds either `+1` or `-1` to that i8 value. The same weight may be selected multiple times, so `--count` may exceed the candidate count. Repeated selections can accumulate or cancel each other out. Values are clamped to the i8 range, so an already saturated `127` or `-128` weight may remain unchanged.
 
-After running, the command prints the candidate count, selected count, changed count, and saturated no-op count.
+After running, the command prints the candidate count, mutation-attempt count, changed count, and saturated no-op count.
