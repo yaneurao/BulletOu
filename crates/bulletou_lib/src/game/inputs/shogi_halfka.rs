@@ -1,6 +1,6 @@
 //! ShogiHalfKA 特徴量モジュール
 //!
-//! 2種類の HalfKA 特徴量を提供:
+//! HalfKA 系の特徴量を提供:
 //!
 //! ## ShogiHalfKA_hm (Half-Mirror)
 //! - キングバケット: 45バケット (Half-Mirror: 9段 × 5筋)
@@ -11,12 +11,18 @@
 //! - キングバケット: 81マス（ミラーなし）
 //! - 入力次元: 138,510 (81 × 1710)
 //! - 最大アクティブ特徴: 40
+//!
+//! ## ShogiHalfKa2
+//! - キングバケット: 81マス（ミラーなし）
+//! - 入力次元: 131,949 (81 × 1629)
+//! - 敵玉を自玉 plane に collapse
+//! - 最大アクティブ特徴: 40
 
 use super::SparseInputType;
 use crate::shogi::{
+    bona_piece::{E_KING, FE_HAND_END, F_KING},
+    types::{Color, Piece, Square, BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
     BonaPiece, PackedSfenValue, ShogiBoard,
-    bona_piece::{E_KING, F_KING, FE_HAND_END},
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square},
 };
 
 // =============================================================================
@@ -309,6 +315,9 @@ pub(crate) fn halfka_index(kb: usize, packed_bp: usize) -> usize {
 /// nnue-pytorch互換の特徴量hash値 (HalfKA Non-Mirror)
 pub const FEATURE_HASH_NONMIRROR: u32 = 0x5f134cb8;
 
+/// YaneuraOu `Features::HalfKA2` 互換の特徴量hash値。
+pub const FEATURE_HASH_HALFKA2: u32 = 0x5f234cb8;
+
 /// キングバケット数 (Non-Mirror: 81マス)
 pub const NUM_KING_BUCKETS_NONMIRROR: usize = 81;
 
@@ -317,6 +326,9 @@ pub const PIECE_INPUTS_NONMIRROR: usize = 1548 + 81 * 2;
 
 /// HalfKA (Non-Mirror) の総入力次元
 pub const HALFKA_DIMENSIONS: usize = NUM_KING_BUCKETS_NONMIRROR * PIECE_INPUTS_NONMIRROR; // 138,510
+
+/// HalfKA2 の総入力次元。敵玉を自玉 plane に畳むので piece inputs は 1629。
+pub const HALFKA2_DIMENSIONS: usize = NUM_KING_BUCKETS_NONMIRROR * PIECE_INPUTS; // 131,949
 
 /// ShogiHalfKA 特徴量 (Non-Mirror)
 ///
@@ -353,6 +365,42 @@ impl SparseInputType for ShogiHalfKA {
     /// 説明
     fn description(&self) -> String {
         "Shogi HalfKA: 81 king buckets (non-mirrored), 1710 piece inputs".to_string()
+    }
+}
+
+// =============================================================================
+// ShogiHalfKa2 特徴量型
+// =============================================================================
+
+/// ShogiHalfKa2 特徴量 (Non-Mirror, enemy king collapsed)
+///
+/// YaneuraOu `Features::HalfKA2(Friend)` 互換。HalfKA の 81 king bucket は
+/// 保ちつつ、敵玉 plane を自玉 plane に collapse する。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiHalfKa2;
+
+impl SparseInputType for ShogiHalfKa2 {
+    type RequiredDataType = PackedSfenValue;
+
+    fn num_inputs(&self) -> usize {
+        HALFKA2_DIMENSIONS
+    }
+
+    fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES
+    }
+
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, f: F) {
+        let board = ShogiBoard::from_packed_sfen(pos);
+        map_halfka2_features(&board, f);
+    }
+
+    fn shorthand(&self) -> String {
+        "shogi-131949x81ka2".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Shogi HalfKA2: 81 king buckets (non-mirrored), 1629 piece inputs".to_string()
     }
 }
 
@@ -448,7 +496,11 @@ fn map_halfka_nonmirror_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
 /// キングインデックス（Non-Mirror, 81マス直指定）
 #[inline]
 fn king_index_nonmirror(ksq: Square, perspective: Color) -> usize {
-    if perspective == Color::Black { ksq.index() } else { ksq.inverse().index() }
+    if perspective == Color::Black {
+        ksq.index()
+    } else {
+        ksq.inverse().index()
+    }
 }
 
 /// 王の BonaPiece インデックス（Non-Mirror）
@@ -464,6 +516,101 @@ fn king_bonapiece_nonmirror(sq_index: usize, is_friend: bool) -> usize {
 #[inline]
 fn halfka_nonmirror_index(kb: usize, bp: usize) -> usize {
     kb * PIECE_INPUTS_NONMIRROR + bp
+}
+
+// =============================================================================
+// HalfKA2 特徴量計算
+// =============================================================================
+
+/// HalfKA2 特徴量インデックスを列挙。
+fn map_halfka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
+    let stm = board.side_to_move;
+    let nstm = stm.opponent();
+
+    let stm_king_sq = board.king_square(stm);
+    let nstm_king_sq = board.king_square(nstm);
+    if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
+        return;
+    }
+
+    let stm_kb = king_index_nonmirror(stm_king_sq, stm);
+    let nstm_kb = king_index_nonmirror(nstm_king_sq, nstm);
+
+    for &pt in &BOARD_PIECE_TYPES {
+        for color in [Color::Black, Color::White] {
+            for sq in board.pieces(color, pt) {
+                let piece = Piece::new(color, pt);
+
+                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+                let stm_idx = halfka2_index(stm_kb, stm_bp.value() as usize);
+
+                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+                let nstm_idx = halfka2_index(nstm_kb, nstm_bp.value() as usize);
+
+                f(stm_idx, nstm_idx);
+            }
+        }
+    }
+
+    {
+        let stm_king_sq_idx = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+        let stm_friend_king_bp = king_bonapiece_nonmirror(stm_king_sq_idx, true);
+        let stm_friend_idx = halfka2_index(stm_kb, stm_friend_king_bp);
+
+        let nstm_king_sq_for_stm =
+            if stm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+        let stm_enemy_king_bp = king_bonapiece_nonmirror(nstm_king_sq_for_stm, false);
+        let stm_enemy_idx = halfka2_index(stm_kb, stm_enemy_king_bp);
+
+        let nstm_king_sq_idx = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+        let nstm_friend_king_bp = king_bonapiece_nonmirror(nstm_king_sq_idx, true);
+        let nstm_friend_idx = halfka2_index(nstm_kb, nstm_friend_king_bp);
+
+        let stm_king_sq_for_nstm =
+            if nstm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+        let nstm_enemy_king_bp = king_bonapiece_nonmirror(stm_king_sq_for_nstm, false);
+        let nstm_enemy_idx = halfka2_index(nstm_kb, nstm_enemy_king_bp);
+
+        f(stm_friend_idx, nstm_friend_idx);
+        f(stm_enemy_idx, nstm_enemy_idx);
+    }
+
+    for owner in [Color::Black, Color::White] {
+        for &pt in &HAND_PIECE_TYPES {
+            let count = board.hand(owner).count(pt);
+            if count == 0 {
+                continue;
+            }
+
+            for i in 1..=count {
+                let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                if stm_bp != BonaPiece::ZERO {
+                    let stm_idx = halfka2_index(stm_kb, stm_bp.value() as usize);
+
+                    let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                    let nstm_idx = halfka2_index(nstm_kb, nstm_bp.value() as usize);
+
+                    f(stm_idx, nstm_idx);
+                }
+            }
+        }
+    }
+}
+
+/// HalfKA2 の BonaPiece pack。敵玉 plane (E_KING) を自玉 plane (F_KING) に畳む。
+#[inline]
+fn pack_bonapiece_halfka2(bp: usize) -> usize {
+    if bp >= E_KING as usize {
+        bp - 81
+    } else {
+        bp
+    }
+}
+
+/// HalfKA2 の特徴インデックスを計算。
+#[inline]
+fn halfka2_index(kb: usize, bp: usize) -> usize {
+    kb * PIECE_INPUTS + pack_bonapiece_halfka2(bp)
 }
 
 // =============================================================================
@@ -648,6 +795,20 @@ mod tests {
     }
 
     #[test]
+    fn test_halfka2_dimensions() {
+        let input = ShogiHalfKa2;
+        assert_eq!(input.num_inputs(), 131_949);
+        assert_eq!(input.max_active(), 40);
+        assert_eq!(FEATURE_HASH_HALFKA2, 0x5f234cb8_u32);
+    }
+
+    #[test]
+    fn test_halfka2_shorthand() {
+        let input = ShogiHalfKa2;
+        assert_eq!(input.shorthand(), "shogi-131949x81ka2");
+    }
+
+    #[test]
     fn test_king_index_nonmirror_black() {
         // 先手視点: そのまま
         let sq_59 = Square::new(4, 8); // 5九
@@ -675,6 +836,17 @@ mod tests {
 
         // kb=80, bp=0 → index=80*1710=136800
         assert_eq!(halfka_nonmirror_index(80, 0), 80 * PIECE_INPUTS_NONMIRROR);
+    }
+
+    #[test]
+    fn test_halfka2_enemy_king_collapse() {
+        assert_eq!(
+            pack_bonapiece_halfka2(E_KING as usize),
+            F_KING as usize,
+            "enemy king plane should collapse onto friend king plane"
+        );
+        assert_eq!(halfka2_index(1, E_KING as usize), PIECE_INPUTS + F_KING as usize);
+        assert_eq!(halfka2_index(80, 0), 80 * PIECE_INPUTS);
     }
 
     #[test]

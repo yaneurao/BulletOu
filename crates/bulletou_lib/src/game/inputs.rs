@@ -30,8 +30,8 @@ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{
-    FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA_HM_DIMENSIONS, NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA,
-    ShogiHalfKA_hm,
+    FEATURE_HASH_HALFKA2, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA2_DIMENSIONS, HALFKA_HM_DIMENSIONS,
+    NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKa2,
 };
 pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
 pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};

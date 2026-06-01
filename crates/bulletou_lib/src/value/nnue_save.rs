@@ -11,8 +11,8 @@
 //! ここに切り出すことで `bulletou` などの統合 CLI からも再利用できる。
 
 use crate::game::inputs::{
-    FEATURE_HASH, FEATURE_HASH_HALFKA_HM1, FEATURE_HASH_HALFKA_HM2, FEATURE_HASH_HALFKPE9, FEATURE_HASH_HALFKPVM,
-    FEATURE_HASH_HM_V2, FEATURE_HASH_KA2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
+    FEATURE_HASH, FEATURE_HASH_HALFKA2, FEATURE_HASH_HALFKA_HM1, FEATURE_HASH_HALFKA_HM2, FEATURE_HASH_HALFKPE9,
+    FEATURE_HASH_HALFKPVM, FEATURE_HASH_HM_V2, FEATURE_HASH_KA2, FEATURE_HASH_KP, FEATURE_HASH_NONMIRROR,
 };
 
 /// YaneuraOu / Stockfish 互換 NNUE バイナリのバージョンマジック。
@@ -26,6 +26,9 @@ pub enum NnueFeatureSet {
     HalfKp,
     /// HalfKA(Friend) — 玉も特徴量に含めた 81 bucket 版 (138,510 次元)。
     HalfKa,
+    /// HalfKA2(Friend) — 81 bucket 版 HalfKA の敵玉 plane collapse 版
+    /// (131,949 次元)。SFNN_HALFKA2 の入力。
+    HalfKa2,
     /// HalfKA_hm(Friend) — half-mirror 化した HalfKA (45 bucket, 73,305 次元)。
     HalfKaHm,
     /// K-P(Friend) — YaneuraOu の `FeatureSet<K, P>` (`k-p_256x2-32-32.h`)。
@@ -45,10 +48,10 @@ pub enum NnueFeatureSet {
     /// 入力次元 76,950 (= 45 × 1710)。
     HalfKaHm1,
     /// HalfKA_hm2(Friend) — YaneuraOu の `Features::HalfKA_hm2` 厳密互換。
-    /// HalfKA + file-mirror、後手玉を自玉 plane に collapse。SFNNwoP-1536 の入力。
+    /// HalfKA + file-mirror、後手玉を自玉 plane に collapse。SFNN_halfkahm2 の入力。
     /// 入力次元 73,305 (= 45 × 1629)。
     HalfKaHm2,
-    /// K-A2(Friend) — YaneuraOu `FeatureSet<K, A2>` (`SFNNwoPSQT_ka2_*`)。
+    /// K-A2(Friend) — YaneuraOu `FeatureSet<K, A2>` (`SFNN_ka2_*`)。
     /// K (玉 2 個, 162 次元) + A2 (玉含む全駒, 後手玉を自玉 plane に collapse, 1629 次元)
     /// = 1791 次元 / perspective。
     Ka2,
@@ -60,6 +63,7 @@ impl NnueFeatureSet {
         match self {
             NnueFeatureSet::HalfKp => FEATURE_HASH,
             NnueFeatureSet::HalfKa => FEATURE_HASH_NONMIRROR,
+            NnueFeatureSet::HalfKa2 => FEATURE_HASH_HALFKA2,
             NnueFeatureSet::HalfKaHm => FEATURE_HASH_HM_V2,
             NnueFeatureSet::Kp => FEATURE_HASH_KP,
             NnueFeatureSet::HalfKpe9 => FEATURE_HASH_HALFKPE9,
@@ -75,6 +79,7 @@ impl NnueFeatureSet {
         match self {
             NnueFeatureSet::HalfKp => 125_388,
             NnueFeatureSet::HalfKa => 138_510,
+            NnueFeatureSet::HalfKa2 => 131_949,
             NnueFeatureSet::HalfKaHm => 73_305,
             NnueFeatureSet::Kp => 1_710,
             NnueFeatureSet::HalfKpe9 => 1_128_492,
@@ -90,6 +95,7 @@ impl NnueFeatureSet {
         match self {
             NnueFeatureSet::HalfKp => "HalfKP(Friend)",
             NnueFeatureSet::HalfKa => "HalfKA(Friend)",
+            NnueFeatureSet::HalfKa2 => "HalfKA2(Friend)",
             NnueFeatureSet::HalfKaHm => "HalfKA_hm(Friend)",
             // FeatureSet<K, P>::GetName() = "K+P" (feature_set.h の "+" 結合) だが、
             // nnue-pytorch / YaneuraOu の description では (Friend) suffix を付ける
