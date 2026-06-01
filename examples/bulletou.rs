@@ -12,22 +12,17 @@ sequentially in a single invocation and assemble the result into
 For NNUE eval types, the architecture is selected with `--arch`. Each
 save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
 
-    bulletou --eval-type NNUE_HALFKP                    classic HalfKP NNUE (default --arch 256x2-32-32)
-    bulletou --eval-type NNUE_HALFKP --arch 1024x2-8-64 larger HalfKP NNUE
-    bulletou --eval-type NNUE_KP                        K+P NNUE (default --arch 256x2-32-32)
-    bulletou --eval-type NNUE_KA2 --arch 256x2-64-64    K+A2 NNUE (e.g. wider hidden layers)
+    bulletou --eval-type NNUE_HALFKP                                        classic HalfKP NNUE
+    bulletou --eval-type NNUE_HALFKP --arch NNUE_halfkp_1024x2_8_64         larger HalfKP NNUE
+    bulletou --eval-type NNUE_KP                                            K+P NNUE
+    bulletou --eval-type NNUE_KA2 --arch NNUE_ka2_256x2_64_64               K+A2 NNUE
     bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
-    bulletou --eval-type SFNN_HALFKA2HM --arch 1536x2-15-32 --layerstack king3-by-king3
-    bulletou --eval-type SFNN_KA2       --arch 1536x2-15-32 --layerstack king3-by-king3
-                                                        SFNN-1536 with HalfKA_hm2 + 9 LayerStacks
-                                                        (= YaneuraOu YANEURAOU_ENGINE_NNUE_SFNNwoP1536)
+    bulletou --eval-type SFNN_HALFKA2HM --arch SFNN_halfkahm2_1536_15_32_k3k3
+    bulletou --eval-type SFNN_HALFKA2   --arch SFNN_halfka2_1024_7_64_k3k3
 
-Supported `--arch` presets (matching the per-arch directories under
-YaneuraOu's NNUE engine binary distribution):
-
-    256x2-32-32   384x2-8-96   512x2-8-64
-    768x2-16-64   1024x2-8-32  1024x2-8-64
+`--arch` uses the YaneuraOu Makefile architecture name with the
+`YANEURAOU_ENGINE_` prefix removed.
 
 (YaneuraOu's KPPT engine requires all three of `KK_synthesized.bin` /
 `KKP_synthesized.bin` / `KPP_synthesized.bin` to load an eval, so the
@@ -57,34 +52,32 @@ use std::path::PathBuf;
 
 use bulletou_lib::{
     game::inputs::{
-        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk, ShogiKkp,
-        ShogiKp, ShogiKpp, SparseInputType,
+        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
+        ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::ShogiLayerStackBucket9,
-    nn::{Affine, InitSettings, Shape, optimiser},
-    teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    nn::{optimiser, Affine, InitSettings, Shape},
+    teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
-    validate::{compute_sign_accuracy, read_random_hcpe_positions},
     trainer::{
         save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, wdl},
+        schedule::{wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
+    validate::{compute_sign_accuracy, read_random_hcpe_positions},
     value::{
-        ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
-            Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes,
-            l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
+            ft_hash_bytes, header_bytes, l1_bias_scale, network_layer_hash_bytes, pad32 as nnue_pad32,
+            pad_weights_for_simd, Activation as NnueActivation, NnueFeatureSet,
         },
         nnue_save_sfnn1536::{
-            LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION, Sfnn1536SaveParams,
-            build_sfnn_1536_save_format,
+            build_sfnn_1536_save_format, Sfnn1536SaveParams, LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION,
         },
         yaneuraou_kppt::{
-            KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
-            unbundle_component_state,
+            bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, unbundle_component_state, KppFormat,
         },
+        ValueTrainerBuilder,
     },
 };
 use clap::{Parser, ValueEnum};
@@ -107,13 +100,13 @@ enum EvalType {
     /// 2018): dual-perspective HalfKP feature transformer + 4-layer
     /// ClippedReLU network. Writes a YaneuraOu / Stockfish nnue-pytorch
     /// compatible `nn.bin` per save. Architecture is selected via `--arch`
-    /// (default `256x2-32-32`).
+    /// (default `NNUE_halfkp_256x2_32_32`).
     NnueHalfkp,
     /// NNUE K-P. YaneuraOu kp_256x2-32-32 — same 4-layer ClippedReLU network
     /// as halfkp_256x2-32-32, but the input is `FeatureSet<K, P>` (K = 162
     /// king features, P = 1548 piece features per perspective; 1710 total)
     /// instead of HalfKP's (king × piece) cross product. Architecture is
-    /// selected via `--arch` (default `256x2-32-32`).
+    /// selected via `--arch` (default `NNUE_kp_256x2_32_32`).
     NnueKp,
     /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>` — same 4-layer ClippedReLU
     /// network as kp_256x2-32-32, but the piece feature is A2 (1629 dims,
@@ -141,103 +134,27 @@ enum EvalType {
     /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
     /// MLP (FT → fc_0(L1+1 PSQT-shortcut) → CReLU + SqrCReLU concat →
     /// fc_1 → fc_2 → +PSQT bypass). Bucketing chosen via `--layerstack`.
-    /// `--arch 1536x2-15-32` matches YaneuraOu's `sfnnwop-1536.h`; that
-    /// is the only preset YaneuraOu currently ships, but other sizes
-    /// can be trained for ablation (not engine-loadable).
+    /// `--arch SFNN_halfkahm1_1536_15_32_k3k3` matches the corresponding
+    /// YaneuraOu SFNN dynamic build.
     SfnnHalfka1hm,
     /// SFNN-1536 with `HalfKA_hm2` input (= strict v2, enemy king
     /// collapsed onto friend plane, 73,305 dim). This is the variant
-    /// YaneuraOu's `YANEURAOU_ENGINE_NNUE_SFNNwoP1536` build actually
-    /// uses. Identical network topology to `SFNN_HALFKA1HM`, only the
-    /// input feature differs.
+    /// `YANEURAOU_ENGINE_SFNN1536` alias uses. Identical network topology
+    /// to `SFNN_HALFKA1HM`, only the input feature differs.
     SfnnHalfka2hm,
+    /// SFNN with `HalfKA2` input (= non-mirrored 81 king buckets, enemy king
+    /// collapsed onto the friend-king plane). Matches YaneuraOu dynamic
+    /// `SFNN_halfka2_*_k3k3` architecture names.
+    SfnnHalfka2,
     /// SFNN-1536 with `K + A2` input (= YaneuraOu `FeatureSet<K, A2>`,
     /// 1791 dim). K (162 king features) + A2 (1629 piece features,
     /// kings collapsed onto friend plane). No file-mirror, so input
     /// dimension is much smaller than HalfKA_hm2 but representation
     /// is also weaker (no king-anchor cross product). Matches
-    /// YaneuraOu's `YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_*` build.
+    /// YaneuraOu's `YANEURAOU_ENGINE_SFNN_ka2_*` build.
     /// Identical network topology and LayerStacks bucketing as the
     /// other SFNN variants.
     SfnnKa2,
-}
-
-/// NNUE architecture size — `<L1>x2-<L2>-<L3>` in the textual CLI form.
-///
-/// Network structure is fixed (4-layer ClippedReLU, dual-perspective for the
-/// non-SFNN family; SFNN family uses a fixed sfnnwop-1536-style topology),
-/// only `(L1, L2, L3)` vary. Free-form: any positive `(L1, L2, L3)` triple
-/// is accepted as long as `L1 % 32 == 0` (SIMD-alignment requirement of
-/// the FT padding).
-///
-/// Common presets that are known to work:
-/// - `256x2-32-32`  (classic Stockfish-style NNUE; YaneuraOu KP / HalfKP default)
-/// - `512x2-8-64`, `768x2-16-64`, `1024x2-8-64`  (larger HalfKP variants
-///   matching YaneuraOu's NNUE binary directories)
-/// - `1536x2-15-32` (SFNN-1536, matches `architectures/sfnnwop-1536.h`;
-///   L2=15 + 1 PSQT-shortcut neuron is added automatically inside the
-///   SFNN trainer)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NnueArch {
-    l1: usize,
-    l2: usize,
-    l3: usize,
-}
-
-impl NnueArch {
-    /// `(l1, l2, l3)` triple.
-    fn dims(self) -> (usize, usize, usize) {
-        (self.l1, self.l2, self.l3)
-    }
-
-    /// The arch's CLI value as the user types it (e.g. `256x2-32-32`).
-    fn cli_name(self) -> String {
-        format!("{}x2-{}-{}", self.l1, self.l2, self.l3)
-    }
-}
-
-impl std::fmt::Display for NnueArch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}x2-{}-{}", self.l1, self.l2, self.l3)
-    }
-}
-
-impl std::str::FromStr for NnueArch {
-    type Err = String;
-
-    /// Parse `<L1>x2-<L2>-<L3>` (e.g. `256x2-32-32`). The middle `x2`
-    /// is required (it stands for the dual-perspective concat) and rejected
-    /// otherwise. `L1` must be a positive multiple of 32 (FT SIMD alignment);
-    /// `L2`, `L3` must be positive.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 {
-            return Err(format!(
-                "invalid arch `{s}`: expected `<L1>x2-<L2>-<L3>` (e.g. `256x2-32-32`)"
-            ));
-        }
-        let l1_part = parts[0]
-            .strip_suffix("x2")
-            .ok_or_else(|| format!("invalid arch `{s}`: `{}` must end with `x2`", parts[0]))?;
-        let l1: usize = l1_part
-            .parse()
-            .map_err(|_| format!("invalid arch `{s}`: L1 `{l1_part}` is not a positive integer"))?;
-        let l2: usize = parts[1]
-            .parse()
-            .map_err(|_| format!("invalid arch `{s}`: L2 `{}` is not a positive integer", parts[1]))?;
-        let l3: usize = parts[2]
-            .parse()
-            .map_err(|_| format!("invalid arch `{s}`: L3 `{}` is not a positive integer", parts[2]))?;
-        if l1 == 0 || l2 == 0 || l3 == 0 {
-            return Err(format!("invalid arch `{s}`: L1/L2/L3 must all be > 0"));
-        }
-        if l1 % 32 != 0 {
-            return Err(format!(
-                "invalid arch `{s}`: L1 (= {l1}) must be a multiple of 32 (FT SIMD-padding requirement)"
-            ));
-        }
-        Ok(NnueArch { l1, l2, l3 })
-    }
 }
 
 /// LayerStack bucketing scheme for the SFNN family. Selects which
@@ -261,10 +178,331 @@ enum LayerStackMode {
     Kingrank3by3,
 }
 
+impl LayerStackMode {
+    /// CLI value as the user types it.
+    fn cli_name(self) -> &'static str {
+        match self {
+            LayerStackMode::Kingrank3by3 => "king3-by-king3",
+        }
+    }
+
+    /// Short YaneuraOu architecture suffix.
+    fn arch_suffix(self) -> &'static str {
+        match self {
+            LayerStackMode::Kingrank3by3 => "k3k3",
+        }
+    }
+
+    /// Number of LayerStacks this bucketing scheme produces.
+    fn num_stacks(self) -> usize {
+        match self {
+            LayerStackMode::Kingrank3by3 => 9,
+        }
+    }
+}
+
+/// NNUE architecture name in the YaneuraOu Makefile form with the
+/// `YANEURAOU_ENGINE_` prefix removed.
+///
+/// Examples:
+/// - `NNUE_halfkp_256x2_32_32`
+/// - `NNUE_ka2_256x2_64_64`
+/// - `SFNN_halfka2_1024_7_64_k3k3`
+/// - `SFNN_halfkahm2_1536_15_32_king3_by_king3`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NnueArch {
+    family: NnueArchFamily,
+    feature: NnueArchFeature,
+    l1: usize,
+    l2: usize,
+    l3: usize,
+    layerstack: Option<LayerStackMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NnueArchFamily {
+    Nnue,
+    Sfnn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NnueArchFeature {
+    Halfkp,
+    Kp,
+    Ka2,
+    Halfkpe9,
+    Halfkpvm,
+    Halfka2,
+    Halfkahm1,
+    Halfkahm2,
+}
+
+impl NnueArch {
+    fn new(
+        family: NnueArchFamily,
+        feature: NnueArchFeature,
+        l1: usize,
+        l2: usize,
+        l3: usize,
+        layerstack: Option<LayerStackMode>,
+    ) -> Self {
+        Self { family, feature, l1, l2, l3, layerstack }
+    }
+
+    /// `(l1, l2, l3)` triple.
+    fn dims(self) -> (usize, usize, usize) {
+        (self.l1, self.l2, self.l3)
+    }
+
+    /// The arch's canonical CLI value.
+    fn cli_name(self) -> String {
+        match self.family {
+            NnueArchFamily::Nnue => {
+                format!("NNUE_{}_{}x2_{}_{}", self.feature.arch_suffix(), self.l1, self.l2, self.l3)
+            }
+            NnueArchFamily::Sfnn => {
+                let layerstack = self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
+                format!(
+                    "SFNN_{}_{}_{}_{}_{}",
+                    self.feature.arch_suffix(),
+                    self.l1,
+                    self.l2,
+                    self.l3,
+                    layerstack.arch_suffix()
+                )
+            }
+        }
+    }
+
+    fn default_for_eval_type(eval_type: EvalType) -> Self {
+        match eval_type {
+            EvalType::NnueHalfkp => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkp, 256, 32, 32, None),
+            EvalType::NnueKp => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Kp, 256, 32, 32, None),
+            EvalType::NnueKa2 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Ka2, 256, 32, 32, None),
+            EvalType::NnueHalfkpe9 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9, 256, 32, 32, None),
+            EvalType::NnueHalfkpvm => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm, 256, 32, 32, None),
+            EvalType::SfnnHalfka1hm => Self::new(
+                NnueArchFamily::Sfnn,
+                NnueArchFeature::Halfkahm1,
+                1536,
+                15,
+                32,
+                Some(LayerStackMode::Kingrank3by3),
+            ),
+            EvalType::SfnnHalfka2hm => Self::new(
+                NnueArchFamily::Sfnn,
+                NnueArchFeature::Halfkahm2,
+                1536,
+                15,
+                32,
+                Some(LayerStackMode::Kingrank3by3),
+            ),
+            EvalType::SfnnHalfka2 => Self::new(
+                NnueArchFamily::Sfnn,
+                NnueArchFeature::Halfka2,
+                1536,
+                15,
+                32,
+                Some(LayerStackMode::Kingrank3by3),
+            ),
+            EvalType::SfnnKa2 => {
+                Self::new(NnueArchFamily::Sfnn, NnueArchFeature::Ka2, 1536, 15, 32, Some(LayerStackMode::Kingrank3by3))
+            }
+            EvalType::Kppt | EvalType::KppKkpt => {
+                Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkp, 256, 32, 32, None)
+            }
+        }
+    }
+
+    fn expected_eval_type(self) -> EvalType {
+        match (self.family, self.feature) {
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfkp) => EvalType::NnueHalfkp,
+            (NnueArchFamily::Nnue, NnueArchFeature::Kp) => EvalType::NnueKp,
+            (NnueArchFamily::Nnue, NnueArchFeature::Ka2) => EvalType::NnueKa2,
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9) => EvalType::NnueHalfkpe9,
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm) => EvalType::NnueHalfkpvm,
+            (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm1) => EvalType::SfnnHalfka1hm,
+            (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2) => EvalType::SfnnHalfka2hm,
+            (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2) => EvalType::SfnnHalfka2,
+            (NnueArchFamily::Sfnn, NnueArchFeature::Ka2) => EvalType::SfnnKa2,
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfka2)
+            | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm1)
+            | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm2)
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkp)
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Kp)
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpe9)
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpvm) => {
+                unreachable!("unsupported parsed architecture combination: {self:?}")
+            }
+        }
+    }
+
+    fn validate_dims(self, original: &str) -> Result<Self, String> {
+        if self.l1 == 0 || self.l2 == 0 || self.l3 == 0 {
+            return Err(format!("invalid arch `{original}`: L1/L2/L3 must all be > 0"));
+        }
+        if self.l1 % 32 != 0 {
+            return Err(format!(
+                "invalid arch `{original}`: L1 (= {}) must be a multiple of 32 (FT SIMD-padding requirement)",
+                self.l1
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl NnueArchFeature {
+    fn parse(raw: &str, family: NnueArchFamily, original: &str) -> Result<Self, String> {
+        let normalized = raw.to_ascii_lowercase();
+        let feature = match normalized.as_str() {
+            "halfkp" => NnueArchFeature::Halfkp,
+            "kp" => NnueArchFeature::Kp,
+            "ka2" => NnueArchFeature::Ka2,
+            "halfkpe9" => NnueArchFeature::Halfkpe9,
+            "halfkpvm" => NnueArchFeature::Halfkpvm,
+            "halfka2" => NnueArchFeature::Halfka2,
+            "halfkahm1" => NnueArchFeature::Halfkahm1,
+            "halfkahm2" => NnueArchFeature::Halfkahm2,
+            _ => return Err(format!("invalid arch `{original}`: unsupported feature `{raw}`")),
+        };
+
+        let supported = matches!(
+            (family, feature),
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfkp)
+                | (NnueArchFamily::Nnue, NnueArchFeature::Kp)
+                | (NnueArchFamily::Nnue, NnueArchFeature::Ka2)
+                | (NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9)
+                | (NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm1)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Ka2)
+        );
+        if !supported {
+            let family_name = match family {
+                NnueArchFamily::Nnue => "NNUE",
+                NnueArchFamily::Sfnn => "SFNN",
+            };
+            return Err(format!("invalid arch `{original}`: feature `{raw}` is not supported for {family_name}"));
+        }
+
+        Ok(feature)
+    }
+
+    fn arch_suffix(self) -> &'static str {
+        match self {
+            NnueArchFeature::Halfkp => "halfkp",
+            NnueArchFeature::Kp => "kp",
+            NnueArchFeature::Ka2 => "ka2",
+            NnueArchFeature::Halfkpe9 => "halfkpe9",
+            NnueArchFeature::Halfkpvm => "halfkpvm",
+            NnueArchFeature::Halfka2 => "halfka2",
+            NnueArchFeature::Halfkahm1 => "halfkahm1",
+            NnueArchFeature::Halfkahm2 => "halfkahm2",
+        }
+    }
+}
+
+impl std::fmt::Display for NnueArch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.cli_name())
+    }
+}
+
+impl std::str::FromStr for NnueArch {
+    type Err = String;
+
+    /// Parse a YaneuraOu architecture name without the `YANEURAOU_ENGINE_`
+    /// prefix. This is intentionally not compatible with the old
+    /// `<L1>x2-<L2>-<L3>` shorthand.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.to_ascii_uppercase().starts_with("YANEURAOU_ENGINE_") {
+            return Err(format!("invalid arch `{s}`: pass the architecture name without the YANEURAOU_ENGINE_ prefix"));
+        }
+        if s.eq_ignore_ascii_case("SFNN1536") {
+            return NnueArch::new(
+                NnueArchFamily::Sfnn,
+                NnueArchFeature::Halfkahm2,
+                1536,
+                15,
+                32,
+                Some(LayerStackMode::Kingrank3by3),
+            )
+            .validate_dims(s);
+        }
+
+        let tokens: Vec<&str> = s.split('_').collect();
+        if tokens.len() < 5 {
+            return Err(format!(
+                "invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>` or `SFNN_<feature>_<FT>_<H1>_<H2>_k3k3`"
+            ));
+        }
+
+        let family = match tokens[0].to_ascii_uppercase().as_str() {
+            "NNUE" => NnueArchFamily::Nnue,
+            "SFNN" => NnueArchFamily::Sfnn,
+            other => {
+                return Err(format!("invalid arch `{s}`: first component must be NNUE or SFNN, got `{other}`"));
+            }
+        };
+        let feature = NnueArchFeature::parse(tokens[1], family, s)?;
+
+        match family {
+            NnueArchFamily::Nnue => {
+                if tokens.len() != 5 {
+                    return Err(format!("invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>`"));
+                }
+                let l1_part = tokens[2]
+                    .strip_suffix("x2")
+                    .or_else(|| tokens[2].strip_suffix("X2"))
+                    .ok_or_else(|| format!("invalid arch `{s}`: `{}` must end with `x2`", tokens[2]))?;
+                let l1: usize = l1_part
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: L1 `{l1_part}` is not a positive integer"))?;
+                let l2: usize = tokens[3]
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: L2 `{}` is not a positive integer", tokens[3]))?;
+                let l3: usize = tokens[4]
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: L3 `{}` is not a positive integer", tokens[4]))?;
+                NnueArch::new(family, feature, l1, l2, l3, None).validate_dims(s)
+            }
+            NnueArchFamily::Sfnn => {
+                if tokens.len() < 6 {
+                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>_k3k3`"));
+                }
+                let l1: usize = tokens[2]
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: FT `{}` is not a positive integer", tokens[2]))?;
+                let l2: usize = tokens[3]
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: H1 `{}` is not a positive integer", tokens[3]))?;
+                let l3: usize = tokens[4]
+                    .parse()
+                    .map_err(|_| format!("invalid arch `{s}`: H2 `{}` is not a positive integer", tokens[4]))?;
+                let layerstack = match tokens[5..].join("_").to_ascii_lowercase().as_str() {
+                    "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
+                    "ls9" => {
+                        return Err(format!(
+                            "invalid arch `{s}`: ls9 is no longer supported; use k3k3 or king3_by_king3"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected k3k3 or king3_by_king3"
+                        ));
+                    }
+                };
+                NnueArch::new(family, feature, l1, l2, l3, Some(layerstack)).validate_dims(s)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "SCREAMING_SNAKE_CASE")]
 enum NerfEvalType {
-    /// Generic SFNNwoPSQT layout. The concrete input feature does not affect
+    /// Generic SFNN layout. The concrete input feature does not affect
     /// nerf offsets because this command leaves the FeatureTransformer intact.
     Sfnn,
     /// SFNN with HalfKA_hm1 input.
@@ -272,7 +510,7 @@ enum NerfEvalType {
     /// SFNN with HalfKA_hm2 input.
     SfnnHalfka2hm,
     /// SFNN with HalfKA2 input, used by dynamic YaneuraOu
-    /// `SFNNwoPSQT_HALFKA2_*` builds.
+    /// `SFNN_halfka2_*` builds.
     SfnnHalfka2,
     /// SFNN with K+A2 input.
     SfnnKa2,
@@ -293,11 +531,7 @@ struct NerfLayerSet {
 
 impl Default for NerfLayerSet {
     fn default() -> Self {
-        Self {
-            fc0: false,
-            fc1: true,
-            fc2: true,
-        }
+        Self { fc0: false, fc1: true, fc2: true }
     }
 }
 
@@ -305,11 +539,7 @@ impl std::str::FromStr for NerfLayerSet {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut set = Self {
-            fc0: false,
-            fc1: false,
-            fc2: false,
-        };
+        let mut set = Self { fc0: false, fc1: false, fc2: false };
         for raw in s.split(',') {
             let token = raw.trim().to_ascii_lowercase();
             if token.is_empty() {
@@ -325,9 +555,7 @@ impl std::str::FromStr for NerfLayerSet {
                 "fc1" | "l2" => set.fc1 = true,
                 "fc2" | "out" | "output" => set.fc2 = true,
                 _ => {
-                    return Err(format!(
-                        "invalid --layers token `{raw}`: expected comma-separated fc0,fc1,fc2 or all"
-                    ));
+                    return Err(format!("invalid --layers token `{raw}`: expected comma-separated fc0,fc1,fc2 or all"));
                 }
             }
         }
@@ -371,14 +599,16 @@ struct NerfArgs {
     #[arg(long, value_enum, default_value = "SFNN")]
     eval_type: NerfEvalType,
 
-    /// Network architecture in `<FT>x2-<H1>-<H2>` form, e.g.
-    /// `1024x2-7-64` for `SFNNwoPSQT_HALFKA2_1024_7_64`.
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed, e.g.
+    /// `SFNN_halfka2_1024_7_64_k3k3`.
     #[arg(long)]
     arch: NnueArch,
 
-    /// LayerStack bucketing scheme for SFNN layouts. Must match the engine build.
-    #[arg(long, value_enum, default_value = "king3-by-king3")]
-    layerstack: LayerStackMode,
+    /// Optional LayerStack bucketing override. If supplied, it must match
+    /// the suffix embedded in `--arch`.
+    #[arg(long, value_enum)]
+    layerstack: Option<LayerStackMode>,
 
     /// Comma-separated layer list. Only i8 weights are changed; biases,
     /// FeatureTransformer, hashes, and padding weights are left intact.
@@ -395,19 +625,28 @@ struct NerfArgs {
     seed: u64,
 }
 
-impl LayerStackMode {
-    /// CLI value as the user types it.
-    fn cli_name(self) -> &'static str {
-        match self {
-            LayerStackMode::Kingrank3by3 => "king3-by-king3",
-        }
+impl NerfArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.or(self.layerstack).unwrap_or(LayerStackMode::Kingrank3by3)
     }
 
-    /// Number of LayerStacks this bucketing scheme produces.
-    fn num_stacks(self) -> usize {
-        match self {
-            LayerStackMode::Kingrank3by3 => 9,
+    fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; nerf currently supports only SFNN nn.bin layouts",
+                self.arch.cli_name()
+            ));
         }
+        if let (Some(from_arg), Some(from_arch)) = (self.layerstack, self.arch.layerstack) {
+            if from_arg != from_arch {
+                return Err(format!(
+                    "--layerstack {} conflicts with --arch {}",
+                    from_arg.cli_name(),
+                    self.arch.cli_name()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -423,6 +662,7 @@ impl EvalType {
             EvalType::NnueHalfkpvm => "shogi_nnue_halfkpvm",
             EvalType::SfnnHalfka1hm => "shogi_sfnn_halfka1hm",
             EvalType::SfnnHalfka2hm => "shogi_sfnn_halfka2hm",
+            EvalType::SfnnHalfka2 => "shogi_sfnn_halfka2",
             EvalType::SfnnKa2 => "shogi_sfnn_ka2",
         }
     }
@@ -440,6 +680,7 @@ impl EvalType {
             | EvalType::NnueHalfkpvm
             | EvalType::SfnnHalfka1hm
             | EvalType::SfnnHalfka2hm
+            | EvalType::SfnnHalfka2
             | EvalType::SfnnKa2 => true,
         }
     }
@@ -448,10 +689,7 @@ impl EvalType {
     /// (LayerStacks-based architectures) does; the rest of the NNUE
     /// family is single-stack.
     fn uses_layerstack(self) -> bool {
-        matches!(
-            self,
-            EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnKa2
-        )
+        matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2)
     }
 
     /// The eval-type's CLI value as the user typed it (e.g. `NNUE_HALFKP`).
@@ -469,6 +707,7 @@ impl EvalType {
             EvalType::NnueHalfkpvm => "NNUE_HALFKPVM",
             EvalType::SfnnHalfka1hm => "SFNN_HALFKA1HM",
             EvalType::SfnnHalfka2hm => "SFNN_HALFKA2HM",
+            EvalType::SfnnHalfka2 => "SFNN_HALFKA2",
             EvalType::SfnnKa2 => "SFNN_KA2",
         }
     }
@@ -548,8 +787,8 @@ impl PositionsLR {
 
 impl LrScheduler for PositionsLR {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
-        let in_run = ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64)
-            * (self.batch_size as u64);
+        let in_run =
+            ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64) * (self.batch_size as u64);
         let total = self.prior_positions + in_run;
         Self::lr_at_positions(self.start, self.min, self.period_positions, total)
     }
@@ -600,8 +839,8 @@ impl CosineLR {
 
 impl LrScheduler for CosineLR {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
-        let in_run = ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64)
-            * (self.batch_size as u64);
+        let in_run =
+            ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64) * (self.batch_size as u64);
         let total = self.prior_positions + in_run;
         Self::lr_at_positions(self.start, self.min, self.period_positions, total)
     }
@@ -654,7 +893,9 @@ enum LrScheduleKind {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
-#[command(after_help = "Subcommands:\n  nerf    Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n\nRun `bulletou nerf --help` for nerf-specific options.")]
+#[command(
+    after_help = "Subcommands:\n  nerf    Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n\nRun `bulletou nerf --help` for nerf-specific options."
+)]
 struct Args {
     /// Evaluation function type to train. Required for training; not
     /// needed (and ignored) when `--count-teacher` is used.
@@ -688,7 +929,7 @@ struct Args {
     /// for running multiple experiments with the same network /
     /// architecture but different hyperparameters: each run lands in
     /// its own directory like
-    /// `checkpoints/<eval-type>-<arch>[-<layerstack>]-<tag>`.
+    /// `checkpoints/<eval-type>-<arch>[-<tag>]`.
     /// Ignored when `--output` is set explicitly (the user-provided
     /// path wins).
     #[arg(long)]
@@ -721,7 +962,7 @@ struct Args {
     #[arg(long, default_value = "1")]
     max_epochs: usize,
 
-/// Initial Adam learning rate.
+    /// Initial Adam learning rate.
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
@@ -818,29 +1059,18 @@ struct Args {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
-    /// Network architecture for NNUE eval types. Free-form format
-    /// `<L1>x2-<L2>-<L3>` where `L1` is the per-perspective FT size
-    /// (must be a multiple of 32 for SIMD alignment) and `L2`, `L3`
-    /// are hidden-layer sizes. Common YaneuraOu-shipped sizes:
-    /// `256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`,
-    /// `1024x2-8-32`, `1024x2-8-64`, plus `1536x2-15-32` for the
-    /// SFNN family (matches `architectures/sfnnwop-1536.h`). Any
-    /// other valid triple (e.g. `256x2-64-64`) is also accepted for
-    /// experimentation, though only the YaneuraOu-shipped sizes can
-    /// be loaded by stock engine builds. Ignored for KPPT / KPP_KKPT
-    /// eval types.
-    #[arg(long, default_value = "256x2-32-32")]
-    arch: NnueArch,
+    /// Network architecture for NNUE / SFNN eval types. Use the YaneuraOu
+    /// Makefile architecture name after removing `YANEURAOU_ENGINE_`, e.g.
+    /// `NNUE_halfkp_256x2_32_32` or `SFNN_halfka2_1024_7_64_k3k3`.
+    /// If omitted, a per-eval-type default is used. Ignored for KPPT /
+    /// KPP_KKPT eval types.
+    #[arg(long)]
+    arch: Option<NnueArch>,
 
-    /// LayerStack bucketing scheme for the SFNN family. Only valid
-    /// when `--eval-type` is `SFNN_HALFKA1HM`, `SFNN_HALFKA2HM`, or
-    /// `SFNN_KA2`. Passing it with a non-SFNN eval type is rejected at
-    /// startup so the flag's effect is never silently dropped.
-    /// Currently only `king3-by-king3` is supported — it matches
-    /// YaneuraOu's `stack_index_for_nnue` (3 friend-king-rank ×
-    /// 3 enemy-king-rank = 9 stacks) so the trained `nn.bin` is
-    /// loadable and evaluation matches between training and inference.
-    /// When omitted for an SFNN eval type, defaults to `king3-by-king3`.
+    /// Optional LayerStack bucketing override for the SFNN family. The
+    /// preferred spelling is the suffix embedded in `--arch` (`k3k3` or
+    /// `king3_by_king3`); if this flag is supplied too, it must agree with
+    /// the architecture suffix.
     #[arg(long)]
     layerstack: Option<LayerStackMode>,
 
@@ -886,9 +1116,9 @@ impl Args {
     ///   types that consume `--arch` (the NNUE family), and
     ///   `checkpoints/<eval-type>` for the KPPT family (which doesn't).
     ///
-    /// `<eval-type>` and `<arch>` are the literal CLI values the user
-    /// would type (e.g. `NNUE_HALFKP`, `256x2-32-32`) so the dir name
-    /// stays in sync with the flags.
+    /// `<eval-type>` and `<arch>` are the canonical CLI values the user
+    /// would type (e.g. `NNUE_HALFKP`, `NNUE_halfkp_256x2_32_32`) so the
+    /// dir name stays in sync with the flags.
     fn output_dir(&self) -> PathBuf {
         if let Some(p) = &self.output {
             // Explicit --output wins; --tag is ignored to keep the
@@ -899,11 +1129,7 @@ impl Args {
         let mut name = self.eval_type().cli_name().to_string();
         if self.eval_type().uses_arch() {
             name.push('-');
-            name.push_str(&self.arch.cli_name());
-        }
-        if self.eval_type().uses_layerstack() {
-            name.push('-');
-            name.push_str(self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3).cli_name());
+            name.push_str(&self.arch().cli_name());
         }
         if let Some(tag) = &self.tag {
             if !tag.is_empty() {
@@ -928,20 +1154,75 @@ impl Args {
     /// always populated (either by the user via the CLI flag or by the
     /// parent run helper).
     fn yaneuraou_scale(&self) -> f32 {
-        self.yaneuraou_quant_scale
-            .expect("yaneuraou_quant_scale must be set before invoking the KPPT trainer")
+        self.yaneuraou_quant_scale.expect("yaneuraou_quant_scale must be set before invoking the KPPT trainer")
     }
 
     fn kpp_format(&self) -> KppFormat {
         self.eval_type().kpp_format()
     }
 
+    fn arch(&self) -> NnueArch {
+        self.arch.unwrap_or_else(|| NnueArch::default_for_eval_type(self.eval_type()))
+    }
+
+    fn effective_layerstack(&self) -> Option<LayerStackMode> {
+        if !self.eval_type().uses_layerstack() {
+            return None;
+        }
+        self.arch().layerstack.or(self.layerstack).or(Some(LayerStackMode::Kingrank3by3))
+    }
+
+    fn validate_arch_flags(&self) -> Result<(), String> {
+        let eval_type = self.eval_type();
+
+        if !eval_type.uses_arch() {
+            if self.arch.is_some() {
+                return Err(format!(
+                    "--arch is only valid with NNUE / SFNN eval types; --eval-type {} has a fixed KPPT layout",
+                    eval_type.cli_name()
+                ));
+            }
+            if self.layerstack.is_some() {
+                return Err(format!(
+                    "--layerstack is only valid with the SFNN family; --eval-type {} has no LayerStacks topology",
+                    eval_type.cli_name()
+                ));
+            }
+            return Ok(());
+        }
+
+        let arch = self.arch();
+        let expected = arch.expected_eval_type();
+        if expected != eval_type {
+            return Err(format!(
+                "--arch {} implies --eval-type {}, but --eval-type {} was selected",
+                arch.cli_name(),
+                expected.cli_name(),
+                eval_type.cli_name()
+            ));
+        }
+
+        if self.layerstack.is_some() && !eval_type.uses_layerstack() {
+            return Err(format!(
+                "--layerstack is only valid with the SFNN family; --eval-type {} has no LayerStacks topology",
+                eval_type.cli_name()
+            ));
+        }
+
+        if let (Some(from_arg), Some(from_arch)) = (self.layerstack, arch.layerstack) {
+            if from_arg != from_arch {
+                return Err(format!("--layerstack {} conflicts with --arch {}", from_arg.cli_name(), arch.cli_name()));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Unwrap `eval_type`. clap's `required_unless_present = "count_teacher"`
     /// guarantees it's `Some` whenever training (= non-count_teacher) is
     /// taking place; if it isn't, there is a clap-side bug, not user error.
     fn eval_type(&self) -> EvalType {
-        self.eval_type
-            .expect("--eval-type required (clap should have validated)")
+        self.eval_type.expect("--eval-type required (clap should have validated)")
     }
 }
 
@@ -986,9 +1267,7 @@ fn auto_epoch_period(
     };
     let mut total: u64 = 0;
     for p in data_files {
-        let size = std::fs::metadata(p)
-            .map_err(|e| format!("stat {p}: {e}"))?
-            .len();
+        let size = std::fs::metadata(p).map_err(|e| format!("stat {p}: {e}"))?.len();
         if size % record_size != 0 {
             return Err(format!(
                 "{p}: size {size} not a multiple of {record_size} byte — \
@@ -1023,16 +1302,12 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         }
     };
 
-    eprintln!(
-        "Counting {format:?} teacher files ({} byte/record)...",
-        record_size
-    );
+    eprintln!("Counting {format:?} teacher files ({} byte/record)...", record_size);
 
     let mut total_positions: u64 = 0;
     let mut total_bytes: u64 = 0;
     for path in &paths {
-        let meta = std::fs::metadata(path)
-            .map_err(|e| format!("failed to stat {path}: {e}"))?;
+        let meta = std::fs::metadata(path).map_err(|e| format!("failed to stat {path}: {e}"))?;
         let size = meta.len();
         if size % record_size != 0 {
             return Err(format!(
@@ -1043,11 +1318,7 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         let positions = size / record_size;
         total_positions += positions;
         total_bytes += size;
-        println!(
-            "  {:>14} positions  ({:>8.2} MB)  {path}",
-            positions,
-            size as f64 / (1024.0 * 1024.0),
-        );
+        println!("  {:>14} positions  ({:>8.2} MB)  {path}", positions, size as f64 / (1024.0 * 1024.0),);
     }
     println!("---");
     println!(
@@ -1141,30 +1412,23 @@ impl NerfRng {
 }
 
 fn read_u32_le(bytes: &[u8], pos: usize, label: &str) -> Result<u32, String> {
-    let end = pos
-        .checked_add(4)
-        .ok_or_else(|| format!("{label}: offset overflow"))?;
-    let slice = bytes
-        .get(pos..end)
-        .ok_or_else(|| format!("{label}: truncated at byte {pos}"))?;
+    let end = pos.checked_add(4).ok_or_else(|| format!("{label}: offset overflow"))?;
+    let slice = bytes.get(pos..end).ok_or_else(|| format!("{label}: truncated at byte {pos}"))?;
     Ok(u32::from_le_bytes(slice.try_into().expect("slice len checked")))
 }
 
 fn skip_leb128_block(bytes: &[u8], pos: usize, label: &str) -> Result<usize, String> {
-    let magic_end = pos
-        .checked_add(LEB128_MAGIC.len())
-        .ok_or_else(|| format!("{label}: offset overflow"))?;
+    let magic_end = pos.checked_add(LEB128_MAGIC.len()).ok_or_else(|| format!("{label}: offset overflow"))?;
     if bytes.get(pos..magic_end) != Some(LEB128_MAGIC) {
         return Err(format!(
-            "{label}: missing LEB128 magic at byte {pos}; this command currently expects an SFNNwoPSQT nn.bin"
+            "{label}: missing LEB128 magic at byte {pos}; this command currently expects an SFNN nn.bin"
         ));
     }
     let size_pos = magic_end;
     let payload_size = read_u32_le(bytes, size_pos, label)? as usize;
     let payload_start = size_pos + 4;
-    let payload_end = payload_start
-        .checked_add(payload_size)
-        .ok_or_else(|| format!("{label}: payload size overflow"))?;
+    let payload_end =
+        payload_start.checked_add(payload_size).ok_or_else(|| format!("{label}: payload size overflow"))?;
     if payload_end > bytes.len() {
         return Err(format!(
             "{label}: payload claims {payload_size} byte(s) at byte {payload_start}, beyond file size {}",
@@ -1180,26 +1444,17 @@ fn sfnn_network_base_offset(bytes: &[u8]) -> Result<usize, String> {
     }
     let version = read_u32_le(bytes, 0, "NNUE header")?;
     if version != SFNN_NNUE_VERSION {
-        return Err(format!(
-            "NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}"
-        ));
+        return Err(format!("NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}"));
     }
     let desc_len = read_u32_le(bytes, 8, "NNUE header desc_len")? as usize;
     let desc_start = 12usize;
-    let desc_end = desc_start
-        .checked_add(desc_len)
-        .ok_or_else(|| "NNUE header desc_len overflow".to_string())?;
+    let desc_end = desc_start.checked_add(desc_len).ok_or_else(|| "NNUE header desc_len overflow".to_string())?;
     if desc_end > bytes.len() {
-        return Err(format!(
-            "NNUE header description claims {desc_len} byte(s), beyond file size {}",
-            bytes.len()
-        ));
+        return Err(format!("NNUE header description claims {desc_len} byte(s), beyond file size {}", bytes.len()));
     }
 
     let ft_hash_pos = desc_end;
-    let mut pos = ft_hash_pos
-        .checked_add(4)
-        .ok_or_else(|| "FeatureTransformer hash offset overflow".to_string())?;
+    let mut pos = ft_hash_pos.checked_add(4).ok_or_else(|| "FeatureTransformer hash offset overflow".to_string())?;
     if pos > bytes.len() {
         return Err("truncated before FeatureTransformer hash".to_string());
     }
@@ -1255,10 +1510,7 @@ fn collect_sfnn_nerf_candidates(
         if layers.fc0 {
             for o in 0..l1_out {
                 for i in 0..ft_size {
-                    out.push(NerfCandidate {
-                        offset: fc0_weights + o * fc0_pad_in + i,
-                        layer: NerfLayerId::Fc0,
-                    });
+                    out.push(NerfCandidate { offset: fc0_weights + o * fc0_pad_in + i, layer: NerfLayerId::Fc0 });
                     report.fc0_candidates += 1;
                 }
             }
@@ -1270,10 +1522,7 @@ fn collect_sfnn_nerf_candidates(
         if layers.fc1 {
             for o in 0..hidden2 {
                 for i in 0..fc1_real_in {
-                    out.push(NerfCandidate {
-                        offset: fc1_weights + o * fc1_pad_in + i,
-                        layer: NerfLayerId::Fc1,
-                    });
+                    out.push(NerfCandidate { offset: fc1_weights + o * fc1_pad_in + i, layer: NerfLayerId::Fc1 });
                     report.fc1_candidates += 1;
                 }
             }
@@ -1284,10 +1533,7 @@ fn collect_sfnn_nerf_candidates(
         let fc2_weights = pos;
         if layers.fc2 {
             for i in 0..hidden2 {
-                out.push(NerfCandidate {
-                    offset: fc2_weights + i,
-                    layer: NerfLayerId::Fc2,
-                });
+                out.push(NerfCandidate { offset: fc2_weights + i, layer: NerfLayerId::Fc2 });
                 report.fc2_candidates += 1;
             }
         }
@@ -1301,8 +1547,8 @@ fn collect_sfnn_nerf_candidates(
 }
 
 fn nerf_sfnn_bytes(mut bytes: Vec<u8>, args: &NerfArgs) -> Result<(Vec<u8>, NerfReport), String> {
-    let (candidates, mut report) =
-        collect_sfnn_nerf_candidates(&bytes, args.arch, args.layerstack, args.layers)?;
+    let layerstack = args.effective_layerstack();
+    let (candidates, mut report) = collect_sfnn_nerf_candidates(&bytes, args.arch, layerstack, args.layers)?;
     if args.count > 0 && candidates.is_empty() {
         return Err(format!(
             "--layers {} produced no candidate weights; choose at least one weight layer",
@@ -1331,6 +1577,7 @@ fn nerf_sfnn_bytes(mut bytes: Vec<u8>, args: &NerfArgs) -> Result<(Vec<u8>, Nerf
 }
 
 fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
+    args.validate_arch_flags()?;
     if args.input == args.output {
         return Err("--input and --output must be different paths".to_string());
     }
@@ -1347,18 +1594,15 @@ fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
         eprintln!("note: --count 0 copies the input without changing weights");
     }
 
-    let bytes = std::fs::read(&args.input)
-        .map_err(|e| format!("failed to read {}: {e}", args.input.display()))?;
+    let bytes = std::fs::read(&args.input).map_err(|e| format!("failed to read {}: {e}", args.input.display()))?;
     let (nerfed, report) = nerf_sfnn_bytes(bytes, args)?;
 
     if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
     }
-    std::fs::write(&args.output, nerfed)
-        .map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
+    std::fs::write(&args.output, nerfed).map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
 
     Ok(report)
 }
@@ -1367,10 +1611,7 @@ fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
 
 fn main() {
     let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if raw_args
-        .get(1)
-        .is_some_and(|arg| arg == std::ffi::OsStr::new("nerf"))
-    {
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("nerf")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
             *program = std::ffi::OsString::from("bulletou nerf");
@@ -1383,7 +1624,7 @@ fn main() {
                 println!("  output             = {}", args.output.display());
                 println!("  eval_type          = {:?}", args.eval_type);
                 println!("  arch               = {}", args.arch);
-                println!("  layerstack         = {}", args.layerstack.cli_name());
+                println!("  layerstack         = {}", args.effective_layerstack().cli_name());
                 println!("  layers             = {}", args.layers);
                 println!("  candidate_weights  = {}", report.candidate_weights);
                 println!("    fc0              = {}", report.fc0_candidates);
@@ -1436,23 +1677,12 @@ fn main() {
             }
         }
     }
-    // Reject `--layerstack` on eval types that have no LayerStacks
-    // topology — silently ignoring the flag would mislead the user
-    // into thinking it had an effect.
-    if args.layerstack.is_some() && !args.eval_type().uses_layerstack() {
-        eprintln!(
-            "error: --layerstack is only valid with the SFNN family \
-             (SFNN_HALFKA1HM / SFNN_HALFKA2HM / SFNN_KA2). \
-             --eval-type {} has no LayerStacks topology; drop the flag.",
-            args.eval_type().cli_name()
-        );
+    if let Err(e) = args.validate_arch_flags() {
+        eprintln!("error: {e}");
         std::process::exit(2);
     }
     if let Err(e) = record_invocation_to_tag_txt(&args) {
-        eprintln!(
-            "warning: failed to write tag.txt under {}: {e}",
-            args.output_dir().display()
-        );
+        eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
     }
     match args.eval_type() {
         EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
@@ -1463,6 +1693,7 @@ fn main() {
         EvalType::NnueHalfkpvm => run_halfkpvm(&args),
         EvalType::SfnnHalfka1hm => run_sfnn_1536(&args, ShogiHalfKaHm1, NnueFeatureSet::HalfKaHm1),
         EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
+        EvalType::SfnnHalfka2 => run_sfnn_1536(&args, ShogiHalfKa2, NnueFeatureSet::HalfKa2),
         EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
     }
 }
@@ -1481,10 +1712,7 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     let output_dir = args.output_dir();
     std::fs::create_dir_all(&output_dir)?;
     let tag_path = output_dir.join("tag.txt");
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // argv joined with single spaces; quoting/escaping is intentionally
     // not applied — the line is for human eyeballing, not for re-execution.
     // (clap-parsed values are mostly path/identifier strings without
@@ -1492,10 +1720,7 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     // is lost by the time we see std::env::args, so reconstructing it is
     // best-effort regardless.)
     let cmdline: String = std::env::args().collect::<Vec<_>>().join(" ");
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&tag_path)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&tag_path)?;
     writeln!(f, "{ts}\t{cmdline}")?;
     Ok(())
 }
@@ -1576,12 +1801,10 @@ fn run_kppt_all(args: &Args) {
             let mut paths: Vec<std::path::PathBuf> = Vec::new();
             for comp in ["kk", "kkp", "kpp"] {
                 let comp_dir = resume_root.join(comp);
-                unbundle_component_state(&records, comp, &comp_dir.join("optimiser_state")).unwrap_or_else(
-                    |e| {
-                        eprintln!("error: state.bin missing `{comp}/*` records: {e}");
-                        std::process::exit(1);
-                    },
-                );
+                unbundle_component_state(&records, comp, &comp_dir.join("optimiser_state")).unwrap_or_else(|e| {
+                    eprintln!("error: state.bin missing `{comp}/*` records: {e}");
+                    std::process::exit(1);
+                });
                 paths.push(comp_dir);
             }
             (paths[0].clone(), paths[1].clone(), paths[2].clone())
@@ -1629,10 +1852,7 @@ fn run_kppt_all(args: &Args) {
             // growing file spanning all resumes. Per-save
             // `<output>/0NNN/learn.log` files are kept as snapshots.
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -1649,7 +1869,8 @@ fn run_kppt_all(args: &Args) {
 /// - `eval`: mirror of the output-dir name (`<eval-type>[-<arch>]`)
 ///   plus a `/<component>` suffix for multi-component eval types. For
 ///   NNUE eval types (single-component) the column holds the eval-type
-///   joined with the architecture, e.g. `NNUE_HALFKP-256x2-32-32`. For
+///   joined with the architecture, e.g.
+///   `NNUE_HALFKP-NNUE_halfkp_256x2_32_32`. For
 ///   KPPT-family eval types (which ignore `--arch`, three components
 ///   trained sequentially) it holds `KPPT/kk`, `KPPT/kkp`, `KPPT/kpp`
 ///   (or `KPP_KKPT/kk`, etc.).
@@ -1694,7 +1915,7 @@ const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
-    /// Arch suffix (`256x2-32-32` etc.) for NNUE eval types. Empty string for
+    /// Canonical architecture name for NNUE eval types. Empty string for
     /// KPPT-family eval types since they ignore `--arch`. When non-empty it is
     /// joined into the `eval` column as `<eval-type>-<arch>`, matching the
     /// output-dir naming.
@@ -1756,7 +1977,7 @@ impl LogContext {
             args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
         Self {
             eval_type: args.eval_type().cli_name(),
-            arch: if args.eval_type().uses_arch() { args.arch.cli_name() } else { String::new() },
+            arch: if args.eval_type().uses_arch() { args.arch().cli_name() } else { String::new() },
             lr_start: args.lr,
             lambda: args.lambda,
             batch_size: args.batch_size,
@@ -1773,8 +1994,7 @@ impl LogContext {
     /// within the current epoch, plus the `position_offset` carried over
     /// from prior runs (read from the existing top-level `learn.log`).
     fn positions_at(&self, superbatch: usize, curr_batch: usize, position_offset: usize) -> usize {
-        position_offset
-            + (superbatch.saturating_sub(1) * self.batches_per_superbatch + curr_batch) * self.batch_size
+        position_offset + (superbatch.saturating_sub(1) * self.batches_per_superbatch + curr_batch) * self.batch_size
     }
 }
 
@@ -1856,11 +2076,8 @@ fn enrich_bullet_log_to_csv(
     let n = parsed.len();
     for (i, &(local_sb, b, train_loss)) in parsed.iter().enumerate() {
         let is_sb_boundary = i + 1 == n || parsed[i + 1].0 != local_sb;
-        let (test_acc_field, test_loss_field) = if is_sb_boundary {
-            (test_acc_filled.as_str(), test_loss_filled.as_str())
-        } else {
-            ("-", "-")
-        };
+        let (test_acc_field, test_loss_field) =
+            if is_sb_boundary { (test_acc_filled.as_str(), test_loss_filled.as_str()) } else { ("-", "-") };
         // Absolute epoch: bullet's `for epoch in 1..=max_epochs` counter
         // is local within the current run. `ctx.epoch_offset` carries
         // the cumulative completed-epoch count from previous runs so
@@ -1876,18 +2093,10 @@ fn enrich_bullet_log_to_csv(
         // (`absolute_sb`) is purely informational — the LR formula is
         // independent of bullet's superbatch counter.
         let lr = match ctx.lr_schedule {
-            LrScheduleKind::Step => PositionsLR::lr_at_positions(
-                ctx.lr_start,
-                ctx.lr_min,
-                ctx.lr_period,
-                positions as u64,
-            ),
-            LrScheduleKind::Cos => CosineLR::lr_at_positions(
-                ctx.lr_start,
-                ctx.lr_min,
-                ctx.lr_period,
-                positions as u64,
-            ),
+            LrScheduleKind::Step => {
+                PositionsLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64)
+            }
+            LrScheduleKind::Cos => CosineLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64),
         };
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
         // `/<component>` suffix for multi-component eval types (KPPT
@@ -1898,11 +2107,8 @@ fn enrich_bullet_log_to_csv(
         } else {
             std::borrow::Cow::Owned(format!("{}-{}", ctx.eval_type, ctx.arch))
         };
-        let eval_field: std::borrow::Cow<'_, str> = if component == "nnue" {
-            head
-        } else {
-            std::borrow::Cow::Owned(format!("{}/{}", head, component))
-        };
+        let eval_field: std::borrow::Cow<'_, str> =
+            if component == "nnue" { head } else { std::borrow::Cow::Owned(format!("{}/{}", head, component)) };
         // All numeric float columns are formatted at fixed 6 decimals
         // for readability. `train` arrives as bullet's raw string (e.g.
         // "0.07035521"); reparse and re-format if possible, otherwise
@@ -2409,11 +2615,10 @@ macro_rules! run_training_inline {
         // Warm-restart cycle period = one epoch's positions. Both `step`
         // (geometric) and `cos` (cosine) schedules use this same period.
         let lr_period: u64 =
-            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch)
-                .unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                });
+            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
 
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
@@ -2446,9 +2651,7 @@ macro_rules! run_training_inline {
         // (= no cb_dataloader_resume_offset in scope, this code path doesn't
         // wire the saved-pointer resume). KPPT-with-HCPE is rare; the per-chunk
         // loader creation remains.
-        let persistent_hcpe_loader: Option<
-            HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>,
-        > = None;
+        let persistent_hcpe_loader: Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> = None;
 
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
@@ -2457,11 +2660,7 @@ macro_rules! run_training_inline {
 
             // checkpoint dir 名は max_epochs=1 のとき従来通り `<net_id>-<superbatch>`、
             // 複数 epoch のときは `<net_id>-e<epoch>-<superbatch>` で重複を避ける。
-            let net_id_for_epoch = if max_epochs > 1 {
-                format!("{net_id_base}-e{epoch}")
-            } else {
-                net_id_base.clone()
-            };
+            let net_id_for_epoch = if max_epochs > 1 { format!("{net_id_base}-e{epoch}") } else { net_id_base.clone() };
             last_net_id_for_epoch = net_id_for_epoch.clone();
 
             let schedule = TrainingSchedule {
@@ -2529,14 +2728,12 @@ macro_rules! run_training_inline {
                     // hoisting here; the macro lacks the resume-offset wiring
                     // that the NNUE macro has).
                     let _ = &persistent_hcpe_loader; // suppress unused
-                    let loader =
-                        HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_loader_threads(args.loader_threads);
+                    let loader = HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                        .with_loader_threads(args.loader_threads);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Hcpe3 => {
-                    let loader =
-                        Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Pack => {
@@ -2787,11 +2984,7 @@ impl TestPositionsCache {
 /// Run validation on the cached test positions and produce per-save
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
-fn run_one_test_pass(
-    cache: &TestPositionsCache,
-    args: &Args,
-    trainer_outputs: Vec<f32>,
-) -> TestMetrics {
+fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: Vec<f32>) -> TestMetrics {
     let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
     let report = compute_sign_accuracy(
         &trainer_outputs,
@@ -2850,11 +3043,10 @@ macro_rules! run_training_inline_nnue {
         // Warm-restart cycle period = one epoch's positions. Both `step`
         // (geometric) and `cos` (cosine) schedules use this same period.
         let lr_period: u64 =
-            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch)
-                .unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                });
+            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
 
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
@@ -2896,9 +3088,7 @@ macro_rules! run_training_inline_nnue {
         // epoch from sb=1 with a fresh dataloader, instead of trying to
         // resume sb=last_sb+1 (which would skip past end_superbatch and
         // train zero batches).
-        let prev_run_completed_epoch = auto_resume_sb_raw
-            .map(|last_sb| last_sb >= end_superbatch)
-            .unwrap_or(false);
+        let prev_run_completed_epoch = auto_resume_sb_raw.map(|last_sb| last_sb >= end_superbatch).unwrap_or(false);
         // Displayed sb in `learn.log` is intrinsically per-epoch (= 1..N
         // each epoch), so no cross-run offset is applied. Only the
         // dataloader's bullet-internal start_sb differs by case below.
@@ -2936,14 +3126,8 @@ macro_rules! run_training_inline_nnue {
         //   K (same as the previous partial save), and its local
         //   epoch=2 displays as K+1.
         let max_epoch_in_log = read_latest_epoch_in_top_level_log(&cb_top_level_log).unwrap_or(0);
-        let mid_epoch_resume = !teacher_changed
-            && !prev_run_completed_epoch
-            && auto_resume_sb_raw.is_some();
-        cb_ctx.epoch_offset = if mid_epoch_resume {
-            max_epoch_in_log.saturating_sub(1)
-        } else {
-            max_epoch_in_log
-        };
+        let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && auto_resume_sb_raw.is_some();
+        cb_ctx.epoch_offset = if mid_epoch_resume { max_epoch_in_log.saturating_sub(1) } else { max_epoch_in_log };
         // The LR column is derived from `positions` (= prior + per-row
         // offset within this run), so we always need the cumulative
         // carry-over from the existing top-level log here so the enrich
@@ -2958,10 +3142,7 @@ macro_rules! run_training_inline_nnue {
         // positions も sb counter と一緒にリセットされてしまう。これを
         // 防ぐため、各 epoch 開始時にこの値を learn.log から再読み込み
         // して累積を反映させる。`mut` で更新される。
-        let mut cb_prior_position = read_prior_positions(&cb_top_level_log)
-            .get("nnue")
-            .copied()
-            .unwrap_or(0);
+        let mut cb_prior_position = read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0);
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
         // HCPE データローダー再開用 byte offset。最新の checkpoint dir に
         // `dataloader_pos.txt` があればそこから読み、なければ 0 (= 先頭から)。
@@ -2969,18 +3150,16 @@ macro_rules! run_training_inline_nnue {
         // (byte_offset, plies_within_unit) のペアで保持する。HCPE / PSV
         // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
         // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
-        let cb_dataloader_resume_offset = std::cell::Cell::new(
-            if teacher_changed || prev_run_completed_epoch {
-                // Continued-training case (= add more epochs after a
-                // completed run): read the teacher from byte 0 of the
-                // first new epoch, otherwise we'd start near EOF (where
-                // the previous run's final epoch ended) and hit early
-                // EOF instead of training.
-                (0u64, 0usize)
-            } else {
-                read_latest_dataloader_pos(&output_dir_buf).unwrap_or((0, 0))
-            }
-        );
+        let cb_dataloader_resume_offset = std::cell::Cell::new(if teacher_changed || prev_run_completed_epoch {
+            // Continued-training case (= add more epochs after a
+            // completed run): read the teacher from byte 0 of the
+            // first new epoch, otherwise we'd start near EOF (where
+            // the previous run's final epoch ended) and hit early
+            // EOF instead of training.
+            (0u64, 0usize)
+        } else {
+            read_latest_dataloader_pos(&output_dir_buf).unwrap_or((0, 0))
+        });
 
         if teacher_changed {
             if let Some(prev) = prev_teacher.as_deref() {
@@ -3001,10 +3180,7 @@ macro_rules! run_training_inline_nnue {
                 if last_sb == 1 { "" } else { "es" },
             );
         } else if let Some(last_sb) = auto_resume_sb_raw {
-            eprintln!(
-                "  auto-resuming from superbatch {} (last saved: {}).",
-                effective_start_superbatch, last_sb
-            );
+            eprintln!("  auto-resuming from superbatch {} (last saved: {}).", effective_start_superbatch, last_sb);
         }
 
         // Build the LR scheduler. Positions-based for both kinds:
@@ -3056,23 +3232,22 @@ macro_rules! run_training_inline_nnue {
         // ファイル末尾に達して exit しているので、同じ loader を持ち越すと
         // 空 channel → `NoBatchesReceived` panic になるため。Epoch 1 だけは
         // 外側からの resume offset を使い、epoch 2 以降は教師頭から (offset=0)。
-        let new_hcpe_loader = |resume_off: u64| -> Option<
-            HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>,
-        > {
-            if matches!(format, DataFormat::Hcpe) {
-                Some(
-                    HcpeDataLoader::new_concat_multiple(
-                        &data_files_ref,
-                        args.buffer_mb,
-                        (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
+        let new_hcpe_loader =
+            |resume_off: u64| -> Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> {
+                if matches!(format, DataFormat::Hcpe) {
+                    Some(
+                        HcpeDataLoader::new_concat_multiple(
+                            &data_files_ref,
+                            args.buffer_mb,
+                            (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
+                        )
+                        .with_loader_threads(args.loader_threads)
+                        .with_resume_offset(resume_off),
                     )
-                    .with_loader_threads(args.loader_threads)
-                    .with_resume_offset(resume_off),
-                )
-            } else {
-                None
-            }
-        };
+                } else {
+                    None
+                }
+            };
         let mut persistent_hcpe_loader = new_hcpe_loader(cb_dataloader_resume_offset.get().0);
 
         for epoch in 1..=max_epochs {
@@ -3090,10 +3265,8 @@ macro_rules! run_training_inline_nnue {
             // Without this, bullet's sb counter reset at trainer.run boundary
             // would also reset the `positions` column.
             if epoch > 1 {
-                cb_prior_position = read_prior_positions(&cb_top_level_log)
-                    .get("nnue")
-                    .copied()
-                    .unwrap_or(cb_prior_position);
+                cb_prior_position =
+                    read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(cb_prior_position);
             }
             // LR scheduler is rebuilt per-epoch so its `prior_positions`
             // reflects the updated cumulative count.
@@ -3115,11 +3288,7 @@ macro_rules! run_training_inline_nnue {
                     batches_per_superbatch,
                 }),
             };
-            let net_id_for_epoch = if max_epochs > 1 {
-                format!("{net_id_base}-e{epoch}")
-            } else {
-                net_id_base.clone()
-            };
+            let net_id_for_epoch = if max_epochs > 1 { format!("{net_id_base}-e{epoch}") } else { net_id_base.clone() };
             last_net_id_for_epoch = net_id_for_epoch.clone();
 
             // Run the epoch in chunks of `save_rate` superbatches. Each
@@ -3134,7 +3303,9 @@ macro_rules! run_training_inline_nnue {
             let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
             let chunk_size = args.save_rate.max(1);
             'epoch: loop {
-                if chunk_start > end_superbatch { break; }
+                if chunk_start > end_superbatch {
+                    break;
+                }
                 let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
 
                 let schedule = TrainingSchedule {
@@ -3158,8 +3329,7 @@ macro_rules! run_training_inline_nnue {
                 let net_id_for_cb = net_id_for_epoch.clone();
                 let output_dir_for_cb = output_dir_buf.clone();
                 let saved_any_ref = &saved_any;
-                let saved_dir_in_chunk: std::cell::RefCell<Option<std::path::PathBuf>> =
-                    std::cell::RefCell::new(None);
+                let saved_dir_in_chunk: std::cell::RefCell<Option<std::path::PathBuf>> = std::cell::RefCell::new(None);
                 let saved_dir_ref = &saved_dir_in_chunk;
                 let on_checkpoint_saved = move |superbatch: usize| {
                     saved_any_ref.set(true);
@@ -3203,9 +3373,8 @@ macro_rules! run_training_inline_nnue {
                     }
                     DataFormat::Hcpe3 => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
-                        let loader =
-                            Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                                .with_resume_offset(resume_off, resume_plies);
+                        let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                            .with_resume_offset(resume_off, resume_plies);
                         dl_offset_handle.set(Some(loader.consumed_offset_handle()));
                         dl_plies_handle.set(Some(loader.consumed_plies_handle()));
                         trainer.run(&schedule, &settings, &loader)
@@ -3231,12 +3400,10 @@ macro_rules! run_training_inline_nnue {
                 // Consumer が「ここまで処理した」を表す (offset, plies) を
                 // 読み出し、次 chunk 用 resume として保持しておく。ファイル
                 // 書き出しは finalize_one_nnue_dir 成功後にやる。
-                let consumed_offset_val = dl_offset_handle.take().map(|arc| {
-                    arc.load(std::sync::atomic::Ordering::Acquire)
-                });
-                let consumed_plies_val = dl_plies_handle.take().map(|arc| {
-                    arc.load(std::sync::atomic::Ordering::Acquire)
-                });
+                let consumed_offset_val =
+                    dl_offset_handle.take().map(|arc| arc.load(std::sync::atomic::Ordering::Acquire));
+                let consumed_plies_val =
+                    dl_plies_handle.take().map(|arc| arc.load(std::sync::atomic::Ordering::Acquire));
                 if let Some(off) = consumed_offset_val {
                     cb_dataloader_resume_offset.set((off, consumed_plies_val.unwrap_or(0)));
                 }
@@ -3256,8 +3423,7 @@ macro_rules! run_training_inline_nnue {
                         if last_error_record.is_empty() {
                             break 'epoch;
                         }
-                        let partial_dir = output_dir_buf
-                            .join(format!("{net_id_for_epoch}-{chunk_start}"));
+                        let partial_dir = output_dir_buf.join(format!("{net_id_for_epoch}-{chunk_start}"));
                         eprintln!(
                             "  partial superbatch {} (teacher EOF mid-sb); \
                              saving partial state to {}",
@@ -3267,20 +3433,11 @@ macro_rules! run_training_inline_nnue {
                         let s = partial_dir.to_str().expect("checkpoint path is utf-8");
                         trainer.save_to_checkpoint(s);
                         if let Err(e) = write_loss_csv(&partial_dir.join("log.txt"), &last_error_record) {
-                            eprintln!(
-                                "  WARN: failed to write log.txt in {}: {e}",
-                                partial_dir.display()
-                            );
+                            eprintln!("  WARN: failed to write log.txt in {}: {e}", partial_dir.display());
                         }
                         match convert_save_dir_to_nnue_layout(&partial_dir) {
-                            Ok(()) => eprintln!(
-                                "  wrote NNUE nn.bin + state.bin in {}",
-                                partial_dir.display()
-                            ),
-                            Err(e) => eprintln!(
-                                "  WARN: failed to convert save dir {}: {e}",
-                                partial_dir.display()
-                            ),
+                            Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", partial_dir.display()),
+                            Err(e) => eprintln!("  WARN: failed to convert save dir {}: {e}", partial_dir.display()),
                         }
                         saved_any.set(true);
                         (partial_dir, true)
@@ -3321,19 +3478,13 @@ macro_rules! run_training_inline_nnue {
                             let plies = consumed_plies_val.unwrap_or(0);
                             let pos_file = dst.join("dataloader_pos.txt");
                             if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
-                                eprintln!(
-                                    "  WARN: failed to write {}: {e}",
-                                    pos_file.display()
-                                );
+                                eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
                             }
                         }
                         eprintln!("  -> {}/", dst.display());
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  WARN: failed to finalise {} into NNNN/: {e}",
-                            ckpt_dir.display()
-                        );
+                        eprintln!("  WARN: failed to finalise {} into NNNN/: {e}", ckpt_dir.display());
                     }
                 }
 
@@ -3393,10 +3544,7 @@ macro_rules! run_training_inline_nnue {
                     eprintln!("  -> {}/", dst.display());
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  WARN: failed to finalise fallback save dir {} into NNNN/: {e}",
-                        ckpt_dir.display()
-                    );
+                    eprintln!("  WARN: failed to finalise fallback save dir {} into NNNN/: {e}", ckpt_dir.display());
                 }
             }
         }
@@ -3481,7 +3629,7 @@ fn build_nnue_save_format(
 /// NNUE HalfKP training entry point.
 ///
 /// 4-layer ClippedReLU network with dual-perspective HalfKP input. L1 /
-/// L2 / L3 sizes come from `--arch` (`256x2-32-32`, `384x2-8-96`, …);
+/// L2 / L3 sizes come from `--arch` (`NNUE_halfkp_256x2_32_32`, …);
 /// the layer structure and activation function are fixed across all
 /// presets — only the sizes vary, matching YaneuraOu's per-arch
 /// `halfkp_*.h` headers.
@@ -3494,7 +3642,7 @@ fn build_nnue_save_format(
 ///   `<output>/<net_id>-<sb>/{nn.bin, state.bin, log.txt}`
 /// then at end-of-training renamed to `<output>/0NNN/{nn.bin, state.bin, learn.log}`.
 fn run_halfkp(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKP.num_inputs();
     let l1_input_dim = 2 * l1_size;
 
@@ -3574,10 +3722,7 @@ fn run_halfkp(args: &Args) {
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -3585,7 +3730,6 @@ fn run_halfkp(args: &Args) {
             std::process::exit(1);
         }
     }
-
 }
 
 /// NNUE K-P training entry point. Structurally identical to [`run_halfkp`]
@@ -3594,7 +3738,7 @@ fn run_halfkp(args: &Args) {
 /// per perspective. The network stack (L0 -> ClippedReLU -> L1 ->
 /// ClippedReLU -> L2 -> ClippedReLU -> Out) is the same as halfkp_256x2-32-32.
 fn run_kp(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiKp.num_inputs();
     let l1_input_dim = 2 * l1_size;
 
@@ -3670,10 +3814,7 @@ fn run_kp(args: &Args) {
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -3681,16 +3822,15 @@ fn run_kp(args: &Args) {
             std::process::exit(1);
         }
     }
-
 }
 
 /// NNUE K-A2 training entry point. Mirrors `run_kp` exactly, only the input
 /// feature differs: K (162 dims) + A2 (1629 dims, kings collapsed onto friend
 /// plane via v2 encoding) = 1791 dims per perspective. Network topology is
 /// the same 4-layer ClippedReLU as halfkp_256x2-32-32 / kp_256x2-32-32.
-/// Architecture is selected via `--arch` (default `256x2-32-32`).
+/// Architecture is selected via `--arch` (default `NNUE_ka2_256x2_32_32`).
 fn run_nnue_ka2(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiKa2.num_inputs();
     let l1_input_dim = 2 * l1_size;
 
@@ -3766,10 +3906,7 @@ fn run_nnue_ka2(args: &Args) {
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -3777,7 +3914,6 @@ fn run_nnue_ka2(args: &Args) {
             std::process::exit(1);
         }
     }
-
 }
 
 /// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
@@ -3786,7 +3922,7 @@ fn run_nnue_ka2(args: &Args) {
 /// computation is done once per training position by `ShogiHalfKpe9`'s
 /// `map_features` using the threat module's `for_each_attack`.
 fn run_halfkpe9(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKpe9.num_inputs();
     let l1_input_dim = 2 * l1_size;
 
@@ -3862,10 +3998,7 @@ fn run_halfkpe9(args: &Args) {
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -3873,7 +4006,6 @@ fn run_halfkpe9(args: &Args) {
             std::process::exit(1);
         }
     }
-
 }
 
 /// NNUE HalfKP_vm training entry point. Identical wiring to `run_halfkp`,
@@ -3881,7 +4013,7 @@ fn run_halfkpe9(args: &Args) {
 /// `ShogiHalfKPvm` (69,660 dims, file-mirror folded). The 4-layer
 /// ClippedReLU network and quantisation pipeline are unchanged.
 fn run_halfkpvm(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch.dims();
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKPvm.num_inputs();
     let l1_input_dim = 2 * l1_size;
 
@@ -3957,10 +4089,7 @@ fn run_halfkpvm(args: &Args) {
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -3968,18 +4097,15 @@ fn run_halfkpvm(args: &Args) {
             std::process::exit(1);
         }
     }
-
 }
 
-/// SFNN-1536 / LayerStacks training entry point (= `SFNN_HALFKA1HM` and
-/// `SFNN_HALFKA2HM`). Generic over the input feature so v1 (`HalfKA_hm1`,
-/// 76,950 dim) and v2 (`HalfKA_hm2`, 73,305 dim) share the entire
-/// training pipeline — only the `input` and `feature_set` arguments
-/// differ between the two callers.
+/// SFNN / LayerStacks training entry point. Generic over the input feature so
+/// HalfKA_hm1, HalfKA_hm2, HalfKA2, and K+A2 share the pipeline; only the
+/// `input` and `feature_set` arguments differ between the callers.
 ///
-/// Network topology mirrors YaneuraOu `architectures/sfnnwop-1536.h`:
-/// per-perspective FT (`l0`, 1536 dim) → CReLU → pairwise-mul → concat
-/// across perspectives → bucket-specific L1 (= 16 = 15 hidden + 1 PSQT
+/// Network topology mirrors YaneuraOu SFNN dynamic architecture:
+/// per-perspective FT (`l0`) → CReLU → pairwise-mul → concat
+/// across perspectives → bucket-specific L1 (= hidden + 1 PSQT
 /// shortcut neuron) → split off the PSQT neuron as a residual bypass
 /// → `[SqrCReLU; CReLU]` concat → L2 (32 dim) → CReLU → L3 (scalar)
 /// → add PSQT residual.
@@ -3989,33 +4115,18 @@ fn run_halfkpvm(args: &Args) {
 /// `.select(output_buckets)` per forward pass picks the active slice
 /// based on `ShogiLayerStackBucket9` (= `--layerstack`).
 ///
-/// **Note**: the `nn.bin` written by this commit uses the standard
-/// non-LayerStack `build_nnue_save_format` and is **not** YaneuraOu-
-/// loadable yet. The LayerStacks-aware save layout (Phase 4) lands
-/// in a follow-up commit.
 fn run_sfnn_1536<I>(args: &Args, input: I, feature_set: NnueFeatureSet)
 where
     I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
 {
-    let (ft_size, l1_hidden, l2_size) = args.arch.dims();
-    if ft_size != 1536 || l1_hidden != 15 || l2_size != 32 {
-        eprintln!(
-            "warning: --arch {} is being trained as an SFNN, but YaneuraOu only ships\n\
-             1536x2-15-32 for the SFNNwoP family. The resulting nn.bin will not be\n\
-             engine-loadable. Continuing for ablation purposes.",
-            args.arch.cli_name()
-        );
-    }
+    let arch = args.arch();
+    let (ft_size, l1_hidden, l2_size) = arch.dims();
     // L1 output = effective hidden + 1 PSQT-shortcut neuron (matches
-    // yaneuraou `kHidden1Dims + 1` in sfnnwop-1536.h).
+    // yaneuraou `kHidden1Dims + 1` in the SFNN architecture).
     let l1_out = l1_hidden + 1;
     let l1_effective = l1_hidden;
     let l2_in = l1_effective * 2; // [SqrCReLU; CReLU] concat
-    // SFNN paths default to `Kingrank3by3` when `--layerstack` is omitted
-    // (the only currently-supported scheme). The startup validator rejects
-    // explicit `--layerstack` for non-SFNN eval types, so SFNN code never
-    // sees an "intended for some other arch" setting here.
-    let layerstack = args.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let num_stacks = layerstack.num_stacks();
     let input_size = input.num_inputs();
 
@@ -4056,10 +4167,10 @@ where
         LayerStackMode::Kingrank3by3 => ShogiLayerStackBucket9::KingRank9,
     };
 
-    // YaneuraOu SFNNwoP1536 互換 nn.bin の save format。`Sfnn1536SaveParams`
+    // YaneuraOu SFNN 互換 nn.bin の save format。`Sfnn1536SaveParams`
     // で feature set / 各層のサイズ / LayerStacks 数を受け、`bulletou_lib::value::nnue_save_sfnn1536`
     // が組み立てた `SavedFormat` 列を渡す。出力は `EvalDir` で yaneuraou
-    // (`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` ビルド) が load できる layout。
+    // (`YANEURAOU_ENGINE_SFNN_*` ビルド) が load できる layout。
     let save_format = build_sfnn_1536_save_format(Sfnn1536SaveParams {
         feature_set,
         input_size,
@@ -4090,11 +4201,7 @@ where
         // stable in the early epochs because `l1` starts at zero — all
         // bucket outputs are equal to `l1f` until per-bucket signal develops.
         let l1 = Affine {
-            weights: builder.new_weights(
-                "l1w",
-                Shape::new(num_stacks * l1_out, ft_size),
-                InitSettings::Zeroed,
-            ),
+            weights: builder.new_weights("l1w", Shape::new(num_stacks * l1_out, ft_size), InitSettings::Zeroed),
             bias: builder.new_weights("l1b", Shape::new(num_stacks * l1_out, 1), InitSettings::Zeroed),
         };
         let l1f = builder.new_affine("l1f", ft_size, l1_out);
@@ -4151,10 +4258,7 @@ where
         Ok((_first_idx, 0)) => {}
         Ok((_first_idx, last_idx)) => {
             if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!(
-                    "warning: failed to update {}: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                );
+                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
             }
         }
         Err(e) => {
@@ -4171,32 +4275,29 @@ where
     let feature_suffix = match feature_set {
         NnueFeatureSet::HalfKaHm1 => "halfkahm1",
         NnueFeatureSet::HalfKaHm2 => "halfkahm2",
+        NnueFeatureSet::HalfKa2 => "halfka2",
         NnueFeatureSet::Ka2 => "ka2",
-        // run_sfnn_1536 is only invoked from EvalType::SfnnHalfka1hm /
-        // SfnnHalfka2hm / SfnnKa2 dispatch in main(), so any other feature
-        // set means a new EvalType variant was added without updating this
-        // arm — fail loudly rather than print a wrong edition name.
+        // run_sfnn_1536 is only invoked from SFNN eval-type dispatch in main(),
+        // so any other feature set means a new EvalType variant was added
+        // without updating this arm.
         other => unreachable!("run_sfnn_1536 received unsupported feature set: {other:?}"),
     };
-    let edition_name = format!(
-        "YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_{feature_suffix}_{ft_size}_{l1_hidden}_{l2_size}_ls{num_stacks}"
-    );
-    let legacy_alias_note = if matches!(feature_set, NnueFeatureSet::HalfKaHm2)
+    let edition_name =
+        format!("YANEURAOU_ENGINE_SFNN_{feature_suffix}_{ft_size}_{l1_hidden}_{l2_size}_{}", layerstack.arch_suffix());
+    let alias_note = if matches!(feature_set, NnueFeatureSet::HalfKaHm2)
         && ft_size == 1536
         && l1_hidden == 15
         && l2_size == 32
         && num_stacks == 9
     {
-        // sfnnwop-1536.h is special-cased in source/Makefile so this exact
-        // architecture is also accepted under the shorter legacy alias.
-        "\n  (legacy alias: YANEURAOU_ENGINE_NNUE_SFNNwoP1536)"
+        "\n  (alias: YANEURAOU_ENGINE_SFNN1536)"
     } else {
         ""
     };
 
     eprintln!(
         "note: nn.bin in each save dir targets a YaneuraOu build with edition\n  \
-             {edition_name}{legacy_alias_note}\n\
+             {edition_name}{alias_note}\n\
          Build it with `make normal YANEURAOU_EDITION=<edition>`."
     );
 }
@@ -4281,25 +4382,30 @@ mod tests {
 
     #[test]
     fn nnue_arch_parse_known_presets() {
-        assert_eq!(NnueArch::from_str("256x2-32-32").unwrap().dims(), (256, 32, 32));
-        assert_eq!(NnueArch::from_str("384x2-8-96").unwrap().dims(), (384, 8, 96));
-        assert_eq!(NnueArch::from_str("512x2-8-64").unwrap().dims(), (512, 8, 64));
-        assert_eq!(NnueArch::from_str("768x2-16-64").unwrap().dims(), (768, 16, 64));
-        assert_eq!(NnueArch::from_str("1024x2-8-32").unwrap().dims(), (1024, 8, 32));
-        assert_eq!(NnueArch::from_str("1024x2-8-64").unwrap().dims(), (1024, 8, 64));
-        assert_eq!(NnueArch::from_str("1536x2-15-32").unwrap().dims(), (1536, 15, 32));
+        assert_eq!(NnueArch::from_str("NNUE_halfkp_256x2_32_32").unwrap().dims(), (256, 32, 32));
+        assert_eq!(NnueArch::from_str("NNUE_halfkp_1024x2_8_64").unwrap().dims(), (1024, 8, 64));
+        assert_eq!(NnueArch::from_str("SFNN_halfkahm2_1536_15_32_k3k3").unwrap().dims(), (1536, 15, 32));
+        assert_eq!(
+            NnueArch::from_str("sfnn_HALFKA2_1024_7_64_K3K3").unwrap().cli_name(),
+            "SFNN_halfka2_1024_7_64_k3k3"
+        );
+        assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
     #[test]
     fn nnue_arch_parse_freeform_sizes() {
-        // 新しい自由なサイズも受理される。
-        assert_eq!(NnueArch::from_str("256x2-64-64").unwrap().dims(), (256, 64, 64));
-        assert_eq!(NnueArch::from_str("2048x2-32-64").unwrap().dims(), (2048, 32, 64));
+        assert_eq!(NnueArch::from_str("NNUE_ka2_256x2_64_64").unwrap().dims(), (256, 64, 64));
+        assert_eq!(NnueArch::from_str("SFNN_halfka2_2048_32_64_king3_by_king3").unwrap().dims(), (2048, 32, 64));
     }
 
     #[test]
     fn nnue_arch_cli_name_roundtrip() {
-        for s in ["256x2-32-32", "1536x2-15-32", "256x2-64-64", "2048x2-32-64"] {
+        for s in [
+            "NNUE_halfkp_256x2_32_32",
+            "NNUE_ka2_256x2_64_64",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "SFNN_halfkahm2_1536_15_32_k3k3",
+        ] {
             let parsed = NnueArch::from_str(s).unwrap();
             assert_eq!(parsed.cli_name(), s);
             assert_eq!(parsed.to_string(), s);
@@ -4309,22 +4415,21 @@ mod tests {
     #[test]
     fn nnue_arch_parse_rejects_bad_format() {
         assert!(NnueArch::from_str("").is_err());
-        assert!(NnueArch::from_str("256-32-32").is_err()); // x2 missing
-        assert!(NnueArch::from_str("256x3-32-32").is_err()); // x3 not allowed
-        assert!(NnueArch::from_str("256x2-32").is_err()); // L3 missing
-        assert!(NnueArch::from_str("256x2-32-32-32").is_err()); // too many parts
-        assert!(NnueArch::from_str("abcx2-32-32").is_err());
+        assert!(NnueArch::from_str("256x2-32-32").is_err());
+        assert!(NnueArch::from_str("YANEURAOU_ENGINE_SFNN_halfka2_1024_7_64_k3k3").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_256x3_32_32").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_256x2_32").is_err());
+        assert!(NnueArch::from_str("NNUE_halfka2_256x2_32_32").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_ls9").is_err());
     }
 
     #[test]
     fn nnue_arch_parse_rejects_bad_dims() {
-        // 0 dims はNG
-        assert!(NnueArch::from_str("0x2-32-32").is_err());
-        assert!(NnueArch::from_str("256x2-0-32").is_err());
-        assert!(NnueArch::from_str("256x2-32-0").is_err());
-        // L1 が 32 の倍数でない
-        assert!(NnueArch::from_str("100x2-32-32").is_err());
-        assert!(NnueArch::from_str("257x2-32-32").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_0x2_32_32").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_256x2_0_32").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_256x2_32_0").is_err());
+        assert!(NnueArch::from_str("NNUE_halfkp_100x2_32_32").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_100_7_64_k3k3").is_err());
     }
 
     /// `finalize_one_nnue_dir` が bullet 形式の checkpoint dir を `<NNNN>/`
@@ -4335,10 +4440,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-finalize-one-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let src = tmp.join("shogi_nnue_ka2-3");
@@ -4350,7 +4452,7 @@ mod tests {
 
         let ctx = LogContext {
             eval_type: "SFNN_KA2",
-            arch: "1536x2-15-32".to_string(),
+            arch: "SFNN_ka2_1536_15_32_k3k3".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4362,8 +4464,10 @@ mod tests {
             lr_min: 0.00001,
         };
 
-        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None)
-            .expect("finalize ok");
+        let dst = finalize_one_nnue_dir(
+            &tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None,
+        )
+        .expect("finalize ok");
 
         // src is gone, dst is `0005/`
         assert!(!src.exists(), "src dir should have been renamed away");
@@ -4382,7 +4486,7 @@ mod tests {
         // and the two test_value_* columns are "-" because we passed None.
         for row in &body_lines {
             assert_eq!(row.split(',').count(), 11, "row `{row}` should be 11 columns");
-            assert!(row.starts_with("SFNN_KA2-1536x2-15-32,"));
+            assert!(row.starts_with("SFNN_KA2-SFNN_ka2_1536_15_32_k3k3,"));
             // Columns: eval, epoch, sb, batch, test_value_accuracy,
             // test_value_loss, train_value_loss, lr, lambda, positions, teacher
             // → indexes 4 and 5 should be "-"
@@ -4402,69 +4506,49 @@ mod tests {
         use clap::Parser as _;
 
         // Baseline (no --tag, no --output): default name only.
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type", "NNUE_KP",
-            "--teacher", "/dev/null",
-        ])
-        .unwrap();
-        assert_eq!(
-            args.output_dir(),
-            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32"),
-        );
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null"]).unwrap();
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
 
         // --tag appends `-<tag>` to the auto-derived name.
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type", "NNUE_KP",
-            "--teacher", "/dev/null",
-            "--tag", "lr0.001",
-        ])
-        .unwrap();
-        assert_eq!(
-            args.output_dir(),
-            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32-lr0.001"),
-        );
+        let args =
+            Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null", "--tag", "lr0.001"])
+                .unwrap();
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-lr0.001"),);
 
-        // --tag with SFNN: applied after the layerstack segment.
+        // --tag with SFNN: applied after the architecture segment.
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type", "SFNN_KA2",
-            "--arch", "1536x2-15-32",
-            "--teacher", "/dev/null",
-            "--tag", "exp7",
+            "--eval-type",
+            "SFNN_KA2",
+            "--arch",
+            "SFNN_ka2_1536_15_32_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--tag",
+            "exp7",
         ])
         .unwrap();
-        assert_eq!(
-            args.output_dir(),
-            std::path::PathBuf::from(
-                "checkpoints/SFNN_KA2-1536x2-15-32-king3-by-king3-exp7"
-            ),
-        );
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_1536_15_32_k3k3-exp7"),);
 
         // Explicit --output wins; --tag is ignored.
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type", "NNUE_KP",
-            "--teacher", "/dev/null",
-            "--output", "/custom/path",
-            "--tag", "ignored",
+            "--eval-type",
+            "NNUE_KP",
+            "--teacher",
+            "/dev/null",
+            "--output",
+            "/custom/path",
+            "--tag",
+            "ignored",
         ])
         .unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("/custom/path"));
 
         // Empty --tag is treated as no tag (no trailing dash).
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type", "NNUE_KP",
-            "--teacher", "/dev/null",
-            "--tag", "",
-        ])
-        .unwrap();
-        assert_eq!(
-            args.output_dir(),
-            std::path::PathBuf::from("checkpoints/NNUE_KP-256x2-32-32"),
-        );
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null", "--tag", ""])
+            .unwrap();
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
     }
 
     /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values
@@ -4474,10 +4558,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-finalize-with-metrics-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let src = tmp.join("shogi_sfnn_ka2-7");
@@ -4488,7 +4569,7 @@ mod tests {
 
         let ctx = LogContext {
             eval_type: "NNUE_KA2",
-            arch: "256x2-32-32".to_string(),
+            arch: "NNUE_ka2_256x2_32_32".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4526,10 +4607,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-toplog-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let dir = tmp.join("0001");
@@ -4546,8 +4624,7 @@ mod tests {
         );
         std::fs::write(dir.join("learn.log"), body).unwrap();
         append_to_top_level_log(&tmp, 1).unwrap();
-        let top =
-            std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let top = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let lines: Vec<&str> = top.lines().collect();
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER, "first line is summary header (no curr_batch)");
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
@@ -4620,7 +4697,7 @@ mod tests {
     fn enrich_uses_cosine_when_schedule_is_cos() {
         let ctx = LogContext {
             eval_type: "NNUE_KP",
-            arch: "256x2-32-32".to_string(),
+            arch: "NNUE_kp_256x2_32_32".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4650,7 +4727,7 @@ mod tests {
     fn enrich_emits_local_sb_with_prior_positions_offset() {
         let ctx = LogContext {
             eval_type: "NNUE_KP",
-            arch: "256x2-32-32".to_string(),
+            arch: "NNUE_kp_256x2_32_32".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4674,10 +4751,7 @@ mod tests {
         // With step (geometric) schedule, lr decays smoothly from positions 0.
         // At 60.5M / 800M = t≈0.0756, lr ≈ 0.001 * (1e-5/1e-3)^0.0756 ≈ 0.000706.
         let lr_val: f32 = cols0[7].parse().expect("lr col is a float");
-        assert!(
-            (lr_val - 0.000706).abs() < 1e-5,
-            "step lr at 60.5M of 800M period should be ~0.000706, got {lr_val}"
-        );
+        assert!((lr_val - 0.000706).abs() < 1e-5, "step lr at 60.5M of 800M period should be ~0.000706, got {lr_val}");
         assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 
@@ -4689,7 +4763,7 @@ mod tests {
     fn enrich_with_epoch_offset_emits_absolute_epoch() {
         let ctx = LogContext {
             eval_type: "NNUE_HALFKP",
-            arch: "256x2-32-32".to_string(),
+            arch: "NNUE_halfkp_256x2_32_32".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4714,10 +4788,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-epoch-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("summary-learn.log");
@@ -4732,7 +4803,8 @@ mod tests {
              NNUE,1,6,-,-,0.1,0.001,1.0,100000000,t.hcpe\n\
              NNUE,2,6,-,-,0.1,0.001,1.0,200000000,t.hcpe\n\
              NNUE,3,6,-,-,0.1,0.001,1.0,300000000,t.hcpe\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(read_latest_epoch_in_top_level_log(&log), Some(3));
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4745,10 +4817,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-resume-sb-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -4764,8 +4833,8 @@ mod tests {
         std::fs::write(
             d1.join("learn.log"),
             format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,1,32,0.1,0.001,1.000,524288,t.hcpe\n\
-                 NNUE_KP-256x2-32-32,1,1,64,0.09,0.001,1.000,1048576,t.hcpe\n"
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,1,32,0.1,0.001,1.000,524288,t.hcpe\n\
+                 NNUE_KP-NNUE_kp_256x2_32_32,1,1,64,0.09,0.001,1.000,1048576,t.hcpe\n"
             ),
         )
         .unwrap();
@@ -4776,9 +4845,7 @@ mod tests {
         std::fs::create_dir(&d4).unwrap();
         std::fs::write(
             d4.join("learn.log"),
-            format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,4,32,0.06,0.001,1.000,2097152,t.hcpe\n"
-            ),
+            format!("{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.06,0.001,1.000,2097152,t.hcpe\n"),
         )
         .unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
@@ -4798,10 +4865,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-resume-teacher-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -4816,9 +4880,7 @@ mod tests {
         // 11-列 row が 1 つあれば teacher が拾える
         std::fs::write(
             d1.join("learn.log"),
-            format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,1,32,-,-,0.1,0.001,1.000,524288,foo.hcpe\n"
-            ),
+            format!("{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,1,32,-,-,0.1,0.001,1.000,524288,foo.hcpe\n"),
         )
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
@@ -4829,7 +4891,7 @@ mod tests {
         std::fs::write(
             d4.join("learn.log"),
             format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-256x2-32-32,1,4,32,0.6,0.05,0.06,0.001,1.000,2097152,bar.hcpe\n"
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.6,0.05,0.06,0.001,1.000,2097152,bar.hcpe\n"
             ),
         )
         .unwrap();
@@ -4855,15 +4917,12 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-test-finalize-empty-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let ctx = LogContext {
             eval_type: "NNUE_KA2",
-            arch: "256x2-32-32".to_string(),
+            arch: "NNUE_ka2_256x2_32_32".to_string(),
             lr_start: 0.001,
             lambda: 1.0,
             batch_size: 16384,
@@ -4932,15 +4991,12 @@ mod tests {
 
     #[test]
     fn sfnn_nerf_collects_only_real_weight_bytes() {
-        let arch = NnueArch { l1: 32, l2: 1, l3: 4 };
+        let arch =
+            NnueArch::new(NnueArchFamily::Sfnn, NnueArchFeature::Halfka2, 32, 1, 4, Some(LayerStackMode::Kingrank3by3));
         let bytes = fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks());
-        let (candidates, report) = collect_sfnn_nerf_candidates(
-            &bytes,
-            arch,
-            LayerStackMode::Kingrank3by3,
-            "fc1,fc2".parse().unwrap(),
-        )
-        .unwrap();
+        let (candidates, report) =
+            collect_sfnn_nerf_candidates(&bytes, arch, LayerStackMode::Kingrank3by3, "fc1,fc2".parse().unwrap())
+                .unwrap();
 
         // fc1: 9 stacks * hidden2(4) * real input(hidden1*2 = 2)
         // fc2: 9 stacks * hidden2(4)
@@ -4952,33 +5008,28 @@ mod tests {
 
     #[test]
     fn sfnn_nerf_allows_repeated_weight_edits() {
-        let arch = NnueArch { l1: 32, l2: 1, l3: 4 };
+        let arch =
+            NnueArch::new(NnueArchFamily::Sfnn, NnueArchFeature::Halfka2, 32, 1, 4, Some(LayerStackMode::Kingrank3by3));
         let input = fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks());
         let args = NerfArgs {
             input: PathBuf::from("in.nn"),
             output: PathBuf::from("out.nn"),
             eval_type: NerfEvalType::Sfnn,
             arch,
-            layerstack: LayerStackMode::Kingrank3by3,
+            layerstack: None,
             layers: "fc2".parse().unwrap(),
             count: 50,
             seed: 123,
         };
         let (output, report) = nerf_sfnn_bytes(input.clone(), &args).unwrap();
         assert_eq!(report.fc2_candidates, 9 * 4);
-        assert!(
-            report.selected > report.fc2_candidates,
-            "test should exercise repeated selection"
-        );
+        assert!(report.selected > report.fc2_candidates, "test should exercise repeated selection");
         assert_eq!(report.selected, 50);
         assert_eq!(report.changed, 50);
         assert_eq!(report.saturated_noops, 0);
 
         let diffs = input.iter().zip(output.iter()).filter(|(a, b)| a != b).count();
-        assert!(
-            diffs <= report.fc2_candidates,
-            "final differing bytes cannot exceed the candidate set"
-        );
+        assert!(diffs <= report.fc2_candidates, "final differing bytes cannot exceed the candidate set");
         assert!(diffs > 0, "at least one byte should differ after repeated edits");
     }
 }

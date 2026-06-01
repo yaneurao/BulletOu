@@ -1,7 +1,7 @@
-//! YaneuraOu `SFNNwoP1536` ビルド向け nn.bin 保存フォーマット。
+//! YaneuraOu SFNN ビルド向け nn.bin 保存フォーマット。
 //!
-//! `bulletou --eval-type SFNN_HALFKA1HM / SFNN_HALFKA2HM` で学習した重みを
-//! やねうら王 (`YANEURAOU_ENGINE_NNUE_SFNNwoP1536`) が `EvalDir` で load
+//! `bulletou --eval-type SFNN_*` で学習した重みを
+//! やねうら王 (`YANEURAOU_ENGINE_SFNN_*`) が `EvalDir` で load
 //! できるバイナリに変換するための [`SavedFormat`] 列を組み立てる。
 //!
 //! 参考にしているやねうら王ソース:
@@ -66,22 +66,22 @@ pub const KHASH_SFNN: u32 = 0x3C203B32;
 /// LEB128 圧縮ブロック先頭の magic (`nnue_common.h:65`)。null terminator は含まない。
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
-/// SFNN-1536 / LayerStacks=9 用 nn.bin save format ビルダパラメータ。
+/// SFNN / LayerStacks 用 nn.bin save format ビルダパラメータ。
 #[derive(Debug, Clone, Copy)]
 pub struct Sfnn1536SaveParams {
-    /// `NnueFeatureSet::HalfKaHm1` または `HalfKaHm2`。description 文字列に
+    /// SFNN 系の `NnueFeatureSet`。description 文字列に
     /// 表示名 (例 `HalfKA_hm2(Friend)`) を埋め込むために使う。
     pub feature_set: NnueFeatureSet,
-    /// 入力特徴量次元 (= `feature_set.input_size()`)。 v1=76950, v2=73305。
+    /// 入力特徴量次元 (= `feature_set.input_size()`)。
     pub input_size: usize,
-    /// Feature Transformer 出力次元 (= `kTransformedFeatureDimensions`)。1536 固定。
+    /// Feature Transformer 出力次元 (= `kTransformedFeatureDimensions`)。
     pub ft_size: usize,
-    /// 隠れ層 1 の実効次元 (`sfnnwop-1536.h::kHidden1Dims`)。15 固定。+1 PSQT
+    /// 隠れ層 1 の実効次元 (`kHidden1Dims`)。+1 PSQT
     /// shortcut neuron は内部で自動付加。
     pub l1_hidden: usize,
-    /// 隠れ層 2 次元 (`kHidden2Dims`)。32 固定。
+    /// 隠れ層 2 次元 (`kHidden2Dims`)。
     pub l2_size: usize,
-    /// LayerStacks 数 (`sfnnwop-1536.h::LayerStacks`)。9 固定。
+    /// LayerStacks 数。
     pub num_stacks: usize,
 }
 
