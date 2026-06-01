@@ -6,19 +6,19 @@
 
 - 序盤 / 中盤 / 終盤、あるいは玉の位置関係などで、評価関数の傾向は実は異なるはず
 - そこで「9 個の独立した小さな NN」を持っておき、局面ごとに 1 個だけを選んで評価値を出す
-- どのサブネットを使うかの **バケット選択ロジック** をやねうら王エンジンと bulletou で揃える必要がある (= `--layerstack` で指定)
+- どのサブネットを使うかの **バケット選択ロジック** をやねうら王エンジンと bulletou で揃える必要がある (= `--arch` の suffix で指定)
 
 bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビルド向けの学習** (= `--eval-type SFNN_HALFKA1HM` / `SFNN_HALFKA2HM`) のみ。詳細仕様は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) を参照。
 
-## 9.1 `--layerstack` の選択
+## 9.1 LayerStack suffix の選択
 
-| flag | バケット数 | やねうら王 load 可 | 説明 |
+| `--arch` suffix | バケット数 | やねうら王 load 可 | 説明 |
 |---|---|---|---|
-| **`king3-by-king3`** (デフォルト) | 9 | ○ | 自玉段を 3 区分 (1-3 / 4-6 / 7-9 段) × 敵玉段も 3 区分 = 9 通り。やねうら王の `stack_index_for_nnue` と完全一致 |
+| **`k3k3(king3-by-king3)`** (デフォルト) | 9 | ○ | 自玉段を 3 区分 (1-3 / 4-6 / 7-9 段) × 敵玉段も 3 区分 = 9 通り。やねうら王の `stack_index_for_nnue` と完全一致 |
 
-現状サポートしている `--layerstack` の値はこれ 1 つだけ。将来やねうら王側で別のバケット選択スキームが追加されれば、それに対応した値をここに足す。
+現状サポートしている suffix はこれ 1 つだけ。将来やねうら王側で別のバケット選択スキームが追加されれば、それに対応した suffix をここに足す。
 
-### king3-by-king3 のバケット表
+### k3k3(king3-by-king3) のバケット表
 
 両玉の段 (perspective 反転後) を 3 区分にしてから組み合わせる:
 
@@ -32,18 +32,17 @@ bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビ�
 
 ## 9.2 使う場面
 
-LayerStack は **SFNN ファミリ専用** のオプションで、他の eval-type (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` 系) では無視される (= 単一 NN 構造のため LayerStack 不要)。
+LayerStack は **SFNN ファミリ専用** で、他の eval-type (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` 系) は単一 NN 構造のため LayerStack 不要。
 
 ```bash
-# SFNN-1536 を king3-by-king3 = 9 バケットで学習
+# SFNN-1536 を k3k3(king3-by-king3) = 9 バケットで学習
 ./target/release/examples/bulletou \
     --eval-type SFNN_HALFKA2HM \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-`--output` を省略すると `checkpoints/SFNN_HALFKA2HM-1536x2-15-32-king3-by-king3/` に書かれる (= `--eval-type` + `--arch` + `--layerstack` を連結した命名)。
+`--output` を省略すると `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` に書かれる (= `--eval-type` + `--arch` を連結した命名)。
 
 学習自体のスケジューリング (`--lr` / `--superbatches` 等) は [§6 学習をチューニング](6-tune.md) と共通。結果の確認も [§7 結果を確認する](7-result.md) と同じ。
 

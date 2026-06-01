@@ -133,7 +133,8 @@ enum EvalType {
     /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
     /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
     /// MLP (FT → fc_0(L1+1 PSQT-shortcut) → CReLU + SqrCReLU concat →
-    /// fc_1 → fc_2 → +PSQT bypass). Bucketing chosen via `--layerstack`.
+    /// fc_1 → fc_2 → +PSQT bypass). Bucketing is selected by the `--arch`
+    /// LayerStack suffix.
     /// `--arch SFNN_halfkahm1_1536_15_32_k3k3` matches the corresponding
     /// YaneuraOu SFNN dynamic build.
     SfnnHalfka1hm,
@@ -162,27 +163,26 @@ enum EvalType {
 /// from the LayerStacks array, and implicitly determines the **stack
 /// count** (the network model uses one bucket per stack).
 ///
-/// Currently `king3-by-king3` is the only choice — it matches YaneuraOu's
+/// Currently `k3k3(king3-by-king3)` is the only choice — it matches YaneuraOu's
 /// `stack_index_for_nnue` so the trained `nn.bin` is engine-loadable
 /// and evaluation matches between training and inference. Other
 /// schemes implemented in `bulletou_lib::game::outputs::ShogiLayerStackBucket9`
 /// (e.g. `Ply9`, `Progress8*`) are intentionally not exposed here
 /// because they cannot be used with YaneuraOu's engine; they remain
 /// available to `examples/shogi_layerstack.rs` for rshogi-style research.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LayerStackMode {
     /// 3 × 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
     /// Matches YaneuraOu `stack_index_for_nnue` byte-for-byte.
     #[default]
-    #[clap(name = "king3-by-king3")]
     Kingrank3by3,
 }
 
 impl LayerStackMode {
-    /// CLI value as the user types it.
+    /// Human-facing display name.
     fn cli_name(self) -> &'static str {
         match self {
-            LayerStackMode::Kingrank3by3 => "king3-by-king3",
+            LayerStackMode::Kingrank3by3 => "k3k3(king3-by-king3)",
         }
     }
 
@@ -605,11 +605,6 @@ struct NerfArgs {
     #[arg(long)]
     arch: NnueArch,
 
-    /// Optional LayerStack bucketing override. If supplied, it must match
-    /// the suffix embedded in `--arch`.
-    #[arg(long, value_enum)]
-    layerstack: Option<LayerStackMode>,
-
     /// Comma-separated layer list. Only i8 weights are changed; biases,
     /// FeatureTransformer, hashes, and padding weights are left intact.
     #[arg(long, default_value = "fc2,fc1")]
@@ -627,7 +622,7 @@ struct NerfArgs {
 
 impl NerfArgs {
     fn effective_layerstack(&self) -> LayerStackMode {
-        self.arch.layerstack.or(self.layerstack).unwrap_or(LayerStackMode::Kingrank3by3)
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
@@ -636,15 +631,6 @@ impl NerfArgs {
                 "--arch {} is not an SFNN architecture; nerf currently supports only SFNN nn.bin layouts",
                 self.arch.cli_name()
             ));
-        }
-        if let (Some(from_arg), Some(from_arch)) = (self.layerstack, self.arch.layerstack) {
-            if from_arg != from_arch {
-                return Err(format!(
-                    "--layerstack {} conflicts with --arch {}",
-                    from_arg.cli_name(),
-                    self.arch.cli_name()
-                ));
-            }
         }
         Ok(())
     }
@@ -685,9 +671,9 @@ impl EvalType {
         }
     }
 
-    /// Does this eval type consume `--layerstack`? Only the SFNN family
-    /// (LayerStacks-based architectures) does; the rest of the NNUE
-    /// family is single-stack.
+    /// Does this eval type use LayerStacks? Only the SFNN family
+    /// (LayerStacks-based architectures) does; the rest of the NNUE family
+    /// is single-stack.
     fn uses_layerstack(self) -> bool {
         matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2)
     }
@@ -1067,13 +1053,6 @@ struct Args {
     #[arg(long)]
     arch: Option<NnueArch>,
 
-    /// Optional LayerStack bucketing override for the SFNN family. The
-    /// preferred spelling is the suffix embedded in `--arch` (`k3k3` or
-    /// `king3_by_king3`); if this flag is supplied too, it must agree with
-    /// the architecture suffix.
-    #[arg(long)]
-    layerstack: Option<LayerStackMode>,
-
     /// Held-out test set (.hcpe only) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each save event (= every `--save-rate` superbatches): random-
@@ -1169,7 +1148,7 @@ impl Args {
         if !self.eval_type().uses_layerstack() {
             return None;
         }
-        self.arch().layerstack.or(self.layerstack).or(Some(LayerStackMode::Kingrank3by3))
+        self.arch().layerstack.or(Some(LayerStackMode::Kingrank3by3))
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
@@ -1179,12 +1158,6 @@ impl Args {
             if self.arch.is_some() {
                 return Err(format!(
                     "--arch is only valid with NNUE / SFNN eval types; --eval-type {} has a fixed KPPT layout",
-                    eval_type.cli_name()
-                ));
-            }
-            if self.layerstack.is_some() {
-                return Err(format!(
-                    "--layerstack is only valid with the SFNN family; --eval-type {} has no LayerStacks topology",
                     eval_type.cli_name()
                 ));
             }
@@ -1200,19 +1173,6 @@ impl Args {
                 expected.cli_name(),
                 eval_type.cli_name()
             ));
-        }
-
-        if self.layerstack.is_some() && !eval_type.uses_layerstack() {
-            return Err(format!(
-                "--layerstack is only valid with the SFNN family; --eval-type {} has no LayerStacks topology",
-                eval_type.cli_name()
-            ));
-        }
-
-        if let (Some(from_arg), Some(from_arch)) = (self.layerstack, arch.layerstack) {
-            if from_arg != from_arch {
-                return Err(format!("--layerstack {} conflicts with --arch {}", from_arg.cli_name(), arch.cli_name()));
-            }
         }
 
         Ok(())
@@ -1491,7 +1451,7 @@ fn collect_sfnn_nerf_candidates(
         .ok_or_else(|| "SFNN network byte count overflow".to_string())?;
     if expected_len != bytes.len() {
         return Err(format!(
-            "SFNN payload size mismatch for --arch {arch} / --layerstack {}: expected file size {expected_len}, got {}. \
+            "SFNN payload size mismatch for --arch {arch} / LayerStack {}: expected file size {expected_len}, got {}. \
              Check that --arch matches the engine architecture.",
             layerstack.cli_name(),
             bytes.len()
@@ -4113,7 +4073,7 @@ fn run_halfkpvm(args: &Args) {
 /// The bucket-specific layers `l1` and `l2` use the LayerStacks pattern:
 /// the weight tensor is `(NUM_STACKS × out_dim, in_dim)` and a
 /// `.select(output_buckets)` per forward pass picks the active slice
-/// based on `ShogiLayerStackBucket9` (= `--layerstack`).
+/// based on `ShogiLayerStackBucket9` (= `--arch` LayerStack suffix).
 ///
 fn run_sfnn_1536<I>(args: &Args, input: I, feature_set: NnueFeatureSet)
 where
@@ -5016,7 +4976,6 @@ mod tests {
             output: PathBuf::from("out.nn"),
             eval_type: NerfEvalType::Sfnn,
             arch,
-            layerstack: None,
             layers: "fc2".parse().unwrap(),
             count: 50,
             seed: 123,

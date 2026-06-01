@@ -40,7 +40,7 @@ Common YaneuraOu-shipped sizes (selectable directly because the matching engine 
 | `768x2-16-64` | 768 | 16 | 64 | |
 | `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
-| `1536x2-15-32` | 1536 | 15 | 32 | SFNN-1536 (matches `architectures/sfnnwop-1536.h`) |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | SFNN-1536 with k3k3(king3-by-king3) LayerStacks |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -53,17 +53,16 @@ Omitting `--arch` falls back to `256x2-32-32`. The same `--arch` flag applies to
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
-If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` build**, use its dedicated `--eval-type`:
+If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE_SFNN1536` build**, use its dedicated `--eval-type`:
 
 ```bash
 ./target/release/examples/bulletou \
     --eval-type SFNN_HALFKA2HM \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-The only thing that's different from the rest of the NNUE family is the `--layerstack` flag (the network uses 9 sub-networks selected per position — see [§9 LayerStack](9-layerstack.md) for an explanation). The full architecture, quantisation, and `nn.bin` layout spec lives in [the SFNN-1536 reference](../shogi/sfnn-1536.md).
+The difference from the rest of the NNUE family is that the network uses 9 sub-networks selected per position. The `k3k3` suffix in `--arch` selects the YaneuraOu-compatible LayerStack scheme; see [§9 LayerStack](9-layerstack.md). The full architecture, quantisation, and `nn.bin` layout spec lives in [the SFNN-1536 reference](../shogi/sfnn-1536.md).
 
 ## 4.5 Training a KPPT eval
 

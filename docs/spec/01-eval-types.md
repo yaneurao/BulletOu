@@ -13,9 +13,10 @@
 | `NNUE_KA2` | NNUE | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_NNUE_ka2_*` ビルド) |
 | `NNUE_HALFKPE9` | NNUE | `nn.bin` 単独 | ○ |
 | `NNUE_HALFKPVM` | NNUE | `nn.bin` 単独 | ○ |
-| `SFNN_HALFKA1HM` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `SFNNwoP1536` ビルド) |
+| `SFNN_HALFKA1HM` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ |
 | `SFNN_HALFKA2HM` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (同上、これが標準) |
-| `SFNN_KA2` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_*` ビルド) |
+| `SFNN_HALFKA2` | SFNN (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_SFNN_halfka2_*_k3k3` ビルド) |
+| `SFNN_KA2` | SFNN-1536 (LayerStacks=9) | `nn.bin` 単独 | ○ (やねうら王 `YANEURAOU_ENGINE_SFNN_ka2_*_k3k3` ビルド) |
 
 すべての eval-type で、save dir には別途 `state.bin` (resume 用) と `learn.log` (loss snapshot) が一緒に書かれる。詳細は [04-checkpoint-layout.md](04-checkpoint-layout.md)。
 
@@ -30,21 +31,21 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 | `--eval-type` | `--arch` を使うか | 現状サポートする `--arch` 値 |
 |---|---|---|
 | `KPPT` / `KPP_KKPT` | 使わない (固定 architecture) | n/a |
-| `NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` | 使う | `256x2-32-32` (default)<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64`<br>(やねうら王が `NNUE_halfkp_*` で配布している全 preset と一致) |
-| `SFNN_HALFKA1HM` / `SFNN_HALFKA2HM` | 使う | `1536x2-15-32` のみ engine-loadable (やねうら王同梱 SFNN ビルドは 1 preset のみ)。他の preset を指定すると学習は通るが nn.bin は engine に load できない (ablation 用途) |
+| `NNUE_HALFKP` / `NNUE_KP` / `NNUE_KA2` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` | 使う | `NNUE_<feature>_<L1>x2_<L2>_<L3>` |
+| `SFNN_HALFKA1HM` / `SFNN_HALFKA2HM` / `SFNN_HALFKA2` / `SFNN_KA2` | 使う | `SFNN_<feature>_<FT>_<H1>_<H2>_k3k3` |
 
-`--arch` の値は `<L1>x2-<L2>-<L3>` 表記 (Stockfish 慣習に準拠)。`x2` は dual-perspective を意味する固定リテラル。SFNN の `1536x2-15-32` は `(ft_size=1536, l1_hidden=15, l2_size=32)` にマップされ、`l1_hidden + 1` の PSQT shortcut neuron は内部で自動付加される (`fc_0` の出力次元は実際には 16)。
+`--arch` の値は、やねうら王 Makefile の `YANEURAOU_ENGINE_` prefix を除いた architecture 名。SFNN の `SFNN_halfkahm2_1536_15_32_k3k3` は `(ft_size=1536, l1_hidden=15, l2_size=32)` と k3k3(king3-by-king3) LayerStacks にマップされ、`l1_hidden + 1` の PSQT shortcut neuron は内部で自動付加される (`fc_0` の出力次元は実際には 16)。
 
 将来 `--arch` の値域を増やす場合は、`bulletou_lib::value::nnue_save` の量子化スケール (qa=127 ClippedReLU 前提) と SIMD パディング規約 (pad32) を踏まえて L0 / L1 サイズを選ぶこと。詳細は [02-nnue-binary.md](02-nnue-binary.md)。
 
-## `--layerstack` 依存
+## LayerStack suffix
 
-SFNN family のみが消費する flag。バケット選択ロジック (どのサブネットを使うか) を決め、暗黙的に **LayerStacks 数** (= バケット数) も決まる:
+SFNN family では `--arch` の末尾 suffix がバケット選択ロジック (どのサブネットを使うか) を決め、暗黙的に **LayerStacks 数** (= バケット数) も決まる。LayerStack 専用の別 flag は使わない:
 
-| `--eval-type` | `--layerstack` を使うか | 現状サポートする値 |
-|---|---|---|
-| `SFNN_HALFKA1HM` / `SFNN_HALFKA2HM` | 使う | `king3-by-king3` (= 自玉段 3 区分 × 敵玉段 3 区分 = 9 stacks、やねうら王 `stack_index_for_nnue` 互換) |
-| その他すべて | 使わない (= 単一 NN) | n/a |
+| `--eval-type` | 現状サポートする suffix |
+|---|---|
+| `SFNN_*` | `k3k3(king3-by-king3)` (= 自玉段 3 区分 × 敵玉段 3 区分 = 9 stacks、やねうら王 `stack_index_for_nnue` 互換) |
+| その他すべて | n/a |
 
 `bulletou_lib::game::outputs::ShogiLayerStackBucket9` には `Ply9` / `Progress8*` 等の他バケットモードが実装済みだが、これらは engine 側のバケット選択ロジックと一致しないため CLI に公開しない (= `examples/shogi_layerstack.rs` 経路で実験用にのみアクセス可能)。
 
@@ -56,14 +57,14 @@ SFNN family のみが消費する flag。バケット選択ロジック (どの�
 |---|---|
 | `KPPT` | `checkpoints/KPPT` |
 | `KPP_KKPT` | `checkpoints/KPP_KKPT` |
-| `NNUE_HALFKP` | `checkpoints/NNUE_HALFKP-256x2-32-32` |
-| `NNUE_KP` | `checkpoints/NNUE_KP-256x2-32-32` |
-| `NNUE_HALFKPE9` | `checkpoints/NNUE_HALFKPE9-256x2-32-32` |
-| `NNUE_HALFKPVM` | `checkpoints/NNUE_HALFKPVM-256x2-32-32` |
-| `SFNN_HALFKA1HM` | `checkpoints/SFNN_HALFKA1HM-1536x2-15-32-king3-by-king3` |
-| `SFNN_HALFKA2HM` | `checkpoints/SFNN_HALFKA2HM-1536x2-15-32-king3-by-king3` |
+| `NNUE_HALFKP` | `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32` |
+| `NNUE_KP` | `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32` |
+| `NNUE_HALFKPE9` | `checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32` |
+| `NNUE_HALFKPVM` | `checkpoints/NNUE_HALFKPVM-NNUE_halfkpvm_256x2_32_32` |
+| `SFNN_HALFKA1HM` | `checkpoints/SFNN_HALFKA1HM-SFNN_halfkahm1_1536_15_32_k3k3` |
+| `SFNN_HALFKA2HM` | `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3` |
 
-NNUE 系は `<eval-type>-<arch>`、SFNN 系は `<eval-type>-<arch>-<layerstack>`、KPPT 系は `<eval-type>` のみ。`<eval-type>` / `<arch>` / `<layerstack>` はそれぞれ CLI でユーザーが入力する値をそのまま使う。
+NNUE / SFNN 系は `<eval-type>-<arch>`、KPPT 系は `<eval-type>` のみ。`<eval-type>` / `<arch>` はそれぞれ CLI でユーザーが入力する値をそのまま使う。
 
 ## アクティベーション
 

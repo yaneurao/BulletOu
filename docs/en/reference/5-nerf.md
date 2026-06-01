@@ -25,8 +25,7 @@ cargo run -p bulletou_lib --release --example bulletou -- nerf \
   --input nn.bin \
   --output nn-nerf.bin \
   --eval-type SFNN_HALFKA2 \
-  --arch 1024x2-7-64 \
-  --layerstack king3-by-king3 \
+  --arch SFNN_halfka2_1024_7_64_k3k3 \
   --layers fc2,fc1 \
   --count 1000 \
   --seed 1
@@ -39,8 +38,7 @@ cargo run -p bulletou_lib --release --example bulletou -- nerf \
 | `--input` | Input `nn.bin` |
 | `--output` | Output `nn.bin`; it must differ from `--input` |
 | `--eval-type` | Evaluation-function type of the input file. Currently SFNN only |
-| `--arch` | Architecture in `<FT>x2-<H1>-<H2>` form, for example `1024x2-7-64` |
-| `--layerstack` | LayerStack bucketing mode. Currently `king3-by-king3` |
+| `--arch` | YaneuraOu architecture name without the `YANEURAOU_ENGINE_` prefix, for example `SFNN_halfka2_1024_7_64_k3k3` |
 | `--layers` | Target layers: comma-separated `fc0` / `fc1` / `fc2` / `all` |
 | `--count` | Number of random `+1` / `-1` mutation attempts. The same weight may be selected multiple times |
 | `--seed` | RNG seed. The same input and seed produce the same output |

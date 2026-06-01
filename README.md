@@ -26,7 +26,7 @@ Target evaluation functions:
 
 Target LayerStacks:
 
-- king3-by-king3
+- k3k3(king3-by-king3)
 
 
 ### Usage

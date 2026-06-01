@@ -94,8 +94,7 @@ SFNN-1536 architecture with KA2 input:
 ```bash
 ./target/release/examples/bulletou \
     --eval-type SFNN_KA2 \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_ka2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
@@ -139,8 +138,8 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_32_32
 # For NNUE_KA2 --arch 256x2-64-64
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
-# For SFNN_KA2 --arch 1536x2-15-32 --layerstack king3-by-king3
-make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_1536_15_32_ls9
+# For SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3
+make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 ```
 
 YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the matching architecture header is generated on the fly. Use **underscores** (not hyphens) in the dimension part of the edition name to avoid a `clang -Wc99-extensions` warning. See [§8 Engine](../tutorial/8-engine.md) for the load procedure.
@@ -151,7 +150,6 @@ YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the
 |---|---|---|
 | `--eval-type` | `NNUE_KA2` (4-layer) or `SFNN_KA2` (LayerStacks-1536) | (required) |
 | `--arch` | Free-form `<L1>x2-<L2>-<L3>` (`L1` must be a multiple of 32) | `256x2-32-32` |
-| `--layerstack` | (`SFNN_KA2` only) `king3-by-king3` | `king3-by-king3` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KA2-256x2-32-32`) |
 

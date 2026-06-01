@@ -26,7 +26,7 @@
 
 対応するLayerStack:
 
-- king3-by-king3
+- k3k3(king3-by-king3)
 
 
 ### 使い方

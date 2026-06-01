@@ -18,8 +18,8 @@ We use **NNUE HalfKP as the running example** in this tutorial, but the same com
 | `NNUE_KP` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` | yes |
 | `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2, 9 combos). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` | yes |
 | `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4). Input dim is ~half of HalfKP. | `nn.bin` | yes |
-| `SFNN_HALFKA2HM` | LayerStacks evaluation for YaneuraOu's NNUEwoSQPT1536 build. Usage in [§9 LayerStack](9-layerstack.md); full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md). | `nn.bin` | yes (1536x2-15-32) |
-| `SFNN_HALFKA1HM` | v1 ablation of the above. | `nn.bin` | yes (1536x2-15-32) |
+| `SFNN_HALFKA2HM` | LayerStacks evaluation for YaneuraOu's `YANEURAOU_ENGINE_SFNN1536` build. Usage in [§9 LayerStack](9-layerstack.md); full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md). | `nn.bin` | yes (`SFNN_halfkahm2_1536_15_32_k3k3`) |
+| `SFNN_HALFKA1HM` | v1 ablation of the above. | `nn.bin` | yes (`SFNN_halfkahm1_1536_15_32_k3k3`) |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | no |
 | `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs | no |
 

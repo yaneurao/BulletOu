@@ -61,7 +61,7 @@ Total effective epochs trained: 3 + 3 = 6.
 |---|---|
 | `--eval-type` | Changes the NN topology → state.bin tensor shapes mismatch. |
 | `--arch` | Same reason (FT / L1 / L2 dims differ). |
-| `--layerstack` (SFNN family) | Number of LayerStacks affects the final layer dim. |
+| `--arch` LayerStack suffix (SFNN family) | Number of LayerStacks affects the final layer dim. |
 | `--tag` | Changing this lands you in a different output dir = fresh training. (Useful only when starting a new experiment.) |
 
 To change any of these, pass a different `--tag` and run as a separate experiment.

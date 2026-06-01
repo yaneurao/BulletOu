@@ -94,8 +94,7 @@ SFNN-1536 architecture を KA2 入力で:
 ```bash
 ./target/release/examples/bulletou \
     --eval-type SFNN_KA2 \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_ka2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
@@ -139,8 +138,8 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_32_32
 # NNUE_KA2 --arch 256x2-64-64 の場合
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
-# SFNN_KA2 --arch 1536x2-15-32 --layerstack king3-by-king3 の場合
-make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_1536_15_32_ls9
+# SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3 の場合
+make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 ```
 
 やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [§8 Engine](../tutorial/8-engine.md) を参照。
@@ -151,7 +150,6 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoPSQT_ka2_1536_15_32_ls
 |---|---|---|
 | `--eval-type` | `NNUE_KA2` (4 層) または `SFNN_KA2` (LayerStacks-1536) | (必須) |
 | `--arch` | 自由形式 `<L1>x2-<L2>-<L3>` (`L1` は 32 の倍数) | `256x2-32-32` |
-| `--layerstack` | (`SFNN_KA2` のみ) `king3-by-king3` | `king3-by-king3` |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KA2-256x2-32-32`) |
 

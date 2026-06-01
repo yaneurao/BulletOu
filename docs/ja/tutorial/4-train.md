@@ -40,7 +40,7 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 | `768x2-16-64` | 768 | 16 | 64 | |
 | `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
-| `1536x2-15-32` | 1536 | 15 | 32 | SFNN-1536 (`architectures/sfnnwop-1536.h` 一致) |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3(king3-by-king3) LayerStacks の SFNN-1536 |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -53,17 +53,16 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 
-やねうら王の **`YANEURAOU_ENGINE_NNUE_SFNNwoP1536` ビルド** に load させる評価関数を学習したい場合は、専用の `--eval-type` を使う:
+やねうら王の **`YANEURAOU_ENGINE_SFNN1536` ビルド** に load させる評価関数を学習したい場合は、専用の `--eval-type` を使う:
 
 ```bash
 ./target/release/examples/bulletou \
     --eval-type SFNN_HALFKA2HM \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-通常の NNUE と違って **9 個のサブネットを局面ごとに使い分ける** (LayerStacks=9) ので `--layerstack` フラグが要る点だけ毛色が違う。使い方の説明は [§9 LayerStack](9-layerstack.md)、アーキテクチャ / 量子化 / `nn.bin` レイアウトの仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)。
+通常の NNUE と違って **9 個のサブネットを局面ごとに使い分ける** (LayerStacks=9)。`--arch` の `k3k3` suffix がやねうら王互換の LayerStack 方式を選ぶ。使い方の説明は [§9 LayerStack](9-layerstack.md)、アーキテクチャ / 量子化 / `nn.bin` レイアウトの仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)。
 
 ## 4.5 KPPT を学習する
 

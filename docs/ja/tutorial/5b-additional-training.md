@@ -61,7 +61,7 @@
 |---|---|
 | `--eval-type` | NN の topology が変わる = state.bin の tensor shape が合わない |
 | `--arch` | 同上 (FT/L1/L2 のサイズが変わる) |
-| `--layerstack` (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
+| `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
 これらを変えるなら **`--tag` を変えて別 run として起動** してください。

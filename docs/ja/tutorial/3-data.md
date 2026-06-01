@@ -18,8 +18,8 @@
 | `NNUE_KP` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` | 使う |
 | `NNUE_HALFKPE9` | HalfKP に利き数情報 (自軍/敵軍 0/1/2 の 9 通り) を多重化した拡張版。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` | 使う |
 | `NNUE_HALFKPVM` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー)。入力次元は HalfKP の約 1/2 | `nn.bin` | 使う |
-| `SFNN_HALFKA2HM` | やねうら王 NNUEwoSQPT1536 ビルド用の LayerStacks 系。使い方は [§9 LayerStack](9-layerstack.md)、仕様詳細は [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) | `nn.bin` | 使う (1536x2-15-32) |
-| `SFNN_HALFKA1HM` | ↑ の v1 アブレーション版 | `nn.bin` | 使う (1536x2-15-32) |
+| `SFNN_HALFKA2HM` | やねうら王 `YANEURAOU_ENGINE_SFNN1536` ビルド用の LayerStacks 系。使い方は [§9 LayerStack](9-layerstack.md)、仕様詳細は [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) | `nn.bin` | 使う (`SFNN_halfkahm2_1536_15_32_k3k3`) |
+| `SFNN_HALFKA1HM` | ↑ の v1 アブレーション版 | `nn.bin` | 使う (`SFNN_halfkahm1_1536_15_32_k3k3`) |
 | `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | 使わない |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) | 使わない |
 

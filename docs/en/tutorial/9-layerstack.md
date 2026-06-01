@@ -6,19 +6,19 @@ A standard NNUE uses a single MLP to evaluate any position. **LayerStack-family*
 
 - The right "shape" of evaluation can differ between opening / middlegame / endgame, or between different king-position relationships.
 - So the model keeps 9 independent small sub-networks, and at inference time picks just one based on the position.
-- The **bucket selection logic** has to agree between the engine and bulletou, configured via `--layerstack`.
+- The **bucket selection logic** has to agree between the engine and bulletou, and is encoded in the `--arch` suffix.
 
 In bulletou, LayerStack is currently used **only** for **YaneuraOu SFNNwoP1536-build training** (= `--eval-type SFNN_HALFKA1HM` / `SFNN_HALFKA2HM`). For the full spec see the [SFNN-1536 training reference](../shogi/sfnn-1536.md).
 
-## 9.1 Choosing `--layerstack`
+## 9.1 Choosing the LayerStack Suffix
 
-| Flag | Buckets | YaneuraOu-loadable | Description |
+| `--arch` suffix | Buckets | YaneuraOu-loadable | Description |
 |---|---|---|---|
-| **`king3-by-king3`** (default) | 9 | yes | Friend king's rank in 3 groups (1-3 / 4-6 / 7-9) × enemy king's rank in 3 groups = 9 combos. Matches YaneuraOu's `stack_index_for_nnue` exactly. |
+| **`k3k3(king3-by-king3)`** (default) | 9 | yes | Friend king's rank in 3 groups (1-3 / 4-6 / 7-9) × enemy king's rank in 3 groups = 9 combos. Matches YaneuraOu's `stack_index_for_nnue` exactly. |
 
-This is currently the only supported value. If YaneuraOu adds a new bucket scheme in the future we'll add the matching value here.
+This is currently the only supported suffix. If YaneuraOu adds a new bucket scheme in the future we'll add the matching suffix here.
 
-### The king3-by-king3 bucket table
+### The k3k3(king3-by-king3) bucket table
 
 After perspective flipping, both kings' ranks are coarsened into three groups, then combined:
 
@@ -32,18 +32,17 @@ Each bucket owns its own set of `fc_0 + fc_1 + fc_2` weights; during training, t
 
 ## 9.2 When it kicks in
 
-LayerStack is **only meaningful for the SFNN family**. The other eval-types (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` family) use a single MLP and ignore `--layerstack`.
+LayerStack is **only meaningful for the SFNN family**. The other eval-types (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` family) use a single MLP.
 
 ```bash
-# Train SFNN-1536 with king3-by-king3 = 9 buckets
+# Train SFNN-1536 with k3k3(king3-by-king3) = 9 buckets
 ./target/release/examples/bulletou \
     --eval-type SFNN_HALFKA2HM \
-    --arch 1536x2-15-32 \
-    --layerstack king3-by-king3 \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-1536x2-15-32-king3-by-king3/` (= the eval-type, arch and layerstack values joined into the directory name).
+Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` (= the eval-type and arch values joined into the directory name).
 
 Schedule flags (`--lr`, `--superbatches`, etc.) and the loss-log format are identical to the rest of the tutorial — see [§6 Tune the training](6-tune.md) and [§7 Inspect the result](7-result.md).
 
@@ -67,7 +66,7 @@ Practical guidance:
 ## 9.5 Related
 
 - [SFNN-1536 training reference](../shogi/sfnn-1536.md) — architecture, binary layout, quantisation scales
-- Existing example: `examples/shogi_layerstack.rs` — has additional (experimental) bucket modes beyond king3-by-king3 (rshogi-format output, kept parallel to bulletou)
+- Existing example: `examples/shogi_layerstack.rs` — has additional (experimental) bucket modes beyond k3k3(king3-by-king3) (rshogi-format output, kept parallel to bulletou)
 
 ---
 
