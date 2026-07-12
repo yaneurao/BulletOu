@@ -79,6 +79,8 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 `plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
 
+既存の checkpoint がある `--tag` で `--superbatches` を付けたり外したりすると、BulletOu は設定変更として扱い、auto resume を拒否する。古い checkpoint を意図して引き継ぐ場合だけ `--resume` を付ける。新しい実験として始めたい場合は `--tag` / `--output` を変える。
+
 制約:
 
 - `--test-teacher` 必須。validation loss がないと判定できない。

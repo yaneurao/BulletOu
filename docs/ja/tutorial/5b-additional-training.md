@@ -12,7 +12,7 @@
 
 ## 5.5.1 基本: 同じ `--tag` で再実行
 
-追加学習は **`--tag` が同じだと自動 resume**, **違うと新規学習** という単純なルール。
+追加学習は **`--tag` と学習設定が同じなら自動 resume**, **`--tag` が違うと新規学習** というルール。
 
 ```powershell
 # 1 回目: 3 epoch 学習
@@ -38,9 +38,11 @@
 
 ⚠️ `--max-epochs` は **「この invocation で何 epoch」** であって「合計目標」ではありません。
 
+`--superbatches` や LR 関係の設定を変えた場合、同じ `--tag` でも auto resume は停止する。設定変更込みで続きを学習したい場合は、意図を明示するために `--resume` を付ける。
+
 ## 5.5.2 変えていいフラグ / 変えてはいけないフラグ
 
-### ✅ 変えても OK
+### ✅ 変えても OK。ただし `--resume` を明示する
 
 | フラグ | 注意点 |
 |---|---|
@@ -52,8 +54,11 @@
 | `--max-epochs` | この invocation の epoch 数 |
 | `--superbatches` | LR cycle 長 (= 1 epoch の局面数) が変わる |
 | `--lambda` | 教師ターゲットの混合比 |
-| `--teacher` | 教師変更検出が働き、dataloader が新ファイルの先頭から読む。LR は新 cycle として再開 ([§5.5.4](#554-教師を変えて-fine-tune)) |
 | `--test-teacher` | 検証セットの差し替え |
+
+これらはモデル構造とは無関係なので、重みと Adam moments 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
+
+`--teacher` だけは例外で、同じ設定のまま教師だけ変える fine-tune は auto resume できる。教師変更検出が働き、dataloader は新ファイルの先頭から読む ([§5.5.4](#554-教師を変えて-fine-tune))。
 
 ### ❌ 変えてはいけない (モデル構造に関わる)
 
@@ -64,7 +69,7 @@
 | `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
-これらを変えるなら **`--tag` を変えて別 run として起動** してください。
+これらを変えるなら **`--tag` を変えて別 run として起動** してください。`--resume` を付けても tensor shape が合わないので復元できない。
 
 ## 5.5.3 例: batch_size を 16384 → 32768 に増やす
 
@@ -74,6 +79,7 @@
     --eval-type NNUE_KP --arch 256x2-32-32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
+    --resume `
     --lr-schedule step --lr-min 0.00001
 ```
 
@@ -107,6 +113,7 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
     --eval-type NNUE_KP --arch 256x2-32-32 `
     --tag distill `
     --max-epochs 2 --superbatches 4 `
+    --resume `
     --lr 0.0001 --lr-min 0.000001 `
     --lr-schedule step
 ```
@@ -133,6 +140,7 @@ LR は新 cycle (= 新教師の epoch 1) として `lr_max` から開始しま�
 # 仕上げ: 1 epoch だけ LR を 1 桁小さく
 .\bulletou.exe --teacher ... --tag main `
     --max-epochs 1 --superbatches 6 `
+    --resume `
     --lr 0.0001 --lr-min 0.000001 `
     --lr-schedule step ...
 ```

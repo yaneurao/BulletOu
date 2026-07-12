@@ -959,6 +959,16 @@ enum LrScheduleKind {
     Plateau,
 }
 
+impl LrScheduleKind {
+    fn cli_name(self) -> &'static str {
+        match self {
+            LrScheduleKind::Step => "step",
+            LrScheduleKind::Cos => "cos",
+            LrScheduleKind::Plateau => "plateau",
+        }
+    }
+}
+
 // ----- CLI ---------------------------------------------------------------
 
 #[derive(Parser, Debug, Clone)]
@@ -1027,6 +1037,19 @@ struct Args {
     /// is reached.
     #[arg(long)]
     superbatches: Option<usize>,
+
+    /// Force loading the latest checkpoint under the output directory,
+    /// even if its stored resume config is missing or differs from the
+    /// current command line. Use this only when you intentionally want to
+    /// continue an old run with changed training controls.
+    #[arg(long, conflicts_with = "no_resume")]
+    resume: bool,
+
+    /// Refuse to load any checkpoint from the output directory. If the
+    /// directory already contains a resumable checkpoint, the program
+    /// stops instead of mixing a fresh run into the same checkpoint series.
+    #[arg(long, conflicts_with = "resume")]
+    no_resume: bool,
 
     /// Number of epochs to train. With `step` / `cos`, one epoch is one
     /// full pass through the teacher data (= dataloader EOF) unless
@@ -1780,6 +1803,7 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    prepare_resume_config_or_exit(&args);
     if let Err(e) = record_invocation_to_tag_txt(&args) {
         eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
     }
@@ -1836,10 +1860,61 @@ fn count_existing_numbered_dirs(output_dir: &std::path::Path) -> usize {
         .count()
 }
 
+const RESUME_CONFIG_NAME: &str = "resume-config.txt";
+
+/// Small, stable signature for the training controls that must match for
+/// implicit auto-resume. Teacher paths are intentionally not part of this:
+/// continuing a trained model on a new teacher is a supported workflow, but
+/// changing controls such as `--superbatches` or LR policy should require an
+/// explicit `--resume`.
+fn resume_signature(args: &Args) -> String {
+    let batches_per_superbatch =
+        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+    let arch = if args.eval_type().uses_arch() { args.arch().cli_name() } else { "-".to_string() };
+    let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
+    let test_teacher =
+        args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
+
+    [
+        "schema=bulletou-resume-v1".to_string(),
+        format!("eval_type={}", args.eval_type().cli_name()),
+        format!("arch={arch}"),
+        format!("net_id={}", args.net_id()),
+        format!("batch_size={}", args.batch_size),
+        format!("batches_per_superbatch={batches_per_superbatch}"),
+        format!("superbatches={superbatches}"),
+        format!("lr_schedule={}", args.lr_schedule.cli_name()),
+        format!("lr={:.9}", args.lr),
+        format!("lr_min={:.9}", args.lr_min),
+        format!("lr_plateau_factor={:.9}", args.lr_plateau_factor),
+        format!("lr_plateau_min_delta={:.9}", args.lr_plateau_min_delta),
+        format!("lambda={:.9}", args.lambda),
+        format!("scale={}", args.scale),
+        format!("save_rate={}", args.save_rate),
+        format!("score_drop_abs={}", args.score_drop_abs),
+        format!("test_teacher={test_teacher}"),
+        format!("test_positions={}", args.test_positions),
+        format!("test_batch_size={}", args.test_batch_size),
+        format!("test_seed={}", args.test_seed),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+fn write_resume_config(output_dir: &std::path::Path, args: &Args) -> std::io::Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(output_dir.join(RESUME_CONFIG_NAME), resume_signature(args))
+}
+
+fn resume_config_matches(output_dir: &std::path::Path, args: &Args) -> Result<bool, std::io::Error> {
+    let stored = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME))?;
+    Ok(stored.trim_end() == resume_signature(args).trim_end())
+}
+
 /// Find the latest numbered subdirectory under `output_dir` (4-or-more-digit
 /// name parsable as `usize`) whose `state.bin` exists. Returns `None` if no
 /// resumable checkpoint is found.
-fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut latest: Option<(usize, std::path::PathBuf)> = None;
     let rd = std::fs::read_dir(output_dir).ok()?;
     for entry in rd.flatten() {
@@ -1862,6 +1937,71 @@ fn find_latest_state_bin(output_dir: &std::path::Path) -> Option<std::path::Path
     latest.map(|(_, p)| p)
 }
 
+fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
+    if args.no_resume {
+        return false;
+    }
+    if find_latest_state_bin_raw(output_dir).is_none() {
+        return false;
+    }
+    if args.resume {
+        return true;
+    }
+    resume_config_matches(output_dir, args).unwrap_or(false)
+}
+
+fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
+}
+
+fn prepare_resume_config_or_exit(args: &Args) {
+    let output_dir = args.output_dir();
+    let latest_state = find_latest_state_bin_raw(&output_dir);
+
+    if latest_state.is_some() && args.no_resume {
+        eprintln!(
+            "error: --no-resume was specified, but {} already contains a resumable checkpoint.\n  \
+             Use a different --tag/--output, or remove/rename the existing checkpoint directory.",
+            output_dir.display()
+        );
+        std::process::exit(2);
+    }
+
+    if latest_state.is_some() && !args.resume {
+        match resume_config_matches(&output_dir, args) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "error: auto-resume refused because {} differs from the current training controls.\n  \
+                     output: {}\n  \
+                     If this is intentional, rerun with --resume. For a new experiment, use a new --tag/--output.",
+                    output_dir.join(RESUME_CONFIG_NAME).display(),
+                    output_dir.display()
+                );
+                std::process::exit(2);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "error: auto-resume refused because {} has old checkpoints but no {}.\n  \
+                     This checkpoint was created before resume compatibility tracking.\n  \
+                     If you really want to continue it, rerun with --resume. For a new experiment, use a new --tag/--output.",
+                    output_dir.display(),
+                    RESUME_CONFIG_NAME
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("error: failed to read {}: {e}", output_dir.join(RESUME_CONFIG_NAME).display());
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if let Err(e) = write_resume_config(&output_dir, args) {
+        eprintln!("warning: failed to write {}: {e}", output_dir.join(RESUME_CONFIG_NAME).display());
+    }
+}
+
 // ----- KPPT family: KK + KKP + KPP sequential dispatch -------------------
 
 /// Run the three KPPT components (KK, KKP, KPP) sequentially, then assemble
@@ -1881,7 +2021,7 @@ fn run_kppt_all(args: &Args) {
     // `optimiser_state/` triplet under `<output>/.bulletou_resume/<comp>/`,
     // and let each child run_kppt_* call `trainer.load_from_checkpoint(<comp>)`
     // immediately after building its trainer.
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dirs: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> =
         resume_state_bin.as_ref().map(|state_bin_path| {
             eprintln!("=== resume detected: {} ===", state_bin_path.display());
@@ -3172,7 +3312,12 @@ macro_rules! run_training_inline_nnue {
         // restarting at sb=1.
         let mut cb_ctx = LogContext::from_args(args, lr_period);
         let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
-        let auto_resume_sb_raw = read_latest_saved_superbatch(&output_dir_buf);
+        let resume_enabled = resume_enabled(args, &output_dir_buf);
+        let auto_resume_sb_raw = if resume_enabled {
+            read_latest_saved_superbatch(&output_dir_buf)
+        } else {
+            None
+        };
         // Teacher-change detection: bullet's dataloader skips
         // `(start_sb - 1) * batches_per_sb` records at startup, which
         // assumes the resume run uses the same teacher data. If the
@@ -3190,7 +3335,11 @@ macro_rules! run_training_inline_nnue {
         // Compare the *resolved* (= expanded file list) form on both
         // sides — `from_args` writes the resolved list to the log, so
         // raw `args.teacher` would never match a stored directory.
-        let prev_teacher = read_latest_saved_teacher(&output_dir_buf);
+        let prev_teacher = if resume_enabled {
+            read_latest_saved_teacher(&output_dir_buf)
+        } else {
+            None
+        };
         let resolved_now = resolve_teacher_for_log(&args.teacher);
         let teacher_changed = match prev_teacher.as_deref() {
             Some(prev) => prev.trim() != resolved_now.trim(),
@@ -3239,7 +3388,11 @@ macro_rules! run_training_inline_nnue {
         //   = max_epoch - 1, so this run's local epoch=1 displays as
         //   K (same as the previous partial save), and its local
         //   epoch=2 displays as K+1.
-        let max_epoch_in_log = read_latest_epoch_in_top_level_log(&cb_top_level_log).unwrap_or(0);
+        let max_epoch_in_log = if resume_enabled {
+            read_latest_epoch_in_top_level_log(&cb_top_level_log).unwrap_or(0)
+        } else {
+            0
+        };
         let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && auto_resume_sb_raw.is_some();
         cb_ctx.epoch_offset = if mid_epoch_resume { max_epoch_in_log.saturating_sub(1) } else { max_epoch_in_log };
         // The LR column is derived from `positions` (= prior + per-row
@@ -3256,7 +3409,11 @@ macro_rules! run_training_inline_nnue {
         // positions も sb counter と一緒にリセットされてしまう。これを
         // 防ぐため、各 epoch 開始時にこの値を learn.log から再読み込み
         // して累積を反映させる。`mut` で更新される。
-        let mut cb_prior_position = read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0);
+        let mut cb_prior_position = if resume_enabled {
+            read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
+        } else {
+            0
+        };
         let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
         // HCPE データローダー再開用 byte offset。最新の checkpoint dir に
         // `dataloader_pos.txt` があればそこから読み、なければ 0 (= 先頭から)。
@@ -3264,7 +3421,11 @@ macro_rules! run_training_inline_nnue {
         // (byte_offset, plies_within_unit) のペアで保持する。HCPE / PSV
         // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
         // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
-        let latest_dataloader_pos = read_latest_dataloader_pos(&output_dir_buf);
+        let latest_dataloader_pos = if resume_enabled {
+            read_latest_dataloader_pos(&output_dir_buf)
+        } else {
+            None
+        };
         let initial_dataloader_resume_exact = !teacher_changed && !prev_run_completed_epoch && latest_dataloader_pos.is_some();
         let cb_dataloader_resume_offset = std::cell::Cell::new(if teacher_changed || prev_run_completed_epoch {
             // Continued-training case (= add more epochs after a
@@ -3908,7 +4069,7 @@ fn run_halfkp(args: &Args) {
 
     // ---- Resume support -------------------------------------------------
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4003,7 +4164,7 @@ fn run_kp(args: &Args) {
     );
 
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4095,7 +4256,7 @@ fn run_nnue_ka2(args: &Args) {
     );
 
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4187,7 +4348,7 @@ fn run_halfkpe9(args: &Args) {
     );
 
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4278,7 +4439,7 @@ fn run_halfkpvm(args: &Args) {
     );
 
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4396,7 +4557,7 @@ where
     );
 
     let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(&output_dir);
+    let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
         eprintln!("=== resume detected: {} ===", state_bin_path.display());
         let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
@@ -4805,6 +4966,48 @@ mod tests {
         let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null", "--tag", ""])
             .unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
+    }
+
+    #[test]
+    fn resume_signature_distinguishes_superbatches_presence() {
+        use clap::Parser as _;
+
+        let with_superbatches = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--tag",
+            "plateau-test",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "/tmp/test.hcpe",
+            "--superbatches",
+            "19",
+        ])
+        .unwrap();
+        let without_superbatches = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--tag",
+            "plateau-test",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "/tmp/test.hcpe",
+        ])
+        .unwrap();
+
+        let sig_with = resume_signature(&with_superbatches);
+        let sig_without = resume_signature(&without_superbatches);
+        assert!(sig_with.contains("superbatches=19"));
+        assert!(sig_without.contains("superbatches=none"));
+        assert_ne!(sig_with, sig_without);
     }
 
     /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values

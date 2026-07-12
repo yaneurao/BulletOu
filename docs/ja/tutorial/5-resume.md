@@ -2,7 +2,7 @@
 
 <a href="../../en/tutorial/5-resume.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-学習途中で `Ctrl+C` で止めたり、マシンの再起動などで中断しても、**同じ `--output` で同じコマンドをもう一度実行するだけで、自動的に最新 `000N/state.bin` から学習が続行される**。
+学習途中で `Ctrl+C` で止めたり、マシンの再起動などで中断しても、**同じ `--output` で同じ学習設定のコマンドをもう一度実行するだけで、自動的に最新 `000N/state.bin` から学習が続行される**。
 
 ```
 checkpoints/.../
@@ -15,11 +15,16 @@ checkpoints/.../
 
 仕組み:
 - `bulletou` 起動時、`--output` 配下に番号付き dir + `state.bin` があれば検出
+- `<output>/resume-config.txt` と現在の学習設定を比較し、一致した場合だけ auto resume する
 - 最大番号の `state.bin` から重みと Adam moments を復元
 - 新 save は既存最大番号の次から書く (前例で `0003/` まであれば `0004/` から)
 - `learn.log` (累積版) には新 run の CSV 行がそのまま追記される。LR scheduler は run ごとに reset されるため superbatch カウンタは 1 から再開するが、`positions` 列は累積される (新 run 開始時に既存 `learn.log` の最大 positions を読み取って続きから書く)
 
-この挙動は eval-type 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 すべて同じ仕組み)。新規学習にしたい場合は `--output` を別の dir にするか、既存 dir を削除する。
+`--superbatches`、`--lr-schedule`、`--lr`、`--lr-min`、`--batch-size` などを変えると、既存 checkpoint は同じ `--tag` でも自動復元されない。これは設定変更に気づかず古い実験を引き継ぐ事故を避けるため。
+
+意図して古い checkpoint を引き継ぎたい場合だけ `--resume` を付ける。逆に、checkpoint がある出力先を誤って使っていないか確認したい場合は `--no-resume` を付けると、既存 checkpoint がある時点で停止する。
+
+この挙動は eval-type 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 すべて同じ仕組み)。新規学習にしたい場合は `--tag` / `--output` を別の dir にするか、既存 dir を削除する。
 
 ---
 
