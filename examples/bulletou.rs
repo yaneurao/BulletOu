@@ -1937,6 +1937,14 @@ fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::
     latest.map(|(_, p)| p)
 }
 
+fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    find_latest_state_bin_raw(output_dir).and_then(|p| p.parent().map(|dir| dir.to_path_buf()))
+}
+
+fn latest_checkpoint_has_file(output_dir: &std::path::Path, filename: &str) -> bool {
+    latest_checkpoint_dir(output_dir).map(|dir| dir.join(filename).is_file()).unwrap_or(false)
+}
+
 fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
     if args.no_resume {
         return false;
@@ -2147,6 +2155,7 @@ const SUMMARY_LEARN_LOG_HEADER: &str =
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
 /// the summary lives next to them so they don't shadow each other.
 const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
+const PLATEAU_EPOCH_DONE_NAME: &str = "plateau_epoch_done.txt";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
@@ -3351,7 +3360,13 @@ macro_rules! run_training_inline_nnue {
         // epoch from sb=1 with a fresh dataloader, instead of trying to
         // resume sb=last_sb+1 (which would skip past end_superbatch and
         // train zero batches).
-        let prev_run_completed_epoch = auto_resume_sb_raw.map(|last_sb| last_sb >= end_superbatch).unwrap_or(false);
+        let prev_run_completed_epoch = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
+            && latest_checkpoint_has_file(&output_dir_buf, PLATEAU_EPOCH_DONE_NAME)
+        {
+            true
+        } else {
+            auto_resume_sb_raw.map(|last_sb| last_sb >= end_superbatch).unwrap_or(false)
+        };
         // Displayed sb in `learn.log` is intrinsically per-epoch (= 1..N
         // each epoch), so no cross-run offset is applied. Only the
         // dataloader's bullet-internal start_sb differs by case below.
@@ -3815,6 +3830,7 @@ macro_rules! run_training_inline_nnue {
                 } else {
                     consumed_offset_val.map(|off| (off, consumed_plies_val.unwrap_or(0)))
                 };
+                let plateau_epoch_done = matches!(plateau_action, Some(PlateauAction::StopAfterFinal { .. }));
 
                 // Finalise this saved dir into <NNNN>/ with the test metrics.
                 let idx = cb_next_idx.get();
@@ -3845,6 +3861,12 @@ macro_rules! run_training_inline_nnue {
                                 let pos_file = dst.join("dataloader_pos.txt");
                                 if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
                                     eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
+                                }
+                            }
+                            if plateau_epoch_done {
+                                let marker = dst.join(PLATEAU_EPOCH_DONE_NAME);
+                                if let Err(e) = std::fs::write(&marker, b"1\n") {
+                                    eprintln!("  WARN: failed to write {}: {e}", marker.display());
                                 }
                             }
                             eprintln!("  -> {}/", dst.display());
@@ -5024,6 +5046,29 @@ mod tests {
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
+    }
+
+    #[test]
+    fn latest_checkpoint_has_file_checks_latest_numbered_state_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-latest-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let d1 = tmp.join("0001");
+        std::fs::create_dir(&d1).unwrap();
+        std::fs::write(d1.join("state.bin"), b"dummy").unwrap();
+        std::fs::write(d1.join(PLATEAU_EPOCH_DONE_NAME), b"1\n").unwrap();
+        assert!(latest_checkpoint_has_file(&tmp, PLATEAU_EPOCH_DONE_NAME));
+
+        let d2 = tmp.join("0002");
+        std::fs::create_dir(&d2).unwrap();
+        std::fs::write(d2.join("state.bin"), b"dummy").unwrap();
+        assert!(!latest_checkpoint_has_file(&tmp, PLATEAU_EPOCH_DONE_NAME));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values
