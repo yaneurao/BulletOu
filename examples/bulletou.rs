@@ -3341,6 +3341,7 @@ macro_rules! run_training_inline_nnue {
                     DataFormat::Hcpe3 => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                            .with_buffer_records(hcpe_loader_buffer_records)
                             .with_resume_offset(resume_off, resume_plies);
                         dl_offset_handle.set(Some(loader.consumed_offset_handle()));
                         dl_plies_handle.set(Some(loader.consumed_plies_handle()));
