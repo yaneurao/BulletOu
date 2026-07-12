@@ -75,7 +75,7 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation loss を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
 
-`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ次の superbatch の LR に `--lr-plateau-factor` を掛ける。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で1 superbatchだけ学習して終了する。
+`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ次の superbatch の LR に `--lr-plateau-factor` を掛ける。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で1 superbatchだけ学習して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
 制約:
 

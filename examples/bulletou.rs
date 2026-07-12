@@ -1049,7 +1049,7 @@ struct Args {
     ///   if `--test-teacher` loss did not improve, multiply LR by
     ///   `--lr-plateau-factor`. When the next LR would fall below
     ///   `--lr-min`, train one final superbatch at exactly `--lr-min`
-    ///   and stop.
+    ///   and end the epoch.
     ///
     /// Epoch length is set by `--superbatches N` (period =
     /// `N * sb_size`). For HCPE / PSV with no `--superbatches`,
@@ -3366,21 +3366,20 @@ macro_rules! run_training_inline_nnue {
                 }
             };
         let mut persistent_hcpe_loader = new_hcpe_loader(cb_dataloader_resume_offset.get().0);
-        let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
-            Some(PlateauLrState::new(
-                args.lr,
-                args.lr_min,
-                args.lr_plateau_factor,
-                args.lr_plateau_min_delta,
-            ))
-        } else {
-            None
-        };
-
-        'epochs: for epoch in 1..=max_epochs {
+        for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
             }
+            let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+                Some(PlateauLrState::new(
+                    args.lr,
+                    args.lr_min,
+                    args.lr_plateau_factor,
+                    args.lr_plateau_min_delta,
+                ))
+            } else {
+                None
+            };
             // Epoch boundary (epoch >= 2): drop the previous epoch's loader
             // (its producer thread already finished at EOF), spawn a fresh one
             // that reads the teacher from the start.
@@ -3654,9 +3653,9 @@ macro_rules! run_training_inline_nnue {
                         }
                         PlateauAction::StopAfterFinal { loss } => {
                             eprintln!(
-                                "  plateau: final lr_min superbatch completed (loss={loss:.6}); stopping training."
+                                "  plateau: final lr_min superbatch completed (loss={loss:.6}); ending this epoch."
                             );
-                            break 'epochs;
+                            break 'epoch;
                         }
                     }
                 }
