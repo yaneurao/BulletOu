@@ -19,6 +19,7 @@ mod shogi_kk;
 mod shogi_kkp;
 mod shogi_kp;
 mod shogi_kpp;
+mod shogi_shardkp;
 pub mod shogi_threat_exclusion;
 
 #[allow(deprecated)]
@@ -47,6 +48,11 @@ pub use shogi_kk::{KK_INPUTS, KK_MAX_ACTIVE, ShogiKk};
 pub use shogi_kkp::{KKP_FE_END, KKP_INPUTS, KKP_MAX_ACTIVE, ShogiKkp};
 pub use shogi_kp::{FEATURE_HASH_KP, KP_DIMENSIONS, KP_MAX_ACTIVE, ShogiKp};
 pub use shogi_kpp::{KPP_FE_END, KPP_INPUTS, KPP_MAX_ACTIVE, ShogiKpp};
+pub use shogi_shardkp::{
+    FEATURE_HASH_SHARDKP, SHARDKP_COMMON_DIMENSIONS, SHARDKP_CONNECTIONS_PER_FEATURE, SHARDKP_DIMENSIONS,
+    SHARDKP_FANOUT, SHARDKP_MAX_ACTIVE, SHARDKP_SHARD_COUNT, SHARDKP_SHARD_DIMENSIONS, SHARDKP_TOTAL_L1,
+    ShogiShardKp, connection_index, shard_for_feature,
+};
 pub use shogi_threat_exclusion::ThreatProfile;
 
 #[allow(deprecated)]

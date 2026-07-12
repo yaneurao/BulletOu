@@ -6,7 +6,8 @@ Usage:
 
 Options:
     --arch <ARCH>       Architecture preset (default: 256x2-32-32)
-                        Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32
+                        Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32,
+                                 NNUE_shardkp_c256_s128x64_f6_16_16
     --l1 <SIZE>         L1 (accumulator) size (overrides preset)
     --l2 <SIZE>         L2 (hidden layer 1) size
     --l3 <SIZE>         L3 (hidden layer 2) size
@@ -55,7 +56,7 @@ Examples:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bulletou_lib::{
-    game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
+    game::inputs::{SHARDKP_TOTAL_L1, ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, ShogiShardKp, SparseInputType},
     nn::{
         ModelNode,
         optimiser::{self, AdamWParams, RAdamParams, RangerParams},
@@ -88,6 +89,9 @@ enum FeatureSet {
     Halfka,
     /// HalfKP - King-Piece (125,388 dimensions, no mirror)
     HalfKP,
+    /// ShardKP - K+P expanded to common 256 + shard 128x64 fanout 6
+    #[value(name = "shard-kp", alias = "shardkp")]
+    ShardKP,
 }
 
 /// Output format selection
@@ -145,10 +149,11 @@ enum OptimizerType {
 #[command(name = "shogi_simple")]
 #[command(about = "Shogi NNUE training script")]
 struct Args {
-    /// Feature set (halfka-hm, halfka, halfkp)
+    /// Feature set (halfka-hm, halfka, halfkp, shard-kp)
     /// halfka-hm: HalfKA_hm (73,305 dims, Half-Mirror) - nnue-pytorch compatible
     /// halfka: HalfKA (138,510 dims, no mirror) - rshogi compatible
     /// halfkp: HalfKP (125,388 dims, no mirror) - classic NNUE
+    /// shard-kp: shardKP experiment input (11,970 dims after connection expansion)
     #[arg(long, value_enum, default_value = "halfka-hm")]
     features: FeatureSet,
 
@@ -172,7 +177,8 @@ struct Args {
     pairwise: PairwiseMode,
 
     /// Architecture preset
-    /// Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32
+    /// Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32,
+    ///          NNUE_shardkp_c256_s128x64_f6_16_16
     #[arg(long, default_value = "256x2-32-32")]
     arch: String,
 
@@ -759,13 +765,23 @@ impl Architecture {
             "512x2-32-32" => Some(Self { l1: 512, l2: 32, l3: 32 }),
             "1024x2-8-32" => Some(Self { l1: 1024, l2: 8, l3: 32 }),
             "1024x2-16-64" => Some(Self { l1: 1024, l2: 16, l3: 64 }),
+            "NNUE_shardkp_c256_s128x64_f6_16_16" | "shardkp_c256_s128x64_f6_16_16" => {
+                Some(Self { l1: SHARDKP_TOTAL_L1, l2: 16, l3: 16 })
+            }
             _ => None,
         }
     }
 
     /// List of available presets
     fn available_presets() -> &'static [&'static str] {
-        &["256x2-32-32", "512x2-8-96", "512x2-32-32", "1024x2-8-32", "1024x2-16-64"]
+        &[
+            "256x2-32-32",
+            "512x2-8-96",
+            "512x2-32-32",
+            "1024x2-8-32",
+            "1024x2-16-64",
+            "NNUE_shardkp_c256_s128x64_f6_16_16",
+        ]
     }
 
     /// Display string
@@ -817,11 +833,12 @@ fn compute_fc_hash(l1_size: usize, l2_size: usize, l3_size: usize) -> u32 {
 
 /// 特徴量hash値を取得
 fn get_feature_hash(features: FeatureSet) -> u32 {
-    use bulletou_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR};
+    use bulletou_lib::game::inputs::{FEATURE_HASH, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, FEATURE_HASH_SHARDKP};
     match features {
         FeatureSet::HalfKP => FEATURE_HASH,
         FeatureSet::HalfkaHm => FEATURE_HASH_HM_V2,
         FeatureSet::Halfka => FEATURE_HASH_NONMIRROR,
+        FeatureSet::ShardKP => FEATURE_HASH_SHARDKP,
     }
 }
 
@@ -831,6 +848,7 @@ fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usiz
         FeatureSet::HalfKP => ("HalfKP(Friend)", 125388usize),
         FeatureSet::HalfkaHm => ("HalfKA_hm(Friend)", 73305usize),
         FeatureSet::Halfka => ("HalfKA(Friend)", 138510usize),
+        FeatureSet::ShardKP => ("ShardKP(Friend)", bulletou_lib::game::inputs::SHARDKP_DIMENSIONS),
     };
 
     // YaneuraOu互換のdescription文字列
@@ -893,6 +911,11 @@ fn main() {
         eprintln!("ERROR: {}", e);
         std::process::exit(1);
     });
+    if matches!(args.features, FeatureSet::ShardKP) && matches!(args.output_format, OutputFormat::Standard) {
+        eprintln!("ERROR: shard-kp is an experimental BulletOu feature and has no standard NNUE save format yet.");
+        eprintln!("       Use: --features shard-kp --arch NNUE_shardkp_c256_s128x64_f6_16_16 --output-format bullet");
+        std::process::exit(1);
+    }
 
     // Determine architecture
     let mut arch = Architecture::from_preset(&args.arch).unwrap_or_else(|| {
@@ -925,6 +948,7 @@ fn main() {
         FeatureSet::HalfkaHm => ("HalfKA_hm", ShogiHalfKA_hm.num_inputs()),
         FeatureSet::Halfka => ("HalfKA", ShogiHalfKA.num_inputs()),
         FeatureSet::HalfKP => ("HalfKP", ShogiHalfKP.num_inputs()),
+        FeatureSet::ShardKP => ("ShardKP", ShogiShardKp.num_inputs()),
     };
 
     // Optimizer name
@@ -1577,6 +1601,18 @@ fn main() {
         }
         (FeatureSet::HalfKP, ActivationType::Crelu, true) => {
             run_training!(ShogiHalfKP, crelu, true, use_win_rate_model)
+        }
+        (FeatureSet::ShardKP, ActivationType::Screlu, false) => {
+            run_training!(ShogiShardKp, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::ShardKP, ActivationType::Screlu, true) => {
+            run_training!(ShogiShardKp, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::ShardKP, ActivationType::Crelu, false) => {
+            run_training!(ShogiShardKp, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::ShardKP, ActivationType::Crelu, true) => {
+            run_training!(ShogiShardKp, crelu, true, use_win_rate_model)
         }
     }
 
