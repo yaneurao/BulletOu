@@ -1030,8 +1030,9 @@ struct Args {
 
     /// Number of epochs to train. With `step` / `cos`, one epoch is one
     /// full pass through the teacher data (= dataloader EOF) unless
-    /// `--superbatches` caps it. With `plateau`, an epoch also ends when
-    /// LR reaches `--lr-min` and the final min-LR retry has completed.
+    /// `--superbatches` caps it. With `plateau`, teacher EOF wraps back to
+    /// the beginning inside the same epoch; the epoch ends when LR reaches
+    /// `--lr-min` and the final min-LR retry has completed.
     /// After each epoch the dataloader is rebuilt from scratch. Default 1.
     #[arg(long, default_value = "1")]
     max_epochs: usize,
@@ -3263,6 +3264,8 @@ macro_rules! run_training_inline_nnue {
         // (byte_offset, plies_within_unit) のペアで保持する。HCPE / PSV
         // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
         // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
+        let latest_dataloader_pos = read_latest_dataloader_pos(&output_dir_buf);
+        let initial_dataloader_resume_exact = !teacher_changed && !prev_run_completed_epoch && latest_dataloader_pos.is_some();
         let cb_dataloader_resume_offset = std::cell::Cell::new(if teacher_changed || prev_run_completed_epoch {
             // Continued-training case (= add more epochs after a
             // completed run): read the teacher from byte 0 of the
@@ -3271,8 +3274,9 @@ macro_rules! run_training_inline_nnue {
             // EOF instead of training.
             (0u64, 0usize)
         } else {
-            read_latest_dataloader_pos(&output_dir_buf).unwrap_or((0, 0))
+            latest_dataloader_pos.unwrap_or((0, 0))
         });
+        let cb_dataloader_resume_exact = std::cell::Cell::new(initial_dataloader_resume_exact);
 
         if teacher_changed {
             if let Some(prev) = prev_teacher.as_deref() {
@@ -3356,23 +3360,28 @@ macro_rules! run_training_inline_nnue {
             .saturating_mul(batches_per_superbatch)
             .saturating_mul(args.batch_size);
         let new_hcpe_loader =
-            |resume_off: u64| -> Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> {
+            |resume_off: u64,
+             resume_exact: bool|
+             -> Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> {
                 if matches!(format, DataFormat::Hcpe) {
-                    Some(
-                        HcpeDataLoader::new_concat_multiple(
-                            &data_files_ref,
-                            args.buffer_mb,
-                            (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
-                        )
-                        .with_buffer_records(hcpe_loader_buffer_records)
-                        .with_loader_threads(args.loader_threads)
-                        .with_resume_offset(resume_off),
+                    let loader = HcpeDataLoader::new_concat_multiple(
+                        &data_files_ref,
+                        args.buffer_mb,
+                        (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
                     )
+                    .with_buffer_records(hcpe_loader_buffer_records)
+                    .with_loader_threads(args.loader_threads);
+                    Some(if resume_exact {
+                        loader.with_exact_resume_offset(resume_off)
+                    } else {
+                        loader.with_resume_offset(resume_off)
+                    })
                 } else {
                     None
                 }
             };
-        let mut persistent_hcpe_loader = new_hcpe_loader(cb_dataloader_resume_offset.get().0);
+        let mut persistent_hcpe_loader =
+            new_hcpe_loader(cb_dataloader_resume_offset.get().0, cb_dataloader_resume_exact.get());
         for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
@@ -3392,8 +3401,9 @@ macro_rules! run_training_inline_nnue {
             // that reads the teacher from the start.
             if epoch > 1 {
                 cb_dataloader_resume_offset.set((0, 0));
+                cb_dataloader_resume_exact.set(false);
                 if matches!(format, DataFormat::Hcpe) {
-                    persistent_hcpe_loader = new_hcpe_loader(0);
+                    persistent_hcpe_loader = new_hcpe_loader(0, false);
                 }
             }
             // Epoch >= 2: re-read the top-level learn.log so `cb_prior_position`
@@ -3423,6 +3433,7 @@ macro_rules! run_training_inline_nnue {
                     break;
                 }
                 let chunk_resume_before = cb_dataloader_resume_offset.get();
+                let chunk_resume_exact_before = cb_dataloader_resume_exact.get();
                 let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
                 let lr_for_chunk = plateau_state.as_ref().map(|s| s.current_lr);
                 let lr_scheduler_for_chunk = match args.lr_schedule {
@@ -3513,8 +3524,12 @@ macro_rules! run_training_inline_nnue {
                     DataFormat::Hcpe3 => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_buffer_records(hcpe_loader_buffer_records)
-                            .with_resume_offset(resume_off, resume_plies);
+                            .with_buffer_records(hcpe_loader_buffer_records);
+                        let loader = if cb_dataloader_resume_exact.get() {
+                            loader.with_exact_resume_offset(resume_off, resume_plies)
+                        } else {
+                            loader.with_resume_offset(resume_off, resume_plies)
+                        };
                         dl_offset_handle.set(Some(loader.consumed_offset_handle()));
                         dl_plies_handle.set(Some(loader.consumed_plies_handle()));
                         trainer.run(&schedule, &settings, &loader)
@@ -3522,8 +3537,12 @@ macro_rules! run_training_inline_nnue {
                     DataFormat::Pack => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_single_epoch(true)
-                            .with_resume_offset(resume_off, resume_plies);
+                            .with_single_epoch(true);
+                        let loader = if cb_dataloader_resume_exact.get() {
+                            loader.with_exact_resume_offset(resume_off, resume_plies)
+                        } else {
+                            loader.with_resume_offset(resume_off, resume_plies)
+                        };
                         dl_offset_handle.set(Some(loader.consumed_offset_handle()));
                         dl_plies_handle.set(Some(loader.consumed_plies_handle()));
                         trainer.run(&schedule, &settings, &loader)
@@ -3532,7 +3551,8 @@ macro_rules! run_training_inline_nnue {
                         // PSV is fixed 40-byte; DirectSequentialDataLoader
                         // already byte-seeks via `start_position * 40`, so
                         // no `dataloader_pos.txt` write is needed.
-                        let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                        let loader = DirectSequentialDataLoader::new(&data_files_ref)
+                            .with_single_epoch(!matches!(args.lr_schedule, LrScheduleKind::Plateau));
                         trainer.run(&schedule, &settings, &loader)
                     }
                 };
@@ -3546,6 +3566,7 @@ macro_rules! run_training_inline_nnue {
                     dl_plies_handle.take().map(|arc| arc.load(std::sync::atomic::Ordering::Acquire));
                 if let Some(off) = consumed_offset_val {
                     cb_dataloader_resume_offset.set((off, consumed_plies_val.unwrap_or(0)));
+                    cb_dataloader_resume_exact.set(true);
                 }
 
                 // Closure dropped → its borrow of saved_dir_in_chunk released.
@@ -3556,11 +3577,30 @@ macro_rules! run_training_inline_nnue {
                 // 場合は手動で trainer.save_to_checkpoint + log.txt 書き出し
                 // を行い、partial sb 分も `0NNN/` ディレクトリ + learn.log
                 // に残す。bullet が batch 0 個でも返ってきた (`last_error_record`
-                // 空) ケースだけ「やることない、epoch 終了」で break する。
+                // 空) ケースは、非 plateau では epoch 終了、plateau では教師先頭に
+                // 巻き戻して同じ epoch を継続する。
                 let (ckpt_dir, is_partial_save) = match saved_ckpt_dir {
                     Some(dir) => (dir, false),
                     None => {
                         if last_error_record.is_empty() {
+                            if plateau_state.is_some() {
+                                if chunk_resume_before == (0, 0) && chunk_resume_exact_before {
+                                    eprintln!(
+                                        "error: --lr-schedule plateau reached teacher EOF immediately after rewinding; \
+                                         teacher appears empty or unreadable."
+                                    );
+                                    break 'epoch;
+                                }
+                                cb_dataloader_resume_offset.set((0, 0));
+                                cb_dataloader_resume_exact.set(true);
+                                if matches!(format, DataFormat::Hcpe) {
+                                    persistent_hcpe_loader = new_hcpe_loader(0, true);
+                                }
+                                eprintln!(
+                                    "  plateau: teacher EOF reached before a new superbatch; rewinding teacher to the beginning."
+                                );
+                                continue 'epoch;
+                            }
                             break 'epoch;
                         }
                         let partial_dir = output_dir_buf.join(format!("{net_id_for_epoch}-{chunk_start}"));
@@ -3595,8 +3635,7 @@ macro_rules! run_training_inline_nnue {
                     let metrics = test_metrics.expect("plateau requires --test-teacher");
                     state.observe(metrics.loss)
                 });
-                let retry_same_chunk =
-                    plateau_action.map(plateau_action_retries_teacher).unwrap_or(false) && !is_partial_save;
+                let retry_same_chunk = plateau_action.map(plateau_action_retries_teacher).unwrap_or(false);
                 let dataloader_pos_to_write = if retry_same_chunk {
                     Some(chunk_resume_before)
                 } else {
@@ -3679,21 +3718,35 @@ macro_rules! run_training_inline_nnue {
                     }
                 }
 
-                // Partial save (= 教師 EOF mid-sb) was just finalised. No more
-                // data in this epoch — break to the next epoch (or end).
-                if is_partial_save {
-                    break 'epoch;
-                }
-
                 if retry_same_chunk {
                     cb_dataloader_resume_offset.set(chunk_resume_before);
+                    cb_dataloader_resume_exact.set(chunk_resume_exact_before);
                     if matches!(format, DataFormat::Hcpe) {
-                        persistent_hcpe_loader = new_hcpe_loader(chunk_resume_before.0);
+                        persistent_hcpe_loader = new_hcpe_loader(chunk_resume_before.0, chunk_resume_exact_before);
                     }
                     eprintln!(
                         "  plateau: rewinding teacher to retry superbatch {chunk_start} at lowered lr."
                     );
                     continue 'epoch;
+                }
+
+                // Partial save (= 教師 EOF mid-sb) was just finalised. Non-plateau
+                // treats this as epoch end. Plateau keeps the same epoch alive by
+                // wrapping the teacher to the beginning until lr_min final run.
+                if is_partial_save {
+                    if plateau_state.is_some() {
+                        cb_dataloader_resume_offset.set((0, 0));
+                        cb_dataloader_resume_exact.set(true);
+                        if matches!(format, DataFormat::Hcpe) {
+                            persistent_hcpe_loader = new_hcpe_loader(0, true);
+                        }
+                        eprintln!(
+                            "  plateau: teacher EOF reached after partial superbatch; rewinding teacher to the beginning."
+                        );
+                        chunk_start = chunk_end + 1;
+                        continue 'epoch;
+                    }
+                    break 'epoch;
                 }
 
                 chunk_start = chunk_end + 1;

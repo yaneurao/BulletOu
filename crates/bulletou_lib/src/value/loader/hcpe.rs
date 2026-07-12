@@ -97,6 +97,9 @@ pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// `map_chunks` の `start_position` 引数 × `HCPE_RECORD_SIZE` を
     /// fallback として使う (= 旧 API 互換)。
     resume_offset: u64,
+    /// true のときは `resume_offset == 0` でも legacy fallback せず、
+    /// 連結ストリームの先頭から読む。
+    resume_offset_explicit: bool,
     /// 学習側 (= `f(&buffer)`) が「ここまでは確実に処理した」ことを表す
     /// byte offset。Producer が buffer を送出する際に attach した
     /// offset を、Consumer が `f` 完了後に書き込む。Save callback から
@@ -151,6 +154,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
             filter,
             loader_threads: None,
             resume_offset: 0,
+            resume_offset_explicit: false,
             consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -179,6 +183,15 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
     /// 0 を渡すと旧来通り `start_position` 由来の skip ロジックに falls back。
     pub fn with_resume_offset(mut self, offset: u64) -> Self {
         self.resume_offset = offset;
+        self.resume_offset_explicit = false;
+        self
+    }
+
+    /// 再開時に最初に seek する byte offset を明示指定する。
+    /// `offset == 0` でも `start_position` 由来の skip を行わず、先頭から読む。
+    pub fn with_exact_resume_offset(mut self, offset: u64) -> Self {
+        self.resume_offset = offset;
+        self.resume_offset_explicit = true;
         self
     }
 
@@ -244,7 +257,7 @@ where
                 let file_paths = self.file_paths.clone();
                 let filter = self.filter.clone();
                 let loader_threads = self.loader_threads;
-                let resume_offset = if self.resume_offset > 0 {
+                let resume_offset = if self.resume_offset_explicit || self.resume_offset > 0 {
                     self.resume_offset
                 } else {
                     (start_position as u64) * HCPE_RECORD_SIZE as u64

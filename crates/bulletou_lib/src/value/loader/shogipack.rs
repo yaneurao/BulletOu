@@ -788,6 +788,9 @@ pub struct ShogiPackLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// 連結ファイル列の先頭からの累積 byte で、ここに居る game header から
     /// 再開する。0 のとき先頭から。
     resume_offset: u64,
+    /// true のときは `(resume_offset, resume_plies) == (0, 0)` でも
+    /// `start_position` 由来の legacy skip を行わず、先頭から読む。
+    resume_offset_explicit: bool,
     /// `resume_offset` の game の中で最初に push する ply の index (0-indexed)。
     /// 0..resume_plies の手は読まれ・do_move で局面に反映されるが PSV は push されない。
     resume_plies: usize,
@@ -809,6 +812,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
             filter,
             single_epoch: false,
             resume_offset: 0,
+            resume_offset_explicit: false,
             resume_plies: 0,
             consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consumed_plies: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -828,6 +832,16 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
     pub fn with_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
         self.resume_offset = byte_offset;
         self.resume_plies = plies;
+        self.resume_offset_explicit = false;
+        self
+    }
+
+    /// 再開位置の (byte offset, plies) を明示指定する。
+    /// `(0, 0)` でも `start_position` 由来の skip を行わず、先頭から読む。
+    pub fn with_exact_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
+        self.resume_offset = byte_offset;
+        self.resume_plies = plies;
+        self.resume_offset_explicit = true;
         self
     }
 
@@ -858,6 +872,7 @@ where
         let filter = self.filter.clone();
         let single_epoch = self.single_epoch;
         let resume_offset = self.resume_offset;
+        let resume_offset_explicit = self.resume_offset_explicit;
         let resume_plies = self.resume_plies;
         let consumed_offset = self.consumed_offset.clone();
         let consumed_plies = self.consumed_plies.clone();
@@ -866,7 +881,7 @@ where
         // 再開を使う (= 前回 save 時に Consumer が書き込んだ位置から再開)。
         // 0 のときは legacy 互換で `start_position` 個の filter 通過 position
         // を expander で読み飛ばす (best-effort consume-and-drop)。
-        let legacy_skip_mode = resume_offset == 0 && resume_plies == 0;
+        let legacy_skip_mode = !resume_offset_explicit && resume_offset == 0 && resume_plies == 0;
         let positions_to_skip = if legacy_skip_mode { start_position } else { 0 };
         if positions_to_skip > 0 {
             eprintln!(

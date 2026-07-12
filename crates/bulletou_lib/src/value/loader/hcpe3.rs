@@ -203,6 +203,9 @@ pub struct Hcpe3DataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// 連結ファイル列の先頭からの累積 byte 数で、ここに居る game header から
     /// 再開する。0 のとき先頭から。
     resume_offset: u64,
+    /// true のときは `(resume_offset, resume_plies) == (0, 0)` でも
+    /// `start_position` 由来の legacy skip を行わず、先頭から読む。
+    resume_offset_explicit: bool,
     /// `resume_offset` の game の中で「最初に push する ply」のインデックス。
     /// 0..resume_plies の MoveInfo は読まれ・do_move で局面に反映されるが、
     /// PSV としては push されない (= 前回 run で処理済みとして扱う)。
@@ -227,6 +230,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
             buffer_size: buffer_size_mb.saturating_mul(1024 * 1024) / 40,
             filter,
             resume_offset: 0,
+            resume_offset_explicit: false,
             resume_plies: 0,
             consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consumed_plies: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -251,6 +255,16 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
     pub fn with_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
         self.resume_offset = byte_offset;
         self.resume_plies = plies;
+        self.resume_offset_explicit = false;
+        self
+    }
+
+    /// 再開位置の (byte offset, plies) を明示指定する。
+    /// `(0, 0)` でも `start_position` 由来の skip を行わず、先頭から読む。
+    pub fn with_exact_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
+        self.resume_offset = byte_offset;
+        self.resume_plies = plies;
+        self.resume_offset_explicit = true;
         self
     }
 
@@ -291,6 +305,7 @@ where
         let file_paths = self.file_paths.clone();
         let filter = self.filter.clone();
         let resume_offset = self.resume_offset;
+        let resume_offset_explicit = self.resume_offset_explicit;
         let resume_plies = self.resume_plies;
         let consumed_offset = self.consumed_offset.clone();
         let consumed_plies = self.consumed_plies.clone();
@@ -304,6 +319,7 @@ where
                 buffer_size,
                 filter,
                 resume_offset,
+                resume_offset_explicit,
                 resume_plies,
                 start_position,
                 tx,
@@ -336,6 +352,7 @@ where
         buffer_size: usize,
         filter: T,
         resume_offset: u64,
+        resume_offset_explicit: bool,
         resume_plies: usize,
         start_position: usize,
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64, usize)>,
@@ -345,7 +362,7 @@ where
         // `resume_offset == 0` のとき (= fresh start, または legacy 互換) は
         // 旧来の `start_position` 由来 filter 通過 record skip を実施。
         let mut skipped = 0usize;
-        let legacy_skip_mode = resume_offset == 0 && resume_plies == 0;
+        let legacy_skip_mode = !resume_offset_explicit && resume_offset == 0 && resume_plies == 0;
 
         // `resume_offset` を含むファイルを線形に探す。
         let mut cumulative_size: u64 = 0;
