@@ -898,11 +898,19 @@ enum PlateauAction {
     Keep { loss: f32, best: f32 },
     Reduced { old_lr: f32, new_lr: f32, loss: f32, best: f32 },
     ScheduledFinal { old_lr: f32, min_lr: f32, loss: f32, best: f32 },
-    StopAfterFinal { loss: f32 },
+    FinalImproved { old_best: f32, new_best: f32 },
+    FinalRejected { loss: f32, best: f32 },
 }
 
 fn plateau_action_retries_teacher(action: PlateauAction) -> bool {
     matches!(action, PlateauAction::Reduced { .. } | PlateauAction::ScheduledFinal { .. })
+}
+
+fn plateau_action_rejects_update(action: PlateauAction) -> bool {
+    matches!(
+        action,
+        PlateauAction::Reduced { .. } | PlateauAction::ScheduledFinal { .. } | PlateauAction::FinalRejected { .. }
+    )
 }
 
 impl PlateauLrState {
@@ -912,7 +920,20 @@ impl PlateauLrState {
 
     fn observe(&mut self, loss: f32) -> PlateauAction {
         if self.final_min_run {
-            return PlateauAction::StopAfterFinal { loss };
+            self.final_min_run = false;
+            match self.best_loss {
+                Some(best) if loss + self.min_delta < best => {
+                    self.best_loss = Some(loss);
+                    return PlateauAction::FinalImproved { old_best: best, new_best: loss };
+                }
+                Some(best) => {
+                    return PlateauAction::FinalRejected { loss, best };
+                }
+                None => {
+                    self.best_loss = Some(loss);
+                    return PlateauAction::First { loss };
+                }
+            }
         }
 
         match self.best_loss {
@@ -927,8 +948,7 @@ impl PlateauLrState {
             Some(best) => {
                 let old_lr = self.current_lr;
                 if old_lr <= self.min_lr {
-                    self.final_min_run = true;
-                    return PlateauAction::StopAfterFinal { loss };
+                    return PlateauAction::FinalRejected { loss, best };
                 }
 
                 let new_lr = old_lr * self.factor;
@@ -1943,6 +1963,20 @@ fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::Path
 
 fn latest_checkpoint_has_file(output_dir: &std::path::Path, filename: &str) -> bool {
     latest_checkpoint_dir(output_dir).map(|dir| dir.join(filename).is_file()).unwrap_or(false)
+}
+
+fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
+    match latest_checkpoint_dir(output_dir) {
+        Some(dir) => {
+            let marker = dir.join(PLATEAU_EPOCH_DONE_NAME);
+            if let Err(e) = std::fs::write(&marker, b"1\n") {
+                eprintln!("  WARN: failed to write {}: {e}", marker.display());
+            }
+        }
+        None => {
+            eprintln!("  WARN: plateau epoch ended with no accepted checkpoint to mark complete");
+        }
+    }
 }
 
 fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
@@ -3818,7 +3852,8 @@ macro_rules! run_training_inline_nnue {
                     state.observe(metrics.loss)
                 });
                 let retry_same_chunk = plateau_action.map(plateau_action_retries_teacher).unwrap_or(false);
-                if retry_same_chunk {
+                let reject_checkpoint = plateau_action.map(plateau_action_rejects_update).unwrap_or(false);
+                if reject_checkpoint {
                     let rollback_path = plateau_rollback_dir.to_str().expect("checkpoint path is utf-8");
                     trainer.load_from_checkpoint(rollback_path);
                     if let Err(e) = std::fs::remove_dir_all(&ckpt_dir) {
@@ -3830,11 +3865,11 @@ macro_rules! run_training_inline_nnue {
                 } else {
                     consumed_offset_val.map(|off| (off, consumed_plies_val.unwrap_or(0)))
                 };
-                let plateau_epoch_done = matches!(plateau_action, Some(PlateauAction::StopAfterFinal { .. }));
+                let plateau_epoch_done = matches!(plateau_action, Some(PlateauAction::FinalImproved { .. }));
 
                 // Finalise this saved dir into <NNNN>/ with the test metrics.
                 let idx = cb_next_idx.get();
-                if !retry_same_chunk {
+                if !reject_checkpoint {
                     match finalize_one_nnue_dir(
                         &output_dir_buf,
                         &ckpt_dir,
@@ -3907,10 +3942,19 @@ macro_rules! run_training_inline_nnue {
                                  (old lr {old_lr})"
                             );
                         }
-                        PlateauAction::StopAfterFinal { loss } => {
+                        PlateauAction::FinalImproved { old_best, new_best } => {
                             eprintln!(
-                                "  plateau: final lr_min superbatch completed (loss={loss:.6}); ending this epoch."
+                                "  plateau: final lr_min superbatch improved validation loss {old_best:.6} -> {new_best:.6}; \
+                                 accepting it and ending this epoch."
                             );
+                            break 'epoch;
+                        }
+                        PlateauAction::FinalRejected { loss, best } => {
+                            eprintln!(
+                                "  plateau: final lr_min superbatch did not improve (loss={loss:.6}, best={best:.6}); \
+                                 discarding it and ending this epoch."
+                            );
+                            mark_latest_checkpoint_epoch_done(&output_dir_buf);
                             break 'epoch;
                         }
                     }
@@ -5231,7 +5275,26 @@ mod tests {
             PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, loss: 0.53, best: 0.49 }
         );
         assert_eq!(s.current_lr, 0.0001);
-        assert_eq!(s.observe(0.54), PlateauAction::StopAfterFinal { loss: 0.54 });
+        assert_eq!(s.observe(0.54), PlateauAction::FinalRejected { loss: 0.54, best: 0.49 });
+    }
+
+    #[test]
+    fn plateau_lr_accepts_final_min_run_only_when_it_improves() {
+        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0);
+        assert_eq!(s.observe(0.50), PlateauAction::First { loss: 0.50 });
+        assert_eq!(s.observe(0.49), PlateauAction::Improved { old_best: 0.50, new_best: 0.49 });
+        assert_eq!(s.observe(0.50), PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, loss: 0.50, best: 0.49 });
+        assert_eq!(s.observe(0.51), PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, loss: 0.51, best: 0.49 });
+        assert_eq!(
+            s.observe(0.52),
+            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, loss: 0.52, best: 0.49 }
+        );
+        assert_eq!(
+            s.observe(0.53),
+            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, loss: 0.53, best: 0.49 }
+        );
+        assert_eq!(s.current_lr, 0.0001);
+        assert_eq!(s.observe(0.48), PlateauAction::FinalImproved { old_best: 0.49, new_best: 0.48 });
     }
 
     #[test]
@@ -5252,7 +5315,34 @@ mod tests {
             old_best: 0.50,
             new_best: 0.49,
         }));
-        assert!(!plateau_action_retries_teacher(PlateauAction::StopAfterFinal { loss: 0.54 }));
+        assert!(!plateau_action_retries_teacher(PlateauAction::FinalRejected {
+            loss: 0.54,
+            best: 0.49,
+        }));
+    }
+
+    #[test]
+    fn plateau_reject_actions_drop_checkpoint() {
+        assert!(plateau_action_rejects_update(PlateauAction::Reduced {
+            old_lr: 0.001,
+            new_lr: 0.0005,
+            loss: 0.50,
+            best: 0.49,
+        }));
+        assert!(plateau_action_rejects_update(PlateauAction::ScheduledFinal {
+            old_lr: 0.000125,
+            min_lr: 0.0001,
+            loss: 0.53,
+            best: 0.49,
+        }));
+        assert!(plateau_action_rejects_update(PlateauAction::FinalRejected {
+            loss: 0.54,
+            best: 0.49,
+        }));
+        assert!(!plateau_action_rejects_update(PlateauAction::FinalImproved {
+            old_best: 0.49,
+            new_best: 0.48,
+        }));
     }
 
     #[test]

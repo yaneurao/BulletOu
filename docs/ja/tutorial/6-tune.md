@@ -75,11 +75,11 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation loss を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
 
-`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
+`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も validation loss が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
 `plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
 
-validation loss が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。checkpoint と `summary-learn.log` に残るのは、採用された更新と最後の `lr_min` run だけ。
+validation loss が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
 
 既存の checkpoint がある `--tag` で `--superbatches` を付けたり外したりすると、BulletOu は設定変更として扱い、auto resume を拒否する。古い checkpoint を意図して引き継ぐ場合だけ `--resume` を付ける。新しい実験として始めたい場合は `--tag` / `--output` を変える。
 
