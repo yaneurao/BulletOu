@@ -3224,8 +3224,11 @@ macro_rules! run_training_inline_nnue {
             // Epoch boundary (epoch >= 2): drop the previous epoch's loader
             // (its producer thread already finished at EOF), spawn a fresh one
             // that reads the teacher from the start.
-            if epoch > 1 && matches!(format, DataFormat::Hcpe) {
-                persistent_hcpe_loader = new_hcpe_loader(0);
+            if epoch > 1 {
+                cb_dataloader_resume_offset.set((0, 0));
+                if matches!(format, DataFormat::Hcpe) {
+                    persistent_hcpe_loader = new_hcpe_loader(0);
+                }
             }
             // Epoch >= 2: re-read the top-level learn.log so `cb_prior_position`
             // picks up the cumulative positions across the previous epoch(s).
