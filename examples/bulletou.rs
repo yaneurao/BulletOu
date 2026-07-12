@@ -3192,6 +3192,12 @@ macro_rules! run_training_inline_nnue {
         // ファイル末尾に達して exit しているので、同じ loader を持ち越すと
         // 空 channel → `NoBatchesReceived` panic になるため。Epoch 1 だけは
         // 外側からの resume offset を使い、epoch 2 以降は教師頭から (offset=0)。
+        let hcpe_loader_buffer_records = args
+            .save_rate
+            .max(1)
+            .min(end_superbatch)
+            .saturating_mul(batches_per_superbatch)
+            .saturating_mul(args.batch_size);
         let new_hcpe_loader =
             |resume_off: u64| -> Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> {
                 if matches!(format, DataFormat::Hcpe) {
@@ -3201,6 +3207,7 @@ macro_rules! run_training_inline_nnue {
                             args.buffer_mb,
                             (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
                         )
+                        .with_buffer_records(hcpe_loader_buffer_records)
                         .with_loader_threads(args.loader_threads)
                         .with_resume_offset(resume_off),
                     )
