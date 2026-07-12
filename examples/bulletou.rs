@@ -3589,6 +3589,7 @@ macro_rules! run_training_inline_nnue {
             // is wrong: each new epoch is a fresh pass over the teacher.
             let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
             let chunk_size = args.save_rate.max(1);
+            let plateau_rollback_dir = output_dir_buf.join(".bulletou_plateau_rollback");
             'epoch: loop {
                 if chunk_start > end_superbatch {
                     break;
@@ -3597,6 +3598,11 @@ macro_rules! run_training_inline_nnue {
                 let chunk_resume_exact_before = cb_dataloader_resume_exact.get();
                 let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
                 let lr_for_chunk = plateau_state.as_ref().map(|s| s.current_lr);
+                if plateau_state.is_some() {
+                    let _ = std::fs::remove_dir_all(&plateau_rollback_dir);
+                    let rollback_path = plateau_rollback_dir.to_str().expect("checkpoint path is utf-8");
+                    trainer.save_to_checkpoint(rollback_path);
+                }
                 let lr_scheduler_for_chunk = match args.lr_schedule {
                     LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
                         start: args.lr,
@@ -3797,6 +3803,13 @@ macro_rules! run_training_inline_nnue {
                     state.observe(metrics.loss)
                 });
                 let retry_same_chunk = plateau_action.map(plateau_action_retries_teacher).unwrap_or(false);
+                if retry_same_chunk {
+                    let rollback_path = plateau_rollback_dir.to_str().expect("checkpoint path is utf-8");
+                    trainer.load_from_checkpoint(rollback_path);
+                    if let Err(e) = std::fs::remove_dir_all(&ckpt_dir) {
+                        eprintln!("  WARN: failed to remove rejected plateau checkpoint {}: {e}", ckpt_dir.display());
+                    }
+                }
                 let dataloader_pos_to_write = if retry_same_chunk {
                     Some(chunk_resume_before)
                 } else {
@@ -3805,38 +3818,40 @@ macro_rules! run_training_inline_nnue {
 
                 // Finalise this saved dir into <NNNN>/ with the test metrics.
                 let idx = cb_next_idx.get();
-                match finalize_one_nnue_dir(
-                    &output_dir_buf,
-                    &ckpt_dir,
-                    &cb_ctx,
-                    epoch,
-                    idx,
-                    cb_prior_position,
-                    test_metrics,
-                ) {
-                    Ok(dst) => {
-                        cb_next_idx.set(idx + 1);
-                        if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
-                            eprintln!(
-                                "  WARN: failed to update {}: {e}",
-                                output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
-                            );
-                        }
-                        // Consumer が「ここまで処理した」を表す pair を
-                        // `dataloader_pos.txt` に書く (`<offset>,<plies>` 形式)。
-                        // HCPE / PSV のような固定長レコードでは plies=0、HCPE3
-                        // / pack のような棋譜単位なら ply 内の位置まで含めて
-                        // 厳密に再開できる。
-                        if let Some((off, plies)) = dataloader_pos_to_write {
-                            let pos_file = dst.join("dataloader_pos.txt");
-                            if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
-                                eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
+                if !retry_same_chunk {
+                    match finalize_one_nnue_dir(
+                        &output_dir_buf,
+                        &ckpt_dir,
+                        &cb_ctx,
+                        epoch,
+                        idx,
+                        cb_prior_position,
+                        test_metrics,
+                    ) {
+                        Ok(dst) => {
+                            cb_next_idx.set(idx + 1);
+                            if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
+                                eprintln!(
+                                    "  WARN: failed to update {}: {e}",
+                                    output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
+                                );
                             }
+                            // Consumer が「ここまで処理した」を表す pair を
+                            // `dataloader_pos.txt` に書く (`<offset>,<plies>` 形式)。
+                            // HCPE / PSV のような固定長レコードでは plies=0、HCPE3
+                            // / pack のような棋譜単位なら ply 内の位置まで含めて
+                            // 厳密に再開できる。
+                            if let Some((off, plies)) = dataloader_pos_to_write {
+                                let pos_file = dst.join("dataloader_pos.txt");
+                                if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
+                                    eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
+                                }
+                            }
+                            eprintln!("  -> {}/", dst.display());
                         }
-                        eprintln!("  -> {}/", dst.display());
-                    }
-                    Err(e) => {
-                        eprintln!("  WARN: failed to finalise {} into NNNN/: {e}", ckpt_dir.display());
+                        Err(e) => {
+                            eprintln!("  WARN: failed to finalise {} into NNNN/: {e}", ckpt_dir.display());
+                        }
                     }
                 }
 
@@ -3886,7 +3901,7 @@ macro_rules! run_training_inline_nnue {
                         persistent_hcpe_loader = new_hcpe_loader(chunk_resume_before.0, chunk_resume_exact_before);
                     }
                     eprintln!(
-                        "  plateau: rewinding teacher to retry superbatch {chunk_start} at lowered lr."
+                        "  plateau: restored model + optimiser, then rewinding teacher to retry superbatch {chunk_start} at lowered lr."
                     );
                     continue 'epoch;
                 }
@@ -3964,6 +3979,7 @@ macro_rules! run_training_inline_nnue {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(output_dir_buf.join(".bulletou_plateau_rollback"));
     }};
 }
 
