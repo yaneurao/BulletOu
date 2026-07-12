@@ -18,8 +18,10 @@
 | `--max-epochs` | 教師データを何周するか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
-| `--lr-schedule` | `step` (= geometric/対数線形) または `cos` (= cosine annealing)。両方とも 1 epoch で warm restart | `step` |
-| `--lr-min` | cycle 末で到達する最小 lr。cycle 長は `--superbatches` / 教師サイズから自動算出。step では `> 0` 必須 | 0.00001 |
+| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation loss が改善しないときだけ LR を下げる) | `step` |
+| `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
+| `--lr-plateau-factor` | `plateau` で loss が改善しなかったときに LR へ掛ける係数 | 0.5 |
+| `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
@@ -68,6 +70,32 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 ⚠️ **`--lr-min` は step では必ず `> 0`**: geometric の式 `lr_max × (lr_min/lr_max)^t` が `lr_min = 0` だと t > 0 で即 0 になり破綻するため、CLI 起動時にエラーになります。`1e-5` 〜 `1e-6` あたりが典型。cos は 0 でも数学的に動きますが、警告は出ます。
 
 実際の lr 推移は `<NNNN>/learn.log` の `lr` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
+
+#### ReduceLROnPlateau を使う
+
+教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation loss を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
+
+`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ次の superbatch の LR に `--lr-plateau-factor` を掛ける。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で1 superbatchだけ学習して終了する。
+
+制約:
+
+- `--test-teacher` 必須。validation loss がないと判定できない。
+- `--save-rate 1` 必須。1 superbatchごとに検証してLRを更新するため。
+- 現状は NNUE/SFNN 系の学習で使用する。
+
+例:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_HALFKP \
+    --max-epochs 10 --superbatches 19 \
+    --lr 0.001 --lr-min 0.00001 \
+    --lr-schedule plateau \
+    --lr-plateau-factor 0.5
+```
+
+factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、それ未満の微小な改善は「改善なし」とみなす。
 
 #### `step` vs `cos` を比較したい
 

@@ -839,6 +839,21 @@ impl LrScheduler for CosineLR {
     }
 }
 
+#[derive(Clone, Debug)]
+struct FixedLR {
+    value: f32,
+}
+
+impl LrScheduler for FixedLR {
+    fn lr(&self, _batch: usize, _superbatch: usize) -> f32 {
+        self.value
+    }
+
+    fn colourful(&self) -> String {
+        format!("plateau: fixed lr {}", self.value)
+    }
+}
+
 /// Wrapper enum so the macro can pass either schedule into bullet's
 /// generic `Trainer::train_custom` (which takes a single
 /// `impl LrScheduler` per run).
@@ -846,6 +861,7 @@ impl LrScheduler for CosineLR {
 enum LrSchedulerImpl {
     Step(PositionsLR),
     Cos(CosineLR),
+    Fixed(FixedLR),
 }
 
 impl LrScheduler for LrSchedulerImpl {
@@ -853,12 +869,76 @@ impl LrScheduler for LrSchedulerImpl {
         match self {
             LrSchedulerImpl::Step(s) => s.lr(batch, superbatch),
             LrSchedulerImpl::Cos(s) => s.lr(batch, superbatch),
+            LrSchedulerImpl::Fixed(s) => s.lr(batch, superbatch),
         }
     }
     fn colourful(&self) -> String {
         match self {
             LrSchedulerImpl::Step(s) => s.colourful(),
             LrSchedulerImpl::Cos(s) => s.colourful(),
+            LrSchedulerImpl::Fixed(s) => s.colourful(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlateauLrState {
+    current_lr: f32,
+    min_lr: f32,
+    factor: f32,
+    min_delta: f32,
+    best_loss: Option<f32>,
+    final_min_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlateauAction {
+    First { loss: f32 },
+    Improved { old_best: f32, new_best: f32 },
+    Keep { loss: f32, best: f32 },
+    Reduced { old_lr: f32, new_lr: f32, loss: f32, best: f32 },
+    ScheduledFinal { old_lr: f32, min_lr: f32, loss: f32, best: f32 },
+    StopAfterFinal { loss: f32 },
+}
+
+impl PlateauLrState {
+    fn new(start_lr: f32, min_lr: f32, factor: f32, min_delta: f32) -> Self {
+        Self { current_lr: start_lr, min_lr, factor, min_delta, best_loss: None, final_min_run: false }
+    }
+
+    fn observe(&mut self, loss: f32) -> PlateauAction {
+        if self.final_min_run {
+            return PlateauAction::StopAfterFinal { loss };
+        }
+
+        match self.best_loss {
+            None => {
+                self.best_loss = Some(loss);
+                PlateauAction::First { loss }
+            }
+            Some(best) if loss + self.min_delta < best => {
+                self.best_loss = Some(loss);
+                PlateauAction::Improved { old_best: best, new_best: loss }
+            }
+            Some(best) => {
+                let old_lr = self.current_lr;
+                if old_lr <= self.min_lr {
+                    self.final_min_run = true;
+                    return PlateauAction::StopAfterFinal { loss };
+                }
+
+                let new_lr = old_lr * self.factor;
+                if new_lr < self.min_lr {
+                    self.current_lr = self.min_lr;
+                    self.final_min_run = true;
+                    PlateauAction::ScheduledFinal { old_lr, min_lr: self.min_lr, loss, best }
+                } else if new_lr < old_lr {
+                    self.current_lr = new_lr;
+                    PlateauAction::Reduced { old_lr, new_lr, loss, best }
+                } else {
+                    PlateauAction::Keep { loss, best }
+                }
+            }
         }
     }
 }
@@ -872,6 +952,7 @@ impl LrScheduler for LrSchedulerImpl {
 enum LrScheduleKind {
     Step,
     Cos,
+    Plateau,
 }
 
 // ----- CLI ---------------------------------------------------------------
@@ -952,9 +1033,10 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// LR schedule kind. Both kinds sweep `--lr` (lr_max) → `--lr-min`
-    /// over **one epoch**, warm-restarting to `--lr` at each epoch
-    /// boundary. They differ only in the curve shape:
+    /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
+    /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
+    /// epoch boundary. `plateau` keeps LR fixed during one superbatch,
+    /// then reduces it when validation loss does not improve:
     ///
     /// - `step` (default) = geometric (= exponential in log space):
     ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
@@ -963,6 +1045,11 @@ struct Args {
     /// - `cos` = cosine annealing (SGDR-style):
     ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
     ///   Slower descent at the start and end, fastest in the middle.
+    /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
+    ///   if `--test-teacher` loss did not improve, multiply LR by
+    ///   `--lr-plateau-factor`. When the next LR would fall below
+    ///   `--lr-min`, train one final superbatch at exactly `--lr-min`
+    ///   and stop.
     ///
     /// Epoch length is set by `--superbatches N` (period =
     /// `N * sb_size`). For HCPE / PSV with no `--superbatches`,
@@ -972,13 +1059,23 @@ struct Args {
     #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
 
-    /// Floor LR reached at the end of each epoch (= the value of
-    /// LR just before the warm restart back to `--lr`). Must be
-    /// strictly positive for `--lr-schedule step` (the geometric
-    /// formula can't reach 0 in finite t); cosine can use 0 but
-    /// 1e-5 or 1e-6 is more typical.
+    /// Floor LR. For `step` / `cos`, this is reached at the end of each
+    /// epoch before warm restart. For `plateau`, this is the final LR.
+    /// Must be strictly positive for `step` and `plateau`; cosine can use
+    /// 0 but 1e-5 or 1e-6 is more typical.
     #[arg(long, default_value = "0.00001")]
     lr_min: f32,
+
+    /// ReduceLROnPlateau factor used by `--lr-schedule plateau`.
+    /// Must satisfy `0 < factor < 1`.
+    #[arg(long, default_value = "0.5")]
+    lr_plateau_factor: f32,
+
+    /// Minimum validation-loss improvement required by
+    /// `--lr-schedule plateau`. With the default 0, any strictly lower
+    /// validation loss counts as an improvement.
+    #[arg(long, default_value = "0.0")]
+    lr_plateau_min_delta: f32,
 
     /// Lambda — weight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
@@ -1614,17 +1711,21 @@ fn main() {
             }
         }
     }
-    // Both `step` and `cos` schedules sweep from `--lr` (lr_max) down to
-    // `--lr-min`; `--lr-min` must be > 0 for step (geometric formula
-    // `start*(min/start)^t` can't reach 0 in finite t). For cos, 0 is fine
-    // but unusual; warn rather than reject.
+    // `step` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
+    // `plateau` reduces `--lr` multiplicatively down to `--lr-min`.
+    // `--lr-min` must be > 0 for step / plateau. For cos, 0 is fine but
+    // unusual; warn rather than reject.
     if args.lr_min <= 0.0 {
         match args.lr_schedule {
-            LrScheduleKind::Step => {
+            LrScheduleKind::Step | LrScheduleKind::Plateau => {
                 eprintln!(
-                    "error: --lr-min must be > 0 for --lr-schedule step \
-                     (the geometric decay formula degenerates at 0). \
-                     1e-5 or 1e-6 is typical."
+                    "error: --lr-min must be > 0 for --lr-schedule {}. \
+                     1e-5 or 1e-6 is typical.",
+                    match args.lr_schedule {
+                        LrScheduleKind::Step => "step",
+                        LrScheduleKind::Plateau => "plateau",
+                        LrScheduleKind::Cos => unreachable!(),
+                    }
                 );
                 std::process::exit(2);
             }
@@ -1635,6 +1736,36 @@ fn main() {
                      usually preferred."
                 );
             }
+        }
+    }
+    if args.lr_schedule == LrScheduleKind::Plateau {
+        if args.test_teacher.is_none() {
+            eprintln!("error: --lr-schedule plateau requires --test-teacher so validation loss can be monitored.");
+            std::process::exit(2);
+        }
+        if args.save_rate != 1 {
+            eprintln!("error: --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions.");
+            std::process::exit(2);
+        }
+        if args.lr <= 0.0 {
+            eprintln!("error: --lr must be > 0 for --lr-schedule plateau.");
+            std::process::exit(2);
+        }
+        if args.lr < args.lr_min {
+            eprintln!("error: --lr must be >= --lr-min for --lr-schedule plateau.");
+            std::process::exit(2);
+        }
+        if !(args.lr_plateau_factor > 0.0 && args.lr_plateau_factor < 1.0) {
+            eprintln!("error: --lr-plateau-factor must satisfy 0 < factor < 1.");
+            std::process::exit(2);
+        }
+        if args.lr_plateau_min_delta < 0.0 {
+            eprintln!("error: --lr-plateau-min-delta must be >= 0.");
+            std::process::exit(2);
+        }
+        if matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt) {
+            eprintln!("error: --lr-schedule plateau is currently supported for NNUE/SFNN eval types only.");
+            std::process::exit(2);
         }
     }
     if let Err(e) = args.validate_arch_flags() {
@@ -1907,6 +2038,10 @@ struct LogContext {
     lr_period: u64,
     /// Floor LR reached at end of each cycle. Mirrors `--lr-min`.
     lr_min: f32,
+    /// When set, the lr column uses this exact value. Used by
+    /// ReduceLROnPlateau because its LR depends on previous validation
+    /// losses, not only on position count.
+    lr_override: Option<f32>,
 }
 
 /// Return `args.teacher` verbatim for the `teacher` column of `learn.log`.
@@ -1947,6 +2082,7 @@ impl LogContext {
             lr_schedule: args.lr_schedule,
             lr_period: lr_period_override,
             lr_min: args.lr_min,
+            lr_override: None,
         }
     }
 
@@ -2057,6 +2193,7 @@ fn enrich_bullet_log_to_csv(
                 PositionsLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64)
             }
             LrScheduleKind::Cos => CosineLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64),
+            LrScheduleKind::Plateau => ctx.lr_override.unwrap_or(ctx.lr_start),
         };
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
         // `/<component>` suffix for multi-component eval types (KPPT
@@ -2572,13 +2709,17 @@ macro_rules! run_training_inline {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Warm-restart cycle period = one epoch's positions. Both `step`
-        // (geometric) and `cos` (cosine) schedules use this same period.
-        let lr_period: u64 =
+        // Warm-restart cycle period = one epoch's positions. `step` and
+        // `cos` use this period; `plateau` is validation-loss driven and
+        // does not need a positions-based cycle.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+            0
+        } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2);
-            });
+            })
+        };
 
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
@@ -2656,6 +2797,7 @@ macro_rules! run_training_inline {
                         batch_size: args.batch_size,
                         batches_per_superbatch,
                     }),
+                    LrScheduleKind::Plateau => LrSchedulerImpl::Fixed(FixedLR { value: args.lr }),
                 },
                 save_rate: args.save_rate,
             };
@@ -3000,13 +3142,17 @@ macro_rules! run_training_inline_nnue {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Warm-restart cycle period = one epoch's positions. Both `step`
-        // (geometric) and `cos` (cosine) schedules use this same period.
-        let lr_period: u64 =
+        // Warm-restart cycle period = one epoch's positions. `step` and
+        // `cos` use this period; `plateau` is validation-loss driven and
+        // does not need a positions-based cycle.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+            0
+        } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2);
-            });
+            })
+        };
 
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
@@ -3159,6 +3305,10 @@ macro_rules! run_training_inline_nnue {
         // (random-pick happens here), then reuse the same positions for
         // every save event. `None` if --test-teacher unset or load failed.
         let test_cache = TestPositionsCache::try_load(args);
+        if matches!(args.lr_schedule, LrScheduleKind::Plateau) && test_cache.is_none() {
+            eprintln!("error: --lr-schedule plateau requires a readable --test-teacher.");
+            std::process::exit(2);
+        }
 
         // Per-save incremental finalize: rename `<net_id>-<sb>` →
         // `<NNNN>/`, generate per-dir `learn.log` (with per-save test
@@ -3216,8 +3366,18 @@ macro_rules! run_training_inline_nnue {
                 }
             };
         let mut persistent_hcpe_loader = new_hcpe_loader(cb_dataloader_resume_offset.get().0);
+        let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+            Some(PlateauLrState::new(
+                args.lr,
+                args.lr_min,
+                args.lr_plateau_factor,
+                args.lr_plateau_min_delta,
+            ))
+        } else {
+            None
+        };
 
-        for epoch in 1..=max_epochs {
+        'epochs: for epoch in 1..=max_epochs {
             if max_epochs > 1 {
                 eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
             }
@@ -3238,26 +3398,6 @@ macro_rules! run_training_inline_nnue {
                 cb_prior_position =
                     read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(cb_prior_position);
             }
-            // LR scheduler is rebuilt per-epoch so its `prior_positions`
-            // reflects the updated cumulative count.
-            let lr_scheduler_for_run = match args.lr_schedule {
-                LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
-                    start: args.lr,
-                    min: args.lr_min,
-                    period_positions: lr_period,
-                    prior_positions: cb_prior_position as u64,
-                    batch_size: args.batch_size,
-                    batches_per_superbatch,
-                }),
-                LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
-                    start: args.lr,
-                    min: args.lr_min,
-                    period_positions: lr_period,
-                    prior_positions: cb_prior_position as u64,
-                    batch_size: args.batch_size,
-                    batches_per_superbatch,
-                }),
-            };
             let net_id_for_epoch = if max_epochs > 1 { format!("{net_id_base}-e{epoch}") } else { net_id_base.clone() };
             last_net_id_for_epoch = net_id_for_epoch.clone();
 
@@ -3277,6 +3417,28 @@ macro_rules! run_training_inline_nnue {
                     break;
                 }
                 let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
+                let lr_for_chunk = plateau_state.as_ref().map(|s| s.current_lr);
+                let lr_scheduler_for_chunk = match args.lr_schedule {
+                    LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
+                        start: args.lr,
+                        min: args.lr_min,
+                        period_positions: lr_period,
+                        prior_positions: cb_prior_position as u64,
+                        batch_size: args.batch_size,
+                        batches_per_superbatch,
+                    }),
+                    LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
+                        start: args.lr,
+                        min: args.lr_min,
+                        period_positions: lr_period,
+                        prior_positions: cb_prior_position as u64,
+                        batch_size: args.batch_size,
+                        batches_per_superbatch,
+                    }),
+                    LrScheduleKind::Plateau => {
+                        LrSchedulerImpl::Fixed(FixedLR { value: lr_for_chunk.unwrap_or(args.lr) })
+                    }
+                };
 
                 let schedule = TrainingSchedule {
                     net_id: net_id_for_epoch.clone(),
@@ -3288,7 +3450,7 @@ macro_rules! run_training_inline_nnue {
                         end_superbatch: chunk_end,
                     },
                     wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                    lr_scheduler: lr_scheduler_for_run.clone(),
+                    lr_scheduler: lr_scheduler_for_chunk,
                     save_rate: args.save_rate,
                 };
 
@@ -3420,6 +3582,7 @@ macro_rules! run_training_inline_nnue {
                     let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
                     run_one_test_pass(cache, args, outputs)
                 });
+                cb_ctx.lr_override = lr_for_chunk;
 
                 // Finalise this saved dir into <NNNN>/ with the test metrics.
                 let idx = cb_next_idx.get();
@@ -3456,6 +3619,45 @@ macro_rules! run_training_inline_nnue {
                     }
                     Err(e) => {
                         eprintln!("  WARN: failed to finalise {} into NNNN/: {e}", ckpt_dir.display());
+                    }
+                }
+
+                if let Some(state) = plateau_state.as_mut() {
+                    let metrics = test_metrics.expect("plateau requires --test-teacher");
+                    match state.observe(metrics.loss) {
+                        PlateauAction::First { loss } => {
+                            eprintln!("  plateau: initial validation loss = {loss:.6}; lr stays {}", state.current_lr);
+                        }
+                        PlateauAction::Improved { old_best, new_best } => {
+                            eprintln!(
+                                "  plateau: validation loss improved {old_best:.6} -> {new_best:.6}; lr stays {}",
+                                state.current_lr
+                            );
+                        }
+                        PlateauAction::Keep { loss, best } => {
+                            eprintln!(
+                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); lr stays {}",
+                                state.current_lr
+                            );
+                        }
+                        PlateauAction::Reduced { old_lr, new_lr, loss, best } => {
+                            eprintln!(
+                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); lr {old_lr} -> {new_lr}"
+                            );
+                        }
+                        PlateauAction::ScheduledFinal { old_lr, min_lr, loss, best } => {
+                            eprintln!(
+                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); \
+                                 next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
+                                 (old lr {old_lr})"
+                            );
+                        }
+                        PlateauAction::StopAfterFinal { loss } => {
+                            eprintln!(
+                                "  plateau: final lr_min superbatch completed (loss={loss:.6}); stopping training."
+                            );
+                            break 'epochs;
+                        }
                     }
                 }
 
@@ -4433,6 +4635,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
+            lr_override: None,
         };
 
         let dst = finalize_one_nnue_dir(
@@ -4550,6 +4753,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
+            lr_override: None,
         };
         let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
         let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
@@ -4663,6 +4867,49 @@ mod tests {
         assert!((lr - mid).abs() < 1e-6, "cycle 2 midpoint same as cycle 1, got {lr}");
     }
 
+    #[test]
+    fn plateau_lr_reduces_and_schedules_final_min_run() {
+        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0);
+        assert_eq!(s.observe(0.50), PlateauAction::First { loss: 0.50 });
+        assert_eq!(s.observe(0.49), PlateauAction::Improved { old_best: 0.50, new_best: 0.49 });
+        assert_eq!(s.observe(0.50), PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, loss: 0.50, best: 0.49 });
+        assert!((s.current_lr - 0.0005).abs() < 1e-12);
+
+        assert_eq!(s.observe(0.51), PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, loss: 0.51, best: 0.49 });
+        assert_eq!(
+            s.observe(0.52),
+            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, loss: 0.52, best: 0.49 }
+        );
+        assert_eq!(
+            s.observe(0.53),
+            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, loss: 0.53, best: 0.49 }
+        );
+        assert_eq!(s.current_lr, 0.0001);
+        assert_eq!(s.observe(0.54), PlateauAction::StopAfterFinal { loss: 0.54 });
+    }
+
+    #[test]
+    fn enrich_uses_plateau_lr_override() {
+        let ctx = LogContext {
+            eval_type: "NNUE_KP",
+            arch: "NNUE_kp_256x2_32_32".to_string(),
+            lr_start: 0.001,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 6104,
+            teacher_csv: "teachers/c.hcpe".to_string(),
+            epoch_offset: 0,
+            lr_schedule: LrScheduleKind::Plateau,
+            lr_period: 0,
+            lr_min: 0.00001,
+            lr_override: Some(0.00025),
+        };
+        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None);
+        let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
+        let lr: f32 = cols[7].parse().unwrap();
+        assert!((lr - 0.00025).abs() < 1e-12, "plateau log should use exact override, got {lr}");
+    }
+
     /// enrich path が `LrScheduleKind::Cos` のとき CosineLR を呼ぶことを確認。
     #[test]
     fn enrich_uses_cosine_when_schedule_is_cos() {
@@ -4678,6 +4925,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Cos,
             lr_period: 100_000_000,
             lr_min: 0.0,
+            lr_override: None,
         };
         // batch=32, prior=0 → positions = 524,288 → t ≈ 0.00524 → lr ≈ lr_max
         let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 0, None);
@@ -4708,6 +4956,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Step,
             lr_period: 800_000_000,
             lr_min: 0.00001,
+            lr_override: None,
         };
         // bullet's local sb in raw log is 1; enrich displays the local sb
         // verbatim (no cross-run shift — sb is per-epoch by design).
@@ -4744,6 +4993,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Step,
             lr_period: 100_000_000,
             lr_min: 0.00001,
+            lr_override: None,
         };
         let raw = "1,32,0.07\n";
         // local epoch=1 + offset 3 → display epoch=4
@@ -4903,6 +5153,7 @@ mod tests {
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
             lr_min: 0.00001,
+            lr_override: None,
         };
         let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
         assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
