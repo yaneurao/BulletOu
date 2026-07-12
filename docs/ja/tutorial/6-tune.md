@@ -14,8 +14,8 @@
 |---|---|---|
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
-| `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし (= EOF まで) |
-| `--max-epochs` | 教師データを何周するか | 1 |
+| `--superbatches` | epoch あたりの superbatch 数の上限。`plateau` では通常不要 | 上限なし (= EOF まで、または plateau の `lr_min` 到達まで) |
+| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では `lr_min` 到達までの試行を何回行うか | 1 |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
 | `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation loss が改善しないときだけ LR を下げる) | `step` |
@@ -46,11 +46,11 @@
 
 `t = (累積局面 mod period) / period`、`period = 1 epoch ぶんの局面数` (= 自動算出)。
 
-**period 決定ルール**:
+**`step` / `cos` の period 決定ルール**:
 
 | 状況 | period |
 |---|---|
-| `--superbatches N` 指定あり | `N × sb_size` (= 1 epoch ぶん。**最推奨**) |
+| `--superbatches N` 指定あり | `N × sb_size` (= 1 epoch ぶん。`step` / `cos` では推奨) |
 | `--superbatches` 未指定 AND HCPE / PSV 教師 | 教師全体の局面数 (file size から自動計算) |
 | `--superbatches` 未指定 AND HCPE3 / pack 教師 | エラー (= 可変長レコードなので教師サイズ不明、明示が必要) |
 
@@ -77,6 +77,8 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 `plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
+`plateau` では 1 epoch の superbatch 数は固定しない。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
+
 制約:
 
 - `--test-teacher` 必須。validation loss がないと判定できない。
@@ -89,7 +91,7 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type NNUE_HALFKP \
-    --max-epochs 10 --superbatches 19 \
+    --max-epochs 10 \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
     --lr-plateau-factor 0.5
@@ -157,15 +159,15 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 | HCPE3 | 可変長 (棋譜単位) | ❌ 未対応 (全 game header を walk する必要あり) |
 | pack | 可変長 (棋譜単位) | ❌ 同上 |
 
-HCPE3 / pack を使うなら、同じ corpus を HCPE / PSV に事前変換するか、`--superbatches` を手動指定してください。
+`step` / `cos` で HCPE3 / pack を使うなら、同じ corpus を HCPE / PSV に事前変換するか、`--superbatches` を手動指定してください。`plateau` は period を使わないので、この制約はない。
 
 ### 複数 epoch 回す
 
-`--max-epochs N` を指定すると教師データを N 周する。各 epoch 開始時に:
+`--max-epochs N` を指定すると epoch を N 回実行する。`step` / `cos` では通常「教師データを N 周する」の意味になる。`plateau` では各 epoch が `lr_min` 到達で途中終了し得るので、「plateau 学習を最大 N 回繰り返す」の意味になる。各 epoch 開始時に:
 - LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る — `step` でも `cos` でも同じ)
 - データローダーが先頭にシークし直す
 
-つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。
+つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。`plateau` では `--superbatches` で cycle を揃える必要はない。
 
 ## 6.2 教師ターゲット (`--lambda`)
 

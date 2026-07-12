@@ -986,9 +986,9 @@ struct Args {
     /// file (instant). HCPE3 / pack are variable-length and would need to
     /// walk every game; not yet supported by this flag.
     ///
-    /// Use the printed total to pick `--superbatches N` such that one
-    /// epoch ≈ (or ≤) the teacher size. With cosine annealing, period
-    /// auto-aligns to `--superbatches` so no extra flag is needed.
+    /// Use the printed total to pick `--superbatches N` for `step` / `cos`
+    /// runs such that one epoch ≈ (or ≤) the teacher size. With cosine
+    /// annealing, period auto-aligns to `--superbatches`.
     #[arg(long)]
     count_teacher: bool,
 
@@ -1022,14 +1022,17 @@ struct Args {
 
     /// Cap on the number of superbatches per epoch. If omitted, there is no
     /// cap (= run until the dataloader reaches EOF). Specify this to stop
-    /// each epoch early (e.g. to fit a quick smoke test). Mutually exclusive
-    /// with `--max-epochs` in practical use.
+    /// each epoch early (e.g. to fit a quick smoke test). For `plateau`,
+    /// this is only a safety cap; the epoch normally ends when `--lr-min`
+    /// is reached.
     #[arg(long)]
     superbatches: Option<usize>,
 
-    /// Number of epochs to train. One epoch = one full pass through the
-    /// teacher data (= one dataloader EOF). After each epoch the
-    /// dataloader is rebuilt from scratch. Default 1.
+    /// Number of epochs to train. With `step` / `cos`, one epoch is one
+    /// full pass through the teacher data (= dataloader EOF) unless
+    /// `--superbatches` caps it. With `plateau`, an epoch also ends when
+    /// LR reaches `--lr-min` and the final min-LR retry has completed.
+    /// After each epoch the dataloader is rebuilt from scratch. Default 1.
     #[arg(long, default_value = "1")]
     max_epochs: usize,
 
@@ -1055,11 +1058,11 @@ struct Args {
     ///   When the next LR would fall below `--lr-min`, train that
     ///   interval one final time at exactly `--lr-min` and end the epoch.
     ///
-    /// Epoch length is set by `--superbatches N` (period =
-    /// `N * sb_size`). For HCPE / PSV with no `--superbatches`,
-    /// falls back to the teacher's total position count. HCPE3 /
-    /// pack without `--superbatches` is rejected (teacher size
-    /// unknown without walking).
+    /// For `step` / `cos`, the LR period is set by `--superbatches N`
+    /// (`N * sb_size`). Without `--superbatches`, HCPE / PSV falls back
+    /// to the teacher's total position count, while HCPE3 / pack needs
+    /// an explicit period. `plateau` is validation-driven and does not
+    /// need `--superbatches` to define epoch length.
     #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
 
