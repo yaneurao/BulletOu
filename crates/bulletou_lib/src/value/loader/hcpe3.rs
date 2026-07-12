@@ -233,6 +233,17 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
         }
     }
 
+    /// shuffle buffer に貯める PackedSfenValue 件数を直接指定する。
+    ///
+    /// `trainer.run` を save chunk ごとに分割して呼ぶ場合、loader がそれより
+    /// 大きな chunk を返すと、呼び出し側は必要 batch 数に達した時点で
+    /// chunk の残りを消費できない。chunk 境界と save chunk 境界を揃えるための
+    /// escape hatch。
+    pub fn with_buffer_records(mut self, records: usize) -> Self {
+        self.buffer_size = records.max(1);
+        self
+    }
+
     /// 再開位置の (byte offset, plies) を指定する。
     /// `byte_offset` は連結ファイル列の先頭からの累積 byte 数で、その位置に
     /// game header があることが前提。`plies` はその game の何手目から
