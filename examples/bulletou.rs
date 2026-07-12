@@ -901,6 +901,10 @@ enum PlateauAction {
     StopAfterFinal { loss: f32 },
 }
 
+fn plateau_action_retries_teacher(action: PlateauAction) -> bool {
+    matches!(action, PlateauAction::Reduced { .. } | PlateauAction::ScheduledFinal { .. })
+}
+
 impl PlateauLrState {
     fn new(start_lr: f32, min_lr: f32, factor: f32, min_delta: f32) -> Self {
         Self { current_lr: start_lr, min_lr, factor, min_delta, best_loss: None, final_min_run: false }
@@ -1047,9 +1051,9 @@ struct Args {
     ///   Slower descent at the start and end, fastest in the middle.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if `--test-teacher` loss did not improve, multiply LR by
-    ///   `--lr-plateau-factor`. When the next LR would fall below
-    ///   `--lr-min`, train one final superbatch at exactly `--lr-min`
-    ///   and end the epoch.
+    ///   `--lr-plateau-factor` and retry the same teacher interval.
+    ///   When the next LR would fall below `--lr-min`, train that
+    ///   interval one final time at exactly `--lr-min` and end the epoch.
     ///
     /// Epoch length is set by `--superbatches N` (period =
     /// `N * sb_size`). For HCPE / PSV with no `--superbatches`,
@@ -3415,6 +3419,7 @@ macro_rules! run_training_inline_nnue {
                 if chunk_start > end_superbatch {
                     break;
                 }
+                let chunk_resume_before = cb_dataloader_resume_offset.get();
                 let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
                 let lr_for_chunk = plateau_state.as_ref().map(|s| s.current_lr);
                 let lr_scheduler_for_chunk = match args.lr_schedule {
@@ -3583,6 +3588,18 @@ macro_rules! run_training_inline_nnue {
                 });
                 cb_ctx.lr_override = lr_for_chunk;
 
+                let plateau_action = plateau_state.as_mut().map(|state| {
+                    let metrics = test_metrics.expect("plateau requires --test-teacher");
+                    state.observe(metrics.loss)
+                });
+                let retry_same_chunk =
+                    plateau_action.map(plateau_action_retries_teacher).unwrap_or(false) && !is_partial_save;
+                let dataloader_pos_to_write = if retry_same_chunk {
+                    Some(chunk_resume_before)
+                } else {
+                    consumed_offset_val.map(|off| (off, consumed_plies_val.unwrap_or(0)))
+                };
+
                 // Finalise this saved dir into <NNNN>/ with the test metrics.
                 let idx = cb_next_idx.get();
                 match finalize_one_nnue_dir(
@@ -3607,8 +3624,7 @@ macro_rules! run_training_inline_nnue {
                         // HCPE / PSV のような固定長レコードでは plies=0、HCPE3
                         // / pack のような棋譜単位なら ply 内の位置まで含めて
                         // 厳密に再開できる。
-                        if let Some(off) = consumed_offset_val {
-                            let plies = consumed_plies_val.unwrap_or(0);
+                        if let Some((off, plies)) = dataloader_pos_to_write {
                             let pos_file = dst.join("dataloader_pos.txt");
                             if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
                                 eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
@@ -3621,22 +3637,22 @@ macro_rules! run_training_inline_nnue {
                     }
                 }
 
-                if let Some(state) = plateau_state.as_mut() {
-                    let metrics = test_metrics.expect("plateau requires --test-teacher");
-                    match state.observe(metrics.loss) {
+                if let Some(action) = plateau_action {
+                    let current_lr = plateau_state.as_ref().map(|s| s.current_lr).unwrap_or(args.lr);
+                    match action {
                         PlateauAction::First { loss } => {
-                            eprintln!("  plateau: initial validation loss = {loss:.6}; lr stays {}", state.current_lr);
+                            eprintln!("  plateau: initial validation loss = {loss:.6}; lr stays {current_lr}");
                         }
                         PlateauAction::Improved { old_best, new_best } => {
                             eprintln!(
                                 "  plateau: validation loss improved {old_best:.6} -> {new_best:.6}; lr stays {}",
-                                state.current_lr
+                                current_lr
                             );
                         }
                         PlateauAction::Keep { loss, best } => {
                             eprintln!(
                                 "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); lr stays {}",
-                                state.current_lr
+                                current_lr
                             );
                         }
                         PlateauAction::Reduced { old_lr, new_lr, loss, best } => {
@@ -3664,6 +3680,17 @@ macro_rules! run_training_inline_nnue {
                 // data in this epoch — break to the next epoch (or end).
                 if is_partial_save {
                     break 'epoch;
+                }
+
+                if retry_same_chunk {
+                    cb_dataloader_resume_offset.set(chunk_resume_before);
+                    if matches!(format, DataFormat::Hcpe) {
+                        persistent_hcpe_loader = new_hcpe_loader(chunk_resume_before.0);
+                    }
+                    eprintln!(
+                        "  plateau: rewinding teacher to retry superbatch {chunk_start} at lowered lr."
+                    );
+                    continue 'epoch;
                 }
 
                 chunk_start = chunk_end + 1;
@@ -4885,6 +4912,27 @@ mod tests {
         );
         assert_eq!(s.current_lr, 0.0001);
         assert_eq!(s.observe(0.54), PlateauAction::StopAfterFinal { loss: 0.54 });
+    }
+
+    #[test]
+    fn plateau_retry_actions_rewind_teacher() {
+        assert!(plateau_action_retries_teacher(PlateauAction::Reduced {
+            old_lr: 0.001,
+            new_lr: 0.0005,
+            loss: 0.50,
+            best: 0.49,
+        }));
+        assert!(plateau_action_retries_teacher(PlateauAction::ScheduledFinal {
+            old_lr: 0.000125,
+            min_lr: 0.0001,
+            loss: 0.53,
+            best: 0.49,
+        }));
+        assert!(!plateau_action_retries_teacher(PlateauAction::Improved {
+            old_best: 0.50,
+            new_best: 0.49,
+        }));
+        assert!(!plateau_action_retries_teacher(PlateauAction::StopAfterFinal { loss: 0.54 }));
     }
 
     #[test]
