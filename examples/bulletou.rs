@@ -50,13 +50,14 @@ Usage:
 
 use std::path::PathBuf;
 
+use bullet_compiler::tensor::TValue;
 use bulletou_lib::{
     game::inputs::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
-    game::outputs::ShogiLayerStackBucket9,
-    nn::optimiser,
+    game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
+    nn::{ExecutionContext, optimiser},
     teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
     trainer::{
@@ -77,7 +78,7 @@ use bulletou_lib::{
         yaneuraou_kppt::{
             bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, unbundle_component_state, KppFormat,
         },
-        ValueTrainerBuilder,
+        ValueTrainer, ValueTrainerBuilder,
     },
 };
 use clap::{Parser, ValueEnum};
@@ -1199,6 +1200,26 @@ struct Args {
     #[arg(long)]
     arch: Option<NnueArch>,
 
+    /// Scale multiplier for nnue-pytorch-compatible initialisation used by
+    /// SFNN / LayerStack networks. The actual bound is
+    /// `scale * sqrt(1 / fan_in)`. Values below 1.0 make the initial
+    /// activations smaller and help diagnose early CReLU saturation.
+    #[arg(long, default_value = "1.0")]
+    nnue_pytorch_init_scale: f32,
+
+    /// Dump SFNN / LayerStack activation saturation statistics on the
+    /// held-out `--test-teacher` positions at startup and after each save.
+    /// Currently supported for SFNN eval types only.
+    #[arg(long)]
+    dump_activation_stats: bool,
+
+    /// Number of `--test-teacher` positions used for
+    /// `--dump-activation-stats`. This is intentionally independent of
+    /// `--test-positions` because the CPU-side diagnostic is heavier than
+    /// normal GPU validation.
+    #[arg(long, default_value = "1024")]
+    activation_stats_positions: usize,
+
     /// Held-out test set (.hcpe only) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each save event (= every `--save-rate` superbatches): random-
@@ -1760,6 +1781,24 @@ fn main() {
             }
         }
     }
+    if !(args.nnue_pytorch_init_scale.is_finite() && args.nnue_pytorch_init_scale > 0.0) {
+        eprintln!("error: --nnue-pytorch-init-scale must be finite and > 0.");
+        std::process::exit(2);
+    }
+    if args.nnue_pytorch_init_scale != 1.0 && !args.eval_type().uses_layerstack() {
+        eprintln!("error: --nnue-pytorch-init-scale currently applies to SFNN / LayerStack eval types only.");
+        std::process::exit(2);
+    }
+    if args.dump_activation_stats {
+        if !args.eval_type().uses_layerstack() {
+            eprintln!("error: --dump-activation-stats currently supports SFNN / LayerStack eval types only.");
+            std::process::exit(2);
+        }
+        if args.activation_stats_positions == 0 {
+            eprintln!("error: --activation-stats-positions must be > 0.");
+            std::process::exit(2);
+        }
+    }
     // `step` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
     // `plateau` reduces `--lr` multiplicatively down to `--lr-min`.
     // `--lr-min` must be > 0 for step / plateau. For cos, 0 is fine but
@@ -1910,6 +1949,7 @@ fn resume_signature(args: &Args) -> String {
         format!("scale={}", args.scale),
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
+        format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -3269,6 +3309,268 @@ impl TestPositionsCache {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SfnnActivationShape {
+    ft_size: usize,
+    l1_hidden: usize,
+    l1_out: usize,
+    l2_in: usize,
+    l2_size: usize,
+    num_stacks: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RunningActivationStats {
+    count: usize,
+    zero: usize,
+    maxed: usize,
+    sum: f64,
+    sum_sq: f64,
+    min: f32,
+    max: f32,
+}
+
+impl Default for RunningActivationStats {
+    fn default() -> Self {
+        Self { count: 0, zero: 0, maxed: 0, sum: 0.0, sum_sq: 0.0, min: f32::INFINITY, max: f32::NEG_INFINITY }
+    }
+}
+
+impl RunningActivationStats {
+    fn observe(&mut self, value: f32) {
+        const EPS: f32 = 1.0e-6;
+        self.count += 1;
+        if value <= EPS {
+            self.zero += 1;
+        }
+        if value >= 1.0 - EPS {
+            self.maxed += 1;
+        }
+        self.sum += f64::from(value);
+        self.sum_sq += f64::from(value) * f64::from(value);
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+
+    fn mean(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.sum / self.count as f64 }
+    }
+
+    fn variance(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            let mean = self.mean();
+            (self.sum_sq / self.count as f64 - mean * mean).max(0.0)
+        }
+    }
+
+    fn stddev(&self) -> f64 {
+        self.variance().sqrt()
+    }
+
+    fn zero_ratio(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.zero as f64 / self.count as f64 }
+    }
+
+    fn max_ratio(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.maxed as f64 / self.count as f64 }
+    }
+}
+
+struct LayerActivationStats {
+    label: &'static str,
+    all: RunningActivationStats,
+    by_neuron: Vec<RunningActivationStats>,
+}
+
+impl LayerActivationStats {
+    fn new(label: &'static str, neurons: usize) -> Self {
+        Self { label, all: RunningActivationStats::default(), by_neuron: vec![RunningActivationStats::default(); neurons] }
+    }
+
+    fn observe(&mut self, neuron: usize, value: f32) {
+        self.all.observe(value);
+        self.by_neuron[neuron].observe(value);
+    }
+
+    fn print(&self) {
+        let flat = self.by_neuron.iter().filter(|s| s.count > 0 && s.variance() < 1.0e-10).count();
+        let max_stuck = self.by_neuron.iter().filter(|s| s.count > 0 && s.max_ratio() > 0.999).count();
+        let zero_stuck = self.by_neuron.iter().filter(|s| s.count > 0 && s.zero_ratio() > 0.999).count();
+        eprintln!(
+            "    {:<16} values={} mean={:.6} std={:.6} min={:.6} max={:.6} zero={:.3}% maxclip={:.3}% flat_neurons={} zero_stuck={} max_stuck={}",
+            self.label,
+            self.all.count,
+            self.all.mean(),
+            self.all.stddev(),
+            self.all.min,
+            self.all.max,
+            self.all.zero_ratio() * 100.0,
+            self.all.max_ratio() * 100.0,
+            flat,
+            zero_stuck,
+            max_stuck,
+        );
+    }
+}
+
+fn model_weight_f32<Opt, I>(
+    trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>,
+    id: &str,
+) -> Option<Vec<f32>>
+where
+    Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
+    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue>,
+{
+    match trainer.optimiser.model.get_weights(id) {
+        Some(TValue::F32(values)) => Some(values),
+        Some(_) => {
+            eprintln!("  WARN: activation stats skipped: weight `{id}` is not f32");
+            None
+        }
+        None => {
+            eprintln!("  WARN: activation stats skipped: missing weight `{id}`");
+            None
+        }
+    }
+}
+
+fn affine_sparse(
+    weights: &[f32],
+    bias: &[f32],
+    rows: usize,
+    active: &[usize],
+    out: &mut [f32],
+) {
+    out.copy_from_slice(&bias[..rows]);
+    for &feature in active {
+        let base = feature * rows;
+        for row in 0..rows {
+            out[row] += weights[base + row];
+        }
+    }
+}
+
+fn affine_stacked_selected(
+    weights: &[f32],
+    bias: &[f32],
+    input: &[f32],
+    output_size_per_bucket: usize,
+    buckets: usize,
+    bucket: usize,
+    out: &mut [f32],
+) {
+    let rows = output_size_per_bucket * buckets;
+    let row_base = bucket * output_size_per_bucket;
+    out.copy_from_slice(&bias[row_base..row_base + output_size_per_bucket]);
+    for (input_idx, &x) in input.iter().enumerate() {
+        if x == 0.0 {
+            continue;
+        }
+        let base = input_idx * rows + row_base;
+        for row in 0..output_size_per_bucket {
+            out[row] += weights[base + row] * x;
+        }
+    }
+}
+
+fn observe_crelu(layer: &mut LayerActivationStats, values: &mut [f32]) {
+    for (idx, value) in values.iter_mut().enumerate() {
+        *value = value.clamp(0.0, 1.0);
+        layer.observe(idx, *value);
+    }
+}
+
+fn pairwise_mul_scaled(input: &[f32], output: &mut [f32]) {
+    let half = input.len() / 2;
+    debug_assert_eq!(output.len(), half);
+    for idx in 0..half {
+        output[idx] = input[idx] * input[idx + half] * (127.0 / 128.0);
+    }
+}
+
+fn dump_sfnn_activation_stats<Opt, I>(
+    args: &Args,
+    trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>,
+    input: I,
+    bucket_impl: ShogiLayerStackBucket9,
+    cache: &TestPositionsCache,
+    shape: SfnnActivationShape,
+)
+where
+    Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
+    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
+{
+    let sample_size = cache.positions.len().min(args.activation_stats_positions);
+    if sample_size == 0 {
+        return;
+    }
+
+    let Some(l0w) = model_weight_f32(trainer, "l0w") else { return };
+    let Some(l0b) = model_weight_f32(trainer, "l0b") else { return };
+    let Some(l1w) = model_weight_f32(trainer, "l1w") else { return };
+    let Some(l1b) = model_weight_f32(trainer, "l1b") else { return };
+    let Some(l2w) = model_weight_f32(trainer, "l2w") else { return };
+    let Some(l2b) = model_weight_f32(trainer, "l2b") else { return };
+
+    let mut l0_stats = LayerActivationStats::new("l0.crelu", shape.ft_size);
+    let mut l1_stats = LayerActivationStats::new("l1.to_l2.crelu", shape.l2_in);
+    let mut l2_stats = LayerActivationStats::new("l2.crelu", shape.l2_size);
+
+    let mut stm_active = Vec::with_capacity(input.max_active());
+    let mut ntm_active = Vec::with_capacity(input.max_active());
+    let mut stm_l0 = vec![0.0; shape.ft_size];
+    let mut ntm_l0 = vec![0.0; shape.ft_size];
+    let mut stm_pair = vec![0.0; shape.ft_size / 2];
+    let mut ntm_pair = vec![0.0; shape.ft_size / 2];
+    let mut combined = vec![0.0; shape.ft_size];
+    let mut l1_out = vec![0.0; shape.l1_out];
+    let mut l2_input = vec![0.0; shape.l2_in];
+    let mut l2_out = vec![0.0; shape.l2_size];
+
+    for pos in cache.positions.iter().take(sample_size) {
+        stm_active.clear();
+        ntm_active.clear();
+        input.map_features_split(pos, |stm, ntm| {
+            if let Some(idx) = stm {
+                stm_active.push(idx);
+            }
+            if let Some(idx) = ntm {
+                ntm_active.push(idx);
+            }
+        });
+
+        affine_sparse(&l0w, &l0b, shape.ft_size, &stm_active, &mut stm_l0);
+        affine_sparse(&l0w, &l0b, shape.ft_size, &ntm_active, &mut ntm_l0);
+        observe_crelu(&mut l0_stats, &mut stm_l0);
+        observe_crelu(&mut l0_stats, &mut ntm_l0);
+
+        pairwise_mul_scaled(&stm_l0, &mut stm_pair);
+        pairwise_mul_scaled(&ntm_l0, &mut ntm_pair);
+        combined[..shape.ft_size / 2].copy_from_slice(&stm_pair);
+        combined[shape.ft_size / 2..].copy_from_slice(&ntm_pair);
+
+        let bucket = bucket_impl.bucket(pos) as usize;
+        affine_stacked_selected(&l1w, &l1b, &combined, shape.l1_out, shape.num_stacks, bucket, &mut l1_out);
+
+        for idx in 0..shape.l1_hidden {
+            let x = l1_out[idx];
+            l2_input[idx] = x.abs().powi(2) * (127.0 / 128.0);
+            l2_input[shape.l1_hidden + idx] = x;
+        }
+        observe_crelu(&mut l1_stats, &mut l2_input);
+
+        affine_stacked_selected(&l2w, &l2b, &l2_input, shape.l2_size, shape.num_stacks, bucket, &mut l2_out);
+        observe_crelu(&mut l2_stats, &mut l2_out);
+    }
+
+    eprintln!("  activation stats: sample={} / test_positions={}", sample_size, cache.positions.len());
+    l0_stats.print();
+    l1_stats.print();
+    l2_stats.print();
+}
+
 /// Run validation on the cached test positions and produce per-save
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
@@ -3303,6 +3605,18 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: V
 /// `convert_save_dir_to_nnue_layout`.
 macro_rules! run_training_inline_nnue {
     ($args:expr, $trainer:expr) => {{
+        run_training_inline_nnue!(@impl none, $args, $trainer);
+    }};
+    ($args:expr, $trainer:expr, $activation_stats:expr) => {{
+        run_training_inline_nnue!(@impl some($activation_stats), $args, $trainer);
+    }};
+    (@dump none, $trainer:ident, $cache:ident) => {{
+        let _ = $cache;
+    }};
+    (@dump some($activation_stats:expr), $trainer:ident, $cache:ident) => {{
+        $activation_stats(&*$trainer, $cache);
+    }};
+    (@impl $stats_mode:ident $(($activation_stats:expr))?, $args:expr, $trainer:expr) => {{
         let args: &Args = $args;
         let trainer = $trainer;
 
@@ -3524,6 +3838,13 @@ macro_rules! run_training_inline_nnue {
         if matches!(args.lr_schedule, LrScheduleKind::Plateau) && test_cache.is_none() {
             eprintln!("error: --lr-schedule plateau requires a readable --test-teacher.");
             std::process::exit(2);
+        }
+        if args.dump_activation_stats {
+            if let Some(cache) = test_cache.as_ref() {
+                run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
+            } else {
+                eprintln!("  WARN: --dump-activation-stats requires a readable --test-teacher; activation stats disabled");
+            }
         }
 
         // Per-save incremental finalize: rename `<net_id>-<sb>` →
@@ -3840,6 +4161,11 @@ macro_rules! run_training_inline_nnue {
                     let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
                     run_one_test_pass(cache, args, outputs)
                 });
+                if args.dump_activation_stats {
+                    if let Some(cache) = test_cache.as_ref() {
+                        run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
+                    }
+                }
                 cb_ctx.lr_override = lr_for_chunk;
 
                 let plateau_action = plateau_state.as_mut().map(|state| {
@@ -4015,6 +4341,11 @@ macro_rules! run_training_inline_nnue {
                 let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
                 run_one_test_pass(cache, args, outputs)
             });
+            if args.dump_activation_stats {
+                if let Some(cache) = test_cache.as_ref() {
+                    run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
+                }
+            }
             let idx = cb_next_idx.get();
             match finalize_one_nnue_dir(
                 &output_dir_buf,
@@ -4632,6 +4963,9 @@ where
         num_stacks,
         layerstack.cli_name()
     );
+    if args.nnue_pytorch_init_scale != 1.0 {
+        eprintln!("  nnue-pytorch init scale = {}", args.nnue_pytorch_init_scale);
+    }
 
     let output_dir = args.output_dir();
     let resume_state_bin = find_latest_state_bin(args, &output_dir);
@@ -4687,7 +5021,7 @@ where
 
     let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
         let l0 = builder.new_affine("l0", input_size, ft_size);
-        l0.init_nnue_pytorch_feature_transformer(input_size);
+        l0.init_nnue_pytorch_feature_transformer_scaled(input_size, args.nnue_pytorch_init_scale);
 
         // L1: yaneuraou's SFNN stores one independent `fc_0` per LayerStack.
         // Do not add a shared factorised term here; sharing the first FC layer
@@ -4695,9 +5029,24 @@ where
         // problem even though it can be folded at save time.
         // Match nnue-pytorch's StackedLinear initialisation: initialise bucket
         // 0 and copy it to every bucket. The output bias is zero-initialised.
-        let l1 = builder.new_stacked_affine_nnue_pytorch("l1", ft_size, l1_out, num_stacks, false);
-        let l2 = builder.new_stacked_affine_nnue_pytorch("l2", l2_in, l2_size, num_stacks, false);
-        let l3 = builder.new_stacked_affine_nnue_pytorch("l3", l2_size, 1, num_stacks, true);
+        let l1 = builder.new_stacked_affine_nnue_pytorch_scaled(
+            "l1",
+            ft_size,
+            l1_out,
+            num_stacks,
+            false,
+            args.nnue_pytorch_init_scale,
+        );
+        let l2 = builder.new_stacked_affine_nnue_pytorch_scaled(
+            "l2",
+            l2_in,
+            l2_size,
+            num_stacks,
+            false,
+            args.nnue_pytorch_init_scale,
+        );
+        let l3 =
+            builder.new_stacked_affine_nnue_pytorch_scaled("l3", l2_size, 1, num_stacks, true, args.nnue_pytorch_init_scale);
 
         // Per-perspective FT → CReLU → pairwise-mul → concat. After the
         // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it
@@ -4733,7 +5082,17 @@ where
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
     }
 
-    run_training_inline_nnue!(args, &mut trainer);
+    let activation_shape = SfnnActivationShape {
+        ft_size,
+        l1_hidden,
+        l1_out,
+        l2_in,
+        l2_size,
+        num_stacks,
+    };
+    run_training_inline_nnue!(args, &mut trainer, |trainer, cache| {
+        dump_sfnn_activation_stats(args, trainer, input, bucket_impl, cache, activation_shape);
+    });
 
     let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
 

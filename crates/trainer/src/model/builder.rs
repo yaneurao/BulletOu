@@ -170,8 +170,20 @@ impl ModelBuilder {
         buckets: usize,
         zero_bias: bool,
     ) -> Affine<'_> {
+        self.new_stacked_affine_nnue_pytorch_scaled(id, input_size, output_size_per_bucket, buckets, zero_bias, 1.0)
+    }
+
+    pub fn new_stacked_affine_nnue_pytorch_scaled(
+        &self,
+        id: &str,
+        input_size: usize,
+        output_size_per_bucket: usize,
+        buckets: usize,
+        zero_bias: bool,
+        init_scale: f32,
+    ) -> Affine<'_> {
         let output_size = output_size_per_bucket * buckets;
-        let bound = nnue_pytorch_linear_bound(input_size);
+        let bound = nnue_pytorch_linear_bound(input_size, init_scale);
         let weights = repeat_bucket0_columns(
             rng::vec_f32(input_size * output_size_per_bucket, 0.0, bound, false),
             input_size,
@@ -301,8 +313,10 @@ impl ModelBuilder {
     }
 }
 
-fn nnue_pytorch_linear_bound(fan_in: usize) -> f32 {
-    (1.0 / fan_in as f32).sqrt()
+fn nnue_pytorch_linear_bound(fan_in: usize, init_scale: f32) -> f32 {
+    assert!(fan_in > 0, "fan_in must be positive");
+    assert!(init_scale.is_finite() && init_scale > 0.0, "init_scale must be finite and positive");
+    init_scale * (1.0 / fan_in as f32).sqrt()
 }
 
 fn repeat_bucket0_columns(
@@ -345,7 +359,7 @@ fn repeat_bucket0_rows(bucket0: Vec<f32>, output_size_per_bucket: usize, buckets
 
 #[cfg(test)]
 mod tests {
-    use super::{repeat_bucket0_columns, repeat_bucket0_rows};
+    use super::{nnue_pytorch_linear_bound, repeat_bucket0_columns, repeat_bucket0_rows};
 
     #[test]
     fn repeat_bucket0_columns_keeps_column_major_layout() {
@@ -366,6 +380,15 @@ mod tests {
 
         assert_eq!(values, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
     }
+
+    #[test]
+    fn nnue_pytorch_linear_bound_respects_scale() {
+        let base = nnue_pytorch_linear_bound(64, 1.0);
+        let scaled = nnue_pytorch_linear_bound(64, 0.25);
+
+        assert!((base - 0.125).abs() < f32::EPSILON);
+        assert!((scaled - 0.03125).abs() < f32::EPSILON);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -385,7 +408,11 @@ impl<'a> Affine<'a> {
     }
 
     pub fn init_nnue_pytorch_feature_transformer(&self, fan_in: usize) {
-        let bound = nnue_pytorch_linear_bound(fan_in);
+        self.init_nnue_pytorch_feature_transformer_scaled(fan_in, 1.0);
+    }
+
+    pub fn init_nnue_pytorch_feature_transformer_scaled(&self, fan_in: usize, init_scale: f32) {
+        let bound = nnue_pytorch_linear_bound(fan_in, init_scale);
         let init = InitSettings::Uniform { mean: 0.0, stdev: bound };
         let mut weights_init = self.weights.builder.init();
         *weights_init.get_mut(&self.weights.node).unwrap() = init.clone();
