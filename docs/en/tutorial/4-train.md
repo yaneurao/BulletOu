@@ -64,7 +64,7 @@ If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE
 
 The difference from the rest of the NNUE family is that the network uses 9 sub-networks selected per position. The `k3k3` suffix in `--arch` selects the YaneuraOu-compatible LayerStack scheme; see [§9 LayerStack](9-layerstack.md). The full architecture, quantisation, and `nn.bin` layout spec lives in [the SFNN-1536 reference](../shogi/sfnn-1536.md).
 
-For SFNN / LayerStack experiments, `--sfnn-ste-crelu` enables an opt-in mitigation for "twin neurons" caused by saturated CReLU activations. The forward value is identical to normal CReLU, but the backward pass lets gradients pass through clipped regions. Because this changes training dynamics and is part of the resume signature, use a separate `--tag` when comparing runs.
+For SFNN / LayerStack experiments, `--sfnn-ste-crelu` enables an opt-in mitigation for "twin neurons" caused by saturated CReLU activations right after the feature transformer. The forward value is identical to normal CReLU, but the FT CReLU backward pass lets gradients pass through clipped regions. Because this changes training dynamics and is part of the resume signature, use a separate `--tag` when comparing runs.
 
 ```bash
 ./target/release/examples/bulletou \

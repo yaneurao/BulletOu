@@ -65,7 +65,7 @@ Practical guidance:
 
 ## 9.5 STE CReLU for Twin-Neuron Mitigation
 
-For large-input LayerStack / SFNN evals, CReLU activations can saturate at 0 or 1 early in training. If several neurons become saturated in the same way, they can behave like near-duplicates from the next layer's point of view. `--sfnn-ste-crelu` is an experimental opt-in mode to mitigate that.
+For large-input LayerStack / SFNN evals, the CReLU activation right after the feature transformer can saturate at 0 or 1 early in training. If several neurons become saturated in the same way, they can behave like near-duplicates from the next layer's point of view. `--sfnn-ste-crelu` is an experimental opt-in mode to mitigate that.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -75,7 +75,7 @@ For large-input LayerStack / SFNN evals, CReLU activations can saturate at 0 or 
     --sfnn-ste-crelu
 ```
 
-This changes **training only**. The forward value is still normal CReLU, so the exported `nn.bin` inference format does not change. The difference is the backward pass: gradients pass through clipped activations. The option is for SFNN / LayerStack evals (`SFNN_*`) only, not standard NNUE eval-types.
+This changes **training only**. The forward value is still normal CReLU, so the exported `nn.bin` inference format does not change. The difference is the backward pass of the feature-transformer CReLU: gradients pass through clipped FT activations. The later CReLU activations after L1 and L2 stay unchanged. The option is for SFNN / LayerStack evals (`SFNN_*`) only, not standard NNUE eval-types.
 
 To inspect saturation, combine it with activation statistics:
 

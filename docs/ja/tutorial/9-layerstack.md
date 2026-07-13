@@ -65,7 +65,7 @@ LayerStack は 9 倍のサブネット重みを持つため、学習も推論も
 
 ## 9.5 双子ニューロン対策としての STE CReLU
 
-LayerStack / SFNN のように入力特徴量が多い評価関数では、初期段階で CReLU が 0 または 1 に張り付くと、複数のニューロンがほぼ同じ出力になり、後段から見て 1 つ分のニューロンのように振る舞うことがある。これを避ける実験用オプションとして `--sfnn-ste-crelu` がある。
+LayerStack / SFNN のように入力特徴量が多い評価関数では、feature transformer 直後の CReLU が初期段階で 0 または 1 に張り付くと、複数のニューロンがほぼ同じ出力になり、後段から見て 1 つ分のニューロンのように振る舞うことがある。これを避ける実験用オプションとして `--sfnn-ste-crelu` がある。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -75,7 +75,7 @@ LayerStack / SFNN のように入力特徴量が多い評価関数では、初�
     --sfnn-ste-crelu
 ```
 
-この指定は **学習時だけ** の挙動を変える。forward の評価値は通常の CReLU と同じなので、出力される `nn.bin` の推論形式は変わらない。違うのは backward で、クリップされたニューロンにも勾配を通す点。標準 NNUE には適用されず、SFNN / LayerStack 系 (`SFNN_*`) 専用。
+この指定は **学習時だけ** の挙動を変える。forward の評価値は通常の CReLU と同じなので、出力される `nn.bin` の推論形式は変わらない。違うのは feature transformer 直後の CReLU の backward で、クリップされた FT ニューロンにも勾配を通す点。L1後段やL2後段の CReLU は通常通りに扱う。標準 NNUE には適用されず、SFNN / LayerStack 系 (`SFNN_*`) 専用。
 
 飽和状況を見たい場合は、以下も併用する:
 
