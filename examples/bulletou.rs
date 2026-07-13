@@ -4687,15 +4687,17 @@ where
 
     let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
         let l0 = builder.new_affine("l0", input_size, ft_size);
-        l0.init_with_effective_input_size(32);
+        l0.init_nnue_pytorch_feature_transformer(input_size);
 
         // L1: yaneuraou's SFNN stores one independent `fc_0` per LayerStack.
         // Do not add a shared factorised term here; sharing the first FC layer
         // couples gradients between buckets and changes the optimisation
         // problem even though it can be folded at save time.
-        let l1 = builder.new_affine("l1", ft_size, num_stacks * l1_out);
-        let l2 = builder.new_affine("l2", l2_in, num_stacks * l2_size);
-        let l3 = builder.new_affine("l3", l2_size, num_stacks);
+        // Match nnue-pytorch's StackedLinear initialisation: initialise bucket
+        // 0 and copy it to every bucket. The output bias is zero-initialised.
+        let l1 = builder.new_stacked_affine_nnue_pytorch("l1", ft_size, l1_out, num_stacks, false);
+        let l2 = builder.new_stacked_affine_nnue_pytorch("l2", l2_in, l2_size, num_stacks, false);
+        let l3 = builder.new_stacked_affine_nnue_pytorch("l3", l2_size, 1, num_stacks, true);
 
         // Per-perspective FT → CReLU → pairwise-mul → concat. After the
         // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it

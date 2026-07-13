@@ -2234,26 +2234,20 @@ fn main() {
             builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
                 // L0 (Feature Transformer)
                 let l0 = builder.new_affine("l0", input_size, ft_out_c);
-                l0.init_with_effective_input_size(32);
+                l0.init_nnue_pytorch_feature_transformer(input_size);
 
                 // L1 入力次元: FT 出力 + （HandCount Dense 有効時は +14）
                 let l1_in_total = ft_out_c + hand_count_dense_dims;
 
                 // LayerStack layers:
-                // - l1: bucket-specific delta (zero init). 入力は [FT 出力 (ft_out_c) | HandCount (14)]
-                //   を concat した全体 (l1_in_total) 次元。
-                // - l1f: shared factorized part。FT 出力 (ft_out_c) のみに作用（HandCount は共有しない）
-                let l1 = Affine {
-                    weights: builder.new_weights(
-                        "l1w",
-                        Shape::new(NUM_BUCKETS * l1_out_c, l1_in_total),
-                        InitSettings::Zeroed,
-                    ),
-                    bias: builder.new_weights("l1b", Shape::new(NUM_BUCKETS * l1_out_c, 1), InitSettings::Zeroed),
-                };
+                // - l1/l2/l3: nnue-pytorch の StackedLinear と同じく bucket 0 を初期化して全 bucket へコピー。
+                // - l1f: factorized part はゼロ初期化。
+                // - l3: output bias はゼロ初期化。
+                let l1 = builder.new_stacked_affine_nnue_pytorch("l1", l1_in_total, l1_out_c, NUM_BUCKETS, false);
                 let l1f = builder.new_affine("l1f", ft_out_c, l1_out_c);
-                let l2 = builder.new_affine("l2", l2_in_c, NUM_BUCKETS * l2_out_c);
-                let l3 = builder.new_affine("l3", l2_out_c, NUM_BUCKETS);
+                l1f.init_zeroed();
+                let l2 = builder.new_stacked_affine_nnue_pytorch("l2", l2_in_c, l2_out_c, NUM_BUCKETS, false);
+                let l3 = builder.new_stacked_affine_nnue_pytorch("l3", l2_out_c, 1, NUM_BUCKETS, true);
 
                 // Forward pass
                 let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);

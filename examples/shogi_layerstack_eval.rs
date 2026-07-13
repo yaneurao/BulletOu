@@ -707,13 +707,14 @@ fn main() {
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             // L0 (Feature Transformer)
             let l0 = builder.new_affine("l0", input_size, l0_size);
-            l0.init_with_effective_input_size(32);
+            l0.init_nnue_pytorch_feature_transformer(input_size);
 
             // LayerStack layers
-            let l1 = builder.new_affine("l1", l1_input_dim, NUM_BUCKETS * l1_size);
+            let l1 = builder.new_stacked_affine_nnue_pytorch("l1", l1_input_dim, l1_size, NUM_BUCKETS, false);
             let l1f = builder.new_affine("l1f", l1_input_dim, l1_size);
-            let l2 = builder.new_affine("l2", l2_input, NUM_BUCKETS * l2_size);
-            let l3 = builder.new_affine("l3", l2_size, NUM_BUCKETS);
+            l1f.init_zeroed();
+            let l2 = builder.new_stacked_affine_nnue_pytorch("l2", l2_input, l2_size, NUM_BUCKETS, false);
+            let l3 = builder.new_stacked_affine_nnue_pytorch("l3", l2_size, 1, NUM_BUCKETS, true);
 
             // PSQT shortcut
             let psqt = Affine {

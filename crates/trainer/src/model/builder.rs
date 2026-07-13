@@ -2,27 +2,27 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Add, Div, Mul, Neg, Sub},
     sync::{
-        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
     },
 };
 
 use bullet_compiler::{
     ir::NodeId,
     tensor::{
-        DType, DValue, IRBuilder, Size, TNode, TType, TValue,
         operation::{
-            BroadcastAcrossDimension, CABinary, CABinaryOp, Matmul, MatrixLayout, PadAcrossDimension, PassThrough,
-            Power, ReduceAcrossDimension, Reduction, Select, SliceAcrossDimension, SparseMatmul, Unary, UnaryOp,
             autograd::{
                 Autograd, AutogradOp, CReLU, DiffableFromOutput, DiffableFromOutputOp, FauxQuantise, ReLU, SCReLU,
                 Sigmoid, SoftmaxCrossEntropyLoss,
             },
+            BroadcastAcrossDimension, CABinary, CABinaryOp, Matmul, MatrixLayout, PadAcrossDimension, PassThrough,
+            Power, ReduceAcrossDimension, Reduction, Select, SliceAcrossDimension, SparseMatmul, Unary, UnaryOp,
         },
         transform::{
             autograd::{LowerForward, TakeGradient},
             inline::InlineSubgraphs,
         },
+        DType, DValue, IRBuilder, Size, TNode, TType, TValue,
     },
 };
 use bullet_gpu::{
@@ -31,7 +31,7 @@ use bullet_gpu::{
     runtime::{Device, Gpu},
 };
 
-use crate::model::{Model, Shape, rng};
+use crate::model::{rng, Model, Shape};
 
 /// 重みテンソルの初期化方式。
 ///
@@ -162,6 +162,43 @@ impl ModelBuilder {
         self.new_affine_custom(id, input_size, output_size, 1)
     }
 
+    pub fn new_stacked_affine_nnue_pytorch(
+        &self,
+        id: &str,
+        input_size: usize,
+        output_size_per_bucket: usize,
+        buckets: usize,
+        zero_bias: bool,
+    ) -> Affine<'_> {
+        let output_size = output_size_per_bucket * buckets;
+        let bound = nnue_pytorch_linear_bound(input_size);
+        let weights = repeat_bucket0_columns(
+            rng::vec_f32(input_size * output_size_per_bucket, 0.0, bound, false),
+            input_size,
+            output_size_per_bucket,
+            buckets,
+        );
+        let bias = if zero_bias {
+            vec![0.0; output_size]
+        } else {
+            repeat_bucket0_rows(
+                rng::vec_f32(output_size_per_bucket, 0.0, bound, false),
+                output_size_per_bucket,
+                buckets,
+            )
+        };
+
+        let weights = self.new_weights(
+            &format!("{id}w"),
+            Shape::new(output_size, input_size),
+            InitSettings::Const { values: weights },
+        );
+        let bias =
+            self.new_weights(&format!("{id}b"), Shape::new(output_size, 1), InitSettings::Const { values: bias });
+
+        Affine { weights, bias }
+    }
+
     pub fn new_affine_custom(&self, id: &str, input_size: usize, output_size: usize, bias_cols: usize) -> Affine<'_> {
         let wid = format!("{id}w");
         let init = InitSettings::Normal { mean: 0.0, stdev: (2.0 / (input_size as f32 * bias_cols as f32)).sqrt() };
@@ -264,6 +301,73 @@ impl ModelBuilder {
     }
 }
 
+fn nnue_pytorch_linear_bound(fan_in: usize) -> f32 {
+    (1.0 / fan_in as f32).sqrt()
+}
+
+fn repeat_bucket0_columns(
+    bucket0: Vec<f32>,
+    input_size: usize,
+    output_size_per_bucket: usize,
+    buckets: usize,
+) -> Vec<f32> {
+    assert_eq!(bucket0.len(), input_size * output_size_per_bucket);
+
+    let output_size = output_size_per_bucket * buckets;
+    let mut values = vec![0.0; input_size * output_size];
+
+    for input in 0..input_size {
+        for output in 0..output_size_per_bucket {
+            let value = bucket0[input * output_size_per_bucket + output];
+            for bucket in 0..buckets {
+                values[input * output_size + bucket * output_size_per_bucket + output] = value;
+            }
+        }
+    }
+
+    values
+}
+
+fn repeat_bucket0_rows(bucket0: Vec<f32>, output_size_per_bucket: usize, buckets: usize) -> Vec<f32> {
+    assert_eq!(bucket0.len(), output_size_per_bucket);
+
+    let mut values = vec![0.0; output_size_per_bucket * buckets];
+
+    for output in 0..output_size_per_bucket {
+        let value = bucket0[output];
+        for bucket in 0..buckets {
+            values[bucket * output_size_per_bucket + output] = value;
+        }
+    }
+
+    values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{repeat_bucket0_columns, repeat_bucket0_rows};
+
+    #[test]
+    fn repeat_bucket0_columns_keeps_column_major_layout() {
+        let values = repeat_bucket0_columns(vec![1.0, 2.0, 3.0, 4.0], 2, 2, 3);
+
+        assert_eq!(
+            values,
+            vec![
+                1.0, 2.0, 1.0, 2.0, 1.0, 2.0, //
+                3.0, 4.0, 3.0, 4.0, 3.0, 4.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn repeat_bucket0_rows_copies_bucket0_bias() {
+        let values = repeat_bucket0_rows(vec![1.0, 2.0], 2, 3);
+
+        assert_eq!(values, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Affine<'a> {
     pub weights: ModelNode<'a>,
@@ -278,6 +382,20 @@ impl<'a> Affine<'a> {
     pub fn init_with_effective_input_size(&self, size: usize) {
         *self.weights.builder.init().get_mut(&self.weights.node).unwrap() =
             InitSettings::Normal { mean: 0.0, stdev: (2.0 / size as f32).sqrt() };
+    }
+
+    pub fn init_nnue_pytorch_feature_transformer(&self, fan_in: usize) {
+        let bound = nnue_pytorch_linear_bound(fan_in);
+        let init = InitSettings::Uniform { mean: 0.0, stdev: bound };
+        let mut weights_init = self.weights.builder.init();
+        *weights_init.get_mut(&self.weights.node).unwrap() = init.clone();
+        *weights_init.get_mut(&self.bias.node).unwrap() = init;
+    }
+
+    pub fn init_zeroed(&self) {
+        let mut weights_init = self.weights.builder.init();
+        *weights_init.get_mut(&self.weights.node).unwrap() = InitSettings::Zeroed;
+        *weights_init.get_mut(&self.bias.node).unwrap() = InitSettings::Zeroed;
     }
 }
 
