@@ -56,7 +56,7 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::ShogiLayerStackBucket9,
-    nn::{optimiser, Affine, InitSettings, Shape},
+    nn::optimiser,
     teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
     trainer::{
@@ -4689,15 +4689,11 @@ where
         let l0 = builder.new_affine("l0", input_size, ft_size);
         l0.init_with_effective_input_size(32);
 
-        // L1: bucket-specific weights (zero-init) + shared factorised
-        // counterpart `l1f`. Bullet's LayerStacks pattern keeps training
-        // stable in the early epochs because `l1` starts at zero — all
-        // bucket outputs are equal to `l1f` until per-bucket signal develops.
-        let l1 = Affine {
-            weights: builder.new_weights("l1w", Shape::new(num_stacks * l1_out, ft_size), InitSettings::Zeroed),
-            bias: builder.new_weights("l1b", Shape::new(num_stacks * l1_out, 1), InitSettings::Zeroed),
-        };
-        let l1f = builder.new_affine("l1f", ft_size, l1_out);
+        // L1: yaneuraou's SFNN stores one independent `fc_0` per LayerStack.
+        // Do not add a shared factorised term here; sharing the first FC layer
+        // couples gradients between buckets and changes the optimisation
+        // problem even though it can be folded at save time.
+        let l1 = builder.new_affine("l1", ft_size, num_stacks * l1_out);
         let l2 = builder.new_affine("l2", l2_in, num_stacks * l2_size);
         let l3 = builder.new_affine("l3", l2_size, num_stacks);
 
@@ -4709,9 +4705,7 @@ where
         let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
         let combined = stm.concat(ntm);
 
-        // L1 = bucket-selected + shared. The shared term is added to all
-        // buckets so the model can learn before per-bucket signal accumulates.
-        let l1_out_t = l1.forward(combined).select(output_buckets) + l1f.forward(combined);
+        let l1_out_t = l1.forward(combined).select(output_buckets);
 
         // Split the L1 output: rows 0..l1_effective are the hidden, the
         // last row is the PSQT shortcut neuron that bypasses everything

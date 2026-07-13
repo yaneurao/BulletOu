@@ -266,19 +266,15 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
         formats.push(SavedFormat::custom(NETWORK_HASH_SFNN.to_le_bytes().to_vec()));
 
         // fc_0: bias i32 × l1_out, weight i8 × l1_out × pad32(ft_size).
-        // bullet 側は per-bucket `l1` + shared `l1f` の合成なので、save 時に
-        // (l1_bucket_k + l1f) を計算してから量子化する。
         let stack = k;
         formats.push(
             SavedFormat::empty()
                 .transform(move |graph, _| {
                     let l1b = read_f32(graph, "l1b");
-                    let l1fb = read_f32(graph, "l1fb");
                     let bias_scale = (QA as i32 * QB as i32) as f32;
                     let mut bytes = Vec::with_capacity(l1_out * 4);
                     for o in 0..l1_out {
-                        let merged = l1b[stack * l1_out + o] + l1fb[o];
-                        bytes.extend_from_slice(&quantise_i32(merged, bias_scale).to_le_bytes());
+                        bytes.extend_from_slice(&quantise_i32(l1b[stack * l1_out + o], bias_scale).to_le_bytes());
                     }
                     bytes_to_f32_passthrough(&bytes)
                 })
@@ -289,16 +285,13 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
             SavedFormat::empty()
                 .transform(move |graph, _| {
                     let l1w = read_f32(graph, "l1w"); // shape (ns*l1_out, ft_size), index `feat*ns*l1_out + stack*l1_out + o`
-                    let l1fw = read_f32(graph, "l1fw"); // shape (l1_out, ft_size), index `feat*l1_out + o`
                     let pad_in = pad32(ft_size);
                     let w_scale = QB as f32;
                     let mut bytes = Vec::with_capacity(l1_out * pad_in);
                     for o in 0..l1_out {
                         for in_ in 0..pad_in {
                             let q = if in_ < ft_size {
-                                let m = l1w[in_ * (num_stacks * l1_out) + stack * l1_out + o]
-                                    + l1fw[in_ * l1_out + o];
-                                quantise_i8(m, w_scale)
+                                quantise_i8(l1w[in_ * (num_stacks * l1_out) + stack * l1_out + o], w_scale)
                             } else {
                                 0
                             };
