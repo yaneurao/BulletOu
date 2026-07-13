@@ -64,6 +64,16 @@ If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE
 
 The difference from the rest of the NNUE family is that the network uses 9 sub-networks selected per position. The `k3k3` suffix in `--arch` selects the YaneuraOu-compatible LayerStack scheme; see [§9 LayerStack](9-layerstack.md). The full architecture, quantisation, and `nn.bin` layout spec lives in [the SFNN-1536 reference](../shogi/sfnn-1536.md).
 
+For SFNN / LayerStack experiments, `--sfnn-ste-crelu` enables an opt-in mitigation for "twin neurons" caused by saturated CReLU activations. The forward value is identical to normal CReLU, but the backward pass lets gradients pass through clipped regions. Because this changes training dynamics and is part of the resume signature, use a separate `--tag` when comparing runs.
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
+    --teacher teachers/ \
+    --sfnn-ste-crelu
+```
+
 ## 4.5 Training a KPPT eval
 
 For KPPT-family eval types the architecture is fixed and `--arch` is ignored:

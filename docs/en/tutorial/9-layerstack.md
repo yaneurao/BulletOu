@@ -63,7 +63,34 @@ Practical guidance:
 - **Need a YaneuraOu SFNNwoP1536-compatible eval** → use `SFNN_HALFKA2HM` + LayerStack.
 - **Otherwise** → a single-MLP NNUE eval-type is enough.
 
-## 9.5 Related
+## 9.5 STE CReLU for Twin-Neuron Mitigation
+
+For large-input LayerStack / SFNN evals, CReLU activations can saturate at 0 or 1 early in training. If several neurons become saturated in the same way, they can behave like near-duplicates from the next layer's point of view. `--sfnn-ste-crelu` is an experimental opt-in mode to mitigate that.
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
+    --teacher teachers/ \
+    --sfnn-ste-crelu
+```
+
+This changes **training only**. The forward value is still normal CReLU, so the exported `nn.bin` inference format does not change. The difference is the backward pass: gradients pass through clipped activations. The option is for SFNN / LayerStack evals (`SFNN_*`) only, not standard NNUE eval-types.
+
+To inspect saturation, combine it with activation statistics:
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
+    --teacher teachers/ \
+    --dump-activation-stats \
+    --activation-stats-positions 4096
+```
+
+`--sfnn-ste-crelu` is part of the resume signature, so use separate `--tag` values when comparing ON/OFF runs.
+
+## 9.6 Related
 
 - [SFNN-1536 training reference](../shogi/sfnn-1536.md) — architecture, binary layout, quantisation scales
 - Existing example: `examples/shogi_layerstack.rs` — has additional (experimental) bucket modes beyond k3k3(king3-by-king3) (rshogi-format output, kept parallel to bulletou)

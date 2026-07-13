@@ -63,7 +63,34 @@ LayerStack は 9 倍のサブネット重みを持つため、学習も推論も
 - **やねうら王 SFNNwoP1536 互換の評価関数が欲しい** → SFNN_HALFKA2HM + LayerStack を使う
 - それ以外 → 通常の NNUE 系で十分
 
-## 9.5 関連
+## 9.5 双子ニューロン対策としての STE CReLU
+
+LayerStack / SFNN のように入力特徴量が多い評価関数では、初期段階で CReLU が 0 または 1 に張り付くと、複数のニューロンがほぼ同じ出力になり、後段から見て 1 つ分のニューロンのように振る舞うことがある。これを避ける実験用オプションとして `--sfnn-ste-crelu` がある。
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
+    --teacher teachers/ \
+    --sfnn-ste-crelu
+```
+
+この指定は **学習時だけ** の挙動を変える。forward の評価値は通常の CReLU と同じなので、出力される `nn.bin` の推論形式は変わらない。違うのは backward で、クリップされたニューロンにも勾配を通す点。標準 NNUE には適用されず、SFNN / LayerStack 系 (`SFNN_*`) 専用。
+
+飽和状況を見たい場合は、以下も併用する:
+
+```bash
+./target/release/examples/bulletou \
+    --eval-type SFNN_HALFKA2HM \
+    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
+    --teacher teachers/ \
+    --dump-activation-stats \
+    --activation-stats-positions 4096
+```
+
+`--sfnn-ste-crelu` は resume 判定に含まれるため、ON/OFF を比較するときは `--tag` を分ける。
+
+## 9.6 関連
 
 - [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) — アーキ・binary layout・量子化スケール
 - 既存実装: `examples/shogi_layerstack.rs` — 9 バケット以外の (実験的) bucketing モードあり (rshogi 互換出力、bulletou と並行存続)
