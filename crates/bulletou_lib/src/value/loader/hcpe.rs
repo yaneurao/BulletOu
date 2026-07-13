@@ -42,7 +42,6 @@ use std::time::Instant;
 
 use crate::shogi::PackedSfenValue;
 
-use super::rng::SimpleRand;
 use super::shogipack::{convert_game_result, MiniPosition};
 use super::DataLoader;
 
@@ -79,14 +78,13 @@ pub(crate) fn decode_hcpe_record(rec: &[u8; HCPE_RECORD_SIZE]) -> Option<PackedS
 /// HCPE データローダー
 ///
 /// 単一または複数の `.hcpe` ファイルからレコードを読み出し、PackedSfenValue に変換しつつ
-/// shuffle buffer に貯めて、buffer_size に達したら Fisher-Yates シャッフルして
-/// callback に渡す。
+/// read buffer に貯めて、buffer_size に達したら入力順のまま callback に渡す。
 ///
 /// `filter` で各レコードを採用するかを制御できる (例: `|psv| psv.score().abs() < 32000`)。
 #[derive(Clone)]
 pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     file_paths: Vec<String>,
-    /// shuffle buffer に貯める PackedSfenValue の最大個数
+    /// read buffer に貯める PackedSfenValue の最大個数
     buffer_size: usize,
     filter: T,
     /// HCP → PSV デコードに使う worker スレッド数。`None` のとき
@@ -140,7 +138,7 @@ impl Drop for HcpeLoaderInner {
 impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
     /// 単一ファイルから作成
     ///
-    /// `buffer_size_mb` で shuffle buffer の上限サイズを MB 単位で指定する。
+    /// `buffer_size_mb` で read buffer の上限サイズを MB 単位で指定する。
     /// PackedSfenValue 1 件 = 40 byte なので、buffer_size = `buffer_size_mb * 1024 * 1024 / 40`。
     pub fn new(path: &str, buffer_size_mb: usize, filter: T) -> Self {
         Self::new_concat_multiple(&[path], buffer_size_mb, filter)
@@ -167,7 +165,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
         self
     }
 
-    /// shuffle buffer に貯める PackedSfenValue 件数を直接指定する。
+    /// read buffer に貯める PackedSfenValue 件数を直接指定する。
     ///
     /// `trainer.run` を save chunk ごとに分割して呼ぶ場合、loader がそれより
     /// 大きな chunk を返すと、呼び出し側は必要 batch 数に達した時点で
@@ -241,7 +239,7 @@ where
         // を停止する (HcpeLoaderInner::drop 参照)。
         //
         // スレッド構造:
-        // - producer thread (1 個): ファイル read + 並列 HCP decode + shuffle
+        // - producer thread (1 個): ファイル read + 並列 HCP decode + read buffer fill
         // - 内部 std::thread::scope worker (N 個): producer 内の per-chunk
         //   並列 decode
         // - consumer (= 呼び出し元 thread): map_chunks 内で channel を pump
@@ -308,8 +306,8 @@ where
     T: Fn(&PackedSfenValue) -> bool + Clone + Send + Sync + 'static,
 {
     /// プロデューサスレッド本体。`file_paths` を順次読み、各チャンクを
-    /// `std::thread::scope` で並列デコードしてから shuffle buffer に集約。
-    /// buffer_size に達するごとに shuffle して `tx` に送る。
+    /// `std::thread::scope` で並列デコードしてから read buffer に集約。
+    /// buffer_size に達するごとに入力順のまま `tx` に送る。
     fn produce_buffers(
         file_paths: Vec<String>,
         buffer_size: usize,
@@ -320,8 +318,6 @@ where
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64)>,
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
-        let mut rng = SimpleRand::with_seed();
-
         // 初回 buffer fill 中だけ進捗を stderr に出す。
         let fill_started_at = Instant::now();
         let mut first_fill_in_progress = true;
@@ -457,7 +453,7 @@ where
                             .collect()
                     });
 
-                // 順序保ったまま shuffle buffer に追加。`start_position` の
+                // 順序を保ったまま read buffer に追加。`start_position` の
                 // skip はファイル冒頭の byte-seek で済んでいるので、ここでは
                 // skip 判定不要。
                 for partial in decoded {
@@ -473,7 +469,7 @@ where
                                     / target_records.max(1) as f64;
                                 let _ = write!(
                                     std::io::stderr(),
-                                    "\r  filling shuffle buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
+                                    "\r  filling read buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
                                     buffer.len() as f64 / 1.0e6,
                                     target_records as f64 / 1.0e6,
                                 );
@@ -487,16 +483,12 @@ where
                                 let elapsed = fill_started_at.elapsed();
                                 let _ = writeln!(
                                     std::io::stderr(),
-                                    "\r  shuffle buffer ready: {:.1}M records in {:.1}s ({} decode threads)   ",
+                                    "\r  read buffer ready: {:.1}M records in {:.1}s ({} decode threads)   ",
                                     buffer.len() as f64 / 1.0e6,
                                     elapsed.as_secs_f64(),
                                     n_workers,
                                 );
                                 first_fill_in_progress = false;
-                            }
-                            for j in (1..buffer.len()).rev() {
-                                let k = (rng.rng() as usize) % (j + 1);
-                                buffer.swap(j, k);
                             }
                             let taken = std::mem::replace(
                                 &mut buffer,
@@ -522,14 +514,10 @@ where
                 let elapsed = fill_started_at.elapsed();
                 let _ = writeln!(
                     std::io::stderr(),
-                    "\r  shuffle buffer ready: {:.1}M records in {:.1}s (teacher smaller than buffer)   ",
+                    "\r  read buffer ready: {:.1}M records in {:.1}s (teacher smaller than buffer)   ",
                     buffer.len() as f64 / 1.0e6,
                     elapsed.as_secs_f64(),
                 );
-            }
-            for j in (1..buffer.len()).rev() {
-                let k = (rng.rng() as usize) % (j + 1);
-                buffer.swap(j, k);
             }
             let _ = tx.send((buffer, bytes_read_total));
         }
@@ -763,7 +751,7 @@ mod tests {
     /// teacher (yaneurao's kif20251209-25000a 1.61 GB file with ~45.5M
     /// records) with a callback that NEVER asks to stop (`|_| false`), and
     /// asserts the loader reads the whole file rather than terminating
-    /// after the first shuffle-buffer flush. Buffer is intentionally small
+    /// after the first buffer flush. Buffer is intentionally small
     /// (`buffer_size_mb = 16` ≒ 420k records) so the bug — if reintroduced
     /// — would visibly truncate the count to ~420k instead of ~45.5M.
     ///

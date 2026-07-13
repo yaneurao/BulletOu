@@ -45,14 +45,24 @@ teachers/
 
 > ⚠️ **Important**: shuffle the teacher file **before** handing it to BulletOu.
 
-Bullet's loader uses an **in-memory shuffle buffer (default 256 MB ≒ 6.7M positions for HCPE)** and Fisher-Yates shuffles its contents before slicing into batches. The shuffle is **intra-buffer only** — successive buffers contain disjoint sequential regions of the file, so the loader is really just doing local shuffles over 6.7M-position windows.
+BulletOu does not shuffle teacher positions during training. `--buffer-mb` controls the read buffer size; it is not a shuffle option.
 
-`gensfen` and dlshogi-style generators emit positions **grouped by game** (positions from one game are contiguous), so training on an un-shuffled file produces **periodic loss spikes at every buffer boundary** (≈ every 410 batches with `--batch-size 16384`) as the distribution shifts.
+`gensfen` and dlshogi-style generators usually emit positions **grouped by game** (positions from one game are contiguous). If you train on such files directly, nearby positions from the same game dominate consecutive mini-batches, and loss / plateau decisions become sensitive to local teacher bias.
 
 How to shuffle:
-- **`.hcpe` / `.hcpe3`**: easiest is dlshogi's shuffle script. HCPE records are fixed-length (38 bytes), so a byte-level random permutation is sufficient. Look in dlshogi's `utils/` directory.
-- **`.pack`**: enable the shuffle option in `gensfen` at generation time, or convert to PSV and shuffle that.
-- **Workaround if you only have an un-shuffled file**: raise `--buffer-mb` so the whole file fits in a single buffer. Example: a 1.94 GB `.hcpe` (≈ 51M positions) fits with `--buffer-mb 2048` and stops crossing buffer boundaries. This costs **host RAM** (not GPU memory), so it works as long as you have the headroom.
+- **`.hcpe` / `.psv`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
+- **`.hcpe3` / `.pack`**: these are variable-length game formats, so record-level shuffling is not straightforward. Shuffle at generation time, or convert to a fixed-position format such as `.psv` / `.hcpe` and shuffle that.
+
+Example: shuffle/split an HCPE or PSV folder into 10M-position files:
+
+```bash
+python /path/to/YaneuraOu-ScriptCollection/teacher/shuffle_split_teacher_external.py \
+    src_teacher_folder \
+    dst_teacher_folder \
+    --positions 10000000
+```
+
+Outputs are named like `shuffled-00001.hcpe`, `shuffled-00002.hcpe`, ... . For more than 99,999 output files, increase the width with `--digits 6`.
 
 ### Trying with a small subset first
 

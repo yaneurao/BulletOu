@@ -93,7 +93,7 @@ A healthy training run typically shows:
    - Drops sharply at first, then slowly tapers
    - You should see a visible drop per superbatch consumed
    - No drop after a full superbatch ⇒ `--lr` may be too large, or the teacher is too small for the model
-   - **Periodic loss spikes** (jumping sharply every few hundred batches) almost always mean the teacher file wasn't pre-shuffled. The shuffle buffer crosses a region boundary (default 256MB buffer ≒ every ~410 batches), and the distribution shifts. Fix: see [§3.2 Pre-shuffle the teacher file](3-data.md#pre-shuffle-the-teacher-file)
+   - **Periodic loss spikes** or local loss bias almost always mean the teacher file wasn't pre-shuffled. BulletOu does not shuffle teacher positions during training. Fix: see [§3.2 Pre-shuffle the teacher file](3-data.md#pre-shuffle-the-teacher-file)
 
 2. **`lr` follows the configured schedule**
    - `--lr-schedule step` (default): geometric (= log-linear) decay from `--lr` (lr_max) to `--lr-min` over one epoch (= `--superbatches × sb_size` positions), warm-restarting back to lr_max at each epoch boundary.

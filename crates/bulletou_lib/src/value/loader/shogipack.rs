@@ -17,7 +17,7 @@
 //!
 //! 1. Reader:  .pack ファイルを読み、対局バイト列を切り出す
 //! 2. Expander: 対局 → 個別局面 (`PackedSfenValue`) に展開、フィルタ適用
-//! 3. Shuffle: シャッフルバッファに蓄積し Fisher-Yates シャッフル
+//! 3. Buffer:  read buffer に蓄積し入力順のまま送出
 //! 4. Batch:   batch_size に分割してコールバックへ
 
 use std::fs::File;
@@ -28,8 +28,6 @@ use crate::shogi::packed_sfen::PackedSfenValue;
 use crate::shogi::types::{Color, Hand, Piece, PieceType};
 
 use super::DataLoader;
-use super::rng::SimpleRand;
-
 // =============================================================================
 // Huffman テーブル (YaneuraOu PSfen 形式 / Apery HCP 形式)
 // =============================================================================
@@ -765,7 +763,7 @@ fn expand_game(game: RawGameData) -> Vec<PackedSfenValue> {
 /// .pack ファイルを読み取り PackedSfenValue を供給するデータローダー
 ///
 /// GenSfen の .pack 形式（可変長対局棋譜）を読み込み、各局面を
-/// PackedSfenValue に展開してバッファシャッフル付きで供給する。
+/// PackedSfenValue に展開して、入力順を保ったままバッファ単位で供給する。
 ///
 /// ## 使用例
 ///
@@ -892,7 +890,7 @@ where
 
         // ----- Stage 1: Reader -----
         // ファイル列 → `Vec<(game_header_offset, RawGameData)>` バッチ。
-        // 空 Vec は sweep 終了マーカー (shuffle 段の tail flush 用)。
+        // 空 Vec は sweep 終了マーカー (buffer 段の tail flush 用)。
         // 初回 sweep のみ resume_offset で開始ファイル + 開始 offset を決める。
         let reader_buffer_size = 256;
         let (reader_tx, reader_rx) =
@@ -1010,7 +1008,7 @@ where
         // `(game_offset, RawGameData)` を受けて PSV に expand。最初の game
         // (初回 sweep のみ) は resume_plies 個の ply を skip。各 push 後に
         // `next_after_push = (current_game_offset, ply+1)` を更新し、Vec<PSV>
-        // と共に shuffle 段に送る。
+        // と共に buffer 段に送る。
         let (expand_tx, expand_rx) =
             mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(16);
         let (expand_stop_tx, expand_stop_rx) = mpsc::sync_channel::<bool>(1);
@@ -1084,17 +1082,17 @@ where
             }
         });
 
-        // ----- Stage 3: Shuffle -----
-        // Vec<PSV> + 最新 (offset, plies) を受け、shuffle buffer に蓄積。
-        // buffer_size に達したら shuffle して `(buf, latest_offset, latest_plies)`
+        // ----- Stage 3: Buffer -----
+        // Vec<PSV> + 最新 (offset, plies) を受け、read buffer に蓄積。
+        // buffer_size に達したら入力順のまま `(buf, latest_offset, latest_plies)`
         // を送る。latest は「buffer 蓄積中に最後に受信した値」(= input order
         // の最後の push に対応)。
-        let (shuffle_tx, shuffle_rx) =
+        let (buffer_tx, buffer_rx) =
             mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
-        let (shuffle_stop_tx, shuffle_stop_rx) = mpsc::sync_channel::<bool>(1);
+        let (buffer_stop_tx, buffer_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
-            let mut shuffle_buffer = Vec::with_capacity(buffer_size);
+            let mut read_buffer = Vec::with_capacity(buffer_size);
             let mut latest_attached: (u64, usize) = (0, 0);
 
             'dataloading: while let Ok((positions, next_off, next_plies)) = expand_rx.recv() {
@@ -1103,62 +1101,49 @@ where
                 }
                 let is_sweep_end = positions.is_empty();
                 for entry in positions {
-                    shuffle_buffer.push(entry);
+                    read_buffer.push(entry);
 
-                    if shuffle_buffer.len() >= buffer_size {
-                        shuffle(&mut shuffle_buffer);
-
-                        if shuffle_stop_rx.try_recv().unwrap_or(false)
-                            || shuffle_tx
-                                .send((shuffle_buffer, latest_attached.0, latest_attached.1))
+                    if read_buffer.len() >= buffer_size {
+                        if buffer_stop_rx.try_recv().unwrap_or(false)
+                            || buffer_tx
+                                .send((read_buffer, latest_attached.0, latest_attached.1))
                                 .is_err()
                         {
                             expand_stop_tx.send(true).ok();
                             break 'dataloading;
                         }
 
-                        shuffle_buffer = Vec::with_capacity(buffer_size);
+                        read_buffer = Vec::with_capacity(buffer_size);
                     }
                 }
 
-                if is_sweep_end && !shuffle_buffer.is_empty() {
-                    shuffle(&mut shuffle_buffer);
-
-                    if shuffle_stop_rx.try_recv().unwrap_or(false)
-                        || shuffle_tx
-                            .send((shuffle_buffer, latest_attached.0, latest_attached.1))
+                if is_sweep_end && !read_buffer.is_empty() {
+                    if buffer_stop_rx.try_recv().unwrap_or(false)
+                        || buffer_tx
+                            .send((read_buffer, latest_attached.0, latest_attached.1))
                             .is_err()
                     {
                         expand_stop_tx.send(true).ok();
                         break 'dataloading;
                     }
 
-                    shuffle_buffer = Vec::with_capacity(buffer_size);
+                    read_buffer = Vec::with_capacity(buffer_size);
                 }
             }
         });
 
         // ----- Stage 4: Flush -----
-        // shuffle buffer を `f` に渡し、終了後に consumed_offset/plies を更新。
+        // read buffer を `f` に渡し、終了後に consumed_offset/plies を更新。
         use std::sync::atomic::Ordering;
-        'dataloading: while let Ok((shuffle_buffer, next_off, next_plies)) = shuffle_rx.recv() {
-            let stop = f(&shuffle_buffer);
+        'dataloading: while let Ok((read_buffer, next_off, next_plies)) = buffer_rx.recv() {
+            let stop = f(&read_buffer);
             consumed_offset.store(next_off, Ordering::Release);
             consumed_plies.store(next_plies, Ordering::Release);
             if stop {
-                shuffle_stop_tx.send(true).ok();
+                buffer_stop_tx.send(true).ok();
                 break 'dataloading;
             }
         }
-    }
-}
-
-/// Fisher-Yates シャッフル
-fn shuffle(data: &mut [PackedSfenValue]) {
-    let mut rng = SimpleRand::with_seed();
-    for i in (0..data.len()).rev() {
-        let idx = rng.rng() as usize % (i + 1);
-        data.swap(idx, i);
     }
 }
 

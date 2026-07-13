@@ -56,7 +56,6 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
 
-use super::rng::SimpleRand;
 use super::shogipack::MiniPosition;
 use super::DataLoader;
 
@@ -192,7 +191,7 @@ fn skip_remaining_game<R: Read>(reader: &mut R, move_num: usize) -> std::io::Res
 /// HCPE3 データローダー
 ///
 /// 各 `.hcpe3` ファイルから 1 ゲームずつ読み、moveNum 個の PackedSfenValue に展開して
-/// shuffle buffer に貯める。buffer_size に達したら Fisher-Yates シャッフルして callback に渡す。
+/// read buffer に貯める。buffer_size に達したら入力順のまま callback に渡す。
 ///
 /// `filter` で各 PackedSfenValue を採用するかを制御できる。
 #[derive(Clone)]
@@ -237,7 +236,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
         }
     }
 
-    /// shuffle buffer に貯める PackedSfenValue 件数を直接指定する。
+    /// read buffer に貯める PackedSfenValue 件数を直接指定する。
     ///
     /// `trainer.run` を save chunk ごとに分割して呼ぶ場合、loader がそれより
     /// 大きな chunk を返すと、呼び出し側は必要 batch 数に達した時点で
@@ -345,7 +344,7 @@ where
     T: Fn(&PackedSfenValue) -> bool + Clone + Send + Sync + 'static,
 {
     /// プロデューサスレッド本体。`resume_offset` byte に seek し、その game
-    /// の `resume_plies` 手目から PSV を expand → shuffle buffer に集約 →
+    /// の `resume_plies` 手目から PSV を expand → read buffer に集約 →
     /// `(buffer, next_game_offset, next_plies)` で送出。
     fn produce_buffers(
         file_paths: Vec<String>,
@@ -358,7 +357,6 @@ where
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64, usize)>,
     ) {
         let mut buffer: Vec<PackedSfenValue> = Vec::with_capacity(buffer_size);
-        let mut rng = SimpleRand::with_seed();
         // `resume_offset == 0` のとき (= fresh start, または legacy 互換) は
         // 旧来の `start_position` 由来 filter 通過 record skip を実施。
         let mut skipped = 0usize;
@@ -491,10 +489,6 @@ where
                                 next_after_push = (game_header_offset, i + 1);
 
                                 if buffer.len() >= buffer_size {
-                                    for j in (1..buffer.len()).rev() {
-                                        let k = (rng.rng() as usize) % (j + 1);
-                                        buffer.swap(j, k);
-                                    }
                                     let taken = std::mem::replace(
                                         &mut buffer,
                                         Vec::with_capacity(buffer_size),
@@ -534,10 +528,6 @@ where
 
         // Trailing buffer
         if !buffer.is_empty() {
-            for j in (1..buffer.len()).rev() {
-                let k = (rng.rng() as usize) % (j + 1);
-                buffer.swap(j, k);
-            }
             let _ = tx.send((buffer, next_after_push.0, next_after_push.1));
         }
     }
@@ -593,8 +583,8 @@ mod tests {
     ///     hcpe3::tests::cross_validate_against_cshogi_psv -- --ignored --nocapture
     /// ```
     ///
-    /// 注: decode_one_game は ply を順序通り出力する (shuffle なし)。
-    /// この単体テストでは Hcpe3DataLoader (shuffle あり) ではなく、decode_one_game 直接を呼ぶ。
+    /// 注: decode_one_game は ply を順序通り出力する。
+    /// Hcpe3DataLoader も学習時の追加シャッフルは行わない。
     #[test]
     #[ignore]
     fn cross_validate_against_cshogi_psv() {

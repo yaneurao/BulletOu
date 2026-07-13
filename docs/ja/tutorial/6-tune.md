@@ -152,7 +152,7 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 - cos period = 400M (= 1 epoch ぴったり)
 - sb 4 末尾で lr_min 着地、次 epoch の sb 1 頭で warm restart して lr_max に戻る
 
-教師末尾の余り 61M は使われない (= 各 epoch 同じ先頭 400M を re-shuffle)。多少の無駄は許容して cycle を綺麗に揃える方が学習結果は読みやすい。
+教師末尾の余り 61M は使われない (= 各 epoch 同じ先頭 400M を使う)。多少の無駄は許容して cycle を綺麗に揃える方が学習結果は読みやすい。
 
 #### 対応フォーマット
 

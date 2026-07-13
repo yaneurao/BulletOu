@@ -45,14 +45,24 @@ teachers/
 
 > ⚠️ **重要**: 教師ファイルは BulletOu に渡す前にシャッフルしておくこと。
 
-bullet のローダーは **メモリ内 shuffle buffer (デフォルト 256 MB ≒ HCPE で 670 万局面)** で局面を Fisher-Yates シャッフルしてから batch に切り出す。これは **buffer 内シャッフルのみ** で buffer をまたいだクロスシャッフルはしないため、教師ファイル先頭から順に 670 万局面ずつ読みながら局所的にシャッフルしているだけになる。
+BulletOu は学習時に教師局面を追加シャッフルしない。`--buffer-mb` は読み込みバッファのサイズであり、シャッフル用の指定ではない。
 
-`gensfen` / dlshogi-style 生成器の出力は **同一対局内の局面が連続して並んでいる** のが普通なので、ファイル全体をシャッフルしないまま学習すると、buffer 境界 (≒ 410 batch ごと、`--batch-size 16384` の場合) で分布が突然変わって **loss が周期的に跳ねる** ことになる。
+`gensfen` / dlshogi-style 生成器の出力は **同一対局内の局面が連続して並んでいる** のが普通なので、ファイル全体をシャッフルしないまま学習すると、近い局面ばかりが連続して mini-batch に入り、loss や plateau 判定が教師の局所的な偏りに振り回される。
 
 対策:
-- **`.hcpe` / `.hcpe3`**: dlshogi のシャッフルスクリプトを使うのが簡単。HCPE は固定長レコード (38 byte) なのでバイト単位のランダムシャッフルで OK。dlshogi リポジトリの `utils/` 配下にツールが用意されている。
-- **`.pack`**: `gensfen` の出力時点でシャッフルオプションを有効にする、もしくは出力後に PSV に変換して shuffle。
-- **緊急回避** (シャッフル前のファイルしか手元にないとき): `--buffer-mb` をファイルサイズと同等以上に上げて 1 バッファに全件収める。例: 1.94 GB の `.hcpe` (≒ 5100 万局面) なら `--buffer-mb 2048` で buffer 境界が無くなる。GPU メモリではなく **CPU 側 RAM** を食うので、メモリに余裕がある環境向け。
+- **`.hcpe` / `.psv`**: [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `teacher/shuffle_split_teacher_external.py` を使う。巨大な教師フォルダでも全体をメモリに載せず、bucket 分配してから出力ファイルへ分割できる。
+- **`.hcpe3` / `.pack`**: 棋譜単位の可変長形式なので単純な固定長レコード shuffle には向かない。生成時点で局面順を混ぜる、または `.psv` / `.hcpe` のような固定長局面形式に変換してからシャッフルする。
+
+HCPE/PSVフォルダを 1000 万局面ごとにシャッフル分割する例:
+
+```bash
+python /path/to/YaneuraOu-ScriptCollection/teacher/shuffle_split_teacher_external.py \
+    src_teacher_folder \
+    dst_teacher_folder \
+    --positions 10000000
+```
+
+出力ファイルは `shuffled-00001.hcpe`, `shuffled-00002.hcpe`, ... のような名前になる。1000 万局面ずつ 1 万ファイルを超える規模なら `--digits 6` のように桁数を増やす。
 
 ### 小さなサブセットで動作確認したい場合
 

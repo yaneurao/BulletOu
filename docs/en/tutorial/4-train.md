@@ -4,7 +4,7 @@
 
 Goal: produce a YaneuraOu-loadable evaluation function from the teacher data you prepared.
 
-This page assumes you have already completed [3. Prepare training data](3-data.md) — the teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready, ideally pre-shuffled.
+This page assumes you have already completed [3. Prepare training data](3-data.md) — the teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready and pre-shuffled.
 
 ## 4.1 Build (one-off)
 

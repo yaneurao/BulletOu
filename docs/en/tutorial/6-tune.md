@@ -118,7 +118,7 @@ Then `--superbatches 4` gives:
 - cos period = 400M (= exactly 1 epoch)
 - `lr_min` lands at end of sb 4; warm restart to `lr_max` at sb 1 of the next epoch
 
-The trailing 61M of teacher is not used (= each epoch re-shuffles the same first 400M). A small amount of waste is usually preferable to ragged cosine cycles.
+The trailing 61M of teacher is not used (= each epoch uses the same first 400M). A small amount of waste is usually preferable to ragged cosine cycles.
 
 #### Supported formats
 

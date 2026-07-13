@@ -1167,12 +1167,10 @@ struct Args {
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
-    /// Loader shuffle buffer size in megabytes. PSV 1 record = 40 byte
+    /// Loader read buffer size in megabytes. PSV 1 record = 40 byte
     /// なので `--buffer-mb 4096` で 107M 局面 (= 約 1 superbatch 分) が
-    /// buffer 内でシャッフル対象になる。教師ファイルが game レベルで
-    /// 並んでいる場合 (= 連続局面が同じ対局由来) はこの window を
-    /// 超える相関は混ざらないので、教師サイズに対してこの値が
-    /// 小さすぎないか注意。
+    /// read buffer に貯められる。BulletOu は学習時に追加シャッフルしないので、
+    /// 教師ファイルは事前にシャッフル済みのものを渡すこと。
     ///
     /// RAM 消費: buffer のみで `buffer_mb` MB。学習中の他の構造
     /// (model / optimiser / batch queue) と合わせて peak はこの 2 倍弱を見込む。
@@ -1182,7 +1180,7 @@ struct Args {
     /// HCPE デコード並列度。`0` (デフォルト) で auto =
     /// `available_parallelism()` (= 論理コア数)。学習中に他プロセスへ
     /// CPU を譲りたいときなどに `--loader-threads 8` 等で上限を絞れる。
-    /// 起動時に `shuffle buffer ready: ... (N decode threads)` で
+    /// 起動時に `read buffer ready: ... (N decode threads)` で
     /// 実際に使われた値が表示される。
     /// 現状 HCPE ローダーのみ反映 (HCPE3 / .pack / .psv は未対応)。
     #[arg(long, default_value = "0")]
@@ -2239,10 +2237,7 @@ struct LogContext {
 ///
 /// Earlier this expanded a directory `--teacher` into the comma-joined
 /// list of actual files used, but for a 50-file teacher dir this made
-/// every row of the log absurdly wide while not actually identifying
-/// which file the last batch came from (the shuffle buffer mixes
-/// positions from many files, so "the last batch's teacher" is not a
-/// well-defined notion). Just record what the user typed and let them
+/// every row of the log absurdly wide. Just record what the user typed and let them
 /// scroll back through tag.txt / shell history if they need the
 /// individual filenames.
 fn resolve_teacher_for_log(teacher: &str) -> String {

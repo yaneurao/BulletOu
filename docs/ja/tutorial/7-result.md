@@ -93,7 +93,7 @@ print(df["value_loss"].describe())   # loss の統計
    - 学習開始直後は急に下がり、徐々に減衰
    - 1 superbatch を消化するごとに目に見えて下がるのが理想
    - 1 superbatch まわっても下がらない場合は `--lr` が大きすぎる、または教師サイズが学習器のキャパに対して小さすぎる可能性
-   - **periodic な loss スパイク** (= 数百 batch ごとに急に跳ねる) が見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。shuffle buffer の境界 (デフォルト 256MB buffer ≒ 約 410 batch ごと) で分布が突然変わって起きる。対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
+   - **periodic な loss スパイク** や局所的な loss の偏りが見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。BulletOu は学習時に追加シャッフルしないので、対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
 
 2. **`lr` がスケジュール通りに動いている**
    - `--lr-schedule step` (デフォルト): 1 epoch (= `--superbatches × sb_size` 局面) で `--lr` (lr_max) → `--lr-min` を **geometric** (= 対数線形) に減衰、epoch 末で warm restart して lr_max に戻る
