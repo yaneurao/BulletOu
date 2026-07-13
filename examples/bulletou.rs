@@ -51,7 +51,6 @@ Usage:
 use std::path::PathBuf;
 
 use bullet_compiler::tensor::TValue;
-use bullet_trainer::model::ModelNode;
 use bulletou_lib::{
     game::inputs::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
@@ -1221,13 +1220,6 @@ struct Args {
     #[arg(long, default_value = "1024")]
     activation_stats_positions: usize,
 
-    /// Use straight-through CReLU for the SFNN / LayerStack feature-transformer activation.
-    /// Forward is still clamp(x, 0, 1), so saved nn.bin inference is
-    /// unchanged, but backward passes gradients through clipped FT neurons.
-    /// This is an opt-in anti-twin-neuron measure for saturated FT CReLU units.
-    #[arg(long)]
-    sfnn_ste_crelu: bool,
-
     /// Held-out test set (.hcpe only) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each save event (= every `--save-rate` superbatches): random-
@@ -1807,10 +1799,6 @@ fn main() {
             std::process::exit(2);
         }
     }
-    if args.sfnn_ste_crelu && !args.eval_type().uses_layerstack() {
-        eprintln!("error: --sfnn-ste-crelu currently applies to SFNN / LayerStack eval types only.");
-        std::process::exit(2);
-    }
     // `step` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
     // `plateau` reduces `--lr` multiplicatively down to `--lr-min`.
     // `--lr-min` must be > 0 for step / plateau. For cos, 0 is fine but
@@ -1962,7 +1950,6 @@ fn resume_signature(args: &Args) -> String {
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
-        format!("sfnn_ste_crelu={}", if args.sfnn_ste_crelu { "ft_only" } else { "false" }),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -3503,14 +3490,6 @@ fn pairwise_mul_scaled(input: &[f32], output: &mut [f32]) {
     }
 }
 
-fn maybe_ste_ft_crelu<'a>(x: ModelNode<'a>, ste: bool) -> ModelNode<'a> {
-    if ste {
-        x.clip_pass_through_grad(0.0, 1.0)
-    } else {
-        x.crelu()
-    }
-}
-
 fn dump_sfnn_activation_stats<Opt, I>(
     args: &Args,
     trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>,
@@ -4987,10 +4966,6 @@ where
     if args.nnue_pytorch_init_scale != 1.0 {
         eprintln!("  nnue-pytorch init scale = {}", args.nnue_pytorch_init_scale);
     }
-    if args.sfnn_ste_crelu {
-        eprintln!("  SFNN FT CReLU backward = straight-through estimator (anti-twin-neuron mode)");
-    }
-
     let output_dir = args.output_dir();
     let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
@@ -5076,8 +5051,8 @@ where
         // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it
         // back to ft_size (matching `kInputDims = kTransformedFeatureDimensions`
         // in sfnnwop-1536.h).
-        let stm = maybe_ste_ft_crelu(l0.forward(stm_inputs), args.sfnn_ste_crelu).pairwise_mul() * (127.0 / 128.0);
-        let ntm = maybe_ste_ft_crelu(l0.forward(ntm_inputs), args.sfnn_ste_crelu).pairwise_mul() * (127.0 / 128.0);
+        let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
+        let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
         let combined = stm.concat(ntm);
 
         let l1_out_t = l1.forward(combined).select(output_buckets);

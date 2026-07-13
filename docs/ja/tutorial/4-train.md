@@ -64,16 +64,6 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 
 通常の NNUE と違って **9 個のサブネットを局面ごとに使い分ける** (LayerStacks=9)。`--arch` の `k3k3` suffix がやねうら王互換の LayerStack 方式を選ぶ。使い方の説明は [§9 LayerStack](9-layerstack.md)、アーキテクチャ / 量子化 / `nn.bin` レイアウトの仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)。
 
-SFNN / LayerStack 系で feature transformer 直後の CReLU 飽和による「双子ニューロン」化を抑えたい場合は、実験用に `--sfnn-ste-crelu` を指定できる。forward の値は通常の CReLU と同じだが、FT CReLU の backward ではクリップ区間外にも勾配を通す。学習挙動が変わり resume 判定にも含まれるので、比較するときは `--tag` を分ける。
-
-```bash
-./target/release/examples/bulletou \
-    --eval-type SFNN_HALFKA2HM \
-    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
-    --teacher teachers/ \
-    --sfnn-ste-crelu
-```
-
 ## 4.5 KPPT を学習する
 
 KPPT 系では `--arch` 不要 (architecture は固定):
