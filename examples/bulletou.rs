@@ -914,6 +914,18 @@ fn plateau_action_rejects_update(action: PlateauAction) -> bool {
     )
 }
 
+fn plateau_action_epoch_final_loss(action: PlateauAction) -> Option<f32> {
+    match action {
+        PlateauAction::FinalImproved { new_best, .. } => Some(new_best),
+        PlateauAction::FinalRejected { best, .. } => Some(best),
+        _ => None,
+    }
+}
+
+fn plateau_epoch_should_stop(previous_loss: Option<f32>, current_loss: f32) -> bool {
+    matches!(previous_loss, Some(previous) if current_loss >= previous)
+}
+
 impl PlateauLrState {
     fn new(start_lr: f32, min_lr: f32, factor: f32, min_delta: f32) -> Self {
         Self { current_lr: start_lr, min_lr, factor, min_delta, best_loss: None, final_min_run: false }
@@ -965,6 +977,20 @@ impl PlateauLrState {
                 }
             }
         }
+    }
+}
+
+fn effective_max_epochs(args: &Args) -> usize {
+    args.max_epochs
+        .unwrap_or_else(|| if matches!(args.lr_schedule, LrScheduleKind::Plateau) { usize::MAX } else { 1 })
+        .max(1)
+}
+
+fn print_epoch_banner(epoch: usize, max_epochs: usize) {
+    if max_epochs == usize::MAX {
+        eprintln!("\n=== epoch {epoch} / unlimited ===");
+    } else if max_epochs > 1 {
+        eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
     }
 }
 
@@ -1077,9 +1103,11 @@ struct Args {
     /// `--superbatches` caps it. With `plateau`, teacher EOF wraps back to
     /// the beginning inside the same epoch; the epoch ends when LR reaches
     /// `--lr-min` and the final min-LR retry has completed.
-    /// After each epoch the dataloader is rebuilt from scratch. Default 1.
-    #[arg(long, default_value = "1")]
-    max_epochs: usize,
+    /// After each epoch the dataloader is rebuilt from scratch. If omitted,
+    /// `step` / `cos` default to 1 epoch, while `plateau` keeps running
+    /// epochs until the epoch-final validation loss no longer improves.
+    #[arg(long)]
+    max_epochs: Option<usize>,
 
     /// Initial Adam learning rate.
     #[arg(long, default_value = "0.001")]
@@ -2522,6 +2550,31 @@ fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option
     max_epoch
 }
 
+/// Read the last parseable `test_value_loss` from the NNUE rows in the
+/// top-level summary log. For plateau resume after a cleanly completed
+/// epoch, this is the previous epoch's final accepted validation loss.
+fn read_latest_nnue_test_loss_in_top_level_log(top_level_log: &std::path::Path) -> Option<f32> {
+    let content = std::fs::read_to_string(top_level_log).ok()?;
+    let mut latest: Option<f32> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(10, ',').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let component = parts[0].split_once('/').map(|(_, c)| c).unwrap_or("nnue");
+        if component != "nnue" {
+            continue;
+        }
+        let Ok(loss) = parts[4].parse::<f32>() else { continue };
+        latest = Some(loss);
+    }
+    latest
+}
+
 /// Detect the latest saved superbatch number from the highest-numbered
 /// `<output_dir>/<NNNN>/learn.log`. Used to auto-resume the LR scheduler
 /// (and the trainer's internal sb counter) at `last_sb + 1` instead of
@@ -2930,7 +2983,7 @@ macro_rules! run_training_inline {
         let output_dir_buf = args.output_dir();
         let yaneuraou_scale = args.yaneuraou_scale();
         let kpp_format = args.kpp_format();
-        let max_epochs = args.max_epochs.max(1);
+        let max_epochs = effective_max_epochs(args);
 
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
@@ -2981,9 +3034,7 @@ macro_rules! run_training_inline {
         let persistent_hcpe_loader: Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> = None;
 
         for epoch in 1..=max_epochs {
-            if max_epochs > 1 {
-                eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
-            }
+            print_epoch_banner(epoch, max_epochs);
 
             // checkpoint dir 名は max_epochs=1 のとき従来通り `<net_id>-<superbatch>`、
             // 複数 epoch のときは `<net_id>-e<epoch>-<superbatch>` で重複を避ける。
@@ -3637,7 +3688,7 @@ macro_rules! run_training_inline_nnue {
         let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
         let net_id_base = args.net_id();
         let output_dir_buf = args.output_dir();
-        let max_epochs = args.max_epochs.max(1);
+        let max_epochs = effective_max_epochs(args);
 
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
@@ -3908,10 +3959,21 @@ macro_rules! run_training_inline_nnue {
             };
         let mut persistent_hcpe_loader =
             new_hcpe_loader(cb_dataloader_resume_offset.get().0, cb_dataloader_resume_exact.get());
+        let mut previous_plateau_epoch_final_loss =
+            if matches!(args.lr_schedule, LrScheduleKind::Plateau) && prev_run_completed_epoch {
+                read_latest_nnue_test_loss_in_top_level_log(&cb_top_level_log)
+            } else {
+                None
+            };
+        if let Some(loss) = previous_plateau_epoch_final_loss {
+            eprintln!("  plateau: previous completed epoch final validation loss = {loss:.6}");
+        }
+        let mut last_epoch_for_fallback = 1usize;
         for epoch in 1..=max_epochs {
-            if max_epochs > 1 {
-                eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
-            }
+            last_epoch_for_fallback = epoch;
+            print_epoch_banner(epoch, max_epochs);
+            let mut stop_training_after_epoch = false;
+            let mut plateau_epoch_final_loss: Option<f32> = None;
             let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
                 Some(PlateauLrState::new(
                     args.lr,
@@ -4264,6 +4326,7 @@ macro_rules! run_training_inline_nnue {
                             );
                         }
                         PlateauAction::FinalImproved { old_best, new_best } => {
+                            plateau_epoch_final_loss = plateau_action_epoch_final_loss(action);
                             eprintln!(
                                 "  plateau: final lr_min superbatch improved validation loss {old_best:.6} -> {new_best:.6}; \
                                  accepting it and ending this epoch."
@@ -4271,6 +4334,7 @@ macro_rules! run_training_inline_nnue {
                             break 'epoch;
                         }
                         PlateauAction::FinalRejected { loss, best } => {
+                            plateau_epoch_final_loss = plateau_action_epoch_final_loss(action);
                             eprintln!(
                                 "  plateau: final lr_min superbatch did not improve (loss={loss:.6}, best={best:.6}); \
                                  discarding it and ending this epoch."
@@ -4314,6 +4378,25 @@ macro_rules! run_training_inline_nnue {
 
                 chunk_start = chunk_end + 1;
             }
+            if let Some(current_loss) = plateau_epoch_final_loss {
+                if plateau_epoch_should_stop(previous_plateau_epoch_final_loss, current_loss) {
+                    let previous_loss = previous_plateau_epoch_final_loss.expect("checked by predicate");
+                    eprintln!(
+                        "  plateau: epoch-final validation loss did not improve from previous epoch \
+                         ({previous_loss:.6} -> {current_loss:.6}); stopping training."
+                    );
+                    stop_training_after_epoch = true;
+                }
+                previous_plateau_epoch_final_loss = Some(current_loss);
+            } else if matches!(args.lr_schedule, LrScheduleKind::Plateau) && max_epochs == usize::MAX {
+                eprintln!(
+                    "  plateau: epoch ended before an epoch-final validation loss was established; stopping unlimited run."
+                );
+                stop_training_after_epoch = true;
+            }
+            if stop_training_after_epoch {
+                break;
+            }
         }
 
         if !saved_any.get() {
@@ -4351,7 +4434,7 @@ macro_rules! run_training_inline_nnue {
                 &output_dir_buf,
                 &ckpt_dir,
                 &cb_ctx,
-                /*epoch=*/ max_epochs,
+                /*epoch=*/ last_epoch_for_fallback,
                 idx,
                 cb_prior_position,
                 test_metrics,
@@ -5695,6 +5778,35 @@ mod tests {
     }
 
     #[test]
+    fn plateau_epoch_final_loss_uses_accepted_loss() {
+        assert_eq!(
+            plateau_action_epoch_final_loss(PlateauAction::FinalImproved { old_best: 0.49, new_best: 0.48 }),
+            Some(0.48)
+        );
+        assert_eq!(
+            plateau_action_epoch_final_loss(PlateauAction::FinalRejected { loss: 0.54, best: 0.49 }),
+            Some(0.49)
+        );
+        assert_eq!(
+            plateau_action_epoch_final_loss(PlateauAction::Reduced {
+                old_lr: 0.001,
+                new_lr: 0.0005,
+                loss: 0.50,
+                best: 0.49,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn plateau_epoch_stops_when_final_loss_does_not_improve() {
+        assert!(!plateau_epoch_should_stop(None, 0.50));
+        assert!(!plateau_epoch_should_stop(Some(0.50), 0.49));
+        assert!(plateau_epoch_should_stop(Some(0.50), 0.50));
+        assert!(plateau_epoch_should_stop(Some(0.50), 0.51));
+    }
+
+    #[test]
     fn enrich_uses_plateau_lr_override() {
         let ctx = LogContext {
             eval_type: "NNUE_KP",
@@ -5833,6 +5945,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_latest_epoch_in_top_level_log(&log), Some(3));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn read_latest_nnue_test_loss_picks_last_numeric_loss() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("summary-learn.log");
+
+        assert_eq!(read_latest_nnue_test_loss_in_top_level_log(&log), None);
+        std::fs::write(
+            &log,
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher\n\
+             KPPT/kk,1,1,0.1,0.999,0.1,0.001,1.0,10,t.hcpe\n\
+             NNUE,1,1,-,-,0.1,0.001,1.0,20,t.hcpe\n\
+             NNUE,1,2,0.5,0.123456,0.1,0.001,1.0,30,t.hcpe\n\
+             NNUE,2,1,0.5,0.120000,0.1,0.001,1.0,40,t.hcpe\n",
+        )
+        .unwrap();
+        assert_eq!(read_latest_nnue_test_loss_in_top_level_log(&log), Some(0.120000));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

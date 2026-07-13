@@ -14,12 +14,14 @@ Main flags:
 |---|---|---|
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
-| `--superbatches` | Cap superbatches per epoch | unlimited (= run until EOF) |
-| `--max-epochs` | Number of full passes through the teacher | 1 |
+| `--superbatches` | Cap superbatches per epoch. Usually unnecessary for `plateau` | unlimited (= non-plateau runs until EOF; plateau runs until `lr_min`) |
+| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
-| `--lr-schedule` | `step` (= geometric / log-linear decay) or `cos` (= cosine annealing); both sweep `--lr` → `--lr-min` over one epoch with warm restart | `step` |
-| `--lr-min` | Floor LR reached at end of each cycle. Cycle length auto-computed from `--superbatches` / teacher size. Must be `> 0` for step | 0.00001 |
+| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when validation loss stops improving) | `step` |
+| `--lr-min` | Floor LR. For `step` / `cos`, this is reached at the end of each cycle. For `plateau`, this is the final LR | 0.00001 |
+| `--lr-plateau-factor` | Factor multiplied into LR when `plateau` validation loss does not improve | 0.5 |
+| `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
@@ -68,6 +70,29 @@ The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_
 ⚠️ **`--lr-min` must be `> 0` for step**: the geometric formula `lr_max × (lr_min/lr_max)^t` collapses to 0 at any t>0 when `lr_min = 0`; the CLI rejects this at startup. `1e-5`–`1e-6` is typical. `cos` accepts 0 mathematically (with a warning).
 
 Inspect `<NNNN>/learn.log`'s `lr` column to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
+
+#### ReduceLROnPlateau
+
+Use `--lr-schedule plateau` when you want validation loss to decide LR reductions instead of forcing a fixed cosine or geometric period.
+
+After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `test_value_loss`. If the loss did not improve, it discards that update, restores both model weights and Adam optimiser state to the start of the superbatch, multiplies LR by `--lr-plateau-factor`, and retries the same teacher interval. When the next LR would go below `--lr-min`, it runs one final attempt at exactly `--lr-min`. That final attempt is accepted only if validation loss improves; otherwise it is discarded and the epoch ends.
+
+If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. After each epoch, BulletOu compares the epoch-final `test_value_loss` that remained in `summary-learn.log` with the previous epoch's final loss. If it is **not strictly lower**, training stops. `--lr-plateau-min-delta` affects only the per-superbatch plateau decision; epoch-to-epoch stopping uses no tolerance.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type NNUE_HALFKP \
+    --lr 0.001 --lr-min 0.00001 \
+    --lr-schedule plateau \
+    --lr-plateau-factor 0.5
+```
+
+Constraints:
+
+- `--test-teacher` is required.
+- `--save-rate 1` is required because LR is decided once per superbatch.
+- `plateau` is currently supported for NNUE/SFNN eval types.
 
 #### Comparing `step` vs `cos`
 

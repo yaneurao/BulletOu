@@ -15,7 +15,7 @@
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
 | `--superbatches` | epoch あたりの superbatch 数の上限。`plateau` では通常不要 | 上限なし (= 非 plateau は EOF まで、plateau は `lr_min` 到達まで) |
-| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では `lr_min` 到達までの試行を何回行うか | 1 |
+| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
 | `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation loss が改善しないときだけ LR を下げる) | `step` |
@@ -77,6 +77,8 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 `plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も validation loss が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
+`plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 `test_value_loss` を前 epoch の最終 `test_value_loss` と比較し、**厳密に下がっていなければそこで学習を停止**する。`--lr-plateau-min-delta` は epoch 間の停止判定には使わない。
+
 `plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
 
 validation loss が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
@@ -95,13 +97,12 @@ validation loss が改善しなかった attempt は正式な checkpoint (`000N/
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type NNUE_HALFKP \
-    --max-epochs 10 \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
     --lr-plateau-factor 0.5
 ```
 
-factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、それ未満の微小な改善は「改善なし」とみなす。
+factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、epoch 内の superbatch 判定でそれ未満の微小な改善は「改善なし」とみなす。epoch 間の停止判定は常に「前 epoch より final loss が厳密に下がったか」だけを見る。
 
 #### `step` vs `cos` を比較したい
 
@@ -167,7 +168,7 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 
 ### 複数 epoch 回す
 
-`--max-epochs N` を指定すると epoch を N 回実行する。`step` / `cos` では通常「教師データを N 周する」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。各 epoch 開始時に:
+`--max-epochs N` を指定すると epoch を N 回実行する。`step` / `cos` では通常「教師データを N 周する」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。`plateau` で省略した場合は、前 epoch より final loss が改善しなくなるまで続ける。各 epoch 開始時に:
 - LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る — `step` でも `cos` でも同じ)
 - データローダーが先頭にシークし直す
 
