@@ -17,19 +17,19 @@
 ```powershell
 # 1 回目: 3 epoch 学習
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch 256x2-32-32 `
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # 2 回目: 追加で 3 epoch
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch 256x2-32-32 `
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 ```
 
 2 回目起動時:
-- 出力 dir (`checkpoints/NNUE_KP-256x2-32-32-round1/`) を発見
+- 出力 dir (`checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-round1/`) を発見
 - 最大番号の `0018/state.bin` (= 前回の最終 checkpoint) を load
 - 続きの `0019/` から save 開始
 - `summary-learn.log` も追記される (= 累積)
@@ -76,7 +76,7 @@
 ```powershell
 # 続きの 3 epoch を 32768 で
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch 256x2-32-32 `
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
     --resume `
@@ -103,14 +103,14 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
 ```powershell
 # 大量の弱教師で 3 epoch 学習
 .\bulletou.exe --teacher c:\shogi\teacher\bulk\ `
-    --eval-type NNUE_KP --arch 256x2-32-32 `
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # 小規模・高品質教師で fine-tune (= LR を小さめに)
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
-    --eval-type NNUE_KP --arch 256x2-32-32 `
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 2 --superbatches 4 `
     --resume `

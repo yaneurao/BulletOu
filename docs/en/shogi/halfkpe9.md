@@ -10,7 +10,7 @@ Network structure is identical to HalfKP / K-P, but the input dimension is **9×
 
 ## Architecture
 
-`--arch <L1>x2-<L2>-<L3>` selects L1 / L2 / L3 (free-form; same set of common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)):
+`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` selects L1 / L2 / L3 (same set of common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)):
 
 ```
 shogi position
@@ -96,14 +96,14 @@ cargo build --release --features device-cuda --example bulletou
     --teacher teachers/
 ```
 
-Default `--output` is `checkpoints/NNUE_HALFKPE9-256x2-32-32/`.
+Default `--output` is `checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/`.
 
 ### Save layout
 
 Identical to HalfKP:
 
 ```
-checkpoints/NNUE_HALFKPE9-256x2-32-32/
+checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/
 ├── learn.log                          ← 9-column CSV, cumulative across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
@@ -130,7 +130,7 @@ L1 / L2 / Out layers are byte-identical to HalfKP for the same `--arch`.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKPE9` | (required) |
-| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | `NNUE_halfkpe9_256x2_32_32` |
 | `--teacher` | Teacher file / directory / comma-separated | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` |
 | `--lambda` | Blend between teacher eval and W/D/L | 1.0 |

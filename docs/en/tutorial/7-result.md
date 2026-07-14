@@ -10,10 +10,10 @@ What to do after (or during) training:
 
 ## 7.1 Inspect the output
 
-After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32/`) has the following layout:
+After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/`) has the following layout:
 
 ```
-checkpoints/NNUE_HALFKP-256x2-32-32/
+checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── learn.log                          ← top-level cumulative log across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
@@ -44,11 +44,11 @@ The loss trajectory of every run, both during training and afterwards, is record
 
 ```csv
 eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-256x2-32-32,1,1,32,0.6234,0.001,1.000,524288,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP-256x2-32-32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
@@ -58,7 +58,7 @@ Bullet writes **one row every 32 batches**. With the default `--batches-per-supe
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-256x2-32-32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every `--batches-per-superbatch` (default 6104) batches | `1`, `2`, ... |
 | `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
@@ -77,7 +77,7 @@ Full spec: [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md#l
 ```python
 import pandas as pd
 
-df = pd.read_csv("checkpoints/NNUE_HALFKP-256x2-32-32/learn.log")
+df = pd.read_csv("checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/learn.log")
 print(df.shape)        # total rows
 print(df.tail())       # last few rows
 print(df["value_loss"].describe())   # loss stats

@@ -10,7 +10,7 @@ Put the latest `000N/nn.bin` where the engine looks for its eval file. With Yane
 
 ```
 # After the engine starts, in the USI command line:
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/0005
 isready
 bench
 ```

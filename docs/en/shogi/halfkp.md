@@ -10,7 +10,7 @@ The activation-function history (why ClippedReLU and not SCReLU) is documented i
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch <L1>x2-<L2>-<L3>` (free-form; `L1` must be a multiple of 32). Common YaneuraOu-shipped sizes: `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. See [§4.3](../tutorial/4-train.md#43-specifying---arch) for the full description. Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` (`L1` must be a multiple of 32). Common YaneuraOu-shipped sizes: `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. On the CLI, use the full architecture name such as `NNUE_halfkp_256x2_32_32`; the old shorthand `256x2-32-32` is not accepted. See [§4.3](../tutorial/4-train.md#43-specifying---arch) for the full description. Below shows the default:
 
 ```
 HalfKP sparse input (125,388 dims, per perspective)
@@ -86,9 +86,9 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKP` | (required) |
-| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-256x2-32-32`) |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | Maximum number of epochs. If omitted: `step` / `cos` = 1, `plateau` = until epoch-final loss stops improving | omitted |
 | `--superbatches` | Cap superbatches per epoch | unlimited |
 | `--batches-per-superbatch` | Mini-batches per superbatch | ≈ 100M positions |

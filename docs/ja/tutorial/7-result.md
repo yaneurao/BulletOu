@@ -10,10 +10,10 @@
 
 ## 7.1 出力を確認する
 
-学習完了後、出力ディレクトリ (例: `checkpoints/NNUE_HALFKP-256x2-32-32/`) は以下のレイアウト:
+学習完了後、出力ディレクトリ (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/`) は以下のレイアウト:
 
 ```
-checkpoints/NNUE_HALFKP-256x2-32-32/
+checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── learn.log                          ← 全 run / resume を連結した累積ログ
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
@@ -44,11 +44,11 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ```csv
 eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-256x2-32-32,1,1,32,0.6234,0.001,1.000,524288,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,0.6234,0.001,1.000,524288,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
 ...
-NNUE_HALFKP-256x2-32-32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
 ...
 ```
 
@@ -58,7 +58,7 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 
 | 列 | 意味 | 例 |
 |---|---|---|
-| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-256x2-32-32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
 | `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
@@ -77,7 +77,7 @@ NNUE 系は `--arch` を `eval` 列に含める (出力ディレクトリ名と�
 ```python
 import pandas as pd
 
-df = pd.read_csv("checkpoints/NNUE_HALFKP-256x2-32-32/learn.log")
+df = pd.read_csv("checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/learn.log")
 print(df.shape)        # 全行数
 print(df.tail())       # 最後の数行
 print(df["value_loss"].describe())   # loss の統計

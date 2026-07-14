@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-L1 / L2 / L3 サイズは `--arch <L1>x2-<L2>-<L3>` で **自由形式**で指定する (`L1` は 32 の倍数)。やねうら王が実エンジンとして配布している共通サイズ: `256x2-32-32` (default)、`384x2-8-96`、`512x2-8-64`、`768x2-16-64`、`1024x2-8-32`、`1024x2-8-64`。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する) 参照。以下はデフォルト構成の図:
+L1 / L2 / L3 サイズは `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` で指定する (`L1` は 32 の倍数)。やねうら王が実エンジンとして配布している共通サイズ: `256x2-32-32` (default)、`384x2-8-96`、`512x2-8-64`、`768x2-16-64`、`1024x2-8-32`、`1024x2-8-64`。CLI では古い短縮形 `256x2-32-32` ではなく `NNUE_halfkp_256x2_32_32` のように書く。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する) 参照。以下はデフォルト構成の図:
 
 ```
 HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
@@ -86,9 +86,9 @@ checkpoints/my-halfkp/
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKP` | (必須) |
-| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-256x2-32-32`) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | epoch を最大何回実行するか。省略時は `step` / `cos` では 1、`plateau` では final loss の改善が止まるまで | 省略 |
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--batches-per-superbatch` | superbatch あたりの mini-batch 数 | ≈ 100M 局面 |

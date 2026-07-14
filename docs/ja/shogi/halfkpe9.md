@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-`--arch <L1>x2-<L2>-<L3>` で L1 / L2 / L3 サイズを選択 (自由形式、NNUE_HALFKP と同じよく使われるサイズ。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する)):
+`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` で L1 / L2 / L3 サイズを選択 (NNUE_HALFKP と同じよく使われるサイズ。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する)):
 
 ```
 将棋の局面
@@ -96,14 +96,14 @@ cargo build --release --features device-cuda --example bulletou
     --teacher teachers/
 ```
 
-`--output` 省略時のデフォルトは `checkpoints/NNUE_HALFKPE9-256x2-32-32/`。
+`--output` 省略時のデフォルトは `checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/`。
 
 ### 保存レイアウト
 
 HalfKP と完全に同じ:
 
 ```
-checkpoints/NNUE_HALFKPE9-256x2-32-32/
+checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/
 ├── learn.log                          ← 9 列 CSV (全 run / resume 累積)
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
@@ -130,7 +130,7 @@ L1 / L2 / Out 層は `--arch` が同じなら HalfKP と byte-identical。
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--eval-type` | `NNUE_HALFKPE9` | (必須) |
-| `--arch` | `256x2-32-32`<br>`384x2-8-96`<br>`512x2-8-64`<br>`768x2-16-64`<br>`1024x2-8-32`<br>`1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | `NNUE_halfkpe9_256x2_32_32` |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 | 1.0 |

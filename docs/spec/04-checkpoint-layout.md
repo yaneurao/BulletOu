@@ -160,10 +160,10 @@ sb 列は intrinsic に **per-epoch カウンタ** (= 各 epoch で 1..`--superb
 
 ```
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-256x2-32-32,1,1,32,-,-,0.234,0.000934,1.000000,524288,teachers/
-NNUE_HALFKP-256x2-32-32,1,1,64,-,-,0.231,0.000934,1.000000,1048576,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.000934,1.000000,524288,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000934,1.000000,1048576,teachers/
 ...
-NNUE_HALFKP-256x2-32-32,1,1,6104,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6104,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
 ```
 
 bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= `--batches-per-superbatch` ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
@@ -172,8 +172,8 @@ bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 
 
 ```
 eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-256x2-32-32,1,1,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
-NNUE_HALFKP-256x2-32-32,1,2,0.583300,0.174947,0.077046,0.000753,1.000000,199622656,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000753,1.000000,199622656,teachers/
 ```
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
@@ -182,7 +182,7 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 
 | 列 | 意味 |
 |---|---|
-| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` を付加。NNUE 系 (シングル component、`--arch` を使う) は `NNUE_HALFKP-256x2-32-32` のように eval-type と arch を `-` で結合。KPPT 系 (`--arch` を使わない、3 component 連続学習) は `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録 |
+| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` を付加。NNUE 系 (シングル component、`--arch` を使う) は `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように eval-type と arch を `-` で結合。KPPT 系 (`--arch` を使わない、3 component 連続学習) は `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録 |
 | `epoch` | この save の epoch 番号。継続学習を跨いで連続化される (= `LogContext.epoch_offset` 補正後の値)。1 始まり |
 | `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される。**per-epoch カウンタ**で、cross-run 累積ではない。新 epoch ごとに 1 にリセット |
 | `curr_batch` | (per-save 版のみ) 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |

@@ -24,15 +24,15 @@ cargo build --release --features device-cuda --example bulletou
     --teacher teachers/
 ```
 
-That's it — no further flags needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-256x2-32-32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
+That's it — no further flags needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
 
 ## 4.3 Specifying `--arch`
 
-For NNUE eval types, the layer sizes are specified with `--arch <L1>x2-<L2>-<L3>` as a free-form triple. `L1` (the per-perspective accumulator size) must be a positive multiple of 32 (FT SIMD-padding requirement); `L2` and `L3` (hidden-layer sizes) must be positive integers. Any valid triple is accepted.
+For NNUE / SFNN eval types, pass the YaneuraOu Makefile edition name after removing the `YANEURAOU_ENGINE_` prefix. For example, HalfKP 256x2-32-32 is `NNUE_halfkp_256x2_32_32`, K-P 256x2-32-32 is `NNUE_kp_256x2_32_32`, and SFNN looks like `SFNN_halfka2_1024_7_64_k3k3`. The old shorthand `256x2-32-32` is not accepted.
 
-Common YaneuraOu-shipped sizes (selectable directly because the matching engine binary exists):
+For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective accumulator size) must be a positive multiple of 32 (FT SIMD-padding requirement); `L2` and `L3` (hidden-layer sizes) must be positive integers. Common sizes:
 
-| `--arch` | L1 (accumulator) | L2 | L3 | Notes |
+| Size suffix | L1 (accumulator) | L2 | L3 | Notes |
 |---|---|---|---|---|
 | `256x2-32-32` (default) | 256 | 32 | 32 | Classic small NNUE; fast to train, good for sanity checks |
 | `384x2-8-96` | 384 | 8 | 96 | |
@@ -45,11 +45,11 @@ Common YaneuraOu-shipped sizes (selectable directly because the matching engine 
 ```bash
 ./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
-    --arch 1024x2-8-64 \
+    --arch NNUE_halfkp_1024x2_8_64 \
     --teacher teachers/
 ```
 
-Omitting `--arch` falls back to `256x2-32-32`. The same `--arch` flag applies to all NNUE / SFNN eval types (`NNUE_HALFKP`, `NNUE_KP`, `NNUE_KA2`, `NNUE_HALFKPE9`, `NNUE_HALFKPVM`, `SFNN_*`). Sizes outside the table above (e.g. `--arch 256x2-64-64`) are also accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches that triple — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
+Omitting `--arch` uses the per-eval-type default. For example, `NNUE_HALFKP` defaults to `NNUE_halfkp_256x2_32_32`, and `NNUE_KP` defaults to `NNUE_kp_256x2_32_32`. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 

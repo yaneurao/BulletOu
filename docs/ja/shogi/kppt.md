@@ -93,7 +93,7 @@ KPPT/kpp,1,1,32,0.245,0.001,1.000,524288,teachers/
 ...
 ```
 
-`eval` 列は **`<eval-type>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。KPPT 系は `--arch` を使わないので arch 接尾辞は付かない (NNUE 系では `NNUE_HALFKP-256x2-32-32` のように arch も結合される)。
+`eval` 列は **`<eval-type>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。KPPT 系は `--arch` を使わないので arch 接尾辞は付かない (NNUE 系では `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように arch も結合される)。
 
 各 save の `0NNN/learn.log` snapshot もトップレベル `<output>/learn.log` も同じ書式。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md) を参照。
 

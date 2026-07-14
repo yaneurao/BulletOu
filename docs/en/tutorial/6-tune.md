@@ -119,19 +119,19 @@ Run twice on the same teacher / same architecture and overlay the `summary-learn
 # stepwise (geometric decay)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --superbatches 4 --tag 5G-step \
     --lr-schedule step --lr-min 0.00001
 
 # cosine (one cycle per epoch)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --tag 5G-cos --superbatches 4 \
     --lr-schedule cos --lr-min 0.00001
 ```
 
-The two runs land in `checkpoints/NNUE_KP-256x2-32-32-5G-step/` and `-5G-cos/`. Load each `summary-learn.log` in pandas / Excel and compare the `test_value_accuracy` / `test_value_loss` columns to see which schedule helps more on your teacher.
+The two runs land in `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-5G-step/` and `-5G-cos/`. Load each `summary-learn.log` in pandas / Excel and compare the `test_value_accuracy` / `test_value_loss` columns to see which schedule helps more on your teacher.
 
 ### Count the teacher to pick `--superbatches`
 

@@ -10,7 +10,7 @@ The architecture file in YaneuraOu source is `source/eval/nnue/architectures/kp_
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch <L1>x2-<L2>-<L3>` (free-form; same set of common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)). YaneuraOu currently ships its `NNUE_kp_*` engine binaries only for `256x2-32-32`; the trainer will happily produce others if you want to experiment. Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch NNUE_kp_<L1>x2_<L2>_<L3>` (same common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)). YaneuraOu currently ships its `NNUE_kp_*` engine binaries only for `256x2-32-32`; the trainer will happily produce others if you want to experiment. On the CLI, use the full architecture name such as `NNUE_kp_256x2_32_32`. Below shows the default:
 
 ```
 Shogi position
@@ -111,8 +111,8 @@ L1 / L2 / Output layers are byte-identical between HalfKP and KP for the same `-
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_KP` | (required) |
-| `--arch` | Free-form `<L1>x2-<L2>-<L3>` (`L1` must be a multiple of 32). Common sizes: `256x2-32-32`, `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64` | `256x2-32-32` |
+| `--arch` | `NNUE_kp_256x2_32_32`, `NNUE_kp_384x2_8_96`, `NNUE_kp_512x2_8_64`, `NNUE_kp_768x2_16_64`, `NNUE_kp_1024x2_8_32`, `NNUE_kp_1024x2_8_64` | `NNUE_kp_256x2_32_32` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-256x2-32-32`) |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32`) |
 
 See [HalfKP Training](halfkp.md) for the full flag list (it is identical between NNUE_HALFKP and NNUE_KP).

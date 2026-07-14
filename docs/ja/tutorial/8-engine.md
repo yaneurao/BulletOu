@@ -10,7 +10,7 @@
 
 ```
 # エンジン起動後、USI コマンドで:
-setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-256x2-32-32/0005
+setoption name EvalDir value C:/shogi/BulletOu/checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/0005
 isready
 bench
 ```

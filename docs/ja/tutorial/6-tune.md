@@ -129,19 +129,19 @@ factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`
 # stepwise (geometric decay)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --superbatches 4 --tag 5G-step \
     --lr-schedule step --lr-min 0.00001
 
 # cosine (epoch ごとに 1 cycle)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch 256x2-32-32 \
+    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --tag 5G-cos --superbatches 4 \
     --lr-schedule cos --lr-min 0.00001
 ```
 
-出力先がそれぞれ `checkpoints/NNUE_KP-256x2-32-32-5G-step/` と `-5G-cos/` に分かれる。`summary-learn.log` の `test_value_accuracy` / `test_value_loss` 列を pandas / Excel で重ねれば比較完了。
+出力先がそれぞれ `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-5G-step/` と `-5G-cos/` に分かれる。`summary-learn.log` の `test_value_accuracy` / `test_value_loss` 列を pandas / Excel で重ねれば比較完了。
 
 ### 教師を数えて `--superbatches` を決める
 

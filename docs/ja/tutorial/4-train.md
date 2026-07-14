@@ -24,15 +24,15 @@ cargo build --release --features device-cuda --example bulletou
     --teacher teachers/
 ```
 
-これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-256x2-32-32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
+これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
 
 ## 4.3 `--arch` を指定する
 
-NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<L3>` で **自由に**指定できる。`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。
+NNUE / SFNN 系 eval-type では `--arch` に **やねうら王の Makefile edition 名から `YANEURAOU_ENGINE_` を取り除いた名前**を指定する。たとえば HalfKP の 256x2-32-32 なら `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 なら `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。古い短縮形 `256x2-32-32` は受け付けない。
 
-やねうら王が配布しているエンジンバイナリのディレクトリ名 (`NNUE_halfkp_*` のサフィックス) と一致するよく使われるサイズは以下:
+NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。よく使われるサイズは以下:
 
-| `--arch` | L1 (accumulator) | L2 | L3 | 用途の目安 |
+| サイズサフィックス | L1 (accumulator) | L2 | L3 | 用途の目安 |
 |---|---|---|---|---|
 | `256x2-32-32` (デフォルト) | 256 | 32 | 32 | 古典的な小型 NNUE。学習時間が短く挙動確認向き |
 | `384x2-8-96` | 384 | 8 | 96 | |
@@ -45,11 +45,11 @@ NNUE 系 eval-type ではネットワーク層サイズを `--arch <L1>x2-<L2>-<
 ```bash
 ./target/release/examples/bulletou \
     --eval-type NNUE_HALFKP \
-    --arch 1024x2-8-64 \
+    --arch NNUE_halfkp_1024x2_8_64 \
     --teacher teachers/
 ```
 
-`--arch` を省略するとデフォルト `256x2-32-32` が適用される。同じ `--arch` フラグが全ての NNUE / SFNN eval-type (`NNUE_HALFKP`, `NNUE_KP`, `NNUE_KA2`, `NNUE_HALFKPE9`, `NNUE_HALFKPVM`, `SFNN_*`) で使える。上記の表に無いサイズ (例: `--arch 256x2-64-64`) も実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ triple のアーキテクチャヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
+`--arch` を省略すると eval-type ごとのデフォルトが適用される。たとえば `NNUE_HALFKP` は `NNUE_halfkp_256x2_32_32`、`NNUE_KP` は `NNUE_kp_256x2_32_32`。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 

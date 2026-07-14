@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-L1 / L2 / L3 サイズは `--arch` で自由に指定できる (`<L1>x2-<L2>-<L3>`)。デフォルトは K-P 系と同じ `256x2-32-32` だが、自由形式の利点を活かして例えば `--arch 256x2-64-64` のように **後段の hidden を厚く**して、HalfKA に比べて KA2 が持たない king-anchor クロス積を後段で多少補う、という使い方ができる。以下はデフォルト構成の図:
+L1 / L2 / L3 サイズは `--arch NNUE_ka2_<L1>x2_<L2>_<L3>` で指定する。デフォルトは K-P 系と同じ `NNUE_ka2_256x2_32_32` だが、自由形式の利点を活かして例えば `--arch NNUE_ka2_256x2_64_64` のように **後段の hidden を厚く**して、HalfKA に比べて KA2 が持たない king-anchor クロス積を後段で多少補う、という使い方ができる。以下はデフォルト構成の図:
 
 ```
 将棋の局面
@@ -71,7 +71,7 @@ K-A2 は表現力的に K-P と HalfKA_hm2 の中間: 駒特徴量側にも両�
 
 ### コマンド
 
-標準の 4 層 NNUE (デフォルト `--arch 256x2-32-32`):
+標準の 4 層 NNUE (デフォルト `--arch NNUE_ka2_256x2_32_32`):
 
 ```bash
 ./target/release/examples/bulletou \
@@ -85,7 +85,7 @@ hidden を厚くする (256x2 FT、64 次元 hidden):
 ```bash
 ./target/release/examples/bulletou \
     --eval-type NNUE_KA2 \
-    --arch 256x2-64-64 \
+    --arch NNUE_ka2_256x2_64_64 \
     --teacher teachers/
 ```
 
@@ -132,10 +132,10 @@ L1 / L2 / Output 層は同じ `--arch` の下で HalfKP / K-P / K-A2 で byte-id
 学習結果の `nn.bin` は、`--arch` の triple と一致するアーキテクチャヘッダで build されたやねうら王でしか load できない。対応する edition 名を `make` に渡してビルドする:
 
 ```bash
-# NNUE_KA2 --arch 256x2-32-32 (デフォルト) の場合
+# NNUE_KA2 --arch NNUE_ka2_256x2_32_32 (デフォルト) の場合
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_32_32
 
-# NNUE_KA2 --arch 256x2-64-64 の場合
+# NNUE_KA2 --arch NNUE_ka2_256x2_64_64 の場合
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
 # SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3 の場合
@@ -149,8 +149,8 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--eval-type` | `NNUE_KA2` (4 層) または `SFNN_KA2` (LayerStacks-1536) | (必須) |
-| `--arch` | 自由形式 `<L1>x2-<L2>-<L3>` (`L1` は 32 の倍数) | `256x2-32-32` |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` (`L1` は 32 の倍数) | `NNUE_ka2_256x2_32_32` |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KA2-256x2-32-32`) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 
 全フラグ一覧は [HalfKP 学習](halfkp.md) を参照 (NNUE family 全体で同じ)。

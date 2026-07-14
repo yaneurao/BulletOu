@@ -10,7 +10,7 @@ The closely-related `--eval-type SFNN_KA2` trains the same input feature with th
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch` (free-form `<L1>x2-<L2>-<L3>`). The default is `256x2-32-32` matching the K-P network shape, but free-form is meant to be exploited here — for example `--arch 256x2-64-64` doubles the post-FT hidden capacity to make up for KA2's lack of king-anchor cross product (compared to HalfKA). Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch NNUE_ka2_<L1>x2_<L2>_<L3>`. The default is `NNUE_ka2_256x2_32_32` matching the K-P network shape, but free-form is meant to be exploited here — for example `--arch NNUE_ka2_256x2_64_64` doubles the post-FT hidden capacity to make up for KA2's lack of king-anchor cross product (compared to HalfKA). Below shows the default:
 
 ```
 Shogi position
@@ -71,7 +71,7 @@ K-A2 sits between K-P and HalfKA_hm2 in expressiveness: it lets the network see 
 
 ### Command
 
-Standard 4-layer NNUE network (default `--arch 256x2-32-32`):
+Standard 4-layer NNUE network (default `--arch NNUE_ka2_256x2_32_32`):
 
 ```bash
 ./target/release/examples/bulletou \
@@ -85,7 +85,7 @@ Wider hidden layers (256x2 FT, 64-dim hidden):
 ```bash
 ./target/release/examples/bulletou \
     --eval-type NNUE_KA2 \
-    --arch 256x2-64-64 \
+    --arch NNUE_ka2_256x2_64_64 \
     --teacher teachers/
 ```
 
@@ -132,10 +132,10 @@ L1 / L2 / Output layers are byte-identical between HalfKP / K-P / K-A2 for the s
 The trained `nn.bin` requires a YaneuraOu build whose architecture header matches your `--arch` triple. Build by passing the matching edition name:
 
 ```bash
-# For NNUE_KA2 --arch 256x2-32-32 (default)
+# For NNUE_KA2 --arch NNUE_ka2_256x2_32_32 (default)
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_32_32
 
-# For NNUE_KA2 --arch 256x2-64-64
+# For NNUE_KA2 --arch NNUE_ka2_256x2_64_64
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
 # For SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3
@@ -149,8 +149,8 @@ YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the
 | Flag | Meaning | Default |
 |---|---|---|
 | `--eval-type` | `NNUE_KA2` (4-layer) or `SFNN_KA2` (LayerStacks-1536) | (required) |
-| `--arch` | Free-form `<L1>x2-<L2>-<L3>` (`L1` must be a multiple of 32) | `256x2-32-32` |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` (`L1` must be a multiple of 32) | `NNUE_ka2_256x2_32_32` |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KA2-256x2-32-32`) |
+| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 
 See [HalfKP Training](halfkp.md) for the full flag list (training schedule / save / resume / log flags are identical across the NNUE family).
