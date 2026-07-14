@@ -79,7 +79,7 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 ⚠️ **`--lr-min` は `step` / `step_gamma` では必ず `> 0`**: `step` は geometric の式 `lr_max × (lr_min/lr_max)^t` が `lr_min = 0` だと破綻し、`step_gamma` では decay の下限として `lr_min` を使うため、どちらも CLI 起動時に正値を要求します。`1e-5` 〜 `1e-6` あたりが典型。cos は 0 でも数学的に動きますが、警告は出ます。
 
-実際の lr 推移は `<NNNN>/learn.log` の `lr` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
+実際の lr 推移は `<NNNN>/learn.log` の `lr_start` / `lr_end` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
 
 #### nnue-pytorch の StepLR 条件に寄せる
 

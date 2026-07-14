@@ -18,7 +18,7 @@ checkpoints/.../
 - `<output>/resume-config.txt` と現在の学習設定を比較し、一致した場合だけ auto resume する
 - 最大番号の `state.bin` から重みと Adam moments を復元
 - 新 save は既存最大番号の次から書く (前例で `0003/` まであれば `0004/` から)
-- `learn.log` (累積版) には新 run の CSV 行がそのまま追記される。LR scheduler は run ごとに reset されるため superbatch カウンタは 1 から再開するが、`positions` 列は累積される (新 run 開始時に既存 `learn.log` の最大 positions を読み取って続きから書く)
+- `summary-learn.log` (累積版) には新 run の CSV 行がそのまま追記される。LR scheduler は run ごとに reset されるため superbatch カウンタは 1 から再開するが、`positions` 列は累積される (新 run 開始時に既存 `summary-learn.log` の最大 positions を読み取って続きから書く)
 
 `--superbatches`、`--lr-schedule`、`--lr`、`--lr-min`、`--batch-size` などを変えると、既存 checkpoint は同じ `--tag` でも自動復元されない。これは設定変更に気づかず古い実験を引き継ぐ事故を避けるため。
 

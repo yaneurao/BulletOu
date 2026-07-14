@@ -14,7 +14,7 @@
 
 ```
 checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
-├── learn.log                          ← 全 run / resume を連結した累積ログ
+├── summary-learn.log                  ← 全 run / resume を連結した sb 単位の累積ログ
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Adam moments
@@ -33,22 +33,22 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ## 7.2 学習ログ (`learn.log`) の読み方
 
-学習中・終了後の loss 推移は `<output>/learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。どちらも **同じ 9 列 CSV** フォーマット。
+学習中・終了後の loss 推移は `<output>/summary-learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。列数は違い、`summary-learn.log` は superbatch 境界だけ、各 `0NNN/learn.log` は per-batch snapshot。
 
 ### どっちを見るか
 
-- **トップレベル `<output>/learn.log`** — 全 run / resume を **連結した累積版**。普段はこれを見る。
+- **トップレベル `<output>/summary-learn.log`** — 全 run / resume を **連結した累積版**。普段はこれを見る。
 - **各 `0NNN/learn.log`** — その save 時点までのスナップショット。学習途中に「save 0005 の時点でどうだったか」を見たいときに使う。
 
 ### CSV のサンプル
 
 ```csv
-eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,0.6234,0.001,1.000,524288,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,0.5891,0.001,1.000,1048576,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,0.5510,0.001,1.000,1572864,teachers/
+eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,524288,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,1048576,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,1572864,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,0.4523,0.001,1.000,100532224,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100532224,teachers/
 ...
 ```
 
@@ -62,9 +62,12 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
 | `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
-| `value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
-| `lr` | その時点の学習率 (StepLR 由来) | `0.001` |
-| `lambda` | `--lambda` 値 (1 run 内で定数、3 桁固定) | `1.000` |
+| `test_value_accuracy` | `--test-teacher` の検証 accuracy。sb 境界行だけ実値、それ以外は `-` | `0.583784` |
+| `test_value_loss` | `--test-teacher` の検証 loss。sb 境界行だけ実値、それ以外は `-` | `0.129676` |
+| `train_value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
+| `lr_start` | その行の区間開始時の学習率。summary 行では superbatch 開始 LR | `0.001000` |
+| `lr_end` | その行の最後の batch で使った学習率。summary 行では superbatch 終端側 LR | `0.000934` |
+| `lambda` | `--lambda` 値 (1 run 内で定数、6 桁固定) | `1.000000` |
 | `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `524288` |
 | `teacher` | `--teacher` の値 | `teachers/` |
 
@@ -77,25 +80,25 @@ NNUE 系は `--arch` を `eval` 列に含める (出力ディレクトリ名と�
 ```python
 import pandas as pd
 
-df = pd.read_csv("checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/learn.log")
+df = pd.read_csv("checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/summary-learn.log")
 print(df.shape)        # 全行数
 print(df.tail())       # 最後の数行
-print(df["value_loss"].describe())   # loss の統計
+print(df["train_value_loss"].describe())   # loss の統計
 ```
 
-9 列 + CSV header 付きなので `pd.read_csv` で列名は自動取得される。
+CSV header 付きなので `pd.read_csv` で列名は自動取得される。
 
 ### 学習が順調かを見るチェックリスト
 
 学習が正しく動いている場合の典型的な兆候:
 
-1. **`value_loss` が概ね単調減少**
+1. **`train_value_loss` が概ね単調減少**
    - 学習開始直後は急に下がり、徐々に減衰
    - 1 superbatch を消化するごとに目に見えて下がるのが理想
    - 1 superbatch まわっても下がらない場合は `--lr` が大きすぎる、または教師サイズが学習器のキャパに対して小さすぎる可能性
    - **periodic な loss スパイク** や局所的な loss の偏りが見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。BulletOu は学習時に追加シャッフルしないので、対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
 
-2. **`lr` がスケジュール通りに動いている**
+2. **`lr_start` / `lr_end` がスケジュール通りに動いている**
    - `--lr-schedule step` (デフォルト): 1 epoch (= `--superbatches × sb_size` 局面) で `--lr` (lr_max) → `--lr-min` を **geometric** (= 対数線形) に減衰、epoch 末で warm restart して lr_max に戻る
    - `--lr-schedule cos`: cosine annealing で `--lr` (lr_max) → `--lr-min` を 1 epoch (= `--superbatches × sb_size` 局面) で 1 周期。各 cycle 末 (= epoch 末) で warm restart して `--lr` に戻る
    - 期待通り変化していないなら lr 系フラグの値を見直す ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)
@@ -116,8 +119,8 @@ import matplotlib.pyplot as plt
 
 # positions を時系列軸に
 plt.figure(figsize=(12, 4))
-plt.plot(df["positions"], df["value_loss"])
-plt.xlabel("positions"); plt.ylabel("value_loss")
+plt.plot(df["positions"], df["train_value_loss"])
+plt.xlabel("positions"); plt.ylabel("train_value_loss")
 plt.title("training loss curve")
 plt.savefig("loss_curve.png")
 ```

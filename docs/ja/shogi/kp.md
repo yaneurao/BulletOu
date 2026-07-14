@@ -77,13 +77,13 @@ K-P は HalfKP と並んで NNUE 系評価関数の最初期に追加された (
     --output checkpoints/my-kp
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` だけが違う。
 
 ### 保存レイアウト
 
 ```
 checkpoints/my-kp/
-├── learn.log
+├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Adam moments

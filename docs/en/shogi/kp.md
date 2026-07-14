@@ -77,13 +77,13 @@ KP was introduced alongside HalfKP in the same architecture family, with the sam
     --output checkpoints/my-kp
 ```
 
-Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `learn.log`) is identical to [HalfKP](halfkp.md) — only `--eval-type` differs.
+Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--eval-type` differs.
 
 ### Save layout
 
 ```
 checkpoints/my-kp/
-├── learn.log
+├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
 │   ├── state.bin                      ← resume data (weights + Adam moments)

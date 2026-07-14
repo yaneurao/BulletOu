@@ -98,13 +98,13 @@ SFNN-1536 architecture with KA2 input:
     --teacher teachers/
 ```
 
-Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `learn.log`) is identical to [HalfKP](halfkp.md) — only `--eval-type` (and the input dim) differs.
+Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--eval-type` (and the input dim) differs.
 
 ### Save layout
 
 ```
 checkpoints/my-ka2/
-├── learn.log
+├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
 │   ├── state.bin                      ← resume data (weights + Adam moments)

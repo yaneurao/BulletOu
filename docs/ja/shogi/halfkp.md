@@ -50,7 +50,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 
 ```
 checkpoints/my-halfkp/
-├── learn.log                          ← トップレベルの通算ログ (全 run / resume を連結)
+├── summary-learn.log                  ← トップレベルの通算ログ (全 run / resume を連結)
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換の NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Adam moments

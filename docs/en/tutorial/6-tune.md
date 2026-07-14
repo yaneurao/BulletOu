@@ -79,7 +79,7 @@ The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_
 
 ⚠️ **`--lr-min` must be `> 0` for `step` / `step_gamma`**: `step`'s geometric formula breaks when `lr_min = 0`, and `step_gamma` uses `lr_min` as its decay floor, so the CLI requires a positive value for both. `1e-5`–`1e-6` is typical. `cos` accepts 0 mathematically (with a warning).
 
-Inspect `<NNNN>/learn.log`'s `lr` column to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
+Inspect `<NNNN>/learn.log`'s `lr_start` / `lr_end` columns to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
 
 #### Matching nnue-pytorch's StepLR condition
 

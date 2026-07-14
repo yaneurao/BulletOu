@@ -98,13 +98,13 @@ SFNN-1536 architecture を KA2 入力で:
     --teacher teachers/
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` (および入力次元) だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` (および入力次元) だけが違う。
 
 ### 保存レイアウト
 
 ```
 checkpoints/my-ka2/
-├── learn.log
+├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Adam moments

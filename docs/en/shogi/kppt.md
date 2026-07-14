@@ -62,7 +62,7 @@ When training finishes, the saved checkpoints are laid out as zero-padded number
 
 ```
 checkpoints/my-kppt/
-├── learn.log                          ← top-level cumulative log across all runs/resumes
+├── summary-learn.log                  ← top-level cumulative log across all runs/resumes
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
@@ -80,22 +80,22 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` is a 9-column CSV with a header row, the same format used by every eval-type:
+`learn.log` is a CSV with a header row, using the same schema as other eval-types:
 
 ```
-eval,epoch,superbatch,curr_batch,value_loss,lr,lambda,positions,teacher
-KPPT/kk,1,1,32,0.234,0.001,1.000,524288,teachers/
-KPPT/kk,1,1,64,0.232,0.001,1.000,1048576,teachers/
+eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
+KPPT/kk,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,524288,teachers/
+KPPT/kk,1,1,64,-,-,0.232,0.000999,0.000998,1.000000,1048576,teachers/
 ...
-KPPT/kkp,1,1,32,0.156,0.001,1.000,524288,teachers/
+KPPT/kkp,1,1,32,-,-,0.156,0.001000,0.000999,1.000000,524288,teachers/
 ...
-KPPT/kpp,1,1,32,0.245,0.001,1.000,524288,teachers/
+KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 ...
 ```
 
 The `eval` column uses the **`<eval-type>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows. KPPT-family eval types ignore `--arch`, so no arch suffix appears here (unlike NNUE rows, which embed it as `NNUE_HALFKP-NNUE_halfkp_256x2_32_32`).
 
-Per-save snapshot `0NNN/learn.log` and the top-level `<output>/learn.log` use the exact same format. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md).
+Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.log` have different granularities but the same column meanings. `summary-learn.log` keeps only sb-boundary rows and omits `curr_batch`. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md).
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 

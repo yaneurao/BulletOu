@@ -156,24 +156,24 @@ sb 列は intrinsic に **per-epoch カウンタ** (= 各 epoch で 1..`--superb
 
 2 種類の CSV ログがあり、列数が違う。両方ともヘッダ行つき、区切り文字はカンマ、行ごとの末尾改行あり。pandas / Excel でそのまま load 可能。
 
-### per-save `<output>/000N/learn.log` (= 11 列、per-batch snapshot)
+### per-save `<output>/000N/learn.log` (= 12 列、per-batch snapshot)
 
 ```
-eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.000934,1.000000,524288,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000934,1.000000,1048576,teachers/
+eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,524288,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000999,0.000998,1.000000,1048576,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6104,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6104,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,100007936,teachers/
 ```
 
 bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= `--batches-per-superbatch` ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
 
-### top-level `<output>/summary-learn.log` (= 10 列、sb 境界のみ抽出)
+### top-level `<output>/summary-learn.log` (= 11 列、sb 境界のみ抽出)
 
 ```
-eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.000934,1.000000,99614720,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000753,1.000000,199622656,teachers/
+eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,100007936,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,200015872,teachers/
 ```
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
@@ -189,9 +189,10 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 | `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。sb 境界行のみ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
 | `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。sb 境界行のみ実値、それ以外は `-` |
 | `train_value_loss` | bullet が最後の 32 batch で観測した training loss (移動平均ではなく 32 batch ウィンドウの即値) |
-| `lr` | その時点の学習率 (positions-based なので `cb_prior_position + 各 batch までの累積` から再計算可能) |
+| `lr_start` | その行が表す区間の開始時点の学習率。summary 行ではその superbatch の開始 LR |
+| `lr_end` | その行が表す区間の最後の batch で使った学習率。summary 行ではその superbatch の終端側 LR |
 | `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |
-| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。常に単調増加 |
+| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × batches_per_superbatch × batch_size` を書く。常に単調増加 |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
 
 ### 累積ロジック

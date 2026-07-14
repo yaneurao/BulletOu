@@ -2561,9 +2561,9 @@ fn run_kppt_all(args: &Args) {
     }
 }
 
-/// CSV header for `learn.log`. Both the top-level `<output>/learn.log` and
-/// each per-save `0NNN/learn.log` start with this line followed by data
-/// rows. Column meanings (9 total):
+/// CSV header for per-save `0NNN/learn.log`. The top-level
+/// `<output>/summary-learn.log` uses [`SUMMARY_LEARN_LOG_HEADER`] because
+/// it drops `curr_batch`. Column meanings (12 total):
 ///
 /// - `eval`: mirror of the output-dir name (`<eval-type>[-<arch>]`)
 ///   plus a `/<component>` suffix for multi-component eval types. For
@@ -2581,19 +2581,18 @@ fn run_kppt_all(args: &Args) {
 ///   96, ...). Combine with `superbatch` for "(superbatch − 1) ×
 ///   batches_per_superbatch + curr_batch" to get the total batch count.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
-/// - `lr`: learning rate at that superbatch (StepLR-derived).
+/// - `lr_start`: learning rate at the start of the row's interval.
+/// - `lr_end`: learning rate used by the last batch in the row's interval.
 /// - `lambda`: `--lambda` value at that point (constant per run), formatted
 ///   to three decimal places (`1.000`, `0.500`, ...).
 /// - `positions`: cumulative number of teacher positions consumed so far
 ///   for this component, including positions from prior runs detected
-///   in the existing top-level `learn.log` (resume-aware). Within a run,
-///   the value resets at epoch boundaries when `--max-epochs > 1` — a
-///   known v1 limitation.
+///   in the existing top-level `summary-learn.log` (resume-aware).
 /// - `teacher`: the user's `--teacher` CLI value verbatim, RFC-4180
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str =
-    "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher";
+    "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
 /// Schema for the top-level `<output>/summary-learn.log`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
@@ -2601,7 +2600,7 @@ const LEARN_LOG_HEADER: &str =
 /// row), where `curr_batch` is always the last batch index of that sb
 /// (= `batches_per_superbatch` rounded down) and conveys no info.
 const SUMMARY_LEARN_LOG_HEADER: &str =
-    "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher";
+    "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
@@ -2611,7 +2610,7 @@ const PLATEAU_EPOCH_DONE_NAME: &str = "plateau_epoch_done.txt";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
 /// raw 3-column `log.txt` rows (`superbatch,curr_batch,loss`) into the
-/// 11-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
+/// 12-column `learn.log` CSV rows defined by [`LEARN_LOG_HEADER`].
 #[derive(Clone, Debug)]
 struct LogContext {
     eval_type: &'static str,
@@ -2699,9 +2698,26 @@ impl LogContext {
 
     /// Cumulative teacher positions consumed up to `(superbatch, curr_batch)`
     /// within the current epoch, plus the `position_offset` carried over
-    /// from prior runs (read from the existing top-level `learn.log`).
+    /// from prior runs (read from the existing top-level `summary-learn.log`).
     fn positions_at(&self, superbatch: usize, curr_batch: usize, position_offset: usize) -> usize {
         position_offset + (superbatch.saturating_sub(1) * self.batches_per_superbatch + curr_batch) * self.batch_size
+    }
+
+    fn lr_at_positions(&self, positions: usize) -> f32 {
+        match self.lr_schedule {
+            LrScheduleKind::Step => {
+                PositionsLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64)
+            }
+            LrScheduleKind::StepGamma => GammaStepLR::lr_at_positions(
+                self.lr_start,
+                self.lr_min,
+                self.lr_step_gamma,
+                self.lr_step_positions,
+                positions as u64,
+            ),
+            LrScheduleKind::Cos => CosineLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64),
+            LrScheduleKind::Plateau => self.lr_override.unwrap_or(self.lr_start),
+        }
     }
 }
 
@@ -2745,7 +2761,7 @@ impl From<TestMetrics> for PlateauMetrics {
 }
 
 /// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
-/// per line) into the enriched 11-column CSV body (no header). The header
+/// per line) into the enriched 12-column CSV body (no header). The header
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
 /// body can be concatenated under a single header by `assemble_numbered_dirs`.
 ///
@@ -2761,6 +2777,7 @@ fn enrich_bullet_log_to_csv(
     component: &str,
     position_offset: usize,
     test_metrics: Option<TestMetrics>,
+    last_superbatch_complete: bool,
 ) -> String {
     let mut out = String::new();
     let (test_acc_filled, test_loss_filled): (String, String) = match test_metrics {
@@ -2788,7 +2805,10 @@ fn enrich_bullet_log_to_csv(
         .collect();
     let n = parsed.len();
     for (i, &(local_sb, b, train_loss)) in parsed.iter().enumerate() {
+        let prev_b = if i > 0 && parsed[i - 1].0 == local_sb { parsed[i - 1].1 } else { 0 };
         let is_sb_boundary = i + 1 == n || parsed[i + 1].0 != local_sb;
+        let boundary_is_complete = is_sb_boundary && (last_superbatch_complete || i + 1 < n);
+        let display_b = if boundary_is_complete { ctx.batches_per_superbatch } else { b };
         let (test_acc_field, test_loss_field) =
             if is_sb_boundary { (test_acc_filled.as_str(), test_loss_filled.as_str()) } else { ("-", "-") };
         // Absolute epoch: bullet's `for epoch in 1..=max_epochs` counter
@@ -2800,25 +2820,15 @@ fn enrich_bullet_log_to_csv(
         // already carries the cumulative count from prior runs — the
         // formula then adds (local_sb-1)*sb_size + b*batch_size to the
         // carry-over to give an honest cumulative position count.
-        let positions = ctx.positions_at(local_sb, b, position_offset);
-        // LR: drops based on cumulative `positions` count (= matches
-        // the trainer's `PositionsLR` / `CosineLR`). The displayed sb
-        // (`absolute_sb`) is purely informational — the LR formula is
-        // independent of bullet's superbatch counter.
-        let lr = match ctx.lr_schedule {
-            LrScheduleKind::Step => {
-                PositionsLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64)
-            }
-            LrScheduleKind::StepGamma => GammaStepLR::lr_at_positions(
-                ctx.lr_start,
-                ctx.lr_min,
-                ctx.lr_step_gamma,
-                ctx.lr_step_positions,
-                positions as u64,
-            ),
-            LrScheduleKind::Cos => CosineLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64),
-            LrScheduleKind::Plateau => ctx.lr_override.unwrap_or(ctx.lr_start),
+        let positions = ctx.positions_at(local_sb, display_b, position_offset);
+        let lr_start_positions = if is_sb_boundary {
+            ctx.positions_at(local_sb, 0, position_offset)
+        } else {
+            ctx.positions_at(local_sb, prev_b, position_offset)
         };
+        let lr_end_positions = positions.saturating_sub(ctx.batch_size);
+        let lr_start = ctx.lr_at_positions(lr_start_positions);
+        let lr_end = ctx.lr_at_positions(lr_end_positions);
         // Mirror the output-dir name (`<eval-type>[-<arch>]`) plus a
         // `/<component>` suffix for multi-component eval types (KPPT
         // family). NNUE rows are single-component so the slash is
@@ -2840,10 +2850,11 @@ fn enrich_bullet_log_to_csv(
             Err(_) => std::borrow::Cow::Borrowed(train_loss),
         };
         out.push_str(&format!(
-            "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr:.6},{lambda:.6},{positions},{teacher}\n",
+            "{eval},{epoch},{sb},{b},{ta},{tl},{train},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher}\n",
             eval = eval_field,
             epoch = absolute_epoch,
             sb = local_sb,
+            b = display_b,
             ta = test_acc_field,
             tl = test_loss_field,
             train = train_field,
@@ -2854,38 +2865,48 @@ fn enrich_bullet_log_to_csv(
     out
 }
 
-/// Read the existing top-level `<output>/learn.log` and return the maximum
+/// Read the existing top-level `<output>/summary-learn.log` and return the maximum
 /// `positions` value seen per component. Used at the start of a run to
 /// pick up the cumulative offset across resumes.
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
 /// Reads the **summary** log [`SUMMARY_LEARN_LOG_NAME`] (`<output>/
-/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (10
+/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (11
 /// columns, NO `curr_batch`):
 ///
 ///   eval, epoch, superbatch, test_value_accuracy, test_value_loss,
-///   train_value_loss, lr, lambda, **positions**, teacher
+///   train_value_loss, lr_start, lr_end, lambda, **positions**, teacher
 ///
-/// `positions` is at index 8. `splitn(10, ',')` so any commas inside
+/// `positions` is at index 9 in the current schema. Older summary logs
+/// used a single `lr` column and had `positions` at index 8; accept both
+/// when reading offsets so users can still resume far enough to receive
+/// the explicit schema-mismatch warning on append.
+///
+/// `splitn` keeps any commas inside
 /// the trailing `teacher` field are preserved. Component is extracted
 /// from the `eval` column at index 0: a slash-suffix (e.g. `KPPT/kk`)
 /// names the component explicitly; absence of a slash maps to `"nnue"`.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
     let mut map = std::collections::BTreeMap::new();
     let Ok(content) = std::fs::read_to_string(top_level_log) else { return map };
+    let mut positions_index = 9usize;
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+        if line.starts_with("eval,") {
+            positions_index = if line.contains(",lr_start,lr_end,") { 9 } else { 8 };
             continue;
         }
-        let parts: Vec<&str> = line.splitn(10, ',').collect();
-        if parts.len() < 9 {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(positions_index + 2, ',').collect();
+        if parts.len() <= positions_index {
             continue;
         }
         let eval = parts[0];
         let component = eval.split_once('/').map(|(_, c)| c).unwrap_or("nnue");
-        let Ok(positions) = parts[8].parse::<usize>() else { continue };
+        let Ok(positions) = parts[positions_index].parse::<usize>() else { continue };
         let entry = map.entry(component.to_string()).or_insert(0);
         if positions > *entry {
             *entry = positions;
@@ -2968,8 +2989,9 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     let n = latest_idx?;
     let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
     let content = std::fs::read_to_string(&learn_log).ok()?;
-    // 11-column rows: eval, epoch, sb, batch, test_value_accuracy,
-    // test_value_loss, train_value_loss, lr, lambda, positions, teacher.
+    // 12-column rows: eval, epoch, sb, batch, test_value_accuracy,
+    // test_value_loss, train_value_loss, lr_start, lr_end, lambda,
+    // positions, teacher.
     // sb is at column index 2. All rows in a single per-save dir share the
     // same sb (bullet flushes log.txt at save time and the dir captures one
     // save event), so taking the max is robust whether the schedule is
@@ -3055,8 +3077,8 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
     let n = latest_idx?;
     let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
     let content = std::fs::read_to_string(&learn_log).ok()?;
-    // Same 11-column layout as read_latest_saved_superbatch. teacher
-    // is the trailing field (index 10). splitn(11, ',') keeps any
+    // Same 12-column layout as read_latest_saved_superbatch. teacher
+    // is the trailing field (index 11). splitn(12, ',') keeps any
     // commas inside teacher (= comma-separated `--teacher` list)
     // as a single CSV field.
     let mut last_teacher: Option<String> = None;
@@ -3065,18 +3087,18 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(11, ',').collect();
-        if parts.len() < 11 {
+        let parts: Vec<&str> = line.splitn(12, ',').collect();
+        if parts.len() < 12 {
             continue;
         }
-        last_teacher = Some(parts[10].trim().to_string());
+        last_teacher = Some(parts[11].trim().to_string());
     }
     last_teacher
 }
 
 /// Append the body of the latest save dir's `learn.log` (already enriched
-/// 11-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
-/// the top-level `<output>/learn.log`, writing the CSV header on first
+/// 12-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
+/// the top-level `<output>/summary-learn.log`, writing the CSV header on first
 /// file creation. The result is a single pure CSV — no section headers,
 /// no separators — that pandas / Excel can load directly.
 ///
@@ -3102,7 +3124,7 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
 
     // Detect schema mismatch on existing file. The summary file is
     // assumed to start with [`SUMMARY_LEARN_LOG_HEADER`] followed by
-    // 10-col data rows.
+    // 11-col data rows.
     if top_existed {
         let mut head_buf = String::new();
         if let Ok(mut f) = std::fs::File::open(&top) {
@@ -3130,7 +3152,7 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
     }
 
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
-    // Per-dir learn.log is 11-col (includes curr_batch); strip its
+    // Per-dir learn.log is 12-col (includes curr_batch); strip its
     // header before filtering data rows.
     let body_no_header = body
         .strip_prefix(LEARN_LOG_HEADER)
@@ -3140,20 +3162,20 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
         writeln!(file, "{SUMMARY_LEARN_LOG_HEADER}")?;
     }
     // Keep only the last row of each (eval, sb) group and drop the
-    // `curr_batch` column (= index 3 in the 11-col per-dir layout).
+    // `curr_batch` column (= index 3 in the 12-col per-dir layout).
     let lines: Vec<&str> = body_no_header.lines().filter(|l| !l.is_empty()).collect();
     let key_of = |line: &str| -> Option<(String, String)> {
-        let parts: Vec<&str> = line.splitn(11, ',').collect();
+        let parts: Vec<&str> = line.splitn(12, ',').collect();
         if parts.len() < 3 {
             return None;
         }
         Some((parts[0].to_string(), parts[2].to_string()))
     };
     let drop_curr_batch = |line: &str| -> Option<String> {
-        // Split with splitn(11, ',') so the trailing `teacher` field
+        // Split with splitn(12, ',') so the trailing `teacher` field
         // keeps any commas. Drop index 3 (`curr_batch`).
-        let parts: Vec<&str> = line.splitn(11, ',').collect();
-        if parts.len() < 11 {
+        let parts: Vec<&str> = line.splitn(12, ',').collect();
+        if parts.len() < 12 {
             return None;
         }
         let mut out = String::with_capacity(line.len());
@@ -3289,7 +3311,7 @@ fn assemble_numbered_dirs(
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
         std::fs::write(dst.join("state.bin"), &state_buf)?;
         // Each component's bullet `log.txt` is the raw
-        // `superbatch,curr_batch,loss` CSV. Enrich each into the 9-column
+        // `superbatch,curr_batch,loss` CSV. Enrich each into the current
         // `learn.log` format (header + data rows for kk, then kkp, then
         // kpp). Pure CSV, no separator between components — the
         // `eval` column's `<eval-type>/<component>` suffix distinguishes them.
@@ -3305,7 +3327,7 @@ fn assemble_numbered_dirs(
             // KPPT family does not run --test-teacher validation (out tensor
             // shape doesn't match the single-scalar assumption); always emit
             // `-` for the test_value_* columns by passing None.
-            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior, None));
+            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior, None, true));
         }
         std::fs::write(dst.join("learn.log"), log_buf)?;
         eprintln!("  -> {}/", dst.display());
@@ -4228,11 +4250,11 @@ macro_rules! run_training_inline_nnue {
         };
         let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && auto_resume_sb_raw.is_some();
         cb_ctx.epoch_offset = if mid_epoch_resume { max_epoch_in_log.saturating_sub(1) } else { max_epoch_in_log };
-        // The LR column is derived from `positions` (= prior + per-row
+        // The LR columns are derived from `positions` (= prior + per-row
         // offset within this run), so we always need the cumulative
         // carry-over from the existing top-level log here so the enrich
         // path's `positions` matches what `PositionsLR` saw.
-        // この変数は `cb_top_level_log` (= `<output>/learn.log`) の最大
+        // この変数は `cb_top_level_log` (= `<output>/summary-learn.log`) の最大
         // positions 値を保持する。enrich path で「この run の sb 1 が始まる
         // 前までに何局面学習されたか」を表し、各 save 行の positions 列に
         // `prior + (sb-1)*sb_size + b*batch_size` で書き込まれる。
@@ -4324,7 +4346,7 @@ macro_rules! run_training_inline_nnue {
 
         // Per-save incremental finalize: rename `<net_id>-<sb>` →
         // `<NNNN>/`, generate per-dir `learn.log` (with per-save test
-        // metrics), append to top-level `learn.log`. Done OUTSIDE
+        // metrics), append to top-level `summary-learn.log`. Done OUTSIDE
         // `trainer.run` (= once per save chunk) so we can call
         // `trainer.eval_packed_batch` for validation between chunks.
         // Killing training mid-run still leaves a clean numbered layout
@@ -4422,7 +4444,7 @@ macro_rules! run_training_inline_nnue {
                     persistent_hcpe_loader = new_hcpe_loader(0, false);
                 }
             }
-            // Epoch >= 2: re-read the top-level learn.log so `cb_prior_position`
+            // Epoch >= 2: re-read the top-level summary-learn.log so `cb_prior_position`
             // picks up the cumulative positions across the previous epoch(s).
             // Without this, bullet's sb counter reset at trainer.run boundary
             // would also reset the `positions` column.
@@ -4698,6 +4720,7 @@ macro_rules! run_training_inline_nnue {
                         idx,
                         cb_prior_position,
                         test_metrics,
+                        !is_partial_save,
                     ) {
                         Ok(dst) => {
                             cb_next_idx.set(idx + 1);
@@ -4897,6 +4920,7 @@ macro_rules! run_training_inline_nnue {
                 idx,
                 cb_prior_position,
                 test_metrics,
+                false,
             ) {
                 Ok(dst) => {
                     cb_next_idx.set(idx + 1);
@@ -5748,7 +5772,7 @@ where
 /// Single-component analogue of `assemble_numbered_dirs`: list `<net_id>-*/`
 /// (or `<net_id>-e<epoch>-<sb>/` for multi-epoch) under `output_dir`, sort
 /// by (epoch, sb), rename them to `0NNN/` starting at `existing_count + 1`,
-/// and enrich each dir's bullet-format `log.txt` into the 7-column CSV
+/// and enrich each dir's bullet-format `log.txt` into the current CSV
 /// `learn.log` shared with KPPT.
 /// Single-dir version of [`finalize_nnue_dirs`]: rename `src` to
 /// `output_dir/<idx:04>/` and convert its raw `log.txt` to the enriched
@@ -5763,13 +5787,14 @@ fn finalize_one_nnue_dir(
     idx: usize,
     prior_position: usize,
     test_metrics: Option<TestMetrics>,
+    last_superbatch_complete: bool,
 ) -> std::io::Result<std::path::PathBuf> {
     let dst = output_dir.join(format!("{idx:04}"));
     std::fs::rename(src, &dst)?;
     let log_txt = dst.join("log.txt");
     let learn_log = dst.join("learn.log");
     let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
-    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics);
+    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics, last_superbatch_complete);
     let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
     content.push_str(LEARN_LOG_HEADER);
     content.push('\n');
@@ -5812,7 +5837,7 @@ fn finalize_nnue_dirs(
         // Leftover dirs were not finalised by the per-save callback so we
         // also have no test metrics for them (validation runs in the
         // training loop, not in this fallback path).
-        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position, None)?;
+        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position, None, true)?;
         eprintln!("  -> {}/", dst.display());
     }
     Ok((existing_count + 1, existing_count + n))
@@ -5876,7 +5901,7 @@ mod tests {
     }
 
     /// `finalize_one_nnue_dir` が bullet 形式の checkpoint dir を `<NNNN>/`
-    /// に rename し、`log.txt` を 9-column の `learn.log` に変換することを確認。
+    /// に rename し、`log.txt` を current schema の `learn.log` に変換することを確認。
     /// per-superbatch save callback で呼ばれた場合の単発動作と等価。
     #[test]
     fn finalize_one_nnue_dir_renames_and_enriches() {
@@ -5911,7 +5936,14 @@ mod tests {
         };
 
         let dst = finalize_one_nnue_dir(
-            &tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None,
+            &tmp,
+            &src,
+            &ctx,
+            /*epoch=*/ 1,
+            /*idx=*/ 5,
+            /*prior=*/ 0,
+            /*test_metrics=*/ None,
+            true,
         )
         .expect("finalize ok");
 
@@ -5928,13 +5960,14 @@ mod tests {
         assert!(learn.starts_with(LEARN_LOG_HEADER), "learn.log should start with header");
         let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
         assert_eq!(body_lines.len(), 2, "two body rows expected");
-        // each row has 11 comma-separated fields (= LEARN_LOG_HEADER columns)
+        // each row has 12 comma-separated fields (= LEARN_LOG_HEADER columns)
         // and the two test_value_* columns are "-" because we passed None.
         for row in &body_lines {
-            assert_eq!(row.split(',').count(), 11, "row `{row}` should be 11 columns");
+            assert_eq!(row.split(',').count(), 12, "row `{row}` should be 12 columns");
             assert!(row.starts_with("SFNN_KA2-SFNN_ka2_1536_15_32_k3k3,"));
             // Columns: eval, epoch, sb, batch, test_value_accuracy,
-            // test_value_loss, train_value_loss, lr, lambda, positions, teacher
+            // test_value_loss, train_value_loss, lr_start, lr_end, lambda,
+            // positions, teacher
             // → indexes 4 and 5 should be "-"
             let cols: Vec<&str> = row.split(',').collect();
             assert_eq!(cols[4], "-", "test_value_accuracy should be '-' when no test_metrics");
@@ -6121,7 +6154,7 @@ mod tests {
             lr_override: None,
         };
         let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
-        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics)).unwrap();
+        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics), true).unwrap();
         let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
         let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
         assert_eq!(body_lines.len(), 2);
@@ -6129,11 +6162,11 @@ mod tests {
         // each sb (here: the second of two rows for sb=7) carries the
         // metric. Earlier rows show `-` for the test_value_* columns.
         let cols0: Vec<&str> = body_lines[0].split(',').collect();
-        assert_eq!(cols0.len(), 11);
+        assert_eq!(cols0.len(), 12);
         assert_eq!(cols0[4], "-", "non-boundary row's test_value_accuracy should be `-`");
         assert_eq!(cols0[5], "-", "non-boundary row's test_value_loss should be `-`");
         let cols1: Vec<&str> = body_lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 11);
+        assert_eq!(cols1.len(), 12);
         assert_eq!(cols1[4], "0.876500", "sb-boundary row carries test_value_accuracy");
         assert_eq!(cols1[5], "0.051200", "sb-boundary row carries test_value_loss");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6155,11 +6188,11 @@ mod tests {
         // Per-dir learn.log: 3 rows for sb=1, 2 rows for sb=2.
         let body = format!(
             "{header}\n\
-             E,1,1,32,-,-,0.10,0.001,1.000,524288,t.hcpe\n\
-             E,1,1,64,-,-,0.09,0.001,1.000,1048576,t.hcpe\n\
-             E,1,1,96,0.50,0.30,0.08,0.001,1.000,1572864,t.hcpe\n\
-             E,1,2,32,-,-,0.07,0.001,1.000,2097152,t.hcpe\n\
-             E,1,2,64,0.55,0.28,0.06,0.001,1.000,2621440,t.hcpe\n",
+             E,1,1,32,-,-,0.10,0.001,0.0009,1.000,524288,t.hcpe\n\
+             E,1,1,64,-,-,0.09,0.001,0.0008,1.000,1048576,t.hcpe\n\
+             E,1,1,96,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,t.hcpe\n\
+             E,1,2,32,-,-,0.07,0.001,0.0006,1.000,2097152,t.hcpe\n\
+             E,1,2,64,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,t.hcpe\n",
             header = LEARN_LOG_HEADER,
         );
         std::fs::write(dir.join("learn.log"), body).unwrap();
@@ -6169,15 +6202,17 @@ mod tests {
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER, "first line is summary header (no curr_batch)");
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
         // boundary row (b=64); intermediate rows dropped, and the
-        // curr_batch column itself is also stripped — leaving 10 cols.
+        // curr_batch column itself is also stripped — leaving 11 cols.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 10, "summary row has 10 cols (no curr_batch)");
+        assert_eq!(cols1.len(), 11, "summary row has 11 cols (no curr_batch)");
         assert_eq!(cols1[2], "1", "first kept row is sb=1");
         // Index 3 is now `test_value_accuracy` (was `curr_batch`).
         assert_eq!(cols1[3], "0.50", "col 3 is test_value_accuracy (curr_batch dropped)");
+        assert_eq!(cols1[6], "0.001", "lr_start is preserved");
+        assert_eq!(cols1[7], "0.0007", "lr_end is preserved");
         let cols2: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(cols2.len(), 10);
+        assert_eq!(cols2.len(), 11);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
         assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6446,10 +6481,12 @@ mod tests {
             lr_min: 0.00001,
             lr_override: Some(0.00025),
         };
-        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None);
+        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
-        let lr: f32 = cols[7].parse().unwrap();
-        assert!((lr - 0.00025).abs() < 1e-12, "plateau log should use exact override, got {lr}");
+        let lr_start: f32 = cols[7].parse().unwrap();
+        let lr_end: f32 = cols[8].parse().unwrap();
+        assert!((lr_start - 0.00025).abs() < 1e-12, "plateau lr_start should use exact override, got {lr_start}");
+        assert!((lr_end - 0.00025).abs() < 1e-12, "plateau lr_end should use exact override, got {lr_end}");
     }
 
     /// enrich path が `LrScheduleKind::Cos` のとき CosineLR を呼ぶことを確認。
@@ -6472,15 +6509,47 @@ mod tests {
             lr_override: None,
         };
         // batch=32, prior=0 → positions = 524,288 → t ≈ 0.00524 → lr ≈ lr_max
-        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 0, None);
+        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 0, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
-        let lr: f32 = cols[7].parse().unwrap();
-        assert!(lr > 0.0009, "near cycle start, lr should be near lr_max=0.001, got {lr}");
+        let lr_start: f32 = cols[7].parse().unwrap();
+        assert!(lr_start > 0.0009, "near cycle start, lr_start should be near lr_max=0.001, got {lr_start}");
         // Push to half a cycle = 50M positions → midpoint = 0.0005
-        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None);
+        let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
-        let lr: f32 = cols[7].parse().unwrap();
-        assert!((lr - 0.0005).abs() < 1e-4, "midpoint should be ~0.0005, got {lr}");
+        let lr_start: f32 = cols[7].parse().unwrap();
+        assert!((lr_start - 0.0005).abs() < 1e-4, "midpoint should be ~0.0005, got {lr_start}");
+    }
+
+    #[test]
+    fn enrich_full_save_uses_exact_superbatch_boundary_and_lr_range() {
+        let ctx = LogContext {
+            eval_type: "SFNN_HALFKA2",
+            arch: "SFNN_halfka2_1024_7_64_k3k3".to_string(),
+            lr_start: 0.001,
+            lambda: 1.0,
+            batch_size: 16384,
+            batches_per_superbatch: 2543,
+            teacher_csv: "teachers/c.hcpe".to_string(),
+            epoch_offset: 0,
+            lr_schedule: LrScheduleKind::Cos,
+            lr_period: 2543 * 12 * 16384,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
+            lr_min: 0.00001,
+            lr_override: None,
+        };
+
+        // bullet's raw log is emitted every 32 batches, so a full
+        // superbatch of 2543 batches may have its last raw row at 2528.
+        // For a completed save, the enriched boundary row must still use
+        // the exact superbatch end.
+        let body = enrich_bullet_log_to_csv("1,2528,0.10\n", &ctx, 1, "nnue", 0, None, true);
+        let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
+        assert_eq!(cols[3], "2543", "completed boundary row should display the exact sb batch count");
+        assert_eq!(cols[10], "41664512", "positions should be exact bps * batch_size, not last raw log batch");
+        assert_eq!(cols[7], "0.001000", "lr_start of sb1 should be lr_max");
+        let lr_end: f32 = cols[8].parse().unwrap();
+        assert!(lr_end < 0.001 && lr_end > 0.00098, "lr_end should be near the cosine value at sb end, got {lr_end}");
     }
 
     /// enrich の sb 列が bullet の local sb をそのまま表示すること、および
@@ -6507,18 +6576,21 @@ mod tests {
         // bullet's local sb in raw log is 1; enrich displays the local sb
         // verbatim (no cross-run shift — sb is per-epoch by design).
         let raw = "1,32,0.07\n1,64,0.06\n";
-        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None);
+        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None, false);
         let rows: Vec<&str> = body.lines().collect();
         assert_eq!(rows.len(), 2);
-        // Each row: eval, epoch, sb, batch, ta, tl, train, lr, lambda, positions, teacher
+        // Each row: eval, epoch, sb, batch, ta, tl, train,
+        // lr_start, lr_end, lambda, positions, teacher
         let cols0: Vec<&str> = rows[0].split(',').collect();
         assert_eq!(cols0[2], "1", "sb column = bullet's local sb");
         // positions = prior 60M + b*batch_size = 60M + 32*16384 = 60_524_288
         // With step (geometric) schedule, lr decays smoothly from positions 0.
-        // At 60.5M / 800M = t≈0.0756, lr ≈ 0.001 * (1e-5/1e-3)^0.0756 ≈ 0.000706.
-        let lr_val: f32 = cols0[7].parse().expect("lr col is a float");
-        assert!((lr_val - 0.000706).abs() < 1e-5, "step lr at 60.5M of 800M period should be ~0.000706, got {lr_val}");
-        assert_eq!(cols0[9], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
+        // lr_start uses the beginning of this row interval, while
+        // lr_end uses the final batch start within the interval.
+        let lr_start: f32 = cols0[7].parse().expect("lr_start col is a float");
+        let lr_end: f32 = cols0[8].parse().expect("lr_end col is a float");
+        assert!(lr_start > lr_end, "step lr should decrease within the row interval");
+        assert_eq!(cols0[10], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 
     /// `LogContext.epoch_offset` が enrich の epoch 列に正しく加算され、
@@ -6545,7 +6617,7 @@ mod tests {
         };
         let raw = "1,32,0.07\n";
         // local epoch=1 + offset 3 → display epoch=4
-        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", 0, None);
+        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", 0, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
         assert_eq!(cols[1], "4", "absolute epoch (= local 1 + offset 3)");
     }
@@ -6568,10 +6640,10 @@ mod tests {
         // header + 3 行 (epoch 1, 2, 3) → max = 3
         std::fs::write(
             &log,
-            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher\n\
-             NNUE,1,6,-,-,0.1,0.001,1.0,100000000,t.hcpe\n\
-             NNUE,2,6,-,-,0.1,0.001,1.0,200000000,t.hcpe\n\
-             NNUE,3,6,-,-,0.1,0.001,1.0,300000000,t.hcpe\n",
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher\n\
+             NNUE,1,6,-,-,0.1,0.001,0.0008,1.0,100000000,t.hcpe\n\
+             NNUE,2,6,-,-,0.1,0.001,0.0008,1.0,200000000,t.hcpe\n\
+             NNUE,3,6,-,-,0.1,0.001,0.0008,1.0,300000000,t.hcpe\n",
         )
         .unwrap();
         assert_eq!(read_latest_epoch_in_top_level_log(&log), Some(3));
@@ -6592,11 +6664,11 @@ mod tests {
         assert_eq!(read_latest_nnue_test_metrics_in_top_level_log(&log), None);
         std::fs::write(
             &log,
-            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher\n\
-             KPPT/kk,1,1,0.1,0.999,0.1,0.001,1.0,10,t.hcpe\n\
-             NNUE,1,1,-,-,0.1,0.001,1.0,20,t.hcpe\n\
-             NNUE,1,2,0.5,0.123456,0.1,0.001,1.0,30,t.hcpe\n\
-             NNUE,2,1,0.5,0.120000,0.1,0.001,1.0,40,t.hcpe\n",
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher\n\
+             KPPT/kk,1,1,0.1,0.999,0.1,0.001,0.0008,1.0,10,t.hcpe\n\
+             NNUE,1,1,-,-,0.1,0.001,0.0008,1.0,20,t.hcpe\n\
+             NNUE,1,2,0.5,0.123456,0.1,0.001,0.0008,1.0,30,t.hcpe\n\
+             NNUE,2,1,0.5,0.120000,0.1,0.001,0.0008,1.0,40,t.hcpe\n",
         )
         .unwrap();
         assert_eq!(
@@ -6655,7 +6727,7 @@ mod tests {
     }
 
     /// `read_latest_saved_teacher` が `<NNNN>/learn.log` の teacher 列
-    /// (= 11-列の最終フィールド) を取り、auto-resume の教師変更検出に
+    /// (= 12-列の最終フィールド) を取り、auto-resume の教師変更検出に
     /// 使えることを確認。
     #[test]
     fn read_latest_saved_teacher_picks_last_teacher() {
@@ -6674,10 +6746,12 @@ mod tests {
         std::fs::create_dir(&d1).unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), None);
 
-        // 11-列 row が 1 つあれば teacher が拾える
+        // 12-列 row が 1 つあれば teacher が拾える
         std::fs::write(
             d1.join("learn.log"),
-            format!("{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,1,32,-,-,0.1,0.001,1.000,524288,foo.hcpe\n"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,1,32,-,-,0.1,0.001,0.0009,1.000,524288,foo.hcpe\n"
+            ),
         )
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
@@ -6688,7 +6762,7 @@ mod tests {
         std::fs::write(
             d4.join("learn.log"),
             format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.6,0.05,0.06,0.001,1.000,2097152,bar.hcpe\n"
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.6,0.05,0.06,0.001,0.0008,1.000,2097152,bar.hcpe\n"
             ),
         )
         .unwrap();
