@@ -20,13 +20,14 @@ pub struct AdamWParams {
     pub decay: f32,
     pub beta1: f32,
     pub beta2: f32,
+    pub epsilon: f32,
     pub min_weight: f32,
     pub max_weight: f32,
 }
 
 impl Default for AdamWParams {
     fn default() -> Self {
-        Self { decay: 0.01, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98 }
+        Self { decay: 0.01, beta1: 0.9, beta2: 0.999, epsilon: 0.00000001, min_weight: -1.98, max_weight: 1.98 }
     }
 }
 
@@ -67,7 +68,7 @@ impl AdamWParams {
             .replace("BETA2", &self.beta2.to_string())
             .replace("WMIN", &self.min_weight.to_string())
             .replace("WMAX", &self.max_weight.to_string())
-            .replace("EPSILON", "0.00000001F");
+            .replace("EPSILON", &self.epsilon.to_string());
 
         let body = if size.is_multiple_of(4) {
             format!(

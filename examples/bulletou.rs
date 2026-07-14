@@ -1195,6 +1195,12 @@ struct Args {
     #[arg(long, default_value = "0.01")]
     adamw_weight_decay: f32,
 
+    /// AdamW epsilon. BulletOu's historical default is 1e-8. Set this to
+    /// 1e-7 to match nodchip nnue-pytorch's Ranger21 epsilon for an isolated
+    /// A/B comparison while still using AdamW.
+    #[arg(long, default_value = "0.00000001")]
+    adamw_epsilon: f32,
+
     /// Use nnue-pytorch-style layer-specific AdamW clipping for NNUE / SFNN
     /// scalar value networks. Hidden weights use +/-127/64, while only the
     /// final output weight tensor uses +/-127*127/(600*16). Default is off
@@ -1454,6 +1460,7 @@ const ADAMW_UNCLIPPED_BIAS_LIMIT: f32 = 1.0e30;
 fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
     optimiser::AdamWParams {
         decay: args.adamw_weight_decay,
+        epsilon: args.adamw_epsilon,
         min_weight: -clip,
         max_weight: clip,
         ..Default::default()
@@ -1920,6 +1927,10 @@ fn main() {
         eprintln!("error: --adamw-weight-decay must be finite and >= 0.");
         std::process::exit(2);
     }
+    if !(args.adamw_epsilon.is_finite() && args.adamw_epsilon > 0.0) {
+        eprintln!("error: --adamw-epsilon must be finite and > 0.");
+        std::process::exit(2);
+    }
     if !(args.nnue_pytorch_init_scale.is_finite() && args.nnue_pytorch_init_scale > 0.0) {
         eprintln!("error: --nnue-pytorch-init-scale must be finite and > 0.");
         std::process::exit(2);
@@ -2021,6 +2032,9 @@ fn main() {
     if args.adamw_weight_decay != 0.01 {
         eprintln!("  AdamW weight decay = {}", args.adamw_weight_decay);
     }
+    if args.adamw_epsilon != 0.00000001 {
+        eprintln!("  AdamW epsilon = {}", args.adamw_epsilon);
+    }
     if args.nnue_pytorch_layer_clip {
         eprintln!(
             "  nnue-pytorch layer clipping = enabled (hidden +/-{:.6}, output weight +/-{:.6})",
@@ -2119,6 +2133,7 @@ fn resume_signature(args: &Args) -> String {
         format!("scale={}", args.scale),
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
         format!("adamw_weight_decay={:.9}", args.adamw_weight_decay),
+        format!("adamw_epsilon={:.9}", args.adamw_epsilon),
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
         format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", args.save_rate),

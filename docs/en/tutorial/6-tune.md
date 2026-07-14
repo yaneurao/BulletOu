@@ -25,6 +25,7 @@ Main flags:
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
+| `--adamw-epsilon` | AdamW epsilon. Try `0.0000001` when matching nnue-pytorch's optimizer condition | 0.00000001 |
 | `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
 | `--nnue-pytorch-no-bias-clip` | Effectively disable AdamW clipping for bias tensors | off |
 
@@ -230,6 +231,20 @@ BulletOu's default AdamW uses `--adamw-weight-decay 0.01`. To move one step towa
 ```
 
 This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from `--nnue-pytorch-wrm-loss`.
+
+### AdamW epsilon
+
+BulletOu's AdamW epsilon defaults to `1e-8`. nodchip nnue-pytorch's Ranger21 uses `eps=1e-7`, so use `--adamw-epsilon 0.0000001` to test only that difference while still using AdamW.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-adamw-eps1e-7 \
+    --adamw-epsilon 0.0000001
+```
+
+This is another optimizer-condition ablation. Compare it by itself first.
 
 ### nnue-pytorch layer clipping
 

@@ -86,7 +86,7 @@ nnue-pytorch は `Ranger21` を使う。
 
 BulletOu の現在の `examples/bulletou.rs` 経路は `AdamW` を使い、
 `AdamWParams::default()` では `weight_decay=0.01` かつ全 weight を
-一律 `[-1.98, 1.98]` に clip する。
+一律 `[-1.98, 1.98]` に clip する。AdamW epsilon は従来 `1e-8`。
 
 これは大きな差分。nnue-pytorch 互換性を比較する場合、最低限
 `weight_decay=0.0` の ablation を行い、その後 Ranger21 相当を検討する。
@@ -213,6 +213,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - まず `AdamW weight_decay=0.0`
    - 実装済み: `--adamw-weight-decay 0.0` で opt-in
    - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
+   - `eps=1e-7` は `--adamw-epsilon 0.0000001` で AdamW のまま単独比較する
    - その後 Ranger21 相当の実装・比較
 
 5. layer-specific clipping を入れる
