@@ -23,3 +23,4 @@
 - [04-checkpoint-layout.md](04-checkpoint-layout.md) — 番号付き save dir / `state.bin` / `learn.log` / resume プロトコル
 - [05-activation-history.md](05-activation-history.md) — ClippedReLU と SqrClippedReLU の歴史的経緯 (誤実装回避用のメモ)
 - [06-validation-metrics.md](06-validation-metrics.md) — `test_value_accuracy` / `test_value_loss` の定義と YaneuraOu / dlshogi との cross-tool 数値比較契約
+- [07-nnue-pytorch-compatibility.md](07-nnue-pytorch-compatibility.md) — nodchip 版 nnue-pytorch 将棋 branch との学習条件差分と互換化の実装順
