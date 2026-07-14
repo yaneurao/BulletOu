@@ -146,10 +146,12 @@ nnue-pytorch は量子化スケールから layer ごとに clip 範囲を決め
 また L1 bucket weight は、factorized shared weight を足した実効 weight が範囲内に入るように
 clip される。
 
-BulletOu の AdamW は現状、全 weight に一律 `[-1.98, 1.98]` を適用する。
+BulletOu の標準 AdamW は全 weight に一律 `[-1.98, 1.98]` を適用する。
 output weight の上限が nnue-pytorch より広く、L1 factorized term も考慮していない。
 
-nnue-pytorch 互換性を高めるには、layer-specific clipping が必要。
+`--nnue-pytorch-layer-clip` を付けると、hidden weight は `[-127/64, 127/64]`、
+final output weight だけは `[-127*127/(600*16), 127*127/(600*16)]` にする。
+余計な差分を避けるため、output bias には output weight 用の狭い clip は適用しない。
 
 ### 6. FeatureSet の一致
 
@@ -206,11 +208,15 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 4. optimizer 条件を近づける
    - まず `AdamW weight_decay=0.0`
    - 実装済み: `--adamw-weight-decay 0.0` で opt-in
+   - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
    - その後 Ranger21 相当の実装・比較
 
 5. layer-specific clipping を入れる
    - hidden と output を別範囲にする
    - L1 factorized term がある場合は実効 weight 基準で clip する
+   - 実装済み: `--nnue-pytorch-layer-clip` で opt-in
+   - 現時点の実装は final output weight の clip 差分だけを検証するためのもの。
+     factorized L1 の実効 weight clip は未対応。
 
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions

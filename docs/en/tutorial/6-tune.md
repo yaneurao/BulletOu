@@ -25,6 +25,7 @@ Main flags:
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
+| `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -228,6 +229,23 @@ BulletOu's default AdamW uses `--adamw-weight-decay 0.01`. To move one step towa
 ```
 
 This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from `--nnue-pytorch-wrm-loss`.
+
+### nnue-pytorch layer clipping
+
+Add `--nnue-pytorch-layer-clip` to move AdamW's weight clipping bounds closer to nnue-pytorch's quantisation scales.
+
+- hidden weight: `[-127/64, 127/64]`
+- final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
+
+This is an experimental NNUE / SFNN flag. It does not change the loss formula or weight decay, so compare it by itself before combining it with other experimental flags.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-layer-clip \
+    --nnue-pytorch-layer-clip
+```
 
 ```bash
 # elmo-style 50/50 blend on KPPT

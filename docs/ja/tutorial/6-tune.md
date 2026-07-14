@@ -25,6 +25,7 @@
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 | `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
+| `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -238,6 +239,23 @@ BulletOu の標準 AdamW は `--adamw-weight-decay 0.01` で動く。nodchip 版
 ```
 
 これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、まず単独で ON/OFF 比較する。
+
+### nnue-pytorch layer clipping
+
+`--nnue-pytorch-layer-clip` を付けると、AdamW の weight clipping 範囲を nnue-pytorch の量子化スケールに寄せる。
+
+- hidden weight: `[-127/64, 127/64]`
+- final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
+
+これは NNUE / SFNN 用の実験フラグ。loss 定義や weight decay は変えないので、まず他の実験フラグと混ぜずに単独で比較する。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-layer-clip \
+    --nnue-pytorch-layer-clip
+```
 
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習
