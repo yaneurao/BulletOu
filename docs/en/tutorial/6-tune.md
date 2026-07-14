@@ -26,6 +26,7 @@ Main flags:
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
 | `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
+| `--nnue-pytorch-no-bias-clip` | Effectively disable AdamW clipping for bias tensors | off |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -246,6 +247,20 @@ This is an experimental NNUE / SFNN flag. It does not change the loss formula or
     --tag sfnn-layer-clip \
     --nnue-pytorch-layer-clip
 ```
+
+### Disabling bias clipping
+
+nnue-pytorch's `WeightClippingCallback` clips weight tensors only; it does not clip bias tensors. BulletOu's default AdamW clips every parameter, including biases. Use `--nnue-pytorch-no-bias-clip` to compare that difference by itself.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-no-bias-clip \
+    --nnue-pytorch-no-bias-clip
+```
+
+You can combine this with `--nnue-pytorch-layer-clip`, but compare it alone first.
 
 ```bash
 # elmo-style 50/50 blend on KPPT

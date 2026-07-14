@@ -1202,6 +1202,12 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_layer_clip: bool,
 
+    /// Do not clip bias tensors in AdamW for NNUE / SFNN scalar value
+    /// networks. nnue-pytorch's WeightClippingCallback clips only selected
+    /// weight tensors, not biases. Default is off for A/B comparisons.
+    #[arg(long)]
+    nnue_pytorch_no_bias_clip: bool,
+
     /// f32 -> integer quantisation scale for the YaneuraOu KPPT output.
     /// If omitted, per-component defaults are used (4000 for KK/KKP, 400
     /// for KPP). Ignored by NNUE eval types.
@@ -1443,6 +1449,7 @@ fn validation_loss_kind(args: &Args) -> ValidationLossKind {
 const BULLETOU_DEFAULT_ADAMW_CLIP: f32 = 1.98;
 const NNUE_PYTORCH_HIDDEN_CLIP: f32 = 127.0 / 64.0;
 const NNUE_PYTORCH_OUTPUT_CLIP: f32 = 127.0 * 127.0 / (600.0 * 16.0);
+const ADAMW_UNCLIPPED_BIAS_LIMIT: f32 = 1.0e30;
 
 fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
     optimiser::AdamWParams {
@@ -1457,6 +1464,7 @@ fn configure_adamw<Inp, Out>(
     args: &Args,
     trainer: &mut ValueTrainer<optimiser::AdamWOptimiser, Inp, Out>,
     output_weight_ids: &[&str],
+    bias_ids: &[&str],
 )
 where
     Inp: SparseInputType,
@@ -1469,6 +1477,13 @@ where
         let output_params = adamw_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
         for id in output_weight_ids {
             trainer.optimiser.set_params_for_weight(id, output_params);
+        }
+    }
+
+    if args.nnue_pytorch_no_bias_clip {
+        let bias_params = adamw_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
+        for id in bias_ids {
+            trainer.optimiser.set_params_for_weight(id, bias_params);
         }
     }
 }
@@ -1962,6 +1977,10 @@ fn main() {
         eprintln!("error: --nnue-pytorch-layer-clip currently applies to NNUE / SFNN eval types only.");
         std::process::exit(2);
     }
+    if args.nnue_pytorch_no_bias_clip && !args.eval_type().uses_arch() {
+        eprintln!("error: --nnue-pytorch-no-bias-clip currently applies to NNUE / SFNN eval types only.");
+        std::process::exit(2);
+    }
     if args.lr_schedule == LrScheduleKind::Plateau {
         if args.test_teacher.is_none() {
             eprintln!("error: --lr-schedule plateau requires --test-teacher so validation loss can be monitored.");
@@ -2007,6 +2026,9 @@ fn main() {
             "  nnue-pytorch layer clipping = enabled (hidden +/-{:.6}, output weight +/-{:.6})",
             NNUE_PYTORCH_HIDDEN_CLIP, NNUE_PYTORCH_OUTPUT_CLIP
         );
+    }
+    if args.nnue_pytorch_no_bias_clip {
+        eprintln!("  nnue-pytorch bias clipping = disabled");
     }
     prepare_resume_config_or_exit(&args);
     if let Err(e) = record_invocation_to_tag_txt(&args) {
@@ -2098,6 +2120,7 @@ fn resume_signature(args: &Args) -> String {
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
         format!("adamw_weight_decay={:.9}", args.adamw_weight_decay),
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
+        format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -3325,7 +3348,7 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[]);
+    configure_adamw(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KK] restoring optimiser state from {}", dir.display());
@@ -3373,7 +3396,7 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[]);
+    configure_adamw(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KKP] restoring optimiser state from {}", dir.display());
@@ -3421,7 +3444,7 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[]);
+    configure_adamw(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KPP] restoring optimiser state from {}", dir.display());
@@ -4779,7 +4802,7 @@ fn run_halfkp(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"]);
+    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -4880,7 +4903,7 @@ fn run_kp(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"]);
+    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -4978,7 +5001,7 @@ fn run_nnue_ka2(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"]);
+    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5076,7 +5099,7 @@ fn run_halfkpe9(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"]);
+    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5173,7 +5196,7 @@ fn run_halfkpvm(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"]);
+    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5374,7 +5397,12 @@ where
         l3_out + l1_skip
     });
 
-    configure_adamw(args, &mut trainer, &["l3w"]);
+    let bias_ids: &[&str] = if args.sfnn_factorized_l1 {
+        &["l0b", "l1b", "l1fb", "l2b", "l3b"]
+    } else {
+        &["l0b", "l1b", "l2b", "l3b"]
+    };
+    configure_adamw(args, &mut trainer, &["l3w"], bias_ids);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());

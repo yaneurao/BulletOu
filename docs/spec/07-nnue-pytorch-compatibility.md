@@ -151,7 +151,11 @@ output weight の上限が nnue-pytorch より広く、L1 factorized term も考
 
 `--nnue-pytorch-layer-clip` を付けると、hidden weight は `[-127/64, 127/64]`、
 final output weight だけは `[-127*127/(600*16), 127*127/(600*16)]` にする。
-余計な差分を避けるため、output bias には output weight 用の狭い clip は適用しない。
+
+nnue-pytorch の `WeightClippingCallback` は `l1.linear.weight`, `l2.linear.weight`,
+`output.linear.weight` だけを clip 対象にしており、bias は clip しない。
+BulletOu の AdamW は標準では bias も含めて全 parameter を clip するため、
+`--nnue-pytorch-no-bias-clip` で bias tensor の clip を実質無効化できるようにした。
 
 ### 6. FeatureSet の一致
 
@@ -217,6 +221,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - 実装済み: `--nnue-pytorch-layer-clip` で opt-in
    - 現時点の実装は final output weight の clip 差分だけを検証するためのもの。
      factorized L1 の実効 weight clip は未対応。
+   - bias clip 無効化は `--nnue-pytorch-no-bias-clip` で別 ablation として試す
 
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions

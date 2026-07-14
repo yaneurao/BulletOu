@@ -26,6 +26,7 @@
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 | `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
 | `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
+| `--nnue-pytorch-no-bias-clip` | bias tensor の AdamW clipping を実質無効にする | off |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -256,6 +257,20 @@ BulletOu の標準 AdamW は `--adamw-weight-decay 0.01` で動く。nodchip 版
     --tag sfnn-layer-clip \
     --nnue-pytorch-layer-clip
 ```
+
+### bias clipping の無効化
+
+nnue-pytorch の `WeightClippingCallback` は weight tensor だけを clip し、bias tensor は clip しない。BulletOu の標準 AdamW は bias も含めて全 parameter を clip するため、`--nnue-pytorch-no-bias-clip` でこの差分を単独比較できる。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-no-bias-clip \
+    --nnue-pytorch-no-bias-clip
+```
+
+`--nnue-pytorch-layer-clip` と組み合わせることもできるが、まずは単独で ON/OFF 比較する。
 
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習
