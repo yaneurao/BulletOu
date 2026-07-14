@@ -23,6 +23,7 @@
 | `--lr-plateau-factor` | `plateau` で loss が改善しなかったときに LR へ掛ける係数 | 0.5 |
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
+| `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -197,6 +198,31 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 デフォルトの `1.0` (純 eval) が安全な初期値。教師エンジンの評価値そのものを真似に行く動作になる。
 
 対局結果 (W/D/L = Win / Draw / Loss) も混ぜたいときに `--lambda` を下げる。完全結果ベース (`--lambda 0.0`) は教師エンジンの強さに依存しないが、勾配が疎で収束が遅い傾向。実用は `0.5 〜 0.8` あたりの混合が多い。
+
+### nnue-pytorch 互換の WRM loss
+
+`--nnue-pytorch-wrm-loss` を付けると、標準の `sigmoid(model_output)` に対する MSE ではなく、nodchip 版 nnue-pytorch と同じ WRM (win-rate model) 形式の loss を使う。
+
+具体的には:
+
+- 教師 eval 側を `out_scaling=380`, `offset=270` の win-rate target に変換する
+- network 出力側を `nnue2score=600`, `in_scaling=340`, `offset=270` の win-rate prediction に変換する
+- loss を `abs(target - prediction)^2.5` にする
+- `test_value_loss` と `plateau` 判定も同じ WRM loss に切り替える
+
+これは **nnue-pytorch と BulletOu の学習条件を近づけて比較するための実験フラグ**。通常の BulletOu 学習では付けなくてよい。ON/OFF で比較するときは、同じ教師・同じ arch・同じ `--tag` ではなく、別の `--tag` を使う。
+
+`--nnue-pytorch-wrm-loss` を使った run の `test_value_loss` は、通常 loss の `test_value_loss` とは式が違うので、数値をそのまま横比較しない。比較するなら同じフラグ状態同士で見る。
+
+使用例:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-wrm-test \
+    --nnue-pytorch-wrm-loss
+```
 
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習

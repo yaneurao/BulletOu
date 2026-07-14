@@ -23,6 +23,7 @@ Main flags:
 | `--lr-plateau-factor` | Factor multiplied into LR when `plateau` validation loss does not improve | 0.5 |
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
+| `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -187,6 +188,31 @@ target = λ × teacher_eval + (1 − λ) × game_result
 The default `1.0` (pure eval) is the safe starting point: the network learns to imitate the teacher engine's scores directly.
 
 Lower `--lambda` to mix in the W/D/L game result. Pure-result training (`--lambda 0.0`) doesn't rely on teacher strength but has sparser gradients and slower convergence. A practical mix is usually `0.5–0.8`.
+
+### nnue-pytorch-compatible WRM loss
+
+Add `--nnue-pytorch-wrm-loss` to use nodchip nnue-pytorch's WRM (win-rate model) loss instead of BulletOu's default MSE on `sigmoid(model_output)`.
+
+This changes:
+
+- teacher eval conversion to a win-rate target with `out_scaling=380` and `offset=270`
+- network output conversion to a win-rate prediction with `nnue2score=600`, `in_scaling=340`, and `offset=270`
+- loss formula to `abs(target - prediction)^2.5`
+- `test_value_loss` and `plateau` decisions to use the same WRM loss
+
+This is an **experimental comparison flag** for reducing the training-condition gap between nnue-pytorch and BulletOu. You do not need it for a normal first run. When comparing ON/OFF, use the same teacher and architecture but a different `--tag`.
+
+`test_value_loss` from a `--nnue-pytorch-wrm-loss` run uses a different formula from the default loss, so do not compare the raw loss number directly against a default-loss run. Compare runs with the same flag state.
+
+Example:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-wrm-test \
+    --nnue-pytorch-wrm-loss
+```
 
 ```bash
 # elmo-style 50/50 blend on KPPT
