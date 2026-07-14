@@ -57,7 +57,7 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
-    nn::{ExecutionContext, optimiser},
+    nn::{ExecutionContext, ModelNode, optimiser},
     teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
     trainer::{
@@ -65,7 +65,7 @@ use bulletou_lib::{
         schedule::{wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    validate::{compute_sign_accuracy, read_random_hcpe_positions},
+    validate::{ValidationLossKind, compute_sign_accuracy_with_loss, read_random_hcpe_positions},
     value::{
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
@@ -672,6 +672,10 @@ impl EvalType {
         }
     }
 
+    fn supports_nnue_pytorch_wrm_loss(self) -> bool {
+        self.uses_arch()
+    }
+
     /// Does this eval type use LayerStacks? Only the SFNN family
     /// (LayerStacks-based architectures) does; the rest of the NNUE family
     /// is single-stack.
@@ -1178,6 +1182,13 @@ struct Args {
     #[arg(long, default_value = "400")]
     scale: u32,
 
+    /// Use nnue-pytorch's WRM value loss and target conversion for NNUE /
+    /// SFNN scalar value networks. This uses the nodchip shogi defaults:
+    /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
+    /// and |target-prediction|^2.5. Default is off for A/B comparisons.
+    #[arg(long)]
+    nnue_pytorch_wrm_loss: bool,
+
     /// f32 -> integer quantisation scale for the YaneuraOu KPPT output.
     /// If omitted, per-component defaults are used (4000 for KK/KKP, 400
     /// for KPP). Ignored by NNUE eval types.
@@ -1387,6 +1398,33 @@ impl Args {
     fn eval_type(&self) -> EvalType {
         self.eval_type.expect("--eval-type required (clap should have validated)")
     }
+}
+
+type ValueLossFn = for<'a> fn(ModelNode<'a>, ModelNode<'a>) -> ModelNode<'a>;
+
+fn sigmoid_mse_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>) -> ModelNode<'a> {
+    output.sigmoid().squared_error(target)
+}
+
+fn nnue_pytorch_wrm_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>) -> ModelNode<'a> {
+    const NNUE2SCORE: f32 = 600.0;
+    const IN_OFFSET: f32 = 270.0;
+    const IN_SCALING: f32 = 340.0;
+    const POW_EXP: f32 = 2.5;
+
+    let scorenet = output * NNUE2SCORE;
+    let q = ((scorenet - IN_OFFSET) / IN_SCALING).sigmoid();
+    let qm = ((-scorenet - IN_OFFSET) / IN_SCALING).sigmoid();
+    let prediction = (1.0 + q - qm) * 0.5;
+    prediction.power_error(target, POW_EXP)
+}
+
+fn value_loss_fn(args: &Args) -> ValueLossFn {
+    if args.nnue_pytorch_wrm_loss { nnue_pytorch_wrm_value_loss } else { sigmoid_mse_value_loss }
+}
+
+fn validation_loss_kind(args: &Args) -> ValidationLossKind {
+    if args.nnue_pytorch_wrm_loss { ValidationLossKind::NnuePytorchWrm } else { ValidationLossKind::SigmoidMse }
 }
 
 // ----- epoch period ------------------------------------------------------
@@ -1866,6 +1904,10 @@ fn main() {
             }
         }
     }
+    if args.nnue_pytorch_wrm_loss && !args.eval_type().supports_nnue_pytorch_wrm_loss() {
+        eprintln!("error: --nnue-pytorch-wrm-loss currently applies to NNUE / SFNN eval types only.");
+        std::process::exit(2);
+    }
     if args.lr_schedule == LrScheduleKind::Plateau {
         if args.test_teacher.is_none() {
             eprintln!("error: --lr-schedule plateau requires --test-teacher so validation loss can be monitored.");
@@ -1899,6 +1941,9 @@ fn main() {
     if let Err(e) = args.validate_arch_flags() {
         eprintln!("error: {e}");
         std::process::exit(2);
+    }
+    if args.nnue_pytorch_wrm_loss {
+        eprintln!("  nnue-pytorch WRM loss = enabled");
     }
     prepare_resume_config_or_exit(&args);
     if let Err(e) = record_invocation_to_tag_txt(&args) {
@@ -1987,6 +2032,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_min_delta={:.9}", args.lr_plateau_min_delta),
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
+        format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -3195,7 +3241,11 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKk)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -3237,7 +3287,11 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKkp)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -3279,7 +3333,11 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKpp)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -3665,13 +3723,14 @@ where
 /// outside `trainer.run`).
 fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: Vec<f32>) -> TestMetrics {
     let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
-    let report = compute_sign_accuracy(
+    let report = compute_sign_accuracy_with_loss(
         &trainer_outputs,
         &cache.teacher_scores,
         &cache.teacher_results,
         cap,
         args.lambda,
         args.scale as f32,
+        validation_loss_kind(args),
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
@@ -4625,7 +4684,11 @@ fn run_halfkp(args: &Args) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiHalfKP)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -4720,7 +4783,11 @@ fn run_kp(args: &Args) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKp)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -4812,7 +4879,11 @@ fn run_nnue_ka2(args: &Args) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiKa2)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -4904,7 +4975,11 @@ fn run_halfkpe9(args: &Args) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiHalfKpe9)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -4995,7 +5070,11 @@ fn run_halfkpvm(args: &Args) {
         .optimiser(optimiser::AdamW)
         .inputs(ShogiHalfKPvm)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);
@@ -5137,7 +5216,11 @@ where
         .inputs(input)
         .output_buckets(bucket_impl)
         .save_format(&save_format)
-        .loss_fn(|out, tgt| out.sigmoid().squared_error(tgt));
+        .loss_fn(value_loss_fn(args));
+
+    if args.nnue_pytorch_wrm_loss {
+        builder = builder.use_win_rate_model();
+    }
 
     if args.score_drop_abs > 0 {
         builder = builder.score_drop_abs(args.score_drop_abs);

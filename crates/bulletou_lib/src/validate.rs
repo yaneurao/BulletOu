@@ -82,9 +82,29 @@ impl AccuracyReport {
     }
 }
 
+/// Loss formula used for `test_value_loss`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationLossKind {
+    /// BulletOu's historical sigmoid MSE:
+    /// `(sigmoid(model_output) - target)^2`, where the score component is
+    /// `sigmoid(teacher_score / eval_scale)`.
+    SigmoidMse,
+    /// nodchip nnue-pytorch shogi WRM value loss with fixed defaults:
+    /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
+    /// and `abs(prediction - target)^2.5`.
+    NnuePytorchWrm,
+}
+
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
+    let q = (score - offset) / scaling;
+    let qm = (-score - offset) / scaling;
+    0.5 * (1.0 + sigmoid(q) - sigmoid(qm))
 }
 
 /// Compute sign-agreement accuracy AND the matching test-set loss
@@ -141,6 +161,26 @@ pub fn compute_sign_accuracy(
     score_drop_abs: Option<u16>,
     lambda: f32,
     eval_scale: f32,
+) -> AccuracyReport {
+    compute_sign_accuracy_with_loss(
+        model_outputs,
+        teacher_scores,
+        teacher_results,
+        score_drop_abs,
+        lambda,
+        eval_scale,
+        ValidationLossKind::SigmoidMse,
+    )
+}
+
+pub fn compute_sign_accuracy_with_loss(
+    model_outputs: &[f32],
+    teacher_scores: &[i16],
+    teacher_results: &[i8],
+    score_drop_abs: Option<u16>,
+    lambda: f32,
+    eval_scale: f32,
+    loss_kind: ValidationLossKind,
 ) -> AccuracyReport {
     assert_eq!(
         model_outputs.len(),
@@ -204,11 +244,20 @@ pub fn compute_sign_accuracy(
                 -1 => 0.0,
                 _ => 0.5,
             };
-            let score_norm = sigmoid(inv_scale * f32::from(s));
+            let score_norm = match loss_kind {
+                ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::NnuePytorchWrm => wrm_probability(f32::from(s), 270.0, 380.0),
+            };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
-            let model_p = sigmoid(*m);
+            let model_p = match loss_kind {
+                ValidationLossKind::SigmoidMse => sigmoid(*m),
+                ValidationLossKind::NnuePytorchWrm => wrm_probability(*m * 600.0, 270.0, 340.0),
+            };
             let diff = model_p - target;
-            loss_sum += diff * diff;
+            loss_sum += match loss_kind {
+                ValidationLossKind::SigmoidMse => diff * diff,
+                ValidationLossKind::NnuePytorchWrm => diff.abs().powf(2.5),
+            };
             report.loss_sampled += 1;
         }
     }
@@ -409,6 +458,19 @@ mod tests {
         let loss = r.test_loss.expect("loss requested");
         // expected: ((0.5 - 0.731)^2 + (0.5 - 0.269)^2) / 2 ≈ 0.0533
         assert!((loss - 0.0533).abs() < 1e-3, "loss={loss}");
+    }
+
+    #[test]
+    fn test_loss_can_use_nnue_pytorch_wrm() {
+        let m = [0.0, 0.0];
+        let t = [400i16, -400];
+        let r =
+            compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, ValidationLossKind::NnuePytorchWrm);
+        assert_eq!(r.compared, 2);
+        let loss = r.test_loss.expect("loss requested");
+        assert!(loss.is_finite());
+        assert!(loss > 0.0);
+        assert!((loss - 0.0533).abs() > 1e-3, "wrm loss should differ from sigmoid MSE, loss={loss}");
     }
 
     #[test]
