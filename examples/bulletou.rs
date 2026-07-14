@@ -1235,6 +1235,14 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     nnue_pytorch_init_scale: f32,
 
+    /// Add nnue-pytorch-style factorized shared L1 weights to SFNN /
+    /// LayerStack networks. The shared term is zero-initialised and added to
+    /// every bucket's L1 output during training, then folded into each bucket
+    /// when saving `nn.bin`. Default is off to preserve historical BulletOu
+    /// behaviour for A/B comparisons.
+    #[arg(long)]
+    sfnn_factorized_l1: bool,
+
     /// Dump SFNN / LayerStack activation saturation statistics on the
     /// held-out `--test-teacher` positions at startup and after each save.
     /// Currently supported for SFNN eval types only.
@@ -1817,6 +1825,10 @@ fn main() {
         eprintln!("error: --nnue-pytorch-init-scale currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
+    if args.sfnn_factorized_l1 && !args.eval_type().uses_layerstack() {
+        eprintln!("error: --sfnn-factorized-l1 currently applies to SFNN / LayerStack eval types only.");
+        std::process::exit(2);
+    }
     if args.dump_activation_stats {
         if !args.eval_type().uses_layerstack() {
             eprintln!("error: --dump-activation-stats currently supports SFNN / LayerStack eval types only.");
@@ -1978,6 +1990,7 @@ fn resume_signature(args: &Args) -> String {
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
+        format!("sfnn_factorized_l1={}", args.sfnn_factorized_l1),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -3526,6 +3539,21 @@ fn affine_stacked_selected(
     }
 }
 
+fn affine_add_dense(weights: &[f32], bias: &[f32], input: &[f32], rows: usize, out: &mut [f32]) {
+    for row in 0..rows {
+        out[row] += bias[row];
+    }
+    for (input_idx, &x) in input.iter().enumerate() {
+        if x == 0.0 {
+            continue;
+        }
+        let base = input_idx * rows;
+        for row in 0..rows {
+            out[row] += weights[base + row] * x;
+        }
+    }
+}
+
 fn observe_crelu(layer: &mut LayerActivationStats, values: &mut [f32]) {
     for (idx, value) in values.iter_mut().enumerate() {
         *value = value.clamp(0.0, 1.0);
@@ -3562,6 +3590,13 @@ where
     let Some(l0b) = model_weight_f32(trainer, "l0b") else { return };
     let Some(l1w) = model_weight_f32(trainer, "l1w") else { return };
     let Some(l1b) = model_weight_f32(trainer, "l1b") else { return };
+    let (l1fw, l1fb) = if args.sfnn_factorized_l1 {
+        let Some(l1fw) = model_weight_f32(trainer, "l1fw") else { return };
+        let Some(l1fb) = model_weight_f32(trainer, "l1fb") else { return };
+        (Some(l1fw), Some(l1fb))
+    } else {
+        (None, None)
+    };
     let Some(l2w) = model_weight_f32(trainer, "l2w") else { return };
     let Some(l2b) = model_weight_f32(trainer, "l2b") else { return };
 
@@ -3604,6 +3639,9 @@ where
 
         let bucket = bucket_impl.bucket(pos) as usize;
         affine_stacked_selected(&l1w, &l1b, &combined, shape.l1_out, shape.num_stacks, bucket, &mut l1_out);
+        if let (Some(l1fw), Some(l1fb)) = (&l1fw, &l1fb) {
+            affine_add_dense(l1fw, l1fb, &combined, shape.l1_out, &mut l1_out);
+        }
 
         for idx in 0..shape.l1_hidden {
             let x = l1_out[idx];
@@ -5049,6 +5087,9 @@ where
     if args.nnue_pytorch_init_scale != 1.0 {
         eprintln!("  nnue-pytorch init scale = {}", args.nnue_pytorch_init_scale);
     }
+    if args.sfnn_factorized_l1 {
+        eprintln!("  SFNN factorized L1 shared term = enabled");
+    }
     let output_dir = args.output_dir();
     let resume_state_bin = find_latest_state_bin(args, &output_dir);
     let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
@@ -5087,6 +5128,7 @@ where
         l1_hidden,
         l2_size,
         num_stacks,
+        factorized_l1: args.sfnn_factorized_l1,
     });
 
     let mut builder = ValueTrainerBuilder::default()
@@ -5106,9 +5148,8 @@ where
         l0.init_nnue_pytorch_feature_transformer_scaled(input_size, args.nnue_pytorch_init_scale);
 
         // L1: yaneuraou's SFNN stores one independent `fc_0` per LayerStack.
-        // Do not add a shared factorised term here; sharing the first FC layer
-        // couples gradients between buckets and changes the optimisation
-        // problem even though it can be folded at save time.
+        // With --sfnn-factorized-l1, also train nnue-pytorch's zero-initialised
+        // shared L1 term and fold it into every bucket when saving `nn.bin`.
         // Match nnue-pytorch's StackedLinear initialisation: initialise bucket
         // 0 and copy it to every bucket. The output bias is zero-initialised.
         let l1 = builder.new_stacked_affine_nnue_pytorch_scaled(
@@ -5119,6 +5160,13 @@ where
             false,
             args.nnue_pytorch_init_scale,
         );
+        let l1f = if args.sfnn_factorized_l1 {
+            let l1f = builder.new_affine("l1f", ft_size, l1_out);
+            l1f.init_zeroed();
+            Some(l1f)
+        } else {
+            None
+        };
         let l2 = builder.new_stacked_affine_nnue_pytorch_scaled(
             "l2",
             l2_in,
@@ -5138,7 +5186,10 @@ where
         let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
         let combined = stm.concat(ntm);
 
-        let l1_out_t = l1.forward(combined).select(output_buckets);
+        let mut l1_out_t = l1.forward(combined).select(output_buckets);
+        if let Some(l1f) = l1f {
+            l1_out_t = l1_out_t + l1f.forward(combined);
+        }
 
         // Split the L1 output: rows 0..l1_effective are the hidden, the
         // last row is the PSQT shortcut neuron that bypasses everything

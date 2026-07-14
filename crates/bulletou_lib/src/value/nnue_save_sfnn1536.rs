@@ -83,6 +83,9 @@ pub struct Sfnn1536SaveParams {
     pub l2_size: usize,
     /// LayerStacks 数。
     pub num_stacks: usize,
+    /// L1 に nnue-pytorch-style factorized shared term (`l1f`) があるか。
+    /// true の場合、保存時に `l1f` を各 bucket の `fc_0` に fold する。
+    pub factorized_l1: bool,
 }
 
 impl Sfnn1536SaveParams {
@@ -95,6 +98,7 @@ impl Sfnn1536SaveParams {
             l1_hidden: 15,
             l2_size: 32,
             num_stacks: 9,
+            factorized_l1: false,
         }
     }
 
@@ -260,6 +264,7 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
     let ft_size = params.ft_size;
     let l2_size = params.l2_size;
     let num_stacks = params.num_stacks;
+    let factorized_l1 = params.factorized_l1;
 
     for k in 0..num_stacks {
         // Network hash (per-stack header u32 LE).
@@ -271,10 +276,15 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
             SavedFormat::empty()
                 .transform(move |graph, _| {
                     let l1b = read_f32(graph, "l1b");
+                    let l1fb = factorized_l1.then(|| read_f32(graph, "l1fb"));
                     let bias_scale = (QA as i32 * QB as i32) as f32;
                     let mut bytes = Vec::with_capacity(l1_out * 4);
                     for o in 0..l1_out {
-                        bytes.extend_from_slice(&quantise_i32(l1b[stack * l1_out + o], bias_scale).to_le_bytes());
+                        let mut v = l1b[stack * l1_out + o];
+                        if let Some(l1fb) = l1fb.as_ref() {
+                            v += l1fb[o];
+                        }
+                        bytes.extend_from_slice(&quantise_i32(v, bias_scale).to_le_bytes());
                     }
                     bytes_to_f32_passthrough(&bytes)
                 })
@@ -285,13 +295,18 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
             SavedFormat::empty()
                 .transform(move |graph, _| {
                     let l1w = read_f32(graph, "l1w"); // shape (ns*l1_out, ft_size), index `feat*ns*l1_out + stack*l1_out + o`
+                    let l1fw = factorized_l1.then(|| read_f32(graph, "l1fw"));
                     let pad_in = pad32(ft_size);
                     let w_scale = QB as f32;
                     let mut bytes = Vec::with_capacity(l1_out * pad_in);
                     for o in 0..l1_out {
                         for in_ in 0..pad_in {
                             let q = if in_ < ft_size {
-                                quantise_i8(l1w[in_ * (num_stacks * l1_out) + stack * l1_out + o], w_scale)
+                                let mut v = l1w[in_ * (num_stacks * l1_out) + stack * l1_out + o];
+                                if let Some(l1fw) = l1fw.as_ref() {
+                                    v += l1fw[in_ * l1_out + o];
+                                }
+                                quantise_i8(v, w_scale)
                             } else {
                                 0
                             };
