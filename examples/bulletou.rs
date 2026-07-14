@@ -892,19 +892,62 @@ struct PlateauLrState {
     min_lr: f32,
     factor: f32,
     min_delta: f32,
-    best_loss: Option<f32>,
+    monitor: PlateauMonitor,
+    best: Option<PlateauMetrics>,
     final_min_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PlateauMetrics {
+    loss: f32,
+    accuracy: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum PlateauAction {
-    First { loss: f32 },
-    Improved { old_best: f32, new_best: f32 },
-    Keep { loss: f32, best: f32 },
-    Reduced { old_lr: f32, new_lr: f32, loss: f32, best: f32 },
-    ScheduledFinal { old_lr: f32, min_lr: f32, loss: f32, best: f32 },
-    FinalImproved { old_best: f32, new_best: f32 },
-    FinalRejected { loss: f32, best: f32 },
+    First { metrics: PlateauMetrics },
+    Improved { old_best: PlateauMetrics, new_best: PlateauMetrics },
+    Keep { metrics: PlateauMetrics, best: PlateauMetrics },
+    Reduced { old_lr: f32, new_lr: f32, metrics: PlateauMetrics, best: PlateauMetrics },
+    ScheduledFinal { old_lr: f32, min_lr: f32, metrics: PlateauMetrics, best: PlateauMetrics },
+    FinalImproved { old_best: PlateauMetrics, new_best: PlateauMetrics },
+    FinalRejected { metrics: PlateauMetrics, best: PlateauMetrics },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "snake_case")]
+enum PlateauMonitor {
+    Loss,
+    Accuracy,
+    LossOrAccuracy,
+}
+
+impl PlateauMonitor {
+    fn cli_name(self) -> &'static str {
+        match self {
+            PlateauMonitor::Loss => "loss",
+            PlateauMonitor::Accuracy => "accuracy",
+            PlateauMonitor::LossOrAccuracy => "loss_or_accuracy",
+        }
+    }
+
+    fn improved(self, current: PlateauMetrics, best: PlateauMetrics, min_delta: f32) -> bool {
+        let loss_improved = current.loss + min_delta < best.loss;
+        let accuracy_improved = current.accuracy > best.accuracy;
+        match self {
+            PlateauMonitor::Loss => loss_improved,
+            PlateauMonitor::Accuracy => accuracy_improved,
+            PlateauMonitor::LossOrAccuracy => loss_improved || accuracy_improved,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PlateauMonitor::Loss => "validation loss",
+            PlateauMonitor::Accuracy => "validation accuracy",
+            PlateauMonitor::LossOrAccuracy => "validation loss/accuracy",
+        }
+    }
 }
 
 fn plateau_action_retries_teacher(action: PlateauAction) -> bool {
@@ -918,7 +961,7 @@ fn plateau_action_rejects_update(action: PlateauAction) -> bool {
     )
 }
 
-fn plateau_action_epoch_final_loss(action: PlateauAction) -> Option<f32> {
+fn plateau_action_epoch_final_metrics(action: PlateauAction) -> Option<PlateauMetrics> {
     match action {
         PlateauAction::FinalImproved { new_best, .. } => Some(new_best),
         PlateauAction::FinalRejected { best, .. } => Some(best),
@@ -926,58 +969,67 @@ fn plateau_action_epoch_final_loss(action: PlateauAction) -> Option<f32> {
     }
 }
 
-fn plateau_epoch_should_stop(previous_loss: Option<f32>, current_loss: f32) -> bool {
-    matches!(previous_loss, Some(previous) if current_loss >= previous)
+fn plateau_metrics_text(metrics: PlateauMetrics) -> String {
+    format!("loss={:.6}, accuracy={:.6}", metrics.loss, metrics.accuracy)
+}
+
+fn plateau_epoch_should_stop(
+    previous_metrics: Option<PlateauMetrics>,
+    current_metrics: PlateauMetrics,
+    monitor: PlateauMonitor,
+    min_delta: f32,
+) -> bool {
+    matches!(previous_metrics, Some(previous) if !monitor.improved(current_metrics, previous, min_delta))
 }
 
 impl PlateauLrState {
-    fn new(start_lr: f32, min_lr: f32, factor: f32, min_delta: f32) -> Self {
-        Self { current_lr: start_lr, min_lr, factor, min_delta, best_loss: None, final_min_run: false }
+    fn new(start_lr: f32, min_lr: f32, factor: f32, min_delta: f32, monitor: PlateauMonitor) -> Self {
+        Self { current_lr: start_lr, min_lr, factor, min_delta, monitor, best: None, final_min_run: false }
     }
 
-    fn observe(&mut self, loss: f32) -> PlateauAction {
+    fn observe(&mut self, metrics: PlateauMetrics) -> PlateauAction {
         if self.final_min_run {
             self.final_min_run = false;
-            match self.best_loss {
-                Some(best) if loss + self.min_delta < best => {
-                    self.best_loss = Some(loss);
-                    return PlateauAction::FinalImproved { old_best: best, new_best: loss };
+            match self.best {
+                Some(best) if self.monitor.improved(metrics, best, self.min_delta) => {
+                    self.best = Some(metrics);
+                    return PlateauAction::FinalImproved { old_best: best, new_best: metrics };
                 }
                 Some(best) => {
-                    return PlateauAction::FinalRejected { loss, best };
+                    return PlateauAction::FinalRejected { metrics, best };
                 }
                 None => {
-                    self.best_loss = Some(loss);
-                    return PlateauAction::First { loss };
+                    self.best = Some(metrics);
+                    return PlateauAction::First { metrics };
                 }
             }
         }
 
-        match self.best_loss {
+        match self.best {
             None => {
-                self.best_loss = Some(loss);
-                PlateauAction::First { loss }
+                self.best = Some(metrics);
+                PlateauAction::First { metrics }
             }
-            Some(best) if loss + self.min_delta < best => {
-                self.best_loss = Some(loss);
-                PlateauAction::Improved { old_best: best, new_best: loss }
+            Some(best) if self.monitor.improved(metrics, best, self.min_delta) => {
+                self.best = Some(metrics);
+                PlateauAction::Improved { old_best: best, new_best: metrics }
             }
             Some(best) => {
                 let old_lr = self.current_lr;
                 if old_lr <= self.min_lr {
-                    return PlateauAction::FinalRejected { loss, best };
+                    return PlateauAction::FinalRejected { metrics, best };
                 }
 
                 let new_lr = old_lr * self.factor;
                 if new_lr < self.min_lr {
                     self.current_lr = self.min_lr;
                     self.final_min_run = true;
-                    PlateauAction::ScheduledFinal { old_lr, min_lr: self.min_lr, loss, best }
+                    PlateauAction::ScheduledFinal { old_lr, min_lr: self.min_lr, metrics, best }
                 } else if new_lr < old_lr {
                     self.current_lr = new_lr;
-                    PlateauAction::Reduced { old_lr, new_lr, loss, best }
+                    PlateauAction::Reduced { old_lr, new_lr, metrics, best }
                 } else {
-                    PlateauAction::Keep { loss, best }
+                    PlateauAction::Keep { metrics, best }
                 }
             }
         }
@@ -1109,7 +1161,7 @@ struct Args {
     /// `--lr-min` and the final min-LR retry has completed.
     /// After each epoch the dataloader is rebuilt from scratch. If omitted,
     /// `step` / `cos` default to 1 epoch, while `plateau` keeps running
-    /// epochs until the epoch-final validation loss no longer improves.
+    /// epochs until the epoch-final validation monitor no longer improves.
     #[arg(long)]
     max_epochs: Option<usize>,
 
@@ -1120,7 +1172,7 @@ struct Args {
     /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
     /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
     /// epoch boundary. `plateau` keeps LR fixed during one superbatch,
-    /// then reduces it when validation loss does not improve:
+    /// then reduces it when the validation monitor does not improve:
     ///
     /// - `step` (default) = geometric (= exponential in log space):
     ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
@@ -1130,7 +1182,7 @@ struct Args {
     ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
     ///   Slower descent at the start and end, fastest in the middle.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
-    ///   if `--test-teacher` loss did not improve, multiply LR by
+    ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
     ///   `--lr-plateau-factor` and retry the same teacher interval.
     ///   When the next LR would fall below `--lr-min`, train that
     ///   interval one final time at exactly `--lr-min` and end the epoch.
@@ -1160,6 +1212,13 @@ struct Args {
     /// validation loss counts as an improvement.
     #[arg(long, default_value = "0.0")]
     lr_plateau_min_delta: f32,
+
+    /// Metric used by `--lr-schedule plateau` to accept a superbatch.
+    /// `loss` keeps the historical behaviour. `accuracy` accepts updates
+    /// whose held-out sign accuracy increases. `loss_or_accuracy` accepts
+    /// either a lower loss or a higher accuracy, and is the practical default.
+    #[arg(long, value_enum, default_value = "loss_or_accuracy")]
+    lr_plateau_monitor: PlateauMonitor,
 
     /// Lambda — weight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
@@ -1994,7 +2053,7 @@ fn main() {
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
         if args.test_teacher.is_none() {
-            eprintln!("error: --lr-schedule plateau requires --test-teacher so validation loss can be monitored.");
+            eprintln!("error: --lr-schedule plateau requires --test-teacher so validation metrics can be monitored.");
             std::process::exit(2);
         }
         if args.save_rate != 1 {
@@ -2034,6 +2093,9 @@ fn main() {
     }
     if args.adamw_epsilon != 0.00000001 {
         eprintln!("  AdamW epsilon = {}", args.adamw_epsilon);
+    }
+    if args.lr_schedule == LrScheduleKind::Plateau {
+        eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
     }
     if args.nnue_pytorch_layer_clip {
         eprintln!(
@@ -2129,6 +2191,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_min={:.9}", args.lr_min),
         format!("lr_plateau_factor={:.9}", args.lr_plateau_factor),
         format!("lr_plateau_min_delta={:.9}", args.lr_plateau_min_delta),
+        format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
@@ -2543,6 +2606,12 @@ struct TestMetrics {
     loss: f32,
 }
 
+impl From<TestMetrics> for PlateauMetrics {
+    fn from(value: TestMetrics) -> Self {
+        Self { loss: value.loss, accuracy: value.accuracy }
+    }
+}
+
 /// Convert bullet's raw 3-column `log.txt` text (`superbatch,curr_batch,loss`
 /// per line) into the enriched 11-column CSV body (no header). The header
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
@@ -2712,18 +2781,18 @@ fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option
     max_epoch
 }
 
-/// Read the last parseable `test_value_loss` from the NNUE rows in the
+/// Read the last parseable validation metrics from the NNUE rows in the
 /// top-level summary log. For plateau resume after a cleanly completed
-/// epoch, this is the previous epoch's final accepted validation loss.
-fn read_latest_nnue_test_loss_in_top_level_log(top_level_log: &std::path::Path) -> Option<f32> {
+/// epoch, this is the previous epoch's final accepted validation state.
+fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Path) -> Option<PlateauMetrics> {
     let content = std::fs::read_to_string(top_level_log).ok()?;
-    let mut latest: Option<f32> = None;
+    let mut latest: Option<PlateauMetrics> = None;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(10, ',').collect();
+        let parts: Vec<&str> = line.splitn(11, ',').collect();
         if parts.len() < 5 {
             continue;
         }
@@ -2731,8 +2800,9 @@ fn read_latest_nnue_test_loss_in_top_level_log(top_level_log: &std::path::Path) 
         if component != "nnue" {
             continue;
         }
+        let Ok(accuracy) = parts[3].parse::<f32>() else { continue };
         let Ok(loss) = parts[4].parse::<f32>() else { continue };
-        latest = Some(loss);
+        latest = Some(PlateauMetrics { loss, accuracy });
     }
     latest
 }
@@ -3151,7 +3221,7 @@ macro_rules! run_training_inline {
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
         // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `plateau` is validation-loss driven and
+        // `cos` use this period; `plateau` is validation-monitor driven and
         // does not need a positions-based cycle.
         let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
             0
@@ -3900,7 +3970,7 @@ macro_rules! run_training_inline_nnue {
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
         // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `plateau` is validation-loss driven and
+        // `cos` use this period; `plateau` is validation-monitor driven and
         // does not need a positions-based cycle.
         let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
             0
@@ -4165,27 +4235,31 @@ macro_rules! run_training_inline_nnue {
             };
         let mut persistent_hcpe_loader =
             new_hcpe_loader(cb_dataloader_resume_offset.get().0, cb_dataloader_resume_exact.get());
-        let mut previous_plateau_epoch_final_loss =
+        let mut previous_plateau_epoch_final_metrics =
             if matches!(args.lr_schedule, LrScheduleKind::Plateau) && prev_run_completed_epoch {
-                read_latest_nnue_test_loss_in_top_level_log(&cb_top_level_log)
+                read_latest_nnue_test_metrics_in_top_level_log(&cb_top_level_log)
             } else {
                 None
             };
-        if let Some(loss) = previous_plateau_epoch_final_loss {
-            eprintln!("  plateau: previous completed epoch final validation loss = {loss:.6}");
+        if let Some(metrics) = previous_plateau_epoch_final_metrics {
+            eprintln!(
+                "  plateau: previous completed epoch final validation metrics = loss {:.6}, accuracy {:.6}",
+                metrics.loss, metrics.accuracy
+            );
         }
         let mut last_epoch_for_fallback = 1usize;
         for epoch in 1..=max_epochs {
             last_epoch_for_fallback = epoch;
             print_epoch_banner(epoch, max_epochs);
             let mut stop_training_after_epoch = false;
-            let mut plateau_epoch_final_loss: Option<f32> = None;
+            let mut plateau_epoch_final_metrics: Option<PlateauMetrics> = None;
             let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
                 Some(PlateauLrState::new(
                     args.lr,
                     args.lr_min,
                     args.lr_plateau_factor,
                     args.lr_plateau_min_delta,
+                    args.lr_plateau_monitor,
                 ))
             } else {
                 None
@@ -4438,7 +4512,7 @@ macro_rules! run_training_inline_nnue {
 
                 let plateau_action = plateau_state.as_mut().map(|state| {
                     let metrics = test_metrics.expect("plateau requires --test-teacher");
-                    state.observe(metrics.loss)
+                    state.observe(metrics.into())
                 });
                 let retry_same_chunk = plateau_action.map(plateau_action_retries_teacher).unwrap_or(false);
                 let reject_checkpoint = plateau_action.map(plateau_action_rejects_update).unwrap_or(false);
@@ -4503,47 +4577,60 @@ macro_rules! run_training_inline_nnue {
 
                 if let Some(action) = plateau_action {
                     let current_lr = plateau_state.as_ref().map(|s| s.current_lr).unwrap_or(args.lr);
+                    let monitor_label = args.lr_plateau_monitor.label();
                     match action {
-                        PlateauAction::First { loss } => {
-                            eprintln!("  plateau: initial validation loss = {loss:.6}; lr stays {current_lr}");
+                        PlateauAction::First { metrics } => {
+                            eprintln!("  plateau: initial validation metrics = {}; lr stays {current_lr}", plateau_metrics_text(metrics));
                         }
                         PlateauAction::Improved { old_best, new_best } => {
                             eprintln!(
-                                "  plateau: validation loss improved {old_best:.6} -> {new_best:.6}; lr stays {}",
-                                current_lr
+                                "  plateau: {monitor_label} improved (best {} -> {}); lr stays {}",
+                                plateau_metrics_text(old_best),
+                                plateau_metrics_text(new_best),
+                                current_lr,
                             );
                         }
-                        PlateauAction::Keep { loss, best } => {
+                        PlateauAction::Keep { metrics, best } => {
                             eprintln!(
-                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); lr stays {}",
-                                current_lr
+                                "  plateau: {monitor_label} did not improve (current {}, best {}); lr stays {}",
+                                plateau_metrics_text(metrics),
+                                plateau_metrics_text(best),
+                                current_lr,
                             );
                         }
-                        PlateauAction::Reduced { old_lr, new_lr, loss, best } => {
+                        PlateauAction::Reduced { old_lr, new_lr, metrics, best } => {
                             eprintln!(
-                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); lr {old_lr} -> {new_lr}"
+                                "  plateau: {monitor_label} did not improve (current {}, best {}); lr {old_lr} -> {new_lr}",
+                                plateau_metrics_text(metrics),
+                                plateau_metrics_text(best),
                             );
                         }
-                        PlateauAction::ScheduledFinal { old_lr, min_lr, loss, best } => {
+                        PlateauAction::ScheduledFinal { old_lr, min_lr, metrics, best } => {
                             eprintln!(
-                                "  plateau: validation loss did not improve (loss={loss:.6}, best={best:.6}); \
+                                "  plateau: {monitor_label} did not improve (current {}, best {}); \
                                  next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
-                                 (old lr {old_lr})"
+                                 (old lr {old_lr})",
+                                plateau_metrics_text(metrics),
+                                plateau_metrics_text(best),
                             );
                         }
                         PlateauAction::FinalImproved { old_best, new_best } => {
-                            plateau_epoch_final_loss = plateau_action_epoch_final_loss(action);
+                            plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
                             eprintln!(
-                                "  plateau: final lr_min superbatch improved validation loss {old_best:.6} -> {new_best:.6}; \
-                                 accepting it and ending this epoch."
+                                "  plateau: final lr_min superbatch improved {monitor_label} (best {} -> {}); \
+                                 accepting it and ending this epoch.",
+                                plateau_metrics_text(old_best),
+                                plateau_metrics_text(new_best),
                             );
                             break 'epoch;
                         }
-                        PlateauAction::FinalRejected { loss, best } => {
-                            plateau_epoch_final_loss = plateau_action_epoch_final_loss(action);
+                        PlateauAction::FinalRejected { metrics, best } => {
+                            plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
                             eprintln!(
-                                "  plateau: final lr_min superbatch did not improve (loss={loss:.6}, best={best:.6}); \
-                                 discarding it and ending this epoch."
+                                "  plateau: final lr_min superbatch did not improve {monitor_label} (current {}, best {}); \
+                                 discarding it and ending this epoch.",
+                                plateau_metrics_text(metrics),
+                                plateau_metrics_text(best),
                             );
                             mark_latest_checkpoint_epoch_done(&output_dir_buf);
                             break 'epoch;
@@ -4584,19 +4671,28 @@ macro_rules! run_training_inline_nnue {
 
                 chunk_start = chunk_end + 1;
             }
-            if let Some(current_loss) = plateau_epoch_final_loss {
-                if plateau_epoch_should_stop(previous_plateau_epoch_final_loss, current_loss) {
-                    let previous_loss = previous_plateau_epoch_final_loss.expect("checked by predicate");
+            if let Some(current_metrics) = plateau_epoch_final_metrics {
+                if plateau_epoch_should_stop(
+                    previous_plateau_epoch_final_metrics,
+                    current_metrics,
+                    args.lr_plateau_monitor,
+                    0.0,
+                ) {
+                    let previous_metrics = previous_plateau_epoch_final_metrics.expect("checked by predicate");
                     eprintln!(
-                        "  plateau: epoch-final validation loss did not improve from previous epoch \
-                         ({previous_loss:.6} -> {current_loss:.6}); stopping training."
+                        "  plateau: epoch-final validation metrics did not improve from previous epoch \
+                         (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
+                        previous_metrics.loss,
+                        current_metrics.loss,
+                        previous_metrics.accuracy,
+                        current_metrics.accuracy
                     );
                     stop_training_after_epoch = true;
                 }
-                previous_plateau_epoch_final_loss = Some(current_loss);
+                previous_plateau_epoch_final_metrics = Some(current_metrics);
             } else if matches!(args.lr_schedule, LrScheduleKind::Plateau) && max_epochs == usize::MAX {
                 eprintln!(
-                    "  plateau: epoch ended before an epoch-final validation loss was established; stopping unlimited run."
+                    "  plateau: epoch ended before epoch-final validation metrics were established; stopping unlimited run."
                 );
                 stop_training_after_epoch = true;
             }
@@ -5949,44 +6045,92 @@ mod tests {
         assert!((lr - mid).abs() < 1e-6, "cycle 2 midpoint same as cycle 1, got {lr}");
     }
 
+    fn pm(loss: f32) -> PlateauMetrics {
+        PlateauMetrics { loss, accuracy: 0.50 }
+    }
+
+    fn pma(loss: f32, accuracy: f32) -> PlateauMetrics {
+        PlateauMetrics { loss, accuracy }
+    }
+
+    fn plateau_loss_state() -> PlateauLrState {
+        PlateauLrState::new(0.001, 0.0001, 0.5, 0.0, PlateauMonitor::Loss)
+    }
+
     #[test]
     fn plateau_lr_reduces_and_schedules_final_min_run() {
-        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0);
-        assert_eq!(s.observe(0.50), PlateauAction::First { loss: 0.50 });
-        assert_eq!(s.observe(0.49), PlateauAction::Improved { old_best: 0.50, new_best: 0.49 });
-        assert_eq!(s.observe(0.50), PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, loss: 0.50, best: 0.49 });
+        let mut s = plateau_loss_state();
+        assert_eq!(s.observe(pm(0.50)), PlateauAction::First { metrics: pm(0.50) });
+        assert_eq!(s.observe(pm(0.49)), PlateauAction::Improved { old_best: pm(0.50), new_best: pm(0.49) });
+        assert_eq!(
+            s.observe(pm(0.50)),
+            PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, metrics: pm(0.50), best: pm(0.49) }
+        );
         assert!((s.current_lr - 0.0005).abs() < 1e-12);
 
-        assert_eq!(s.observe(0.51), PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, loss: 0.51, best: 0.49 });
         assert_eq!(
-            s.observe(0.52),
-            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, loss: 0.52, best: 0.49 }
+            s.observe(pm(0.51)),
+            PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, metrics: pm(0.51), best: pm(0.49) }
         );
         assert_eq!(
-            s.observe(0.53),
-            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, loss: 0.53, best: 0.49 }
+            s.observe(pm(0.52)),
+            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, metrics: pm(0.52), best: pm(0.49) }
+        );
+        assert_eq!(
+            s.observe(pm(0.53)),
+            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, metrics: pm(0.53), best: pm(0.49) }
         );
         assert_eq!(s.current_lr, 0.0001);
-        assert_eq!(s.observe(0.54), PlateauAction::FinalRejected { loss: 0.54, best: 0.49 });
+        assert_eq!(s.observe(pm(0.54)), PlateauAction::FinalRejected { metrics: pm(0.54), best: pm(0.49) });
     }
 
     #[test]
     fn plateau_lr_accepts_final_min_run_only_when_it_improves() {
-        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0);
-        assert_eq!(s.observe(0.50), PlateauAction::First { loss: 0.50 });
-        assert_eq!(s.observe(0.49), PlateauAction::Improved { old_best: 0.50, new_best: 0.49 });
-        assert_eq!(s.observe(0.50), PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, loss: 0.50, best: 0.49 });
-        assert_eq!(s.observe(0.51), PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, loss: 0.51, best: 0.49 });
+        let mut s = plateau_loss_state();
+        assert_eq!(s.observe(pm(0.50)), PlateauAction::First { metrics: pm(0.50) });
+        assert_eq!(s.observe(pm(0.49)), PlateauAction::Improved { old_best: pm(0.50), new_best: pm(0.49) });
         assert_eq!(
-            s.observe(0.52),
-            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, loss: 0.52, best: 0.49 }
+            s.observe(pm(0.50)),
+            PlateauAction::Reduced { old_lr: 0.001, new_lr: 0.0005, metrics: pm(0.50), best: pm(0.49) }
         );
         assert_eq!(
-            s.observe(0.53),
-            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, loss: 0.53, best: 0.49 }
+            s.observe(pm(0.51)),
+            PlateauAction::Reduced { old_lr: 0.0005, new_lr: 0.00025, metrics: pm(0.51), best: pm(0.49) }
+        );
+        assert_eq!(
+            s.observe(pm(0.52)),
+            PlateauAction::Reduced { old_lr: 0.00025, new_lr: 0.000125, metrics: pm(0.52), best: pm(0.49) }
+        );
+        assert_eq!(
+            s.observe(pm(0.53)),
+            PlateauAction::ScheduledFinal { old_lr: 0.000125, min_lr: 0.0001, metrics: pm(0.53), best: pm(0.49) }
         );
         assert_eq!(s.current_lr, 0.0001);
-        assert_eq!(s.observe(0.48), PlateauAction::FinalImproved { old_best: 0.49, new_best: 0.48 });
+        assert_eq!(s.observe(pm(0.48)), PlateauAction::FinalImproved { old_best: pm(0.49), new_best: pm(0.48) });
+    }
+
+    #[test]
+    fn plateau_accuracy_monitor_accepts_accuracy_improvement_even_if_loss_worsens() {
+        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0, PlateauMonitor::Accuracy);
+        assert_eq!(s.observe(pma(0.50, 0.55)), PlateauAction::First { metrics: pma(0.50, 0.55) });
+        assert_eq!(
+            s.observe(pma(0.60, 0.56)),
+            PlateauAction::Improved { old_best: pma(0.50, 0.55), new_best: pma(0.60, 0.56) }
+        );
+    }
+
+    #[test]
+    fn plateau_loss_or_accuracy_monitor_accepts_either_improvement() {
+        let mut s = PlateauLrState::new(0.001, 0.0001, 0.5, 0.0, PlateauMonitor::LossOrAccuracy);
+        assert_eq!(s.observe(pma(0.50, 0.55)), PlateauAction::First { metrics: pma(0.50, 0.55) });
+        assert_eq!(
+            s.observe(pma(0.60, 0.56)),
+            PlateauAction::Improved { old_best: pma(0.50, 0.55), new_best: pma(0.60, 0.56) }
+        );
+        assert_eq!(
+            s.observe(pma(0.49, 0.54)),
+            PlateauAction::Improved { old_best: pma(0.60, 0.56), new_best: pma(0.49, 0.54) }
+        );
     }
 
     #[test]
@@ -5994,22 +6138,22 @@ mod tests {
         assert!(plateau_action_retries_teacher(PlateauAction::Reduced {
             old_lr: 0.001,
             new_lr: 0.0005,
-            loss: 0.50,
-            best: 0.49,
+            metrics: pm(0.50),
+            best: pm(0.49),
         }));
         assert!(plateau_action_retries_teacher(PlateauAction::ScheduledFinal {
             old_lr: 0.000125,
             min_lr: 0.0001,
-            loss: 0.53,
-            best: 0.49,
+            metrics: pm(0.53),
+            best: pm(0.49),
         }));
         assert!(!plateau_action_retries_teacher(PlateauAction::Improved {
-            old_best: 0.50,
-            new_best: 0.49,
+            old_best: pm(0.50),
+            new_best: pm(0.49),
         }));
         assert!(!plateau_action_retries_teacher(PlateauAction::FinalRejected {
-            loss: 0.54,
-            best: 0.49,
+            metrics: pm(0.54),
+            best: pm(0.49),
         }));
     }
 
@@ -6018,52 +6162,58 @@ mod tests {
         assert!(plateau_action_rejects_update(PlateauAction::Reduced {
             old_lr: 0.001,
             new_lr: 0.0005,
-            loss: 0.50,
-            best: 0.49,
+            metrics: pm(0.50),
+            best: pm(0.49),
         }));
         assert!(plateau_action_rejects_update(PlateauAction::ScheduledFinal {
             old_lr: 0.000125,
             min_lr: 0.0001,
-            loss: 0.53,
-            best: 0.49,
+            metrics: pm(0.53),
+            best: pm(0.49),
         }));
         assert!(plateau_action_rejects_update(PlateauAction::FinalRejected {
-            loss: 0.54,
-            best: 0.49,
+            metrics: pm(0.54),
+            best: pm(0.49),
         }));
         assert!(!plateau_action_rejects_update(PlateauAction::FinalImproved {
-            old_best: 0.49,
-            new_best: 0.48,
+            old_best: pm(0.49),
+            new_best: pm(0.48),
         }));
     }
 
     #[test]
-    fn plateau_epoch_final_loss_uses_accepted_loss() {
+    fn plateau_epoch_final_metrics_uses_accepted_metrics() {
         assert_eq!(
-            plateau_action_epoch_final_loss(PlateauAction::FinalImproved { old_best: 0.49, new_best: 0.48 }),
-            Some(0.48)
+            plateau_action_epoch_final_metrics(PlateauAction::FinalImproved { old_best: pm(0.49), new_best: pm(0.48) }),
+            Some(pm(0.48))
         );
         assert_eq!(
-            plateau_action_epoch_final_loss(PlateauAction::FinalRejected { loss: 0.54, best: 0.49 }),
-            Some(0.49)
+            plateau_action_epoch_final_metrics(PlateauAction::FinalRejected { metrics: pm(0.54), best: pm(0.49) }),
+            Some(pm(0.49))
         );
         assert_eq!(
-            plateau_action_epoch_final_loss(PlateauAction::Reduced {
+            plateau_action_epoch_final_metrics(PlateauAction::Reduced {
                 old_lr: 0.001,
                 new_lr: 0.0005,
-                loss: 0.50,
-                best: 0.49,
+                metrics: pm(0.50),
+                best: pm(0.49),
             }),
             None
         );
     }
 
     #[test]
-    fn plateau_epoch_stops_when_final_loss_does_not_improve() {
-        assert!(!plateau_epoch_should_stop(None, 0.50));
-        assert!(!plateau_epoch_should_stop(Some(0.50), 0.49));
-        assert!(plateau_epoch_should_stop(Some(0.50), 0.50));
-        assert!(plateau_epoch_should_stop(Some(0.50), 0.51));
+    fn plateau_epoch_stops_when_monitor_does_not_improve() {
+        assert!(!plateau_epoch_should_stop(None, pm(0.50), PlateauMonitor::Loss, 0.0));
+        assert!(!plateau_epoch_should_stop(Some(pm(0.50)), pm(0.49), PlateauMonitor::Loss, 0.0));
+        assert!(plateau_epoch_should_stop(Some(pm(0.50)), pm(0.50), PlateauMonitor::Loss, 0.0));
+        assert!(plateau_epoch_should_stop(Some(pm(0.50)), pm(0.51), PlateauMonitor::Loss, 0.0));
+        assert!(!plateau_epoch_should_stop(
+            Some(pma(0.50, 0.55)),
+            pma(0.60, 0.56),
+            PlateauMonitor::LossOrAccuracy,
+            0.0
+        ));
     }
 
     #[test]
@@ -6210,16 +6360,16 @@ mod tests {
     }
 
     #[test]
-    fn read_latest_nnue_test_loss_picks_last_numeric_loss() {
+    fn read_latest_nnue_test_metrics_picks_last_numeric_metrics() {
         let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-loss-{}-{}",
+            "bulletou-test-metrics-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("summary-learn.log");
 
-        assert_eq!(read_latest_nnue_test_loss_in_top_level_log(&log), None);
+        assert_eq!(read_latest_nnue_test_metrics_in_top_level_log(&log), None);
         std::fs::write(
             &log,
             "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr,lambda,positions,teacher\n\
@@ -6229,7 +6379,10 @@ mod tests {
              NNUE,2,1,0.5,0.120000,0.1,0.001,1.0,40,t.hcpe\n",
         )
         .unwrap();
-        assert_eq!(read_latest_nnue_test_loss_in_top_level_log(&log), Some(0.120000));
+        assert_eq!(
+            read_latest_nnue_test_metrics_in_top_level_log(&log),
+            Some(PlateauMetrics { loss: 0.120000, accuracy: 0.5 })
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

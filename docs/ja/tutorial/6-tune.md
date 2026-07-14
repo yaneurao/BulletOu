@@ -18,10 +18,11 @@
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
-| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation loss が改善しないときだけ LR を下げる) | `step` |
+| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
-| `--lr-plateau-factor` | `plateau` で loss が改善しなかったときに LR へ掛ける係数 | 0.5 |
+| `--lr-plateau-factor` | `plateau` で監視指標が改善しなかったときに LR へ掛ける係数 | 0.5 |
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
+| `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 | `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
@@ -78,21 +79,31 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 #### ReduceLROnPlateau を使う
 
-教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation loss を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
+教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation 指標を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
 
-`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` を計測し、過去 best より下がっていなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も validation loss が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
+`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` / `test_value_accuracy` を計測し、`--lr-plateau-monitor` で指定した指標が改善していれば採用する。改善していなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も監視指標が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
-`plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 `test_value_loss` を前 epoch の最終 `test_value_loss` と比較し、**厳密に下がっていなければそこで学習を停止**する。`--lr-plateau-min-delta` は epoch 間の停止判定には使わない。
+`--lr-plateau-monitor` は次の3種類:
+
+| 値 | 採用条件 |
+|---|---|
+| `loss` | `test_value_loss` が下がった場合だけ採用する。従来どおりの ReduceLROnPlateau |
+| `accuracy` | `test_value_accuracy` が上がった場合だけ採用する |
+| `loss_or_accuracy` | loss が下がるか、accuracy が上がった場合に採用する。デフォルト |
+
+`--lr-plateau-min-delta` は loss 側だけに効く。accuracy 側は「厳密に上がったか」だけを見る。
+
+`plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 validation 指標を前 epoch の最終指標と比較し、`--lr-plateau-monitor` の条件で改善していなければそこで学習を停止する。`--lr-plateau-min-delta` は epoch 間の停止判定には使わない。
 
 `plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
 
-validation loss が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
+監視指標が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
 
 既存の checkpoint がある `--tag` で `--superbatches` を付けたり外したりすると、BulletOu は設定変更として扱い、auto resume を拒否する。古い checkpoint を意図して引き継ぐ場合だけ `--resume` を付ける。新しい実験として始めたい場合は `--tag` / `--output` を変える。
 
 制約:
 
-- `--test-teacher` 必須。validation loss がないと判定できない。
+- `--test-teacher` 必須。validation 指標がないと判定できない。
 - `--save-rate 1` 必須。1 superbatchごとに検証してLRを更新するため。
 - 現状は NNUE/SFNN 系の学習で使用する。
 
@@ -104,10 +115,11 @@ validation loss が改善しなかった attempt は正式な checkpoint (`000N/
     --eval-type NNUE_HALFKP \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
-    --lr-plateau-factor 0.5
+    --lr-plateau-factor 0.5 \
+    --lr-plateau-monitor loss_or_accuracy
 ```
 
-factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、epoch 内の superbatch 判定でそれ未満の微小な改善は「改善なし」とみなす。epoch 間の停止判定は常に「前 epoch より final loss が厳密に下がったか」だけを見る。
+factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、epoch 内の superbatch 判定でそれ未満の微小な loss 改善は「改善なし」とみなす。epoch 間の停止判定は `--lr-plateau-monitor` の条件を見るが、`--lr-plateau-min-delta` は使わない。
 
 #### `step` vs `cos` を比較したい
 
@@ -173,7 +185,7 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 
 ### 複数 epoch 回す
 
-`--max-epochs N` を指定すると epoch を N 回実行する。`step` / `cos` では通常「教師データを N 周する」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。`plateau` で省略した場合は、前 epoch より final loss が改善しなくなるまで続ける。各 epoch 開始時に:
+`--max-epochs N` を指定すると epoch を N 回実行する。`step` / `cos` では通常「教師データを N 周する」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。`plateau` で省略した場合は、前 epoch より最終 validation 指標が改善しなくなるまで続ける。各 epoch 開始時に:
 - LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る — `step` でも `cos` でも同じ)
 - データローダーが先頭にシークし直す
 

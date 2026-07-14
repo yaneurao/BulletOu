@@ -18,10 +18,11 @@ Main flags:
 | `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
-| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when validation loss stops improving) | `step` |
+| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
 | `--lr-min` | Floor LR. For `step` / `cos`, this is reached at the end of each cycle. For `plateau`, this is the final LR | 0.00001 |
-| `--lr-plateau-factor` | Factor multiplied into LR when `plateau` validation loss does not improve | 0.5 |
+| `--lr-plateau-factor` | Factor multiplied into LR when the `plateau` monitor does not improve | 0.5 |
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
+| `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
@@ -78,11 +79,21 @@ Inspect `<NNNN>/learn.log`'s `lr` column to verify the actual lr trajectory ([§
 
 #### ReduceLROnPlateau
 
-Use `--lr-schedule plateau` when you want validation loss to decide LR reductions instead of forcing a fixed cosine or geometric period.
+Use `--lr-schedule plateau` when you want validation metrics to decide LR reductions instead of forcing a fixed cosine or geometric period.
 
-After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `test_value_loss`. If the loss did not improve, it discards that update, restores both model weights and Adam optimiser state to the start of the superbatch, multiplies LR by `--lr-plateau-factor`, and retries the same teacher interval. When the next LR would go below `--lr-min`, it runs one final attempt at exactly `--lr-min`. That final attempt is accepted only if validation loss improves; otherwise it is discarded and the epoch ends.
+After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `test_value_loss` / `test_value_accuracy`. The update is accepted when the metric selected by `--lr-plateau-monitor` improves. If it does not improve, BulletOu discards that update, restores both model weights and Adam optimiser state to the start of the superbatch, multiplies LR by `--lr-plateau-factor`, and retries the same teacher interval. When the next LR would go below `--lr-min`, it runs one final attempt at exactly `--lr-min`. That final attempt is accepted only if the monitor improves; otherwise it is discarded and the epoch ends.
 
-If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. After each epoch, BulletOu compares the epoch-final `test_value_loss` that remained in `summary-learn.log` with the previous epoch's final loss. If it is **not strictly lower**, training stops. `--lr-plateau-min-delta` affects only the per-superbatch plateau decision; epoch-to-epoch stopping uses no tolerance.
+`--lr-plateau-monitor` has three modes:
+
+| Value | Acceptance rule |
+|---|---|
+| `loss` | Accept only when `test_value_loss` decreases. This is the historical ReduceLROnPlateau behaviour |
+| `accuracy` | Accept only when `test_value_accuracy` increases |
+| `loss_or_accuracy` | Accept when either loss decreases or accuracy increases. This is the default |
+
+`--lr-plateau-min-delta` applies only to the loss side. Accuracy uses a strict increase.
+
+If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. After each epoch, BulletOu compares the epoch-final validation metrics that remained in `summary-learn.log` with the previous epoch's final metrics. If the selected `--lr-plateau-monitor` does not improve, training stops. `--lr-plateau-min-delta` affects only the per-superbatch plateau decision; epoch-to-epoch stopping uses no tolerance.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -90,7 +101,8 @@ If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. Afte
     --eval-type NNUE_HALFKP \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
-    --lr-plateau-factor 0.5
+    --lr-plateau-factor 0.5 \
+    --lr-plateau-monitor loss_or_accuracy
 ```
 
 Constraints:
