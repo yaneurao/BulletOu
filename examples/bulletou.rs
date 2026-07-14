@@ -1189,6 +1189,12 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_wrm_loss: bool,
 
+    /// AdamW weight decay. BulletOu's historical default is 0.01. Set this
+    /// to 0.0 to match nodchip nnue-pytorch's optimizer condition for A/B
+    /// comparisons while keeping the rest of the AdamW implementation.
+    #[arg(long, default_value = "0.01")]
+    adamw_weight_decay: f32,
+
     /// f32 -> integer quantisation scale for the YaneuraOu KPPT output.
     /// If omitted, per-component defaults are used (4000 for KK/KKP, 400
     /// for KPP). Ignored by NNUE eval types.
@@ -1425,6 +1431,17 @@ fn value_loss_fn(args: &Args) -> ValueLossFn {
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
     if args.nnue_pytorch_wrm_loss { ValidationLossKind::NnuePytorchWrm } else { ValidationLossKind::SigmoidMse }
+}
+
+fn configure_adamw<Inp, Out>(args: &Args, trainer: &mut ValueTrainer<optimiser::AdamWOptimiser, Inp, Out>)
+where
+    Inp: SparseInputType,
+    Out: OutputBuckets<Inp::RequiredDataType>,
+{
+    trainer.optimiser.set_params(optimiser::AdamWParams {
+        decay: args.adamw_weight_decay,
+        ..Default::default()
+    });
 }
 
 // ----- epoch period ------------------------------------------------------
@@ -1855,6 +1872,10 @@ fn main() {
             }
         }
     }
+    if !(args.adamw_weight_decay.is_finite() && args.adamw_weight_decay >= 0.0) {
+        eprintln!("error: --adamw-weight-decay must be finite and >= 0.");
+        std::process::exit(2);
+    }
     if !(args.nnue_pytorch_init_scale.is_finite() && args.nnue_pytorch_init_scale > 0.0) {
         eprintln!("error: --nnue-pytorch-init-scale must be finite and > 0.");
         std::process::exit(2);
@@ -1945,6 +1966,9 @@ fn main() {
     if args.nnue_pytorch_wrm_loss {
         eprintln!("  nnue-pytorch WRM loss = enabled");
     }
+    if args.adamw_weight_decay != 0.01 {
+        eprintln!("  AdamW weight decay = {}", args.adamw_weight_decay);
+    }
     prepare_resume_config_or_exit(&args);
     if let Err(e) = record_invocation_to_tag_txt(&args) {
         eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
@@ -2033,6 +2057,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
+        format!("adamw_weight_decay={:.9}", args.adamw_weight_decay),
         format!("save_rate={}", args.save_rate),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -3260,6 +3285,8 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
+    configure_adamw(args, &mut trainer);
+
     if let Some(dir) = resume_dir {
         eprintln!("  [KK] restoring optimiser state from {}", dir.display());
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
@@ -3306,6 +3333,8 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
+    configure_adamw(args, &mut trainer);
+
     if let Some(dir) = resume_dir {
         eprintln!("  [KKP] restoring optimiser state from {}", dir.display());
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
@@ -3351,6 +3380,8 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
         let combined = stm_eval.concat(ntm_eval);
         out.forward(combined)
     });
+
+    configure_adamw(args, &mut trainer);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KPP] restoring optimiser state from {}", dir.display());
@@ -4708,6 +4739,8 @@ fn run_halfkp(args: &Args) {
         out.forward(hidden2)
     });
 
+    configure_adamw(args, &mut trainer);
+
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
@@ -4807,6 +4840,8 @@ fn run_kp(args: &Args) {
         out.forward(hidden2)
     });
 
+    configure_adamw(args, &mut trainer);
+
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
@@ -4902,6 +4937,8 @@ fn run_nnue_ka2(args: &Args) {
         let hidden2 = l2.forward(hidden1).crelu();
         out.forward(hidden2)
     });
+
+    configure_adamw(args, &mut trainer);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -4999,6 +5036,8 @@ fn run_halfkpe9(args: &Args) {
         out.forward(hidden2)
     });
 
+    configure_adamw(args, &mut trainer);
+
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
@@ -5093,6 +5132,8 @@ fn run_halfkpvm(args: &Args) {
         let hidden2 = l2.forward(hidden1).crelu();
         out.forward(hidden2)
     });
+
+    configure_adamw(args, &mut trainer);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5292,6 +5333,8 @@ where
         // yaneuraou's `buf.fc_2_out[0] += buf.fc_0_out[kHidden1Dims]`.
         l3_out + l1_skip
     });
+
+    configure_adamw(args, &mut trainer);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());

@@ -24,6 +24,7 @@
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
+| `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -223,6 +224,20 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --tag sfnn-wrm-test \
     --nnue-pytorch-wrm-loss
 ```
+
+### AdamW weight decay
+
+BulletOu の標準 AdamW は `--adamw-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を AdamW のまま `--adamw-weight-decay 0.0` だけを試す。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-adamw-decay0 \
+    --adamw-weight-decay 0.0
+```
+
+これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、まず単独で ON/OFF 比較する。
 
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習

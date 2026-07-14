@@ -205,6 +205,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 
 4. optimizer 条件を近づける
    - まず `AdamW weight_decay=0.0`
+   - 実装済み: `--adamw-weight-decay 0.0` で opt-in
    - その後 Ranger21 相当の実装・比較
 
 5. layer-specific clipping を入れる
