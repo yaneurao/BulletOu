@@ -1328,6 +1328,18 @@ struct Args {
     #[arg(long, default_value = "0.00000001")]
     adamw_epsilon: f32,
 
+    /// AdamW beta1. BulletOu's historical default is 0.9, matching
+    /// nodchip nnue-pytorch's Ranger21 setting. Expose it as an isolated
+    /// optimizer-dynamics ablation while keeping AdamW.
+    #[arg(long, default_value = "0.9")]
+    adamw_beta1: f32,
+
+    /// AdamW beta2. BulletOu's historical default is 0.999, matching
+    /// nodchip nnue-pytorch's Ranger21 setting. Expose it as an isolated
+    /// optimizer-dynamics ablation while keeping AdamW.
+    #[arg(long, default_value = "0.999")]
+    adamw_beta2: f32,
+
     /// Use nnue-pytorch-style layer-specific AdamW clipping for NNUE / SFNN
     /// scalar value networks. Hidden weights use +/-127/64, while only the
     /// final output weight tensor uses +/-127*127/(600*16). Default is off
@@ -1588,6 +1600,8 @@ fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
     optimiser::AdamWParams {
         decay: args.adamw_weight_decay,
         epsilon: args.adamw_epsilon,
+        beta1: args.adamw_beta1,
+        beta2: args.adamw_beta2,
         min_weight: -clip,
         max_weight: clip,
         ..Default::default()
@@ -2058,6 +2072,14 @@ fn main() {
         eprintln!("error: --adamw-epsilon must be finite and > 0.");
         std::process::exit(2);
     }
+    if !(args.adamw_beta1.is_finite() && args.adamw_beta1 > 0.0 && args.adamw_beta1 < 1.0) {
+        eprintln!("error: --adamw-beta1 must be finite and satisfy 0 < beta1 < 1.");
+        std::process::exit(2);
+    }
+    if !(args.adamw_beta2.is_finite() && args.adamw_beta2 > 0.0 && args.adamw_beta2 < 1.0) {
+        eprintln!("error: --adamw-beta2 must be finite and satisfy 0 < beta2 < 1.");
+        std::process::exit(2);
+    }
     if !(args.nnue_pytorch_init_scale.is_finite() && args.nnue_pytorch_init_scale > 0.0) {
         eprintln!("error: --nnue-pytorch-init-scale must be finite and > 0.");
         std::process::exit(2);
@@ -2177,6 +2199,12 @@ fn main() {
     if args.adamw_epsilon != 0.00000001 {
         eprintln!("  AdamW epsilon = {}", args.adamw_epsilon);
     }
+    if args.adamw_beta1 != 0.9 {
+        eprintln!("  AdamW beta1 = {}", args.adamw_beta1);
+    }
+    if args.adamw_beta2 != 0.999 {
+        eprintln!("  AdamW beta2 = {}", args.adamw_beta2);
+    }
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
     }
@@ -2294,6 +2322,8 @@ fn resume_signature(args: &Args) -> String {
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
         format!("adamw_weight_decay={:.9}", args.adamw_weight_decay),
         format!("adamw_epsilon={:.9}", args.adamw_epsilon),
+        format!("adamw_beta1={:.9}", args.adamw_beta1),
+        format!("adamw_beta2={:.9}", args.adamw_beta2),
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
         format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", args.save_rate),
@@ -6007,6 +6037,32 @@ mod tests {
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
+    }
+
+    #[test]
+    fn adamw_beta_flags_feed_optimizer_and_resume_signature() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--adamw-beta1",
+            "0.85",
+            "--adamw-beta2",
+            "0.995",
+        ])
+        .unwrap();
+
+        let params = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        assert_eq!(params.beta1, 0.85);
+        assert_eq!(params.beta2, 0.995);
+
+        let sig = resume_signature(&args);
+        assert!(sig.contains("adamw_beta1=0.850000024"));
+        assert!(sig.contains("adamw_beta2=0.995000005"));
     }
 
     #[test]

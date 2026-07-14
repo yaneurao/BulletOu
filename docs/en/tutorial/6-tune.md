@@ -29,6 +29,8 @@ Main flags:
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
 | `--adamw-epsilon` | AdamW epsilon. Try `0.0000001` when matching nnue-pytorch's optimizer condition | 0.00000001 |
+| `--adamw-beta1` | AdamW beta1 for isolated optimizer-momentum ablations | 0.9 |
+| `--adamw-beta2` | AdamW beta2 for isolated second-moment ablations | 0.999 |
 | `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
 | `--nnue-pytorch-no-bias-clip` | Effectively disable AdamW clipping for bias tensors | off |
 
@@ -279,6 +281,23 @@ BulletOu's AdamW epsilon defaults to `1e-8`. nodchip nnue-pytorch's Ranger21 use
 ```
 
 This is another optimizer-condition ablation. Compare it by itself first.
+
+### AdamW beta
+
+AdamW `beta1` / `beta2` can also be set from the CLI. The defaults are `beta1=0.9`, `beta2=0.999`, which already match nodchip nnue-pytorch's Ranger21 setting. Normally you do not need to specify them.
+
+If you want to isolate only the optimizer momentum time constants while still using AdamW, pass `--adamw-beta1` / `--adamw-beta2`.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-adamw-beta-test \
+    --adamw-beta1 0.85 \
+    --adamw-beta2 0.995
+```
+
+This is not a Ranger21 compatibility mode. It is an AdamW-only ablation, so compare it by itself before combining it with weight decay or epsilon changes.
 
 ### nnue-pytorch layer clipping
 

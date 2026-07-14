@@ -29,6 +29,8 @@
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 | `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
 | `--adamw-epsilon` | AdamW の epsilon。nnue-pytorch 条件に寄せる比較では `0.0000001` を試す | 0.00000001 |
+| `--adamw-beta1` | AdamW の beta1。optimizer の momentum 条件だけを変える比較用 | 0.9 |
+| `--adamw-beta2` | AdamW の beta2。optimizer の second moment 条件だけを変える比較用 | 0.999 |
 | `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
 | `--nnue-pytorch-no-bias-clip` | bias tensor の AdamW clipping を実質無効にする | off |
 
@@ -289,6 +291,23 @@ BulletOu の AdamW epsilon は標準で `1e-8`。nodchip 版 nnue-pytorch の Ra
 ```
 
 これも optimizer 条件の差分調査用フラグなので、まず単独で比較する。
+
+### AdamW beta
+
+AdamW の `beta1` / `beta2` も CLI から変更できる。デフォルトは `beta1=0.9`, `beta2=0.999` で、これは nodchip 版 nnue-pytorch の Ranger21 設定と同じ。したがって、通常は指定する必要はない。
+
+それでも optimizer の momentum 条件だけを動かして切り分けたい場合は、AdamW のまま `--adamw-beta1` / `--adamw-beta2` を指定する。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-adamw-beta-test \
+    --adamw-beta1 0.85 \
+    --adamw-beta2 0.995
+```
+
+これは Ranger21 互換化ではなく、AdamW の内部時定数だけを見る ablation。weight decay や epsilon と混ぜず、まず単独で比較する。
 
 ### nnue-pytorch layer clipping
 

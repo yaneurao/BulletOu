@@ -233,6 +233,8 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - 実装済み: `--adamw-weight-decay 0.0` で opt-in
    - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
    - `eps=1e-7` は `--adamw-epsilon 0.0000001` で AdamW のまま単独比較する
+   - `beta1` / `beta2` は `--adamw-beta1` / `--adamw-beta2` で AdamW のまま単独比較する
+     - デフォルトは `0.9` / `0.999` で、nodchip nnue-pytorch の Ranger21 設定と同じ
    - その後 Ranger21 相当の実装・比較
 
 5. layer-specific clipping を入れる
