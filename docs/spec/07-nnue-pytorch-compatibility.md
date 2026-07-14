@@ -91,6 +91,25 @@ BulletOu の現在の `examples/bulletou.rs` 経路は `AdamW` を使い、
 これは大きな差分。nnue-pytorch 互換性を比較する場合、最低限
 `weight_decay=0.0` の ablation を行い、その後 Ranger21 相当を検討する。
 
+scheduler 差分については、既存の BulletOu `--lr-schedule step` は
+1 epoch の中で `lr -> lr_min` へ滑らかに落として epoch 境界で warm restart する
+独自の geometric schedule であり、nnue-pytorch の `StepLR(gamma=0.992)` とは別物。
+比較用に `--lr-schedule step_gamma` を追加した。これは指定局面数ごとに
+`lr *= --lr-step-gamma` し、warm restart しない。
+
+nnue-pytorch 既定に寄せる比較例:
+
+```text
+--lr 0.000875
+--lr-schedule step_gamma
+--lr-step-gamma 0.992
+--lr-step-positions 100000000
+--lr-min 0.00001
+```
+
+`--lr-step-positions` を省略した場合は 1 superbatch ごとの decay になる。
+比較では明示したほうがよい。
+
 ### 3. SFNN の L1 factorized shared term
 
 nnue-pytorch の `LayerStacks` は、L1 に `FactorizedStackedLinear` を使う。
@@ -227,6 +246,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions
    - `StepLR(gamma=0.992)` と BulletOu 側 schedule を区別する
+   - 実装済み: `--lr-schedule step_gamma --lr-step-gamma 0.992 --lr-step-positions 100000000`
 
 ## 比較時の注意
 

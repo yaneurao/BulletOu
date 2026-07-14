@@ -792,6 +792,46 @@ impl LrScheduler for PositionsLR {
     }
 }
 
+/// nnue-pytorch-style StepLR ablation. Drops LR by a fixed gamma every
+/// `step_positions` trained positions and never warm-restarts.
+#[derive(Clone, Debug)]
+struct GammaStepLR {
+    start: f32,
+    min: f32,
+    gamma: f32,
+    step_positions: u64,
+    prior_positions: u64,
+    batch_size: usize,
+    batches_per_superbatch: usize,
+}
+
+impl GammaStepLR {
+    fn lr_at_positions(start: f32, min: f32, gamma: f32, step_positions: u64, total: u64) -> f32 {
+        if step_positions == 0 {
+            return start;
+        }
+        let steps = total / step_positions;
+        let lr = (start as f64) * (gamma as f64).powf(steps as f64);
+        (lr as f32).max(min)
+    }
+}
+
+impl LrScheduler for GammaStepLR {
+    fn lr(&self, batch: usize, superbatch: usize) -> f32 {
+        let in_run =
+            ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64) * (self.batch_size as u64);
+        let total = self.prior_positions + in_run;
+        Self::lr_at_positions(self.start, self.min, self.gamma, self.step_positions, total)
+    }
+
+    fn colourful(&self) -> String {
+        format!(
+            "step_gamma: start {} min {} gamma {} every {} positions (cumulative, prior {})",
+            self.start, self.min, self.gamma, self.step_positions, self.prior_positions
+        )
+    }
+}
+
 /// Cosine annealing with warm restart (SGDR style), positions-based.
 ///
 /// Mirrors [`PositionsLR`] structurally so the two schedules can be
@@ -865,6 +905,7 @@ impl LrScheduler for FixedLR {
 #[derive(Clone, Debug)]
 enum LrSchedulerImpl {
     Step(PositionsLR),
+    StepGamma(GammaStepLR),
     Cos(CosineLR),
     Fixed(FixedLR),
 }
@@ -873,6 +914,7 @@ impl LrScheduler for LrSchedulerImpl {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         match self {
             LrSchedulerImpl::Step(s) => s.lr(batch, superbatch),
+            LrSchedulerImpl::StepGamma(s) => s.lr(batch, superbatch),
             LrSchedulerImpl::Cos(s) => s.lr(batch, superbatch),
             LrSchedulerImpl::Fixed(s) => s.lr(batch, superbatch),
         }
@@ -880,6 +922,7 @@ impl LrScheduler for LrSchedulerImpl {
     fn colourful(&self) -> String {
         match self {
             LrSchedulerImpl::Step(s) => s.colourful(),
+            LrSchedulerImpl::StepGamma(s) => s.colourful(),
             LrSchedulerImpl::Cos(s) => s.colourful(),
             LrSchedulerImpl::Fixed(s) => s.colourful(),
         }
@@ -1050,14 +1093,16 @@ fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     }
 }
 
-/// Which LR schedule the trainer should follow. `Step` is stepwise
-/// `gamma`-decay (current behaviour); `Cos` is SGDR-style cosine
-/// annealing with one cycle per epoch (period auto-computed; see
-/// `Args::lr_min` doc).
+/// Which LR schedule the trainer should follow. `Step` is the existing
+/// smooth geometric epoch schedule; `StepGamma` is fixed gamma drops for
+/// nnue-pytorch StepLR ablations; `Cos` is SGDR-style cosine annealing
+/// with one cycle per epoch.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[clap(rename_all = "lowercase")]
 enum LrScheduleKind {
     Step,
+    #[value(name = "step_gamma", alias = "step-gamma")]
+    StepGamma,
     Cos,
     Plateau,
 }
@@ -1066,10 +1111,16 @@ impl LrScheduleKind {
     fn cli_name(self) -> &'static str {
         match self {
             LrScheduleKind::Step => "step",
+            LrScheduleKind::StepGamma => "step_gamma",
             LrScheduleKind::Cos => "cos",
             LrScheduleKind::Plateau => "plateau",
         }
     }
+}
+
+fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u64 {
+    args.lr_step_positions
+        .unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
 }
 
 // ----- CLI ---------------------------------------------------------------
@@ -1171,8 +1222,10 @@ struct Args {
 
     /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
     /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
-    /// epoch boundary. `plateau` keeps LR fixed during one superbatch,
-    /// then reduces it when the validation monitor does not improve:
+    /// epoch boundary. `step_gamma` applies nnue-pytorch-style fixed
+    /// gamma drops and does not warm-restart. `plateau` keeps LR fixed
+    /// during one superbatch, then reduces it when the validation monitor
+    /// does not improve:
     ///
     /// - `step` (default) = geometric (= exponential in log space):
     ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
@@ -1181,6 +1234,10 @@ struct Args {
     /// - `cos` = cosine annealing (SGDR-style):
     ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
     ///   Slower descent at the start and end, fastest in the middle.
+    /// - `step_gamma` = `lr = max(lr_min, lr * gamma^n)` where n is
+    ///   the number of completed `--lr-step-positions` intervals.
+    ///   This is the scheduler ablation closest to nnue-pytorch
+    ///   `StepLR(gamma=0.992)`.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
     ///   `--lr-plateau-factor` and retry the same teacher interval.
@@ -1190,17 +1247,28 @@ struct Args {
     /// For `step` / `cos`, the LR period is set by `--superbatches N`
     /// (`N * sb_size`). Without `--superbatches`, HCPE / PSV falls back
     /// to the teacher's total position count, while HCPE3 / pack needs
-    /// an explicit period. `plateau` is validation-driven and does not
-    /// need `--superbatches` to define epoch length.
+    /// an explicit period. `step_gamma` uses `--lr-step-positions`
+    /// instead, and `plateau` is validation-driven.
     #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
 
     /// Floor LR. For `step` / `cos`, this is reached at the end of each
     /// epoch before warm restart. For `plateau`, this is the final LR.
-    /// Must be strictly positive for `step` and `plateau`; cosine can use
-    /// 0 but 1e-5 or 1e-6 is more typical.
+    /// Must be strictly positive for `step`, `step_gamma`, and `plateau`;
+    /// cosine can use 0 but 1e-5 or 1e-6 is more typical.
     #[arg(long, default_value = "0.00001")]
     lr_min: f32,
+
+    /// Multiplicative LR factor used by `--lr-schedule step_gamma`.
+    /// nnue-pytorch's default `StepLR` uses gamma=0.992.
+    #[arg(long, default_value = "0.992")]
+    lr_step_gamma: f32,
+
+    /// Position interval for one `step_gamma` decay. If omitted, one
+    /// BulletOu superbatch is used (`batch_size * batches_per_superbatch`).
+    /// Use `100000000` to mirror nnue-pytorch's default 100M-position epoch.
+    #[arg(long)]
+    lr_step_positions: Option<u64>,
 
     /// ReduceLROnPlateau factor used by `--lr-schedule plateau`.
     /// Must satisfy `0 < factor < 1`.
@@ -2013,17 +2081,18 @@ fn main() {
         }
     }
     // `step` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
-    // `plateau` reduces `--lr` multiplicatively down to `--lr-min`.
-    // `--lr-min` must be > 0 for step / plateau. For cos, 0 is fine but
-    // unusual; warn rather than reject.
+    // `step_gamma` and `plateau` reduce `--lr` multiplicatively down to
+    // `--lr-min`. `--lr-min` must be > 0 for multiplicative schedules.
+    // For cos, 0 is fine but unusual; warn rather than reject.
     if args.lr_min <= 0.0 {
         match args.lr_schedule {
-            LrScheduleKind::Step | LrScheduleKind::Plateau => {
+            LrScheduleKind::Step | LrScheduleKind::StepGamma | LrScheduleKind::Plateau => {
                 eprintln!(
                     "error: --lr-min must be > 0 for --lr-schedule {}. \
                      1e-5 or 1e-6 is typical.",
                     match args.lr_schedule {
                         LrScheduleKind::Step => "step",
+                        LrScheduleKind::StepGamma => "step_gamma",
                         LrScheduleKind::Plateau => "plateau",
                         LrScheduleKind::Cos => unreachable!(),
                     }
@@ -2037,6 +2106,20 @@ fn main() {
                      usually preferred."
                 );
             }
+        }
+    }
+    if args.lr_schedule == LrScheduleKind::StepGamma {
+        if !(args.lr_step_gamma > 0.0 && args.lr_step_gamma <= 1.0) {
+            eprintln!("error: --lr-step-gamma must satisfy 0 < gamma <= 1 for --lr-schedule step_gamma.");
+            std::process::exit(2);
+        }
+        if matches!(args.lr_step_positions, Some(0)) {
+            eprintln!("error: --lr-step-positions must be > 0.");
+            std::process::exit(2);
+        }
+        if args.lr <= 0.0 {
+            eprintln!("error: --lr must be > 0 for --lr-schedule step_gamma.");
+            std::process::exit(2);
         }
     }
     if args.nnue_pytorch_wrm_loss && !args.eval_type().supports_nnue_pytorch_wrm_loss() {
@@ -2096,6 +2179,15 @@ fn main() {
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
+    }
+    if args.lr_schedule == LrScheduleKind::StepGamma {
+        eprintln!(
+            "  step_gamma scheduler = gamma {}, step_positions {}",
+            args.lr_step_gamma,
+            args.lr_step_positions
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "one superbatch".to_string())
+        );
     }
     if args.nnue_pytorch_layer_clip {
         eprintln!(
@@ -2189,6 +2281,11 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_schedule={}", args.lr_schedule.cli_name()),
         format!("lr={:.9}", args.lr),
         format!("lr_min={:.9}", args.lr_min),
+        format!("lr_step_gamma={:.9}", args.lr_step_gamma),
+        format!(
+            "lr_step_positions={}",
+            args.lr_step_positions.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string())
+        ),
         format!("lr_plateau_factor={:.9}", args.lr_plateau_factor),
         format!("lr_plateau_min_delta={:.9}", args.lr_plateau_min_delta),
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
@@ -2518,6 +2615,9 @@ struct LogContext {
     /// positions), shared by both schedules. Computed via
     /// [`auto_epoch_period`] at training start.
     lr_period: u64,
+    /// Decay factor and interval used by `step_gamma`.
+    lr_step_gamma: f32,
+    lr_step_positions: u64,
     /// Floor LR reached at end of each cycle. Mirrors `--lr-min`.
     lr_min: f32,
     /// When set, the lr column uses this exact value. Used by
@@ -2560,6 +2660,8 @@ impl LogContext {
             epoch_offset: 0,
             lr_schedule: args.lr_schedule,
             lr_period: lr_period_override,
+            lr_step_gamma: args.lr_step_gamma,
+            lr_step_positions: effective_lr_step_positions(args, batches_per_superbatch),
             lr_min: args.lr_min,
             lr_override: None,
         }
@@ -2677,6 +2779,13 @@ fn enrich_bullet_log_to_csv(
             LrScheduleKind::Step => {
                 PositionsLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64)
             }
+            LrScheduleKind::StepGamma => GammaStepLR::lr_at_positions(
+                ctx.lr_start,
+                ctx.lr_min,
+                ctx.lr_step_gamma,
+                ctx.lr_step_positions,
+                positions as u64,
+            ),
             LrScheduleKind::Cos => CosineLR::lr_at_positions(ctx.lr_start, ctx.lr_min, ctx.lr_period, positions as u64),
             LrScheduleKind::Plateau => ctx.lr_override.unwrap_or(ctx.lr_start),
         };
@@ -3221,9 +3330,8 @@ macro_rules! run_training_inline {
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
         // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `plateau` is validation-monitor driven and
-        // does not need a positions-based cycle.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+        // `cos` use this period; `step_gamma` and `plateau` do not.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::StepGamma | LrScheduleKind::Plateau) {
             0
         } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
@@ -3231,6 +3339,7 @@ macro_rules! run_training_inline {
                 std::process::exit(2);
             })
         };
+        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
 
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
@@ -3294,6 +3403,15 @@ macro_rules! run_training_inline {
                         start: args.lr,
                         min: args.lr_min,
                         period_positions: lr_period,
+                        prior_positions: 0,
+                        batch_size: args.batch_size,
+                        batches_per_superbatch,
+                    }),
+                    LrScheduleKind::StepGamma => LrSchedulerImpl::StepGamma(GammaStepLR {
+                        start: args.lr,
+                        min: args.lr_min,
+                        gamma: args.lr_step_gamma,
+                        step_positions: lr_step_positions,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -3970,9 +4088,8 @@ macro_rules! run_training_inline_nnue {
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
         // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `plateau` is validation-monitor driven and
-        // does not need a positions-based cycle.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
+        // `cos` use this period; `step_gamma` and `plateau` do not.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::StepGamma | LrScheduleKind::Plateau) {
             0
         } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
@@ -3980,6 +4097,7 @@ macro_rules! run_training_inline_nnue {
                 std::process::exit(2);
             })
         };
+        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
 
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
@@ -4315,6 +4433,15 @@ macro_rules! run_training_inline_nnue {
                         start: args.lr,
                         min: args.lr_min,
                         period_positions: lr_period,
+                        prior_positions: cb_prior_position as u64,
+                        batch_size: args.batch_size,
+                        batches_per_superbatch,
+                    }),
+                    LrScheduleKind::StepGamma => LrSchedulerImpl::StepGamma(GammaStepLR {
+                        start: args.lr,
+                        min: args.lr_min,
+                        gamma: args.lr_step_gamma,
+                        step_positions: lr_step_positions,
                         prior_positions: cb_prior_position as u64,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -5747,6 +5874,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: None,
         };
@@ -5930,6 +6059,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: None,
         };
@@ -6016,6 +6147,31 @@ mod tests {
         // Exact cycle boundary → warm restart to lr_max
         let lr = PositionsLR::lr_at_positions(max, min, period, period);
         assert!((lr - max).abs() < 1e-7, "cycle boundary should warm-restart to lr_max, got {lr}");
+    }
+
+    /// step_gamma は nnue-pytorch の StepLR 比較用。指定局面数ごとに
+    /// gamma を掛け、warm restart しない。lr_min を下回ったら floor する。
+    #[test]
+    fn step_gamma_lr_drops_by_fixed_gamma_without_restart() {
+        let max = 0.000875f32;
+        let min = 0.00001f32;
+        let gamma = 0.992f32;
+        let step = 100_000_000u64;
+
+        let lr0 = GammaStepLR::lr_at_positions(max, min, gamma, step, 0);
+        assert!((lr0 - max).abs() < 1e-9, "initial lr should be max, got {lr0}");
+
+        let lr_mid = GammaStepLR::lr_at_positions(max, min, gamma, step, step - 1);
+        assert!((lr_mid - max).abs() < 1e-9, "drop should happen only at the step boundary, got {lr_mid}");
+
+        let lr1 = GammaStepLR::lr_at_positions(max, min, gamma, step, step);
+        assert!((lr1 - max * gamma).abs() < 1e-9, "first boundary should apply gamma once, got {lr1}");
+
+        let lr2 = GammaStepLR::lr_at_positions(max, min, gamma, step, step * 2);
+        assert!((lr2 - max * gamma * gamma).abs() < 1e-9, "second boundary should apply gamma twice, got {lr2}");
+
+        let lr_floor = GammaStepLR::lr_at_positions(max, min, gamma, step, step * 10_000);
+        assert_eq!(lr_floor, min, "step_gamma should floor at lr_min");
     }
 
     /// CosineLR の式: lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt)) が
@@ -6229,6 +6385,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Plateau,
             lr_period: 0,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: Some(0.00025),
         };
@@ -6252,6 +6410,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Cos,
             lr_period: 100_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.0,
             lr_override: None,
         };
@@ -6283,6 +6443,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 800_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: None,
         };
@@ -6320,6 +6482,8 @@ mod tests {
             epoch_offset: 3, // = "previous run completed epoch 1..3 cleanly"
             lr_schedule: LrScheduleKind::Step,
             lr_period: 100_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: None,
         };
@@ -6508,6 +6672,8 @@ mod tests {
             epoch_offset: 0,
             lr_schedule: LrScheduleKind::Step,
             lr_period: 500_000_000,
+            lr_step_gamma: 0.992,
+            lr_step_positions: 100_000_000,
             lr_min: 0.00001,
             lr_override: None,
         };

@@ -18,8 +18,10 @@ Main flags:
 | `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
-| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
+| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), `step_gamma` (= nnue-pytorch StepLR comparison), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
 | `--lr-min` | Floor LR. For `step` / `cos`, this is reached at the end of each cycle. For `plateau`, this is the final LR | 0.00001 |
+| `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. nnue-pytorch's default is `0.992` | 0.992 |
+| `--lr-step-positions` | Positions per `step_gamma` LR drop. If omitted, one superbatch is used | omitted |
 | `--lr-plateau-factor` | Factor multiplied into LR when the `plateau` monitor does not improve | 0.5 |
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
@@ -73,9 +75,29 @@ Example with `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 
 
 The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_max)^(1/batches_per_epoch)` ≒ `0.99987`, a very smooth exponential decay.
 
-⚠️ **`--lr-min` must be `> 0` for step**: the geometric formula `lr_max × (lr_min/lr_max)^t` collapses to 0 at any t>0 when `lr_min = 0`; the CLI rejects this at startup. `1e-5`–`1e-6` is typical. `cos` accepts 0 mathematically (with a warning).
+⚠️ **`--lr-min` must be `> 0` for `step` / `step_gamma`**: `step`'s geometric formula breaks when `lr_min = 0`, and `step_gamma` uses `lr_min` as its decay floor, so the CLI requires a positive value for both. `1e-5`–`1e-6` is typical. `cos` accepts 0 mathematically (with a warning).
 
 Inspect `<NNNN>/learn.log`'s `lr` column to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
+
+#### Matching nnue-pytorch's StepLR condition
+
+`--lr-schedule step_gamma` is an ablation scheduler for matching nodchip nnue-pytorch's `StepLR(gamma=0.992)`. It is different from BulletOu's existing `step`: it does not warm-restart and simply applies `lr *= gamma` every configured number of positions.
+
+To match nnue-pytorch's default LR condition, make it explicit:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --lr 0.000875 \
+    --lr-schedule step_gamma \
+    --lr-step-gamma 0.992 \
+    --lr-step-positions 100000000 \
+    --lr-min 0.00001 \
+    --tag step-gamma-ablation
+```
+
+If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. The default superbatch is close to 100M positions, but explicit `100000000` is easier to audit in comparison runs.
 
 #### ReduceLROnPlateau
 

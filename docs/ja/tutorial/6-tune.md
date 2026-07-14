@@ -18,8 +18,10 @@
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
-| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
+| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`step_gamma` (= nnue-pytorch StepLR 比較用)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
+| `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。nnue-pytorch 既定値は `0.992` | 0.992 |
+| `--lr-step-positions` | `step_gamma` で何局面ごとに LR を落とすか。省略時は 1 superbatch | 省略 |
 | `--lr-plateau-factor` | `plateau` で監視指標が改善しなかったときに LR へ掛ける係数 | 0.5 |
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
@@ -73,9 +75,29 @@
 
 step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)` ≒ `0.99987` 倍ずつ下がる、超滑らかな指数減衰です。
 
-⚠️ **`--lr-min` は step では必ず `> 0`**: geometric の式 `lr_max × (lr_min/lr_max)^t` が `lr_min = 0` だと t > 0 で即 0 になり破綻するため、CLI 起動時にエラーになります。`1e-5` 〜 `1e-6` あたりが典型。cos は 0 でも数学的に動きますが、警告は出ます。
+⚠️ **`--lr-min` は `step` / `step_gamma` では必ず `> 0`**: `step` は geometric の式 `lr_max × (lr_min/lr_max)^t` が `lr_min = 0` だと破綻し、`step_gamma` では decay の下限として `lr_min` を使うため、どちらも CLI 起動時に正値を要求します。`1e-5` 〜 `1e-6` あたりが典型。cos は 0 でも数学的に動きますが、警告は出ます。
 
 実際の lr 推移は `<NNNN>/learn.log` の `lr` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
+
+#### nnue-pytorch の StepLR 条件に寄せる
+
+`--lr-schedule step_gamma` は、nodchip 版 nnue-pytorch の `StepLR(gamma=0.992)` に寄せるための比較用スケジューラです。既存の `step` とは別物で、warm restart せず、指定局面数ごとに `lr *= gamma` します。
+
+nnue-pytorch の既定条件に寄せるなら、次のように明示します:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --lr 0.000875 \
+    --lr-schedule step_gamma \
+    --lr-step-gamma 0.992 \
+    --lr-step-positions 100000000 \
+    --lr-min 0.00001 \
+    --tag step-gamma-ablation
+```
+
+`--lr-step-positions` を省略すると 1 superbatch ごとに LR を落とします。デフォルトの superbatch は約 1 億局面なので近い値になりますが、比較実験では `100000000` を明示するほうがログを読み違えません。
 
 #### ReduceLROnPlateau を使う
 
