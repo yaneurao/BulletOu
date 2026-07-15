@@ -1260,10 +1260,11 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     lr: f32,
 
-    /// Optimizer used for training. `ranger` is BulletOu's existing
+    /// Optimizer used for training. The default is `ranger`, matching
+    /// bullet-shogi's shogi examples. `ranger` is BulletOu's existing
     /// RAdam+Lookahead implementation; it is useful for ablation against
     /// nnue-pytorch's Ranger21, but is not a full Ranger21 clone.
-    #[arg(long, value_enum, default_value = "adamw")]
+    #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerKind,
 
     /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
@@ -1363,35 +1364,25 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_wrm_loss: bool,
 
-    /// Optimizer weight decay. The `adamw-` prefix is kept for CLI
-    /// compatibility, but this value is applied to the selected optimizer
-    /// (`adamw`, `radam`, or `ranger`). BulletOu's historical default is
-    /// 0.01. Set this to 0.0 to match nodchip nnue-pytorch's optimizer
-    /// condition for A/B comparisons.
+    /// Optimizer weight decay for the selected optimizer.
     #[arg(long, default_value = "0.01")]
-    adamw_weight_decay: f32,
+    optimizer_weight_decay: f32,
 
-    /// Optimizer epsilon. The `adamw-` prefix is kept for CLI
-    /// compatibility, but this value is applied to `adamw`, `radam`, and
-    /// `ranger`. BulletOu's historical default is 1e-8. Set this to 1e-7 to
-    /// match nodchip nnue-pytorch's Ranger21 epsilon for an isolated A/B
-    /// comparison.
-    #[arg(long, default_value = "0.00000001")]
-    adamw_epsilon: f32,
+    /// Optimizer epsilon override for the selected optimizer. If omitted,
+    /// the optimizer's own default is used.
+    #[arg(long)]
+    optimizer_epsilon: Option<f32>,
 
-    /// Optimizer beta1. The `adamw-` prefix is kept for CLI compatibility,
-    /// but this value is applied to the selected optimizer. BulletOu's
-    /// historical default is 0.9, matching nodchip nnue-pytorch's Ranger21
-    /// setting.
-    #[arg(long, default_value = "0.9")]
-    adamw_beta1: f32,
+    /// Optimizer beta1 override for the selected optimizer. If omitted,
+    /// the optimizer's own default is used. This matters for `ranger`:
+    /// bullet-shogi's Ranger default is beta1=0.99, not AdamW's 0.9.
+    #[arg(long)]
+    optimizer_beta1: Option<f32>,
 
-    /// Optimizer beta2. The `adamw-` prefix is kept for CLI compatibility,
-    /// but this value is applied to the selected optimizer. BulletOu's
-    /// historical default is 0.999, matching nodchip nnue-pytorch's
-    /// Ranger21 setting.
-    #[arg(long, default_value = "0.999")]
-    adamw_beta2: f32,
+    /// Optimizer beta2 override for the selected optimizer. If omitted,
+    /// the optimizer's own default is used.
+    #[arg(long)]
+    optimizer_beta2: Option<f32>,
 
     /// Use nnue-pytorch-style layer-specific AdamW clipping for NNUE / SFNN
     /// scalar value networks. Hidden weights use +/-127/64, while only the
@@ -1650,38 +1641,59 @@ const NNUE_PYTORCH_OUTPUT_CLIP: f32 = 127.0 * 127.0 / (600.0 * 16.0);
 const ADAMW_UNCLIPPED_BIAS_LIMIT: f32 = 1.0e30;
 
 fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
-    optimiser::AdamWParams {
-        decay: args.adamw_weight_decay,
-        epsilon: args.adamw_epsilon,
-        beta1: args.adamw_beta1,
-        beta2: args.adamw_beta2,
+    let mut params = optimiser::AdamWParams {
+        decay: args.optimizer_weight_decay,
         min_weight: -clip,
         max_weight: clip,
         ..Default::default()
+    };
+    if let Some(epsilon) = args.optimizer_epsilon {
+        params.epsilon = epsilon;
     }
+    if let Some(beta1) = args.optimizer_beta1 {
+        params.beta1 = beta1;
+    }
+    if let Some(beta2) = args.optimizer_beta2 {
+        params.beta2 = beta2;
+    }
+    params
 }
 
 fn radam_params(args: &Args, clip: f32) -> bullet_trainer::optimiser::radam::RAdamParams {
-    bullet_trainer::optimiser::radam::RAdamParams {
-        decay: args.adamw_weight_decay,
-        beta1: args.adamw_beta1,
-        beta2: args.adamw_beta2,
-        epsilon: args.adamw_epsilon,
-        n_sma_threshold: 5.0,
+    let mut params = bullet_trainer::optimiser::radam::RAdamParams {
+        decay: args.optimizer_weight_decay,
         clip: Some((-clip, clip)),
+        ..Default::default()
+    };
+    if let Some(epsilon) = args.optimizer_epsilon {
+        params.epsilon = epsilon;
     }
+    if let Some(beta1) = args.optimizer_beta1 {
+        params.beta1 = beta1;
+    }
+    if let Some(beta2) = args.optimizer_beta2 {
+        params.beta2 = beta2;
+    }
+    params
 }
 
 fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
-    optimiser::RangerParams {
-        decay: args.adamw_weight_decay,
-        beta1: args.adamw_beta1,
-        beta2: args.adamw_beta2,
-        epsilon: args.adamw_epsilon,
+    let mut params = optimiser::RangerParams {
+        decay: args.optimizer_weight_decay,
         min_weight: -clip,
         max_weight: clip,
         ..Default::default()
+    };
+    if let Some(epsilon) = args.optimizer_epsilon {
+        params.epsilon = epsilon;
     }
+    if let Some(beta1) = args.optimizer_beta1 {
+        params.beta1 = beta1;
+    }
+    if let Some(beta2) = args.optimizer_beta2 {
+        params.beta2 = beta2;
+    }
+    params
 }
 
 trait BulletouOptimizer: optimiser::OptimiserType + Default {
@@ -2236,21 +2248,27 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
-    if !(args.adamw_weight_decay.is_finite() && args.adamw_weight_decay >= 0.0) {
-        eprintln!("error: --adamw-weight-decay must be finite and >= 0.");
+    if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
+        eprintln!("error: --optimizer-weight-decay must be finite and >= 0.");
         std::process::exit(2);
     }
-    if !(args.adamw_epsilon.is_finite() && args.adamw_epsilon > 0.0) {
-        eprintln!("error: --adamw-epsilon must be finite and > 0.");
-        std::process::exit(2);
+    if let Some(epsilon) = args.optimizer_epsilon {
+        if !(epsilon.is_finite() && epsilon > 0.0) {
+            eprintln!("error: --optimizer-epsilon must be finite and > 0.");
+            std::process::exit(2);
+        }
     }
-    if !(args.adamw_beta1.is_finite() && args.adamw_beta1 > 0.0 && args.adamw_beta1 < 1.0) {
-        eprintln!("error: --adamw-beta1 must be finite and satisfy 0 < beta1 < 1.");
-        std::process::exit(2);
+    if let Some(beta1) = args.optimizer_beta1 {
+        if !(beta1.is_finite() && beta1 > 0.0 && beta1 < 1.0) {
+            eprintln!("error: --optimizer-beta1 must be finite and satisfy 0 < beta1 < 1.");
+            std::process::exit(2);
+        }
     }
-    if !(args.adamw_beta2.is_finite() && args.adamw_beta2 > 0.0 && args.adamw_beta2 < 1.0) {
-        eprintln!("error: --adamw-beta2 must be finite and satisfy 0 < beta2 < 1.");
-        std::process::exit(2);
+    if let Some(beta2) = args.optimizer_beta2 {
+        if !(beta2.is_finite() && beta2 > 0.0 && beta2 < 1.0) {
+            eprintln!("error: --optimizer-beta2 must be finite and satisfy 0 < beta2 < 1.");
+            std::process::exit(2);
+        }
     }
     if !(args.nnue_pytorch_init_scale.is_finite() && args.nnue_pytorch_init_scale > 0.0) {
         eprintln!("error: --nnue-pytorch-init-scale must be finite and > 0.");
@@ -2365,20 +2383,20 @@ fn main() {
     if args.nnue_pytorch_wrm_loss {
         eprintln!("  nnue-pytorch WRM loss = enabled");
     }
-    if args.optimizer != OptimizerKind::Adamw {
+    if args.optimizer != OptimizerKind::Ranger {
         eprintln!("  optimizer = {}", args.optimizer.cli_name());
     }
-    if args.adamw_weight_decay != 0.01 {
-        eprintln!("  optimizer weight decay = {}", args.adamw_weight_decay);
+    if args.optimizer_weight_decay != 0.01 {
+        eprintln!("  optimizer weight decay = {}", args.optimizer_weight_decay);
     }
-    if args.adamw_epsilon != 0.00000001 {
-        eprintln!("  optimizer epsilon = {}", args.adamw_epsilon);
+    if let Some(epsilon) = args.optimizer_epsilon {
+        eprintln!("  optimizer epsilon = {}", epsilon);
     }
-    if args.adamw_beta1 != 0.9 {
-        eprintln!("  optimizer beta1 = {}", args.adamw_beta1);
+    if let Some(beta1) = args.optimizer_beta1 {
+        eprintln!("  optimizer beta1 = {}", beta1);
     }
-    if args.adamw_beta2 != 0.999 {
-        eprintln!("  optimizer beta2 = {}", args.adamw_beta2);
+    if let Some(beta2) = args.optimizer_beta2 {
+        eprintln!("  optimizer beta2 = {}", beta2);
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
@@ -2495,10 +2513,19 @@ fn resume_signature(args: &Args) -> String {
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
         format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
-        format!("adamw_weight_decay={:.9}", args.adamw_weight_decay),
-        format!("adamw_epsilon={:.9}", args.adamw_epsilon),
-        format!("adamw_beta1={:.9}", args.adamw_beta1),
-        format!("adamw_beta2={:.9}", args.adamw_beta2),
+        format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
+        format!(
+            "optimizer_epsilon={}",
+            args.optimizer_epsilon.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
+        ),
+        format!(
+            "optimizer_beta1={}",
+            args.optimizer_beta1.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
+        ),
+        format!(
+            "optimizer_beta2={}",
+            args.optimizer_beta2.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
+        ),
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
         format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", args.save_rate),
@@ -6468,15 +6495,13 @@ mod tests {
             "NNUE_HALFKP",
             "--teacher",
             "/dev/null",
-            "--optimizer",
-            "ranger",
-            "--adamw-weight-decay",
+            "--optimizer-weight-decay",
             "0.0",
-            "--adamw-epsilon",
+            "--optimizer-epsilon",
             "0.0000001",
-            "--adamw-beta1",
+            "--optimizer-beta1",
             "0.85",
-            "--adamw-beta2",
+            "--optimizer-beta2",
             "0.995",
         ])
         .unwrap();
@@ -6502,10 +6527,24 @@ mod tests {
 
         let sig = resume_signature(&args);
         assert!(sig.contains("optimizer=ranger"));
-        assert!(sig.contains("adamw_weight_decay=0.000000000"));
-        assert!(sig.contains("adamw_epsilon=0.000000100"));
-        assert!(sig.contains("adamw_beta1=0.850000024"));
-        assert!(sig.contains("adamw_beta2=0.995000005"));
+        assert!(sig.contains("optimizer_weight_decay=0.000000000"));
+        assert!(sig.contains("optimizer_epsilon=0.000000100"));
+        assert!(sig.contains("optimizer_beta1=0.850000024"));
+        assert!(sig.contains("optimizer_beta2=0.995000005"));
+    }
+
+    #[test]
+    fn default_optimizer_matches_bullet_shogi_ranger_defaults() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(args.optimizer, OptimizerKind::Ranger);
+        let adamw = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        let ranger = ranger_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        assert_eq!(adamw.beta1, 0.9);
+        assert_eq!(ranger.beta1, 0.99);
+        assert_eq!(ranger.beta2, 0.999);
     }
 
     #[test]

@@ -18,7 +18,7 @@
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
-| `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `adamw` |
+| `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
 | `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`step_gamma` (= nnue-pytorch StepLR 比較用)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
 | `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。nnue-pytorch 既定値は `0.992` | 0.992 |
@@ -28,10 +28,10 @@
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
-| `--adamw-weight-decay` | 選択中 optimizer の weight decay。引数名は互換性のため `adamw-` のまま | 0.01 |
-| `--adamw-epsilon` | 選択中 optimizer の epsilon。引数名は互換性のため `adamw-` のまま | 0.00000001 |
-| `--adamw-beta1` | 選択中 optimizer の beta1 | 0.9 |
-| `--adamw-beta2` | 選択中 optimizer の beta2 | 0.999 |
+| `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.01 |
+| `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
+| `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |
+| `--optimizer-beta2` | 選択中 optimizer の beta2 を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
 | `--nnue-pytorch-no-bias-clip` | bias tensor の optimizer clipping を実質無効にする | off |
 
@@ -269,7 +269,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 ### Optimizer の選択
 
-`--optimizer` で `adamw` / `radam` / `ranger` を切り替えられる。デフォルトは従来通り `adamw`。
+`--optimizer` で `adamw` / `radam` / `ranger` を切り替えられる。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -287,55 +287,55 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --eval-type SFNN_HALFKA2 \
     --tag sfnn-ranger-decay0 \
     --optimizer ranger \
-    --adamw-weight-decay 0.0 \
-    --adamw-beta1 0.9 \
-    --adamw-beta2 0.999 \
-    --adamw-epsilon 0.0000001
+    --optimizer-weight-decay 0.0 \
+    --optimizer-beta1 0.9 \
+    --optimizer-beta2 0.999 \
+    --optimizer-epsilon 0.0000001
 ```
 
-`--adamw-weight-decay` / `--adamw-epsilon` / `--adamw-beta1` / `--adamw-beta2` は、名前は互換性のため `adamw-` のままだが、`radam` / `ranger` を選んだ場合もその optimizer に適用される。
+`--optimizer-beta1` / `--optimizer-beta2` / `--optimizer-epsilon` を省略した場合は、選択した optimizer の既定値を使う。特に `ranger` の beta1 既定値は `bullet-shogi` と同じ `0.99` で、AdamW の `0.9` ではない。
 
 ### Optimizer weight decay
 
-BulletOu の標準設定は `--adamw-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を同じまま `--adamw-weight-decay 0.0` だけを試す。
+BulletOu の標準設定は `--optimizer-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を同じまま `--optimizer-weight-decay 0.0` だけを試す。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
     --tag sfnn-adamw-decay0 \
-    --adamw-weight-decay 0.0
+    --optimizer-weight-decay 0.0
 ```
 
 これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、まず単独で ON/OFF 比較する。
 
 ### Optimizer epsilon
 
-BulletOu の optimizer epsilon は標準で `1e-8`。nodchip 版 nnue-pytorch の Ranger21 は `eps=1e-7` なので、epsilon だけ寄せる場合は `--adamw-epsilon 0.0000001` を使う。
+BulletOu の optimizer epsilon は省略時に選択中 optimizer の既定値を使う。nodchip 版 nnue-pytorch の Ranger21 は `eps=1e-7` なので、epsilon だけ寄せる場合は `--optimizer-epsilon 0.0000001` を使う。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
     --tag sfnn-adamw-eps1e-7 \
-    --adamw-epsilon 0.0000001
+    --optimizer-epsilon 0.0000001
 ```
 
 これも optimizer 条件の差分調査用フラグなので、まず単独で比較する。
 
 ### Optimizer beta
 
-optimizer の `beta1` / `beta2` も CLI から変更できる。デフォルトは `beta1=0.9`, `beta2=0.999` で、これは nodchip 版 nnue-pytorch の Ranger21 設定と同じ。したがって、通常は指定する必要はない。
+optimizer の `beta1` / `beta2` も CLI から変更できる。省略時は optimizer 固有の既定値を使う。`ranger` の既定値は `beta1=0.99`, `beta2=0.999`、`adamw` / `radam` の既定値は `beta1=0.9`, `beta2=0.999`。
 
-それでも optimizer の momentum 条件だけを動かして切り分けたい場合は、`--adamw-beta1` / `--adamw-beta2` を指定する。
+optimizer の momentum 条件だけを動かして切り分けたい場合は、`--optimizer-beta1` / `--optimizer-beta2` を指定する。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
-    --tag sfnn-adamw-beta-test \
-    --adamw-beta1 0.85 \
-    --adamw-beta2 0.995
+    --tag sfnn-optimizer-beta-test \
+    --optimizer-beta1 0.85 \
+    --optimizer-beta2 0.995
 ```
 
 これは内部時定数だけを見る ablation。weight decay や epsilon と混ぜず、まず単独で比較する。

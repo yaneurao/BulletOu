@@ -85,15 +85,16 @@ nnue-pytorch は `Ranger21` を使う。
 | default lr | `8.75e-4` |
 
 BulletOu の `examples/bulletou.rs` 経路は `--optimizer adamw|radam|ranger`
-で optimizer を切り替えられる。デフォルトは従来通り `adamw`。
+で optimizer を切り替えられる。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
 `ranger` は BulletOu 既存の RAdam+Lookahead 実装であり、nnue-pytorch の
 Ranger21 完全互換ではない。
 
-CLI 互換性のため引数名は `--adamw-weight-decay` / `--adamw-epsilon` /
-`--adamw-beta1` / `--adamw-beta2` のままだが、これらは選択中 optimizer
-(`adamw`, `radam`, `ranger`) に適用する。標準設定は
-`weight_decay=0.01`, `eps=1e-8`, `beta=(0.9,0.999)`, 全 weight を一律
-`[-1.98, 1.98]` に clip。
+optimizer 条件の上書きは `--optimizer-weight-decay` /
+`--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` で行う。
+`epsilon` / `beta1` / `beta2` を省略した場合は、選択中 optimizer 自身の既定値を使う。
+そのため `ranger` の既定値は `bullet-shogi` と同じ `beta=(0.99,0.999)` で、
+AdamW の `beta=(0.9,0.999)` は混ざらない。標準設定は `weight_decay=0.01`、
+全 weight を一律 `[-1.98, 1.98]` に clip。
 
 これは大きな差分。nnue-pytorch 互換性を比較する場合、最低限
 `weight_decay=0.0` の ablation を行い、その後 `--optimizer ranger`
@@ -238,11 +239,11 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 
 4. optimizer 条件を近づける
    - まず同じ optimizer のまま `weight_decay=0.0`
-   - 実装済み: `--adamw-weight-decay 0.0` で opt-in
+   - 実装済み: `--optimizer-weight-decay 0.0` で opt-in
    - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
-   - `eps=1e-7` は `--adamw-epsilon 0.0000001` で単独比較する
-   - `beta1` / `beta2` は `--adamw-beta1` / `--adamw-beta2` で単独比較する
-     - デフォルトは `0.9` / `0.999` で、nodchip nnue-pytorch の Ranger21 設定と同じ
+   - `eps=1e-7` は `--optimizer-epsilon 0.0000001` で単独比較する
+   - `beta1` / `beta2` は `--optimizer-beta1` / `--optimizer-beta2` で単独比較する
+     - 省略時は optimizer 固有の既定値。`ranger` は `0.99` / `0.999`
    - optimizer 種別は `--optimizer adamw|radam|ranger` で比較する
      - `ranger` は RAdam+Lookahead であり Ranger21 完全互換ではない
 
