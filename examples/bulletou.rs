@@ -4602,7 +4602,10 @@ macro_rules! run_training_inline_nnue {
         let mut last_epoch_for_fallback = 1usize;
         for epoch in 1..=max_epochs {
             last_epoch_for_fallback = epoch;
-            print_epoch_banner(epoch, max_epochs);
+            let display_epoch = epoch + cb_ctx.epoch_offset;
+            let display_max_epochs =
+                if max_epochs == usize::MAX { usize::MAX } else { max_epochs + cb_ctx.epoch_offset };
+            print_epoch_banner(display_epoch, display_max_epochs);
             let mut stop_training_after_epoch = false;
             let mut plateau_epoch_final_metrics: Option<PlateauMetrics> = None;
             let mut epoch_final_metrics: Option<PlateauMetrics> = None;
@@ -4635,7 +4638,11 @@ macro_rules! run_training_inline_nnue {
                 cb_prior_position =
                     read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(cb_prior_position);
             }
-            let net_id_for_epoch = if max_epochs > 1 { format!("{net_id_base}-e{epoch}") } else { net_id_base.clone() };
+            let net_id_for_epoch = if max_epochs > 1 || cb_ctx.epoch_offset > 0 {
+                format!("{net_id_base}-e{display_epoch}")
+            } else {
+                net_id_base.clone()
+            };
             last_net_id_for_epoch = net_id_for_epoch.clone();
 
             // Run the epoch in chunks of `save_rate` superbatches. Each
