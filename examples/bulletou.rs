@@ -1080,9 +1080,7 @@ impl PlateauLrState {
 }
 
 fn effective_max_epochs(args: &Args) -> usize {
-    args.max_epochs
-        .unwrap_or_else(|| if matches!(args.lr_schedule, LrScheduleKind::Plateau) { usize::MAX } else { 1 })
-        .max(1)
+    args.max_epochs.unwrap_or(usize::MAX).max(1)
 }
 
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
@@ -1229,8 +1227,7 @@ struct Args {
     /// the beginning inside the same epoch; the epoch ends when LR reaches
     /// `--lr-min` and the final min-LR retry has completed.
     /// After each epoch the dataloader is rebuilt from scratch. If omitted,
-    /// `step` / `cos` default to 1 epoch, while `plateau` keeps running
-    /// epochs until the epoch-final validation monitor no longer improves.
+    /// all LR schedules keep running without a fixed epoch cap.
     /// With a readable `--test-teacher`, training also stops before reaching
     /// this cap when an epoch-final validation run improves neither loss nor
     /// accuracy versus the previous epoch.
@@ -4592,9 +4589,14 @@ macro_rules! run_training_inline_nnue {
             );
         }
         if !matches!(args.lr_schedule, LrScheduleKind::Plateau) && max_epochs > 1 && test_cache.is_none() {
+            let fallback = if max_epochs == usize::MAX {
+                "no epoch cap is set, so training will continue until interrupted."
+            } else {
+                "--max-epochs will be used."
+            };
             eprintln!(
                 "  note: epoch-final early stop requires a readable --test-teacher; \
-                 validation metrics are unavailable, so max-epochs will be used."
+                 validation metrics are unavailable, so {fallback}"
             );
         }
         let mut last_epoch_for_fallback = 1usize;
@@ -6312,6 +6314,41 @@ mod tests {
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
+    }
+
+    #[test]
+    fn max_epochs_omitted_is_unlimited_for_all_schedules() {
+        use clap::Parser as _;
+
+        for schedule in ["step", "step_gamma", "cos", "plateau"] {
+            let args = Args::try_parse_from([
+                "bulletou",
+                "--eval-type",
+                "NNUE_HALFKP",
+                "--teacher",
+                "/dev/null",
+                "--lr-schedule",
+                schedule,
+                "--test-teacher",
+                "/tmp/test.hcpe",
+            ])
+            .unwrap();
+            assert_eq!(effective_max_epochs(&args), usize::MAX, "schedule={schedule}");
+        }
+
+        let capped = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--lr-schedule",
+            "cos",
+            "--max-epochs",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(effective_max_epochs(&capped), 3);
     }
 
     #[test]

@@ -15,7 +15,7 @@ Main flags:
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
 | `--superbatches` | Cap superbatches per epoch. Usually unnecessary for `plateau` | unlimited (= non-plateau runs until EOF; plateau runs until `lr_min`) |
-| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
+| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `adamw` |
@@ -200,7 +200,7 @@ For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` 
 
 ### Multi-epoch training
 
-`--max-epochs N` runs through the teacher data at most N times. At each epoch boundary:
+`--max-epochs N` runs through the teacher data at most N times. If omitted, there is no fixed epoch cap for any schedule; with `--test-teacher`, training still stops when epoch-final loss and accuracy both fail to improve. Without `--test-teacher`, non-plateau schedules keep looping over epochs until interrupted. At each epoch boundary:
 - The LR scheduler resets (superbatch counter back to 1, `lr = --lr`) — applies to both `step` and `cos`.
 - The dataloader rewinds to the beginning of the data.
 
