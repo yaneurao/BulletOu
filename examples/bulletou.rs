@@ -57,7 +57,7 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
-    nn::{ExecutionContext, ModelNode, optimiser},
+    nn::{optimiser, ExecutionContext, ModelNode},
     teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
     trainer::{
@@ -65,7 +65,7 @@ use bulletou_lib::{
         schedule::{wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    validate::{ValidationLossKind, compute_sign_accuracy_with_loss, read_random_hcpe_positions},
+    validate::{compute_sign_accuracy_with_loss, read_random_hcpe_positions, ValidationLossKind},
     value::{
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
@@ -743,7 +743,7 @@ const KPPT_KPP_DEFAULT_QUANT_SCALE: f32 = 400.0;
 /// bullet's local counter, which restarts at 1 each `trainer.run`
 /// call in the chunk loop).
 #[derive(Clone, Debug)]
-struct PositionsLR {
+struct GeometricLR {
     start: f32,
     min: f32,
     period_positions: u64,
@@ -752,7 +752,7 @@ struct PositionsLR {
     batches_per_superbatch: usize,
 }
 
-impl PositionsLR {
+impl GeometricLR {
     /// Pure formula: LR for a given total cumulative position count.
     /// Used by both `LrScheduler::lr` and the `learn.log` enrich path
     /// so the trainer's LR and the logged LR always agree.
@@ -776,7 +776,7 @@ impl PositionsLR {
     }
 }
 
-impl LrScheduler for PositionsLR {
+impl LrScheduler for GeometricLR {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         let in_run =
             ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64) * (self.batch_size as u64);
@@ -786,55 +786,65 @@ impl LrScheduler for PositionsLR {
 
     fn colourful(&self) -> String {
         format!(
-            "step (exp): start {} min {} period {} positions (cumulative, prior {})",
+            "geometric: start {} min {} period {} positions (cumulative, prior {})",
             self.start, self.min, self.period_positions, self.prior_positions
         )
     }
 }
 
-/// nnue-pytorch-style StepLR ablation. Drops LR by a fixed gamma every
-/// `step_positions` trained positions and never warm-restarts.
+/// StepLR with an epoch-local warm restart. Drops LR by a fixed gamma every
+/// `step_positions` trained positions within the current epoch, then resets
+/// to `start` at the next epoch boundary.
 #[derive(Clone, Debug)]
-struct GammaStepLR {
+struct StepLR {
     start: f32,
     min: f32,
     gamma: f32,
     step_positions: u64,
+    period_positions: u64,
     prior_positions: u64,
     batch_size: usize,
     batches_per_superbatch: usize,
 }
 
-impl GammaStepLR {
-    fn lr_at_positions(start: f32, min: f32, gamma: f32, step_positions: u64, total: u64) -> f32 {
+impl StepLR {
+    fn lr_at_positions(
+        start: f32,
+        min: f32,
+        gamma: f32,
+        step_positions: u64,
+        period_positions: u64,
+        total: u64,
+    ) -> f32 {
         if step_positions == 0 {
             return start;
         }
-        let steps = total / step_positions;
+        let epoch_pos = if period_positions == 0 { total } else { total % period_positions };
+        let steps = epoch_pos / step_positions;
         let lr = (start as f64) * (gamma as f64).powf(steps as f64);
         (lr as f32).max(min)
     }
 }
 
-impl LrScheduler for GammaStepLR {
+impl LrScheduler for StepLR {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         let in_run =
             ((superbatch.saturating_sub(1) * self.batches_per_superbatch + batch) as u64) * (self.batch_size as u64);
         let total = self.prior_positions + in_run;
-        Self::lr_at_positions(self.start, self.min, self.gamma, self.step_positions, total)
+        Self::lr_at_positions(self.start, self.min, self.gamma, self.step_positions, self.period_positions, total)
     }
 
     fn colourful(&self) -> String {
         format!(
-            "step_gamma: start {} min {} gamma {} every {} positions (cumulative, prior {})",
-            self.start, self.min, self.gamma, self.step_positions, self.prior_positions
+            "step: start {} min {} gamma {} every {} positions, period {} positions (prior {})",
+            self.start, self.min, self.gamma, self.step_positions, self.period_positions, self.prior_positions
         )
     }
 }
 
 /// Cosine annealing with warm restart (SGDR style), positions-based.
 ///
-/// Mirrors [`PositionsLR`] structurally so the two schedules can be
+/// Mirrors [`GeometricLR`] structurally so the two schedules can be
 /// dropped into the same training run as alternatives. Within each
 /// `period_positions`-long cycle the LR sweeps `start` → `min`
 /// following the half-cosine curve; at cycle boundaries it snaps back
@@ -904,8 +914,8 @@ impl LrScheduler for FixedLR {
 /// `impl LrScheduler` per run).
 #[derive(Clone, Debug)]
 enum LrSchedulerImpl {
-    Step(PositionsLR),
-    StepGamma(GammaStepLR),
+    Step(StepLR),
+    Geometric(GeometricLR),
     Cos(CosineLR),
     Fixed(FixedLR),
 }
@@ -914,7 +924,7 @@ impl LrScheduler for LrSchedulerImpl {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         match self {
             LrSchedulerImpl::Step(s) => s.lr(batch, superbatch),
-            LrSchedulerImpl::StepGamma(s) => s.lr(batch, superbatch),
+            LrSchedulerImpl::Geometric(s) => s.lr(batch, superbatch),
             LrSchedulerImpl::Cos(s) => s.lr(batch, superbatch),
             LrSchedulerImpl::Fixed(s) => s.lr(batch, superbatch),
         }
@@ -922,7 +932,7 @@ impl LrScheduler for LrSchedulerImpl {
     fn colourful(&self) -> String {
         match self {
             LrSchedulerImpl::Step(s) => s.colourful(),
-            LrSchedulerImpl::StepGamma(s) => s.colourful(),
+            LrSchedulerImpl::Geometric(s) => s.colourful(),
             LrSchedulerImpl::Cos(s) => s.colourful(),
             LrSchedulerImpl::Fixed(s) => s.colourful(),
         }
@@ -1091,16 +1101,14 @@ fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     }
 }
 
-/// Which LR schedule the trainer should follow. `Step` is the existing
-/// smooth geometric epoch schedule; `StepGamma` is fixed gamma drops for
-/// nnue-pytorch StepLR ablations; `Cos` is SGDR-style cosine annealing
-/// with one cycle per epoch.
+/// Which LR schedule the trainer should follow. `Step` is the
+/// Epoch-local fixed-gamma StepLR; `Geometric` is the old smooth epoch
+/// schedule; `Cos` is SGDR-style cosine annealing with one cycle per epoch.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[clap(rename_all = "lowercase")]
 enum LrScheduleKind {
     Step,
-    #[value(name = "step_gamma", alias = "step-gamma")]
-    StepGamma,
+    Geometric,
     Cos,
     Plateau,
 }
@@ -1109,7 +1117,7 @@ impl LrScheduleKind {
     fn cli_name(self) -> &'static str {
         match self {
             LrScheduleKind::Step => "step",
-            LrScheduleKind::StepGamma => "step_gamma",
+            LrScheduleKind::Geometric => "geometric",
             LrScheduleKind::Cos => "cos",
             LrScheduleKind::Plateau => "plateau",
         }
@@ -1135,10 +1143,10 @@ impl OptimizerKind {
 }
 
 fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u64 {
-    args.lr_step_positions
-        .unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
+    args.lr_step_positions.unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
 }
 
+const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
@@ -1157,6 +1165,43 @@ fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
 
 fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
     Ok(effective_batches_per_superbatch(args)?.saturating_mul(args.batch_size))
+}
+
+fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result<(f32, bool), String> {
+    if let Some(gamma) = args.lr_step_gamma {
+        return Ok((gamma, false));
+    }
+    if args.lr_schedule != LrScheduleKind::Step {
+        return Ok((DEFAULT_LR_STEP_GAMMA, false));
+    }
+    let Some(superbatches) = args.superbatches else {
+        return Ok((DEFAULT_LR_STEP_GAMMA, false));
+    };
+    if args.lr <= 0.0 {
+        return Err("--lr must be > 0 for automatic --lr-step-gamma.".to_string());
+    }
+    if args.lr_min <= 0.0 {
+        return Err("--lr-min must be > 0 for automatic --lr-step-gamma.".to_string());
+    }
+    if args.lr_min > args.lr {
+        return Err("--lr-min must be <= --lr for automatic --lr-step-gamma.".to_string());
+    }
+
+    let step_positions = effective_lr_step_positions(args, batches_per_superbatch);
+    if step_positions == 0 {
+        return Err("--lr-step-positions must be > 0.".to_string());
+    }
+    let total_positions =
+        (superbatches as u128).saturating_mul(batches_per_superbatch as u128).saturating_mul(args.batch_size as u128);
+    let steps = total_positions / (step_positions as u128);
+    if steps == 0 {
+        return Err(
+            "automatic --lr-step-gamma needs at least one LR step; reduce --lr-step-positions or increase --superbatches."
+                .to_string(),
+        );
+    }
+    let gamma = ((args.lr_min as f64) / (args.lr as f64)).powf(1.0 / steps as f64) as f32;
+    Ok((gamma, true))
 }
 
 // ----- CLI ---------------------------------------------------------------
@@ -1186,7 +1231,7 @@ struct Args {
     /// file (instant). HCPE3 / pack are variable-length and would need to
     /// walk every game; not yet supported by this flag.
     ///
-    /// Use the printed total to pick `--superbatches N` for `step` / `cos`
+    /// Use the printed total to pick `--superbatches N` for `geometric` / `cos`
     /// runs such that one epoch ≈ (or ≤) the teacher size. With cosine
     /// annealing, period auto-aligns to `--superbatches`.
     #[arg(long)]
@@ -1253,7 +1298,7 @@ struct Args {
     /// With a readable `--test-teacher`, training also stops before reaching
     /// this cap when an epoch-final validation run improves neither loss nor
     /// accuracy versus the previous epoch.
-    #[arg(long)]
+    #[arg(long, alias = "max-epoch")]
     max_epochs: Option<usize>,
 
     /// Initial optimizer learning rate. Default follows the tatara
@@ -1269,56 +1314,57 @@ struct Args {
     #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerKind,
 
-    /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
-    /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
-    /// epoch boundary. `step_gamma` applies tatara/bullet-shogi-style
-    /// fixed gamma drops and does not warm-restart. `plateau` keeps LR fixed
-    /// during one superbatch, then reduces it when the validation monitor
-    /// does not improve:
+    /// LR schedule kind. `step` applies fixed gamma drops within one epoch
+    /// and warm-restarts to `--lr` at epoch boundaries. `geometric` and `cos` sweep
+    /// `--lr` (lr_max) → `--lr-min` over **one epoch**, warm-restarting to
+    /// `--lr` at each epoch boundary. `plateau` keeps LR fixed during one
+    /// superbatch, then reduces it when the validation monitor does not
+    /// improve:
     ///
-    /// - `step` = geometric (= exponential in log space):
+    /// - `step` (default) = `lr = max(lr_min, lr * gamma^n)` where n is
+    ///   the number of completed `--lr-step-positions` intervals.
+    ///   If `--lr-step-positions` is omitted, this is one gamma drop per
+    ///   superbatch.
+    /// - `geometric` = exponential interpolation in log space:
     ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
     ///   "fraction of one epoch completed". Constant multiplicative
     ///   decay per batch.
     /// - `cos` = cosine annealing (SGDR-style):
     ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
     ///   Slower descent at the start and end, fastest in the middle.
-    /// - `step_gamma` (default) = `lr = max(lr_min, lr * gamma^n)` where n is
-    ///   the number of completed `--lr-step-positions` intervals.
-    ///   This matches tatara's lr_step=1 and bullet-shogi's shogi examples
-    ///   when `--lr-step-positions` is omitted: one gamma drop per superbatch.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
     ///   `--lr-plateau-factor` and retry the same teacher interval.
     ///   When the next LR would fall below `--lr-min`, train that
     ///   interval one final time at exactly `--lr-min` and end the epoch.
     ///
-    /// For `step` / `cos`, the LR period is set by `--superbatches N`
-    /// (`N * sb_size`). Without `--superbatches`, HCPE / PSV falls back
-    /// to the teacher's total position count, while HCPE3 / pack needs
-    /// an explicit period. `step_gamma` uses `--lr-step-positions`
-    /// instead, and `plateau` is validation-driven.
-    #[arg(long, value_enum, default_value = "step_gamma")]
+    /// For `step` / `geometric` / `cos`, the epoch period is set by
+    /// `--superbatches N` (`N * sb_size`). Without `--superbatches`,
+    /// `step` uses open-ended gamma=0.992, while `geometric` / `cos` fall
+    /// back to the teacher's total position count for HCPE / PSV and require
+    /// an explicit period for HCPE3 / pack. `plateau` is validation-driven.
+    #[arg(long, value_enum, default_value = "step")]
     lr_schedule: LrScheduleKind,
 
-    /// Floor LR. For `step_gamma` / `plateau`, this is the lower bound.
-    /// For `step` / `cos`, this is reached at the end of each epoch
+    /// Floor LR. For `step` / `plateau`, this is the lower bound.
+    /// For `geometric` / `cos`, this is reached at the end of each epoch
     /// before warm restart.
-    /// Must be strictly positive for `step`, `step_gamma`, and `plateau`;
+    /// Must be strictly positive for `step`, `geometric`, and `plateau`;
     /// cosine can use 0 but 1e-5 or 1e-6 is more typical.
     #[arg(long, default_value = "0.00001")]
     lr_min: f32,
 
-    /// Multiplicative LR factor used by `--lr-schedule step_gamma`.
-    /// tatara / bullet-shogi / nnue-pytorch default `StepLR` uses gamma=0.992.
-    #[arg(long, default_value = "0.992")]
-    lr_step_gamma: f32,
+    /// Multiplicative LR factor used by `--lr-schedule step`.
+    /// If omitted and `--superbatches` is set, BulletOu computes gamma so
+    /// LR reaches `--lr-min` within one epoch. If the epoch length is open-ended,
+    /// tatara / bullet-shogi's default gamma=0.992 is used.
+    #[arg(long)]
+    lr_step_gamma: Option<f32>,
 
-    /// Position interval for one `step_gamma` decay. If omitted, one
+    /// Position interval for one `step` decay. If omitted, one
     /// BulletOu superbatch is used (the effective `--positions-per-superbatch`,
     /// rounded down to a multiple of `--batch-size`).
-    /// Omit this to match tatara's lr_step=1 and bullet-shogi's
-    /// `StepLR { gamma=0.992, step=1 }`.
+    /// Omit this to decay once per BulletOu superbatch.
     /// Use `100000000` for position-fixed comparisons against
     /// nnue-pytorch's default 100M-position epoch.
     #[arg(long)]
@@ -1635,11 +1681,19 @@ fn nnue_pytorch_wrm_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>)
 }
 
 fn value_loss_fn(args: &Args) -> ValueLossFn {
-    if args.nnue_pytorch_wrm_loss { nnue_pytorch_wrm_value_loss } else { sigmoid_mse_value_loss }
+    if args.nnue_pytorch_wrm_loss {
+        nnue_pytorch_wrm_value_loss
+    } else {
+        sigmoid_mse_value_loss
+    }
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
-    if args.nnue_pytorch_wrm_loss { ValidationLossKind::NnuePytorchWrm } else { ValidationLossKind::SigmoidMse }
+    if args.nnue_pytorch_wrm_loss {
+        ValidationLossKind::NnuePytorchWrm
+    } else {
+        ValidationLossKind::SigmoidMse
+    }
 }
 
 const BULLETOU_DEFAULT_ADAMW_CLIP: f32 = 1.98;
@@ -1709,8 +1763,7 @@ trait BulletouOptimizer: optimiser::OptimiserType + Default {
         trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
         output_weight_ids: &[&str],
         bias_ids: &[&str],
-    )
-    where
+    ) where
         Inp: SparseInputType,
         Out: OutputBuckets<Inp::RequiredDataType>;
 }
@@ -1721,8 +1774,7 @@ impl BulletouOptimizer for optimiser::AdamW {
         trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
         output_weight_ids: &[&str],
         bias_ids: &[&str],
-    )
-    where
+    ) where
         Inp: SparseInputType,
         Out: OutputBuckets<Inp::RequiredDataType>,
     {
@@ -1752,8 +1804,7 @@ impl BulletouOptimizer for optimiser::RAdam {
         trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
         output_weight_ids: &[&str],
         bias_ids: &[&str],
-    )
-    where
+    ) where
         Inp: SparseInputType,
         Out: OutputBuckets<Inp::RequiredDataType>,
     {
@@ -1783,8 +1834,7 @@ impl BulletouOptimizer for optimiser::Ranger {
         trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
         output_weight_ids: &[&str],
         bias_ids: &[&str],
-    )
-    where
+    ) where
         Inp: SparseInputType,
         Out: OutputBuckets<Inp::RequiredDataType>,
     {
@@ -1813,8 +1863,7 @@ fn configure_optimizer<O, Inp, Out>(
     trainer: &mut ValueTrainer<O::Optimiser, Inp, Out>,
     output_weight_ids: &[&str],
     bias_ids: &[&str],
-)
-where
+) where
     O: BulletouOptimizer,
     Inp: SparseInputType,
     Out: OutputBuckets<Inp::RequiredDataType>,
@@ -1824,14 +1873,14 @@ where
 
 // ----- epoch period ------------------------------------------------------
 
-/// Compute the warm-restart cycle period (= one epoch's positions),
-/// shared by both `step` and `cos` schedules.
+/// Compute the warm-restart cycle period (= one epoch's positions), shared by
+/// `step`, `geometric`, and `cos` schedules.
 ///
 /// Semantics:
 /// - If `--superbatches N` is set, period = `N * effective_sb_size`.
 ///   `effective_sb_size` is `--positions-per-superbatch` rounded down to
 ///   a multiple of `--batch-size`. This is the most common case: 1 cycle
-///   per epoch, with `lr_min` landing exactly at sb N's end.
+///   per epoch.
 /// - Otherwise (= unlimited sb cap), fall back to the teacher's total
 ///   position count. For HCPE / PSV (fixed-length records) we just
 ///   read `file_size / record_size` per file. HCPE3 / pack (variable
@@ -1853,7 +1902,7 @@ fn auto_epoch_period(
         DataFormat::Psv => 40,
         DataFormat::Hcpe3 | DataFormat::Pack => {
             return Err(format!(
-                "--lr-schedule cos with variable-length teacher format \
+                "position-based LR schedule with variable-length teacher format \
                  ({format:?}) requires --superbatches to be set so the \
                  cosine cycle period is well-defined (no way to compute \
                  epoch length without walking the file). Use \
@@ -2251,10 +2300,10 @@ fn main() {
             }
         }
     }
-    if let Err(e) = effective_batches_per_superbatch(&args) {
+    let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2);
-    }
+    });
     if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
         eprintln!("error: --optimizer-weight-decay must be finite and >= 0.");
         std::process::exit(2);
@@ -2299,19 +2348,19 @@ fn main() {
             std::process::exit(2);
         }
     }
-    // `step` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
-    // `step_gamma` and `plateau` reduce `--lr` multiplicatively down to
-    // `--lr-min`. `--lr-min` must be > 0 for multiplicative schedules.
+    // `geometric` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
+    // `step` and `plateau` reduce `--lr` multiplicatively down to
+    // `--lr-min`. `--lr-min` must be > 0 for geometric/multiplicative schedules.
     // For cos, 0 is fine but unusual; warn rather than reject.
     if args.lr_min <= 0.0 {
         match args.lr_schedule {
-            LrScheduleKind::Step | LrScheduleKind::StepGamma | LrScheduleKind::Plateau => {
+            LrScheduleKind::Step | LrScheduleKind::Geometric | LrScheduleKind::Plateau => {
                 eprintln!(
                     "error: --lr-min must be > 0 for --lr-schedule {}. \
                      1e-5 or 1e-6 is typical.",
                     match args.lr_schedule {
                         LrScheduleKind::Step => "step",
-                        LrScheduleKind::StepGamma => "step_gamma",
+                        LrScheduleKind::Geometric => "geometric",
                         LrScheduleKind::Plateau => "plateau",
                         LrScheduleKind::Cos => unreachable!(),
                     }
@@ -2327,9 +2376,15 @@ fn main() {
             }
         }
     }
-    if args.lr_schedule == LrScheduleKind::StepGamma {
-        if !(args.lr_step_gamma > 0.0 && args.lr_step_gamma <= 1.0) {
-            eprintln!("error: --lr-step-gamma must satisfy 0 < gamma <= 1 for --lr-schedule step_gamma.");
+    if args.lr_schedule == LrScheduleKind::Step {
+        if let Some(gamma) = args.lr_step_gamma {
+            if !(gamma > 0.0 && gamma <= 1.0) {
+                eprintln!("error: --lr-step-gamma must satisfy 0 < gamma <= 1 for --lr-schedule step.");
+                std::process::exit(2);
+            }
+        }
+        if let Err(e) = effective_lr_step_gamma(&args, batches_per_superbatch) {
+            eprintln!("error: {e}");
             std::process::exit(2);
         }
         if matches!(args.lr_step_positions, Some(0)) {
@@ -2337,8 +2392,16 @@ fn main() {
             std::process::exit(2);
         }
         if args.lr <= 0.0 {
-            eprintln!("error: --lr must be > 0 for --lr-schedule step_gamma.");
+            eprintln!("error: --lr must be > 0 for --lr-schedule step.");
             std::process::exit(2);
+        }
+    }
+    if args.lr_schedule != LrScheduleKind::Step {
+        if let Some(gamma) = args.lr_step_gamma {
+            if !(gamma > 0.0 && gamma <= 1.0) {
+                eprintln!("error: --lr-step-gamma must satisfy 0 < gamma <= 1.");
+                std::process::exit(2);
+            }
         }
     }
     if args.nnue_pytorch_wrm_loss && !args.eval_type().supports_nnue_pytorch_wrm_loss() {
@@ -2408,13 +2471,28 @@ fn main() {
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
     }
-    if args.lr_schedule == LrScheduleKind::StepGamma {
+    if args.lr_schedule == LrScheduleKind::Step {
+        let (gamma, auto_gamma) = effective_lr_step_gamma(&args, batches_per_superbatch).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
+        let gamma_source = if args.lr_step_gamma.is_some() {
+            "explicit"
+        } else if auto_gamma {
+            "auto"
+        } else {
+            "default"
+        };
         eprintln!(
-            "  step_gamma scheduler = gamma {}, step_positions {}",
-            args.lr_step_gamma,
-            args.lr_step_positions
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "one superbatch".to_string())
+            "  step scheduler = gamma {} ({gamma_source}), step_positions {}, epoch_positions {}",
+            gamma,
+            args.lr_step_positions.map(|v| v.to_string()).unwrap_or_else(|| "one superbatch".to_string()),
+            args.superbatches
+                .map(|n| (n as u64)
+                    .saturating_mul(args.batch_size as u64)
+                    .saturating_mul(batches_per_superbatch as u64)
+                    .to_string())
+                .unwrap_or_else(|| "open-ended".to_string())
         );
     }
     if args.nnue_pytorch_layer_clip {
@@ -2492,6 +2570,9 @@ const RESUME_CONFIG_NAME: &str = "resume-config.txt";
 /// explicit `--resume`.
 fn resume_signature(args: &Args) -> String {
     let positions_per_superbatch = effective_positions_per_superbatch(args).unwrap_or(DEFAULT_POSITIONS_PER_SUPERBATCH);
+    let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or(1);
+    let lr_step_gamma =
+        effective_lr_step_gamma(args, batches_per_superbatch).map(|(gamma, _)| gamma).unwrap_or(DEFAULT_LR_STEP_GAMMA);
     let arch = if args.eval_type().uses_arch() { args.arch().cli_name() } else { "-".to_string() };
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
@@ -2509,7 +2590,7 @@ fn resume_signature(args: &Args) -> String {
         format!("optimizer={}", args.optimizer.cli_name()),
         format!("lr={:.9}", args.lr),
         format!("lr_min={:.9}", args.lr_min),
-        format!("lr_step_gamma={:.9}", args.lr_step_gamma),
+        format!("lr_step_gamma={lr_step_gamma:.9}"),
         format!(
             "lr_step_positions={}",
             args.lr_step_positions.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string())
@@ -2620,7 +2701,11 @@ fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
 }
 
 fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
+    if resume_enabled(args, output_dir) {
+        find_latest_state_bin_raw(output_dir)
+    } else {
+        None
+    }
 }
 
 fn prepare_resume_config_or_exit(args: &Args) {
@@ -2801,16 +2886,14 @@ fn run_kppt_all(args: &Args) {
 /// - `teacher`: the user's `--teacher` CLI value verbatim, RFC-4180
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
-const LEARN_LOG_HEADER: &str =
-    "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
 /// Schema for the top-level `<output>/summary-learn.log`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
 /// (= the effective superbatch boundary) and conveys no info.
-const SUMMARY_LEARN_LOG_HEADER: &str =
-    "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
@@ -2847,14 +2930,15 @@ struct LogContext {
     /// 0 for fresh first runs.
     epoch_offset: usize,
     /// Which LR schedule the trainer is running. Switches the
-    /// enrich-path lr formula between `PositionsLR::lr_at_positions`
-    /// (step / geometric) and `CosineLR::lr_at_positions` (cos).
+    /// enrich-path lr formula between `StepLR::lr_at_positions` (step),
+    /// `GeometricLR::lr_at_positions` (geometric), and
+    /// `CosineLR::lr_at_positions` (cos).
     lr_schedule: LrScheduleKind,
     /// Period of one warm-restart cycle (= one epoch's worth of
     /// positions), shared by both schedules. Computed via
     /// [`auto_epoch_period`] at training start.
     lr_period: u64,
-    /// Decay factor and interval used by `step_gamma`.
+    /// Decay factor and interval used by `step`.
     lr_step_gamma: f32,
     lr_step_positions: u64,
     /// Floor LR reached at end of each cycle. Mirrors `--lr-min`.
@@ -2890,6 +2974,12 @@ impl LogContext {
             eprintln!("error: {e}");
             std::process::exit(2);
         });
+        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            })
+            .0;
         Self {
             eval_type: args.eval_type().cli_name(),
             arch: if args.eval_type().uses_arch() { args.arch().cli_name() } else { String::new() },
@@ -2901,7 +2991,7 @@ impl LogContext {
             epoch_offset: 0,
             lr_schedule: args.lr_schedule,
             lr_period: lr_period_override,
-            lr_step_gamma: args.lr_step_gamma,
+            lr_step_gamma,
             lr_step_positions: effective_lr_step_positions(args, batches_per_superbatch),
             lr_min: args.lr_min,
             lr_override: None,
@@ -2917,17 +3007,20 @@ impl LogContext {
 
     fn lr_at_positions(&self, positions: usize) -> f32 {
         match self.lr_schedule {
-            LrScheduleKind::Step => {
-                PositionsLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64)
-            }
-            LrScheduleKind::StepGamma => GammaStepLR::lr_at_positions(
+            LrScheduleKind::Step => StepLR::lr_at_positions(
                 self.lr_start,
                 self.lr_min,
                 self.lr_step_gamma,
                 self.lr_step_positions,
+                self.lr_period,
                 positions as u64,
             ),
-            LrScheduleKind::Cos => CosineLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64),
+            LrScheduleKind::Geometric => {
+                GeometricLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64)
+            }
+            LrScheduleKind::Cos => {
+                CosineLR::lr_at_positions(self.lr_start, self.lr_min, self.lr_period, positions as u64)
+            }
             LrScheduleKind::Plateau => self.lr_override.unwrap_or(self.lr_start),
         }
     }
@@ -3585,8 +3678,7 @@ macro_rules! run_training_inline {
         // --superbatches が未指定なら epoch ごとに loader EOF まで回す (= usize::MAX で
         // 上限なし、loader 側で EOF が来たら trainer.run が返る)。
         let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
-        let teacher_single_epoch =
-            args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
+        let teacher_single_epoch = args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
 
         let net_id_base = args.net_id();
         let output_dir_buf = args.output_dir();
@@ -3597,9 +3689,11 @@ macro_rules! run_training_inline {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `step_gamma` and `plateau` do not.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::StepGamma | LrScheduleKind::Plateau) {
+        // Warm-restart cycle period = one epoch's positions. `step`,
+        // `geometric`, and `cos` use this period; `plateau` is validation-driven.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
+            || (matches!(args.lr_schedule, LrScheduleKind::Step) && args.superbatches.is_none())
+        {
             0
         } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
@@ -3608,6 +3702,12 @@ macro_rules! run_training_inline {
             })
         };
         let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
+        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            })
+            .0;
 
         // Tracks whether bullet fired the save callback at least once across
         // all epochs. If 教師 is smaller than a single superbatch (or any
@@ -3667,19 +3767,20 @@ macro_rules! run_training_inline {
                 // cumulative `prior_positions` across resumes (KPPT
                 // resume support is itself limited), so prior is 0.
                 lr_scheduler: match args.lr_schedule {
-                    LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
+                    LrScheduleKind::Step => LrSchedulerImpl::Step(StepLR {
                         start: args.lr,
                         min: args.lr_min,
+                        gamma: lr_step_gamma,
+                        step_positions: lr_step_positions,
                         period_positions: lr_period,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
                     }),
-                    LrScheduleKind::StepGamma => LrSchedulerImpl::StepGamma(GammaStepLR {
+                    LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
                         start: args.lr,
                         min: args.lr_min,
-                        gamma: args.lr_step_gamma,
-                        step_positions: lr_step_positions,
+                        period_positions: lr_period,
                         prior_positions: 0,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -3741,8 +3842,8 @@ macro_rules! run_training_inline {
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Psv => {
-                    let loader = DirectSequentialDataLoader::new(&data_files_ref)
-                        .with_single_epoch(teacher_single_epoch);
+                    let loader =
+                        DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(teacher_single_epoch);
                     trainer.run(&schedule, &settings, &loader)
                 }
             };
@@ -4067,7 +4168,11 @@ impl RunningActivationStats {
     }
 
     fn mean(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.sum / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
     }
 
     fn variance(&self) -> f64 {
@@ -4084,11 +4189,19 @@ impl RunningActivationStats {
     }
 
     fn zero_ratio(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.zero as f64 / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.zero as f64 / self.count as f64
+        }
     }
 
     fn max_ratio(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.maxed as f64 / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.maxed as f64 / self.count as f64
+        }
     }
 }
 
@@ -4100,7 +4213,11 @@ struct LayerActivationStats {
 
 impl LayerActivationStats {
     fn new(label: &'static str, neurons: usize) -> Self {
-        Self { label, all: RunningActivationStats::default(), by_neuron: vec![RunningActivationStats::default(); neurons] }
+        Self {
+            label,
+            all: RunningActivationStats::default(),
+            by_neuron: vec![RunningActivationStats::default(); neurons],
+        }
     }
 
     fn observe(&mut self, neuron: usize, value: f32) {
@@ -4129,10 +4246,7 @@ impl LayerActivationStats {
     }
 }
 
-fn model_weight_f32<Opt, I>(
-    trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>,
-    id: &str,
-) -> Option<Vec<f32>>
+fn model_weight_f32<Opt, I>(trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>, id: &str) -> Option<Vec<f32>>
 where
     Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
     I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue>,
@@ -4150,13 +4264,7 @@ where
     }
 }
 
-fn affine_sparse(
-    weights: &[f32],
-    bias: &[f32],
-    rows: usize,
-    active: &[usize],
-    out: &mut [f32],
-) {
+fn affine_sparse(weights: &[f32], bias: &[f32], rows: usize, active: &[usize], out: &mut [f32]) {
     out.copy_from_slice(&bias[..rows]);
     for &feature in active {
         let base = feature * rows;
@@ -4226,8 +4334,7 @@ fn dump_sfnn_activation_stats<Opt, I>(
     bucket_impl: ShogiLayerStackBucket9,
     cache: &TestPositionsCache,
     shape: SfnnActivationShape,
-)
-where
+) where
     Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
     I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
 {
@@ -4390,9 +4497,11 @@ macro_rules! run_training_inline_nnue {
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
 
-        // Warm-restart cycle period = one epoch's positions. `step` and
-        // `cos` use this period; `step_gamma` and `plateau` do not.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::StepGamma | LrScheduleKind::Plateau) {
+        // Warm-restart cycle period = one epoch's positions. `step`,
+        // `geometric`, and `cos` use this period; `plateau` is validation-driven.
+        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
+            || (matches!(args.lr_schedule, LrScheduleKind::Step) && args.superbatches.is_none())
+        {
             0
         } else {
             auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
@@ -4401,6 +4510,10 @@ macro_rules! run_training_inline_nnue {
             })
         };
         let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
+        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }).0;
 
         let saved_any = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
@@ -4504,7 +4617,7 @@ macro_rules! run_training_inline_nnue {
         // The LR columns are derived from `positions` (= prior + per-row
         // offset within this run), so we always need the cumulative
         // carry-over from the existing top-level log here so the enrich
-        // path's `positions` matches what `PositionsLR` saw.
+        // path's `positions` matches what `GeometricLR` saw.
         // この変数は `cb_top_level_log` (= `<output>/summary-learn.log`) の最大
         // positions 値を保持する。enrich path で「この run の sb 1 が始まる
         // 前までに何局面学習されたか」を表し、各 save 行の positions 列に
@@ -4582,9 +4695,9 @@ macro_rules! run_training_inline_nnue {
         // `prior_positions` carries the cumulative-trained count from
         // the existing top-level log so the schedule stays continuous
         // across resumes. Bullet's local sb resets per `trainer.run`
-        // call (= per epoch / chunk) which makes the effective in-run
-        // position offset restart, giving the per-epoch reset
-        // (sawtooth for `step`, warm-restart for `cos`).
+        // call (= per epoch / chunk), but the cumulative position offset
+        // keeps `step` continuous. `geometric` / `cos` still use their
+        // configured cycle period.
         // Note: lr_scheduler_for_run は each-epoch で再構築する
         // (`for epoch in 1..=max_epochs` 内)。`cb_prior_position` が epoch
         // を跨いで前 epoch の累積を反映するため、各 epoch で正しい LR
@@ -4764,19 +4877,20 @@ macro_rules! run_training_inline_nnue {
                     trainer.save_to_checkpoint(rollback_path);
                 }
                 let lr_scheduler_for_chunk = match args.lr_schedule {
-                    LrScheduleKind::Step => LrSchedulerImpl::Step(PositionsLR {
+                    LrScheduleKind::Step => LrSchedulerImpl::Step(StepLR {
                         start: args.lr,
                         min: args.lr_min,
+                        gamma: lr_step_gamma,
+                        step_positions: lr_step_positions,
                         period_positions: lr_period,
                         prior_positions: cb_prior_position as u64,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
                     }),
-                    LrScheduleKind::StepGamma => LrSchedulerImpl::StepGamma(GammaStepLR {
+                    LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
                         start: args.lr,
                         min: args.lr_min,
-                        gamma: args.lr_step_gamma,
-                        step_positions: lr_step_positions,
+                        period_positions: lr_period,
                         prior_positions: cb_prior_position as u64,
                         batch_size: args.batch_size,
                         batches_per_superbatch,
@@ -5999,8 +6113,14 @@ where
             false,
             args.nnue_pytorch_init_scale,
         );
-        let l3 =
-            builder.new_stacked_affine_nnue_pytorch_scaled("l3", l2_size, 1, num_stacks, true, args.nnue_pytorch_init_scale);
+        let l3 = builder.new_stacked_affine_nnue_pytorch_scaled(
+            "l3",
+            l2_size,
+            1,
+            num_stacks,
+            true,
+            args.nnue_pytorch_init_scale,
+        );
 
         // Per-perspective FT → CReLU → pairwise-mul → concat. After the
         // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it
@@ -6046,14 +6166,7 @@ where
         trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
     }
 
-    let activation_shape = SfnnActivationShape {
-        ft_size,
-        l1_hidden,
-        l1_out,
-        l2_in,
-        l2_size,
-        num_stacks,
-    };
+    let activation_shape = SfnnActivationShape { ft_size, l1_hidden, l1_out, l2_in, l2_size, num_stacks };
     run_training_inline_nnue!(args, &mut trainer, |trainer, cache| {
         dump_sfnn_activation_stats(args, trainer, input, bucket_impl, cache, activation_shape);
     });
@@ -6139,7 +6252,8 @@ fn finalize_one_nnue_dir(
     let log_txt = dst.join("log.txt");
     let learn_log = dst.join("learn.log");
     let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
-    let body = enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics, last_superbatch_complete);
+    let body =
+        enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics, last_superbatch_complete);
     let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
     content.push_str(LEARN_LOG_HEADER);
     content.push('\n');
@@ -6281,14 +6395,7 @@ mod tests {
         };
 
         let dst = finalize_one_nnue_dir(
-            &tmp,
-            &src,
-            &ctx,
-            /*epoch=*/ 1,
-            /*idx=*/ 5,
-            /*prior=*/ 0,
-            /*test_metrics=*/ None,
-            true,
+            &tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None, true,
         )
         .expect("finalize ok");
 
@@ -6461,7 +6568,7 @@ mod tests {
     fn max_epochs_omitted_is_unlimited_for_all_schedules() {
         use clap::Parser as _;
 
-        for schedule in ["step", "step_gamma", "cos", "plateau"] {
+        for schedule in ["step", "geometric", "cos", "plateau"] {
             let args = Args::try_parse_from([
                 "bulletou",
                 "--eval-type",
@@ -6544,14 +6651,7 @@ mod tests {
     fn default_optimizer_matches_bullet_shogi_ranger_defaults() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
-            "--teacher",
-            "/dev/null",
-        ])
-        .unwrap();
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
         let adamw = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
@@ -6565,20 +6665,80 @@ mod tests {
     fn default_lr_and_step_schedule_match_tatara_recipe() {
         use clap::Parser as _;
 
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(args.lr, 0.000875);
+        assert_eq!(args.lr_schedule, LrScheduleKind::Step);
+        assert_eq!(args.lr_step_gamma, None);
+        let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap();
+        let (gamma, auto) = effective_lr_step_gamma(&args, batches_per_superbatch).unwrap();
+        assert_eq!(gamma, DEFAULT_LR_STEP_GAMMA);
+        assert!(!auto);
+        assert_eq!(args.lr_step_positions, None);
+        assert_eq!(args.optimizer_weight_decay, 0.0);
+    }
+
+    #[test]
+    fn omitted_step_gamma_auto_reaches_lr_min_within_one_epoch() {
+        use clap::Parser as _;
+
         let args = Args::try_parse_from([
             "bulletou",
             "--eval-type",
             "NNUE_HALFKP",
             "--teacher",
             "/dev/null",
+            "--superbatches",
+            "15",
+            "--max-epochs",
+            "2",
+            "--lr",
+            "0.000875",
+            "--lr-min",
+            "0.00001",
         ])
         .unwrap();
 
-        assert_eq!(args.lr, 0.000875);
-        assert_eq!(args.lr_schedule, LrScheduleKind::StepGamma);
-        assert_eq!(args.lr_step_gamma, 0.992);
-        assert_eq!(args.lr_step_positions, None);
-        assert_eq!(args.optimizer_weight_decay, 0.0);
+        let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap();
+        let (gamma, auto) = effective_lr_step_gamma(&args, batches_per_superbatch).unwrap();
+        let expected = (0.00001_f64 / 0.000875_f64).powf(1.0 / 15.0) as f32;
+        assert!(auto);
+        assert!((gamma - expected).abs() < 1e-9, "expected {expected}, got {gamma}");
+    }
+
+    #[test]
+    fn max_epoch_alias_is_accepted() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--max-epoch",
+            "3",
+        ])
+        .unwrap();
+
+        assert_eq!(args.max_epochs, Some(3));
+    }
+
+    #[test]
+    fn removed_step_gamma_schedule_name_is_rejected() {
+        use clap::Parser as _;
+
+        let parsed = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--lr-schedule",
+            "step_gamma",
+        ]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]
@@ -6629,7 +6789,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/foo.hcpe".to_string(),
             epoch_offset: 0,
-            lr_schedule: LrScheduleKind::Step,
+            lr_schedule: LrScheduleKind::Geometric,
             lr_period: 500_000_000,
             lr_step_gamma: 0.992,
             lr_step_positions: 100_000_000,
@@ -6701,51 +6861,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// 新 step (geometric) schedule の検証: 1 epoch 末で lr_min、cycle 跨ぎで
+    /// geometric schedule の検証: 1 epoch 末で lr_min、cycle 跨ぎで
     /// warm restart して lr_max に戻る。
     #[test]
-    fn step_lr_geometric_warm_restart() {
+    fn geometric_lr_warm_restarts() {
         let max = 0.001f32;
         let min = 0.00001f32;
         let period = 500_000_000u64;
         // t=0 → lr_max
-        let lr = PositionsLR::lr_at_positions(max, min, period, 0);
+        let lr = GeometricLR::lr_at_positions(max, min, period, 0);
         assert!((lr - max).abs() < 1e-7, "t=0 should be lr_max, got {lr}");
         // t=0.5 → log-space midpoint = sqrt(max * min)
-        let lr = PositionsLR::lr_at_positions(max, min, period, period / 2);
+        let lr = GeometricLR::lr_at_positions(max, min, period, period / 2);
         let geomean = (max as f64 * min as f64).sqrt() as f32;
         assert!((lr - geomean).abs() < 1e-6, "t=0.5 should be geomean {geomean}, got {lr}");
         // Just before cycle end → near lr_min
-        let lr = PositionsLR::lr_at_positions(max, min, period, period - 1);
+        let lr = GeometricLR::lr_at_positions(max, min, period, period - 1);
         assert!(lr < min * 1.1, "near t=1 should approach lr_min, got {lr}");
         // Exact cycle boundary → warm restart to lr_max
-        let lr = PositionsLR::lr_at_positions(max, min, period, period);
+        let lr = GeometricLR::lr_at_positions(max, min, period, period);
         assert!((lr - max).abs() < 1e-7, "cycle boundary should warm-restart to lr_max, got {lr}");
     }
 
-    /// step_gamma は nnue-pytorch の StepLR 比較用。指定局面数ごとに
-    /// gamma を掛け、warm restart しない。lr_min を下回ったら floor する。
+    /// step は指定局面数ごとに gamma を掛け、epoch 境界で lr_max に戻る。
+    /// lr_min を下回ったら floor する。
     #[test]
-    fn step_gamma_lr_drops_by_fixed_gamma_without_restart() {
+    fn step_lr_drops_by_fixed_gamma_and_restarts_each_epoch() {
         let max = 0.000875f32;
         let min = 0.00001f32;
         let gamma = 0.992f32;
         let step = 100_000_000u64;
+        let period = step * 3;
 
-        let lr0 = GammaStepLR::lr_at_positions(max, min, gamma, step, 0);
+        let lr0 = StepLR::lr_at_positions(max, min, gamma, step, period, 0);
         assert!((lr0 - max).abs() < 1e-9, "initial lr should be max, got {lr0}");
 
-        let lr_mid = GammaStepLR::lr_at_positions(max, min, gamma, step, step - 1);
+        let lr_mid = StepLR::lr_at_positions(max, min, gamma, step, period, step - 1);
         assert!((lr_mid - max).abs() < 1e-9, "drop should happen only at the step boundary, got {lr_mid}");
 
-        let lr1 = GammaStepLR::lr_at_positions(max, min, gamma, step, step);
+        let lr1 = StepLR::lr_at_positions(max, min, gamma, step, period, step);
         assert!((lr1 - max * gamma).abs() < 1e-9, "first boundary should apply gamma once, got {lr1}");
 
-        let lr2 = GammaStepLR::lr_at_positions(max, min, gamma, step, step * 2);
+        let lr2 = StepLR::lr_at_positions(max, min, gamma, step, period, step * 2);
         assert!((lr2 - max * gamma * gamma).abs() < 1e-9, "second boundary should apply gamma twice, got {lr2}");
 
-        let lr_floor = GammaStepLR::lr_at_positions(max, min, gamma, step, step * 10_000);
-        assert_eq!(lr_floor, min, "step_gamma should floor at lr_min");
+        let lr_restart = StepLR::lr_at_positions(max, min, gamma, step, period, period);
+        assert!((lr_restart - max).abs() < 1e-9, "epoch boundary should restart to lr_max, got {lr_restart}");
+
+        let lr_floor = StepLR::lr_at_positions(max, min, gamma, step, 0, step * 10_000);
+        assert_eq!(lr_floor, min, "step should floor at lr_min");
+    }
+
+    #[test]
+    fn step_lr_with_one_superbatch_step_drops_from_next_superbatch() {
+        let scheduler = StepLR {
+            start: 0.000875,
+            min: 0.00001,
+            gamma: 0.992,
+            step_positions: 4 * 16_384,
+            period_positions: 8 * 16_384,
+            prior_positions: 0,
+            batch_size: 16_384,
+            batches_per_superbatch: 4,
+        };
+
+        assert!((scheduler.lr(0, 1) - 0.000875).abs() < 1e-12);
+        assert!((scheduler.lr(3, 1) - 0.000875).abs() < 1e-12);
+        assert!((scheduler.lr(0, 2) - 0.000875 * 0.992).abs() < 1e-12);
+        assert!((scheduler.lr(0, 3) - 0.000875).abs() < 1e-12);
     }
 
     /// CosineLR の式: lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt)) が
@@ -6877,14 +7060,8 @@ mod tests {
             metrics: pm(0.53),
             best: pm(0.49),
         }));
-        assert!(!plateau_action_retries_teacher(PlateauAction::Improved {
-            old_best: pm(0.50),
-            new_best: pm(0.49),
-        }));
-        assert!(!plateau_action_retries_teacher(PlateauAction::FinalRejected {
-            metrics: pm(0.54),
-            best: pm(0.49),
-        }));
+        assert!(!plateau_action_retries_teacher(PlateauAction::Improved { old_best: pm(0.50), new_best: pm(0.49) }));
+        assert!(!plateau_action_retries_teacher(PlateauAction::FinalRejected { metrics: pm(0.54), best: pm(0.49) }));
     }
 
     #[test]
@@ -6901,10 +7078,7 @@ mod tests {
             metrics: pm(0.53),
             best: pm(0.49),
         }));
-        assert!(plateau_action_rejects_update(PlateauAction::FinalRejected {
-            metrics: pm(0.54),
-            best: pm(0.49),
-        }));
+        assert!(plateau_action_rejects_update(PlateauAction::FinalRejected { metrics: pm(0.54), best: pm(0.49) }));
         assert!(!plateau_action_rejects_update(PlateauAction::FinalImproved {
             old_best: pm(0.49),
             new_best: pm(0.48),
@@ -6938,18 +7112,8 @@ mod tests {
         assert!(!epoch_final_should_stop(Some(pm(0.50)), pm(0.49), PlateauMonitor::Loss, 0.0));
         assert!(epoch_final_should_stop(Some(pm(0.50)), pm(0.50), PlateauMonitor::Loss, 0.0));
         assert!(epoch_final_should_stop(Some(pm(0.50)), pm(0.51), PlateauMonitor::Loss, 0.0));
-        assert!(!epoch_final_should_stop(
-            Some(pma(0.50, 0.55)),
-            pma(0.60, 0.56),
-            PlateauMonitor::LossOrAccuracy,
-            0.0
-        ));
-        assert!(epoch_final_should_stop(
-            Some(pma(0.50, 0.55)),
-            pma(0.60, 0.55),
-            PlateauMonitor::LossOrAccuracy,
-            0.0
-        ));
+        assert!(!epoch_final_should_stop(Some(pma(0.50, 0.55)), pma(0.60, 0.56), PlateauMonitor::LossOrAccuracy, 0.0));
+        assert!(epoch_final_should_stop(Some(pma(0.50, 0.55)), pma(0.60, 0.55), PlateauMonitor::LossOrAccuracy, 0.0));
     }
 
     #[test]
@@ -7055,7 +7219,7 @@ mod tests {
             batches_per_superbatch: 6104,
             teacher_csv: "teachers/round2.hcpe".to_string(),
             epoch_offset: 0,
-            lr_schedule: LrScheduleKind::Step,
+            lr_schedule: LrScheduleKind::Geometric,
             lr_period: 800_000_000,
             lr_step_gamma: 0.992,
             lr_step_positions: 100_000_000,
@@ -7065,7 +7229,8 @@ mod tests {
         // bullet's local sb in raw log is 1; enrich displays the local sb
         // verbatim (no cross-run shift — sb is per-epoch by design).
         let raw = "1,32,0.07\n1,64,0.06\n";
-        let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None, false);
+        let body =
+            enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None, false);
         let rows: Vec<&str> = body.lines().collect();
         assert_eq!(rows.len(), 2);
         // Each row: eval, epoch, sb, batch, ta, tl, train,
@@ -7073,12 +7238,12 @@ mod tests {
         let cols0: Vec<&str> = rows[0].split(',').collect();
         assert_eq!(cols0[2], "1", "sb column = bullet's local sb");
         // positions = prior 60M + b*batch_size = 60M + 32*16384 = 60_524_288
-        // With step (geometric) schedule, lr decays smoothly from positions 0.
+        // With geometric schedule, lr decays smoothly from positions 0.
         // lr_start uses the beginning of this row interval, while
         // lr_end uses the final batch start within the interval.
         let lr_start: f32 = cols0[7].parse().expect("lr_start col is a float");
         let lr_end: f32 = cols0[8].parse().expect("lr_end col is a float");
-        assert!(lr_start > lr_end, "step lr should decrease within the row interval");
+        assert!(lr_start > lr_end, "geometric lr should decrease within the row interval");
         assert_eq!(cols0[10], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 

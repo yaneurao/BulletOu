@@ -101,28 +101,30 @@ SFNN-1536 reference run に寄せて `weight_decay=0.0`、全 weight を一律
 weight decay は既定で 0 になっているので、その後 `--optimizer ranger`
 や epsilon / beta の差を試す。ただし Ranger21 そのものではないので、完全一致を期待しないこと。
 
-現在の BulletOu デフォルトは `--lr-schedule step_gamma`。これは tatara reference
-run および `bullet-shogi` の将棋用 example と同じ StepLR 系で、指定局面数ごとに
-`lr *= --lr-step-gamma` し、warm restart しない。`--lr-step-positions` を
-省略した場合は 1 superbatch ごとに減衰するので、tatara の `lr_step=1` および
-`bullet-shogi` の `StepLR { gamma=0.992, step=1 }` に対応する。
+現在の BulletOu デフォルトは `--lr-schedule step`。これは指定局面数ごとに
+`lr *= gamma` する StepLR 系で、epoch 境界で `--lr` に戻る。`--lr-step-positions`
+を省略した場合は 1 superbatch ごとに減衰する。`--lr-step-gamma` を省略し、
+かつ `--superbatches` を指定した場合は、1 epoch 内で `--lr` から `--lr-min` へ
+到達する gamma を自動計算する。epoch 長が決まらない場合は既定値の `0.992` を使う。
 
-一方、BulletOu の `--lr-schedule step` は 1 epoch の中で `lr -> lr_min` へ
-滑らかに落として epoch 境界で warm restart する独自の geometric schedule であり、
-nnue-pytorch / bullet-shogi の StepLR とは別物。
+旧 BulletOu の滑らかな schedule は `--lr-schedule geometric` に改名されている。
+これは 1 epoch の中で `lr -> lr_min` へ滑らかに落として epoch 境界で warm restart
+する独自 schedule であり、nnue-pytorch / bullet-shogi の StepLR とは別物。
 
-tatara / bullet-shogi の StepLR 条件を明示する比較例:
+tatara / bullet-shogi の `gamma=0.992` StepLR 条件を明示する比較例:
 
 ```text
 --lr 0.000875
---lr-schedule step_gamma
+--lr-schedule step
 --lr-step-gamma 0.992
 --lr-step-positions 100000000
 --lr-min 0.00001
 ```
 
 `--lr-step-positions` を省略した場合は 1 superbatch ごとの decay になる。
-比較では明示したほうがよい。
+比較では `--lr-step-gamma 0.992` も含めて明示したほうがよい。一方、1 epoch 内で
+`lr_min` へ到達させたい実験では `--lr-step-gamma` を省略し、`--superbatches` から
+自動計算させる。
 
 ### 3. SFNN の L1 factorized shared term
 
@@ -261,9 +263,11 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions
-   - `step_gamma` は BulletOu のデフォルト。`step` / `cos` は warm restart 系なので区別する
+   - `step` は BulletOu のデフォルトで、階段状の StepLR 系
+   - `geometric` / `cos` は warm restart 系なので区別する
    - tatara reference に合わせて既定 LR は `0.000875`
-   - 局面数で固定したい場合は `--lr-schedule step_gamma --lr-step-gamma 0.992 --lr-step-positions 100000000`
+   - tatara / bullet-shogi の固定 gamma 条件に合わせる場合は `--lr-schedule step --lr-step-gamma 0.992 --lr-step-positions 100000000`
+   - 1 epoch 内で `lr_min` に到達させる場合は `--lr-step-gamma` を省略する
 
 ## 比較時の注意
 

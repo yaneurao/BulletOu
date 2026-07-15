@@ -44,7 +44,7 @@ HalfKP sparse input (125,388 dims, per perspective)
     --output checkpoints/my-halfkp
 ```
 
-Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). To run multiple passes, pass `--max-epochs N`. The default `step_gamma` LR continues; explicit `step` / `cos` warm-restart at epoch boundaries.
+Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). For multi-epoch runs, set the epoch length with `--superbatches` and then pass `--max-epochs N`. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries.
 
 ### Save layout
 
@@ -89,11 +89,11 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
-| `--max-epochs` | Maximum number of epochs. If omitted: `step` / `cos` = 1, `plateau` = until epoch-final loss stops improving | omitted |
+| `--max-epochs` | Maximum number of epochs. If omitted: no fixed epoch cap | omitted |
 | `--superbatches` | Cap superbatches per epoch | unlimited |
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--save-rate` | Save every N superbatches | 1 |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step_gamma` = tatara/bullet-shogi-compatible StepLR, `step` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step_gamma` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 
 Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to ClippedReLU (matching the original 2018 architecture). These can be added as flags later if needed.

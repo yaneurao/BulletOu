@@ -87,7 +87,7 @@ KPPT 系では `--arch` 不要 (architecture は固定):
 
 ## 4.7 学習がどこまで進むか
 
-`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する。LR の挙動は schedule 依存で、デフォルトの `step_gamma` は継続、`step` / `cos` は epoch 境界で warm restart する。
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--superbatches` で epoch 長を決めたうえで `--max-epochs 3` のように指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
 
 教師サイズが事前にわかっていると `--superbatches N` で「1 epoch = N sb」を明示できる ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)。教師の総局面数を一瞬で数える `--count-teacher` フラグがある:
 

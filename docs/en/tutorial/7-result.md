@@ -99,8 +99,8 @@ A healthy training run typically shows:
    - **Periodic loss spikes** or local loss bias almost always mean the teacher file wasn't pre-shuffled. BulletOu does not shuffle teacher positions during training. Fix: see [§3.2 Pre-shuffle the teacher file](3-data.md#pre-shuffle-the-teacher-file)
 
 2. **`lr_start` / `lr_end` follow the configured schedule**
-   - `--lr-schedule step_gamma` (default): multiply lr by `--lr-step-gamma` once per superbatch, floor at `--lr-min`, and do not warm-restart.
-   - `--lr-schedule step`: geometric (= log-linear) decay from `--lr` (lr_max) to `--lr-min` over one epoch (= `--superbatches × sb_size` positions), warm-restarting back to lr_max at each epoch boundary.
+   - `--lr-schedule step` (default): multiply lr by `gamma` once per superbatch, floor at `--lr-min`, and restart to `--lr` at epoch boundaries. `gamma` is either explicit or auto-computed from one epoch's length.
+   - `--lr-schedule geometric`: geometric (= log-linear) decay from `--lr` (lr_max) to `--lr-min` over one epoch (= `--superbatches × sb_size` positions), warm-restarting back to lr_max at each epoch boundary.
    - `--lr-schedule cos`: cosine annealing sweeping `--lr` (lr_max) → `--lr-min` over one epoch (= `--superbatches × sb_size` positions), then warm-restarts to `--lr` at each epoch boundary.
    - If it isn't moving as expected, double-check the LR flags ([§6.1 Training schedule](6-tune.md#61-training-schedule)).
 

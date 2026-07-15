@@ -99,8 +99,8 @@ CSV header 付きなので `pd.read_csv` で列名は自動取得される。
    - **periodic な loss スパイク** や局所的な loss の偏りが見える場合は、教師ファイルが事前シャッフルされていない可能性が高い。BulletOu は学習時に追加シャッフルしないので、対処は [§3.2 教師ファイルは事前にシャッフルしておく](3-data.md#教師ファイルは事前にシャッフルしておく) を参照
 
 2. **`lr_start` / `lr_end` がスケジュール通りに動いている**
-   - `--lr-schedule step_gamma` (デフォルト): 1 superbatch ごとに `lr *= --lr-step-gamma` し、`--lr-min` を下限にする。warm restart しない
-   - `--lr-schedule step`: 1 epoch (= `--superbatches × sb_size` 局面) で `--lr` (lr_max) → `--lr-min` を **geometric** (= 対数線形) に減衰、epoch 末で warm restart して lr_max に戻る
+   - `--lr-schedule step` (デフォルト): 1 superbatch ごとに `lr *= gamma` し、`--lr-min` を下限にする。`gamma` は明示値、または 1 epoch 長から自動計算された値。epoch 境界で `--lr` に戻る
+   - `--lr-schedule geometric`: 1 epoch (= `--superbatches × sb_size` 局面) で `--lr` (lr_max) → `--lr-min` を **geometric** (= 対数線形) に減衰、epoch 末で warm restart して lr_max に戻る
    - `--lr-schedule cos`: cosine annealing で `--lr` (lr_max) → `--lr-min` を 1 epoch (= `--superbatches × sb_size` 局面) で 1 周期。各 cycle 末 (= epoch 末) で warm restart して `--lr` に戻る
    - 期待通り変化していないなら lr 系フラグの値を見直す ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)
 

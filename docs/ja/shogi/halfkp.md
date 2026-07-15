@@ -44,7 +44,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
     --output checkpoints/my-halfkp
 ```
 
-`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する。デフォルトの `step_gamma` は LR を継続し、`step` / `cos` を明示した場合は epoch 境界で warm restart する。
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--superbatches` で epoch 長を決めたうえで `--max-epochs 3` のように指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
 
 ### 保存レイアウト
 
@@ -89,11 +89,11 @@ checkpoints/my-halfkp/
 | `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
-| `--max-epochs` | epoch を最大何回実行するか。省略時は `step` / `cos` では 1、`plateau` では final loss の改善が止まるまで | 省略 |
+| `--max-epochs` | epoch を最大何回実行するか。省略時は固定上限なし | 省略 |
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--positions-per-superbatch` | superbatch あたりの目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--save-rate` | N superbatch ごとに save | 1 |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step_gamma` = tatara/bullet-shogi 互換 StepLR、`step` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step_gamma` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 
 loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。
