@@ -17,18 +17,18 @@
 | `--superbatches` | 1 epoch を何 superbatch にするか。`step` / `cos` では LR cycle 長そのもの。`step_gamma` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では LR cycle を最大何回繰り返すか、`step_gamma` では StepLR を継続したまま何 epoch 進めるか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
-| `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
+| `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
 | `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
-| `--lr-schedule` | `step_gamma` (= bullet-shogi 互換 StepLR)、`step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step_gamma` |
+| `--lr-schedule` | `step_gamma` (= tatara/bullet-shogi 互換 StepLR)、`step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step_gamma` |
 | `--lr-min` | 最小 lr。`step_gamma` / `plateau` では下限、`step` / `cos` では cycle 末で到達する値 | 0.00001 |
-| `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。bullet-shogi / nnue-pytorch 既定値は `0.992` | 0.992 |
+| `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。tatara / bullet-shogi / nnue-pytorch 既定値は `0.992` | 0.992 |
 | `--lr-step-positions` | `step_gamma` で何局面ごとに LR を落とすか。省略時は 1 superbatch | 省略 |
 | `--lr-plateau-factor` | `plateau` で監視指標が改善しなかったときに LR へ掛ける係数 | 0.5 |
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
-| `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.01 |
+| `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta2` | 選択中 optimizer の beta2 を上書き。省略時は optimizer 固有の既定値 | 省略 |
@@ -48,7 +48,7 @@
 
 ### 学習率の動き
 
-デフォルトの `step_gamma` は、`bullet-shogi` の将棋用 example と同じ StepLR 系です。`--lr-step-positions` を省略すると、1 superbatch ごとに `lr *= --lr-step-gamma` し、`--lr-min` を下限としてそれ以上は下がりません。warm restart はしません。
+デフォルトの `step_gamma` は、tatara の reference run および `bullet-shogi` の将棋用 example と同じ StepLR 系です。`--lr-step-positions` を省略すると、1 superbatch ごとに `lr *= --lr-step-gamma` し、`--lr-min` を下限としてそれ以上は下がりません。warm restart はしません。
 
 `step` と `cos` を明示した場合は、1 epoch をかけて `--lr` (lr_max) から `--lr-min` (lr_min) へ滑らかに減衰、epoch 境界で warm restart して lr_max に戻る形になります。違いは曲線の形だけ:
 
@@ -86,9 +86,9 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 実際の lr 推移は `<NNNN>/learn.log` の `lr_start` / `lr_end` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
 
-#### bullet-shogi / nnue-pytorch の StepLR 条件
+#### tatara / bullet-shogi / nnue-pytorch の StepLR 条件
 
-`--lr-schedule step_gamma` は、`bullet-shogi` の将棋用 example と同じ StepLR 系のデフォルトスケジューラです。既存の `step` とは別物で、warm restart せず、指定局面数ごとに `lr *= gamma` します。
+`--lr-schedule step_gamma` は、tatara の reference run および `bullet-shogi` の将棋用 example と同じ StepLR 系のデフォルトスケジューラです。既存の `step` とは別物で、warm restart せず、指定局面数ごとに `lr *= gamma` します。
 
 デフォルト挙動を明示するなら、次のように書けます:
 
@@ -96,13 +96,14 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --lr 0.000875 \
     --lr-schedule step_gamma \
     --lr-step-gamma 0.992 \
     --lr-min 0.00001 \
     --tag step-gamma-ablation
 ```
 
-`--lr-step-positions` を省略すると 1 superbatch ごとに LR を落とします。これは `bullet-shogi` の `StepLR { gamma=0.992, step=1 }` に対応します。局面数で固定したい比較実験では `--lr-step-positions 100000000` のように明示できます。
+`--lr-step-positions` を省略すると 1 superbatch ごとに LR を落とします。これは tatara の `lr_step=1` および `bullet-shogi` の `StepLR { gamma=0.992, step=1 }` に対応します。局面数で固定したい比較実験では `--lr-step-positions 100000000` のように明示できます。
 
 #### ReduceLROnPlateau を使う
 
@@ -297,17 +298,17 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 ### Optimizer weight decay
 
-BulletOu の標準設定は `--optimizer-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を同じまま `--optimizer-weight-decay 0.0` だけを試す。
+BulletOu の標準設定は、tatara の SFNN-1536 reference run に寄せて `--optimizer-weight-decay 0.0` にしている。weight decay の有無を比較したい場合は、optimizer を同じまま `--optimizer-weight-decay 0.01` などを明示して試す。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
-    --tag sfnn-adamw-decay0 \
-    --optimizer-weight-decay 0.0
+    --tag sfnn-ranger-decay001 \
+    --optimizer-weight-decay 0.01
 ```
 
-これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、まず単独で ON/OFF 比較する。
+これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、単独で ON/OFF 比較する。
 
 ### Optimizer epsilon
 

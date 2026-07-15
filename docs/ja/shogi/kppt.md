@@ -126,7 +126,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
 | `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。LR は schedule 依存で、`step_gamma` は継続、`step` / `cos` は epoch 境界で warm restart | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step_gamma` = bullet-shogi 互換 StepLR、`step` = geometric、`cos` = cosine、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.001 / `step_gamma` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step_gamma` = tatara/bullet-shogi 互換 StepLR、`step` = geometric、`cos` = cosine、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step_gamma` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
@@ -147,7 +147,7 @@ KPPT は歴史的に以下の組み合わせが多い:
 - 強めの weight decay
 - 小さめの learning rate (`--lr 1e-4 〜 1e-3`)
 
-`bulletou` のデフォルトは純 eval (`--lambda 1.0`、`--lr 1e-3`) になっている。KPPT で実用品質を狙う場合は `--lambda` と学習率を上記の方針で調整する。
+`bulletou` のデフォルトは純 eval (`--lambda 1.0`) と tatara 寄せの `--lr 8.75e-4` になっている。KPPT で実用品質を狙う場合は `--lambda` と学習率を上記の方針で調整する。
 
 ## 関連
 

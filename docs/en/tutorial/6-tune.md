@@ -17,18 +17,18 @@ Main flags:
 | `--superbatches` | Number of superbatches per epoch. For `step` / `cos`, this is the LR cycle length. For `step_gamma`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
 | `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is the number of LR cycles. For `step_gamma`, StepLR continues across epochs. For `plateau`, this caps plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
-| `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
+| `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.000875 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `ranger` |
-| `--lr-schedule` | `step_gamma` (= bullet-shogi-compatible StepLR), `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step_gamma` |
+| `--lr-schedule` | `step_gamma` (= tatara/bullet-shogi-compatible StepLR), `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step_gamma` |
 | `--lr-min` | Floor LR. For `step_gamma` / `plateau`, this is the lower bound. For `step` / `cos`, this is reached at the end of each cycle | 0.00001 |
-| `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. bullet-shogi / nnue-pytorch default is `0.992` | 0.992 |
+| `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. tatara / bullet-shogi / nnue-pytorch default is `0.992` | 0.992 |
 | `--lr-step-positions` | Positions per `step_gamma` LR drop. If omitted, one superbatch is used | omitted |
 | `--lr-plateau-factor` | Factor multiplied into LR when the `plateau` monitor does not improve | 0.5 |
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
-| `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.01 |
+| `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
 | `--optimizer-epsilon` | Override epsilon for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
 | `--optimizer-beta1` | Override beta1 for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
 | `--optimizer-beta2` | Override beta2 for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
@@ -48,7 +48,7 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower it
 
 ### Learning-rate evolution
 
-The default `step_gamma` schedule is the StepLR-style schedule used by bullet-shogi's shogi examples. If `--lr-step-positions` is omitted, BulletOu applies `lr *= --lr-step-gamma` once per superbatch, floors at `--lr-min`, and does not warm-restart.
+The default `step_gamma` schedule is the StepLR-style schedule used by the tatara reference run and bullet-shogi's shogi examples. If `--lr-step-positions` is omitted, BulletOu applies `lr *= --lr-step-gamma` once per superbatch, floors at `--lr-min`, and does not warm-restart.
 
 If `step` or `cos` is selected explicitly, the schedule sweeps from `--lr` (lr_max) down to `--lr-min` over one epoch, then warm-restarts back to lr_max at the next epoch's start. They differ only in the curve shape:
 
@@ -86,9 +86,9 @@ The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_
 
 Inspect `<NNNN>/learn.log`'s `lr_start` / `lr_end` columns to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
 
-#### bullet-shogi / nnue-pytorch StepLR condition
+#### tatara / bullet-shogi / nnue-pytorch StepLR condition
 
-`--lr-schedule step_gamma` is the default StepLR-style scheduler matching bullet-shogi's shogi examples. It is different from BulletOu's existing `step`: it does not warm-restart and simply applies `lr *= gamma` every configured number of positions.
+`--lr-schedule step_gamma` is the default StepLR-style scheduler matching the tatara reference run and bullet-shogi's shogi examples. It is different from BulletOu's existing `step`: it does not warm-restart and simply applies `lr *= gamma` every configured number of positions.
 
 To spell out the default behaviour explicitly:
 
@@ -96,13 +96,14 @@ To spell out the default behaviour explicitly:
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --lr 0.000875 \
     --lr-schedule step_gamma \
     --lr-step-gamma 0.992 \
     --lr-min 0.00001 \
     --tag step-gamma-ablation
 ```
 
-If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. This corresponds to bullet-shogi's `StepLR { gamma=0.992, step=1 }`. For position-fixed comparison runs, you can pass `--lr-step-positions 100000000` explicitly.
+If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. This corresponds to tatara's `lr_step=1` and bullet-shogi's `StepLR { gamma=0.992, step=1 }`. For position-fixed comparison runs, you can pass `--lr-step-positions 100000000` explicitly.
 
 #### ReduceLROnPlateau
 
@@ -287,14 +288,14 @@ If `--optimizer-beta1`, `--optimizer-beta2`, or `--optimizer-epsilon` is omitted
 
 ### Optimizer Weight Decay
 
-BulletOu's default setting uses `--optimizer-weight-decay 0.01`. To move one step toward nodchip nnue-pytorch's optimizer condition while keeping the same optimizer, test only `--optimizer-weight-decay 0.0`.
+BulletOu's default setting uses `--optimizer-weight-decay 0.0`, matching the tatara SFNN-1536 reference run. To compare weight decay in isolation, keep the optimizer fixed and pass a non-zero value such as `--optimizer-weight-decay 0.01`.
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
-    --tag sfnn-adamw-decay0 \
-    --optimizer-weight-decay 0.0
+    --tag sfnn-ranger-decay001 \
+    --optimizer-weight-decay 0.01
 ```
 
 This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from `--nnue-pytorch-wrm-loss`.

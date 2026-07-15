@@ -1256,12 +1256,14 @@ struct Args {
     #[arg(long)]
     max_epochs: Option<usize>,
 
-    /// Initial optimizer learning rate.
-    #[arg(long, default_value = "0.001")]
+    /// Initial optimizer learning rate. Default follows the tatara
+    /// SFNN-1536 reference recipe.
+    #[arg(long, default_value = "0.000875")]
     lr: f32,
 
     /// Optimizer used for training. The default is `ranger`, matching
-    /// bullet-shogi's shogi examples. `ranger` is BulletOu's existing
+    /// the tatara reference recipe and bullet-shogi's shogi examples.
+    /// `ranger` is BulletOu's existing
     /// RAdam+Lookahead implementation; it is useful for ablation against
     /// nnue-pytorch's Ranger21, but is not a full Ranger21 clone.
     #[arg(long, value_enum, default_value = "ranger")]
@@ -1269,8 +1271,8 @@ struct Args {
 
     /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
     /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
-    /// epoch boundary. `step_gamma` applies nnue-pytorch-style fixed
-    /// gamma drops and does not warm-restart. `plateau` keeps LR fixed
+    /// epoch boundary. `step_gamma` applies tatara/bullet-shogi-style
+    /// fixed gamma drops and does not warm-restart. `plateau` keeps LR fixed
     /// during one superbatch, then reduces it when the validation monitor
     /// does not improve:
     ///
@@ -1283,8 +1285,8 @@ struct Args {
     ///   Slower descent at the start and end, fastest in the middle.
     /// - `step_gamma` (default) = `lr = max(lr_min, lr * gamma^n)` where n is
     ///   the number of completed `--lr-step-positions` intervals.
-    ///   This matches bullet-shogi's shogi examples when
-    ///   `--lr-step-positions` is omitted: one gamma drop per superbatch.
+    ///   This matches tatara's lr_step=1 and bullet-shogi's shogi examples
+    ///   when `--lr-step-positions` is omitted: one gamma drop per superbatch.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
     ///   `--lr-plateau-factor` and retry the same teacher interval.
@@ -1308,14 +1310,15 @@ struct Args {
     lr_min: f32,
 
     /// Multiplicative LR factor used by `--lr-schedule step_gamma`.
-    /// bullet-shogi / nnue-pytorch default `StepLR` uses gamma=0.992.
+    /// tatara / bullet-shogi / nnue-pytorch default `StepLR` uses gamma=0.992.
     #[arg(long, default_value = "0.992")]
     lr_step_gamma: f32,
 
     /// Position interval for one `step_gamma` decay. If omitted, one
     /// BulletOu superbatch is used (the effective `--positions-per-superbatch`,
     /// rounded down to a multiple of `--batch-size`).
-    /// Omit this to match bullet-shogi's `StepLR { gamma=0.992, step=1 }`.
+    /// Omit this to match tatara's lr_step=1 and bullet-shogi's
+    /// `StepLR { gamma=0.992, step=1 }`.
     /// Use `100000000` for position-fixed comparisons against
     /// nnue-pytorch's default 100M-position epoch.
     #[arg(long)]
@@ -1367,8 +1370,9 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_wrm_loss: bool,
 
-    /// Optimizer weight decay for the selected optimizer.
-    #[arg(long, default_value = "0.01")]
+    /// Optimizer weight decay for the selected optimizer. Default follows
+    /// the tatara SFNN-1536 reference recipe.
+    #[arg(long, default_value = "0.0")]
     optimizer_weight_decay: f32,
 
     /// Optimizer epsilon override for the selected optimizer. If omitted,
@@ -2389,7 +2393,7 @@ fn main() {
     if args.optimizer != OptimizerKind::Ranger {
         eprintln!("  optimizer = {}", args.optimizer.cli_name());
     }
-    if args.optimizer_weight_decay != 0.01 {
+    if args.optimizer_weight_decay != 0.0 {
         eprintln!("  optimizer weight decay = {}", args.optimizer_weight_decay);
     }
     if let Some(epsilon) = args.optimizer_epsilon {
@@ -6558,14 +6562,23 @@ mod tests {
     }
 
     #[test]
-    fn default_lr_schedule_matches_bullet_shogi_step_lr() {
+    fn default_lr_and_step_schedule_match_tatara_recipe() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap();
 
+        assert_eq!(args.lr, 0.000875);
         assert_eq!(args.lr_schedule, LrScheduleKind::StepGamma);
         assert_eq!(args.lr_step_gamma, 0.992);
         assert_eq!(args.lr_step_positions, None);
+        assert_eq!(args.optimizer_weight_decay, 0.0);
     }
 
     #[test]

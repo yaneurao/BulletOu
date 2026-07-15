@@ -93,24 +93,25 @@ optimizer 条件の上書きは `--optimizer-weight-decay` /
 `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` で行う。
 `epsilon` / `beta1` / `beta2` を省略した場合は、選択中 optimizer 自身の既定値を使う。
 そのため `ranger` の既定値は `bullet-shogi` と同じ `beta=(0.99,0.999)` で、
-AdamW の `beta=(0.9,0.999)` は混ざらない。標準設定は `weight_decay=0.01`、
-全 weight を一律 `[-1.98, 1.98]` に clip。
+AdamW の `beta=(0.9,0.999)` は混ざらない。標準設定は tatara の
+SFNN-1536 reference run に寄せて `weight_decay=0.0`、全 weight を一律
+`[-1.98, 1.98]` に clip。
 
 これは大きな差分。nnue-pytorch 互換性を比較する場合、最低限
-`weight_decay=0.0` の ablation を行い、その後 `--optimizer ranger`
-を試す。ただし Ranger21 そのものではないので、完全一致を期待しないこと。
+weight decay は既定で 0 になっているので、その後 `--optimizer ranger`
+や epsilon / beta の差を試す。ただし Ranger21 そのものではないので、完全一致を期待しないこと。
 
-現在の BulletOu デフォルトは `--lr-schedule step_gamma`。これは `bullet-shogi`
-の将棋用 example と同じ StepLR 系で、指定局面数ごとに
+現在の BulletOu デフォルトは `--lr-schedule step_gamma`。これは tatara reference
+run および `bullet-shogi` の将棋用 example と同じ StepLR 系で、指定局面数ごとに
 `lr *= --lr-step-gamma` し、warm restart しない。`--lr-step-positions` を
-省略した場合は 1 superbatch ごとに減衰するので、`bullet-shogi` の
-`StepLR { gamma=0.992, step=1 }` に対応する。
+省略した場合は 1 superbatch ごとに減衰するので、tatara の `lr_step=1` および
+`bullet-shogi` の `StepLR { gamma=0.992, step=1 }` に対応する。
 
 一方、BulletOu の `--lr-schedule step` は 1 epoch の中で `lr -> lr_min` へ
 滑らかに落として epoch 境界で warm restart する独自の geometric schedule であり、
 nnue-pytorch / bullet-shogi の StepLR とは別物。
 
-nnue-pytorch 既定に寄せる比較例:
+tatara / bullet-shogi の StepLR 条件を明示する比較例:
 
 ```text
 --lr 0.000875
@@ -242,9 +243,8 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - 有効時は学習 loss だけでなく `test_value_loss` / plateau 判定も WRM loss に切り替わる
 
 4. optimizer 条件を近づける
-   - まず同じ optimizer のまま `weight_decay=0.0`
-   - 実装済み: `--optimizer-weight-decay 0.0` で opt-in
-   - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
+   - `weight_decay=0.0` は tatara SFNN-1536 reference run に合わせて既定値
+   - 実測では非ゼロ weight decay が悪化する場合があるので、他の ablation と混ぜず単独で比較する
    - `eps=1e-7` は `--optimizer-epsilon 0.0000001` で単独比較する
    - `beta1` / `beta2` は `--optimizer-beta1` / `--optimizer-beta2` で単独比較する
      - 省略時は optimizer 固有の既定値。`ranger` は `0.99` / `0.999`
@@ -262,6 +262,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions
    - `step_gamma` は BulletOu のデフォルト。`step` / `cos` は warm restart 系なので区別する
+   - tatara reference に合わせて既定 LR は `0.000875`
    - 局面数で固定したい場合は `--lr-schedule step_gamma --lr-step-gamma 0.992 --lr-step-positions 100000000`
 
 ## 比較時の注意
