@@ -1016,7 +1016,7 @@ fn plateau_metrics_text(metrics: PlateauMetrics) -> String {
     format!("loss={:.6}, accuracy={:.6}", metrics.loss, metrics.accuracy)
 }
 
-fn plateau_epoch_should_stop(
+fn epoch_final_should_stop(
     previous_metrics: Option<PlateauMetrics>,
     current_metrics: PlateauMetrics,
     monitor: PlateauMonitor,
@@ -1231,6 +1231,9 @@ struct Args {
     /// After each epoch the dataloader is rebuilt from scratch. If omitted,
     /// `step` / `cos` default to 1 epoch, while `plateau` keeps running
     /// epochs until the epoch-final validation monitor no longer improves.
+    /// With `cos` and a readable `--test-teacher`, training also stops
+    /// before reaching this cap when an epoch-final validation run improves
+    /// neither loss nor accuracy versus the previous epoch.
     #[arg(long)]
     max_epochs: Option<usize>,
 
@@ -4589,12 +4592,31 @@ macro_rules! run_training_inline_nnue {
                 metrics.loss, metrics.accuracy
             );
         }
+        let mut previous_cos_epoch_final_metrics =
+            if matches!(args.lr_schedule, LrScheduleKind::Cos) && prev_run_completed_epoch {
+                read_latest_nnue_test_metrics_in_top_level_log(&cb_top_level_log)
+            } else {
+                None
+            };
+        if let Some(metrics) = previous_cos_epoch_final_metrics {
+            eprintln!(
+                "  cos: previous completed epoch final validation metrics = loss {:.6}, accuracy {:.6}",
+                metrics.loss, metrics.accuracy
+            );
+        }
+        if matches!(args.lr_schedule, LrScheduleKind::Cos) && max_epochs > 1 && test_cache.is_none() {
+            eprintln!(
+                "  note: --lr-schedule cos epoch-final early stop requires a readable --test-teacher; \
+                 validation metrics are unavailable, so max-epochs will be used."
+            );
+        }
         let mut last_epoch_for_fallback = 1usize;
         for epoch in 1..=max_epochs {
             last_epoch_for_fallback = epoch;
             print_epoch_banner(epoch, max_epochs);
             let mut stop_training_after_epoch = false;
             let mut plateau_epoch_final_metrics: Option<PlateauMetrics> = None;
+            let mut cos_epoch_final_metrics: Option<PlateauMetrics> = None;
             let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
                 Some(PlateauLrState::new(
                     args.lr,
@@ -4854,6 +4876,9 @@ macro_rules! run_training_inline_nnue {
                     let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
                     run_one_test_pass(cache, args, outputs)
                 });
+                if matches!(args.lr_schedule, LrScheduleKind::Cos) {
+                    cos_epoch_final_metrics = test_metrics.map(Into::into);
+                }
                 if args.dump_activation_stats {
                     if let Some(cache) = test_cache.as_ref() {
                         run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
@@ -5024,7 +5049,7 @@ macro_rules! run_training_inline_nnue {
                 chunk_start = chunk_end + 1;
             }
             if let Some(current_metrics) = plateau_epoch_final_metrics {
-                if plateau_epoch_should_stop(
+                if epoch_final_should_stop(
                     previous_plateau_epoch_final_metrics,
                     current_metrics,
                     args.lr_plateau_monitor,
@@ -5047,6 +5072,28 @@ macro_rules! run_training_inline_nnue {
                     "  plateau: epoch ended before epoch-final validation metrics were established; stopping unlimited run."
                 );
                 stop_training_after_epoch = true;
+            }
+            if matches!(args.lr_schedule, LrScheduleKind::Cos) {
+                if let Some(current_metrics) = cos_epoch_final_metrics {
+                    if epoch_final_should_stop(
+                        previous_cos_epoch_final_metrics,
+                        current_metrics,
+                        PlateauMonitor::LossOrAccuracy,
+                        0.0,
+                    ) {
+                        let previous_metrics = previous_cos_epoch_final_metrics.expect("checked by predicate");
+                        eprintln!(
+                            "  cos: epoch-final validation metrics did not improve from previous epoch \
+                             (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
+                            previous_metrics.loss,
+                            current_metrics.loss,
+                            previous_metrics.accuracy,
+                            current_metrics.accuracy
+                        );
+                        stop_training_after_epoch = true;
+                    }
+                    previous_cos_epoch_final_metrics = Some(current_metrics);
+                }
             }
             if stop_training_after_epoch {
                 break;
@@ -6698,14 +6745,20 @@ mod tests {
     }
 
     #[test]
-    fn plateau_epoch_stops_when_monitor_does_not_improve() {
-        assert!(!plateau_epoch_should_stop(None, pm(0.50), PlateauMonitor::Loss, 0.0));
-        assert!(!plateau_epoch_should_stop(Some(pm(0.50)), pm(0.49), PlateauMonitor::Loss, 0.0));
-        assert!(plateau_epoch_should_stop(Some(pm(0.50)), pm(0.50), PlateauMonitor::Loss, 0.0));
-        assert!(plateau_epoch_should_stop(Some(pm(0.50)), pm(0.51), PlateauMonitor::Loss, 0.0));
-        assert!(!plateau_epoch_should_stop(
+    fn epoch_final_stops_when_monitor_does_not_improve() {
+        assert!(!epoch_final_should_stop(None, pm(0.50), PlateauMonitor::Loss, 0.0));
+        assert!(!epoch_final_should_stop(Some(pm(0.50)), pm(0.49), PlateauMonitor::Loss, 0.0));
+        assert!(epoch_final_should_stop(Some(pm(0.50)), pm(0.50), PlateauMonitor::Loss, 0.0));
+        assert!(epoch_final_should_stop(Some(pm(0.50)), pm(0.51), PlateauMonitor::Loss, 0.0));
+        assert!(!epoch_final_should_stop(
             Some(pma(0.50, 0.55)),
             pma(0.60, 0.56),
+            PlateauMonitor::LossOrAccuracy,
+            0.0
+        ));
+        assert!(epoch_final_should_stop(
+            Some(pma(0.50, 0.55)),
+            pma(0.60, 0.55),
             PlateauMonitor::LossOrAccuracy,
             0.0
         ));
