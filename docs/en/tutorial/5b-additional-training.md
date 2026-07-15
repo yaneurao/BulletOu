@@ -19,13 +19,13 @@ Continued training works with the same auto-resume mechanism as §5: **same `--t
 .\bulletou.exe --teacher c:\shogi\teacher\... `
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 
 # Round 2: 3 more epochs
 .\bulletou.exe --teacher c:\shogi\teacher\... `
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 ```
 
 On the second invocation:
@@ -46,13 +46,13 @@ Total effective epochs trained: 3 + 3 = 6.
 |---|---|
 | `--batch-size` | state.bin is batch-size-independent; Adam state is per-parameter, portable. |
 | `--positions-per-superbatch` | Changes sb size. The effective value is rounded down to a multiple of `batch_size`. |
-| `--lr` (lr_max) | Each new epoch starts from the new lr_max. |
-| `--lr-min` | Each new epoch ends at the new lr_min. |
-| `--lr-schedule` (step ⇄ cos) | Only the curve shape changes. |
+| `--lr` | Start LR for `step_gamma`; lr_max for `step` / `cos`. |
+| `--lr-min` | LR floor. |
+| `--lr-schedule` (`step_gamma` / `step` / `cos` / `plateau`) | Changes the LR trajectory. The bullet-shogi-compatible default is `step_gamma`. |
 | `--max-epochs` | How many epochs in this invocation. |
-| `--superbatches` | Changes LR cycle length (= one epoch's positions). |
+| `--superbatches` | LR cycle length for `step` / `cos`; per-epoch processing cap for `step_gamma`. |
 | `--lambda` | Teacher-target blend. |
-| `--teacher` | Teacher-change detection triggers; dataloader reads new teacher from the start. LR restarts as a new cycle ([§5.5.4](#554-fine-tune-on-a-different-teacher)). |
+| `--teacher` | Teacher-change detection triggers; dataloader reads new teacher from the start. See the LR note in [§5.5.4](#554-fine-tune-on-a-different-teacher). |
 | `--test-teacher` | Validation set swap. |
 
 ### ❌ Don't change (model topology)
@@ -74,7 +74,7 @@ To change any of these, pass a different `--tag` and run as a separate experimen
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 ```
 
 ### `positions-per-superbatch` and `batch-size`
@@ -102,7 +102,7 @@ A common workflow: distill on a large weaker corpus, then fine-tune on a small s
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 
 # Fine-tune on strong teacher with a smaller LR
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
@@ -110,7 +110,7 @@ A common workflow: distill on a large weaker corpus, then fine-tune on a small s
     --tag distill `
     --max-epochs 2 --superbatches 4 `
     --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step
+    --lr-schedule step_gamma
 ```
 
 Teacher-change handling:
@@ -119,7 +119,7 @@ Teacher-change handling:
 - Resets `dataloader_pos.txt`.
 - Adjusts the displayed sb counter (`cb_ctx.sb_offset`) so the log row stays monotonic.
 
-LR starts a fresh cycle (= the new teacher's epoch 1) at `--lr` (lr_max).
+With `step_gamma`, changing the teacher does not warm-restart StepLR. If you want to raise LR again for fine-tuning, pass a new `--lr` explicitly, and use a different `--tag` when you want a separate run. Only explicit `step` / `cos` schedules start a fresh cycle (= the new teacher's epoch 1) at `--lr` (lr_max).
 
 ## 5.5.5 Cooling down with a smaller LR
 
@@ -130,13 +130,13 @@ After a near-converged run, a final polish at 1/10 the LR is a classic move:
 .\bulletou.exe --teacher ... --tag main `
     --max-epochs 3 --superbatches 6 `
     --lr 0.001 --lr-min 0.00001 `
-    --lr-schedule step ...
+    --lr-schedule step_gamma ...
 
 # Polish: 1 more epoch at 1/10 LR
 .\bulletou.exe --teacher ... --tag main `
     --max-epochs 1 --superbatches 6 `
     --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step ...
+    --lr-schedule step_gamma ...
 ```
 
 This is the textbook LR-annealing-for-fine-tuning pattern: small final step, no big swings.
@@ -147,8 +147,8 @@ Splitting 6 epochs into 2 × 3-epoch invocations is **functionally equivalent** 
 
 | Aspect | 2 invocations | 1 invocation |
 |---|---|---|
-| Total weight updates | Same (6 × lr_max → lr_min cycles) | Same |
-| LR cycles | Warm restart at each epoch | Same |
+| Total weight updates | Same | Same |
+| LR cycles | `step_gamma` does not warm-restart. `step` / `cos` warm-restart at each epoch. | Same |
 | CUDA JIT compile | Twice (once per invocation; the *first* invocation is the slow one) | Once |
 | Intermediate checkpoints | Same (per-sb save) | Same |
 | Interruption tolerance | Higher (each invocation is a clean unit) | One long process |

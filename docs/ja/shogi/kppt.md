@@ -56,7 +56,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
     --output checkpoints/my-kppt
 ```
 
-`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する (各 epoch 開始時に LR がリセットされる)。
+`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--max-epochs 3` のように指定する。デフォルトの `step_gamma` は LR を継続し、`step` / `cos` を明示した場合は epoch 境界で warm restart する。
 
 完了すると、各 save 単位で `0001/`, `0002/`, ... と 4 桁番号のディレクトリが並び、それぞれに 3 ファイルが入る:
 
@@ -124,9 +124,9 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--positions-per-superbatch` | 1 superbatch の目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
-| `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。各 epoch 開始時に LR スケジューラがリセットされる | 1 |
+| `--max-epochs` | 教師データを何周回すか (= dataloader EOF を何回踏むか)。LR は schedule 依存で、`step_gamma` は継続、`step` / `cos` は epoch 境界で warm restart | 1 |
 | `--save-rate` | N superbatch ごとに保存 | 1 |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = geometric / `cos` = cosine、1 epoch で `--lr` → `--lr-min` を warm restart 込みでスイープ、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.001 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step_gamma` = bullet-shogi 互換 StepLR、`step` = geometric、`cos` = cosine、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.001 / `step_gamma` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |

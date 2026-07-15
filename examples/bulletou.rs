@@ -1274,17 +1274,17 @@ struct Args {
     /// during one superbatch, then reduces it when the validation monitor
     /// does not improve:
     ///
-    /// - `step` (default) = geometric (= exponential in log space):
+    /// - `step` = geometric (= exponential in log space):
     ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
     ///   "fraction of one epoch completed". Constant multiplicative
     ///   decay per batch.
     /// - `cos` = cosine annealing (SGDR-style):
     ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
     ///   Slower descent at the start and end, fastest in the middle.
-    /// - `step_gamma` = `lr = max(lr_min, lr * gamma^n)` where n is
+    /// - `step_gamma` (default) = `lr = max(lr_min, lr * gamma^n)` where n is
     ///   the number of completed `--lr-step-positions` intervals.
-    ///   This is the scheduler ablation closest to nnue-pytorch
-    ///   `StepLR(gamma=0.992)`.
+    ///   This matches bullet-shogi's shogi examples when
+    ///   `--lr-step-positions` is omitted: one gamma drop per superbatch.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
     ///   `--lr-plateau-factor` and retry the same teacher interval.
@@ -1296,25 +1296,28 @@ struct Args {
     /// to the teacher's total position count, while HCPE3 / pack needs
     /// an explicit period. `step_gamma` uses `--lr-step-positions`
     /// instead, and `plateau` is validation-driven.
-    #[arg(long, value_enum, default_value = "step")]
+    #[arg(long, value_enum, default_value = "step_gamma")]
     lr_schedule: LrScheduleKind,
 
-    /// Floor LR. For `step` / `cos`, this is reached at the end of each
-    /// epoch before warm restart. For `plateau`, this is the final LR.
+    /// Floor LR. For `step_gamma` / `plateau`, this is the lower bound.
+    /// For `step` / `cos`, this is reached at the end of each epoch
+    /// before warm restart.
     /// Must be strictly positive for `step`, `step_gamma`, and `plateau`;
     /// cosine can use 0 but 1e-5 or 1e-6 is more typical.
     #[arg(long, default_value = "0.00001")]
     lr_min: f32,
 
     /// Multiplicative LR factor used by `--lr-schedule step_gamma`.
-    /// nnue-pytorch's default `StepLR` uses gamma=0.992.
+    /// bullet-shogi / nnue-pytorch default `StepLR` uses gamma=0.992.
     #[arg(long, default_value = "0.992")]
     lr_step_gamma: f32,
 
     /// Position interval for one `step_gamma` decay. If omitted, one
     /// BulletOu superbatch is used (the effective `--positions-per-superbatch`,
     /// rounded down to a multiple of `--batch-size`).
-    /// Use `100000000` to mirror nnue-pytorch's default 100M-position epoch.
+    /// Omit this to match bullet-shogi's `StepLR { gamma=0.992, step=1 }`.
+    /// Use `100000000` for position-fixed comparisons against
+    /// nnue-pytorch's default 100M-position epoch.
     #[arg(long)]
     lr_step_positions: Option<u64>,
 
@@ -6537,7 +6540,14 @@ mod tests {
     fn default_optimizer_matches_bullet_shogi_ranger_defaults() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
         let adamw = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
@@ -6545,6 +6555,17 @@ mod tests {
         assert_eq!(adamw.beta1, 0.9);
         assert_eq!(ranger.beta1, 0.99);
         assert_eq!(ranger.beta2, 0.999);
+    }
+
+    #[test]
+    fn default_lr_schedule_matches_bullet_shogi_step_lr() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(args.lr_schedule, LrScheduleKind::StepGamma);
+        assert_eq!(args.lr_step_gamma, 0.992);
+        assert_eq!(args.lr_step_positions, None);
     }
 
     #[test]

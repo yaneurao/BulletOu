@@ -14,14 +14,14 @@ Main flags:
 |---|---|---|
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
-| `--superbatches` | Number of superbatches per epoch. For `step` / `cos`, this is the LR cycle length. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
-| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is the number of LR cycles. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
+| `--superbatches` | Number of superbatches per epoch. For `step` / `cos`, this is the LR cycle length. For `step_gamma`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
+| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is the number of LR cycles. For `step_gamma`, StepLR continues across epochs. For `plateau`, this caps plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `ranger` |
-| `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), `step_gamma` (= nnue-pytorch StepLR comparison), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
-| `--lr-min` | Floor LR. For `step` / `cos`, this is reached at the end of each cycle. For `plateau`, this is the final LR | 0.00001 |
-| `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. nnue-pytorch's default is `0.992` | 0.992 |
+| `--lr-schedule` | `step_gamma` (= bullet-shogi-compatible StepLR), `step` (= geometric / log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step_gamma` |
+| `--lr-min` | Floor LR. For `step_gamma` / `plateau`, this is the lower bound. For `step` / `cos`, this is reached at the end of each cycle | 0.00001 |
+| `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. bullet-shogi / nnue-pytorch default is `0.992` | 0.992 |
 | `--lr-step-positions` | Positions per `step_gamma` LR drop. If omitted, one superbatch is used | omitted |
 | `--lr-plateau-factor` | Factor multiplied into LR when the `plateau` monitor does not improve | 0.5 |
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
@@ -48,11 +48,13 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower it
 
 ### Learning-rate evolution
 
-**Both** `step` and `cos` schedules sweep from `--lr` (lr_max) down to `--lr-min` over one epoch, then warm-restart back to lr_max at the next epoch's start. They differ only in the curve shape:
+The default `step_gamma` schedule is the StepLR-style schedule used by bullet-shogi's shogi examples. If `--lr-step-positions` is omitted, BulletOu applies `lr *= --lr-step-gamma` once per superbatch, floors at `--lr-min`, and does not warm-restart.
+
+If `step` or `cos` is selected explicitly, the schedule sweeps from `--lr` (lr_max) down to `--lr-min` over one epoch, then warm-restarts back to lr_max at the next epoch's start. They differ only in the curve shape:
 
 | schedule | formula | shape |
 |---|---|---|
-| `step` (default) | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | Log-linear — constant multiplicative drop per batch |
+| `step` | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | Log-linear — constant multiplicative drop per batch |
 | `cos` | `lr(t) = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(πt))` | Gentle at start/end, steepest in the middle |
 
 `t = (cumulative_positions mod period) / period`, `period = one epoch's positions` (auto-derived).
@@ -65,7 +67,7 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower it
 | Unlimited sb AND HCPE / PSV teacher | Total teacher position count (read from file sizes) |
 | Unlimited sb AND HCPE3 / pack teacher | Error — variable-length format, set `--superbatches` explicitly |
 
-When `--superbatches N` is set, an epoch is an LR/validation cycle, **not** one teacher pass. If the teacher reaches EOF in the middle of an epoch, BulletOu wraps to the teacher beginning and continues until N superbatches are complete. Conversely, epoch 2 does not rewind the teacher. It starts from the teacher position reached at the end of epoch 1. The teacher is a cyclic stream; only the LR schedule warm-restarts at the epoch boundary.
+When `--superbatches N` is set, an epoch is a validation / LR-control cycle, **not** one teacher pass. If the teacher reaches EOF in the middle of an epoch, BulletOu wraps to the teacher beginning and continues until N superbatches are complete. Conversely, epoch 2 does not rewind the teacher. It starts from the teacher position reached at the end of epoch 1. The teacher is a cyclic stream. LR behaviour is schedule-dependent: `step` / `cos` warm-restart at epoch boundaries, while `step_gamma` continues.
 
 Example with `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M positions):
 
@@ -84,25 +86,23 @@ The `step` schedule is **log-linear**: every batch multiplies lr by `(lr_min/lr_
 
 Inspect `<NNNN>/learn.log`'s `lr_start` / `lr_end` columns to verify the actual lr trajectory ([§7.2](7-result.md#72-reading-the-training-log-learnlog)). Note that bullet's stdout `LR dropped to X` only prints at sb boundaries — for per-batch changes look at the per-dir log.
 
-#### Matching nnue-pytorch's StepLR condition
+#### bullet-shogi / nnue-pytorch StepLR condition
 
-`--lr-schedule step_gamma` is an ablation scheduler for matching nodchip nnue-pytorch's `StepLR(gamma=0.992)`. It is different from BulletOu's existing `step`: it does not warm-restart and simply applies `lr *= gamma` every configured number of positions.
+`--lr-schedule step_gamma` is the default StepLR-style scheduler matching bullet-shogi's shogi examples. It is different from BulletOu's existing `step`: it does not warm-restart and simply applies `lr *= gamma` every configured number of positions.
 
-To match nnue-pytorch's default LR condition, make it explicit:
+To spell out the default behaviour explicitly:
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --lr 0.000875 \
     --lr-schedule step_gamma \
     --lr-step-gamma 0.992 \
-    --lr-step-positions 100000000 \
     --lr-min 0.00001 \
     --tag step-gamma-ablation
 ```
 
-If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. The default superbatch is close to 100M positions, but explicit `100000000` is easier to audit in comparison runs.
+If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. This corresponds to bullet-shogi's `StepLR { gamma=0.992, step=1 }`. For position-fixed comparison runs, you can pass `--lr-step-positions 100000000` explicitly.
 
 #### ReduceLROnPlateau
 
@@ -202,9 +202,9 @@ For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` 
 
 ### Multi-epoch training
 
-`--max-epochs N` runs at most N epochs. For `step` / `cos`, this means N LR cycles. If omitted, there is no fixed epoch cap for any schedule; with `--test-teacher`, training still stops when epoch-final loss and accuracy both fail to improve. Without `--test-teacher`, non-plateau schedules keep looping over epochs until interrupted.
+`--max-epochs N` runs at most N epochs. For `step` / `cos`, this means N LR cycles. For `step_gamma`, it means continuing StepLR across N epochs. If omitted, there is no fixed epoch cap for any schedule; with `--test-teacher`, training still stops when epoch-final loss and accuracy both fail to improve. Without `--test-teacher`, non-plateau schedules keep looping over epochs until interrupted.
 
-At each epoch boundary, the LR scheduler and displayed superbatch counter reset. With explicit `--superbatches`, the teacher position does **not** reset; the teacher stream continues and wraps only at EOF. Only the old unlimited non-plateau mode (`--superbatches` omitted) treats teacher EOF as epoch end and starts the next epoch from the teacher beginning.
+At each epoch boundary, the displayed superbatch counter resets. With explicit `--superbatches`, the teacher position does **not** reset; the teacher stream continues and wraps only at EOF. LR warm-restarts for `step` / `cos`, and continues by cumulative positions for `step_gamma`. Only the old unlimited non-plateau mode (`--superbatches` omitted) treats teacher EOF as epoch end and starts the next epoch from the teacher beginning.
 
 This is useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training) without repeatedly training on the same prefix of the teacher. For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup). When `--test-teacher` is set, every schedule compares epoch-final validation metrics with the previous epoch. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops even before `--max-epochs` is reached.
 

@@ -14,14 +14,14 @@
 |---|---|---|
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
-| `--superbatches` | 1 epoch を何 superbatch にするか。`step` / `cos` では LR cycle 長そのもの。`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
-| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
+| `--superbatches` | 1 epoch を何 superbatch にするか。`step` / `cos` では LR cycle 長そのもの。`step_gamma` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
+| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では LR cycle を最大何回繰り返すか、`step_gamma` では StepLR を継続したまま何 epoch 進めるか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
 | `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
-| `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`step_gamma` (= nnue-pytorch StepLR 比較用)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
-| `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
-| `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。nnue-pytorch 既定値は `0.992` | 0.992 |
+| `--lr-schedule` | `step_gamma` (= bullet-shogi 互換 StepLR)、`step` (= geometric/対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step_gamma` |
+| `--lr-min` | 最小 lr。`step_gamma` / `plateau` では下限、`step` / `cos` では cycle 末で到達する値 | 0.00001 |
+| `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。bullet-shogi / nnue-pytorch 既定値は `0.992` | 0.992 |
 | `--lr-step-positions` | `step_gamma` で何局面ごとに LR を落とすか。省略時は 1 superbatch | 省略 |
 | `--lr-plateau-factor` | `plateau` で監視指標が改善しなかったときに LR へ掛ける係数 | 0.5 |
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
@@ -48,11 +48,13 @@
 
 ### 学習率の動き
 
-`step` と `cos` の **両方** が、1 epoch をかけて `--lr` (lr_max) から `--lr-min` (lr_min) へ滑らかに減衰、epoch 境界で warm restart して lr_max に戻る形になります。違いは曲線の形だけ:
+デフォルトの `step_gamma` は、`bullet-shogi` の将棋用 example と同じ StepLR 系です。`--lr-step-positions` を省略すると、1 superbatch ごとに `lr *= --lr-step-gamma` し、`--lr-min` を下限としてそれ以上は下がりません。warm restart はしません。
+
+`step` と `cos` を明示した場合は、1 epoch をかけて `--lr` (lr_max) から `--lr-min` (lr_min) へ滑らかに減衰、epoch 境界で warm restart して lr_max に戻る形になります。違いは曲線の形だけ:
 
 | schedule | 式 | 形 |
 |---|---|---|
-| `step` (default) | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | 対数線形 — batch ごとに一定倍率で下がる |
+| `step` | `lr(t) = lr_max × (lr_min/lr_max)^t` (geometric) | 対数線形 — batch ごとに一定倍率で下がる |
 | `cos` | `lr(t) = lr_min + 0.5 × (lr_max − lr_min) × (1 + cos(πt))` | 先頭と末尾は緩やか、中盤で最も急 |
 
 `t = (累積局面 mod period) / period`、`period = 1 epoch ぶんの局面数` (= 自動算出)。
@@ -65,7 +67,7 @@
 | `--superbatches` 未指定 AND HCPE / PSV 教師 | 教師全体の局面数 (file size から自動計算) |
 | `--superbatches` 未指定 AND HCPE3 / pack 教師 | エラー (= 可変長レコードなので教師サイズ不明、明示が必要) |
 
-`--superbatches N` を指定した場合、**epoch は教師1周ではなく LR/validation の周期**になる。教師が epoch の途中で EOF した場合は、同じ epoch のまま教師先頭へ戻って N superbatch まで継続する。逆に、epoch 末になっても教師は先頭へ戻さない。次 epoch は、前 epoch の最後に読んだ教師位置の続きから始まる。つまり教師は cyclic stream として流れ続け、LR だけが epoch 境界で warm restart する。
+`--superbatches N` を指定した場合、**epoch は教師1周ではなく validation / LR 制御の周期**になる。教師が epoch の途中で EOF した場合は、同じ epoch のまま教師先頭へ戻って N superbatch まで継続する。逆に、epoch 末になっても教師は先頭へ戻さない。次 epoch は、前 epoch の最後に読んだ教師位置の続きから始まる。つまり教師は cyclic stream として流れ続ける。LR は schedule 依存で、`step` / `cos` は epoch 境界で warm restart し、`step_gamma` は継続する。
 
 たとえば `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M 局面) の lr 推移:
 
@@ -84,25 +86,23 @@ step は **対数線形**: 各 batch で `(lr_min/lr_max)^(1/batches_per_epoch)`
 
 実際の lr 推移は `<NNNN>/learn.log` の `lr_start` / `lr_end` 列で確認できる ([§7.2 学習ログの読み方](7-result.md#72-学習ログ-learnlog-の読み方))。**bullet stdout の `LR dropped to X` は sb 開始時のみ表示** されるので、batch ごとの変化を見たいときは per-dir log を見てください。
 
-#### nnue-pytorch の StepLR 条件に寄せる
+#### bullet-shogi / nnue-pytorch の StepLR 条件
 
-`--lr-schedule step_gamma` は、nodchip 版 nnue-pytorch の `StepLR(gamma=0.992)` に寄せるための比較用スケジューラです。既存の `step` とは別物で、warm restart せず、指定局面数ごとに `lr *= gamma` します。
+`--lr-schedule step_gamma` は、`bullet-shogi` の将棋用 example と同じ StepLR 系のデフォルトスケジューラです。既存の `step` とは別物で、warm restart せず、指定局面数ごとに `lr *= gamma` します。
 
-nnue-pytorch の既定条件に寄せるなら、次のように明示します:
+デフォルト挙動を明示するなら、次のように書けます:
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --lr 0.000875 \
     --lr-schedule step_gamma \
     --lr-step-gamma 0.992 \
-    --lr-step-positions 100000000 \
     --lr-min 0.00001 \
     --tag step-gamma-ablation
 ```
 
-`--lr-step-positions` を省略すると 1 superbatch ごとに LR を落とします。デフォルトの superbatch は約 1 億局面なので近い値になりますが、比較実験では `100000000` を明示するほうがログを読み違えません。
+`--lr-step-positions` を省略すると 1 superbatch ごとに LR を落とします。これは `bullet-shogi` の `StepLR { gamma=0.992, step=1 }` に対応します。局面数で固定したい比較実験では `--lr-step-positions 100000000` のように明示できます。
 
 #### ReduceLROnPlateau を使う
 
@@ -212,9 +212,9 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 
 ### 複数 epoch 回す
 
-`--max-epochs N` を指定すると epoch を最大 N 回実行する。`step` / `cos` では「LR cycle を N 回繰り返す」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。省略した場合は、どの schedule でも epoch 数の固定上限は置かない。`--test-teacher` があれば前 epoch より最終 validation 指標が改善しなくなるまで続ける。`--test-teacher` がなければ、非 plateau schedule は中断されるまで epoch を繰り返す。
+`--max-epochs N` を指定すると epoch を最大 N 回実行する。`step` / `cos` では「LR cycle を N 回繰り返す」の意味、`step_gamma` では StepLR を継続したまま N epoch 進める意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。省略した場合は、どの schedule でも epoch 数の固定上限は置かない。`--test-teacher` があれば前 epoch より最終 validation 指標が改善しなくなるまで続ける。`--test-teacher` がなければ、非 plateau schedule は中断されるまで epoch を繰り返す。
 
-各 epoch 開始時にリセットされるのは LR scheduler と superbatch 表示であり、`--superbatches` 指定時の教師位置はリセットされない。教師は cyclic stream として継続し、EOF した時点でだけ先頭へ戻る。`--superbatches` 未指定の非 plateau だけは従来通り「教師EOF = epoch終了」として扱われ、次 epoch は教師先頭から始まる。
+各 epoch 開始時にリセットされるのは superbatch 表示であり、`--superbatches` 指定時の教師位置はリセットされない。教師は cyclic stream として継続し、EOF した時点でだけ先頭へ戻る。LR は `step` / `cos` では epoch ごとに warm restart、`step_gamma` では累積局面数ベースで継続する。`--superbatches` 未指定の非 plateau だけは従来通り「教師EOF = epoch終了」として扱われ、次 epoch は教師先頭から始まる。
 
 各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。`--test-teacher` が指定されている場合、どの schedule でも epoch 末の validation 指標を前 epoch 末と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がらなければ、`--max-epochs` に到達していなくてもそこで停止する。`plateau` では `--superbatches` で cycle を揃える必要はない。
 

@@ -85,7 +85,7 @@ The default output dir is `checkpoints/KPPT/`. To get the factorised variant, sw
 
 ## 4.7 How long does training run
 
-Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). To run multiple passes, pass `--max-epochs N` — the LR scheduler restarts at the beginning of each epoch.
+Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). To run multiple passes, pass `--max-epochs N`. LR behaviour is schedule-dependent: default `step_gamma` continues, while `step` / `cos` warm-restart at epoch boundaries.
 
 If you know the teacher size you can pin "1 epoch = N sb" explicitly with `--superbatches N` (see [§6.1 Training schedule](6-tune.md#61-training-schedule)). The `--count-teacher` flag tells you the total position count instantly:
 

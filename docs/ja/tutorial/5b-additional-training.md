@@ -19,13 +19,13 @@
 .\bulletou.exe --teacher c:\shogi\teacher\... `
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 
 # 2 回目: 追加で 3 epoch
 .\bulletou.exe --teacher c:\shogi\teacher\... `
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 ```
 
 2 回目起動時:
@@ -48,11 +48,11 @@
 |---|---|
 | `--batch-size` | state.bin は batch_size 非依存。Adam moments も per-parameter なので互換 |
 | `--positions-per-superbatch` | 1 superbatch の局面数が変わる。実効値は `batch_size` の倍数へ切り捨て |
-| `--lr` (= lr_max) | 各 epoch が新 lr_max から始まる |
-| `--lr-min` | 各 epoch が新 lr_min に着地 |
-| `--lr-schedule` (step ⇄ cos) | curve 形だけ変わる |
+| `--lr` | `step_gamma` では StepLR の開始値、`step` / `cos` では lr_max |
+| `--lr-min` | LR の下限 |
+| `--lr-schedule` (`step_gamma` / `step` / `cos` / `plateau`) | LR の動きが変わる。bullet-shogi 寄せの既定値は `step_gamma` |
 | `--max-epochs` | この invocation の epoch 数 |
-| `--superbatches` | LR cycle 長 (= 1 epoch の局面数) が変わる |
+| `--superbatches` | `step` / `cos` では LR cycle 長、`step_gamma` では epoch 内の処理上限 |
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
 
@@ -80,7 +80,7 @@
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
     --resume `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 ```
 
 ### `positions-per-superbatch` と `batch-size`
@@ -108,7 +108,7 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
     --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+    --lr-schedule step_gamma --lr-min 0.00001
 
 # 小規模・高品質教師で fine-tune (= LR を小さめに)
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
@@ -117,7 +117,7 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
     --max-epochs 2 --superbatches 4 `
     --resume `
     --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step
+    --lr-schedule step_gamma
 ```
 
 教師変更時の挙動:
@@ -126,7 +126,7 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
 - `dataloader_pos.txt` をリセット
 - sb counter は連続表示するため `cb_ctx.sb_offset` を内部調整
 
-LR は新 cycle (= 新教師の epoch 1) として `lr_max` から開始します。
+`step_gamma` では、教師を変えても StepLR は warm restart しません。LR を上げ直したい fine-tune では、`--lr` を明示し、必要なら `--tag` を変えて別 run にしてください。`step` / `cos` を明示した場合だけ、新 cycle (= 新教師の epoch 1) として `lr_max` から開始します。
 
 ## 5.5.5 LR を小さくして微調整
 
@@ -137,14 +137,14 @@ LR は新 cycle (= 新教師の epoch 1) として `lr_max` から開始しま�
 .\bulletou.exe --teacher ... --tag main `
     --max-epochs 3 --superbatches 6 `
     --lr 0.001 --lr-min 0.00001 `
-    --lr-schedule step ...
+    --lr-schedule step_gamma ...
 
 # 仕上げ: 1 epoch だけ LR を 1 桁小さく
 .\bulletou.exe --teacher ... --tag main `
     --max-epochs 1 --superbatches 6 `
     --resume `
     --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step ...
+    --lr-schedule step_gamma ...
 ```
 
 これは "learning rate annealing for fine-tuning" の典型パターン。最後の 1 epoch で大きな揺れを起こさず微調整できます。
@@ -155,8 +155,8 @@ LR は新 cycle (= 新教師の epoch 1) として `lr_max` から開始しま�
 
 | 観点 | 2 invocation | 1 invocation |
 |---|---|---|
-| 重み更新の総量 | 同じ (各 epoch lr_max → lr_min × 6 回) | 同じ |
-| LR cycle | 各 epoch で warm restart | 同じ |
+| 重み更新の総量 | 同じ | 同じ |
+| LR cycle | `step_gamma` は warm restart なし。`step` / `cos` は各 epoch で warm restart | 同じ |
 | CUDA JIT compile | 2 回起動 = 2 回発生 (= 初回だけ重い) | 1 回 |
 | 中間 checkpoint | 同じ (= 各 sb で save) | 同じ |
 | 中断耐性 | 高い (= 1 invocation 終わるごとに完了) | 1 起動が長くなる |

@@ -100,11 +100,15 @@ AdamW の `beta=(0.9,0.999)` は混ざらない。標準設定は `weight_decay=
 `weight_decay=0.0` の ablation を行い、その後 `--optimizer ranger`
 を試す。ただし Ranger21 そのものではないので、完全一致を期待しないこと。
 
-scheduler 差分については、既存の BulletOu `--lr-schedule step` は
-1 epoch の中で `lr -> lr_min` へ滑らかに落として epoch 境界で warm restart する
-独自の geometric schedule であり、nnue-pytorch の `StepLR(gamma=0.992)` とは別物。
-比較用に `--lr-schedule step_gamma` を追加した。これは指定局面数ごとに
-`lr *= --lr-step-gamma` し、warm restart しない。
+現在の BulletOu デフォルトは `--lr-schedule step_gamma`。これは `bullet-shogi`
+の将棋用 example と同じ StepLR 系で、指定局面数ごとに
+`lr *= --lr-step-gamma` し、warm restart しない。`--lr-step-positions` を
+省略した場合は 1 superbatch ごとに減衰するので、`bullet-shogi` の
+`StepLR { gamma=0.992, step=1 }` に対応する。
+
+一方、BulletOu の `--lr-schedule step` は 1 epoch の中で `lr -> lr_min` へ
+滑らかに落として epoch 境界で warm restart する独自の geometric schedule であり、
+nnue-pytorch / bullet-shogi の StepLR とは別物。
 
 nnue-pytorch 既定に寄せる比較例:
 
@@ -257,8 +261,8 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions
-   - `StepLR(gamma=0.992)` と BulletOu 側 schedule を区別する
-   - 実装済み: `--lr-schedule step_gamma --lr-step-gamma 0.992 --lr-step-positions 100000000`
+   - `step_gamma` は BulletOu のデフォルト。`step` / `cos` は warm restart 系なので区別する
+   - 局面数で固定したい場合は `--lr-schedule step_gamma --lr-step-gamma 0.992 --lr-step-positions 100000000`
 
 ## 比較時の注意
 
