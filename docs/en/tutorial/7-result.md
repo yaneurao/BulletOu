@@ -48,11 +48,11 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,1048576,teachers/
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,1572864,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100532224,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100515840,teachers/
 ...
 ```
 
-Bullet writes **one row every 32 batches**. With the default `--batches-per-superbatch ≒ 6104`, that's about 191 rows per superbatch. Once `curr_batch` reaches `batches_per_superbatch` (default 6104), `superbatch` increments by 1 and `curr_batch` restarts from 1.
+Bullet writes **one row every 32 batches**. With the default `--positions-per-superbatch 100000000` and `--batch-size 16384`, the effective superbatch is 6103 batches (= 99,991,552 positions), so that's about 191 rows per superbatch. Once `curr_batch` reaches the final batch in the effective superbatch, `superbatch` increments by 1 and `curr_batch` restarts from 1.
 
 ### Column meanings
 
@@ -60,8 +60,8 @@ Bullet writes **one row every 32 batches**. With the default `--batches-per-supe
 |---|---|---|
 | `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
-| `superbatch` | within-epoch superbatch (1-indexed). +1 every `--batches-per-superbatch` (default 6104) batches | `1`, `2`, ... |
-| `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6104` |
+| `superbatch` | within-epoch superbatch (1-indexed). +1 every effective `--positions-per-superbatch` positions | `1`, `2`, ... |
+| `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6103` |
 | `test_value_accuracy` | Validation accuracy from `--test-teacher`. Filled only on sb-boundary rows; otherwise `-` | `0.583784` |
 | `test_value_loss` | Validation loss from `--test-teacher`. Filled only on sb-boundary rows; otherwise `-` | `0.129676` |
 | `train_value_loss` | bullet's per-32-batch averaged loss | `0.234` |
@@ -104,13 +104,13 @@ A healthy training run typically shows:
    - If it isn't moving as expected, double-check the LR flags ([§6.1 Training schedule](6-tune.md#61-training-schedule)).
 
 3. **`positions` is monotonically increasing** (within a run and across resumes)
-   - One completed superbatch ≒ 100M (= `--batches-per-superbatch × --batch-size`)
+   - One completed superbatch ≒ 100M (= `--positions-per-superbatch` rounded down to a multiple of `--batch-size`)
    - Cross-check against your teacher size to confirm "is all of the teacher being consumed?"
 
 4. **`superbatch` advances as expected**
    - With a teacher smaller than 100M positions, `superbatch` stays at 1 for the whole run (fallback save fires once at the end). That's by design.
-   - With a larger teacher, `superbatch` should increment every time `curr_batch` reaches 6104 (= `--batches-per-superbatch` default).
-   - If `superbatch` is stuck at 1 and `curr_batch` plateaus far below `batches_per_superbatch`, the dataloader may be cut short (e.g. the old HCPE polarity bug).
+   - With a larger teacher, `superbatch` should increment every time `curr_batch` reaches the final batch in the effective superbatch.
+   - If `superbatch` is stuck at 1 and `curr_batch` plateaus far below the final batch in the effective superbatch, the dataloader may be cut short (e.g. the old HCPE polarity bug).
 
 ### Quick plot
 

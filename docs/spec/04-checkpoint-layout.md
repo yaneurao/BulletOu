@@ -167,17 +167,17 @@ eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,524288,teachers/
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000999,0.000998,1.000000,1048576,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6104,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,100007936,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6103,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99991552,teachers/
 ```
 
-bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= `--batches-per-superbatch` ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
+bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
 
 ### top-level `<output>/summary-learn.log` (= 11 列、sb 境界のみ抽出)
 
 ```
 eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,100007936,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,200015872,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99991552,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199983104,teachers/
 ```
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
@@ -188,7 +188,7 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 |---|---|
 | `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` を付加。NNUE 系 (シングル component、`--arch` を使う) は `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように eval-type と arch を `-` で結合。KPPT 系 (`--arch` を使わない、3 component 連続学習) は `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` (または `KPP_KKPT/kk` 等) を行ごとに記録 |
 | `epoch` | この save の epoch 番号。継続学習を跨いで連続化される (= `LogContext.epoch_offset` 補正後の値)。1 始まり |
-| `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 される。**per-epoch カウンタ**で、cross-run 累積ではない。新 epoch ごとに 1 にリセット |
+| `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--positions-per-superbatch` の実効局面数ごとに +1 される。**per-epoch カウンタ**で、cross-run 累積ではない。新 epoch ごとに 1 にリセット |
 | `curr_batch` | (per-save 版のみ) 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
 | `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。sb 境界行のみ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
 | `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。sb 境界行のみ実値、それ以外は `-` |
@@ -196,12 +196,12 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 | `lr_start` | その行が表す区間の開始時点の学習率。summary 行ではその superbatch の開始 LR |
 | `lr_end` | その行が表す区間の最後の batch で使った学習率。summary 行ではその superbatch の終端側 LR |
 | `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |
-| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × batches_per_superbatch × batch_size` を書く。常に単調増加 |
+| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × 実効superbatch内batch数 × batch_size` を書く。常に単調増加 |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
 
 ### 累積ロジック
 
-- 1 run 内で各 component が消費する局面数: `positions = cb_prior_position + (local_superbatch − 1) × batches_per_superbatch × batch_size + curr_batch × batch_size`
+- 1 run 内で各 component が消費する局面数: `positions = cb_prior_position + (local_superbatch − 1) × 実効superbatch内batch数 × batch_size + curr_batch × batch_size`
 - `cb_prior_position` は run 開始時 + 各 epoch 境界で `read_prior_positions()` から再ロードされる (= component 別の最大 `positions`)
 - 各 save dir の `0NNN/learn.log` は「**その save 時点までの累積**」(bullet が log.txt を逐次更新するため)。最新番号 dir の `learn.log` を読めばその run の全貌が分かる
 - トップレベル `<output>/summary-learn.log` は各 save の callback で sb 境界行を 1 行ずつ追記する (新規作成時のみ 1 度ヘッダを書く)。ファイル内のヘッダは常に 1 行のみ

@@ -48,11 +48,11 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,1048576,teachers/
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,1572864,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100532224,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100515840,teachers/
 ...
 ```
 
-bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--batches-per-superbatch ≒ 6104` なら、1 superbatch あたり約 191 行。`curr_batch` 列が `batches_per_superbatch` (= 6104) に達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
+bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--positions-per-superbatch 100000000` かつ `--batch-size 16384` なら、実効値は 6103 batch (= 99,991,552 局面) で、1 superbatch あたり約 191 行。`curr_batch` 列が実効superbatch内の最終batchに達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
 
 ### 列の意味
 
@@ -60,8 +60,8 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 |---|---|---|
 | `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
-| `superbatch` | epoch 内 superbatch (1 始まり)。`--batches-per-superbatch` (デフォルト 6104) batch ごとに +1 | `1`, `2`, ... |
-| `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6104` |
+| `superbatch` | epoch 内 superbatch (1 始まり)。`--positions-per-superbatch` の実効局面数ごとに +1 | `1`, `2`, ... |
+| `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6103` |
 | `test_value_accuracy` | `--test-teacher` の検証 accuracy。sb 境界行だけ実値、それ以外は `-` | `0.583784` |
 | `test_value_loss` | `--test-teacher` の検証 loss。sb 境界行だけ実値、それ以外は `-` | `0.129676` |
 | `train_value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
@@ -104,13 +104,13 @@ CSV header 付きなので `pd.read_csv` で列名は自動取得される。
    - 期待通り変化していないなら lr 系フラグの値を見直す ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)
 
 3. **`positions` が単調増加** (run 内、resume 跨いでも)
-   - 1 superbatch 完了で約 1 億 (= `--batches-per-superbatch × --batch-size`)
+   - 1 superbatch 完了で約 1 億 (= `--positions-per-superbatch` を `--batch-size` の倍数へ切り捨てた値)
    - 教師サイズと照らし合わせると「ちゃんと教師を全部読めているか」が分かる
 
 4. **`superbatch` がきちんと進んでいるか**
    - 教師局面数が 1 億未満だと 1 周回しても `superbatch` は 1 のまま終わる (fallback save で 1 度だけ保存)。これは仕様
-   - 大きな教師なら `curr_batch` が 6104 (デフォルト `--batches-per-superbatch`) に到達するごとに `superbatch` が +1 されているはず
-   - `superbatch` がいつまでも 1 のままで `curr_batch` も小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
+   - 大きな教師なら `curr_batch` が実効superbatch内の最終batchに到達するごとに `superbatch` が +1 されているはず
+   - `superbatch` がいつまでも 1 のままで `curr_batch` も実効superbatch内の最終batchよりかなり小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
 
 ### 簡単なプロット
 

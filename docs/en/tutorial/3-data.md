@@ -66,7 +66,7 @@ Outputs are named like `shuffled-00001.hcpe`, `shuffled-00002.hcpe`, ... . For m
 
 ### Trying with a small subset first
 
-Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--batches-per-superbatch` so each superbatch consumes less data (see [§6.1 Training schedule](6-tune.md#61-training-schedule)).
+Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--positions-per-superbatch` so each superbatch consumes less data (see [§6.1 Training schedule](6-tune.md#61-training-schedule)).
 
 ---
 

@@ -1139,6 +1139,26 @@ fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u6
         .unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
 }
 
+const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
+
+fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
+    if args.batch_size == 0 {
+        return Err("--batch-size must be > 0.".to_string());
+    }
+    let batches = args.positions_per_superbatch / args.batch_size;
+    if batches == 0 {
+        return Err(format!(
+            "--positions-per-superbatch ({}) must be >= --batch-size ({}).",
+            args.positions_per_superbatch, args.batch_size
+        ));
+    }
+    Ok(batches)
+}
+
+fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
+    Ok(effective_batches_per_superbatch(args)?.saturating_mul(args.batch_size))
+}
+
 // ----- CLI ---------------------------------------------------------------
 
 #[derive(Parser, Debug, Clone)]
@@ -1195,10 +1215,11 @@ struct Args {
     #[arg(long, default_value = "16384")]
     batch_size: usize,
 
-    /// Number of mini-batches per superbatch. Default ≈ 100M positions per
-    /// superbatch (100_000_000 / batch_size).
-    #[arg(long)]
-    batches_per_superbatch: Option<usize>,
+    /// Target positions consumed per superbatch. The actual value is rounded
+    /// down to a multiple of `--batch-size` because the trainer advances in
+    /// whole mini-batches. Default = 100M positions.
+    #[arg(long, default_value_t = DEFAULT_POSITIONS_PER_SUPERBATCH)]
+    positions_per_superbatch: usize,
 
     /// Cap on the number of superbatches per epoch. If omitted, there is no
     /// cap (= run until the dataloader reaches EOF). Specify this to stop
@@ -1221,13 +1242,14 @@ struct Args {
     #[arg(long, conflicts_with = "resume")]
     no_resume: bool,
 
-    /// Number of epochs to train. With `step` / `cos`, one epoch is one
-    /// full pass through the teacher data (= dataloader EOF) unless
-    /// `--superbatches` caps it. With `plateau`, teacher EOF wraps back to
-    /// the beginning inside the same epoch; the epoch ends when LR reaches
-    /// `--lr-min` and the final min-LR retry has completed.
-    /// After each epoch the dataloader is rebuilt from scratch. If omitted,
-    /// all LR schedules keep running without a fixed epoch cap.
+    /// Number of epochs to train. With explicit `--superbatches N`, one
+    /// epoch is an LR/validation cycle of N superbatches; the teacher stream
+    /// continues across epoch boundaries and wraps only at EOF. Without
+    /// `--superbatches`, non-plateau schedules treat teacher EOF as the
+    /// epoch end. With `plateau`, teacher EOF wraps back to the beginning
+    /// inside the same epoch; the epoch ends when LR reaches `--lr-min` and
+    /// the final min-LR retry has completed. If omitted, all LR schedules
+    /// keep running without a fixed epoch cap.
     /// With a readable `--test-teacher`, training also stops before reaching
     /// this cap when an epoch-final validation run improves neither loss nor
     /// accuracy versus the previous epoch.
@@ -1289,7 +1311,8 @@ struct Args {
     lr_step_gamma: f32,
 
     /// Position interval for one `step_gamma` decay. If omitted, one
-    /// BulletOu superbatch is used (`batch_size * batches_per_superbatch`).
+    /// BulletOu superbatch is used (the effective `--positions-per-superbatch`,
+    /// rounded down to a multiple of `--batch-size`).
     /// Use `100000000` to mirror nnue-pytorch's default 100M-position epoch.
     #[arg(long)]
     lr_step_positions: Option<u64>,
@@ -1786,9 +1809,10 @@ where
 /// shared by both `step` and `cos` schedules.
 ///
 /// Semantics:
-/// - If `--superbatches N` is set, period = `N * batches_per_superbatch
-///   * batch_size`. This is the most common case: 1 cycle per epoch,
-///   with `lr_min` landing exactly at sb N's end.
+/// - If `--superbatches N` is set, period = `N * effective_sb_size`.
+///   `effective_sb_size` is `--positions-per-superbatch` rounded down to
+///   a multiple of `--batch-size`. This is the most common case: 1 cycle
+///   per epoch, with `lr_min` landing exactly at sb N's end.
 /// - Otherwise (= unlimited sb cap), fall back to the teacher's total
 ///   position count. For HCPE / PSV (fixed-length records) we just
 ///   read `file_size / record_size` per file. HCPE3 / pack (variable
@@ -1881,10 +1905,10 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         paths.len(),
     );
 
-    // Estimate sb count for default settings (batch_size=16384, sb≈100M).
+    // Estimate sb count for default settings (batch_size=16384, sb<=100M).
     let default_batch_size: u64 = 16384;
-    let default_sb_size: u64 = (100_000_000u64 / default_batch_size + 1) * default_batch_size;
-    // = ceil(100M / batch_size) * batch_size = 100,007,936 for batch_size=16384.
+    let default_sb_size: u64 = (DEFAULT_POSITIONS_PER_SUPERBATCH as u64 / default_batch_size) * default_batch_size;
+    // = floor(100M / batch_size) * batch_size = 99,991,552 for batch_size=16384.
     let full_sbs = total_positions / default_sb_size;
     let remainder = total_positions % default_sb_size;
     let partial_sb_fraction = remainder as f64 / default_sb_size as f64;
@@ -2208,6 +2232,10 @@ fn main() {
             }
         }
     }
+    if let Err(e) = effective_batches_per_superbatch(&args) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     if !(args.adamw_weight_decay.is_finite() && args.adamw_weight_decay >= 0.0) {
         eprintln!("error: --adamw-weight-decay must be finite and >= 0.");
         std::process::exit(2);
@@ -2438,20 +2466,19 @@ const RESUME_CONFIG_NAME: &str = "resume-config.txt";
 /// changing controls such as `--superbatches` or LR policy should require an
 /// explicit `--resume`.
 fn resume_signature(args: &Args) -> String {
-    let batches_per_superbatch =
-        args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+    let positions_per_superbatch = effective_positions_per_superbatch(args).unwrap_or(DEFAULT_POSITIONS_PER_SUPERBATCH);
     let arch = if args.eval_type().uses_arch() { args.arch().cli_name() } else { "-".to_string() };
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
 
     [
-        "schema=bulletou-resume-v1".to_string(),
+        "schema=bulletou-resume-v2".to_string(),
         format!("eval_type={}", args.eval_type().cli_name()),
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", args.batch_size),
-        format!("batches_per_superbatch={batches_per_superbatch}"),
+        format!("positions_per_superbatch={positions_per_superbatch}"),
         format!("superbatches={superbatches}"),
         format!("lr_schedule={}", args.lr_schedule.cli_name()),
         format!("optimizer={}", args.optimizer.cli_name()),
@@ -2723,11 +2750,12 @@ fn run_kppt_all(args: &Args) {
 ///   (or `KPP_KKPT/kk`, etc.).
 /// - `epoch`: 1-indexed epoch counter within this run (`--max-epochs`).
 /// - `superbatch`: 1-indexed superbatch within the current epoch.
-///   Increments every `--batches-per-superbatch` batches (default 6104).
+///   Increments every internal superbatch boundary
+///   (= `--positions-per-superbatch` rounded down to whole batches).
 /// - `curr_batch`: 1-indexed batch counter within the current superbatch
 ///   (= the `curr_batch` field bullet records every 32 batches: 32, 64,
 ///   96, ...). Combine with `superbatch` for "(superbatch − 1) ×
-///   batches_per_superbatch + curr_batch" to get the total batch count.
+///   effective_batches_per_superbatch + curr_batch" to get the total batch count.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
 /// - `lr_start`: learning rate at the start of the row's interval.
 /// - `lr_end`: learning rate used by the last batch in the row's interval.
@@ -2746,7 +2774,7 @@ const LEARN_LOG_HEADER: &str =
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
-/// (= `batches_per_superbatch` rounded down) and conveys no info.
+/// (= the effective superbatch boundary) and conveys no info.
 const SUMMARY_LEARN_LOG_HEADER: &str =
     "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
@@ -2824,8 +2852,10 @@ impl LogContext {
     /// enrich paths), pass 0; the lr column in enrich is only
     /// meaningful when we know what the trainer actually used.
     fn from_args(args: &Args, lr_period_override: u64) -> Self {
-        let batches_per_superbatch =
-            args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
         Self {
             eval_type: args.eval_type().cli_name(),
             arch: if args.eval_type().uses_arch() { args.arch().cli_name() } else { String::new() },
@@ -3502,8 +3532,10 @@ macro_rules! run_training_inline {
         let args: &Args = $args;
         let trainer = $trainer;
 
-        let batches_per_superbatch =
-            args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
 
         let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
             eprintln!("error: {e}");
@@ -4294,8 +4326,10 @@ macro_rules! run_training_inline_nnue {
         let args: &Args = $args;
         let trainer = $trainer;
 
-        let batches_per_superbatch =
-            args.batches_per_superbatch.unwrap_or_else(|| 100_000_000_usize.div_ceil(args.batch_size));
+        let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
 
         let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
             eprintln!("error: {e}");
@@ -6344,9 +6378,49 @@ mod tests {
 
         let sig_with = resume_signature(&with_superbatches);
         let sig_without = resume_signature(&without_superbatches);
+        assert!(sig_with.contains("schema=bulletou-resume-v2"));
+        assert!(sig_with.contains("positions_per_superbatch=99991552"));
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
+    }
+
+    #[test]
+    fn positions_per_superbatch_rounds_down_to_whole_batches() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--batch-size",
+            "16384",
+            "--positions-per-superbatch",
+            "10000000",
+        ])
+        .unwrap();
+
+        assert_eq!(effective_batches_per_superbatch(&args).unwrap(), 610);
+        assert_eq!(effective_positions_per_superbatch(&args).unwrap(), 9_994_240);
+    }
+
+    #[test]
+    fn batches_per_superbatch_cli_option_is_removed() {
+        use clap::Parser as _;
+
+        let parsed = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--batches-per-superbatch",
+            "5086",
+        ]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]

@@ -105,8 +105,8 @@ While it runs:
 Training Preamble
 Net Name               : shogi_nnue_halfkp
 Batch Size             : 16384
-Batches / Superbatch   : 6104
-Positions / Superbatch : 100007936
+Batches / Superbatch   : 6103
+Positions / Superbatch : 99991552
 ...
 superbatch 1   pos = ... pos/s = ...   loss = ...
 superbatch 2   ...

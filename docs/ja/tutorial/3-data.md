@@ -66,7 +66,7 @@ python /path/to/YaneuraOu-ScriptCollection/teacher/shuffle_split_teacher_externa
 
 ### 小さなサブセットで動作確認したい場合
 
-巨大なデータセット (数十 GB) でいきなり動かす前に、小さなサブセットで試したいときは、`gensfen` 等で小さめのファイルを生成するか、`--batches-per-superbatch` を指定して 1 superbatch あたりの消費量を絞る ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)。
+巨大なデータセット (数十 GB) でいきなり動かす前に、小さなサブセットで試したいときは、`gensfen` 等で小さめのファイルを生成するか、`--positions-per-superbatch` を指定して 1 superbatch あたりの消費量を絞る ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)。
 
 ---
 

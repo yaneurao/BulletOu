@@ -13,7 +13,7 @@ Main flags:
 | Flag | Meaning | Default |
 |---|---|---|
 | `--batch-size` | Positions per gradient step | 16384 |
-| `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
+| `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
 | `--superbatches` | Number of superbatches per epoch. For `step` / `cos`, this is the LR cycle length. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
 | `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is the number of LR cycles. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
@@ -44,7 +44,7 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
     --superbatches 40
 ```
 
-If your teacher file is smaller than one superbatch (< 100M positions), lower `--batches-per-superbatch` (e.g. `1024` ⇒ 1 superbatch ≒ 16.78M positions) so multiple saves fire.
+If your teacher file is smaller than one superbatch (< 100M positions), lower it with something like `--positions-per-superbatch 10000000` so multiple saves fire. The effective value is `floor(positions / batch_size) * batch_size`.
 
 ### Learning-rate evolution
 

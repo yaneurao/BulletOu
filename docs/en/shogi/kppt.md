@@ -122,7 +122,7 @@ Resume / restart behaviour is identical across every eval-type; see [tutorial 5.
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
 | `--batch-size` | Positions per gradient step | 16384 |
-| `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` |
+| `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |
 | `--max-epochs` | Number of epochs to run (= dataloader EOFs). LR scheduler restarts at the start of each epoch | 1 |
 | `--save-rate` | Save every N superbatches | 1 |

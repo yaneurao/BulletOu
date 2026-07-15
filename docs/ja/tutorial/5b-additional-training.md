@@ -47,7 +47,7 @@
 | フラグ | 注意点 |
 |---|---|
 | `--batch-size` | state.bin は batch_size 非依存。Adam moments も per-parameter なので互換 |
-| `--batches-per-superbatch` | 影響あるが load 時に新値で動く |
+| `--positions-per-superbatch` | 1 superbatch の局面数が変わる。実効値は `batch_size` の倍数へ切り捨て |
 | `--lr` (= lr_max) | 各 epoch が新 lr_max から始まる |
 | `--lr-min` | 各 epoch が新 lr_min に着地 |
 | `--lr-schedule` (step ⇄ cos) | curve 形だけ変わる |
@@ -83,14 +83,16 @@
     --lr-schedule step --lr-min 0.00001
 ```
 
-### sb_size は変わらない (= 偶然便利)
+### `positions-per-superbatch` と `batch-size`
 
-| batch_size | batches_per_sb (= ceil(100M / batch_size)) | sb_size |
+`--positions-per-superbatch` は目標局面数で、実際の `sb_size` は `floor(positions_per_superbatch / batch_size) * batch_size` になる。
+
+| batch_size | positions_per_superbatch | 実効 sb_size |
 |---|---|---|
-| 16384 | 6104 | 100,007,936 |
-| 32768 | 3052 | 100,007,936 ← **同じ** |
+| 16384 | 100,000,000 | 99,991,552 |
+| 32768 | 100,000,000 | 99,975,168 |
 
-なので `--superbatches 6` は両方とも **1 epoch ≒ 600M 局面**。LR cycle 長も同じ。連続性が保たれます。
+`--batch-size` を変えると切り捨て後の実効 sb_size は少し変わる。完全に同じ LR cycle 長へ揃えたい場合は、`--positions-per-superbatch` も明示して調整する。
 
 ### Adam moments の意味の差
 

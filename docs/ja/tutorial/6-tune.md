@@ -13,7 +13,7 @@
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
-| `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
+| `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`step` / `cos` では LR cycle 長そのもの。`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
@@ -44,7 +44,7 @@
     --superbatches 40
 ```
 
-教師ファイルが 1 superbatch 未満 (≒ 1 億局面未満) しか無い場合は `--batches-per-superbatch` を小さくする (例: `1024` で 1 superbatch ≒ 1670 万局面) と、何回も save が走るようになる。
+教師ファイルが 1 superbatch 未満 (≒ 1 億局面未満) しか無い場合は `--positions-per-superbatch 10000000` のように小さくすると、何回も save が走るようになる。実効値は `floor(positions / batch_size) * batch_size` に丸められる。
 
 ### 学習率の動き
 
@@ -122,7 +122,7 @@ nnue-pytorch の既定条件に寄せるなら、次のように明示します:
 
 `plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 validation 指標を前 epoch の最終指標と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がっていなければそこで学習を停止する。`--lr-plateau-monitor` と `--lr-plateau-min-delta` は epoch 内の superbatch 採用判定だけに効き、epoch 間の停止判定は常に tolerance なしの loss-or-accuracy 改善で見る。
 
-`plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
+`plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--positions-per-superbatch` で決める。
 
 監視指標が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
 

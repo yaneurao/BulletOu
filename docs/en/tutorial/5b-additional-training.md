@@ -45,7 +45,7 @@ Total effective epochs trained: 3 + 3 = 6.
 | Flag | Notes |
 |---|---|
 | `--batch-size` | state.bin is batch-size-independent; Adam state is per-parameter, portable. |
-| `--batches-per-superbatch` | Affects sb size; resume picks up with the new value. |
+| `--positions-per-superbatch` | Changes sb size. The effective value is rounded down to a multiple of `batch_size`. |
 | `--lr` (lr_max) | Each new epoch starts from the new lr_max. |
 | `--lr-min` | Each new epoch ends at the new lr_min. |
 | `--lr-schedule` (step ⇄ cos) | Only the curve shape changes. |
@@ -77,14 +77,16 @@ To change any of these, pass a different `--tag` and run as a separate experimen
     --lr-schedule step --lr-min 0.00001
 ```
 
-### sb_size stays the same (= a convenient coincidence)
+### `positions-per-superbatch` and `batch-size`
 
-| batch_size | batches_per_sb (= ceil(100M / batch_size)) | sb_size |
+`--positions-per-superbatch` is the target position count. The effective `sb_size` is `floor(positions_per_superbatch / batch_size) * batch_size`.
+
+| batch_size | positions_per_superbatch | effective sb_size |
 |---|---|---|
-| 16384 | 6104 | 100,007,936 |
-| 32768 | 3052 | 100,007,936 ← **same** |
+| 16384 | 100,000,000 | 99,991,552 |
+| 32768 | 100,000,000 | 99,975,168 |
 
-So `--superbatches 6` means 1 epoch ≒ 600M positions in both cases. LR cycle length is unchanged, so the schedule stays continuous.
+Changing `--batch-size` can slightly change the rounded effective sb_size. If you need an exactly matched LR cycle length, set `--positions-per-superbatch` explicitly as well.
 
 ### Adam moments are slightly out of sync
 
