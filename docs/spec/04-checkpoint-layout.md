@@ -29,7 +29,7 @@ resume 時は **既存番号の続きから連番**。例えば前回 `0005/` �
 
 `learn.log` (各 save 配下) は **その save 時点までの loss 履歴 snapshot**。同一 run 内では cumulative。run を跨ぐ (resume する) と loss snapshot はその run 単位で start し直す。
 
-`dataloader_pos.txt` は HCPE / HCPE3 / pack の byte offset 再開用。各 save の callback で「consumer がここまで処理した」位置を `<byte_offset>,<plies_within_unit>` 形式 1 行で書く (固定長 HCPE / PSV では plies は常に 0)。auto-resume は最新 dir のこのファイルを読み、bullet の dataloader を該当 offset から再開させる (= 同教師継続再開時)。教師が変わった場合 / 完走後継続学習の場合は無視して頭から読む。
+`dataloader_pos.txt` は HCPE / HCPE3 / pack の byte offset 再開用。各 save の callback で「consumer がここまで処理した」位置を `<byte_offset>,<plies_within_unit>` 形式 1 行で書く (固定長 HCPE / PSV では plies は常に 0)。auto-resume は最新 dir のこのファイルを読み、bullet の dataloader を該当 offset から再開させる (= 同教師継続再開時)。教師が変わった場合は無視して新教師の先頭から読む。`--superbatches N` 指定時の完走後継続学習では、これを使って教師位置も継続する。
 
 ## eval-type 別の per-save ファイル
 
@@ -128,11 +128,15 @@ record を必要なだけ連結したものが `state.bin`。
 | ケース | 検出条件 | bullet `start_sb` | dataloader offset | log 表示 |
 |---|---|---|---|---|
 | **mid-epoch resume** | 教師同じ & 前回 last_sb < `--superbatches` | `last_sb + 1` | `dataloader_pos.txt` から | sb 列 = `last_sb+1..N` で再開、次 epoch 以降 sb=1..N |
-| **clean continuation** | 教師同じ & 前回 last_sb >= `--superbatches` (= 完走後の追加学習) | `1` | `0` (= 頭から) | sb 列 = 1..N (= 新 epoch の自然なカウント) |
+| **clean continuation** | 教師同じ & 前回 last_sb >= `--superbatches` (= 完走後の追加学習) | `1` | `dataloader_pos.txt` から | sb 列 = 1..N (= 新 epoch の自然なカウント) |
 | **teacher-changed** | 教師パス変更 (= `summary-learn.log` 最終行と現 `--teacher` 不一致) | `1` | `0` | sb 列 = 1..N |
 | **fresh first run** | numbered dir 無し | `1` | `0` | sb 列 = 1..N |
 
-各 epoch の chunk loop 開始時、bullet `start_sb` は **epoch 1 のみ** 上記の値、**epoch 2 以降は常に 1** にリセットされる (= 新 epoch は教師頭から sb=1..N で走る)。
+`--superbatches N` を明示した run では、epoch は教師1周ではなく LR/validation cycle である。そのため clean continuation でも教師位置は `dataloader_pos.txt` から継続し、epoch 境界で教師先頭へは戻さない。教師EOFに到達した場合だけ、同じ epoch のまま教師先頭へ cyclic に戻る。
+
+`--superbatches` 未指定の非 plateau run だけは、従来通り「教師EOF = epoch終了」として扱う。このモードで次 epoch を開始する場合は、教師先頭から読む。
+
+各 epoch の chunk loop 開始時、bullet `start_sb` は **epoch 1 のみ** 上記の値、**epoch 2 以降は常に 1** にリセットされる。これは表示上の sb と LR/validation cycle のリセットであり、`--superbatches N` 指定時の教師位置リセットではない。
 
 ### epoch カウンタの cross-run 連続化
 

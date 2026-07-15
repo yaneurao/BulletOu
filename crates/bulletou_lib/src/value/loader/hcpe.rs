@@ -90,6 +90,10 @@ pub struct HcpeDataLoader<T: Fn(&PackedSfenValue) -> bool> {
     /// HCP → PSV デコードに使う worker スレッド数。`None` のとき
     /// `std::thread::available_parallelism()` (= 論理コア数) で自動決定。
     loader_threads: Option<usize>,
+    /// true のときは corpus を 1 周したら EOF として停止する。
+    /// false のときは corpus 末尾から先頭へ戻り、呼び出し側が止めるまで
+    /// 連続ストリームとして供給する。
+    single_epoch: bool,
     /// 再開時の seek 位置 (= 全ファイル連結ストリームの先頭からの byte
     /// offset)。`with_resume_offset` で外部から指定する。0 のときは
     /// `map_chunks` の `start_position` 引数 × `HCPE_RECORD_SIZE` を
@@ -151,6 +155,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
             buffer_size: buffer_size_mb.saturating_mul(1024 * 1024) / 40,
             filter,
             loader_threads: None,
+            single_epoch: true,
             resume_offset: 0,
             resume_offset_explicit: false,
             consumed_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -162,6 +167,16 @@ impl<T: Fn(&PackedSfenValue) -> bool> HcpeDataLoader<T> {
     /// 渡すと auto detection (= `available_parallelism()`) のまま。
     pub fn with_loader_threads(mut self, n: usize) -> Self {
         self.loader_threads = if n == 0 { None } else { Some(n) };
+        self
+    }
+
+    /// 1 周読み終わったら停止するかを指定する。
+    ///
+    /// `false` にすると、EOF 到達後に先頭へ戻る cyclic teacher stream になる。
+    /// `--superbatches N` で epoch 長を明示した学習では、epoch 境界と教師
+    /// 1 周の境界を独立させるため、このモードを使う。
+    pub fn with_single_epoch(mut self, enabled: bool) -> Self {
+        self.single_epoch = enabled;
         self
     }
 
@@ -255,6 +270,7 @@ where
                 let file_paths = self.file_paths.clone();
                 let filter = self.filter.clone();
                 let loader_threads = self.loader_threads;
+                let single_epoch = self.single_epoch;
                 let resume_offset = if self.resume_offset_explicit || self.resume_offset > 0 {
                     self.resume_offset
                 } else {
@@ -270,6 +286,7 @@ where
                         filter,
                         resume_offset,
                         loader_threads,
+                        single_epoch,
                         stop_flag_for_producer,
                         tx,
                     );
@@ -314,6 +331,7 @@ where
         filter: T,
         resume_offset: u64,
         loader_threads: Option<usize>,
+        single_epoch: bool,
         stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64)>,
     ) {
@@ -332,25 +350,47 @@ where
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
-        // Resume support: `resume_offset` byte だけ全ファイル連結ストリーム
-        // を先に進めてから読み始める。固定長レコード前提ではなく、単に
-        // 「前回ここまで処理した」を表す byte offset。次の seek 量を
-        // 残しながらファイルを順に walk して、該当するファイルにきたら
-        // `seek(SeekFrom::Start(...))` する。
-        let mut bytes_to_skip = resume_offset;
-        if bytes_to_skip > 0 {
+        if resume_offset > 0 {
             eprintln!(
                 "  resuming from byte offset {} ({:.2} GB)...",
-                bytes_to_skip,
-                bytes_to_skip as f64 / (1024.0 * 1024.0 * 1024.0),
+                resume_offset,
+                resume_offset as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
-        // 「読み終わって send したぶんを含めた、ストリーム先頭からの
-        // 累積 byte 数」。バッファ送出時に同梱して、Consumer 側で
-        // `consumed_offset` に書き込まれる。次回起動時はこの offset を
-        // `with_resume_offset` で渡せば、Producer の先読みぶんも含めて
-        // 「Consumer が処理し終わった点」から再開できる。
-        let mut bytes_read_total: u64 = resume_offset;
+
+        let total_bytes: u64 = file_paths
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+            .sum();
+        if total_bytes == 0 {
+            return;
+        }
+
+        let mut first_sweep = true;
+        let mut consecutive_empty_sweeps = 0usize;
+        let mut latest_offset_for_flush = resume_offset.min(total_bytes);
+        const MAX_EMPTY_SWEEPS: usize = 2;
+
+        'sweeps: loop {
+            if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+
+            // Resume support: 初回 sweep だけ `resume_offset` byte だけ全ファイル
+            // 連結ストリームを先に進めてから読み始める。2周目以降は先頭から。
+            let mut bytes_to_skip = if first_sweep { resume_offset } else { 0 };
+            if bytes_to_skip >= total_bytes {
+                if single_epoch {
+                    break 'sweeps;
+                }
+                first_sweep = false;
+                continue 'sweeps;
+            }
+
+            // 「読み終わって send したぶんを含めた、corpus 先頭からの byte
+            // offset」。cyclic mode では sweep ごとに 0 から数え直す。
+            let mut bytes_read_total: u64 = bytes_to_skip;
+            let mut accepted_in_sweep = 0usize;
 
         for path in &file_paths {
             // この path の全体サイズ。`bytes_to_skip` がこれより大きければ
@@ -409,6 +449,7 @@ where
                 // Consumer 側が「この buffer まで処理完了 = ここまで読まれた」
                 // を知れる。
                 bytes_read_total += (records_in_chunk * HCPE_RECORD_SIZE) as u64;
+                latest_offset_for_flush = bytes_read_total;
 
                 // この chunk を n_workers で均等に分割して並列デコード。
                 // 各 worker は自分のスライスをデコード → 返す Vec<PSV> を
@@ -458,6 +499,7 @@ where
                 // skip 判定不要。
                 for partial in decoded {
                     for psv in partial {
+                        accepted_in_sweep += 1;
                         buffer.push(psv);
 
                         if first_fill_in_progress {
@@ -508,8 +550,27 @@ where
             }
         }
 
-        // 残った buffer を flush
-        if !buffer.is_empty() {
+            if accepted_in_sweep == 0 {
+                consecutive_empty_sweeps += 1;
+                if consecutive_empty_sweeps >= MAX_EMPTY_SWEEPS {
+                    panic!(
+                        "HcpeDataLoader: filter accepted 0 positions in {MAX_EMPTY_SWEEPS} consecutive sweeps. \
+                         Filter is too restrictive or the HCPE corpus contains no usable data.",
+                    );
+                }
+            } else {
+                consecutive_empty_sweeps = 0;
+            }
+
+            first_sweep = false;
+            if single_epoch {
+                break 'sweeps;
+            }
+        }
+
+        // 残った buffer を flush。cyclic mode では EOF で flush せず、
+        // 呼び出し側が止めるまで次 sweep の局面で buffer を満たす。
+        if single_epoch && !buffer.is_empty() {
             if first_fill_in_progress {
                 let elapsed = fill_started_at.elapsed();
                 let _ = writeln!(
@@ -519,7 +580,7 @@ where
                     elapsed.as_secs_f64(),
                 );
             }
-            let _ = tx.send((buffer, bytes_read_total));
+            let _ = tx.send((buffer, latest_offset_for_flush));
         }
     }
 }

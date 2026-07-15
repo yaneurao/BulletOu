@@ -96,7 +96,7 @@ KPPT 系では `--arch` 不要 (architecture は固定):
 # → "Total: 461373440 positions, suggested --superbatches 4"
 ```
 
-cosine annealing (`--lr-schedule cos`) を使うときは特に重要 — 1 cycle が 1 epoch とぴったり合うように `--superbatches` を選ぶと、各 epoch 末で lr_min に着地、次 epoch 頭で lr_max に warm restart、というきれいなサイクルになる。
+cosine annealing (`--lr-schedule cos`) を使うときは特に重要 — 1 cycle が 1 epoch とぴったり合うように `--superbatches` を選ぶと、各 epoch 末で lr_min に着地、次 epoch 頭で lr_max に warm restart、というきれいなサイクルになる。この場合、教師データ自体は epoch 境界で先頭へ戻らない。教師EOFに到達したときだけ先頭へ戻る cyclic stream として扱われる。
 
 ## 4.8 期待される出力
 

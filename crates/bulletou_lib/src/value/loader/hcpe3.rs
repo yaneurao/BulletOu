@@ -199,6 +199,10 @@ pub struct Hcpe3DataLoader<T: Fn(&PackedSfenValue) -> bool> {
     file_paths: Vec<String>,
     buffer_size: usize,
     filter: T,
+    /// true のときは corpus を 1 周したら EOF として停止する。
+    /// false のときは corpus 末尾から先頭へ戻り、呼び出し側が止めるまで
+    /// 連続ストリームとして供給する。
+    single_epoch: bool,
     /// 連結ファイル列の先頭からの累積 byte 数で、ここに居る game header から
     /// 再開する。0 のとき先頭から。
     resume_offset: u64,
@@ -228,6 +232,7 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
             file_paths: paths.iter().map(|x| (*x).to_string()).collect(),
             buffer_size: buffer_size_mb.saturating_mul(1024 * 1024) / 40,
             filter,
+            single_epoch: true,
             resume_offset: 0,
             resume_offset_explicit: false,
             resume_plies: 0,
@@ -244,6 +249,16 @@ impl<T: Fn(&PackedSfenValue) -> bool> Hcpe3DataLoader<T> {
     /// escape hatch。
     pub fn with_buffer_records(mut self, records: usize) -> Self {
         self.buffer_size = records.max(1);
+        self
+    }
+
+    /// 1 周読み終わったら停止するかを指定する。
+    ///
+    /// `false` にすると、EOF 到達後に先頭へ戻る cyclic teacher stream になる。
+    /// `--superbatches N` で epoch 長を明示した学習では、epoch 境界と教師
+    /// 1 周の境界を独立させるため、このモードを使う。
+    pub fn with_single_epoch(mut self, enabled: bool) -> Self {
+        self.single_epoch = enabled;
         self
     }
 
@@ -303,6 +318,7 @@ where
         let buffer_size = self.buffer_size.max(1);
         let file_paths = self.file_paths.clone();
         let filter = self.filter.clone();
+        let single_epoch = self.single_epoch;
         let resume_offset = self.resume_offset;
         let resume_offset_explicit = self.resume_offset_explicit;
         let resume_plies = self.resume_plies;
@@ -320,6 +336,7 @@ where
                 resume_offset,
                 resume_offset_explicit,
                 resume_plies,
+                single_epoch,
                 start_position,
                 tx,
             );
@@ -353,6 +370,7 @@ where
         resume_offset: u64,
         resume_offset_explicit: bool,
         resume_plies: usize,
+        single_epoch: bool,
         start_position: usize,
         tx: std::sync::mpsc::SyncSender<(Vec<PackedSfenValue>, u64, usize)>,
     ) {
@@ -362,37 +380,57 @@ where
         let mut skipped = 0usize;
         let legacy_skip_mode = !resume_offset_explicit && resume_offset == 0 && resume_plies == 0;
 
-        // `resume_offset` を含むファイルを線形に探す。
-        let mut cumulative_size: u64 = 0;
-        let mut first_file_idx: usize = file_paths.len();
-        let mut in_file_seek: u64 = 0;
-        if resume_offset > 0 {
-            for (idx, path) in file_paths.iter().enumerate() {
-                let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                if cumulative_size + file_size > resume_offset {
-                    first_file_idx = idx;
-                    in_file_seek = resume_offset - cumulative_size;
-                    break;
-                }
-                cumulative_size += file_size;
-            }
-            if first_file_idx >= file_paths.len() {
-                // resume_offset がすべてのファイルサイズの合計を超えている → 何もしない
-                return;
-            }
-        } else {
-            first_file_idx = 0;
-        }
-
         // `next_after_push` = 直近 push した PSV の次の resume 位置。
         // 各 push 後に (game_header_offset, ply+1) で更新する。Buffer send
         // 時にこのペアを attach する。初期値は呼び出し時点の resume 位置。
         let mut next_after_push: (u64, usize) = (resume_offset, resume_plies);
 
-        // `current_global_offset` = 連結ファイル列の先頭からの現在の読み込み
-        // 累積 byte 数。各 read で進める。
-        let mut current_global_offset: u64 = if resume_offset > 0 { resume_offset } else { 0 };
-        let mut first_game_for_this_resume = true;
+        let total_bytes: u64 = file_paths
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+            .sum();
+        if total_bytes == 0 {
+            return;
+        }
+        let mut first_sweep = true;
+        let mut consecutive_empty_sweeps = 0usize;
+        const MAX_EMPTY_SWEEPS: usize = 2;
+
+        'sweeps: loop {
+            // `resume_offset` を含むファイルを線形に探す。初回 sweep だけ
+            // resume を適用し、2周目以降は corpus 先頭から読む。
+            let mut cumulative_size: u64 = 0;
+            let mut first_file_idx: usize = 0;
+            let mut in_file_seek: u64 = 0;
+            if first_sweep && resume_offset > 0 {
+                first_file_idx = file_paths.len();
+                for (idx, path) in file_paths.iter().enumerate() {
+                    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    if cumulative_size + file_size > resume_offset {
+                        first_file_idx = idx;
+                        in_file_seek = resume_offset - cumulative_size;
+                        break;
+                    }
+                    cumulative_size += file_size;
+                }
+                if first_file_idx >= file_paths.len() {
+                    if single_epoch {
+                        return;
+                    }
+                    first_sweep = false;
+                    continue 'sweeps;
+                }
+            }
+
+            // `current_global_offset` = 連結ファイル列の先頭からの現在の読み込み
+            // 累積 byte 数。cyclic mode では sweep ごとに 0 から数え直す。
+            let mut current_global_offset: u64 = if first_sweep && resume_offset > 0 {
+                resume_offset
+            } else {
+                0
+            };
+            let mut first_game_for_this_resume = first_sweep;
+            let mut accepted_in_sweep = 0usize;
 
         'files: for (idx, path) in file_paths.iter().enumerate() {
             if idx < first_file_idx {
@@ -480,6 +518,7 @@ where
                             if legacy_skip_mode && skipped < start_position {
                                 skipped += 1;
                             } else {
+                                accepted_in_sweep += 1;
                                 buffer.push(psv);
                                 // 次に push する PSV の位置 = (この game,
                                 // ply i+1)。i+1 == move_num の場合は次 game
@@ -526,8 +565,27 @@ where
             }
         }
 
-        // Trailing buffer
-        if !buffer.is_empty() {
+            if accepted_in_sweep == 0 {
+                consecutive_empty_sweeps += 1;
+                if consecutive_empty_sweeps >= MAX_EMPTY_SWEEPS {
+                    panic!(
+                        "Hcpe3DataLoader: filter accepted 0 positions in {MAX_EMPTY_SWEEPS} consecutive sweeps. \
+                         Filter is too restrictive or the HCPE3 corpus contains no usable data.",
+                    );
+                }
+            } else {
+                consecutive_empty_sweeps = 0;
+            }
+
+            first_sweep = false;
+            if single_epoch {
+                break 'sweeps;
+            }
+        }
+
+        // Trailing buffer。cyclic mode では EOF で flush せず、呼び出し側が
+        // 止めるまで次 sweep の局面で buffer を満たす。
+        if single_epoch && !buffer.is_empty() {
             let _ = tx.send((buffer, next_after_push.0, next_after_push.1));
         }
     }

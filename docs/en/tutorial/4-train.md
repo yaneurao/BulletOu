@@ -94,7 +94,7 @@ If you know the teacher size you can pin "1 epoch = N sb" explicitly with `--sup
 # → "Total: 461373440 positions, suggested --superbatches 4"
 ```
 
-This matters especially for `--lr-schedule cos`: pick `--superbatches` so one cosine cycle equals one epoch, and `lr_min` lands at each epoch's last batch with a clean warm restart back to `lr_max` at the next epoch.
+This matters especially for `--lr-schedule cos`: pick `--superbatches` so one cosine cycle equals one epoch, and `lr_min` lands at each epoch's last batch with a clean warm restart back to `lr_max` at the next epoch. In this mode, the teacher itself does not rewind at epoch boundaries. It is treated as a cyclic stream and rewinds only when it reaches EOF.
 
 ## 4.8 What you should see
 

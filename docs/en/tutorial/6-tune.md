@@ -14,8 +14,8 @@ Main flags:
 |---|---|---|
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
-| `--superbatches` | Cap superbatches per epoch. Usually unnecessary for `plateau` | unlimited (= non-plateau runs until EOF; plateau runs until `lr_min`) |
-| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
+| `--superbatches` | Number of superbatches per epoch. For `step` / `cos`, this is the LR cycle length. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
+| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is the number of LR cycles. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `adamw` |
@@ -64,6 +64,8 @@ If your teacher file is smaller than one superbatch (< 100M positions), lower `-
 | `--superbatches N` set | `N × sb_size` (= one epoch, the **recommended** setup) |
 | Unlimited sb AND HCPE / PSV teacher | Total teacher position count (read from file sizes) |
 | Unlimited sb AND HCPE3 / pack teacher | Error — variable-length format, set `--superbatches` explicitly |
+
+When `--superbatches N` is set, an epoch is an LR/validation cycle, **not** one teacher pass. If the teacher reaches EOF in the middle of an epoch, BulletOu wraps to the teacher beginning and continues until N superbatches are complete. Conversely, epoch 2 does not rewind the teacher. It starts from the teacher position reached at the end of epoch 1. The teacher is a cyclic stream; only the LR schedule warm-restarts at the epoch boundary.
 
 Example with `--superbatches 4 --lr 0.001 --lr-min 0.00001` (1 epoch = 4 sb ≒ 400M positions):
 
@@ -185,7 +187,7 @@ Then `--superbatches 4` gives:
 - cos period = 400M (= exactly 1 epoch)
 - `lr_min` lands at end of sb 4; warm restart to `lr_max` at sb 1 of the next epoch
 
-The trailing 61M of teacher is not used (= each epoch uses the same first 400M). A small amount of waste is usually preferable to ragged cosine cycles.
+The trailing 61M of teacher is not discarded. Epoch 1 reads the first 400M positions; epoch 2 starts from the remaining 61M, then wraps to the teacher beginning and continues. `--superbatches` decides where the LR cycle / validation epoch ends; it does not mean "rewind the teacher at every epoch".
 
 #### Supported formats
 
@@ -200,11 +202,11 @@ For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` 
 
 ### Multi-epoch training
 
-`--max-epochs N` runs through the teacher data at most N times. If omitted, there is no fixed epoch cap for any schedule; with `--test-teacher`, training still stops when epoch-final loss and accuracy both fail to improve. Without `--test-teacher`, non-plateau schedules keep looping over epochs until interrupted. At each epoch boundary:
-- The LR scheduler resets (superbatch counter back to 1, `lr = --lr`) — applies to both `step` and `cos`.
-- The dataloader rewinds to the beginning of the data.
+`--max-epochs N` runs at most N epochs. For `step` / `cos`, this means N LR cycles. If omitted, there is no fixed epoch cap for any schedule; with `--test-teacher`, training still stops when epoch-final loss and accuracy both fail to improve. Without `--test-teacher`, non-plateau schedules keep looping over epochs until interrupted.
 
-Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup). When `--test-teacher` is set, every schedule compares epoch-final validation metrics with the previous epoch. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops even before `--max-epochs` is reached.
+At each epoch boundary, the LR scheduler and displayed superbatch counter reset. With explicit `--superbatches`, the teacher position does **not** reset; the teacher stream continues and wraps only at EOF. Only the old unlimited non-plateau mode (`--superbatches` omitted) treats teacher EOF as epoch end and starts the next epoch from the teacher beginning.
+
+This is useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training) without repeatedly training on the same prefix of the teacher. For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup). When `--test-teacher` is set, every schedule compares epoch-final validation metrics with the previous epoch. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops even before `--max-epochs` is reached.
 
 ## 6.2 Training target (`--lambda`)
 

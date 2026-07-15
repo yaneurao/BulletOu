@@ -3519,6 +3519,8 @@ macro_rules! run_training_inline {
         // --superbatches が未指定なら epoch ごとに loader EOF まで回す (= usize::MAX で
         // 上限なし、loader 側で EOF が来たら trainer.run が返る)。
         let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
+        let teacher_single_epoch =
+            args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
 
         let net_id_base = args.net_id();
         let output_dir_buf = args.output_dir();
@@ -3658,20 +3660,23 @@ macro_rules! run_training_inline {
                     // that the NNUE macro has).
                     let _ = &persistent_hcpe_loader; // suppress unused
                     let loader = HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_loader_threads(args.loader_threads);
+                        .with_loader_threads(args.loader_threads)
+                        .with_single_epoch(teacher_single_epoch);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Hcpe3 => {
-                    let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                    let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                        .with_single_epoch(teacher_single_epoch);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Pack => {
                     let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_single_epoch(true);
+                        .with_single_epoch(teacher_single_epoch);
                     trainer.run(&schedule, &settings, &loader)
                 }
                 DataFormat::Psv => {
-                    let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+                    let loader = DirectSequentialDataLoader::new(&data_files_ref)
+                        .with_single_epoch(teacher_single_epoch);
                     trainer.run(&schedule, &settings, &loader)
                 }
             };
@@ -4307,6 +4312,12 @@ macro_rules! run_training_inline_nnue {
         let net_id_base = args.net_id();
         let output_dir_buf = args.output_dir();
         let max_epochs = effective_max_epochs(args);
+        // `--superbatches` が未指定の非 plateau だけは、従来通り「教師 1 周
+        // = epoch」として EOF で epoch を終える。`--superbatches N` 指定時は
+        // epoch は LR/validation の周期であり、教師 stream は EOF で先頭へ
+        // cyclic に戻って epoch を跨いでも継続する。
+        let teacher_single_epoch =
+            args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
 
         let output_dir_str = args.output_dir();
         let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
@@ -4453,16 +4464,19 @@ macro_rules! run_training_inline_nnue {
         } else {
             None
         };
-        let initial_dataloader_resume_exact = !teacher_changed && !prev_run_completed_epoch && latest_dataloader_pos.is_some();
-        let cb_dataloader_resume_offset = std::cell::Cell::new(if teacher_changed || prev_run_completed_epoch {
-            // Continued-training case (= add more epochs after a
-            // completed run): read the teacher from byte 0 of the
-            // first new epoch, otherwise we'd start near EOF (where
-            // the previous run's final epoch ended) and hit early
-            // EOF instead of training.
-            (0u64, 0usize)
-        } else {
+        let resume_teacher_from_latest_pos = !teacher_changed
+            && latest_dataloader_pos.is_some()
+            && !(prev_run_completed_epoch && teacher_single_epoch);
+        let initial_dataloader_resume_exact = resume_teacher_from_latest_pos;
+        let cb_dataloader_resume_offset = std::cell::Cell::new(if resume_teacher_from_latest_pos {
             latest_dataloader_pos.unwrap_or((0, 0))
+        } else {
+            // Teacher-changed runs and the old omitted-`--superbatches`
+            // non-plateau mode start a new epoch as a new teacher pass.
+            // With explicit `--superbatches N`, epoch is only an
+            // LR/validation cycle, so clean continuations use the latest
+            // dataloader position above instead of rewinding the teacher.
+            (0u64, 0usize)
         });
         let cb_dataloader_resume_exact = std::cell::Cell::new(initial_dataloader_resume_exact);
 
@@ -4476,14 +4490,22 @@ macro_rules! run_training_inline_nnue {
                 );
             }
         } else if prev_run_completed_epoch {
-            let last_sb = auto_resume_sb_raw.unwrap();
-            eprintln!(
-                "  previous run completed {} superbatch{} cleanly; \
-                 continuing as additional epoch(s) — each new epoch starts from sb=1 \
-                 reading the teacher from the beginning.",
-                last_sb,
-                if last_sb == 1 { "" } else { "es" },
-            );
+            let sb_text = auto_resume_sb_raw
+                .map(|last_sb| format!("{} superbatch{}", last_sb, if last_sb == 1 { "" } else { "es" }))
+                .unwrap_or_else(|| "a plateau epoch".to_string());
+            if resume_teacher_from_latest_pos {
+                let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
+                eprintln!(
+                    "  previous run completed {sb_text} cleanly; \
+                     continuing as additional epoch(s) from sb=1. \
+                     The teacher stream continues from dataloader offset {resume_off}, plies {resume_plies}."
+                );
+            } else {
+                eprintln!(
+                    "  previous run completed {sb_text} cleanly; \
+                     continuing as additional epoch(s) from sb=1, reading the teacher from the beginning."
+                );
+            }
         } else if let Some(last_sb) = auto_resume_sb_raw {
             eprintln!("  auto-resuming from superbatch {} (last saved: {}).", effective_start_superbatch, last_sb);
         }
@@ -4544,10 +4566,9 @@ macro_rules! run_training_inline_nnue {
 
         // HCPE 専用: persistent loader。Producer thread を chunk loop の外で
         // 立ち上げ、複数 trainer.run 呼び出しを跨いで pre-fetch を継続する。
-        // 各 epoch 開始時に新しい loader を spawn し直す: 前 epoch の producer は
-        // ファイル末尾に達して exit しているので、同じ loader を持ち越すと
-        // 空 channel → `NoBatchesReceived` panic になるため。Epoch 1 だけは
-        // 外側からの resume offset を使い、epoch 2 以降は教師頭から (offset=0)。
+        // teacher-single-epoch mode では各 epoch 開始時に新しい loader を
+        // spawn し直す。明示 `--superbatches N` では epoch は LR/validation
+        // cycle なので、同じ loader を持ち越して教師ストリームを継続する。
         let hcpe_loader_buffer_records = args
             .save_rate
             .max(1)
@@ -4565,7 +4586,8 @@ macro_rules! run_training_inline_nnue {
                         (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
                     )
                     .with_buffer_records(hcpe_loader_buffer_records)
-                    .with_loader_threads(args.loader_threads);
+                    .with_loader_threads(args.loader_threads)
+                    .with_single_epoch(teacher_single_epoch);
                     Some(if resume_exact {
                         loader.with_exact_resume_offset(resume_off)
                     } else {
@@ -4620,10 +4642,12 @@ macro_rules! run_training_inline_nnue {
             } else {
                 None
             };
-            // Epoch boundary (epoch >= 2): drop the previous epoch's loader
-            // (its producer thread already finished at EOF), spawn a fresh one
-            // that reads the teacher from the start.
-            if epoch > 1 {
+            // Epoch boundary (epoch >= 2): in teacher-single-epoch mode,
+            // a new epoch is a new pass over the teacher, so reset the
+            // dataloader. When `--superbatches N` is set, epoch is an
+            // LR/validation cycle; the teacher stream must continue from
+            // its current position across epoch boundaries.
+            if epoch > 1 && teacher_single_epoch {
                 cb_dataloader_resume_offset.set((0, 0));
                 cb_dataloader_resume_exact.set(false);
                 if matches!(format, DataFormat::Hcpe) {
@@ -4651,9 +4675,10 @@ macro_rules! run_training_inline_nnue {
             //
             // chunk_start: epoch 1 honours the auto-resume / user-set
             // start sb so an interrupted previous epoch picks up where it
-            // left off. Epoch≥2 always starts at sb=1 — otherwise the new
-            // epoch would skip sb 1..effective_start_superbatch-1, which
-            // is wrong: each new epoch is a fresh pass over the teacher.
+            // left off. Epoch>=2 always starts at displayed sb=1. This
+            // resets the LR/validation cycle only; with explicit
+            // `--superbatches N`, the dataloader position continues
+            // across the boundary.
             let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
             let chunk_size = args.save_rate.max(1);
             let plateau_rollback_dir = output_dir_buf.join(".bulletou_plateau_rollback");
@@ -4767,7 +4792,8 @@ macro_rules! run_training_inline_nnue {
                     DataFormat::Hcpe3 => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_buffer_records(hcpe_loader_buffer_records);
+                            .with_buffer_records(hcpe_loader_buffer_records)
+                            .with_single_epoch(teacher_single_epoch);
                         let loader = if cb_dataloader_resume_exact.get() {
                             loader.with_exact_resume_offset(resume_off, resume_plies)
                         } else {
@@ -4780,7 +4806,7 @@ macro_rules! run_training_inline_nnue {
                     DataFormat::Pack => {
                         let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
                         let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_single_epoch(true);
+                            .with_single_epoch(teacher_single_epoch);
                         let loader = if cb_dataloader_resume_exact.get() {
                             loader.with_exact_resume_offset(resume_off, resume_plies)
                         } else {
@@ -4795,7 +4821,7 @@ macro_rules! run_training_inline_nnue {
                         // already byte-seeks via `start_position * 40`, so
                         // no `dataloader_pos.txt` write is needed.
                         let loader = DirectSequentialDataLoader::new(&data_files_ref)
-                            .with_single_epoch(!matches!(args.lr_schedule, LrScheduleKind::Plateau));
+                            .with_single_epoch(teacher_single_epoch);
                         trainer.run(&schedule, &settings, &loader)
                     }
                 };
