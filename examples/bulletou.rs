@@ -1118,6 +1118,24 @@ impl LrScheduleKind {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "lowercase")]
+enum OptimizerKind {
+    Adamw,
+    Radam,
+    Ranger,
+}
+
+impl OptimizerKind {
+    fn cli_name(self) -> &'static str {
+        match self {
+            OptimizerKind::Adamw => "adamw",
+            OptimizerKind::Radam => "radam",
+            OptimizerKind::Ranger => "ranger",
+        }
+    }
+}
+
 fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u64 {
     args.lr_step_positions
         .unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
@@ -1216,9 +1234,15 @@ struct Args {
     #[arg(long)]
     max_epochs: Option<usize>,
 
-    /// Initial Adam learning rate.
+    /// Initial optimizer learning rate.
     #[arg(long, default_value = "0.001")]
     lr: f32,
+
+    /// Optimizer used for training. `ranger` is BulletOu's existing
+    /// RAdam+Lookahead implementation; it is useful for ablation against
+    /// nnue-pytorch's Ranger21, but is not a full Ranger21 clone.
+    #[arg(long, value_enum, default_value = "adamw")]
+    optimizer: OptimizerKind,
 
     /// LR schedule kind. `step` and `cos` sweep `--lr` (lr_max) →
     /// `--lr-min` over **one epoch**, warm-restarting to `--lr` at each
@@ -1316,27 +1340,33 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_wrm_loss: bool,
 
-    /// AdamW weight decay. BulletOu's historical default is 0.01. Set this
-    /// to 0.0 to match nodchip nnue-pytorch's optimizer condition for A/B
-    /// comparisons while keeping the rest of the AdamW implementation.
+    /// Optimizer weight decay. The `adamw-` prefix is kept for CLI
+    /// compatibility, but this value is applied to the selected optimizer
+    /// (`adamw`, `radam`, or `ranger`). BulletOu's historical default is
+    /// 0.01. Set this to 0.0 to match nodchip nnue-pytorch's optimizer
+    /// condition for A/B comparisons.
     #[arg(long, default_value = "0.01")]
     adamw_weight_decay: f32,
 
-    /// AdamW epsilon. BulletOu's historical default is 1e-8. Set this to
-    /// 1e-7 to match nodchip nnue-pytorch's Ranger21 epsilon for an isolated
-    /// A/B comparison while still using AdamW.
+    /// Optimizer epsilon. The `adamw-` prefix is kept for CLI
+    /// compatibility, but this value is applied to `adamw`, `radam`, and
+    /// `ranger`. BulletOu's historical default is 1e-8. Set this to 1e-7 to
+    /// match nodchip nnue-pytorch's Ranger21 epsilon for an isolated A/B
+    /// comparison.
     #[arg(long, default_value = "0.00000001")]
     adamw_epsilon: f32,
 
-    /// AdamW beta1. BulletOu's historical default is 0.9, matching
-    /// nodchip nnue-pytorch's Ranger21 setting. Expose it as an isolated
-    /// optimizer-dynamics ablation while keeping AdamW.
+    /// Optimizer beta1. The `adamw-` prefix is kept for CLI compatibility,
+    /// but this value is applied to the selected optimizer. BulletOu's
+    /// historical default is 0.9, matching nodchip nnue-pytorch's Ranger21
+    /// setting.
     #[arg(long, default_value = "0.9")]
     adamw_beta1: f32,
 
-    /// AdamW beta2. BulletOu's historical default is 0.999, matching
-    /// nodchip nnue-pytorch's Ranger21 setting. Expose it as an isolated
-    /// optimizer-dynamics ablation while keeping AdamW.
+    /// Optimizer beta2. The `adamw-` prefix is kept for CLI compatibility,
+    /// but this value is applied to the selected optimizer. BulletOu's
+    /// historical default is 0.999, matching nodchip nnue-pytorch's
+    /// Ranger21 setting.
     #[arg(long, default_value = "0.999")]
     adamw_beta2: f32,
 
@@ -1608,32 +1638,146 @@ fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
     }
 }
 
-fn configure_adamw<Inp, Out>(
+fn radam_params(args: &Args, clip: f32) -> bullet_trainer::optimiser::radam::RAdamParams {
+    bullet_trainer::optimiser::radam::RAdamParams {
+        decay: args.adamw_weight_decay,
+        beta1: args.adamw_beta1,
+        beta2: args.adamw_beta2,
+        epsilon: args.adamw_epsilon,
+        n_sma_threshold: 5.0,
+        clip: Some((-clip, clip)),
+    }
+}
+
+fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
+    optimiser::RangerParams {
+        decay: args.adamw_weight_decay,
+        beta1: args.adamw_beta1,
+        beta2: args.adamw_beta2,
+        epsilon: args.adamw_epsilon,
+        min_weight: -clip,
+        max_weight: clip,
+        ..Default::default()
+    }
+}
+
+trait BulletouOptimizer: optimiser::OptimiserType + Default {
+    fn configure<Inp, Out>(
+        args: &Args,
+        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
+        output_weight_ids: &[&str],
+        bias_ids: &[&str],
+    )
+    where
+        Inp: SparseInputType,
+        Out: OutputBuckets<Inp::RequiredDataType>;
+}
+
+impl BulletouOptimizer for optimiser::AdamW {
+    fn configure<Inp, Out>(
+        args: &Args,
+        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
+        output_weight_ids: &[&str],
+        bias_ids: &[&str],
+    )
+    where
+        Inp: SparseInputType,
+        Out: OutputBuckets<Inp::RequiredDataType>,
+    {
+        let global_clip =
+            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
+        trainer.optimiser.set_params(adamw_params(args, global_clip));
+
+        if args.nnue_pytorch_layer_clip {
+            let output_params = adamw_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
+            for id in output_weight_ids {
+                trainer.optimiser.set_params_for_weight(id, output_params);
+            }
+        }
+
+        if args.nnue_pytorch_no_bias_clip {
+            let bias_params = adamw_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
+            for id in bias_ids {
+                trainer.optimiser.set_params_for_weight(id, bias_params);
+            }
+        }
+    }
+}
+
+impl BulletouOptimizer for optimiser::RAdam {
+    fn configure<Inp, Out>(
+        args: &Args,
+        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
+        output_weight_ids: &[&str],
+        bias_ids: &[&str],
+    )
+    where
+        Inp: SparseInputType,
+        Out: OutputBuckets<Inp::RequiredDataType>,
+    {
+        let global_clip =
+            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
+        trainer.optimiser.set_params(radam_params(args, global_clip));
+
+        if args.nnue_pytorch_layer_clip {
+            let output_params = radam_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
+            for id in output_weight_ids {
+                trainer.optimiser.set_params_for_weight(id, output_params);
+            }
+        }
+
+        if args.nnue_pytorch_no_bias_clip {
+            let bias_params = radam_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
+            for id in bias_ids {
+                trainer.optimiser.set_params_for_weight(id, bias_params);
+            }
+        }
+    }
+}
+
+impl BulletouOptimizer for optimiser::Ranger {
+    fn configure<Inp, Out>(
+        args: &Args,
+        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
+        output_weight_ids: &[&str],
+        bias_ids: &[&str],
+    )
+    where
+        Inp: SparseInputType,
+        Out: OutputBuckets<Inp::RequiredDataType>,
+    {
+        let global_clip =
+            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
+        trainer.optimiser.set_params(ranger_params(args, global_clip));
+
+        if args.nnue_pytorch_layer_clip {
+            let output_params = ranger_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
+            for id in output_weight_ids {
+                trainer.optimiser.set_params_for_weight(id, output_params);
+            }
+        }
+
+        if args.nnue_pytorch_no_bias_clip {
+            let bias_params = ranger_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
+            for id in bias_ids {
+                trainer.optimiser.set_params_for_weight(id, bias_params);
+            }
+        }
+    }
+}
+
+fn configure_optimizer<O, Inp, Out>(
     args: &Args,
-    trainer: &mut ValueTrainer<optimiser::AdamWOptimiser, Inp, Out>,
+    trainer: &mut ValueTrainer<O::Optimiser, Inp, Out>,
     output_weight_ids: &[&str],
     bias_ids: &[&str],
 )
 where
+    O: BulletouOptimizer,
     Inp: SparseInputType,
     Out: OutputBuckets<Inp::RequiredDataType>,
 {
-    let global_clip = if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
-    trainer.optimiser.set_params(adamw_params(args, global_clip));
-
-    if args.nnue_pytorch_layer_clip {
-        let output_params = adamw_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
-        for id in output_weight_ids {
-            trainer.optimiser.set_params_for_weight(id, output_params);
-        }
-    }
-
-    if args.nnue_pytorch_no_bias_clip {
-        let bias_params = adamw_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
-        for id in bias_ids {
-            trainer.optimiser.set_params_for_weight(id, bias_params);
-        }
-    }
+    O::configure(args, trainer, output_weight_ids, bias_ids);
 }
 
 // ----- epoch period ------------------------------------------------------
@@ -2193,17 +2337,20 @@ fn main() {
     if args.nnue_pytorch_wrm_loss {
         eprintln!("  nnue-pytorch WRM loss = enabled");
     }
+    if args.optimizer != OptimizerKind::Adamw {
+        eprintln!("  optimizer = {}", args.optimizer.cli_name());
+    }
     if args.adamw_weight_decay != 0.01 {
-        eprintln!("  AdamW weight decay = {}", args.adamw_weight_decay);
+        eprintln!("  optimizer weight decay = {}", args.adamw_weight_decay);
     }
     if args.adamw_epsilon != 0.00000001 {
-        eprintln!("  AdamW epsilon = {}", args.adamw_epsilon);
+        eprintln!("  optimizer epsilon = {}", args.adamw_epsilon);
     }
     if args.adamw_beta1 != 0.9 {
-        eprintln!("  AdamW beta1 = {}", args.adamw_beta1);
+        eprintln!("  optimizer beta1 = {}", args.adamw_beta1);
     }
     if args.adamw_beta2 != 0.999 {
-        eprintln!("  AdamW beta2 = {}", args.adamw_beta2);
+        eprintln!("  optimizer beta2 = {}", args.adamw_beta2);
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
@@ -2307,6 +2454,7 @@ fn resume_signature(args: &Args) -> String {
         format!("batches_per_superbatch={batches_per_superbatch}"),
         format!("superbatches={superbatches}"),
         format!("lr_schedule={}", args.lr_schedule.cli_name()),
+        format!("optimizer={}", args.optimizer.cli_name()),
         format!("lr={:.9}", args.lr),
         format!("lr_min={:.9}", args.lr_min),
         format!("lr_step_gamma={:.9}", args.lr_step_gamma),
@@ -3568,6 +3716,14 @@ fn write_loss_csv(path: &std::path::Path, records: &[(usize, usize, f32)]) -> st
 // ----- KPPT: KK ---------------------------------------------------------
 
 fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_kppt_kk_impl::<optimiser::AdamW>(args, resume_dir),
+        OptimizerKind::Radam => run_kppt_kk_impl::<optimiser::RAdam>(args, resume_dir),
+        OptimizerKind::Ranger => run_kppt_kk_impl::<optimiser::Ranger>(args, resume_dir),
+    }
+}
+
+fn run_kppt_kk_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -3581,7 +3737,7 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiKk)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -3603,7 +3759,7 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[], &[]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KK] restoring optimiser state from {}", dir.display());
@@ -3616,6 +3772,14 @@ fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
 // ----- KPPT: KKP --------------------------------------------------------
 
 fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_kppt_kkp_impl::<optimiser::AdamW>(args, resume_dir),
+        OptimizerKind::Radam => run_kppt_kkp_impl::<optimiser::RAdam>(args, resume_dir),
+        OptimizerKind::Ranger => run_kppt_kkp_impl::<optimiser::Ranger>(args, resume_dir),
+    }
+}
+
+fn run_kppt_kkp_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -3629,7 +3793,7 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiKkp)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -3651,7 +3815,7 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[], &[]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KKP] restoring optimiser state from {}", dir.display());
@@ -3664,6 +3828,14 @@ fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
 // ----- KPPT: KPP --------------------------------------------------------
 
 fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_kppt_kpp_impl::<optimiser::AdamW>(args, resume_dir),
+        OptimizerKind::Radam => run_kppt_kpp_impl::<optimiser::RAdam>(args, resume_dir),
+        OptimizerKind::Ranger => run_kppt_kpp_impl::<optimiser::Ranger>(args, resume_dir),
+    }
+}
+
+fn run_kppt_kpp_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
     let qa: i16 = 256;
     let qb: i16 = 64;
     let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
@@ -3677,7 +3849,7 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiKpp)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -3699,7 +3871,7 @@ fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
         out.forward(combined)
     });
 
-    configure_adamw(args, &mut trainer, &[], &[]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
 
     if let Some(dir) = resume_dir {
         eprintln!("  [KPP] restoring optimiser state from {}", dir.display());
@@ -5032,6 +5204,14 @@ fn build_nnue_save_format(
 ///   `<output>/<net_id>-<sb>/{nn.bin, state.bin, log.txt}`
 /// then at end-of-training renamed to `<output>/0NNN/{nn.bin, state.bin, learn.log}`.
 fn run_halfkp(args: &Args) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_halfkp_impl::<optimiser::AdamW>(args),
+        OptimizerKind::Radam => run_halfkp_impl::<optimiser::RAdam>(args),
+        OptimizerKind::Ranger => run_halfkp_impl::<optimiser::Ranger>(args),
+    }
+}
+
+fn run_halfkp_impl<O: BulletouOptimizer>(args: &Args) {
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKP.num_inputs();
     let l1_input_dim = 2 * l1_size;
@@ -5067,7 +5247,7 @@ fn run_halfkp(args: &Args) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiHalfKP)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -5094,7 +5274,7 @@ fn run_halfkp(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5134,6 +5314,14 @@ fn run_halfkp(args: &Args) {
 /// per perspective. The network stack (L0 -> ClippedReLU -> L1 ->
 /// ClippedReLU -> L2 -> ClippedReLU -> Out) is the same as halfkp_256x2-32-32.
 fn run_kp(args: &Args) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_kp_impl::<optimiser::AdamW>(args),
+        OptimizerKind::Radam => run_kp_impl::<optimiser::RAdam>(args),
+        OptimizerKind::Ranger => run_kp_impl::<optimiser::Ranger>(args),
+    }
+}
+
+fn run_kp_impl<O: BulletouOptimizer>(args: &Args) {
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiKp.num_inputs();
     let l1_input_dim = 2 * l1_size;
@@ -5168,7 +5356,7 @@ fn run_kp(args: &Args) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiKp)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -5195,7 +5383,7 @@ fn run_kp(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5232,6 +5420,14 @@ fn run_kp(args: &Args) {
 /// the same 4-layer ClippedReLU as halfkp_256x2-32-32 / kp_256x2-32-32.
 /// Architecture is selected via `--arch` (default `NNUE_ka2_256x2_32_32`).
 fn run_nnue_ka2(args: &Args) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_nnue_ka2_impl::<optimiser::AdamW>(args),
+        OptimizerKind::Radam => run_nnue_ka2_impl::<optimiser::RAdam>(args),
+        OptimizerKind::Ranger => run_nnue_ka2_impl::<optimiser::Ranger>(args),
+    }
+}
+
+fn run_nnue_ka2_impl<O: BulletouOptimizer>(args: &Args) {
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiKa2.num_inputs();
     let l1_input_dim = 2 * l1_size;
@@ -5266,7 +5462,7 @@ fn run_nnue_ka2(args: &Args) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiKa2)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -5293,7 +5489,7 @@ fn run_nnue_ka2(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5330,6 +5526,14 @@ fn run_nnue_ka2(args: &Args) {
 /// computation is done once per training position by `ShogiHalfKpe9`'s
 /// `map_features` using the threat module's `for_each_attack`.
 fn run_halfkpe9(args: &Args) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_halfkpe9_impl::<optimiser::AdamW>(args),
+        OptimizerKind::Radam => run_halfkpe9_impl::<optimiser::RAdam>(args),
+        OptimizerKind::Ranger => run_halfkpe9_impl::<optimiser::Ranger>(args),
+    }
+}
+
+fn run_halfkpe9_impl<O: BulletouOptimizer>(args: &Args) {
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKpe9.num_inputs();
     let l1_input_dim = 2 * l1_size;
@@ -5364,7 +5568,7 @@ fn run_halfkpe9(args: &Args) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiHalfKpe9)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -5391,7 +5595,7 @@ fn run_halfkpe9(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5427,6 +5631,14 @@ fn run_halfkpe9(args: &Args) {
 /// `ShogiHalfKPvm` (69,660 dims, file-mirror folded). The 4-layer
 /// ClippedReLU network and quantisation pipeline are unchanged.
 fn run_halfkpvm(args: &Args) {
+    match args.optimizer {
+        OptimizerKind::Adamw => run_halfkpvm_impl::<optimiser::AdamW>(args),
+        OptimizerKind::Radam => run_halfkpvm_impl::<optimiser::RAdam>(args),
+        OptimizerKind::Ranger => run_halfkpvm_impl::<optimiser::Ranger>(args),
+    }
+}
+
+fn run_halfkpvm_impl<O: BulletouOptimizer>(args: &Args) {
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKPvm.num_inputs();
     let l1_input_dim = 2 * l1_size;
@@ -5461,7 +5673,7 @@ fn run_halfkpvm(args: &Args) {
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(ShogiHalfKPvm)
         .save_format(&save_format)
         .loss_fn(value_loss_fn(args));
@@ -5488,7 +5700,7 @@ fn run_halfkpvm(args: &Args) {
         out.forward(hidden2)
     });
 
-    configure_adamw(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -5537,6 +5749,18 @@ fn run_halfkpvm(args: &Args) {
 ///
 fn run_sfnn_1536<I>(args: &Args, input: I, feature_set: NnueFeatureSet)
 where
+    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
+{
+    match args.optimizer {
+        OptimizerKind::Adamw => run_sfnn_1536_impl::<optimiser::AdamW, I>(args, input, feature_set),
+        OptimizerKind::Radam => run_sfnn_1536_impl::<optimiser::RAdam, I>(args, input, feature_set),
+        OptimizerKind::Ranger => run_sfnn_1536_impl::<optimiser::Ranger, I>(args, input, feature_set),
+    }
+}
+
+fn run_sfnn_1536_impl<O, I>(args: &Args, input: I, feature_set: NnueFeatureSet)
+where
+    O: BulletouOptimizer,
     I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
 {
     let arch = args.arch();
@@ -5608,7 +5832,7 @@ where
 
     let mut builder = ValueTrainerBuilder::default()
         .dual_perspective()
-        .optimiser(optimiser::AdamW)
+        .optimiser(O::default())
         .inputs(input)
         .output_buckets(bucket_impl)
         .save_format(&save_format)
@@ -5694,7 +5918,7 @@ where
     } else {
         &["l0b", "l1b", "l2b", "l3b"]
     };
-    configure_adamw(args, &mut trainer, &["l3w"], bias_ids);
+    configure_optimizer::<O, _, _>(args, &mut trainer, &["l3w"], bias_ids);
 
     if let Some(dir) = resume_dir.as_ref() {
         eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
@@ -6073,7 +6297,7 @@ mod tests {
     }
 
     #[test]
-    fn adamw_beta_flags_feed_optimizer_and_resume_signature() {
+    fn optimizer_flags_feed_params_and_resume_signature() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -6082,6 +6306,12 @@ mod tests {
             "NNUE_HALFKP",
             "--teacher",
             "/dev/null",
+            "--optimizer",
+            "ranger",
+            "--adamw-weight-decay",
+            "0.0",
+            "--adamw-epsilon",
+            "0.0000001",
             "--adamw-beta1",
             "0.85",
             "--adamw-beta2",
@@ -6090,10 +6320,28 @@ mod tests {
         .unwrap();
 
         let params = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        assert_eq!(args.optimizer, OptimizerKind::Ranger);
+        assert_eq!(params.decay, 0.0);
+        assert_eq!(params.epsilon, 0.0000001);
         assert_eq!(params.beta1, 0.85);
         assert_eq!(params.beta2, 0.995);
 
+        let radam = radam_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        assert_eq!(radam.decay, 0.0);
+        assert_eq!(radam.epsilon, 0.0000001);
+        assert_eq!(radam.beta1, 0.85);
+        assert_eq!(radam.beta2, 0.995);
+
+        let ranger = ranger_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        assert_eq!(ranger.decay, 0.0);
+        assert_eq!(ranger.epsilon, 0.0000001);
+        assert_eq!(ranger.beta1, 0.85);
+        assert_eq!(ranger.beta2, 0.995);
+
         let sig = resume_signature(&args);
+        assert!(sig.contains("optimizer=ranger"));
+        assert!(sig.contains("adamw_weight_decay=0.000000000"));
+        assert!(sig.contains("adamw_epsilon=0.000000100"));
         assert!(sig.contains("adamw_beta1=0.850000024"));
         assert!(sig.contains("adamw_beta2=0.995000005"));
     }

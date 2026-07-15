@@ -23,12 +23,13 @@ pub struct RAdamParams {
     pub beta2: f32,
     pub n_sma_threshold: f32,
     pub decay: f32,
+    pub epsilon: f32,
     pub clip: Option<(f32, f32)>,
 }
 
 impl Default for RAdamParams {
     fn default() -> Self {
-        Self { beta1: 0.9, beta2: 0.999, n_sma_threshold: 5.0, decay: 0.0, clip: None }
+        Self { beta1: 0.9, beta2: 0.999, n_sma_threshold: 5.0, decay: 0.0, epsilon: 0.00000001, clip: None }
     }
 }
 
@@ -73,9 +74,9 @@ impl RAdamParams {
             .replace("DECAY", &self.decay.to_string())
             .replace("BETA1", &self.beta1.to_string())
             .replace("BETA2", &self.beta2.to_string())
+            .replace("EPSILON", &format!("{}F", self.epsilon))
             .replace("WMIN", &min.to_string())
-            .replace("WMAX", &max.to_string())
-            .replace("EPSILON", "0.00000001F");
+            .replace("WMAX", &max.to_string());
 
         let body = if size.is_multiple_of(4) {
             format!(

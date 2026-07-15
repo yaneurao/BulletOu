@@ -165,6 +165,7 @@ pub struct RangerParams {
     pub decay: f32,
     pub beta1: f32,
     pub beta2: f32,
+    pub epsilon: f32,
     pub min_weight: f32,
     pub max_weight: f32,
     pub alpha: f32,
@@ -173,7 +174,16 @@ pub struct RangerParams {
 
 impl Default for RangerParams {
     fn default() -> Self {
-        RangerParams { decay: 0.01, beta1: 0.99, beta2: 0.999, min_weight: -1.98, max_weight: 1.98, alpha: 0.5, k: 6 }
+        RangerParams {
+            decay: 0.01,
+            beta1: 0.99,
+            beta2: 0.999,
+            epsilon: 0.00000001,
+            min_weight: -1.98,
+            max_weight: 1.98,
+            alpha: 0.5,
+            k: 6,
+        }
     }
 }
 
@@ -185,6 +195,7 @@ impl From<RangerParams> for RangerLookaheadParams<RAdamParams> {
                 beta2: value.beta2,
                 n_sma_threshold: 5.0,
                 decay: value.decay,
+                epsilon: value.epsilon,
                 clip: Some((value.min_weight, value.max_weight)),
             },
             alpha: value.alpha,

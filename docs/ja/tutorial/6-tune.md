@@ -18,6 +18,7 @@
 | `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
+| `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `adamw` |
 | `--lr-schedule` | `step` (= geometric/対数線形)、`cos` (= cosine annealing)、`step_gamma` (= nnue-pytorch StepLR 比較用)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `cos` では cycle 末で到達する値、`plateau` では最終 lr | 0.00001 |
 | `--lr-step-gamma` | `step_gamma` で LR に掛ける係数。nnue-pytorch 既定値は `0.992` | 0.992 |
@@ -27,12 +28,12 @@
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
-| `--adamw-weight-decay` | AdamW の weight decay。nnue-pytorch 条件に寄せる比較では `0.0` を試す | 0.01 |
-| `--adamw-epsilon` | AdamW の epsilon。nnue-pytorch 条件に寄せる比較では `0.0000001` を試す | 0.00000001 |
-| `--adamw-beta1` | AdamW の beta1。optimizer の momentum 条件だけを変える比較用 | 0.9 |
-| `--adamw-beta2` | AdamW の beta2。optimizer の second moment 条件だけを変える比較用 | 0.999 |
+| `--adamw-weight-decay` | 選択中 optimizer の weight decay。引数名は互換性のため `adamw-` のまま | 0.01 |
+| `--adamw-epsilon` | 選択中 optimizer の epsilon。引数名は互換性のため `adamw-` のまま | 0.00000001 |
+| `--adamw-beta1` | 選択中 optimizer の beta1 | 0.9 |
+| `--adamw-beta2` | 選択中 optimizer の beta2 | 0.999 |
 | `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
-| `--nnue-pytorch-no-bias-clip` | bias tensor の AdamW clipping を実質無効にする | off |
+| `--nnue-pytorch-no-bias-clip` | bias tensor の optimizer clipping を実質無効にする | off |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -105,7 +106,7 @@ nnue-pytorch の既定条件に寄せるなら、次のように明示します:
 
 教師データ量が限られていて、epoch 長に合わせて `cos` を1周期回すよりも、validation 指標を見ながら LR を下げたい場合は `--lr-schedule plateau` を使う。
 
-`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` / `test_value_accuracy` を計測し、`--lr-plateau-monitor` で指定した指標が改善していれば採用する。改善していなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state (Adam の momentum / variance) の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も監視指標が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
+`plateau` は各 superbatch の保存後に `--test-teacher` の `test_value_loss` / `test_value_accuracy` を計測し、`--lr-plateau-monitor` で指定した指標が改善していれば採用する。改善していなければ LR に `--lr-plateau-factor` を掛け、同じ superbatch の教師区間を下げた LR でもう一度学習する。このとき、棄却した更新は採用せず、model weight と optimizer state の両方をその superbatch 開始前に戻す。教師データが尽きた場合は同じ epoch のまま教師の先頭に戻り、`lr_min` に到達するまで継続する。次の LR が `--lr-min` を下回る段階になったら、最後に **ちょうど `--lr-min`** で同じ教師区間を1 superbatchだけ学習する。この最後の試行も監視指標が改善した場合だけ採用し、改善しなければ破棄して、その epoch を終了する。次の epoch は、また `--lr` から plateau 判定を開始する。
 
 `--lr-plateau-monitor` は次の3種類:
 
@@ -264,9 +265,37 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --nnue-pytorch-wrm-loss
 ```
 
-### AdamW weight decay
+### Optimizer の選択
 
-BulletOu の標準 AdamW は `--adamw-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を AdamW のまま `--adamw-weight-decay 0.0` だけを試す。
+`--optimizer` で `adamw` / `radam` / `ranger` を切り替えられる。デフォルトは従来通り `adamw`。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-ranger \
+    --optimizer ranger
+```
+
+`ranger` は BulletOu 既存の RAdam+Lookahead 実装で、nodchip 版 nnue-pytorch の Ranger21 完全互換ではない。Ranger21との差を調べるための ablation として使う。nnue-pytorch 条件に寄せるなら、まず次のようにする。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-ranger-decay0 \
+    --optimizer ranger \
+    --adamw-weight-decay 0.0 \
+    --adamw-beta1 0.9 \
+    --adamw-beta2 0.999 \
+    --adamw-epsilon 0.0000001
+```
+
+`--adamw-weight-decay` / `--adamw-epsilon` / `--adamw-beta1` / `--adamw-beta2` は、名前は互換性のため `adamw-` のままだが、`radam` / `ranger` を選んだ場合もその optimizer に適用される。
+
+### Optimizer weight decay
+
+BulletOu の標準設定は `--adamw-weight-decay 0.01` で動く。nodchip 版 nnue-pytorch の比較条件に寄せたい場合は、まず optimizer を同じまま `--adamw-weight-decay 0.0` だけを試す。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -278,9 +307,9 @@ BulletOu の標準 AdamW は `--adamw-weight-decay 0.01` で動く。nodchip 版
 
 これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、まず単独で ON/OFF 比較する。
 
-### AdamW epsilon
+### Optimizer epsilon
 
-BulletOu の AdamW epsilon は標準で `1e-8`。nodchip 版 nnue-pytorch の Ranger21 は `eps=1e-7` なので、optimizer を AdamW のまま epsilon だけ寄せる場合は `--adamw-epsilon 0.0000001` を使う。
+BulletOu の optimizer epsilon は標準で `1e-8`。nodchip 版 nnue-pytorch の Ranger21 は `eps=1e-7` なので、epsilon だけ寄せる場合は `--adamw-epsilon 0.0000001` を使う。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -292,11 +321,11 @@ BulletOu の AdamW epsilon は標準で `1e-8`。nodchip 版 nnue-pytorch の Ra
 
 これも optimizer 条件の差分調査用フラグなので、まず単独で比較する。
 
-### AdamW beta
+### Optimizer beta
 
-AdamW の `beta1` / `beta2` も CLI から変更できる。デフォルトは `beta1=0.9`, `beta2=0.999` で、これは nodchip 版 nnue-pytorch の Ranger21 設定と同じ。したがって、通常は指定する必要はない。
+optimizer の `beta1` / `beta2` も CLI から変更できる。デフォルトは `beta1=0.9`, `beta2=0.999` で、これは nodchip 版 nnue-pytorch の Ranger21 設定と同じ。したがって、通常は指定する必要はない。
 
-それでも optimizer の momentum 条件だけを動かして切り分けたい場合は、AdamW のまま `--adamw-beta1` / `--adamw-beta2` を指定する。
+それでも optimizer の momentum 条件だけを動かして切り分けたい場合は、`--adamw-beta1` / `--adamw-beta2` を指定する。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -307,11 +336,11 @@ AdamW の `beta1` / `beta2` も CLI から変更できる。デフォルトは `
     --adamw-beta2 0.995
 ```
 
-これは Ranger21 互換化ではなく、AdamW の内部時定数だけを見る ablation。weight decay や epsilon と混ぜず、まず単独で比較する。
+これは内部時定数だけを見る ablation。weight decay や epsilon と混ぜず、まず単独で比較する。
 
 ### nnue-pytorch layer clipping
 
-`--nnue-pytorch-layer-clip` を付けると、AdamW の weight clipping 範囲を nnue-pytorch の量子化スケールに寄せる。
+`--nnue-pytorch-layer-clip` を付けると、選択中 optimizer の weight clipping 範囲を nnue-pytorch の量子化スケールに寄せる。
 
 - hidden weight: `[-127/64, 127/64]`
 - final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
@@ -328,7 +357,7 @@ AdamW の `beta1` / `beta2` も CLI から変更できる。デフォルトは `
 
 ### bias clipping の無効化
 
-nnue-pytorch の `WeightClippingCallback` は weight tensor だけを clip し、bias tensor は clip しない。BulletOu の標準 AdamW は bias も含めて全 parameter を clip するため、`--nnue-pytorch-no-bias-clip` でこの差分を単独比較できる。
+nnue-pytorch の `WeightClippingCallback` は weight tensor だけを clip し、bias tensor は clip しない。BulletOu の標準 optimizer 設定は bias も含めて全 parameter を clip するため、`--nnue-pytorch-no-bias-clip` でこの差分を単独比較できる。
 
 ```bash
 ./target/release/examples/bulletou \

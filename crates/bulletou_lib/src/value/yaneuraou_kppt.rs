@@ -178,14 +178,14 @@ pub fn write_model_weights_bin<'a>(
     buf
 }
 
-/// Bundle one component's `optimiser_state/{weights,momentum,velocity}.bin`
-/// files at `optimiser_state_dir` into the running combined-state buffer
+/// Bundle one component's `optimiser_state/` files into the running combined-state buffer
 /// `out`, with every record's ID prefixed by
 /// `<component>/<section>/` so the three components do not clash on shared
 /// IDs (e.g. all components have `outw`).
 ///
-/// `component` is `"kk"` / `"kkp"` / `"kpp"`. `section` selects which
-/// optimiser file: `"weights"`, `"momentum"`, or `"velocity"`.
+/// `component` is `"kk"` / `"kkp"` / `"kpp"` / `"nnue"`. Required sections
+/// are `"weights"`, `"momentum"`, and `"velocity"`. Ranger additionally writes
+/// `"slow"` and a text `"step_ranger"` file; these are bundled when present.
 pub fn bundle_component_state(
     out: &mut Vec<u8>,
     component: &str,
@@ -200,6 +200,38 @@ pub fn bundle_component_state(
         }).collect();
         records.sort_by(|a, b| a.0.cmp(&b.0));
         let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), *v)));
+        out.extend_from_slice(&chunk);
+    }
+    for section in ["slow"] {
+        let path = optimiser_state_dir.join(format!("{section}.bin"));
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let parsed = parse_model_weights_bin(&bytes)?;
+        let mut records: Vec<(String, &[f32])> = parsed
+            .iter()
+            .map(|(k, v)| (format!("{component}/{section}/{k}"), v.as_slice()))
+            .collect();
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), *v)));
+        out.extend_from_slice(&chunk);
+    }
+    let step_path = optimiser_state_dir.join("step_ranger.txt");
+    if step_path.is_file() {
+        let text = std::fs::read_to_string(&step_path)?;
+        let mut records: Vec<(String, Vec<f32>)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((id, step)) = line.split_once(',') else { continue };
+            let Ok(step) = step.trim().parse::<u64>() else { continue };
+            records.push((format!("{component}/step_ranger/{}", id.trim()), vec![step as f32]));
+        }
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), v.as_slice())));
         out.extend_from_slice(&chunk);
     }
     Ok(())
@@ -222,8 +254,7 @@ pub fn extract_component_section(
         .collect()
 }
 
-/// Write a single component's `weights.bin` / `momentum.bin` /
-/// `velocity.bin` triplet to `optimiser_state_dir` from the bundled
+/// Write a single component's optimiser state files to `optimiser_state_dir` from the bundled
 /// `state.bin` buffer, so a freshly-built bullet trainer can pick it up
 /// via `Optimiser::load_from_checkpoint(<dir>)`. Returns an error if the
 /// component's records are missing from `state_records`.
@@ -244,6 +275,29 @@ pub fn unbundle_component_state(
         let records: Vec<(&str, &[f32])> = extracted.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
         let chunk = write_model_weights_bin(records.into_iter());
         std::fs::write(optimiser_state_dir.join(format!("{section}.bin")), chunk)?;
+    }
+    let slow = extract_component_section(state_records, component, "slow");
+    if slow.is_empty() {
+        // Older state.bin files, and AdamW/RAdam checkpoints, have no Ranger
+        // slow weights. Initialising slow weights from current weights lets a
+        // user intentionally switch to Ranger with `--resume` without crashing.
+        let weights = extract_component_section(state_records, component, "weights");
+        let records: Vec<(&str, &[f32])> = weights.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let chunk = write_model_weights_bin(records.into_iter());
+        std::fs::write(optimiser_state_dir.join("slow.bin"), chunk)?;
+    } else {
+        let records: Vec<(&str, &[f32])> = slow.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let chunk = write_model_weights_bin(records.into_iter());
+        std::fs::write(optimiser_state_dir.join("slow.bin"), chunk)?;
+    }
+    let steps = extract_component_section(state_records, component, "step_ranger");
+    if !steps.is_empty() {
+        let mut lines = String::new();
+        for (id, v) in steps {
+            let step = v.first().copied().unwrap_or(0.0).max(0.0).round() as u64;
+            lines.push_str(&format!("{id},{step}\n"));
+        }
+        std::fs::write(optimiser_state_dir.join("step_ranger.txt"), lines)?;
     }
     Ok(())
 }
@@ -547,6 +601,17 @@ mod tests {
                 );
                 fs::write(dir.join(format!("{section}.bin")), bytes).unwrap();
             }
+            if comp == "kkp" {
+                let slow_bytes = write_model_weights_bin(
+                    [
+                        ("kkp_idA", [7.0f32, 8.0, 9.0].as_slice()),
+                        ("kkp_idB", [10.0f32, 11.0].as_slice()),
+                    ]
+                    .into_iter(),
+                );
+                fs::write(dir.join("slow.bin"), slow_bytes).unwrap();
+                fs::write(dir.join("step_ranger.txt"), "kkp_idA,12\nkkp_idB,18\n").unwrap();
+            }
         }
 
         // Bundle
@@ -566,6 +631,16 @@ mod tests {
                     fs::read(tmp.join(format!("{comp}_orig/optimiser_state/{section}.bin"))).unwrap();
                 let restored = fs::read(dst.join(format!("{section}.bin"))).unwrap();
                 assert_eq!(orig, restored, "{comp}/{section}: round-trip mismatch");
+            }
+            if comp == "kkp" {
+                let orig = fs::read(tmp.join("kkp_orig/optimiser_state/slow.bin")).unwrap();
+                let restored = fs::read(dst.join("slow.bin")).unwrap();
+                assert_eq!(orig, restored, "kkp/slow: round-trip mismatch");
+                let step = fs::read_to_string(dst.join("step_ranger.txt")).unwrap();
+                assert_eq!(step, "kkp_idA,12\nkkp_idB,18\n");
+            } else {
+                assert!(dst.join("slow.bin").is_file(), "{comp}/slow fallback should be written");
+                assert!(!dst.join("step_ranger.txt").exists(), "{comp}/step_ranger should remain absent");
             }
         }
 

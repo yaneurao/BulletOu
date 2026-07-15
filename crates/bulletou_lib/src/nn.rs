@@ -53,13 +53,14 @@ pub mod optimiser {
         pub decay: f32,
         pub beta1: f32,
         pub beta2: f32,
+        pub epsilon: f32,
         pub min_weight: f32,
         pub max_weight: f32,
     }
 
     impl Default for RAdamParams {
         fn default() -> Self {
-            Self { decay: 0.0, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98 }
+            Self { decay: 0.0, beta1: 0.9, beta2: 0.999, epsilon: 0.00000001, min_weight: -1.98, max_weight: 1.98 }
         }
     }
 
@@ -70,6 +71,7 @@ pub mod optimiser {
                 beta2: value.beta2,
                 n_sma_threshold: 5.0,
                 decay: value.decay,
+                epsilon: value.epsilon,
                 clip: Some((value.min_weight, value.max_weight)),
             }
         }

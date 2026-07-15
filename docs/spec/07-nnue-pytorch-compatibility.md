@@ -84,12 +84,20 @@ nnue-pytorch は `Ranger21` を使う。
 | scheduler | `StepLR(gamma=0.992)` |
 | default lr | `8.75e-4` |
 
-BulletOu の現在の `examples/bulletou.rs` 経路は `AdamW` を使い、
-`AdamWParams::default()` では `weight_decay=0.01` かつ全 weight を
-一律 `[-1.98, 1.98]` に clip する。AdamW epsilon は従来 `1e-8`。
+BulletOu の `examples/bulletou.rs` 経路は `--optimizer adamw|radam|ranger`
+で optimizer を切り替えられる。デフォルトは従来通り `adamw`。
+`ranger` は BulletOu 既存の RAdam+Lookahead 実装であり、nnue-pytorch の
+Ranger21 完全互換ではない。
+
+CLI 互換性のため引数名は `--adamw-weight-decay` / `--adamw-epsilon` /
+`--adamw-beta1` / `--adamw-beta2` のままだが、これらは選択中 optimizer
+(`adamw`, `radam`, `ranger`) に適用する。標準設定は
+`weight_decay=0.01`, `eps=1e-8`, `beta=(0.9,0.999)`, 全 weight を一律
+`[-1.98, 1.98]` に clip。
 
 これは大きな差分。nnue-pytorch 互換性を比較する場合、最低限
-`weight_decay=0.0` の ablation を行い、その後 Ranger21 相当を検討する。
+`weight_decay=0.0` の ablation を行い、その後 `--optimizer ranger`
+を試す。ただし Ranger21 そのものではないので、完全一致を期待しないこと。
 
 scheduler 差分については、既存の BulletOu `--lr-schedule step` は
 1 epoch の中で `lr -> lr_min` へ滑らかに落として epoch 境界で warm restart する
@@ -165,7 +173,7 @@ nnue-pytorch は量子化スケールから layer ごとに clip 範囲を決め
 また L1 bucket weight は、factorized shared weight を足した実効 weight が範囲内に入るように
 clip される。
 
-BulletOu の標準 AdamW は全 weight に一律 `[-1.98, 1.98]` を適用する。
+BulletOu の標準 optimizer 設定は全 weight に一律 `[-1.98, 1.98]` を適用する。
 output weight の上限が nnue-pytorch より広く、L1 factorized term も考慮していない。
 
 `--nnue-pytorch-layer-clip` を付けると、hidden weight は `[-127/64, 127/64]`、
@@ -173,7 +181,7 @@ final output weight だけは `[-127*127/(600*16), 127*127/(600*16)]` にする�
 
 nnue-pytorch の `WeightClippingCallback` は `l1.linear.weight`, `l2.linear.weight`,
 `output.linear.weight` だけを clip 対象にしており、bias は clip しない。
-BulletOu の AdamW は標準では bias も含めて全 parameter を clip するため、
+BulletOu の標準 optimizer 設定は bias も含めて全 parameter を clip するため、
 `--nnue-pytorch-no-bias-clip` で bias tensor の clip を実質無効化できるようにした。
 
 ### 6. FeatureSet の一致
@@ -229,13 +237,14 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - 有効時は学習 loss だけでなく `test_value_loss` / plateau 判定も WRM loss に切り替わる
 
 4. optimizer 条件を近づける
-   - まず `AdamW weight_decay=0.0`
+   - まず同じ optimizer のまま `weight_decay=0.0`
    - 実装済み: `--adamw-weight-decay 0.0` で opt-in
    - 実測では悪化する場合があるので、他の ablation と混ぜず単独で比較する
-   - `eps=1e-7` は `--adamw-epsilon 0.0000001` で AdamW のまま単独比較する
-   - `beta1` / `beta2` は `--adamw-beta1` / `--adamw-beta2` で AdamW のまま単独比較する
+   - `eps=1e-7` は `--adamw-epsilon 0.0000001` で単独比較する
+   - `beta1` / `beta2` は `--adamw-beta1` / `--adamw-beta2` で単独比較する
      - デフォルトは `0.9` / `0.999` で、nodchip nnue-pytorch の Ranger21 設定と同じ
-   - その後 Ranger21 相当の実装・比較
+   - optimizer 種別は `--optimizer adamw|radam|ranger` で比較する
+     - `ranger` は RAdam+Lookahead であり Ranger21 完全互換ではない
 
 5. layer-specific clipping を入れる
    - hidden と output を別範囲にする

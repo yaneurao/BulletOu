@@ -18,6 +18,7 @@ Main flags:
 | `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
+| `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `adamw` |
 | `--lr-schedule` | `step` (= geometric / log-linear decay), `cos` (= cosine annealing), `step_gamma` (= nnue-pytorch StepLR comparison), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
 | `--lr-min` | Floor LR. For `step` / `cos`, this is reached at the end of each cycle. For `plateau`, this is the final LR | 0.00001 |
 | `--lr-step-gamma` | Multiplicative LR factor for `step_gamma`. nnue-pytorch's default is `0.992` | 0.992 |
@@ -27,12 +28,12 @@ Main flags:
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
-| `--adamw-weight-decay` | AdamW weight decay. Try `0.0` when matching nnue-pytorch's optimizer condition | 0.01 |
-| `--adamw-epsilon` | AdamW epsilon. Try `0.0000001` when matching nnue-pytorch's optimizer condition | 0.00000001 |
-| `--adamw-beta1` | AdamW beta1 for isolated optimizer-momentum ablations | 0.9 |
-| `--adamw-beta2` | AdamW beta2 for isolated second-moment ablations | 0.999 |
+| `--adamw-weight-decay` | Weight decay for the selected optimizer. The `adamw-` prefix is kept for CLI compatibility | 0.01 |
+| `--adamw-epsilon` | Epsilon for the selected optimizer. The `adamw-` prefix is kept for CLI compatibility | 0.00000001 |
+| `--adamw-beta1` | beta1 for the selected optimizer | 0.9 |
+| `--adamw-beta2` | beta2 for the selected optimizer | 0.999 |
 | `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
-| `--nnue-pytorch-no-bias-clip` | Effectively disable AdamW clipping for bias tensors | off |
+| `--nnue-pytorch-no-bias-clip` | Effectively disable optimizer clipping for bias tensors | off |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -105,7 +106,7 @@ If `--lr-step-positions` is omitted, BulletOu drops LR once per superbatch. The 
 
 Use `--lr-schedule plateau` when you want validation metrics to decide LR reductions instead of forcing a fixed cosine or geometric period.
 
-After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `test_value_loss` / `test_value_accuracy`. The update is accepted when the metric selected by `--lr-plateau-monitor` improves. If it does not improve, BulletOu discards that update, restores both model weights and Adam optimiser state to the start of the superbatch, multiplies LR by `--lr-plateau-factor`, and retries the same teacher interval. When the next LR would go below `--lr-min`, it runs one final attempt at exactly `--lr-min`. That final attempt is accepted only if the monitor improves; otherwise it is discarded and the epoch ends.
+After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `test_value_loss` / `test_value_accuracy`. The update is accepted when the metric selected by `--lr-plateau-monitor` improves. If it does not improve, BulletOu discards that update, restores both model weights and optimizer state to the start of the superbatch, multiplies LR by `--lr-plateau-factor`, and retries the same teacher interval. When the next LR would go below `--lr-min`, it runs one final attempt at exactly `--lr-min`. That final attempt is accepted only if the monitor improves; otherwise it is discarded and the epoch ends.
 
 `--lr-plateau-monitor` has three modes:
 
@@ -254,9 +255,37 @@ Example:
     --nnue-pytorch-wrm-loss
 ```
 
-### AdamW weight decay
+### Optimizer Selection
 
-BulletOu's default AdamW uses `--adamw-weight-decay 0.01`. To move one step toward nodchip nnue-pytorch's optimizer condition while keeping AdamW, test only `--adamw-weight-decay 0.0`.
+Use `--optimizer` to switch between `adamw`, `radam`, and `ranger`. The default remains `adamw`.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-ranger \
+    --optimizer ranger
+```
+
+`ranger` is BulletOu's existing RAdam+Lookahead implementation. It is not a full clone of nodchip nnue-pytorch's Ranger21, so treat it as an ablation for narrowing the optimizer gap. To move it toward the nnue-pytorch condition, start with:
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ --test-teacher test.hcpe \
+    --eval-type SFNN_HALFKA2 \
+    --tag sfnn-ranger-decay0 \
+    --optimizer ranger \
+    --adamw-weight-decay 0.0 \
+    --adamw-beta1 0.9 \
+    --adamw-beta2 0.999 \
+    --adamw-epsilon 0.0000001
+```
+
+`--adamw-weight-decay`, `--adamw-epsilon`, `--adamw-beta1`, and `--adamw-beta2` keep their historical `adamw-` names for compatibility, but they configure the selected optimizer when `radam` or `ranger` is used too.
+
+### Optimizer Weight Decay
+
+BulletOu's default setting uses `--adamw-weight-decay 0.01`. To move one step toward nodchip nnue-pytorch's optimizer condition while keeping the same optimizer, test only `--adamw-weight-decay 0.0`.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -268,9 +297,9 @@ BulletOu's default AdamW uses `--adamw-weight-decay 0.01`. To move one step towa
 
 This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from `--nnue-pytorch-wrm-loss`.
 
-### AdamW epsilon
+### Optimizer Epsilon
 
-BulletOu's AdamW epsilon defaults to `1e-8`. nodchip nnue-pytorch's Ranger21 uses `eps=1e-7`, so use `--adamw-epsilon 0.0000001` to test only that difference while still using AdamW.
+BulletOu's optimizer epsilon defaults to `1e-8`. nodchip nnue-pytorch's Ranger21 uses `eps=1e-7`, so use `--adamw-epsilon 0.0000001` to test only that difference.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -282,11 +311,11 @@ BulletOu's AdamW epsilon defaults to `1e-8`. nodchip nnue-pytorch's Ranger21 use
 
 This is another optimizer-condition ablation. Compare it by itself first.
 
-### AdamW beta
+### Optimizer Beta
 
-AdamW `beta1` / `beta2` can also be set from the CLI. The defaults are `beta1=0.9`, `beta2=0.999`, which already match nodchip nnue-pytorch's Ranger21 setting. Normally you do not need to specify them.
+Optimizer `beta1` / `beta2` can also be set from the CLI. The defaults are `beta1=0.9`, `beta2=0.999`, which already match nodchip nnue-pytorch's Ranger21 setting. Normally you do not need to specify them.
 
-If you want to isolate only the optimizer momentum time constants while still using AdamW, pass `--adamw-beta1` / `--adamw-beta2`.
+If you want to isolate only the optimizer momentum time constants, pass `--adamw-beta1` / `--adamw-beta2`.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -297,11 +326,11 @@ If you want to isolate only the optimizer momentum time constants while still us
     --adamw-beta2 0.995
 ```
 
-This is not a Ranger21 compatibility mode. It is an AdamW-only ablation, so compare it by itself before combining it with weight decay or epsilon changes.
+This is not a Ranger21 compatibility mode by itself. Compare it by itself before combining it with weight decay or epsilon changes.
 
 ### nnue-pytorch layer clipping
 
-Add `--nnue-pytorch-layer-clip` to move AdamW's weight clipping bounds closer to nnue-pytorch's quantisation scales.
+Add `--nnue-pytorch-layer-clip` to move the selected optimizer's weight clipping bounds closer to nnue-pytorch's quantisation scales.
 
 - hidden weight: `[-127/64, 127/64]`
 - final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
@@ -318,7 +347,7 @@ This is an experimental NNUE / SFNN flag. It does not change the loss formula or
 
 ### Disabling bias clipping
 
-nnue-pytorch's `WeightClippingCallback` clips weight tensors only; it does not clip bias tensors. BulletOu's default AdamW clips every parameter, including biases. Use `--nnue-pytorch-no-bias-clip` to compare that difference by itself.
+nnue-pytorch's `WeightClippingCallback` clips weight tensors only; it does not clip bias tensors. BulletOu's default optimizer settings clip every parameter, including biases. Use `--nnue-pytorch-no-bias-clip` to compare that difference by itself.
 
 ```bash
 ./target/release/examples/bulletou \
