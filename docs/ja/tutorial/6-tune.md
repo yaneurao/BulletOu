@@ -15,7 +15,7 @@
 | `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
 | `--batches-per-superbatch` | 1 superbatch を構成する mini-batch 数 | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 1 億局面) |
 | `--superbatches` | epoch あたりの superbatch 数の上限。`plateau` では通常不要 | 上限なし (= 非 plateau は EOF まで、plateau は `lr_min` 到達まで) |
-| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか。`cos` は `--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
+| `--max-epochs` | epoch を最大何回実行するか。`step` / `cos` では基本的に教師を何周するか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は `step` / `cos` = 1、`plateau` = 改善が止まるまで |
 | `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.001 |
 | `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `adamw` |
@@ -118,7 +118,7 @@ nnue-pytorch の既定条件に寄せるなら、次のように明示します:
 
 `--lr-plateau-min-delta` は loss 側だけに効く。accuracy 側は「厳密に上がったか」だけを見る。
 
-`plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 validation 指標を前 epoch の最終指標と比較し、`--lr-plateau-monitor` の条件で改善していなければそこで学習を停止する。`--lr-plateau-min-delta` は epoch 間の停止判定には使わない。
+`plateau` で `--max-epochs` を省略すると、epoch 数の固定上限は置かない。各 epoch の最後に `summary-learn.log` へ残った最終 validation 指標を前 epoch の最終指標と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がっていなければそこで学習を停止する。`--lr-plateau-monitor` と `--lr-plateau-min-delta` は epoch 内の superbatch 採用判定だけに効き、epoch 間の停止判定は常に tolerance なしの loss-or-accuracy 改善で見る。
 
 `plateau` では 1 epoch の superbatch 数は固定しない。教師ファイルを読み切っても epoch は終わらず、教師先頭へ戻って続行する。`--superbatches` は「この数を超えたら打ち切る」という安全上限であり、通常は指定しない。superbatch の大きさだけを `--batches-per-superbatch` で決める。
 
@@ -144,7 +144,7 @@ nnue-pytorch の既定条件に寄せるなら、次のように明示します:
     --lr-plateau-monitor loss_or_accuracy
 ```
 
-factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、epoch 内の superbatch 判定でそれ未満の微小な loss 改善は「改善なし」とみなす。epoch 間の停止判定は `--lr-plateau-monitor` の条件を見るが、`--lr-plateau-min-delta` は使わない。
+factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`--lr-plateau-min-delta 0.000001` のように指定すると、epoch 内の superbatch 判定でそれ未満の微小な loss 改善は「改善なし」とみなす。epoch 間の停止判定は `--lr-plateau-monitor` ではなく、常に `test_value_loss` が下がるか `test_value_accuracy` が上がるかで見る。
 
 #### `step` vs `cos` を比較したい
 
@@ -214,7 +214,7 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 - LR scheduler が reset される (superbatch 1 から再開、`lr = --lr` に戻る — `step` でも `cos` でも同じ)
 - データローダーが先頭にシークし直す
 
-つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。`cos` かつ `--test-teacher` が指定されている場合、epoch 末の validation 指標を前 epoch 末と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がらなければ、`--max-epochs` に到達していなくてもそこで停止する。`plateau` では `--superbatches` で cycle を揃える必要はない。
+つまり N 回学習し直すに近い挙動。各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。`--test-teacher` が指定されている場合、どの schedule でも epoch 末の validation 指標を前 epoch 末と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がらなければ、`--max-epochs` に到達していなくてもそこで停止する。`plateau` では `--superbatches` で cycle を揃える必要はない。
 
 ## 6.2 教師ターゲット (`--lambda`)
 

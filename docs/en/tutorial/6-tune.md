@@ -15,7 +15,7 @@ Main flags:
 | `--batch-size` | Positions per gradient step | 16384 |
 | `--batches-per-superbatch` | Mini-batches per superbatch | `ceil(100M / batch-size)` (≒ 1 superbatch ≒ 100M positions) |
 | `--superbatches` | Cap superbatches per epoch. Usually unnecessary for `plateau` | unlimited (= non-plateau runs until EOF; plateau runs until `lr_min`) |
-| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs. With `cos` and `--test-teacher`, training stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
+| `--max-epochs` | Maximum number of epochs. For `step` / `cos`, this is usually the number of teacher passes. For `plateau`, this caps the number of plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = `step` / `cos`: 1; `plateau`: until improvement stops |
 | `--save-rate` | Save a checkpoint every N superbatches | 1 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.001 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `adamw` |
@@ -118,7 +118,7 @@ After each saved superbatch, BulletOu evaluates `--test-teacher` and checks `tes
 
 `--lr-plateau-min-delta` applies only to the loss side. Accuracy uses a strict increase.
 
-If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. After each epoch, BulletOu compares the epoch-final validation metrics that remained in `summary-learn.log` with the previous epoch's final metrics. If the selected `--lr-plateau-monitor` does not improve, training stops. `--lr-plateau-min-delta` affects only the per-superbatch plateau decision; epoch-to-epoch stopping uses no tolerance.
+If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. After each epoch, BulletOu compares the epoch-final validation metrics that remained in `summary-learn.log` with the previous epoch's final metrics. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops. `--lr-plateau-monitor` and `--lr-plateau-min-delta` affect only the per-superbatch plateau decision; epoch-to-epoch stopping always uses strict loss-or-accuracy improvement with no tolerance.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -204,7 +204,7 @@ For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` 
 - The LR scheduler resets (superbatch counter back to 1, `lr = --lr`) — applies to both `step` and `cos`.
 - The dataloader rewinds to the beginning of the data.
 
-Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup). When `--lr-schedule cos` and `--test-teacher` are both set, BulletOu compares epoch-final validation metrics with the previous epoch. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops even before `--max-epochs` is reached.
+Effectively N restarted trainings on the same data. Useful when you want each epoch to descend on its own LR schedule (a way to escape local minima in long training). For `cos` schedule, setting `--superbatches N` automatically makes cycle = epoch (= canonical SGDR setup). When `--test-teacher` is set, every schedule compares epoch-final validation metrics with the previous epoch. If `test_value_loss` does not decrease and `test_value_accuracy` does not increase, training stops even before `--max-epochs` is reached.
 
 ## 6.2 Training target (`--lambda`)
 
