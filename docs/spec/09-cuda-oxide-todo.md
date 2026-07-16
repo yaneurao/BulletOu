@@ -12,8 +12,8 @@ status を更新する。
 |---|---|---|---|
 | CO-001 | done | TODO 起票 | このファイルと README へのリンクを追加する |
 | CO-002 | done | fixed-layout batch adapter | 既存 dataloader から `FastBatchHost` を直接列挙できる |
-| CO-003 | in-progress | cuda-oxide crate 境界の作成 | 既存 workspace を巻き込まず、専用 crate / binary の置き場所を作る |
-| CO-004 | todo | PTX smoke loader | 生成済み PTX を load し、最小 kernel を launch する |
+| CO-003 | done | cuda-oxide crate 境界の作成 | 既存 workspace を巻き込まず、専用 crate / binary の置き場所を作る |
+| CO-004 | in-progress | PTX smoke loader | 生成済み PTX を load し、最小 kernel を launch する |
 | CO-005 | todo | CPU reference test harness | fast backend kernel と既存 Bullet backend の 1 batch 出力比較を作る |
 | CO-006 | todo | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる |
 | CO-007 | todo | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |

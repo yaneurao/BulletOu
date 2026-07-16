@@ -481,6 +481,10 @@ Phase 1 の実装方針は以下とする。
 この境界を守ることで、cuda-oxide 実験が壊れても既存 BulletOu の学習経路を壊さない。
 速度比較のためにも、既存 backend は baseline として常に動く必要がある。
 
+実体は root workspace とは別に `cuda-oxide/` nested workspace として置く。
+root `Cargo.toml` の `members` には入れず、`cuda-oxide/rust-toolchain.toml` 側で
+cuda-oxide 用 nightly を pin する。
+
 必要なもの:
 
 - CUDA context / stream / module / device buffer wrapper

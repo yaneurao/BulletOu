@@ -1,0 +1,5 @@
+# Keep this in sync with the cuda-oxide revision used by the fast backend.
+# This mirrors the tatara investigation baseline.
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]

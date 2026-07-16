@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/runtime",
+    "bins/bulletou-cuda-train",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jw1912/bullet"
+rust-version = "1.96"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
