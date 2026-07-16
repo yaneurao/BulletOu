@@ -15,7 +15,9 @@ pub use dataloader::FastValueDataLoader;
 pub use fast_batch::{
     FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs,
 };
-pub use fast_nnue::{FastNnueError, NnueForwardShape, NnueForwardWeights, NNUE_HALFKP_256X2_32_32};
+pub use fast_nnue::{
+    FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardWeights,
+};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
     Trainer,
