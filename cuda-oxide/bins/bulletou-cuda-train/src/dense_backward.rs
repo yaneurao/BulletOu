@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bulletou_cuda_oxide_runtime::{
     backward::{
         DenseCReluBackwardLaunchPlan, DenseCReluBackwardLayout, DenseOutputBackwardLaunchPlan,
-        DenseOutputBackwardLayout,
+        DenseOutputBackwardLayout, NnueL0CReluBackwardLaunchPlan, NnueL0CReluBackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -92,6 +92,46 @@ pub(crate) fn launch_dense_crelu_backward(
                 batch,
                 input_dim,
                 output_dim
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_nnue_l0_crelu_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: NnueL0CReluBackwardLayout,
+    combined_gradients: &DeviceBuffer<f32>,
+    stm_activations: &DeviceBuffer<f32>,
+    nstm_activations: &DeviceBuffer<f32>,
+    mut stm_gradients: &mut DeviceBuffer<f32>,
+    mut nstm_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = NnueL0CReluBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let l1 = layout.l1 as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `nnue_l0_crelu_backward`; all buffers are
+        // device allocations owned by the same CUDA context and live until the
+        // caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::backward::nnue_l0_crelu_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(combined_gradients),
+                slice(stm_activations),
+                slice(nstm_activations),
+                slice_mut(stm_gradients),
+                slice_mut(nstm_gradients),
+                batch,
+                l1
             ]
         }
     }?;

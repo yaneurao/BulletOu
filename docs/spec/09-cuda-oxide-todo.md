@@ -275,16 +275,20 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - The smoke runs the existing NNUE forward launch first, then chains the
   generic backward kernels across the dense stack:
   `output -> hidden2 CReLU -> hidden1 CReLU -> combined`.
+- Extended the smoke with `nnue_l0_crelu_backward`, which splits
+  `combined_grad` back into stm/nstm L0 gradients and applies the L0 CReLU
+  derivative gate.
 - Added CPU scalar golden for the same dense-stack backward path, including
   output, L2, and L1 weight/bias gradients plus intermediate activation
-  gradients.
+  gradients and L0 stm/nstm pre-activation gradients.
 - Validation:
   - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
   - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
   - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
   - `--nnue-dense-backward-smoke --debug-readback` tiny case succeeded:
-    max_abs diff `0` for all compared buffers except `combined_grad`
-    max_abs diff `0.0000000004656613`.
+    max_abs diff `0` for all compared buffers except `combined_grad` and
+    `stm_l0_grad`, both max_abs diff `0.0000000004656613`.
   - `--nnue-dense-backward-smoke --nnue-forward-case halfkp --debug-readback`
     succeeded for `NNUE_HALFKP_256x2_32_32`: largest observed max_abs diff
     was `0.0000000004656613` (`outw_grad`).

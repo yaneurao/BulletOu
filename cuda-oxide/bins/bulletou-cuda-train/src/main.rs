@@ -334,7 +334,7 @@ fn run_dense_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
 #[cfg(feature = "cuda")]
 fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        backward::{DenseCReluBackwardLayout, DenseOutputBackwardLayout},
+        backward::{DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueL0CReluBackwardLayout},
         nnue::{
             NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
             NnueForwardWorkspace, NnueForwardWorkspaceLayout,
@@ -431,11 +431,27 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
         &mut l1w_gradients,
         &mut l1b_gradients,
     )?;
+
+    let l0_layout = NnueL0CReluBackwardLayout::new(case.batch_size, case.shape.l1);
+    let mut stm_l0_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.per_perspective_len())?;
+    let mut nstm_l0_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.per_perspective_len())?;
+    dense_backward::launch_nnue_l0_crelu_backward(
+        &stream,
+        &module,
+        l0_layout,
+        &combined_gradients,
+        &forward_workspace.stm_l0,
+        &forward_workspace.nstm_l0,
+        &mut stm_l0_gradients,
+        &mut nstm_l0_gradients,
+    )?;
     stream.synchronize()?;
 
     let gpu_hidden2_gradients = hidden2_gradients.to_host_vec(&stream)?;
     let gpu_hidden1_gradients = hidden1_gradients.to_host_vec(&stream)?;
     let gpu_combined_gradients = combined_gradients.to_host_vec(&stream)?;
+    let gpu_stm_l0_gradients = stm_l0_gradients.to_host_vec(&stream)?;
+    let gpu_nstm_l0_gradients = nstm_l0_gradients.to_host_vec(&stream)?;
     let gpu_outw_gradients = outw_gradients.to_host_vec(&stream)?;
     let gpu_outb_gradient = outb_gradient.to_host_vec(&stream)?;
     let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
@@ -447,6 +463,8 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
         compare_slices("hidden2_grad", &cpu_trace.hidden2_gradients, &gpu_hidden2_gradients, args.tolerance)?,
         compare_slices("hidden1_grad", &cpu_trace.hidden1_gradients, &gpu_hidden1_gradients, args.tolerance)?,
         compare_slices("combined_grad", &cpu_trace.combined_gradients, &gpu_combined_gradients, args.tolerance)?,
+        compare_slices("stm_l0_grad", &cpu_trace.stm_l0_gradients, &gpu_stm_l0_gradients, args.tolerance)?,
+        compare_slices("nstm_l0_grad", &cpu_trace.nstm_l0_gradients, &gpu_nstm_l0_gradients, args.tolerance)?,
         compare_slices("outw_grad", &cpu_trace.outw_gradients, &gpu_outw_gradients, args.tolerance)?,
         compare_slices("outb_grad", &[cpu_trace.outb_gradient], &gpu_outb_gradient, args.tolerance)?,
         compare_slices("l2w_grad", &cpu_trace.l2w_gradients, &gpu_l2w_gradients, args.tolerance)?,
@@ -894,7 +912,7 @@ fn usage() -> &'static str {
      CO-009 dense CReLU backward smoke: compare CReLU-gated dense layer\n\
      gradients for input, weight, and bias against a CPU scalar golden.\n\
      CO-009 NNUE dense backward smoke: run NNUE forward, then chain output,\n\
-     hidden2, and hidden1 dense backward kernels against a CPU golden.\n\
+     hidden2, hidden1, and L0 CReLU split backward kernels against a CPU golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1012,6 +1030,8 @@ struct NnueDenseBackwardTrace {
     hidden2_gradients: Vec<f32>,
     hidden1_gradients: Vec<f32>,
     combined_gradients: Vec<f32>,
+    stm_l0_gradients: Vec<f32>,
+    nstm_l0_gradients: Vec<f32>,
     outw_gradients: Vec<f32>,
     outb_gradient: f32,
     l2w_gradients: Vec<f32>,
@@ -1363,12 +1383,21 @@ impl NnueForwardCase {
             self.shape.l1 * 2,
             self.shape.l2,
         );
+        let (stm_l0_gradients, nstm_l0_gradients) = nnue_l0_crelu_backward_trace(
+            &combined_gradients,
+            &forward.stm_l0,
+            &forward.nstm_l0,
+            self.batch_size,
+            self.shape.l1,
+        );
 
         NnueDenseBackwardTrace {
             output_gradients,
             hidden2_gradients,
             hidden1_gradients,
             combined_gradients,
+            stm_l0_gradients,
+            nstm_l0_gradients,
             outw_gradients,
             outb_gradient,
             l2w_gradients,
@@ -1959,6 +1988,36 @@ fn dense_crelu_backward_trace(
     }
 
     (input_gradients, weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_l0_crelu_backward_trace(
+    combined_gradients: &[f32],
+    stm_activations: &[f32],
+    nstm_activations: &[f32],
+    batch_size: usize,
+    l1: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut stm_gradients = vec![0.0_f32; batch_size * l1];
+    let mut nstm_gradients = vec![0.0_f32; batch_size * l1];
+
+    for sample in 0..batch_size {
+        let perspective_start = sample * l1;
+        let combined_start = sample * l1 * 2;
+        for row in 0..l1 {
+            let perspective_idx = perspective_start + row;
+            stm_gradients[perspective_idx] = crelu_pre_gradient_from_activation(
+                stm_activations[perspective_idx],
+                combined_gradients[combined_start + row],
+            );
+            nstm_gradients[perspective_idx] = crelu_pre_gradient_from_activation(
+                nstm_activations[perspective_idx],
+                combined_gradients[combined_start + l1 + row],
+            );
+        }
+    }
+
+    (stm_gradients, nstm_gradients)
 }
 
 #[cfg(feature = "cuda")]

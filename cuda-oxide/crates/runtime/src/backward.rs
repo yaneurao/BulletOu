@@ -2,7 +2,9 @@
 
 pub const DENSE_OUTPUT_BACKWARD_KERNEL: &str = "dense_output_backward";
 pub const DENSE_CRELU_BACKWARD_KERNEL: &str = "dense_crelu_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 2] = [DENSE_OUTPUT_BACKWARD_KERNEL, DENSE_CRELU_BACKWARD_KERNEL];
+pub const NNUE_L0_CRELU_BACKWARD_KERNEL: &str = "nnue_l0_crelu_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 3] =
+    [DENSE_OUTPUT_BACKWARD_KERNEL, DENSE_CRELU_BACKWARD_KERNEL, NNUE_L0_CRELU_BACKWARD_KERNEL];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLayout {
@@ -96,6 +98,36 @@ impl DenseCReluBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueL0CReluBackwardLayout {
+    pub batch_size: usize,
+    pub l1: usize,
+}
+
+impl NnueL0CReluBackwardLayout {
+    pub fn new(batch_size: usize, l1: usize) -> Self {
+        Self { batch_size, l1 }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.l1 == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn per_perspective_len(self) -> usize {
+        self.batch_size * self.l1
+    }
+
+    pub fn combined_len(self) -> usize {
+        self.per_perspective_len() * 2
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -119,6 +151,17 @@ impl DenseCReluBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueL0CReluBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl NnueL0CReluBackwardLaunchPlan {
+    pub fn new(layout: NnueL0CReluBackwardLayout) -> Self {
+        Self { threads: layout.combined_len().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -135,7 +178,7 @@ mod tests {
 
     #[test]
     fn kernel_names_are_stable() {
-        assert_eq!(BACKWARD_KERNEL_NAMES, ["dense_output_backward", "dense_crelu_backward"]);
+        assert_eq!(BACKWARD_KERNEL_NAMES, ["dense_output_backward", "dense_crelu_backward", "nnue_l0_crelu_backward"]);
     }
 
     #[test]
@@ -174,5 +217,20 @@ mod tests {
         assert_eq!(DenseCReluBackwardLayout::new(0, 4, 5).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
         assert_eq!(DenseCReluBackwardLayout::new(3, 0, 5).validate().unwrap_err(), BackwardLayoutError::EmptyInput);
         assert_eq!(DenseCReluBackwardLayout::new(3, 4, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
+    }
+
+    #[test]
+    fn nnue_l0_crelu_layout_counts_buffers() {
+        let layout = NnueL0CReluBackwardLayout::new(3, 4);
+
+        assert_eq!(layout.per_perspective_len(), 12);
+        assert_eq!(layout.combined_len(), 24);
+        assert_eq!(NnueL0CReluBackwardLaunchPlan::new(layout).threads, 24);
+    }
+
+    #[test]
+    fn nnue_l0_crelu_layout_rejects_empty_values() {
+        assert_eq!(NnueL0CReluBackwardLayout::new(0, 4).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
+        assert_eq!(NnueL0CReluBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
     }
 }

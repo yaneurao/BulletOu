@@ -106,6 +106,47 @@ pub fn dense_crelu_backward(
     }
 }
 
+#[kernel]
+pub fn nnue_l0_crelu_backward(
+    combined_gradients: &[f32],
+    stm_activations: &[f32],
+    nstm_activations: &[f32],
+    mut stm_gradients: DisjointSlice<f32>,
+    mut nstm_gradients: DisjointSlice<f32>,
+    batch: u32,
+    l1: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let rows = l1 as usize;
+    let combined_stride = rows * 2;
+    let combined_len = batch_size * combined_stride;
+
+    if tid_value < combined_len {
+        let sample = tid_value / combined_stride;
+        let col = tid_value - sample * combined_stride;
+        if col < rows {
+            let perspective_idx = sample * rows + col;
+            let grad = crelu_pre_gradient_from_value(stm_activations[perspective_idx], combined_gradients[tid_value]);
+            // SAFETY: for col < rows, each 1D thread maps to exactly one
+            // unique stm perspective index within the validated output slice.
+            unsafe {
+                *stm_gradients.get_unchecked_mut(perspective_idx) = grad;
+            }
+        } else {
+            let row = col - rows;
+            let perspective_idx = sample * rows + row;
+            let grad = crelu_pre_gradient_from_value(nstm_activations[perspective_idx], combined_gradients[tid_value]);
+            // SAFETY: for col >= rows, each 1D thread maps to exactly one
+            // unique nstm perspective index within the validated output slice.
+            unsafe {
+                *nstm_gradients.get_unchecked_mut(perspective_idx) = grad;
+            }
+        }
+    }
+}
+
 #[cuda_device::device]
 fn dense_crelu_pre_gradient(
     activations: &[f32],
@@ -115,9 +156,13 @@ fn dense_crelu_pre_gradient(
     output_rows: usize,
 ) -> f32 {
     let idx = sample * output_rows + out_col;
-    let activation = activations[idx];
+    crelu_pre_gradient_from_value(activations[idx], output_gradients[idx])
+}
+
+#[cuda_device::device]
+fn crelu_pre_gradient_from_value(activation: f32, output_gradient: f32) -> f32 {
     if activation > 0.0_f32 && activation < 1.0_f32 {
-        output_gradients[idx]
+        output_gradient
     } else {
         0.0_f32
     }
