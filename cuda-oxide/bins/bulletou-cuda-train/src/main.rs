@@ -34,6 +34,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
     match args.mode {
         SmokeMode::Ptx => run_ptx_smoke(args),
         SmokeMode::Loss => run_loss_smoke(args),
+        SmokeMode::DenseCReluBackward => run_dense_crelu_backward_smoke(args),
         SmokeMode::DenseOutputBackward => run_dense_output_backward_smoke(args),
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
@@ -64,6 +65,7 @@ struct Args {
 enum SmokeMode {
     Ptx,
     Loss,
+    DenseCReluBackward,
     DenseOutputBackward,
     NnueForward,
     SfnnForward,
@@ -121,6 +123,7 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--loss-smoke" => parsed.mode = SmokeMode::Loss,
+                "--dense-crelu-backward-smoke" => parsed.mode = SmokeMode::DenseCReluBackward,
                 "--dense-output-backward-smoke" => parsed.mode = SmokeMode::DenseOutputBackward,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
@@ -186,6 +189,75 @@ fn run_ptx_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     println!("  kernel    : {}", args.kernel);
     println!("  launch    : ok");
     println!("  roundtrip : {roundtrip_ok}");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_dense_crelu_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{backward::DenseCReluBackwardLayout, DeviceBuffer};
+
+    let case = DenseCReluBackwardCase::tiny();
+    let cpu_trace = case.cpu_backward_trace();
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let layout = DenseCReluBackwardLayout::new(case.batch_size, case.input_dim, case.output_dim);
+    let inputs = DeviceBuffer::from_host(&stream, &case.inputs)?;
+    let activations = DeviceBuffer::from_host(&stream, &case.activations)?;
+    let output_gradients = DeviceBuffer::from_host(&stream, &case.output_gradients)?;
+    let weights = DeviceBuffer::from_host(&stream, &case.weights)?;
+    let mut input_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.input_gradients_len())?;
+    let mut weight_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.weight_len())?;
+    let mut bias_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.bias_len())?;
+
+    dense_backward::launch_dense_crelu_backward(
+        &stream,
+        &module,
+        layout,
+        &inputs,
+        &activations,
+        &output_gradients,
+        &weights,
+        &mut input_gradients,
+        &mut weight_gradients,
+        &mut bias_gradients,
+    )?;
+    stream.synchronize()?;
+
+    let gpu_input_gradients = input_gradients.to_host_vec(&stream)?;
+    let gpu_weight_gradients = weight_gradients.to_host_vec(&stream)?;
+    let gpu_bias_gradients = bias_gradients.to_host_vec(&stream)?;
+    let input_cmp = compare_slices("input_grad", &cpu_trace.input_gradients, &gpu_input_gradients, args.tolerance)?;
+    let weight_cmp = compare_slices("weight_grad", &cpu_trace.weight_gradients, &gpu_weight_gradients, args.tolerance)?;
+    let bias_cmp = compare_slices("bias_grad", &cpu_trace.bias_gradients, &gpu_bias_gradients, args.tolerance)?;
+
+    println!("bulletou-cuda-train dense CReLU backward smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  batch        : {} samples", case.batch_size);
+    println!("  input_dim    : {}", case.input_dim);
+    println!("  output_dim   : {}", case.output_dim);
+    println!("  tolerance    : {}", args.tolerance);
+    println!(
+        "  {:<11}: max_abs={} at {}, mean_abs={}",
+        input_cmp.name, input_cmp.max_abs_diff, input_cmp.max_abs_index, input_cmp.mean_abs_diff
+    );
+    println!(
+        "  {:<11}: max_abs={} at {}, mean_abs={}",
+        weight_cmp.name, weight_cmp.max_abs_diff, weight_cmp.max_abs_index, weight_cmp.mean_abs_diff
+    );
+    println!(
+        "  {:<11}: max_abs={} at {}, mean_abs={}",
+        bias_cmp.name, bias_cmp.max_abs_diff, bias_cmp.max_abs_index, bias_cmp.mean_abs_diff
+    );
+    println!("  compare      : ok");
 
     Ok(())
 }
@@ -655,6 +727,7 @@ fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
        bulletou-cuda-train --loss-smoke [--loss-kind sigmoid-mse|wrm] [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -668,6 +741,8 @@ fn usage() -> &'static str {
      weighted_sum, and mean (= weighted_sum / batch_size).\n\
      \n\
      CO-009 dense output backward smoke: compare scalar-output affine backward\n\
+     gradients for input, weight, and bias against a CPU scalar golden.\n\
+     CO-009 dense CReLU backward smoke: compare CReLU-gated dense layer\n\
      gradients for input, weight, and bias against a CPU scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
@@ -690,6 +765,27 @@ const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
 
 #[cfg(feature = "cuda")]
 const SFNN_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUSFWD1";
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct DenseCReluBackwardCase {
+    label: &'static str,
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+    inputs: Vec<f32>,
+    activations: Vec<f32>,
+    output_gradients: Vec<f32>,
+    weights: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct DenseCReluBackwardTrace {
+    input_gradients: Vec<f32>,
+    weight_gradients: Vec<f32>,
+    bias_gradients: Vec<f32>,
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -788,6 +884,72 @@ struct SfnnForwardTrace {
     l2_input: Vec<f32>,
     l2: Vec<f32>,
     outputs: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl DenseCReluBackwardCase {
+    fn tiny() -> Self {
+        Self {
+            label: "tiny",
+            batch_size: 3,
+            input_dim: 4,
+            output_dim: 3,
+            inputs: vec![
+                0.25, -0.5, 1.0, 2.0, //
+                -1.5, 0.0, 0.75, -0.25, //
+                3.0, -2.0, 0.5, 1.25,
+            ],
+            // Post-CReLU activations. Values at 0 and 1 intentionally gate
+            // gradients off; interior values pass them through.
+            activations: vec![
+                0.2, 0.0, 0.8, //
+                1.0, 0.4, 0.6, //
+                0.7, 1.0, 0.0,
+            ],
+            output_gradients: vec![
+                0.1, -0.5, 0.25, //
+                -0.2, 0.3, -0.1, //
+                0.05, 0.4, -0.35,
+            ],
+            weights: vec![
+                0.5, -1.0, 0.25, //
+                1.5, 0.75, -0.5, //
+                -0.25, 0.6, 1.25, //
+                2.0, -1.5, 0.1,
+            ],
+        }
+    }
+
+    fn cpu_backward_trace(&self) -> DenseCReluBackwardTrace {
+        let mut input_gradients = vec![0.0_f32; self.batch_size * self.input_dim];
+        let mut weight_gradients = vec![0.0_f32; self.input_dim * self.output_dim];
+        let mut bias_gradients = vec![0.0_f32; self.output_dim];
+
+        for sample in 0..self.batch_size {
+            for out_col in 0..self.output_dim {
+                let pre_grad = self.crelu_pre_gradient(sample, out_col);
+                bias_gradients[out_col] += pre_grad;
+                for in_col in 0..self.input_dim {
+                    input_gradients[sample * self.input_dim + in_col] +=
+                        pre_grad * self.weights[in_col * self.output_dim + out_col];
+                    weight_gradients[in_col * self.output_dim + out_col] +=
+                        pre_grad * self.inputs[sample * self.input_dim + in_col];
+                }
+            }
+        }
+
+        DenseCReluBackwardTrace { input_gradients, weight_gradients, bias_gradients }
+    }
+
+    fn crelu_pre_gradient(&self, sample: usize, out_col: usize) -> f32 {
+        let idx = sample * self.output_dim + out_col;
+        let activation = self.activations[idx];
+        if activation > 0.0 && activation < 1.0 {
+            self.output_gradients[idx]
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]

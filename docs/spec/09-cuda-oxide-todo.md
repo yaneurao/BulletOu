@@ -243,3 +243,28 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-009 work: hidden dense layers with activation derivatives,
   stacked SFNN layout support, and sparse feature-transformer gradient
   accumulation.
+
+### 2026-07-17 CO-009 dense CReLU backward slice
+
+- Added cuda-oxide runtime layout for hidden dense layers with CReLU
+  activation derivatives:
+  `DenseCReluBackwardLayout { batch_size, input_dim, output_dim }`.
+- Added CUDA kernel `dense_crelu_backward`:
+  - gates the upstream gradient with the post-CReLU activation
+    (`0 < activation < 1` passes; saturated `0` / `1` stops);
+  - computes `input_gradients[sample, input]`;
+  - accumulates `weight_gradients[input, output]`;
+  - accumulates `bias_gradients[output]`.
+- Added host launcher and CLI smoke:
+  `bulletou-cuda-train --dense-crelu-backward-smoke`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--dense-crelu-backward-smoke --debug-readback`: input_grad max_abs
+    diff `0`; weight_grad max_abs diff `0.000000029802322`; bias_grad
+    max_abs diff `0`.
+- Remaining CO-009 work: map this generic CReLU backward into the NNUE / SFNN
+  stacked layer shapes, then add sparse feature-transformer gradient
+  accumulation.
