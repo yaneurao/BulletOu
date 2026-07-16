@@ -12,7 +12,7 @@
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--batch-size` | 1 gradient step あたりの局面数。省略時は NNUE/SFNN では tatara に合わせて 65536、KPPT/KPP_KKPT では従来どおり 16384 | NNUE/SFNN: 65536、KPPT: 16384 |
+| `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |

@@ -52,7 +52,7 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000
 ...
 ```
 
-Bullet writes **one row every 32 batches**. With the NNUE/SFNN default (`--positions-per-superbatch 100000000`, omitted `--batch-size` = 65536), the effective superbatch is 1525 batches (= 99,942,400 positions), so that's about 48 rows per superbatch. If you explicitly pass `--batch-size 16384`, the effective superbatch is 6103 batches (= 99,991,552 positions), or about 191 rows. Once `curr_batch` reaches the final batch in the effective superbatch, `superbatch` increments by 1 and `curr_batch` restarts from 1.
+Bullet writes **one row every 32 batches**. With the default (`--positions-per-superbatch 100000000`, omitted `--batch-size` = 65536), the effective superbatch is 1525 batches (= 99,942,400 positions), so that's about 48 rows per superbatch. If you explicitly pass `--batch-size 16384`, the effective superbatch is 6103 batches (= 99,991,552 positions), or about 191 rows. Once `curr_batch` reaches the final batch in the effective superbatch, `superbatch` increments by 1 and `curr_batch` restarts from 1.
 
 ### Column meanings
 

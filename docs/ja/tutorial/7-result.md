@@ -52,7 +52,7 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000
 ...
 ```
 
-bullet は **32 batch ごとに 1 行** loss を記録する。NNUE/SFNN のデフォルト (`--positions-per-superbatch 100000000`、`--batch-size` 省略 = 65536) では、実効値は 1525 batch (= 99,942,400 局面) で、1 superbatch あたり約 48 行。`--batch-size 16384` を明示した場合は 6103 batch (= 99,991,552 局面) で約 191 行になる。`curr_batch` 列が実効superbatch内の最終batchに達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
+bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト (`--positions-per-superbatch 100000000`、`--batch-size` 省略 = 65536) では、実効値は 1525 batch (= 99,942,400 局面) で、1 superbatch あたり約 48 行。`--batch-size 16384` を明示した場合は 6103 batch (= 99,991,552 局面) で約 191 行になる。`curr_batch` 列が実効superbatch内の最終batchに達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
 
 ### 列の意味
 

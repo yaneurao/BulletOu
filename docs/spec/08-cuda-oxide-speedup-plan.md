@@ -215,8 +215,7 @@ binary crate 側に置く。CPU reference と host 側 helper は library crate 
 ### Phase 0.5: 既存 backend での即効改善
 
 cuda-oxide 専用 backend へ進む前の低リスクな改善として、`--batch-size` 省略時の
-デフォルトを NNUE/SFNN だけ `65536` に寄せる。KPPT / KPP_KKPT は今回の高速化対象外
-なので従来どおり `16384` のままにする。
+デフォルトを `65536` に寄せる。
 
 この変更の狙い:
 

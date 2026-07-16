@@ -1149,14 +1149,10 @@ fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u6
 
 const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
-const DEFAULT_BATCH_SIZE_KPPT: usize = 16_384;
-const DEFAULT_BATCH_SIZE_NNUE_SFNN: usize = 65_536;
+const DEFAULT_BATCH_SIZE: usize = 65_536;
 
 fn effective_batch_size(args: &Args) -> usize {
-    args.batch_size.unwrap_or_else(|| match args.eval_type() {
-        EvalType::Kppt | EvalType::KppKkpt => DEFAULT_BATCH_SIZE_KPPT,
-        _ => DEFAULT_BATCH_SIZE_NNUE_SFNN,
-    })
+    args.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
 }
 
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
@@ -1269,9 +1265,7 @@ struct Args {
     net_id: Option<String>,
 
     /// Mini-batch size (positions per gradient step). If omitted, BulletOu
-    /// uses 65536 for NNUE/SFNN to match tatara's high-throughput recipe,
-    /// and keeps 16384 for KPPT/KPP_KKPT to avoid increasing their memory
-    /// footprint.
+    /// uses 65536 to match tatara's high-throughput recipe.
     #[arg(long)]
     batch_size: Option<usize>,
 
@@ -1988,8 +1982,8 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         paths.len(),
     );
 
-    // Estimate sb count for the NNUE/SFNN default settings (batch_size=65536, sb<=100M).
-    let default_batch_size: u64 = DEFAULT_BATCH_SIZE_NNUE_SFNN as u64;
+    // Estimate sb count for the default settings (batch_size=65536, sb<=100M).
+    let default_batch_size: u64 = DEFAULT_BATCH_SIZE as u64;
     let default_sb_size: u64 = (DEFAULT_POSITIONS_PER_SUPERBATCH as u64 / default_batch_size) * default_batch_size;
     // = floor(100M / batch_size) * batch_size = 99,942,400 for batch_size=65536.
     let full_sbs = total_positions / default_sb_size;
@@ -6566,16 +6560,16 @@ mod tests {
     }
 
     #[test]
-    fn omitted_batch_size_uses_tatara_sized_nnue_default_but_keeps_kppt_legacy_default() {
+    fn omitted_batch_size_uses_tatara_sized_default_for_all_eval_types() {
         use clap::Parser as _;
 
         let nnue = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
         let sfnn = Args::try_parse_from(["bulletou", "--eval-type", "SFNN_HALFKA2", "--teacher", "/dev/null"]).unwrap();
         let kppt = Args::try_parse_from(["bulletou", "--eval-type", "KPPT", "--teacher", "/dev/null"]).unwrap();
 
-        assert_eq!(effective_batch_size(&nnue), DEFAULT_BATCH_SIZE_NNUE_SFNN);
-        assert_eq!(effective_batch_size(&sfnn), DEFAULT_BATCH_SIZE_NNUE_SFNN);
-        assert_eq!(effective_batch_size(&kppt), DEFAULT_BATCH_SIZE_KPPT);
+        assert_eq!(effective_batch_size(&nnue), DEFAULT_BATCH_SIZE);
+        assert_eq!(effective_batch_size(&sfnn), DEFAULT_BATCH_SIZE);
+        assert_eq!(effective_batch_size(&kppt), DEFAULT_BATCH_SIZE);
     }
 
     #[test]

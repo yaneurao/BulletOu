@@ -121,7 +121,7 @@ Resume / restart behaviour is identical across every eval-type; see [tutorial 5.
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
-| `--batch-size` | Positions per gradient step | 16384 |
+| `--batch-size` | Positions per gradient step | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |
 | `--max-epochs` | Number of epochs to run. With `--superbatches`, an epoch is an LR/validation cycle rather than one teacher pass. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries | 1 |

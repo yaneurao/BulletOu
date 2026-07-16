@@ -121,7 +121,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
-| `--batch-size` | 1 gradient step あたりの局面数 | 16384 |
+| `--batch-size` | 1 gradient step あたりの局面数 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch の目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
 | `--max-epochs` | epoch を何回実行するか。`--superbatches` 指定時の epoch は教師1周ではなく LR/validation cycle。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る | 1 |
