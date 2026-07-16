@@ -500,6 +500,79 @@ pub fn sfnn_pairwise_backward(
     }
 }
 
+#[kernel]
+pub fn sfnn_l0_sparse_backward(
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    stm_activations: &[f32],
+    nstm_activations: &[f32],
+    stm_output_gradients: &[f32],
+    nstm_output_gradients: &[f32],
+    mut stm_pre_gradients: DisjointSlice<f32>,
+    mut nstm_pre_gradients: DisjointSlice<f32>,
+    mut l0w_gradients: DisjointSlice<f32>,
+    mut l0b_gradients: DisjointSlice<f32>,
+    batch: u32,
+    max_active: u32,
+    input_size: u32,
+    ft_size: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let slots = max_active as usize;
+    let rows = ft_size as usize;
+    let features = input_size as usize;
+    let l0_len = batch_size * rows;
+    let weight_len = features * rows;
+
+    if tid_value < l0_len {
+        let stm_grad = crelu_pre_gradient_from_value(stm_activations[tid_value], stm_output_gradients[tid_value]);
+        let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid_value], nstm_output_gradients[tid_value]);
+        if let Some(out) = stm_pre_gradients.get_mut(tid) {
+            *out = stm_grad;
+        }
+        if let Some(out) = nstm_pre_gradients.get_mut(thread::index_1d()) {
+            *out = nstm_grad;
+        }
+    }
+
+    if tid_value < weight_len {
+        let feature = tid_value / rows;
+        let row = tid_value - feature * rows;
+        let mut sum = 0.0_f32;
+        for sample in 0..batch_size {
+            let sparse_base = sample * slots;
+            let grad_idx = sample * rows + row;
+            let stm_grad = crelu_pre_gradient_from_value(stm_activations[grad_idx], stm_output_gradients[grad_idx]);
+            let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[grad_idx], nstm_output_gradients[grad_idx]);
+            for slot in 0..slots {
+                if stm_indices[sparse_base + slot] == feature as i32 {
+                    sum += stm_grad;
+                }
+                if nstm_indices[sparse_base + slot] == feature as i32 {
+                    sum += nstm_grad;
+                }
+            }
+        }
+        if let Some(out) = l0w_gradients.get_mut(thread::index_1d()) {
+            *out = sum;
+        }
+    }
+
+    if tid_value < rows {
+        let mut sum = 0.0_f32;
+        for sample in 0..batch_size {
+            let grad_idx = sample * rows + tid_value;
+            sum += crelu_pre_gradient_from_value(stm_activations[grad_idx], stm_output_gradients[grad_idx]);
+            sum += crelu_pre_gradient_from_value(nstm_activations[grad_idx], nstm_output_gradients[grad_idx]);
+        }
+        if let Some(out) = l0b_gradients.get_mut(thread::index_1d()) {
+            *out = sum;
+        }
+    }
+}
+
 #[cuda_device::device]
 fn dense_crelu_pre_gradient(
     activations: &[f32],

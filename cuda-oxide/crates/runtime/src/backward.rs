@@ -9,7 +9,8 @@ pub const SFNN_STACKED_CRELU_BACKWARD_KERNEL: &str = "sfnn_stacked_crelu_backwar
 pub const SFNN_L2_INPUT_BACKWARD_KERNEL: &str = "sfnn_l2_input_backward";
 pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backward";
 pub const SFNN_PAIRWISE_BACKWARD_KERNEL: &str = "sfnn_pairwise_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 9] = [
+pub const SFNN_L0_SPARSE_BACKWARD_KERNEL: &str = "sfnn_l0_sparse_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 10] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
@@ -19,6 +20,7 @@ pub const BACKWARD_KERNEL_NAMES: [&str; 9] = [
     SFNN_L2_INPUT_BACKWARD_KERNEL,
     SFNN_STACKED_AFFINE_BACKWARD_KERNEL,
     SFNN_PAIRWISE_BACKWARD_KERNEL,
+    SFNN_L0_SPARSE_BACKWARD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +413,54 @@ impl SfnnPairwiseBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnL0SparseBackwardLayout {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub input_size: usize,
+    pub ft_size: usize,
+}
+
+impl SfnnL0SparseBackwardLayout {
+    pub fn new(batch_size: usize, max_active: usize, input_size: usize, ft_size: usize) -> Self {
+        Self { batch_size, max_active, input_size, ft_size }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.max_active == 0 {
+            Err(BackwardLayoutError::EmptySparse)
+        } else if self.input_size == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.ft_size == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn sparse_values_len(self) -> usize {
+        self.batch_size * self.max_active
+    }
+
+    pub fn l0_len(self) -> usize {
+        self.batch_size * self.ft_size
+    }
+
+    pub fn weight_len(self) -> usize {
+        self.input_size * self.ft_size
+    }
+
+    pub fn bias_len(self) -> usize {
+        self.ft_size
+    }
+
+    pub fn gradient_threads(self) -> usize {
+        self.l0_len().max(self.weight_len()).max(self.bias_len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -511,6 +561,17 @@ impl SfnnPairwiseBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnL0SparseBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnL0SparseBackwardLaunchPlan {
+    pub fn new(layout: SfnnL0SparseBackwardLayout) -> Self {
+        Self { threads: layout.gradient_threads().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -542,7 +603,8 @@ mod tests {
                 "sfnn_stacked_crelu_backward",
                 "sfnn_l2_input_backward",
                 "sfnn_stacked_affine_backward",
-                "sfnn_pairwise_backward"
+                "sfnn_pairwise_backward",
+                "sfnn_l0_sparse_backward"
             ]
         );
     }
@@ -760,5 +822,37 @@ mod tests {
     fn sfnn_pairwise_layout_rejects_empty_values() {
         assert_eq!(SfnnPairwiseBackwardLayout::new(0, 8).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
         assert_eq!(SfnnPairwiseBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyInput);
+    }
+
+    #[test]
+    fn sfnn_l0_sparse_layout_counts_buffers() {
+        let layout = SfnnL0SparseBackwardLayout::new(3, 5, 7, 4);
+
+        assert_eq!(layout.sparse_values_len(), 15);
+        assert_eq!(layout.l0_len(), 12);
+        assert_eq!(layout.weight_len(), 28);
+        assert_eq!(layout.bias_len(), 4);
+        assert_eq!(layout.gradient_threads(), 28);
+        assert_eq!(SfnnL0SparseBackwardLaunchPlan::new(layout).threads, 28);
+    }
+
+    #[test]
+    fn sfnn_l0_sparse_layout_rejects_empty_values() {
+        assert_eq!(
+            SfnnL0SparseBackwardLayout::new(0, 5, 7, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            SfnnL0SparseBackwardLayout::new(3, 0, 7, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptySparse
+        );
+        assert_eq!(
+            SfnnL0SparseBackwardLayout::new(3, 5, 0, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            SfnnL0SparseBackwardLayout::new(3, 5, 7, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
     }
 }

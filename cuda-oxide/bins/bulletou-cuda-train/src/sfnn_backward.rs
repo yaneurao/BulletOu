@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
     backward::{
-        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan,
-        SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLaunchPlan, SfnnStackedAffineBackwardLayout,
-        SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan,
-        SfnnStackedL3BackwardLayout,
+        SfnnL0SparseBackwardLaunchPlan, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLaunchPlan,
+        SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan, SfnnPairwiseBackwardLayout,
+        SfnnStackedAffineBackwardLaunchPlan, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan,
+        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -230,6 +230,60 @@ pub(crate) fn launch_sfnn_pairwise_backward(
                 slice_mut(stm_gradients),
                 slice_mut(nstm_gradients),
                 batch,
+                ft_size
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_l0_sparse_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnL0SparseBackwardLayout,
+    stm_indices: &DeviceBuffer<i32>,
+    nstm_indices: &DeviceBuffer<i32>,
+    stm_activations: &DeviceBuffer<f32>,
+    nstm_activations: &DeviceBuffer<f32>,
+    stm_output_gradients: &DeviceBuffer<f32>,
+    nstm_output_gradients: &DeviceBuffer<f32>,
+    mut stm_pre_gradients: &mut DeviceBuffer<f32>,
+    mut nstm_pre_gradients: &mut DeviceBuffer<f32>,
+    mut l0w_gradients: &mut DeviceBuffer<f32>,
+    mut l0b_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnL0SparseBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let max_active = layout.max_active as u32;
+    let input_size = layout.input_size as u32;
+    let ft_size = layout.ft_size as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_l0_sparse_backward`; each launched
+        // thread owns one output gradient element in every mutable output it
+        // writes, and weight/bias gradients are race-free scan outputs.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_l0_sparse_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(stm_indices),
+                slice(nstm_indices),
+                slice(stm_activations),
+                slice(nstm_activations),
+                slice(stm_output_gradients),
+                slice(nstm_output_gradients),
+                slice_mut(stm_pre_gradients),
+                slice_mut(nstm_pre_gradients),
+                slice_mut(l0w_gradients),
+                slice_mut(l0b_gradients),
+                batch,
+                max_active,
+                input_size,
                 ft_size
             ]
         }

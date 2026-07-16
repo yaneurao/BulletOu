@@ -327,8 +327,43 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `--sfnn-output-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
     succeeded for `SFNN_halfka2_1024_7_64_k3k3`: all compared buffers
     max_abs diff `0`.
-- Remaining CO-009 work: SFNN sparse L0 CReLU backward and integration into
-  trainer gradient buffers.
+- Remaining CO-009 work: gradient-buffer ownership/plumbing and optimizer
+  integration in the trainer.
+
+### 2026-07-17 CO-009 SFNN sparse L0 CReLU backward smoke
+
+- Added cuda-oxide runtime layout for SFNN sparse L0 backward:
+  `SfnnL0SparseBackwardLayout { batch_size, max_active, input_size, ft_size }`.
+- Added CUDA kernel `sfnn_l0_sparse_backward`:
+  - applies the CReLU derivative gate to pairwise-produced `stm_l0_grad` and
+    `nstm_l0_grad`, producing `stm_l0_pre` / `nstm_l0_pre` diagnostic buffers;
+  - accumulates shared sparse feature-transformer `l0w_grad`;
+  - accumulates shared sparse feature-transformer `l0b_grad`;
+  - uses the same race-free scan strategy as the NNUE L0 sparse correctness
+    baseline because cuda-oxide rev `b5d35e0` does not yet lower the needed
+    atomic RMW path.
+- Extended `--sfnn-dense-backward-smoke` to cover the full current SFNN
+  forward stack:
+  `stacked L3 output backward -> stacked L2 CReLU backward -> L2-input
+  transform backward -> stacked L1 backward -> pairwise backward -> sparse L0
+  CReLU backward`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--sfnn-dense-backward-smoke --debug-readback` tiny case succeeded:
+    all compared buffers max_abs diff `0` except `l0b_grad`, whose max_abs
+    diff was `0.000000029802322`.
+  - `--sfnn-dense-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
+    succeeded for `SFNN_halfka2_1024_7_64_k3k3`: `stm_l0_pre` max_abs diff
+    `0.000000000014551915`, `nstm_l0_pre` max_abs diff
+    `0.000000000007275958`, `l0w_grad` max_abs diff
+    `0.000000000014551915`, `l0b_grad` max_abs diff
+    `0.000000000021827873`, and all previous compared buffers remained within
+    tolerance.
+- Remaining CO-009 work: gradient-buffer ownership/plumbing and optimizer
+  integration in the trainer.
 
 ### 2026-07-17 CO-009 SFNN pairwise backward smoke
 
