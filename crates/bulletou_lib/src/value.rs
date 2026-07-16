@@ -2,6 +2,7 @@ pub(crate) mod builder;
 mod dataloader;
 pub mod fast_batch;
 pub mod fast_nnue;
+pub mod fast_nnue_fixture;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
@@ -18,6 +19,10 @@ pub use fast_batch::{
 pub use fast_nnue::{
     FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardWeights,
     NnueForwardTrace, NnueForwardWorkspaceLayout,
+};
+pub use fast_nnue_fixture::{
+    NNUE_FORWARD_FIXTURE_MAGIC, NnueForwardFixtureError, write_nnue_forward_fixture,
+    write_nnue_forward_fixture_file,
 };
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
