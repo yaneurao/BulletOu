@@ -1,6 +1,7 @@
 pub(crate) mod builder;
 mod dataloader;
 pub mod fast_batch;
+pub mod fast_loss;
 pub mod fast_nnue;
 pub mod fast_nnue_fixture;
 pub mod fast_sfnn;
@@ -17,6 +18,9 @@ pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
 pub use dataloader::FastValueDataLoader;
 pub use fast_batch::{
     FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs,
+};
+pub use fast_loss::{
+    FastLossError, ScalarValueLossKind, ScalarValueLossTrace, scalar_value_loss_trace,
 };
 pub use fast_nnue::{
     FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardWeights,
