@@ -22,6 +22,47 @@ pub struct NnueForwardShape {
 
 pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape { input_size: 125_388, l1: 256, l2: 32, l3: 32 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueForwardWorkspaceLayout {
+    pub shape: NnueForwardShape,
+    pub batch_size: usize,
+}
+
+impl NnueForwardWorkspaceLayout {
+    pub fn new(shape: NnueForwardShape, batch_size: usize) -> Self {
+        Self { shape, batch_size }
+    }
+
+    pub fn l0_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1)
+    }
+
+    pub fn combined_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1).saturating_mul(2)
+    }
+
+    pub fn hidden1_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2)
+    }
+
+    pub fn hidden2_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l3)
+    }
+
+    pub fn output_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn total_activation_f32_len(self) -> usize {
+        self.l0_len()
+            .saturating_mul(2)
+            .saturating_add(self.combined_len())
+            .saturating_add(self.hidden1_len())
+            .saturating_add(self.hidden2_len())
+            .saturating_add(self.output_len())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NnueForwardWeights<'a> {
     pub shape: NnueForwardShape,
@@ -249,6 +290,24 @@ mod tests {
         let weights = tiny_weights(shape);
 
         weights.validate().unwrap();
+    }
+
+    #[test]
+    fn workspace_layout_counts_forward_activations() {
+        let shape = NnueForwardShape {
+            input_size: 4,
+            l1: 2,
+            l2: 3,
+            l3: 1,
+        };
+        let layout = NnueForwardWorkspaceLayout::new(shape, 5);
+
+        assert_eq!(layout.l0_len(), 10);
+        assert_eq!(layout.combined_len(), 20);
+        assert_eq!(layout.hidden1_len(), 15);
+        assert_eq!(layout.hidden2_len(), 5);
+        assert_eq!(layout.output_len(), 5);
+        assert_eq!(layout.total_activation_f32_len(), 65);
     }
 
     #[test]
