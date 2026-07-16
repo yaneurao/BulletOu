@@ -284,6 +284,8 @@ enqueue されるため、`OptimiserUpdateSync::sync()` が kernel guard ごと�
 1 つに集約し、optimizer update 全体につき 1 回だけ compute stream を同期する。
 この集約用の `OptimiserUpdateSync` も batch ごとの短命な container なので、weight 数や
 optimizer 種別から分かる範囲で容量を事前確保し、update 時の `Vec` 伸長を減らす。
+optimizer state と model weights は同じ重み集合から作られるため、update 時は key lookup ではなく
+sorted map 同士を zip し、weight 取得の `BTreeMap::get` を避ける。
 
 ### Phase 0.8: one-batch delayed loss readback
 

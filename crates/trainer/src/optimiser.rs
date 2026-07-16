@@ -149,8 +149,8 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
             sync.extend_by(additional.apply_update(&self.model)?);
         }
 
-        for (id, single) in &mut self.state {
-            let weight = self.model.weights().get(id).unwrap();
+        for ((id, single), (weight_id, weight)) in self.state.iter_mut().zip(self.model.weights().iter()) {
+            debug_assert_eq!(id, weight_id);
 
             if let Some(grads) = gradients.get(id) {
                 sync.extend_by(single.update(
