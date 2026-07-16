@@ -452,6 +452,8 @@ input 数は 5〜6 個なので tree 構築より安い。
 checkpoint / weight 書き出しでは、tensor ごとに一時 byte buffer を作って全体 buffer へ
 積み直す必要はない。同じ raw format のまま writer へ逐次書きし、save 時の余分な allocation と
 peak memory を減らす。
+ただし f32 ごとに `write_all()` すると syscall / buffering overhead が大きいため、
+固定サイズ chunk に packed little-endian bytes を詰め、chunk 単位で writer へ流す。
 
 ### Phase 1: cuda-oxide runtime skeleton
 

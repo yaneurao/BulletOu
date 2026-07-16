@@ -23,8 +23,15 @@ pub fn write_to_writer(value: &TValue, id: &str, writer: &mut impl std::io::Writ
     writer.write_all(b"\n")?;
     writer.write_all(&usize::to_le_bytes(value.len()))?;
 
-    for &val in value {
-        writer.write_all(&f32::to_le_bytes(val))?;
+    const CHUNK_FLOATS: usize = 4096;
+    let mut chunk_bytes = [0u8; CHUNK_FLOATS * std::mem::size_of::<f32>()];
+
+    for chunk in value.chunks(CHUNK_FLOATS) {
+        for (idx, &val) in chunk.iter().enumerate() {
+            let offset = idx * std::mem::size_of::<f32>();
+            chunk_bytes[offset..offset + std::mem::size_of::<f32>()].copy_from_slice(&f32::to_le_bytes(val));
+        }
+        writer.write_all(&chunk_bytes[..chunk.len() * std::mem::size_of::<f32>()])?;
     }
 
     Ok(())
