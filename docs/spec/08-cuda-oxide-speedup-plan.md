@@ -255,6 +255,9 @@ copy 完了を待ってから current batch の compute sync に進む形にな�
 既存 backend 側では、次 batch の host buffer を生存させたまま H2D copy を enqueue し、
 current batch の compute sync を先に待ってから copy stream を同期する。これにより、
 次 batch の upload と current batch の backward / optimizer update を重ねられる。
+次 batch 用の device buffer は、読み出し前に必ず host batch から全体 H2D copy されるため、
+初期確保時の zero fill は不要である。受け皿は uninitialised buffer として確保し、起動時の
+余分な device memset を避ける。
 
 これは cuda-oxide の本命である input upload ring の小さい前段である。
 完全な ring 化ではないが、既存の double buffer 構造のまま安全に overlap を増やせる。

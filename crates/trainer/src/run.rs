@@ -188,7 +188,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
     let mut next_on_device = batch_on_device
         .iter()
         .map(|(id, tensor)| {
-            let buf = Buffer::zeroed(&device, tensor.dtype(), tensor.size());
+            // This buffer is only read after a full H2D copy from the next host batch.
+            let buf = unsafe { Buffer::uninit(&device, tensor.dtype(), tensor.size()) };
             (id.clone(), buf.unwrap())
         })
         .collect();
