@@ -1,6 +1,7 @@
 pub(crate) mod builder;
 mod dataloader;
 pub mod fast_batch;
+pub mod fast_nnue;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
@@ -14,6 +15,7 @@ pub use dataloader::FastValueDataLoader;
 pub use fast_batch::{
     FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs,
 };
+pub use fast_nnue::{FastNnueError, NnueForwardShape, NnueForwardWeights, NNUE_HALFKP_256X2_32_32};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
     Trainer,
