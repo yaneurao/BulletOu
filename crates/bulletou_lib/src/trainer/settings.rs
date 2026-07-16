@@ -34,6 +34,7 @@ pub struct LocalSettings<'a> {
 impl LocalSettings<'_> {
     pub fn display(&self) {
         println!("Threads                : {}", ansi(self.threads, 31));
+        println!("Batch Queue Size       : {}", ansi(self.batch_queue_size, 31));
         println!("Output Path            : {}", ansi(self.output_directory, "32;1"));
     }
 }

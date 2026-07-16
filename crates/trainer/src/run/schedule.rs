@@ -32,4 +32,5 @@ pub struct TrainingSchedule<'a> {
     pub steps: TrainingSteps,
     pub lr_schedule: Box<dyn Fn(usize, usize) -> f32 + 'a>,
     pub log_rate: usize,
+    pub batch_queue_size: usize,
 }

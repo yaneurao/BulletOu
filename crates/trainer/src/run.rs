@@ -39,10 +39,11 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
     );
 
     let timer = Instant::now();
+    let batch_queue_size = schedule.batch_queue_size.max(1);
     let lr = schedule.lr_schedule;
     let steps = schedule.steps;
 
-    let (sender, receiver) = mpsc::sync_channel::<PreparedBatchHost>(32);
+    let (sender, receiver) = mpsc::sync_channel::<PreparedBatchHost>(batch_queue_size);
 
     let dataloader = thread::spawn(move || {
         let mut batch_no = 0;

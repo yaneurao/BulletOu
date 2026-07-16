@@ -170,6 +170,7 @@ where
             run::schedule::TrainingSchedule {
                 steps,
                 log_rate: 128,
+                batch_queue_size: settings.batch_queue_size,
                 lr_schedule: Box::new(|a, b| lr_scheduler.lr(a, b)),
             },
             ValueDataLoader { steps, threads: settings.threads, dataloader, wdl: schedule.wdl_scheduler.clone() },

@@ -228,6 +228,22 @@ cuda-oxide 専用 backend へ進む前の低リスクな改善として、`--bat
 これは fused kernel 化ではないため、tatara 相当の速度にはまだ届かない。
 本命の改善は Phase 1 以降の NNUE/SFNN 専用 cuda-oxide backend で行う。
 
+### Phase 0.6: dataloader queue tuning
+
+`--batch-queue-size` は CLI / `LocalSettings` には存在していたが、低層の
+training loop では固定値 `32` の同期 channel が使われていた。
+
+このため、ユーザーが大きい batch queue を指定しても dataloader の先読み量は
+増えず、CPU decode / batch 構築が GPU に追いつかない条件で調整できなかった。
+
+既存 backend では、`LocalSettings::batch_queue_size` を
+`bullet_trainer::run::TrainingSchedule` に渡し、`sync_channel` の容量として
+そのまま使う。`0` が渡った場合は安全側で `1` に丸める。
+
+これは kernel 自体を速くする変更ではないが、HCPE / HCPE3 decode が重い条件で
+GPU 側を空転させにくくするための土台である。cuda-oxide backend でも同じ考え方で、
+host 側の decode queue と device upload ring を明示的に分離する。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
