@@ -72,7 +72,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
     fn new(device: &Arc<Device<G>>, size: usize, params: Self::Params) -> Result<Self, G::Error> {
         Ok(Self {
             op: build_ranger_op(size, params.alpha).unwrap().compile(device.clone())?,
-            slow_params: Buffer::from_host(device, &TValue::F32(vec![0.0; size]))?,
+            slow_params: Buffer::zeroed(device, DType::F32, size)?,
             inner: S::new(device, size, params.inner.clone())?,
             k: params.k,
             step: 0,
