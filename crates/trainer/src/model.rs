@@ -13,7 +13,7 @@ use bullet_compiler::{
 };
 use bullet_gpu::{
     buffer::{Buffer, SyncOnValue},
-    function::Function,
+    function::{Function, FunctionInput},
     runtime::{Device, Gpu, Stream},
 };
 
@@ -56,7 +56,7 @@ pub struct Model<G: Gpu> {
 }
 
 pub(crate) struct TensorBinding<G: Gpu> {
-    node: NodeId,
+    input: FunctionInput,
     source: TensorSource<G>,
 }
 
@@ -90,10 +90,10 @@ impl<G: Gpu> Model<G> {
         inputs: &TensorMap<G>,
         outputs: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        self.forward.execute_binding_refs(
+        self.forward.execute_resolved_binding_refs(
             stream.clone(),
             self.fwd_bindings.iter().map(|binding| {
-                (binding.node, resolve_tensor_ref(&binding.source, inputs, outputs, None).unwrap())
+                (binding.input, resolve_tensor_ref(&binding.source, inputs, outputs, None).unwrap())
             }),
         )
     }
@@ -113,10 +113,10 @@ impl<G: Gpu> Model<G> {
         outputs: &TensorMap<G>,
         gradients: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        self.backward.execute_binding_refs(
+        self.backward.execute_resolved_binding_refs(
             stream.clone(),
             self.bwd_bindings.iter().map(|binding| {
-                (binding.node, resolve_tensor_ref(&binding.source, inputs, outputs, Some(gradients)).unwrap())
+                (binding.input, resolve_tensor_ref(&binding.source, inputs, outputs, Some(gradients)).unwrap())
             }),
         )
     }
@@ -203,10 +203,11 @@ impl<G: Gpu> Model<G> {
 pub(crate) fn make_tensor_bindings<G: Gpu>(
     map: &BTreeMap<String, NodeId>,
     weights: &TensorMap<G>,
+    function: &Function<G>,
 ) -> Vec<TensorBinding<G>> {
     map.iter()
         .map(|(name, &node)| TensorBinding {
-            node,
+            input: function.input_slot(node).unwrap(),
             source: if let Some(name) = name.strip_prefix("weights/") {
                 TensorSource::Weight(weights.get(name).unwrap().clone())
             } else if let Some(name) = name.strip_prefix("inputs/") {

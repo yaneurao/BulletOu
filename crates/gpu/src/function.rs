@@ -25,6 +25,13 @@ use crate::{
     runtime::{Blas, Device, Dim3, GemmConfig, Gpu, Kernel, Module, Stream},
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct FunctionInput {
+    idx: usize,
+    is_mut: bool,
+    ty: TType,
+}
+
 #[derive(Debug)]
 enum Arg {
     Pointer { idx: usize },
@@ -60,7 +67,7 @@ enum Inst<G: Gpu> {
 
 pub struct Function<G: Gpu> {
     device: Arc<Device<G>>,
-    maps: Box<[(NodeId, (usize, bool, TType))]>,
+    maps: Box<[(NodeId, FunctionInput)]>,
     insts: Box<[Inst<G>]>,
     num_ptrs: usize,
     blas: Option<Blas<G>>,
@@ -144,9 +151,9 @@ impl<G: Gpu> Function<G> {
             for &output in op.outputs() {
                 if ir.is_input(output)? {
                     let input = op.outputs()[0];
-                    maps.insert(input, (num_ptrs, false, ir.get_node(input)?.ty()));
+                    maps.insert(input, FunctionInput { idx: num_ptrs, is_mut: false, ty: ir.get_node(input)?.ty() });
                 } else if ir.is_output(output) {
-                    maps.insert(output, (num_ptrs, true, ir.get_node(output)?.ty()));
+                    maps.insert(output, FunctionInput { idx: num_ptrs, is_mut: true, ty: ir.get_node(output)?.ty() });
                 } else {
                     insts.push(Inst::Malloc { idx: num_ptrs, ty: ir.get_node(output)?.ty() });
                     times_seen.insert(output, 0);
@@ -284,6 +291,34 @@ impl<G: Gpu> Function<G> {
     where
         G: 'a,
     {
+        let inputs = inputs
+            .into_iter()
+            .map(|(name, buffer)| -> Result<_, G::Error> {
+                let input = match self.input_slot(name) {
+                    Some(input) => input,
+                    None => return Err(String::from("Input not in function!").into()),
+                };
+                Ok((input, buffer))
+            })
+            .collect::<Result<Vec<_>, G::Error>>()?;
+        self.execute_resolved_binding_refs(stream, inputs)
+    }
+
+    pub fn input_slot(&self, node: NodeId) -> Option<FunctionInput> {
+        self.maps
+            .binary_search_by_key(&node, |(node, _)| *node)
+            .ok()
+            .map(|idx| self.maps[idx].1)
+    }
+
+    pub fn execute_resolved_binding_refs<'a>(
+        &self,
+        stream: Arc<Stream<G>>,
+        inputs: impl IntoIterator<Item = (FunctionInput, &'a Arc<Buffer<G>>)>,
+    ) -> Result<SyncOnValue<G, &Self>, G::Error>
+    where
+        G: 'a,
+    {
         let inputs = inputs.into_iter();
         let input_capacity = inputs.size_hint().0;
         let mut sync = SyncOnDrop::with_capacity(stream.clone(), input_capacity);
@@ -296,13 +331,8 @@ impl<G: Gpu> Function<G> {
         }
         let mut var_size = None;
 
-        for (name, buf) in inputs {
-            let (_, (idx, is_mut, ty)) = *self
-                .maps
-                .binary_search_by_key(&name, |(node, _)| *node)
-                .ok()
-                .map(|idx| &self.maps[idx])
-                .ok_or("Input not in function!".into())?;
+        for (input, buf) in inputs {
+            let FunctionInput { idx, is_mut, ty } = input;
             let size = ty.size();
 
             if buf.dtype() != ty.dtype() {

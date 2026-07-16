@@ -393,6 +393,8 @@ batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tenso
 `Function` 内部の NodeId→pointer slot 対応も、実行時に `BTreeMap` を引く必要はない。
 構築時にだけ map を作り、実行時はソート済み slice の binary search にすることで、
 forward/backward の binding 解決で tree node を辿る overhead を減らす。
+Model の forward/backward 経路ではさらに、`TensorBinding` 構築時に `FunctionInput`
+slot まで解決しておき、batch 中は NodeId lookup 自体を行わない。
 
 training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` を batch ごとに
 新規作成する必要はない。loop 外で 2 つの scalar host buffer を確保し、batch ごとに値だけ
