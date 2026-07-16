@@ -449,6 +449,10 @@ input 数は 5〜6 個なので tree 構築より安い。
 通常 batch ではこの plan に従って H2D copy し、input 名の探索を避ける。DataLoader が input
 順序を変えた場合だけ、名前確認の fallback に落とす。
 
+checkpoint / weight 書き出しでは、tensor ごとに一時 byte buffer を作って全体 buffer へ
+積み直す必要はない。同じ raw format のまま writer へ逐次書きし、save 時の余分な allocation と
+peak memory を減らす。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

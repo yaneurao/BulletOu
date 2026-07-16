@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bullet_gpu::{buffer::Buffer, runtime::Gpu};
 
-use crate::model::utils::{read_from_byte_buffer, write_to_byte_buffer};
+use crate::model::utils::{read_from_byte_buffer, write_to_writer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -12,18 +12,13 @@ pub enum Placement {
 
 /// Write a set of labelled weights from a `BTreeMap` into a file.
 pub fn write_weights_to_file<G: Gpu>(map: &[(impl AsRef<str>, &Arc<Buffer<G>>)], path: &str) -> Result<(), G::Error> {
-    use std::{fs::File, io::Write};
-
-    let mut buf = Vec::new();
-
-    for (id, weights) in map {
-        let this_buf = (*weights).clone().to_host()?;
-        let byte_buf = write_to_byte_buffer(&this_buf, id.as_ref()).unwrap();
-        buf.extend_from_slice(&byte_buf);
-    }
+    use std::fs::File;
 
     let mut file = File::create(path).unwrap();
-    file.write_all(&buf).unwrap();
+    for (id, weights) in map {
+        let this_buf = weights.to_host()?;
+        write_to_writer(&this_buf, id.as_ref(), &mut file).unwrap();
+    }
 
     Ok(())
 }

@@ -155,19 +155,14 @@ impl<G: Gpu> Model<G> {
     /// Writes the weights of a graph to a file. If `gradients` is true,
     /// it will instead write the gradients of those weights.
     pub fn write_to(&self, writer: &mut impl std::io::Write) -> Result<(), G::Error> {
-        let mut buf = Vec::new();
-
-        for (id, value) in self.weights.clone() {
+        for (id, value) in &self.weights {
             if value.dtype() != DType::F32 {
                 unimplemented!("Non f32 writing!");
             }
 
-            let this_buf = value.clone().to_host()?;
-            let byte_buf = utils::write_to_byte_buffer(&this_buf, &id).unwrap();
-            buf.extend_from_slice(&byte_buf);
+            let this_buf = value.to_host()?;
+            utils::write_to_writer(&this_buf, id, writer).unwrap();
         }
-
-        writer.write_all(&buf).unwrap();
 
         Ok(())
     }
@@ -182,7 +177,7 @@ impl<G: Gpu> Model<G> {
 
         while offset < buf.len() {
             let (buffer, id, bytes_read) = utils::read_from_byte_buffer(&buf[offset..]);
-            let weights = self.weights.get(&id).expect("No weight with ID found!").clone();
+            let weights = self.weights.get(&id).expect("No weight with ID found!");
 
             if weights.dtype() != DType::F32 {
                 unimplemented!("Non f32 writing!");

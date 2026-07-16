@@ -1,7 +1,13 @@
 use bullet_compiler::tensor::TValue;
 
 pub fn write_to_byte_buffer(value: &TValue, id: &str) -> std::io::Result<Vec<u8>> {
-    use std::io::{Error, ErrorKind, Write};
+    let mut buf = Vec::new();
+    write_to_writer(value, id, &mut buf)?;
+    Ok(buf)
+}
+
+pub fn write_to_writer(value: &TValue, id: &str, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
 
     let TValue::F32(value) = value else { unimplemented!() };
 
@@ -13,20 +19,15 @@ pub fn write_to_byte_buffer(value: &TValue, id: &str) -> std::io::Result<Vec<u8>
         return Err(Error::new(ErrorKind::InvalidInput, "IDs may not contain newlines!"));
     }
 
-    let mut id_bytes = id.chars().map(|ch| ch as u8).collect::<Vec<_>>();
-
-    id_bytes.push(b'\n');
-
-    let mut buf = Vec::new();
-
-    buf.write_all(&id_bytes)?;
-    buf.write_all(&usize::to_le_bytes(value.len()))?;
+    writer.write_all(id.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.write_all(&usize::to_le_bytes(value.len()))?;
 
     for &val in value {
-        buf.write_all(&f32::to_le_bytes(val))?;
+        writer.write_all(&f32::to_le_bytes(val))?;
     }
 
-    Ok(buf)
+    Ok(())
 }
 
 pub fn read_from_byte_buffer(bytes: &[u8]) -> (Vec<f32>, String, usize) {

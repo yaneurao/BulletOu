@@ -206,8 +206,8 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
     }
 
     pub fn set_params(&mut self, params: S::Params) {
-        for id in self.model.weights().clone().keys() {
-            self.set_params_for_weight(id, params.clone());
+        for single in self.state.values_mut() {
+            single.set_params(params.clone()).unwrap();
         }
     }
 
