@@ -4,11 +4,13 @@
 use crate::{CudaStream, DeviceBuffer, Result};
 
 pub const LOSS_SIGMOID_MSE_REDUCE_KERNEL: &str = "loss_sigmoid_mse_reduce";
-pub const LOSS_KERNEL_NAMES: [&str; 1] = [LOSS_SIGMOID_MSE_REDUCE_KERNEL];
+pub const LOSS_NNUE_PYTORCH_WRM_REDUCE_KERNEL: &str = "loss_nnue_pytorch_wrm_reduce";
+pub const LOSS_KERNEL_NAMES: [&str; 2] = [LOSS_SIGMOID_MSE_REDUCE_KERNEL, LOSS_NNUE_PYTORCH_WRM_REDUCE_KERNEL];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarLossKind {
     SigmoidMse,
+    NnuePytorchWrm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +137,7 @@ mod tests {
 
     #[test]
     fn kernel_names_are_stable() {
-        assert_eq!(LOSS_KERNEL_NAMES, ["loss_sigmoid_mse_reduce"]);
+        assert_eq!(LOSS_KERNEL_NAMES, ["loss_sigmoid_mse_reduce", "loss_nnue_pytorch_wrm_reduce"]);
     }
 
     #[test]

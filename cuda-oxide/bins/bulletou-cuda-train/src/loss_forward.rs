@@ -45,6 +45,43 @@ pub(crate) fn launch_sigmoid_mse_loss(
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) fn launch_nnue_pytorch_wrm_loss(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    batch: &ScalarLossDeviceBatch,
+    workspace: &mut ScalarLossWorkspace,
+) -> Result<()> {
+    validate_loss_layout(batch, workspace)?;
+
+    let layout = workspace.layout;
+    let plan = ScalarLossLaunchPlan::new(layout);
+    let batch_size = layout.batch_size as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `loss_nnue_pytorch_wrm_reduce`; all
+        // buffers are device allocations owned by the same CUDA context and
+        // live until the caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::loss::loss_nnue_pytorch_wrm_reduce,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.reduce_threads),
+            args: [
+                slice(batch.outputs),
+                slice(batch.targets),
+                slice(batch.entry_weights),
+                slice_mut(workspace.per_sample),
+                slice_mut(workspace.weighted_sum),
+                slice_mut(workspace.mean),
+                batch_size
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
 fn validate_loss_layout(batch: &ScalarLossDeviceBatch, workspace: &ScalarLossWorkspace) -> Result<()> {
     expect_layout_value("batch_size", workspace.layout.batch_size, batch.batch_size)
 }

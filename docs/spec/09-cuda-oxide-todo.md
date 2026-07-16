@@ -171,3 +171,29 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   replace this shim.
 - Remaining CO-008/CO-009 work: WRM value loss / target transform variants,
   parallel reduction, and backward gradients.
+
+### 2026-07-17 CO-008 WRM value loss extension
+
+- Added `ScalarValueLossKind::NnuePytorchWrm` to the root CPU golden. The
+  formula matches `examples/bulletou.rs`: `scorenet = output * 600`,
+  `q = sigmoid((scorenet - 270) / 340)`,
+  `qm = sigmoid((-scorenet - 270) / 340)`,
+  `prediction = (1 + q - qm) * 0.5`, and
+  `abs(prediction - target)^2.5`.
+- Added CUDA kernel `loss_nnue_pytorch_wrm_reduce`, using
+  `core::intrinsics::expf32` and `core::intrinsics::powf32` for libdevice
+  lowering.
+- Added `--loss-kind sigmoid-mse|wrm` to `bulletou-cuda-train --loss-smoke`.
+- Validation:
+  - `cargo test -p bulletou_lib fast_loss` succeeded.
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime loss` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--loss-kind wrm --loss-case tiny --debug-readback`: sum/mean/per_sample
+    max_abs diff `0`.
+  - `--loss-kind wrm --loss-case weighted --debug-readback`: sum/mean max_abs
+    diff `0`; per_sample max_abs diff `0.0000000000000008881784`.
+  - Regression `--loss-kind sigmoid-mse --loss-case weighted --debug-readback`
+    remained within tolerance: sum max_abs diff `0.0000000009313226`;
+    mean max_abs diff `0.00000000023283064`; per_sample max_abs diff `0`.

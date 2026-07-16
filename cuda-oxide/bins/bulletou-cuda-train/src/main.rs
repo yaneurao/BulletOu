@@ -45,6 +45,7 @@ struct Args {
     device: usize,
     tolerance: f32,
     debug_readback: bool,
+    loss_kind: LossKind,
     loss_case: LossCaseKind,
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
@@ -61,6 +62,13 @@ enum SmokeMode {
     Loss,
     NnueForward,
     SfnnForward,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossKind {
+    SigmoidMse,
+    NnuePytorchWrm,
 }
 
 #[cfg(feature = "cuda")]
@@ -95,6 +103,7 @@ impl Args {
             device: 0,
             tolerance: 1.0e-5,
             debug_readback: false,
+            loss_kind: LossKind::SigmoidMse,
             loss_case: LossCaseKind::Tiny,
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
@@ -116,6 +125,9 @@ impl Args {
                 }
                 "--tolerance" => {
                     parsed.tolerance = parse_f32_arg(required_arg(&mut args, "--tolerance")?, "--tolerance")?;
+                }
+                "--loss-kind" => {
+                    parsed.loss_kind = parse_loss_kind(required_arg(&mut args, "--loss-kind")?)?;
                 }
                 "--loss-case" => {
                     parsed.loss_case = parse_loss_case(required_arg(&mut args, "--loss-case")?)?;
@@ -179,7 +191,7 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     };
 
     let case = LossSmokeCase::new(args.loss_case);
-    let cpu_trace = case.cpu_loss_trace();
+    let cpu_trace = case.cpu_loss_trace(args.loss_kind);
     let ptx = match args.ptx {
         Some(ptx) => ptx,
         None => default_nnue_ptx()?,
@@ -198,7 +210,12 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     let layout = ScalarLossLayout::new(case.outputs.len());
     let mut workspace = ScalarLossWorkspace::new(&stream, layout)?;
 
-    loss_forward::launch_sigmoid_mse_loss(&stream, &module, &device_batch, &mut workspace)?;
+    match args.loss_kind {
+        LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss(&stream, &module, &device_batch, &mut workspace)?,
+        LossKind::NnuePytorchWrm => {
+            loss_forward::launch_nnue_pytorch_wrm_loss(&stream, &module, &device_batch, &mut workspace)?
+        }
+    }
     stream.synchronize()?;
 
     let gpu_sum = workspace.weighted_sum.to_host_vec(&stream)?;
@@ -209,6 +226,7 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     println!("bulletou-cuda-train scalar loss smoke");
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
+    println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
     println!("  case         : {}", case.label);
     println!("  batch        : {} samples", case.outputs.len());
     println!("  tolerance    : {}", args.tolerance);
@@ -519,6 +537,15 @@ fn parse_f32_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_run
 }
 
 #[cfg(feature = "cuda")]
+fn parse_loss_kind(value: String) -> bulletou_cuda_oxide_runtime::Result<LossKind> {
+    match value.as_str() {
+        "sigmoid-mse" | "sigmoid_mse" => Ok(LossKind::SigmoidMse),
+        "wrm" | "nnue-pytorch-wrm" | "nnue_pytorch_wrm" => Ok(LossKind::NnuePytorchWrm),
+        _ => usage_error(format!("--loss-kind must be one of: sigmoid-mse, wrm (got {value})")),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn parse_loss_case(value: String) -> bulletou_cuda_oxide_runtime::Result<LossCaseKind> {
     match value.as_str() {
         "tiny" => Ok(LossCaseKind::Tiny),
@@ -549,7 +576,7 @@ fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
-       bulletou-cuda-train --loss-smoke [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --loss-smoke [--loss-kind sigmoid-mse|wrm] [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
@@ -680,18 +707,24 @@ impl LossSmokeCase {
         }
     }
 
-    fn cpu_loss_trace(&self) -> LossSmokeTrace {
+    fn cpu_loss_trace(&self, kind: LossKind) -> LossSmokeTrace {
         let mut per_sample = Vec::with_capacity(self.outputs.len());
         let mut weighted_sum = 0.0_f32;
         for ((&output, &target), &entry_weight) in self.outputs.iter().zip(&self.targets).zip(&self.entry_weights) {
-            let prediction = sigmoid(output);
-            let error = prediction - target;
-            let weighted = entry_weight * error * error;
+            let weighted = entry_weight * loss_value(kind, output, target);
             per_sample.push(weighted);
             weighted_sum += weighted;
         }
         let mean = weighted_sum / self.outputs.len() as f32;
         LossSmokeTrace { per_sample, weighted_sum, mean }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn loss_kind_label(kind: LossKind) -> &'static str {
+    match kind {
+        LossKind::SigmoidMse => "sigmoid-mse",
+        LossKind::NnuePytorchWrm => "wrm",
     }
 }
 
@@ -1414,6 +1447,32 @@ fn fill_sfnn_l2_input(l1: &[f32], l1_hidden: usize, out: &mut [f32]) {
         out[row] = (l1[row].abs() * l1[row].abs() * SCALE).clamp(0.0, 1.0);
         out[l1_hidden + row] = l1[row].clamp(0.0, 1.0);
     }
+}
+
+#[cfg(feature = "cuda")]
+fn loss_value(kind: LossKind, output: f32, target: f32) -> f32 {
+    match kind {
+        LossKind::SigmoidMse => {
+            let prediction = sigmoid(output);
+            let error = prediction - target;
+            error * error
+        }
+        LossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss(output, target),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
+    const NNUE2SCORE: f32 = 600.0;
+    const IN_OFFSET: f32 = 270.0;
+    const IN_SCALING: f32 = 340.0;
+    const POW_EXP: f32 = 2.5;
+
+    let scorenet = output * NNUE2SCORE;
+    let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
+    let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
+    let prediction = (1.0 + q - qm) * 0.5;
+    (prediction - target).abs().powf(POW_EXP)
 }
 
 #[cfg(feature = "cuda")]

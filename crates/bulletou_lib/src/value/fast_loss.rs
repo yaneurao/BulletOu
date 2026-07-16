@@ -9,6 +9,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarValueLossKind {
     SigmoidMse,
+    NnuePytorchWrm,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +60,7 @@ pub fn scalar_value_loss_trace(
                 let error = prediction - target;
                 error * error
             }
+            ScalarValueLossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss(output, target),
         };
         let weighted = entry_weight * loss;
         per_sample.push(weighted);
@@ -79,6 +81,19 @@ fn expect_len(name: &'static str, expected: usize, actual: usize) -> Result<(), 
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
+    const NNUE2SCORE: f32 = 600.0;
+    const IN_OFFSET: f32 = 270.0;
+    const IN_SCALING: f32 = 340.0;
+    const POW_EXP: f32 = 2.5;
+
+    let scorenet = output * NNUE2SCORE;
+    let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
+    let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
+    let prediction = (1.0 + q - qm) * 0.5;
+    (prediction - target).abs().powf(POW_EXP)
 }
 
 #[cfg(test)]
@@ -109,6 +124,20 @@ mod tests {
 
         assert_eq!(trace.per_sample[0], 0.0);
         assert!(trace.per_sample[1] > 0.999);
+    }
+
+    #[test]
+    fn nnue_pytorch_wrm_loss_matches_known_values() {
+        let outputs = [-4.0, -1.25, 0.0, 1.5, 4.0];
+        let targets = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let weights = [1.0, 0.0, 0.5, 2.0, 0.25];
+
+        let trace = scalar_value_loss_trace(ScalarValueLossKind::NnuePytorchWrm, &outputs, &targets, &weights).unwrap();
+
+        assert_eq!(trace.kind, ScalarValueLossKind::NnuePytorchWrm);
+        assert_close_slice("per_sample", &trace.per_sample, &[4.4222793e-8, 0.0, 0.0, 0.022698434, 1.1055698e-8]);
+        assert_close("weighted_sum", trace.weighted_sum, 0.022698488);
+        assert_close("mean", trace.mean, 0.0045396974);
     }
 
     #[test]
