@@ -219,7 +219,7 @@ impl<G: Gpu> Buffer<G> {
 
     /// Copy buffer to host on the given stream
     pub fn to_host_async(self: &Arc<Self>, stream: &Arc<Stream<G>>) -> Result<SyncOnValue<G, TValue>, G::Error> {
-        let guard = self.clone().acquire(stream.clone())?;
+        let guard = self.acquire(stream.clone())?;
         let mut value = TValue::zeros(guard.dtype, guard.size);
 
         unsafe {
@@ -267,7 +267,7 @@ impl<G: Gpu> Buffer<G> {
 
         unsafe {
             let mut sync = SyncOnDrop::with_capacity(stream.clone(), 1);
-            let guard = self.clone().acquire(stream.clone())?;
+            let guard = self.acquire(stream.clone())?;
 
             stream.memcpy_h2d(value.ptr(), guard.ptr(), guard.bytes())?;
 

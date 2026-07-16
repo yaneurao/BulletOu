@@ -48,7 +48,7 @@ impl PreparedBatchHost {
             }
 
             unsafe {
-                let guard = tensor.clone().acquire(stream.clone())?;
+                let guard = tensor.acquire(stream.clone())?;
                 stream.memcpy_h2d(value.ptr(), guard.ptr(), guard.bytes())?;
                 sync.attach(guard)?;
             }

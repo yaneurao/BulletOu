@@ -214,7 +214,7 @@ impl<G: Gpu> CompiledKernel<G> {
         let mut var_size = None;
 
         for (input, &ttype) in inputs.iter().zip(&self.inputs) {
-            let guard = input.clone().acquire(stream.clone())?;
+            let guard = input.acquire(stream.clone())?;
             if guard.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());
             }
@@ -237,7 +237,7 @@ impl<G: Gpu> CompiledKernel<G> {
         }
 
         for (output, &ttype) in outputs.iter().zip(&self.outputs) {
-            let guard = output.clone().acquire(stream.clone())?;
+            let guard = output.acquire(stream.clone())?;
             if guard.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());
             }
