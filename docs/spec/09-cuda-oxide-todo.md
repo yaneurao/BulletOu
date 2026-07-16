@@ -305,3 +305,28 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     `0.00000000000017053026`.
 - Remaining CO-009 work: actual optimizer integration / gradient buffer
   plumbing and the analogous SFNN stacked dense/backward path.
+
+### 2026-07-17 CO-009 SFNN output backward first slice
+
+- Added cuda-oxide runtime layout for SFNN stacked L3 output backward:
+  `SfnnStackedL3BackwardLayout { batch_size, l2_size, l1_out, num_stacks }`.
+- Added CUDA kernel `sfnn_stacked_l3_backward`:
+  - computes `l2_gradients[sample, row]`;
+  - writes the L1 skip-connection gradient at `l1_hidden`;
+  - accumulates stacked `l3w_gradients[row, stack]`;
+  - accumulates stacked `l3b_gradients[stack]`.
+- Added host launcher and CLI smoke:
+  `bulletou-cuda-train --sfnn-output-backward-smoke`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--sfnn-output-backward-smoke --debug-readback` tiny case succeeded:
+    `l2_grad`, `l1_grad`, `l3w_grad`, and `l3b_grad` max_abs diff `0`.
+  - `--sfnn-output-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
+    succeeded for `SFNN_halfka2_1024_7_64_k3k3`: all compared buffers
+    max_abs diff `0`.
+- Remaining CO-009 work: SFNN L2 CReLU backward, L2-input transform backward,
+  stacked L1 backward, pairwise/L0 backward, and integration into trainer
+  gradient buffers.

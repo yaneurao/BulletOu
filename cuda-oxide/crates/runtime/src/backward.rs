@@ -4,11 +4,13 @@ pub const DENSE_OUTPUT_BACKWARD_KERNEL: &str = "dense_output_backward";
 pub const DENSE_CRELU_BACKWARD_KERNEL: &str = "dense_crelu_backward";
 pub const NNUE_L0_CRELU_BACKWARD_KERNEL: &str = "nnue_l0_crelu_backward";
 pub const NNUE_L0_SPARSE_BACKWARD_KERNEL: &str = "nnue_l0_sparse_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 4] = [
+pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 5] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
     NNUE_L0_SPARSE_BACKWARD_KERNEL,
+    SFNN_STACKED_L3_BACKWARD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +183,58 @@ impl NnueL0SparseBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnStackedL3BackwardLayout {
+    pub batch_size: usize,
+    pub l2_size: usize,
+    pub l1_out: usize,
+    pub num_stacks: usize,
+}
+
+impl SfnnStackedL3BackwardLayout {
+    pub fn new(batch_size: usize, l2_size: usize, l1_out: usize, num_stacks: usize) -> Self {
+        Self { batch_size, l2_size, l1_out, num_stacks }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.l2_size == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.l1_out == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else if self.num_stacks == 0 {
+            Err(BackwardLayoutError::EmptyStack)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn output_gradients_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn input_gradients_len(self) -> usize {
+        self.batch_size * self.l2_size
+    }
+
+    pub fn l1_gradients_len(self) -> usize {
+        self.batch_size * self.l1_out
+    }
+
+    pub fn weight_len(self) -> usize {
+        self.l2_size * self.num_stacks
+    }
+
+    pub fn bias_len(self) -> usize {
+        self.num_stacks
+    }
+
+    pub fn gradient_threads(self) -> usize {
+        self.input_gradients_len().max(self.l1_gradients_len()).max(self.weight_len()).max(self.bias_len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -226,6 +280,17 @@ impl NnueL0SparseBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnStackedL3BackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnStackedL3BackwardLaunchPlan {
+    pub fn new(layout: SfnnStackedL3BackwardLayout) -> Self {
+        Self { threads: layout.gradient_threads().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -236,6 +301,8 @@ pub enum BackwardLayoutError {
     EmptyOutput,
     #[error("backward sparse list must contain at least one slot")]
     EmptySparse,
+    #[error("backward stack count must be at least one")]
+    EmptyStack,
 }
 
 #[cfg(test)]
@@ -246,7 +313,13 @@ mod tests {
     fn kernel_names_are_stable() {
         assert_eq!(
             BACKWARD_KERNEL_NAMES,
-            ["dense_output_backward", "dense_crelu_backward", "nnue_l0_crelu_backward", "nnue_l0_sparse_backward"]
+            [
+                "dense_output_backward",
+                "dense_crelu_backward",
+                "nnue_l0_crelu_backward",
+                "nnue_l0_sparse_backward",
+                "sfnn_stacked_l3_backward"
+            ]
         );
     }
 
@@ -332,6 +405,39 @@ mod tests {
         assert_eq!(
             NnueL0SparseBackwardLayout::new(3, 5, 7, 0).validate().unwrap_err(),
             BackwardLayoutError::EmptyOutput
+        );
+    }
+
+    #[test]
+    fn sfnn_stacked_l3_layout_counts_buffers() {
+        let layout = SfnnStackedL3BackwardLayout::new(3, 5, 4, 2);
+
+        assert_eq!(layout.output_gradients_len(), 3);
+        assert_eq!(layout.input_gradients_len(), 15);
+        assert_eq!(layout.l1_gradients_len(), 12);
+        assert_eq!(layout.weight_len(), 10);
+        assert_eq!(layout.bias_len(), 2);
+        assert_eq!(layout.gradient_threads(), 15);
+        assert_eq!(SfnnStackedL3BackwardLaunchPlan::new(layout).threads, 15);
+    }
+
+    #[test]
+    fn sfnn_stacked_l3_layout_rejects_empty_values() {
+        assert_eq!(
+            SfnnStackedL3BackwardLayout::new(0, 5, 4, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            SfnnStackedL3BackwardLayout::new(3, 0, 4, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            SfnnStackedL3BackwardLayout::new(3, 5, 0, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
+        assert_eq!(
+            SfnnStackedL3BackwardLayout::new(3, 5, 4, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyStack
         );
     }
 }

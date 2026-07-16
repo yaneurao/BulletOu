@@ -203,6 +203,81 @@ pub fn nnue_l0_sparse_backward(
     }
 }
 
+#[kernel]
+pub fn sfnn_stacked_l3_backward(
+    inputs: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    buckets: &[i32],
+    mut input_gradients: DisjointSlice<f32>,
+    mut l1_gradients: DisjointSlice<f32>,
+    mut weight_gradients: DisjointSlice<f32>,
+    mut bias_gradients: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    l1_out: u32,
+    num_stacks: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let rows = input_dim as usize;
+    let l1_rows = l1_out as usize;
+    let stacks = num_stacks as usize;
+    let input_gradient_len = batch_size * rows;
+    let l1_gradient_len = batch_size * l1_rows;
+    let weight_len = rows * stacks;
+
+    if tid_value < input_gradient_len {
+        let sample = tid_value / rows;
+        let row = tid_value - sample * rows;
+        let stack_i32 = buckets[sample];
+        let value = if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            output_gradients[sample] * weights[row * stacks + stack_i32 as usize]
+        } else {
+            0.0_f32
+        };
+        if let Some(out) = input_gradients.get_mut(tid) {
+            *out = value;
+        }
+    }
+
+    if tid_value < l1_gradient_len {
+        let sample = tid_value / l1_rows;
+        let col = tid_value - sample * l1_rows;
+        let value = if col + 1 == l1_rows { output_gradients[sample] } else { 0.0_f32 };
+        if let Some(out) = l1_gradients.get_mut(thread::index_1d()) {
+            *out = value;
+        }
+    }
+
+    if tid_value < weight_len {
+        let row = tid_value / stacks;
+        let stack = tid_value - row * stacks;
+        let mut sum = 0.0_f32;
+        for sample in 0..batch_size {
+            if buckets[sample] == stack as i32 {
+                sum += output_gradients[sample] * inputs[sample * rows + row];
+            }
+        }
+        if let Some(out) = weight_gradients.get_mut(thread::index_1d()) {
+            *out = sum;
+        }
+    }
+
+    if tid_value < stacks {
+        let mut sum = 0.0_f32;
+        for sample in 0..batch_size {
+            if buckets[sample] == tid_value as i32 {
+                sum += output_gradients[sample];
+            }
+        }
+        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
+            *out = sum;
+        }
+    }
+}
+
 #[cuda_device::device]
 fn dense_crelu_pre_gradient(
     activations: &[f32],
