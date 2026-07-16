@@ -84,11 +84,11 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for WeightDecay<G, S> {
         let mut blocks = OptimiserUpdateSync::default();
 
         if self.placement == Placement::Before {
-            blocks.push_kernel(self.op.execute(stream.clone(), Vec::new(), vec![weights.clone()])?);
+            blocks.push_kernel(self.op.execute_slices(stream.clone(), &[], &[weights.clone()])?);
             blocks.extend_by(self.inner.update(stream, weights, grads, gradient_factor, learning_rate)?);
         } else {
             blocks.extend_by(self.inner.update(stream, weights.clone(), grads, gradient_factor, learning_rate)?);
-            blocks.push_kernel(self.op.execute(stream.clone(), Vec::new(), vec![weights])?);
+            blocks.push_kernel(self.op.execute_slices(stream.clone(), &[], &[weights])?);
         }
 
         Ok(blocks)

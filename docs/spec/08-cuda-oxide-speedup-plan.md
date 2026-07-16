@@ -357,6 +357,8 @@ launch 引数、device pointer 引数配列を kernel 呼び出しごとに再�
 `vec![...]` ではなく stack 上の配列参照を渡す。各 weight ごとの optimizer kernel launch で
 入力/出力 buffer リスト用の heap allocation を避けるための変更であり、GPU kernel の内容や
 同期順序は変えない。
+同じく optimizer の補助 kernel である weight decay / weight clipping も
+`execute_slices` 経由に揃え、pre/post update の小さな allocation を避ける。
 
 forward/backward では `TensorBinding` を事前計算しているが、実行時の binding 解決で
 `Arc<Buffer>` を clone して `Function` に渡す必要はない。`Function::execute_binding_refs`
