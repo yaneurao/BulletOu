@@ -153,7 +153,7 @@ impl<G: Gpu> CompiledKernel<G> {
         let outputs =
             outputs.iter().map(|o| o.clone().acquire(stream.clone())).collect::<Result<Vec<BufferGuard<G>>, _>>()?;
 
-        let mut vars = BTreeSet::new();
+        let mut var_size = None;
 
         if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
             return Err("Mismatched number of inputs/outputs!".to_string().into());
@@ -166,19 +166,21 @@ impl<G: Gpu> CompiledKernel<G> {
 
             let concrete_size = buf.size();
             if let Some(var) = ttype.size().get_var_size(concrete_size) {
-                vars.insert(var);
+                match var_size {
+                    None => var_size = Some(var),
+                    Some(old_var) if old_var == var => {}
+                    Some(old_var) => {
+                        return Err(format!("Mismatching batch sizes in inputs: {old_var} != {var}").into());
+                    }
+                }
             } else if ttype.size().evaluate_constant().unwrap() != concrete_size {
                 return Err("Mismatched sizes!".to_string().into());
             }
         }
 
-        let var = match vars.len() {
-            0 => 1,
-            1 => *vars.iter().next().unwrap(),
-            _ => return Err(format!("Mismatching batch sizes in inputs: {vars:?}").into()),
-        };
+        let var = var_size.unwrap_or(1);
 
-        let mut args: Vec<*mut c_void> = Vec::new();
+        let mut args: Vec<*mut c_void> = Vec::with_capacity(self.arg_order.len() + usize::from(self.requires_var_size_arg));
 
         let size = var as i32;
         if self.requires_var_size_arg {

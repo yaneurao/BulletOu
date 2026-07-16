@@ -338,6 +338,11 @@ kernel launch 引数も同様に、launch ごとに小さな `Vec` を作る必�
 `Function::execute` 内で `max_num_args` 分の引数 buffer を 1 つ確保し、各 kernel launch で
 `clear()` して再利用する。これは GPU 計算順序や数値に影響しない host-side allocation 削減である。
 
+optimizer の weight ごとの update kernel は `CompiledKernel::execute` を大量に呼ぶため、
+ここでも小さな allocation が積み重なる。可変 batch size の一致確認は `BTreeSet` ではなく
+`Option<usize>` で十分なので、set allocation を避ける。また launch 引数 `Vec` は必要容量を
+事前に確保する。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
