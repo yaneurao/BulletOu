@@ -263,6 +263,10 @@ current batch の compute sync を先に待ってから copy stream を同期す
 1 つの `SyncOnDrop` にまとめる。これにより、同じ copy stream への同期呼び出しを
 input tensor 数ぶん繰り返す無駄を避ける。
 
+また、`SyncOnDrop::sync(self)` は明示 sync 後に `Drop` で再度 sync しないようにする。
+従来は `sync(self)` が `self` を消費したあと `synced=false` のまま drop されるため、
+明示 `sync()` が二重の stream sync になっていた。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
