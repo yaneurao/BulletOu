@@ -32,3 +32,15 @@ status を更新する。
 - 数値が変わる高速化は opt-in にする。
 - 速度比較は fp32 baseline の 1 batch 数値一致後に行う。
 - KPPT / KPP_KKPT は今回の cuda-oxide 高速化対象外とする。
+
+## CO-006 minimal NNUE forward 内訳
+
+- done: `FastBatchHost` sparse padding を `-1` sentinel に統一。
+- done: `FastBatchHost` から 1 sample の `stm` / `nstm` sparse slice を取り出す API を追加。
+- done: `NNUE_HALFKP_256x2_32_32` の CPU scalar golden forward を追加。
+- done: root 側に owned weight layout と workspace layout を追加。
+- done: nested `cuda-oxide` runtime 側に weight / workspace / launch plan layout を追加。
+- done: nested `cuda-oxide` runtime 側に forward kernel set resolve 境界を追加。
+- todo: `nnue_sparse_l0_crelu` kernel を実装し、CPU golden の L0 出力と比較する。
+- todo: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` を実装する。
+- todo: host launch sequence を実装し、1 batch の最終 output を CPU golden と比較する。
