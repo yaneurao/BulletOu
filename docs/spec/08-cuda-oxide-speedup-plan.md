@@ -403,6 +403,8 @@ push する。事前確保により launch 直前の pointer は安定し、GPU 
 `kernel_args` を forward/backward 呼び出しごとに再利用する。kernel launch は host pointer 配列を
 launch 呼び出し中に読むだけなので、launch 後に scratch を再利用しても GPU 側の実行内容は変わらない。
 これにより graph 実行ごとの短命な `Vec` allocation を避ける。
+pointer slot 数は graph 構築後に固定なので、`ptrs` は最初に固定長で確保し、各実行で
+default 値を詰め直さない。必要な slot は入力 binding または `Malloc` 命令で実行前に上書きされる。
 
 `SyncOnDrop` は attach される guard 数が分かっている呼び出し経路では容量を事前確保する。
 `Function::execute_binding_refs` と `CompiledKernel::execute_slices` で guard list の再確保を避ける。

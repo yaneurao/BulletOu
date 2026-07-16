@@ -86,7 +86,7 @@ struct FunctionScratch<G: Gpu> {
 impl<G: Gpu> FunctionScratch<G> {
     fn new(num_ptrs: usize, max_num_args: usize) -> Self {
         Self {
-            ptrs: Vec::with_capacity(num_ptrs),
+            ptrs: vec![G::DevicePtr::default(); num_ptrs],
             aliases: Vec::new(),
             sizes: Vec::with_capacity(max_num_args),
             kernel_args: Vec::with_capacity(max_num_args),
@@ -94,8 +94,7 @@ impl<G: Gpu> FunctionScratch<G> {
     }
 
     fn prepare(&mut self, num_ptrs: usize) {
-        self.ptrs.clear();
-        self.ptrs.resize(num_ptrs, G::DevicePtr::default());
+        debug_assert_eq!(self.ptrs.len(), num_ptrs);
         self.aliases.clear();
         self.sizes.clear();
         self.kernel_args.clear();
