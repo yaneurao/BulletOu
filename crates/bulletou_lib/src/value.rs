@@ -11,7 +11,9 @@ use std::cell::RefCell;
 
 pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
 pub use dataloader::FastValueDataLoader;
-pub use fast_batch::{FastBatchHost, FastBatchLayout};
+pub use fast_batch::{
+    FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs,
+};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
     Trainer,
