@@ -5,6 +5,7 @@ mod kernels;
 mod nnue_forward;
 
 #[cfg(feature = "cuda")]
+#[allow(unused_imports)]
 pub(crate) use kernels::*;
 
 fn main() {

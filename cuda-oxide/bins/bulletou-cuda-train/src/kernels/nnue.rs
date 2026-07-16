@@ -3,7 +3,7 @@
 //! These kernels are intentionally simple. They are the correctness baseline
 //! for CO-006; later passes can fuse or tile them after CPU/GPU traces match.
 
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, device, kernel, thread};
 
 #[kernel]
 pub fn nnue_sparse_l0_crelu(
@@ -65,7 +65,7 @@ pub fn nnue_dense_l1_crelu(
     input: &[f32],
     weights: &[f32],
     bias: &[f32],
-    mut output: DisjointSlice<f32>,
+    output: DisjointSlice<f32>,
     batch: u32,
     input_dim: u32,
     output_dim: u32,
@@ -78,7 +78,7 @@ pub fn nnue_dense_l2_crelu(
     input: &[f32],
     weights: &[f32],
     bias: &[f32],
-    mut output: DisjointSlice<f32>,
+    output: DisjointSlice<f32>,
     batch: u32,
     input_dim: u32,
     output_dim: u32,
@@ -112,6 +112,7 @@ pub fn nnue_dense_output(
     }
 }
 
+#[device]
 fn dense_crelu(
     input: &[f32],
     weights: &[f32],
@@ -142,6 +143,7 @@ fn dense_crelu(
     }
 }
 
+#[device]
 fn crelu(value: f32) -> f32 {
     if value < 0.0_f32 {
         0.0_f32

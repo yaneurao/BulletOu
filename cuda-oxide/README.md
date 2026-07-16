@@ -38,6 +38,27 @@ cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --ptx /
 Add `--debug-readback` to compare L0 / concat / hidden buffers as well as the
 final output.
 
+WSL2 Ubuntu 24.04 validation example:
+
+```bash
+export CUDA_HOME=/usr
+export CUDA_PATH=/usr
+export CUDA_TOOLKIT_PATH=/usr
+export CUDA_OXIDE_LIBDEVICE=/usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc
+export LIBCLANG_PATH=/usr/lib/llvm-20/lib
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CARGO_TARGET_DIR=/tmp/bulletou-cuda-target
+
+cargo oxide setup
+cargo oxide build --arch sm_89 --features cuda \
+  --cargo-target-dir "$CARGO_TARGET_DIR" -- --package bulletou-cuda-train
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --ptx ./bulletou_cuda_train.ptx --debug-readback
+```
+
+`cargo oxide build` writes `bulletou_cuda_train.{ll,opt.ll,ptx}` into this
+workspace root. These are generated artifacts and are intentionally ignored.
+
 The default build intentionally does not enable CUDA:
 
 ```bash

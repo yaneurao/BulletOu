@@ -6,4 +6,5 @@
 
 pub(crate) mod nnue;
 
+#[allow(unused_imports)]
 pub(crate) use nnue::*;

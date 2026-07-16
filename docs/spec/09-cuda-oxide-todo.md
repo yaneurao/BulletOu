@@ -41,11 +41,24 @@ status を更新する。
 - done: root 側に owned weight layout と workspace layout を追加。
 - done: nested `cuda-oxide` runtime 側に weight / workspace / launch plan layout を追加。
 - done: nested `cuda-oxide` runtime 側に forward kernel set resolve 境界を追加。
-- in-progress: `nnue_sparse_l0_crelu` kernel 定義を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と CPU golden の L0 出力比較が必要。
-- in-progress: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加済み。CUDA Toolkit 環境で compile / launch 検証が必要。
-- in-progress: host launch sequence を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と 1 batch 最終 output の CPU golden 比較が必要。
+- done: `nnue_sparse_l0_crelu` kernel 定義を追加。WSL2 Ubuntu 24.04 + RTX 4090 で feature `cuda` の compile と tiny fixed case の L0 出力比較を確認。
+- done: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加。WSL2 Ubuntu 24.04 + RTX 4090 で compile / launch を確認。
+- done: host launch sequence を追加。WSL2 Ubuntu 24.04 + RTX 4090 で tiny fixed case の CPU golden 比較を確認。
 - done: `bulletou-cuda-train --nnue-forward-smoke` CLI と tiny fixed weight / sparse batch の CPU golden 比較を追加。
-- blocked: 現 Windows native 環境では RTX 4090 と CUDA Toolkit v13.1 は見える。`cargo-oxide` と Python wheel 由来の `libclang.dll` は導入済み。CUDA 13.1 headers と Python wheel の CUDA 12.9 headers の双方で `cargo check -p bulletou-cuda-train --features cuda` を試したが、pin済み cuda-oxide rev の `cuda-core` が Windows bindgen 生成の `u32` flag / enum と合わず E0308 で停止する。WSL2 distro は未導入。実機 launch 検証は Linux/WSL2 か、cuda-oxide 側の Windows native 型不一致 patch が必要。
+- in-progress: 実 `NNUE_HALFKP_256x2_32_32` の weight / sparse batch を tiny fixed case ではなく実データ経路から流し、同じ launch sequence で CPU golden と比較する。
+- note: 現 Windows native 環境では RTX 4090 と CUDA Toolkit v13.1 は見える。`cargo-oxide` と Python wheel 由来の `libclang.dll` は導入済み。CUDA 13.1 headers と Python wheel の CUDA 12.9 headers の双方で `cargo check -p bulletou-cuda-train --features cuda` を試したが、pin済み cuda-oxide rev の `cuda-core` が Windows bindgen 生成の `u32` flag / enum と合わず E0308 で停止する。実機 launch 検証は WSL2 Ubuntu 24.04 で進める。
+
+### 2026-07-16 WSL2 / RTX 4090 検証結果
+
+- WSL2 Ubuntu 24.04 を導入し、`.wslconfig` に `networkingMode=mirrored` / `dnsTunneling=true` / `autoProxy=true` を追加して apt の外向き通信を復旧。
+- WSL2 側で `nvidia-smi` が RTX 4090 を認識することを確認。
+- 導入済み: `rustup`, `nightly-2026-04-03`, `cargo-oxide` rev `b5d35e0`, LLVM/Clang 20, Ubuntu `nvidia-cuda-toolkit` 12.0。
+- `cargo check` と `cargo check -p bulletou-cuda-train --features cuda` は WSL2 で成功。
+- `cargo oxide setup` と `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train` は成功。
+- `cargo oxide doctor` は Ubuntu CUDA 12.0 の `libnvJitLink.so` が `nvJitLinkCreate` 未バージョン名シンボルを出さないため赤を残す。ただし現 CO-006 tiny forward kernel は libdevice math を使わず、PTX 生成と実行は成功。
+- `cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --ptx ./bulletou_cuda_train.ptx --debug-readback` は成功。
+  - output max_abs diff: `0.00000011920929`
+  - `stm_l0` / `nstm_l0` / `combined` / `hidden1` / `hidden2`: max_abs diff `0`
 
 ### CO-006 CUDA 実機検証
 
