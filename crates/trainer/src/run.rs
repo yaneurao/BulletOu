@@ -168,6 +168,16 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?,
         model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?,
     ];
+    let losses = [
+        outputs[0]
+            .get("outputs/loss")
+            .expect("`Trainer` must have a \"loss\" output!")
+            .clone(),
+        outputs[1]
+            .get("outputs/loss")
+            .expect("`Trainer` must have a \"loss\" output!")
+            .clone(),
+    ];
     let gradients = model.make_gradient_tensors().map_err(TrainerError::Unexpected)?;
     let tlr = Buffer::from_host(&device, &TValue::F32(vec![0.0])).map_err(TrainerError::Unexpected)?;
     let tgf = Buffer::from_host(&device, &TValue::F32(vec![0.0])).map_err(TrainerError::Unexpected)?;
@@ -315,9 +325,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             )?;
         }
 
-        let loss = outputs[output_slot].get("outputs/loss").expect("`Trainer` must have a \"loss\" output!");
-        let current_loss = loss
-            .clone()
+        let current_loss = losses[output_slot]
             .to_host_async(&loss_stream)
             .map_err(TrainerError::Unexpected)?;
         let current_loss = PendingLoss {

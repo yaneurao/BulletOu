@@ -319,6 +319,8 @@ batch N+1:
 checkpoint の重みタイミングを壊さないため、superbatch 末尾の loss は遅延しない。
 末尾 batch は即座に loss を回収し、running loss を確定してから save callback を呼ぶ。
 したがって、checkpoint は従来通り「その superbatch の最後の update 直後」の重みになる。
+`outputs/loss` buffer は output tensor 作成後に変わらないため、batch loop の外で `Arc` を
+保持しておき、loss readback のたびに output map を lookup しない。
 
 ### Phase 0.9: avoid per-batch prefixed tensor map rebuild
 
