@@ -457,6 +457,26 @@ peak memory を減らす。
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
 
+ただし、ここから先は Phase 0.x のような既存 backend 内の小改修とは性質が違う。
+tatara は `rust-version = "1.96"` と、cuda-oxide の特定 git rev
+(`b5d35e0`) を前提にしている。一方、BulletOu workspace は現時点で
+`rust-version = "1.87"` である。
+
+そのため、`cuda-core` / `cuda-host` / `cuda-device` を workspace root の
+共通 dependency に直接追加してはいけない。これを行うと、通常の Bullet backend、
+Windows native build、CI、既存ユーザーの Rust toolchain まで巻き込んでしまう。
+
+Phase 1 の実装方針は以下とする。
+
+1. 既存 `examples/bulletou.rs` と `crates/gpu` は Rust 1.87 / 既存 backend のまま維持する
+2. cuda-oxide 経路は専用 binary / 専用 crate に隔離する
+3. cuda-oxide 専用 crate だけが nightly Rust / `cargo-oxide` / LLVM 21+ を要求する
+4. `--backend cuda-oxide` は runtime が接続されるまで fail-fast のままにする
+5. 既存 backend と cuda-oxide backend の checkpoint / log 互換は保つが、optimizer state は backend marker で区別する
+
+この境界を守ることで、cuda-oxide 実験が壊れても既存 BulletOu の学習経路を壊さない。
+速度比較のためにも、既存 backend は baseline として常に動く必要がある。
+
 必要なもの:
 
 - CUDA context / stream / module / device buffer wrapper
@@ -466,6 +486,12 @@ tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
 - build artifact 探索
 
 この段階では kernel は smoke test 用でよい。
+
+tatara の `crates/gpu-runtime` は非常に薄い wrapper なので、思想は流用する。
+ただし、`kernel_loader` は LLVM tool 探索、libdevice 探索、`.ll`→`.ptx` 変換まで
+含んでおり、そのまま持ち込むと toolchain 依存が一気に増える。最初の実装では
+「既に生成済みの PTX を読み込んで smoke kernel を launch する」だけに絞り、
+`.ll` 変換 helper は PTX load が安定してから追加する。
 
 ### Phase 1a: backend selector
 
