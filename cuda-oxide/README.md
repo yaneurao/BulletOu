@@ -17,12 +17,16 @@ Initial scope:
 Current smoke command:
 
 ```bash
-cargo run -p bulletou-cuda-train --features cuda -- --ptx /path/to/module.ptx --kernel noop
+cargo run -p bulletou-cuda-train --features cuda
 ```
 
-This loads a generated PTX module, resolves the kernel symbol, and checks a
-host-device-host buffer round trip. Repository-local smoke PTX generation and
-actual launch are the next CO-004 step.
+This loads `smoke/noop.ptx`, resolves the `noop` kernel symbol, launches it,
+and checks a host-device-host buffer round trip. A custom PTX module can be
+tested with:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- --ptx /path/to/module.ptx --kernel noop
+```
 
 The default build intentionally does not enable CUDA:
 

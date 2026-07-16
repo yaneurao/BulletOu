@@ -8,7 +8,9 @@
 use std::{path::Path, sync::Arc};
 
 #[cfg(feature = "cuda")]
-pub use cuda_core::{CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError};
+pub use cuda_core::{
+    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError, LaunchConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -63,6 +65,33 @@ pub fn host_device_roundtrip(ctx: &Arc<CudaContext>, len: usize) -> Result<bool>
     let device = DeviceBuffer::from_host(&stream, &host)?;
     let restored = device.to_host_vec(&stream)?;
     Ok(restored == host)
+}
+
+#[cfg(feature = "cuda")]
+pub fn launch_zero_arg_kernel(ctx: &Arc<CudaContext>, func: &CudaFunction) -> Result<()> {
+    let stream = ctx.default_stream();
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut kernel_params: [*mut std::ffi::c_void; 0] = [];
+
+    // SAFETY: this smoke launch uses a repository-local zero-argument PTX
+    // kernel. The module and stream belong to the same context, and the empty
+    // parameter list matches `.entry noop()`.
+    unsafe {
+        cuda_core::launch_kernel_on_stream(
+            func,
+            config.grid_dim,
+            config.block_dim,
+            config.shared_mem_bytes,
+            &stream,
+            &mut kernel_params,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(())
 }
 
 pub fn cuda_feature_enabled() -> bool {

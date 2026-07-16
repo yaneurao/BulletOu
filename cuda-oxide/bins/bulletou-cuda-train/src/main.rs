@@ -27,15 +27,17 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         }
     }
 
-    let ptx = ptx.unwrap_or_else(|| usage_exit("--ptx is required"));
+    let ptx = ptx.unwrap_or_else(default_smoke_ptx);
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(device)?;
     let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
-    let _kernel = bulletou_cuda_oxide_runtime::resolve_kernel(&module, &kernel)?;
+    let kernel_func = bulletou_cuda_oxide_runtime::resolve_kernel(&module, &kernel)?;
+    bulletou_cuda_oxide_runtime::launch_zero_arg_kernel(&ctx, &kernel_func)?;
     let roundtrip_ok = bulletou_cuda_oxide_runtime::host_device_roundtrip(&ctx, 1024)?;
 
     println!("bulletou-cuda-train PTX smoke");
     println!("  ptx       : {}", ptx.display());
     println!("  kernel    : {kernel}");
+    println!("  launch    : ok");
     println!("  roundtrip : {roundtrip_ok}");
 
     Ok(())
@@ -46,9 +48,15 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
     let _ = bulletou_cuda_oxide_runtime::backend_status();
     eprintln!(
         "bulletou-cuda-train was built without CUDA support.\n\
-         Rebuild with:\n  cargo run -p bulletou-cuda-train --features cuda -- --ptx <PATH> [--kernel <NAME>]"
+         Rebuild with:\n  cargo run -p bulletou-cuda-train --features cuda -- [--ptx <PATH>] [--kernel <NAME>]"
     );
     Err(bulletou_cuda_oxide_runtime::Error::CudaFeatureDisabled)
+}
+
+#[cfg(feature = "cuda")]
+fn default_smoke_ptx() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../smoke/noop.ptx")
 }
 
 #[cfg(feature = "cuda")]
@@ -65,9 +73,9 @@ fn usage_exit(message: &str) -> ! {
 
 #[cfg(feature = "cuda")]
 fn usage() -> &'static str {
-    "Usage: bulletou-cuda-train --ptx <PATH> [--kernel <NAME>] [--device <ID>]\n\
+    "Usage: bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
      \n\
-     CO-004 smoke command: load a generated PTX module, resolve a kernel symbol,\n\
-     and verify a host-device-host buffer round trip. Kernel launch is added in\n\
-     the next CO-004 step once a repository-local smoke PTX is generated."
+     CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
+     zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
+     --ptx is omitted, cuda-oxide/smoke/noop.ptx is used."
 }
