@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bullet_compiler::tensor::TValue;
 use bullet_gpu::{
-    buffer::{Buffer, SyncOnValue},
+    buffer::{Buffer, SyncOnDrop, SyncOnValue},
     runtime::{Device, Gpu, Stream},
 };
 
@@ -29,15 +29,28 @@ impl PreparedBatchHost {
         &'a self,
         stream: &Arc<Stream<G>>,
         tensors: &TensorMap<G>,
-    ) -> Result<Vec<SyncOnValue<G, &'a TValue>>, G::Error> {
-        let mut syncs = Vec::new();
+    ) -> Result<SyncOnValue<G, &'a Self>, G::Error> {
+        let mut sync = SyncOnDrop::new(stream.clone());
 
         for (id, tensor) in tensors {
             let value = self.inputs.get(id).ok_or("Missing input!".into())?;
-            syncs.push(tensor.copy_from_host_async(stream, value)?);
+
+            if tensor.size() != value.size() {
+                return Err(format!("Mismatched sizes: {} != {}", tensor.size(), value.size()).into());
+            }
+
+            if tensor.dtype() != value.dtype() {
+                return Err(format!("Mismatched DType: {:?} != {:?}", tensor.dtype(), value.dtype()).into());
+            }
+
+            unsafe {
+                let guard = tensor.clone().acquire(stream.clone())?;
+                stream.memcpy_h2d(value.ptr(), guard.ptr(), guard.bytes())?;
+                sync.attach(guard)?;
+            }
         }
 
-        Ok(syncs)
+        Ok(SyncOnValue::new(sync, self))
     }
 
     pub fn to_device<G: Gpu>(self, device: &Arc<Device<G>>) -> Result<TensorMap<G>, G::Error> {

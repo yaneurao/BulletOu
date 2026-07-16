@@ -259,6 +259,10 @@ current batch の compute sync を先に待ってから copy stream を同期す
 これは cuda-oxide の本命である input upload ring の小さい前段である。
 完全な ring 化ではないが、既存の double buffer 構造のまま安全に overlap を増やせる。
 
+あわせて、複数 input tensor の H2D copy を tensor ごとの `SyncOnDrop` ではなく、
+1 つの `SyncOnDrop` にまとめる。これにより、同じ copy stream への同期呼び出しを
+input tensor 数ぶん繰り返す無駄を避ける。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
