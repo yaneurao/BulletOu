@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::run::{
@@ -66,16 +66,15 @@ where
 
 impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
     fn from(prepared_data: PreparedData<I, O>) -> Self {
-        let mut inputs: BTreeMap<String, TValue> = BTreeMap::from([
-            ("stm".to_string(), TValue::I32(prepared_data.stm)),
-            ("nstm".to_string(), TValue::I32(prepared_data.nstm)),
-            ("buckets".to_string(), TValue::I32(prepared_data.buckets)),
-            ("targets".to_string(), TValue::F32(prepared_data.targets)),
-            ("entry_weights".to_string(), TValue::F32(prepared_data.weights)),
-        ]);
+        let mut inputs = Vec::with_capacity(5 + usize::from(prepared_data.hand_count.is_some()));
+        inputs.push((Cow::Borrowed("stm"), TValue::I32(prepared_data.stm)));
+        inputs.push((Cow::Borrowed("nstm"), TValue::I32(prepared_data.nstm)));
+        inputs.push((Cow::Borrowed("buckets"), TValue::I32(prepared_data.buckets)));
+        inputs.push((Cow::Borrowed("targets"), TValue::F32(prepared_data.targets)));
+        inputs.push((Cow::Borrowed("entry_weights"), TValue::F32(prepared_data.weights)));
 
         if let Some(hc) = prepared_data.hand_count {
-            inputs.insert("hand_count".to_string(), TValue::F32(hc));
+            inputs.push((Cow::Borrowed("hand_count"), TValue::F32(hc)));
         }
 
         PreparedBatchHost { batch_size: prepared_data.batch_size, inputs }

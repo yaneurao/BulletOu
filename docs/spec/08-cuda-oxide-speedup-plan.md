@@ -372,6 +372,12 @@ training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` �
 新規作成する必要はない。loop 外で 2 つの scalar host buffer を確保し、batch ごとに値だけ
 書き換えて H2D copy することで、小さな `Vec<f32>` allocation を避ける。
 
+`PreparedBatchHost` の host-side input container も、batch ごとに小さな
+`BTreeMap<String, TValue>` を作る必要はない。現行の shogi trainer では input 名は固定なので、
+`Vec<(Cow<'static, str>, TValue)>` にして固定名は borrowed key として持つ。device 側の
+`TensorMap<String, Buffer>` はそのまま維持し、copy 時だけ線形探索で該当 input を引く。
+input 数は 5〜6 個なので tree 構築より安い。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

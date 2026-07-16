@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use bullet_compiler::tensor::TValue;
 use bullet_gpu::{
@@ -21,10 +21,14 @@ pub trait DataLoader: Send + Sync + 'static {
 
 pub struct PreparedBatchHost {
     pub batch_size: usize,
-    pub inputs: BTreeMap<String, TValue>,
+    pub inputs: Vec<(Cow<'static, str>, TValue)>,
 }
 
 impl PreparedBatchHost {
+    fn input(&self, id: &str) -> Option<&TValue> {
+        self.inputs.iter().find_map(|(name, value)| (name.as_ref() == id).then_some(value))
+    }
+
     pub fn copy_to_device_async<'a, G: Gpu>(
         &'a self,
         stream: &Arc<Stream<G>>,
@@ -33,7 +37,7 @@ impl PreparedBatchHost {
         let mut sync = SyncOnDrop::with_capacity(stream.clone(), tensors.len());
 
         for (id, tensor) in tensors {
-            let value = self.inputs.get(id).ok_or("Missing input!".into())?;
+            let value = self.input(id).ok_or("Missing input!".into())?;
 
             if tensor.size() != value.size() {
                 return Err(format!("Mismatched sizes: {} != {}", tensor.size(), value.size()).into());
@@ -56,7 +60,7 @@ impl PreparedBatchHost {
     pub fn to_device<G: Gpu>(self, device: &Arc<Device<G>>) -> Result<TensorMap<G>, G::Error> {
         self.inputs
             .iter()
-            .map(|(id, value)| Buffer::from_host(device, value).map(|tensor| (id.clone(), tensor)))
+            .map(|(id, value)| Buffer::from_host(device, value).map(|tensor| (id.to_string(), tensor)))
             .collect()
     }
 }
