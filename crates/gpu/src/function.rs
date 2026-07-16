@@ -313,7 +313,7 @@ impl<G: Gpu> Function<G> {
         }
 
         let var = var_size.unwrap_or(1);
-        let mut sizes = vec![0; self.max_num_args];
+        let mut sizes = Vec::with_capacity(self.max_num_args);
         let mut kernel_args: Vec<*mut c_void> = Vec::with_capacity(self.max_num_args);
 
         assert_ne!(var, 0, "Variable size = 0!");
@@ -332,12 +332,14 @@ impl<G: Gpu> Function<G> {
                     Inst::Free { .. } => {}
                     Inst::LaunchKernel { func, args, gdim, bdim, smem } => {
                         kernel_args.clear();
-                        for (i, arg) in args.iter().enumerate() {
+                        sizes.clear();
+                        for arg in args {
                             kernel_args.push(match arg {
                                 Arg::Pointer { idx } => ptrs.as_ptr().add(*idx).cast_mut().cast(),
                                 Arg::Size(size) => {
-                                    sizes[i] = size.evaluate(var) as i32;
-                                    (&sizes[i] as *const i32).cast_mut().cast()
+                                    sizes.push(size.evaluate(var) as i32);
+                                    let last = sizes.last().unwrap();
+                                    (last as *const i32).cast_mut().cast()
                                 }
                             });
                         }

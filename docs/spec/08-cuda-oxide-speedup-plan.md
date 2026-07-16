@@ -358,6 +358,10 @@ guard を作るため、ownership/sync の意味は変わらず、binding 解決
 `Vec<(DevicePtr, bool)>` の線形探索で十分である。これにより forward/backward 呼び出しごとの
 map node allocation を避ける。
 
+kernel launch の size 引数用 buffer は `max_num_args` 個をゼロ初期化する必要はない。
+`Vec::with_capacity(max_num_args)` で容量だけ確保し、各 launch で実際に必要な size 引数だけを
+push する。事前確保により launch 直前の pointer は安定し、GPU に渡す値は従来と同じである。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
