@@ -5,6 +5,9 @@
 //! device entry points here.
 
 pub(crate) mod nnue;
+pub(crate) mod sfnn;
 
 #[allow(unused_imports)]
 pub(crate) use nnue::*;
+#[allow(unused_imports)]
+pub(crate) use sfnn::*;
