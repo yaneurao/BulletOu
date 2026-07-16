@@ -10,6 +10,7 @@ pub mod yaneuraou_kppt;
 use std::cell::RefCell;
 
 pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
+pub use dataloader::FastValueDataLoader;
 pub use fast_batch::{FastBatchHost, FastBatchLayout};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
