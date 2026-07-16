@@ -348,6 +348,12 @@ optimizer の weight ごとの update kernel は `CompiledKernel::execute` を�
 入力/出力 buffer リスト用の heap allocation を避けるための変更であり、GPU kernel の内容や
 同期順序は変えない。
 
+forward/backward では `TensorBinding` を事前計算しているが、実行時の binding 解決で
+`Arc<Buffer>` を clone して `Function` に渡す必要はない。`Function::execute_binding_refs`
+を追加し、`Model::forward/backward` は `&Arc<Buffer>` を渡す。`Buffer::acquire` が必要な
+guard を作るため、ownership/sync の意味は変わらず、binding 解決時の atomic refcount 操作を
+減らせる。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

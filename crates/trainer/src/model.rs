@@ -90,10 +90,10 @@ impl<G: Gpu> Model<G> {
         inputs: &TensorMap<G>,
         outputs: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        self.forward.execute_bindings(
+        self.forward.execute_binding_refs(
             stream.clone(),
             self.fwd_bindings.iter().map(|binding| {
-                (binding.node, resolve_tensor(&binding.source, &self.weights, inputs, outputs, None).unwrap())
+                (binding.node, resolve_tensor_ref(&binding.source, &self.weights, inputs, outputs, None).unwrap())
             }),
         )
     }
@@ -113,12 +113,12 @@ impl<G: Gpu> Model<G> {
         outputs: &TensorMap<G>,
         gradients: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        self.backward.execute_bindings(
+        self.backward.execute_binding_refs(
             stream.clone(),
             self.bwd_bindings.iter().map(|binding| {
                 (
                     binding.node,
-                    resolve_tensor(&binding.source, &self.weights, inputs, outputs, Some(gradients)).unwrap(),
+                    resolve_tensor_ref(&binding.source, &self.weights, inputs, outputs, Some(gradients)).unwrap(),
                 )
             }),
         )
@@ -220,17 +220,17 @@ pub(crate) fn make_tensor_bindings(map: &BTreeMap<String, NodeId>) -> Vec<Tensor
         .collect()
 }
 
-fn resolve_tensor<G: Gpu>(
+fn resolve_tensor_ref<'a, G: Gpu>(
     source: &TensorSource,
-    weights: &TensorMap<G>,
-    inputs: &TensorMap<G>,
-    outputs: &TensorMap<G>,
-    gradients: Option<&TensorMap<G>>,
-) -> Option<Arc<Buffer<G>>> {
+    weights: &'a TensorMap<G>,
+    inputs: &'a TensorMap<G>,
+    outputs: &'a TensorMap<G>,
+    gradients: Option<&'a TensorMap<G>>,
+) -> Option<&'a Arc<Buffer<G>>> {
     match source {
-        TensorSource::Weight(name) => weights.get(name).cloned(),
-        TensorSource::Input(name) => inputs.get(name).cloned(),
-        TensorSource::Output(name) => outputs.get(name).cloned(),
-        TensorSource::Gradient(name) => gradients.and_then(|gradients| gradients.get(name).cloned()),
+        TensorSource::Weight(name) => weights.get(name),
+        TensorSource::Input(name) => inputs.get(name),
+        TensorSource::Output(name) => outputs.get(name),
+        TensorSource::Gradient(name) => gradients.and_then(|gradients| gradients.get(name)),
     }
 }

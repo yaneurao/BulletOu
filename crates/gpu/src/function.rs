@@ -238,7 +238,7 @@ impl<G: Gpu> Function<G> {
         stream: Arc<Stream<G>>,
         inputs: &BTreeMap<NodeId, Arc<Buffer<G>>>,
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
-        self.execute_bindings(stream, inputs.iter().map(|(&node, buffer)| (node, buffer.clone())))
+        self.execute_binding_refs(stream, inputs.iter().map(|(&node, buffer)| (node, buffer)))
     }
 
     pub fn execute_bindings(
@@ -246,6 +246,18 @@ impl<G: Gpu> Function<G> {
         stream: Arc<Stream<G>>,
         inputs: impl IntoIterator<Item = (NodeId, Arc<Buffer<G>>)>,
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        self.execute_binding_refs(stream, inputs.iter().map(|(node, buffer)| (*node, buffer)))
+    }
+
+    pub fn execute_binding_refs<'a>(
+        &self,
+        stream: Arc<Stream<G>>,
+        inputs: impl IntoIterator<Item = (NodeId, &'a Arc<Buffer<G>>)>,
+    ) -> Result<SyncOnValue<G, &Self>, G::Error>
+    where
+        G: 'a,
+    {
         let mut sync = SyncOnDrop::new(stream.clone());
 
         let mut ptrs = vec![G::DevicePtr::default(); self.num_ptrs];
@@ -285,7 +297,7 @@ impl<G: Gpu> Function<G> {
                 }
             }
 
-            let guard = buf.clone().acquire(stream.clone())?;
+            let guard = buf.acquire(stream.clone())?;
             let ptr = guard.ptr();
             sync.attach(guard)?;
             ptrs[idx] = ptr;
