@@ -5,10 +5,7 @@
 //! layouts match before uploading buffers.
 
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
-
-#[cfg(feature = "cuda")]
-use crate::{CudaFunction, CudaModule, CudaStream, DeviceBuffer, Result, resolve_kernel};
+use crate::{CudaStream, DeviceBuffer, Result};
 
 pub const NNUE_SPARSE_L0_CRELU_KERNEL: &str = "nnue_sparse_l0_crelu";
 pub const NNUE_CONCAT_L0_KERNEL: &str = "nnue_concat_l0";
@@ -22,28 +19,6 @@ pub const NNUE_FORWARD_KERNEL_NAMES: [&str; 5] = [
     NNUE_DENSE_L2_CRELU_KERNEL,
     NNUE_DENSE_OUTPUT_KERNEL,
 ];
-
-#[cfg(feature = "cuda")]
-pub struct NnueForwardKernels {
-    pub sparse_l0_crelu: CudaFunction,
-    pub concat_l0: CudaFunction,
-    pub dense_l1_crelu: CudaFunction,
-    pub dense_l2_crelu: CudaFunction,
-    pub dense_output: CudaFunction,
-}
-
-#[cfg(feature = "cuda")]
-impl NnueForwardKernels {
-    pub fn resolve(module: &Arc<CudaModule>) -> Result<Self> {
-        Ok(Self {
-            sparse_l0_crelu: resolve_kernel(module, NNUE_SPARSE_L0_CRELU_KERNEL)?,
-            concat_l0: resolve_kernel(module, NNUE_CONCAT_L0_KERNEL)?,
-            dense_l1_crelu: resolve_kernel(module, NNUE_DENSE_L1_CRELU_KERNEL)?,
-            dense_l2_crelu: resolve_kernel(module, NNUE_DENSE_L2_CRELU_KERNEL)?,
-            dense_output: resolve_kernel(module, NNUE_DENSE_OUTPUT_KERNEL)?,
-        })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {
