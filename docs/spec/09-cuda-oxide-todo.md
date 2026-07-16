@@ -81,7 +81,8 @@ status を更新する。
 - `cargo check -p bulletou_lib --example export_nnue_forward_fixture` は成功。
 - root で出力した tiny fixture (`target/bulletou-root-tiny.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.00000011920929`、debug readback buffers は許容誤差内。
 - root で出力した HalfKP fixture (`target/bulletou-root-halfkp.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000009313226`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.0000000037252903`、`hidden2` max_abs diff: `0.0000000018626451`。
-- `export_nnue_forward_fixture --teacher` の loader 配線は `cargo check -p bulletou_lib --example export_nnue_forward_fixture` で型検証済み。現 workspace / `C:\shogi` には `.hcpe` / `.hcpe3` / `.pack` / `.psv` teacher が見つからなかったため、実 teacher file での smoke は次回実データ配置後に行う。
+- `export_nnue_forward_fixture --teacher` の loader 配線は `cargo check -p bulletou_lib --example export_nnue_forward_fixture` で型検証済み。
+- user-provided HCPE teacher `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` から batch_size=2 の HalfKP fixture (`target/bulletou-teacher-halfkp.nnuef`) を export し、WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000027939677`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.000000007450581`、`hidden2` max_abs diff: `0.0000000018626451`。
 
 ### CO-006 CUDA 実機検証
 
