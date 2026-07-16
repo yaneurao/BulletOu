@@ -31,7 +31,7 @@ use bullet_gpu::{
     runtime::{Device, Gpu},
 };
 
-use crate::model::{rng, Model, Shape};
+use crate::model::{make_tensor_bindings, rng, Model, Shape};
 
 /// 重みテンソルの初期化方式。
 ///
@@ -303,9 +303,9 @@ impl ModelBuilder {
             weights,
             shapes,
             forward: Function::new(device.clone(), fwd).unwrap(),
-            fwd_map,
+            fwd_bindings: make_tensor_bindings(&fwd_map),
             backward: Function::new(device.clone(), bwd).unwrap(),
-            bwd_map,
+            bwd_bindings: make_tensor_bindings(&bwd_map),
             fwd_output_types: [("outputs/output".to_string(), fwd_ty)].into(),
             bwd_output_types: [("outputs/loss".to_string(), bwd_ty)].into(),
             device,

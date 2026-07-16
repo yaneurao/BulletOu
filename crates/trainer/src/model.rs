@@ -48,11 +48,23 @@ pub struct Model<G: Gpu> {
     weights: TensorMap<G>,
     shapes: BTreeMap<String, (Shape, Option<usize>)>,
     forward: Function<G>,
-    fwd_map: BTreeMap<String, NodeId>,
+    fwd_bindings: Vec<TensorBinding>,
     backward: Function<G>,
-    bwd_map: BTreeMap<String, NodeId>,
+    bwd_bindings: Vec<TensorBinding>,
     fwd_output_types: BTreeMap<String, TType>,
     bwd_output_types: BTreeMap<String, TType>,
+}
+
+pub(crate) struct TensorBinding {
+    node: NodeId,
+    source: TensorSource,
+}
+
+enum TensorSource {
+    Weight(String),
+    Input(String),
+    Output(String),
+    Gradient(String),
 }
 
 impl<G: Gpu> Model<G> {
@@ -78,12 +90,12 @@ impl<G: Gpu> Model<G> {
         inputs: &TensorMap<G>,
         outputs: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let bindings = self
-            .fwd_map
-            .iter()
-            .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, None).unwrap()))
-            .collect::<Vec<_>>();
-        self.forward.execute_bindings(stream.clone(), bindings)
+        self.forward.execute_bindings(
+            stream.clone(),
+            self.fwd_bindings.iter().map(|binding| {
+                (binding.node, resolve_tensor(&binding.source, &self.weights, inputs, outputs, None).unwrap())
+            }),
+        )
     }
 
     pub fn set_fwd_batch_size(&mut self, batch_size: usize) -> Result<(), G::Error> {
@@ -101,13 +113,15 @@ impl<G: Gpu> Model<G> {
         outputs: &TensorMap<G>,
         gradients: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let bindings = self
-            .bwd_map
-            .iter()
-            .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, Some(gradients)).unwrap()))
-            .collect::<Vec<_>>();
-
-        self.backward.execute_bindings(stream.clone(), bindings)
+        self.backward.execute_bindings(
+            stream.clone(),
+            self.bwd_bindings.iter().map(|binding| {
+                (
+                    binding.node,
+                    resolve_tensor(&binding.source, &self.weights, inputs, outputs, Some(gradients)).unwrap(),
+                )
+            }),
+        )
     }
 
     pub fn make_gradient_tensors(&self) -> Result<TensorMap<G>, G::Error> {
@@ -189,20 +203,34 @@ impl<G: Gpu> Model<G> {
     }
 }
 
+pub(crate) fn make_tensor_bindings(map: &BTreeMap<String, NodeId>) -> Vec<TensorBinding> {
+    map.iter()
+        .map(|(name, &node)| TensorBinding {
+            node,
+            source: if let Some(name) = name.strip_prefix("weights/") {
+                TensorSource::Weight(name.to_string())
+            } else if let Some(name) = name.strip_prefix("inputs/") {
+                TensorSource::Input(name.to_string())
+            } else if let Some(name) = name.strip_prefix("gradients/") {
+                TensorSource::Gradient(name.to_string())
+            } else {
+                TensorSource::Output(name.clone())
+            },
+        })
+        .collect()
+}
+
 fn resolve_tensor<G: Gpu>(
-    name: &str,
+    source: &TensorSource,
     weights: &TensorMap<G>,
     inputs: &TensorMap<G>,
     outputs: &TensorMap<G>,
     gradients: Option<&TensorMap<G>>,
 ) -> Option<Arc<Buffer<G>>> {
-    if let Some(name) = name.strip_prefix("weights/") {
-        weights.get(name).cloned()
-    } else if let Some(name) = name.strip_prefix("inputs/") {
-        inputs.get(name).cloned()
-    } else if let Some(name) = name.strip_prefix("gradients/") {
-        gradients.and_then(|gradients| gradients.get(name).cloned())
-    } else {
-        outputs.get(name).cloned()
+    match source {
+        TensorSource::Weight(name) => weights.get(name).cloned(),
+        TensorSource::Input(name) => inputs.get(name).cloned(),
+        TensorSource::Output(name) => outputs.get(name).cloned(),
+        TensorSource::Gradient(name) => gradients.and_then(|gradients| gradients.get(name).cloned()),
     }
 }

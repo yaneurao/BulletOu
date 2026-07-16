@@ -319,6 +319,11 @@ tensor 名を prefix 解決して、直接該当する map から buffer を引�
 これにより `Model::forward` / `Model::backward` は NodeId→Buffer の中間 `BTreeMap` を作らず、
 小さな binding 配列から直接 kernel 実行へ進める。
 
+最後に、tensor 名の prefix 分類も graph 構築時に固定する。
+`weights/` / `inputs/` / `gradients/` / output のどこを見るかを `TensorSource` として
+保持しておけば、batch 中の `strip_prefix()` と一時 binding 配列 allocation も不要になる。
+batch 中は固定済み binding を走査し、該当する tensor map から `Arc<Buffer>` を clone するだけでよい。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
