@@ -134,6 +134,7 @@ impl Args {
                 "--dense-output-backward-smoke" => parsed.mode = SmokeMode::DenseOutputBackward,
                 "--nnue-dense-backward-smoke" => parsed.mode = SmokeMode::NnueDenseBackward,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
+                "--sfnn-dense-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-output-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
                 "--ptx" => parsed.ptx = Some(required_path_arg(&mut args, "--ptx")?),
@@ -786,7 +787,7 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 #[cfg(feature = "cuda")]
 fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        backward::SfnnStackedL3BackwardLayout,
+        backward::{SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout},
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
             SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
@@ -853,20 +854,45 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &mut l3w_gradients,
         &mut l3b_gradients,
     )?;
+
+    let l2_layout =
+        SfnnStackedCReluBackwardLayout::new(case.batch_size, shape.l2_in(), shape.l2_size, shape.num_stacks);
+    let mut l2_input_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.input_gradients_len())?;
+    let mut l2w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.weight_len())?;
+    let mut l2b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.bias_len())?;
+    sfnn_backward::launch_sfnn_stacked_crelu_backward(
+        &stream,
+        &module,
+        l2_layout,
+        &forward_workspace.l2_input,
+        &forward_workspace.l2,
+        &l2_gradients,
+        &device_weights.l2w,
+        &device_batch.buckets,
+        &mut l2_input_gradients,
+        &mut l2w_gradients,
+        &mut l2b_gradients,
+    )?;
     stream.synchronize()?;
 
     let gpu_l2_gradients = l2_gradients.to_host_vec(&stream)?;
     let gpu_l1_gradients = l1_gradients.to_host_vec(&stream)?;
     let gpu_l3w_gradients = l3w_gradients.to_host_vec(&stream)?;
     let gpu_l3b_gradients = l3b_gradients.to_host_vec(&stream)?;
+    let gpu_l2_input_gradients = l2_input_gradients.to_host_vec(&stream)?;
+    let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
+    let gpu_l2b_gradients = l2b_gradients.to_host_vec(&stream)?;
     let comparisons = [
         compare_slices("l2_grad", &cpu_trace.l2_gradients, &gpu_l2_gradients, args.tolerance)?,
         compare_slices("l1_grad", &cpu_trace.l1_gradients, &gpu_l1_gradients, args.tolerance)?,
         compare_slices("l3w_grad", &cpu_trace.l3w_gradients, &gpu_l3w_gradients, args.tolerance)?,
         compare_slices("l3b_grad", &cpu_trace.l3b_gradients, &gpu_l3b_gradients, args.tolerance)?,
+        compare_slices("l2_in_grad", &cpu_trace.l2_input_gradients, &gpu_l2_input_gradients, args.tolerance)?,
+        compare_slices("l2w_grad", &cpu_trace.l2w_gradients, &gpu_l2w_gradients, args.tolerance)?,
+        compare_slices("l2b_grad", &cpu_trace.l2b_gradients, &gpu_l2b_gradients, args.tolerance)?,
     ];
 
-    println!("bulletou-cuda-train SFNN output backward smoke");
+    println!("bulletou-cuda-train SFNN dense backward smoke");
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
     println!("  case         : {}", case.label);
@@ -1031,7 +1057,8 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --sfnn-output-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
@@ -1049,8 +1076,8 @@ fn usage() -> &'static str {
      CO-009 NNUE dense backward smoke: run NNUE forward, then chain output,\n\
      hidden2, hidden1, L0 CReLU split, and sparse L0 weight/bias backward\n\
      kernels against a CPU golden.\n\
-     CO-009 SFNN output backward smoke: run SFNN forward, then compare the\n\
-     stacked L3 output backward kernel against a CPU scalar golden.\n\
+     CO-009 SFNN dense backward smoke: run SFNN forward, then chain stacked\n\
+     L3 output backward and L2 CReLU backward kernels against a CPU scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1220,6 +1247,9 @@ struct SfnnOutputBackwardTrace {
     l1_gradients: Vec<f32>,
     l3w_gradients: Vec<f32>,
     l3b_gradients: Vec<f32>,
+    l2_input_gradients: Vec<f32>,
+    l2w_gradients: Vec<f32>,
+    l2b_gradients: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1840,8 +1870,28 @@ impl SfnnForwardCase {
             self.shape.l1_out(),
             self.shape.num_stacks,
         );
+        let (l2_input_gradients, l2w_gradients, l2b_gradients) = sfnn_stacked_crelu_backward_trace(
+            &forward.l2_input,
+            &forward.l2,
+            &l2_gradients,
+            &self.l2w,
+            &self.buckets,
+            self.batch_size,
+            self.shape.l2_in(),
+            self.shape.l2_size,
+            self.shape.num_stacks,
+        );
 
-        SfnnOutputBackwardTrace { output_gradients, l2_gradients, l1_gradients, l3w_gradients, l3b_gradients }
+        SfnnOutputBackwardTrace {
+            output_gradients,
+            l2_gradients,
+            l1_gradients,
+            l3w_gradients,
+            l3b_gradients,
+            l2_input_gradients,
+            l2w_gradients,
+            l2b_gradients,
+        }
     }
 
     fn read_fixture(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Self> {
@@ -2171,6 +2221,50 @@ fn sfnn_stacked_l3_backward_trace(
     }
 
     (input_gradients, l1_gradients, weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_stacked_crelu_backward_trace(
+    inputs: &[f32],
+    activations: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    buckets: &[i32],
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+    num_stacks: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut input_gradients = vec![0.0_f32; batch_size * input_dim];
+    let stack_stride = num_stacks * output_dim;
+    let mut weight_gradients = vec![0.0_f32; input_dim * stack_stride];
+    let mut bias_gradients = vec![0.0_f32; stack_stride];
+
+    for sample in 0..batch_size {
+        let stack_i32 = buckets[sample];
+        if stack_i32 < 0 || stack_i32 as usize >= num_stacks {
+            continue;
+        }
+        let stack = stack_i32 as usize;
+        let sample_input_start = sample * input_dim;
+        let sample_output_start = sample * output_dim;
+
+        for out_col in 0..output_dim {
+            let activation_idx = sample_output_start + out_col;
+            let pre_grad =
+                crelu_pre_gradient_from_activation(activations[activation_idx], output_gradients[activation_idx]);
+            let stacked_out_col = stack * output_dim + out_col;
+            bias_gradients[stacked_out_col] += pre_grad;
+            for in_col in 0..input_dim {
+                let input_value = inputs[sample_input_start + in_col];
+                let weight_idx = in_col * stack_stride + stacked_out_col;
+                input_gradients[sample_input_start + in_col] += pre_grad * weights[weight_idx];
+                weight_gradients[weight_idx] += pre_grad * input_value;
+            }
+        }
+    }
+
+    (input_gradients, weight_gradients, bias_gradients)
 }
 
 #[cfg(feature = "cuda")]

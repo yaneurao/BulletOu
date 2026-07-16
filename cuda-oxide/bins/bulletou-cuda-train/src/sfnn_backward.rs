@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
-    backward::{SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout},
+    backward::{
+        SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan,
+        SfnnStackedL3BackwardLayout,
+    },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
 use cuda_host::cuda_launch;
@@ -50,6 +53,56 @@ pub(crate) fn launch_sfnn_stacked_l3_backward(
                 batch,
                 input_dim,
                 l1_out,
+                num_stacks
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_stacked_crelu_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnStackedCReluBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    activations: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    buckets: &DeviceBuffer<i32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnStackedCReluBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+    let num_stacks = layout.num_stacks as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_stacked_crelu_backward`; all
+        // buffers are device allocations owned by the same CUDA context and
+        // live until the caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_stacked_crelu_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(inputs),
+                slice(activations),
+                slice(output_gradients),
+                slice(weights),
+                slice(buckets),
+                slice_mut(input_gradients),
+                slice_mut(weight_gradients),
+                slice_mut(bias_gradients),
+                batch,
+                input_dim,
+                output_dim,
                 num_stacks
             ]
         }
