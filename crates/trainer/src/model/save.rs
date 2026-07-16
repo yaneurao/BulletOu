@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
+    io,
     rc::Rc,
 };
 
@@ -166,11 +166,16 @@ fn round_or_trunc(x: f64, round: bool) -> f64 {
 
 impl QuantTarget {
     pub fn quantise(self, round: bool, buf: &[f32]) -> io::Result<Vec<u8>> {
-        let mut quantised = Vec::<u8>::new();
+        let bytes_per_value = match self {
+            Self::Float | Self::I32(_) => std::mem::size_of::<i32>(),
+            Self::I8(_) => std::mem::size_of::<i8>(),
+            Self::I16(_) => std::mem::size_of::<i16>(),
+        };
+        let mut quantised = Vec::<u8>::with_capacity(buf.len() * bytes_per_value);
 
         for &float in buf {
-            let to_write = match self {
-                Self::Float => float.to_le_bytes().to_vec(),
+            match self {
+                Self::Float => quantised.extend_from_slice(&float.to_le_bytes()),
                 Self::I8(q) => {
                     let qf = round_or_trunc(f64::from(q) * f64::from(float), round);
                     let x = qf as i8;
@@ -179,7 +184,7 @@ impl QuantTarget {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed quantisation from f32 to i8!"));
                     }
 
-                    x.to_le_bytes().to_vec()
+                    quantised.extend_from_slice(&x.to_le_bytes());
                 }
                 Self::I16(q) => {
                     let qf = round_or_trunc(f64::from(q) * f64::from(float), round);
@@ -189,7 +194,7 @@ impl QuantTarget {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed quantisation from f32 to i16!"));
                     }
 
-                    x.to_le_bytes().to_vec()
+                    quantised.extend_from_slice(&x.to_le_bytes());
                 }
                 Self::I32(q) => {
                     let qf = round_or_trunc(f64::from(q) * f64::from(float), round);
@@ -199,11 +204,9 @@ impl QuantTarget {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed quantisation from f32 to i32!"));
                     }
 
-                    x.to_le_bytes().to_vec()
+                    quantised.extend_from_slice(&x.to_le_bytes());
                 }
-            };
-
-            quantised.write_all(&to_write)?;
+            }
         }
 
         Ok(quantised)

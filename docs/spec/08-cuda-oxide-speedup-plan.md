@@ -454,6 +454,8 @@ checkpoint / weight 書き出しでは、tensor ごとに一時 byte buffer を�
 peak memory を減らす。
 ただし f32 ごとに `write_all()` すると syscall / buffering overhead が大きいため、
 固定サイズ chunk に packed little-endian bytes を詰め、chunk 単位で writer へ流す。
+`nn.bin` などの量子化保存でも、値ごとの短命な `Vec<u8>` を作らず、最終 byte buffer に
+直接 little-endian bytes を append する。
 
 ### Phase 1: cuda-oxide runtime skeleton
 
