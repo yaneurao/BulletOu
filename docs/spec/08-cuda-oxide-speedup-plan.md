@@ -362,6 +362,9 @@ kernel launch の size 引数用 buffer は `max_num_args` 個をゼロ初期化
 `Vec::with_capacity(max_num_args)` で容量だけ確保し、各 launch で実際に必要な size 引数だけを
 push する。事前確保により launch 直前の pointer は安定し、GPU に渡す値は従来と同じである。
 
+`SyncOnDrop` は attach される guard 数が分かっている呼び出し経路では容量を事前確保する。
+`Function::execute_binding_refs` と `CompiledKernel::execute_slices` で guard list の再確保を避ける。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

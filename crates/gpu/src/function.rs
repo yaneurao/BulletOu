@@ -258,12 +258,12 @@ impl<G: Gpu> Function<G> {
     where
         G: 'a,
     {
-        let mut sync = SyncOnDrop::new(stream.clone());
-
         let inputs = inputs.into_iter();
+        let input_capacity = inputs.size_hint().0;
+        let mut sync = SyncOnDrop::with_capacity(stream.clone(), input_capacity);
         let mut ptrs = vec![G::DevicePtr::default(); self.num_ptrs];
 
-        let mut aliases = Vec::with_capacity(inputs.size_hint().0);
+        let mut aliases = Vec::with_capacity(input_capacity);
         let mut var_size = None;
 
         for (name, buf) in inputs {

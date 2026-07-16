@@ -30,6 +30,10 @@ impl<G: Gpu> SyncOnDrop<G> {
         Self { stream, guards: Vec::new(), synced: false }
     }
 
+    pub fn with_capacity(stream: Arc<Stream<G>>, capacity: usize) -> Self {
+        Self { stream, guards: Vec::with_capacity(capacity), synced: false }
+    }
+
     pub fn sync(mut self) -> Result<(), G::Error> {
         let result = self.stream.sync();
         self.synced = true;

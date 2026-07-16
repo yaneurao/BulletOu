@@ -155,11 +155,11 @@ impl<G: Gpu> CompiledKernel<G> {
         inputs: &[Arc<Buffer<G>>],
         outputs: &[Arc<Buffer<G>>],
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
-        let mut sync = SyncOnDrop::new(stream.clone());
-
         if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
             return Err("Mismatched number of inputs/outputs!".to_string().into());
         }
+
+        let mut sync = SyncOnDrop::with_capacity(stream.clone(), inputs.len() + outputs.len());
 
         let mut input_guards = Vec::with_capacity(inputs.len());
         for input in inputs {
