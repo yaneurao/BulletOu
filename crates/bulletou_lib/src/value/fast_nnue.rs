@@ -10,7 +10,7 @@ use bullet_compiler::tensor::TValue;
 use bullet_gpu::runtime::Gpu;
 use bullet_trainer::model::Model;
 
-use crate::value::FastBatchHost;
+use crate::value::{FastBatchHost, fast_batch::active_feature_indices};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {
@@ -152,7 +152,6 @@ impl<'a> NnueForwardWeights<'a> {
 
         let shape = self.shape;
         let batch_size = batch.layout.batch_size;
-        let max_active = batch.layout.max_active;
         let mut outputs = Vec::with_capacity(batch_size);
 
         let mut stm_l0 = vec![0.0; shape.l1];
@@ -167,7 +166,7 @@ impl<'a> NnueForwardWeights<'a> {
                 self.l0b,
                 shape.l1,
                 shape.input_size,
-                &batch.stm[sample * max_active..(sample + 1) * max_active],
+                batch.stm_sample(sample).expect("validated batch sample"),
                 &mut stm_l0,
             );
             affine_sparse_padded(
@@ -175,7 +174,7 @@ impl<'a> NnueForwardWeights<'a> {
                 self.l0b,
                 shape.l1,
                 shape.input_size,
-                &batch.nstm[sample * max_active..(sample + 1) * max_active],
+                batch.nstm_sample(sample).expect("validated batch sample"),
                 &mut nstm_l0,
             );
 
@@ -207,11 +206,8 @@ fn expect_len(name: &'static str, expected: usize, actual: usize) -> Result<(), 
 
 fn affine_sparse_padded(weights: &[f32], bias: &[f32], rows: usize, cols: usize, active: &[i32], out: &mut [f32]) {
     out.copy_from_slice(&bias[..rows]);
-    for &feature in active {
-        if feature < 0 || feature as usize >= cols {
-            continue;
-        }
-        let base = feature as usize * rows;
+    for feature in active_feature_indices(active, cols) {
+        let base = feature * rows;
         for row in 0..rows {
             out[row] += weights[base + row];
         }

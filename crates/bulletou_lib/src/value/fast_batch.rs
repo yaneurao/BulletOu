@@ -165,6 +165,24 @@ impl FastBatchHost {
         PreparedBatchHost { batch_size: self.layout.batch_size, inputs }
     }
 
+    pub fn stm_sample(&self, sample: usize) -> Option<&[i32]> {
+        self.sparse_sample(&self.stm, sample)
+    }
+
+    pub fn nstm_sample(&self, sample: usize) -> Option<&[i32]> {
+        self.sparse_sample(&self.nstm, sample)
+    }
+
+    fn sparse_sample<'a>(&self, sparse: &'a [i32], sample: usize) -> Option<&'a [i32]> {
+        if sample >= self.layout.batch_size {
+            return None;
+        }
+
+        let start = sample * self.layout.max_active;
+        let end = start + self.layout.max_active;
+        sparse.get(start..end)
+    }
+
     pub fn compare_prepared_batch(
         &self,
         prepared: &PreparedBatchHost,
@@ -207,6 +225,16 @@ impl FastBatchHost {
         }
         Ok(())
     }
+}
+
+pub fn active_feature_indices(active: &[i32], feature_count: usize) -> impl Iterator<Item = usize> + '_ {
+    active.iter().filter_map(move |&feature| {
+        if feature < 0 || feature as usize >= feature_count {
+            None
+        } else {
+            Some(feature as usize)
+        }
+    })
 }
 
 pub fn compare_forward_outputs(
@@ -400,6 +428,32 @@ mod tests {
         let prepared = batch.clone().into_prepared_batch_host();
 
         batch.compare_prepared_batch(&prepared, 0.0).unwrap();
+    }
+
+    #[test]
+    fn sparse_samples_are_sliced_per_position() {
+        let layout = FastBatchLayout { batch_size: 2, max_active: 3, output_size: 1, hand_count_dim: 0 };
+        let batch = FastBatchHost {
+            layout,
+            stm: vec![1, 2, -1, 3, 4, -1],
+            nstm: vec![5, -1, -1, 6, 7, -1],
+            buckets: vec![0, 0],
+            targets: vec![0.0; layout.target_len()],
+            weights: vec![1.0; layout.batch_size],
+            hand_count: None,
+        };
+
+        assert_eq!(batch.stm_sample(0), Some([1, 2, -1].as_slice()));
+        assert_eq!(batch.stm_sample(1), Some([3, 4, -1].as_slice()));
+        assert_eq!(batch.nstm_sample(1), Some([6, 7, -1].as_slice()));
+        assert_eq!(batch.stm_sample(2), None);
+    }
+
+    #[test]
+    fn active_feature_iterator_ignores_sentinel_and_out_of_range() {
+        let active: Vec<_> = active_feature_indices(&[0, 2, -1, 99, 3], 4).collect();
+
+        assert_eq!(active, vec![0, 2, 3]);
     }
 
     #[test]
