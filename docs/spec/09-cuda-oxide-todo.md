@@ -15,7 +15,7 @@ status を更新する。
 | CO-003 | done | cuda-oxide crate 境界の作成 | 既存 workspace を巻き込まず、専用 crate / binary の置き場所を作る |
 | CO-004 | done | PTX smoke loader | 生成済み PTX を load し、kernel symbol resolve と最小 kernel launch を行う |
 | CO-005 | done | CPU reference test harness | fast backend kernel と既存 Bullet backend の 1 batch 出力比較を作る |
-| CO-006 | in-progress | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる。CPU golden と所有重みレイアウトは追加済み |
+| CO-006 | done | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる。CPU golden と所有重みレイアウトは追加済み |
 | CO-007 | todo | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |
 | CO-008 | todo | loss kernel | target transform / sigmoid / loss reduction を fused kernel 化する |
 | CO-009 | todo | backward kernel | dense backward と sparse FT backward を実装する |
@@ -49,7 +49,7 @@ status を更新する。
 - done: `--write-nnue-forward-fixture` / `--nnue-forward-fixture` を追加。root workspace へ依存せず、root 側 exporter から `FastBatchHost` + `NnueForwardOwnedWeights` を渡すための little-endian fixture 境界を用意。
 - done: root 側 `write_nnue_forward_fixture` / `write_nnue_forward_fixture_file` を追加。`FastBatchHost` + `NnueForwardWeights` から同じ fixture 形式を書き出せる。
 - done: root example `export_nnue_forward_fixture --teacher` を追加。既存 `expand_teacher` / `infer_data_format` / `HcpeDataLoader` / `Hcpe3DataLoader` / `ShogiPackLoader` / `DirectSequentialDataLoader` と `DefaultDataLoader::prepare(ShogiHalfKP)` を通して、実 teacher の先頭 1 batch を `FastBatchHost` fixture にできる。
-- in-progress: root 側 `FastBatchHost` / `NnueForwardOwnedWeights` から nested cuda-oxide 実行へ流す橋渡しを作り、synthetic ではなく既存データ経路の 1 batch で CPU golden と比較する。
+- done: root 側 `FastBatchHost` / `NnueForwardOwnedWeights` から nested cuda-oxide 実行へ流す橋渡しを作り、synthetic ではなく既存データ経路の 1 batch で CPU golden と比較する。
 - note: 現 Windows native 環境では RTX 4090 と CUDA Toolkit v13.1 は見える。`cargo-oxide` と Python wheel 由来の `libclang.dll` は導入済み。CUDA 13.1 headers と Python wheel の CUDA 12.9 headers の双方で `cargo check -p bulletou-cuda-train --features cuda` を試したが、pin済み cuda-oxide rev の `cuda-core` が Windows bindgen 生成の `u32` flag / enum と合わず E0308 で停止する。実機 launch 検証は WSL2 Ubuntu 24.04 で進める。
 
 ### 2026-07-16 WSL2 / RTX 4090 検証結果
@@ -83,6 +83,7 @@ status を更新する。
 - root で出力した HalfKP fixture (`target/bulletou-root-halfkp.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000009313226`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.0000000037252903`、`hidden2` max_abs diff: `0.0000000018626451`。
 - `export_nnue_forward_fixture --teacher` の loader 配線は `cargo check -p bulletou_lib --example export_nnue_forward_fixture` で型検証済み。
 - user-provided HCPE teacher `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` から batch_size=2 の HalfKP fixture (`target/bulletou-teacher-halfkp.nnuef`) を export し、WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000027939677`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.000000007450581`、`hidden2` max_abs diff: `0.0000000018626451`。
+- actual BulletOu checkpoint weight `checkpoints/NNUE_HALFKP-256x2-32-32-6sb-cos/0031/state.bin` と user-provided HCPE teacher `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` から batch_size=2 の HalfKP fixture (`target/bulletou-teacher-realweights-halfkp.nnuef`) を export し、WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。CPU output は `[-1.3658719, 4.570574]`、GPU comparison は output max_abs diff: `0.00000011920929`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.00000011920929`、`hidden2` max_abs diff: `0.00000011920929`。
 
 ### CO-006 CUDA 実機検証
 
