@@ -1,5 +1,6 @@
 pub(crate) mod builder;
 mod dataloader;
+pub mod fast_batch;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
@@ -9,6 +10,7 @@ pub mod yaneuraou_kppt;
 use std::cell::RefCell;
 
 pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
+pub use fast_batch::{FastBatchHost, FastBatchLayout};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
     Trainer,

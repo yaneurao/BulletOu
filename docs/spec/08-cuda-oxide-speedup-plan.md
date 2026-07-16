@@ -285,6 +285,12 @@ struct CudaNnueBatch {
 HCPE / HCPE3 は既存 loader の decode 実装を reuse し、GPU backend に渡す直前で
 固定 batch struct に詰め替える。
 
+Phase 2a として、既存 `PreparedData` から変換できる `FastBatchHost` /
+`FastBatchLayout` を `bulletou_lib::value::fast_batch` に追加する。これはまだ
+GPU kernel を起動しないが、`stm` / `nstm` / `buckets` / `targets` / `weights` /
+`hand_count` を name-keyed tensor map ではなく固定 field として保持する。後続の
+cuda-oxide backend はこの layout を device buffer へ直接 upload する。
+
 ### Phase 3: 最小 NNUE forward / backward
 
 最初の kernel 対象は、実装量が少ないほうから始める。
