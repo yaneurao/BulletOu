@@ -12,7 +12,12 @@ workspace = true
 
 [features]
 default = []
-cuda = ["bulletou-cuda-oxide-runtime/cuda"]
+cuda = [
+    "bulletou-cuda-oxide-runtime/cuda",
+    "dep:cuda-core",
+    "dep:cuda-device",
+    "dep:cuda-host",
+]
 
 [[bin]]
 name = "bulletou-cuda-train"
@@ -20,3 +25,6 @@ path = "src/main.rs"
 
 [dependencies]
 bulletou-cuda-oxide-runtime = { path = "../../crates/runtime" }
+cuda-core = { workspace = true, optional = true }
+cuda-device = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }

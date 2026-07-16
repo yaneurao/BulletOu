@@ -41,6 +41,6 @@ status を更新する。
 - done: root 側に owned weight layout と workspace layout を追加。
 - done: nested `cuda-oxide` runtime 側に weight / workspace / launch plan layout を追加。
 - done: nested `cuda-oxide` runtime 側に forward kernel set resolve 境界を追加。
-- todo: `nnue_sparse_l0_crelu` kernel を実装し、CPU golden の L0 出力と比較する。
-- todo: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` を実装する。
+- in-progress: `nnue_sparse_l0_crelu` kernel 定義を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と CPU golden の L0 出力比較が必要。
+- in-progress: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加済み。CUDA Toolkit 環境で compile / launch 検証が必要。
 - todo: host launch sequence を実装し、1 batch の最終 output を CPU golden と比較する。

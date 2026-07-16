@@ -1,3 +1,9 @@
+#[cfg(feature = "cuda")]
+mod kernels;
+
+#[cfg(feature = "cuda")]
+pub(crate) use kernels::*;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");

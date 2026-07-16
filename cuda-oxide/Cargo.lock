@@ -66,6 +66,9 @@ name = "bulletou-cuda-train"
 version = "0.1.0"
 dependencies = [
  "bulletou-cuda-oxide-runtime",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
 ]
 
 [[package]]
@@ -146,6 +149,14 @@ dependencies = [
  "cuda-macros",
  "half",
  "oxide-artifacts",
+]
+
+[[package]]
+name = "cuda-device"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=b5d35e0#b5d35e07a3fe492f594afe8e176a6e1e085e9cae"
+dependencies = [
+ "cuda-macros",
 ]
 
 [[package]]
