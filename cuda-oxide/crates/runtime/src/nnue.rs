@@ -117,6 +117,18 @@ pub enum NnueLayoutError {
         expected: usize,
         actual: usize,
     },
+    #[error("batch length mismatch for {name}: expected {expected}, got {actual}")]
+    BatchLength {
+        name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("layout value mismatch for {name}: expected {expected}, got {actual}")]
+    LayoutValue {
+        name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 fn expect_len(name: &'static str, expected: usize, actual: usize) -> std::result::Result<(), NnueLayoutError> {
@@ -124,6 +136,52 @@ fn expect_len(name: &'static str, expected: usize, actual: usize) -> std::result
         Ok(())
     } else {
         Err(NnueLayoutError::WeightLength { name, expected, actual })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NnueForwardHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl<'a> NnueForwardHostBatch<'a> {
+    pub fn validate(&self) -> std::result::Result<(), NnueLayoutError> {
+        let expected = self.batch_size.saturating_mul(self.max_active);
+        expect_batch_len("stm_indices", expected, self.stm_indices.len())?;
+        expect_batch_len("nstm_indices", expected, self.nstm_indices.len())?;
+        Ok(())
+    }
+}
+
+fn expect_batch_len(name: &'static str, expected: usize, actual: usize) -> std::result::Result<(), NnueLayoutError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(NnueLayoutError::BatchLength { name, expected, actual })
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct NnueForwardDeviceBatch {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub stm_indices: DeviceBuffer<i32>,
+    pub nstm_indices: DeviceBuffer<i32>,
+}
+
+#[cfg(feature = "cuda")]
+impl NnueForwardDeviceBatch {
+    pub fn from_host(stream: &CudaStream, batch: &NnueForwardHostBatch<'_>) -> Result<Self> {
+        batch.validate()?;
+        Ok(Self {
+            batch_size: batch.batch_size,
+            max_active: batch.max_active,
+            stm_indices: DeviceBuffer::from_host(stream, batch.stm_indices)?,
+            nstm_indices: DeviceBuffer::from_host(stream, batch.nstm_indices)?,
+        })
     }
 }
 
@@ -354,6 +412,39 @@ mod tests {
                 name: "l0w",
                 expected: 8,
                 actual: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn host_batch_validates_fixed_width_sparse_indices() {
+        let batch = NnueForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[3, -1, -1, 0, 2, -1],
+            batch_size: 2,
+            max_active: 3,
+        };
+
+        batch.validate().unwrap();
+    }
+
+    #[test]
+    fn host_batch_reports_length_mismatch() {
+        let batch = NnueForwardHostBatch {
+            stm_indices: &[0, 1, -1],
+            nstm_indices: &[3, -1, -1, 0, 2, -1],
+            batch_size: 2,
+            max_active: 3,
+        };
+
+        let err = batch.validate().unwrap_err();
+
+        assert_eq!(
+            err,
+            NnueLayoutError::BatchLength {
+                name: "stm_indices",
+                expected: 6,
+                actual: 3,
             }
         );
     }

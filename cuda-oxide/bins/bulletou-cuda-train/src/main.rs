@@ -2,6 +2,9 @@
 mod kernels;
 
 #[cfg(feature = "cuda")]
+mod nnue_forward;
+
+#[cfg(feature = "cuda")]
 pub(crate) use kernels::*;
 
 fn main() {

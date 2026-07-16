@@ -43,4 +43,4 @@ status を更新する。
 - done: nested `cuda-oxide` runtime 側に forward kernel set resolve 境界を追加。
 - in-progress: `nnue_sparse_l0_crelu` kernel 定義を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と CPU golden の L0 出力比較が必要。
 - in-progress: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加済み。CUDA Toolkit 環境で compile / launch 検証が必要。
-- todo: host launch sequence を実装し、1 batch の最終 output を CPU golden と比較する。
+- in-progress: host launch sequence を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と 1 batch 最終 output の CPU golden 比較が必要。
