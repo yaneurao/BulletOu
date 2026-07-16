@@ -259,6 +259,12 @@ current batch の compute sync を先に待ってから copy stream を同期す
 これは cuda-oxide の本命である input upload ring の小さい前段である。
 完全な ring 化ではないが、既存の double buffer 構造のまま安全に overlap を増やせる。
 
+さらに、次 batch が dataloader queue にすでに到着している場合は、current batch の
+backward/update を enqueue する前に `try_recv` で取得し、`next_on_device` への H2D copy を
+先行 enqueue する。`try_recv` なので dataloader が遅い場合には compute 開始をブロックしない。
+queue に余裕がある条件では、next batch upload と current batch compute の overlap 時間を
+より長く取れる。
+
 あわせて、複数 input tensor の H2D copy を tensor ごとの `SyncOnDrop` ではなく、
 1 つの `SyncOnDrop` にまとめる。これにより、同じ copy stream への同期呼び出しを
 input tensor 数ぶん繰り返す無駄を避ける。

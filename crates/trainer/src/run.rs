@@ -2,7 +2,11 @@ pub mod dataloader;
 pub mod logger;
 pub mod schedule;
 
-use std::{sync::mpsc, thread, time::Instant};
+use std::{
+    sync::mpsc::{self, TryRecvError},
+    thread,
+    time::Instant,
+};
 
 use bullet_compiler::tensor::{DValue, TValue};
 use bullet_gpu::{
@@ -205,6 +209,9 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         let batch_superbatch = superbatch;
         let batch_curr_batch = curr_batch;
         let batch_ends_superbatch = batch_curr_batch + 1 == steps.batches_per_superbatch;
+        let mut dataloader_exhausted = false;
+        let mut early_next_batch = None;
+        let mut early_next_copy = None;
 
         lr_value.write(0, DValue::F32(lrate));
         let lrdrop = tlr.copy_from_host_async(&copy_stream, &lr_value).map_err(TrainerError::Unexpected)?;
@@ -222,6 +229,24 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         }
 
         prev_lr = lrate;
+
+        match receiver.try_recv() {
+            Ok(next_batch_host) => {
+                next_batch_size = next_batch_host.batch_size;
+                early_next_batch = Some(next_batch_host);
+                early_next_copy = Some(
+                    early_next_batch
+                        .as_ref()
+                        .unwrap()
+                        .copy_to_device_async(&copy_stream, &next_on_device)
+                        .map_err(TrainerError::Unexpected)?,
+                );
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                dataloader_exhausted = true;
+            }
+        }
 
         let compute_block1 = trainer
             .optimiser
@@ -242,7 +267,20 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             .update(&compute_stream, tgf.clone(), tlr.clone(), &gradients)
             .map_err(TrainerError::OptimiserUpdateError)?;
 
-        if let Ok(next_batch_host) = receiver.recv() {
+        if let Some(next_copy) = early_next_copy {
+            compute_block1.sync().map_err(TrainerError::Unexpected)?;
+            compute_block2.sync().map_err(TrainerError::Unexpected)?;
+
+            // The copy was enqueued before current batch compute, so this
+            // drop usually only waits for the tail of H2D copy, if any.
+            drop(next_copy);
+            drop(early_next_batch);
+            std::mem::swap(&mut batch_on_device, &mut next_on_device);
+        } else if dataloader_exhausted {
+            batch_queued = false;
+            compute_block1.sync().map_err(TrainerError::Unexpected)?;
+            compute_block2.sync().map_err(TrainerError::Unexpected)?;
+        } else if let Ok(next_batch_host) = receiver.recv() {
             next_batch_size = next_batch_host.batch_size;
             let next_copy = next_batch_host
                 .copy_to_device_async(&copy_stream, &next_on_device)
