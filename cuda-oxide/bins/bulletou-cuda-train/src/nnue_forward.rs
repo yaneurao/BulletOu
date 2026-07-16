@@ -9,8 +9,7 @@ use std::sync::Arc;
 use bulletou_cuda_oxide_runtime::{
     CudaModule, CudaStream, LaunchConfig, Result,
     nnue::{
-        NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardLaunchPlan,
-        NnueForwardWorkspace, NnueLayoutError,
+        NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardLaunchPlan, NnueForwardWorkspace, NnueLayoutError,
     },
 };
 use cuda_host::cuda_launch;
@@ -147,11 +146,7 @@ fn validate_forward_layout(
     workspace: &NnueForwardWorkspace,
 ) -> Result<()> {
     expect_layout_value("batch_size", workspace.layout.batch_size, batch.batch_size)?;
-    expect_layout_value(
-        "shape.input_size",
-        workspace.layout.shape.input_size,
-        weights.shape.input_size,
-    )?;
+    expect_layout_value("shape.input_size", workspace.layout.shape.input_size, weights.shape.input_size)?;
     expect_layout_value("shape.l1", workspace.layout.shape.l1, weights.shape.l1)?;
     expect_layout_value("shape.l2", workspace.layout.shape.l2, weights.shape.l2)?;
     expect_layout_value("shape.l3", workspace.layout.shape.l3, weights.shape.l3)?;

@@ -10,9 +10,7 @@ pub mod nnue;
 use std::{path::Path, sync::Arc};
 
 #[cfg(feature = "cuda")]
-pub use cuda_core::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError, LaunchConfig,
-};
+pub use cuda_core::{CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -40,6 +38,8 @@ pub enum Error {
         #[source]
         source: DriverError,
     },
+    #[error("{0}")]
+    Smoke(String),
     #[error("cuda feature is disabled; rebuild with `--features cuda`")]
     CudaFeatureDisabled,
 }
@@ -48,18 +48,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "cuda")]
 pub fn load_ptx_module(ctx: &Arc<CudaContext>, ptx_path: &Path) -> Result<Arc<CudaModule>> {
-    let path = ptx_path
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(ptx_path.display().to_string()))?;
+    let path = ptx_path.to_str().ok_or_else(|| Error::NonUtf8Path(ptx_path.display().to_string()))?;
     Ok(ctx.load_module_from_file(path)?)
 }
 
 #[cfg(feature = "cuda")]
 pub fn resolve_kernel(module: &Arc<CudaModule>, kernel: &str) -> Result<CudaFunction> {
-    module.load_function(kernel).map_err(|source| Error::MissingKernel {
-        kernel: kernel.to_string(),
-        source,
-    })
+    module.load_function(kernel).map_err(|source| Error::MissingKernel { kernel: kernel.to_string(), source })
 }
 
 #[cfg(feature = "cuda")]
@@ -74,11 +69,7 @@ pub fn host_device_roundtrip(ctx: &Arc<CudaContext>, len: usize) -> Result<bool>
 #[cfg(feature = "cuda")]
 pub fn launch_zero_arg_kernel(ctx: &Arc<CudaContext>, func: &CudaFunction) -> Result<()> {
     let stream = ctx.default_stream();
-    let config = LaunchConfig {
-        grid_dim: (1, 1, 1),
-        block_dim: (1, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let config = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
     let mut kernel_params: [*mut std::ffi::c_void; 0] = [];
 
     // SAFETY: this smoke launch uses a repository-local zero-argument PTX

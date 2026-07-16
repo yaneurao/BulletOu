@@ -42,13 +42,7 @@ pub fn nnue_sparse_l0_crelu(
 }
 
 #[kernel]
-pub fn nnue_concat_l0(
-    stm_l0: &[f32],
-    nstm_l0: &[f32],
-    mut combined: DisjointSlice<f32>,
-    batch: u32,
-    rows: u32,
-) {
+pub fn nnue_concat_l0(stm_l0: &[f32], nstm_l0: &[f32], mut combined: DisjointSlice<f32>, batch: u32, rows: u32) {
     let tid = thread::index_1d();
     let combined_rows = (rows as usize) * 2;
     let total = (batch as usize) * combined_rows;
@@ -59,11 +53,7 @@ pub fn nnue_concat_l0(
     let col = tid.get() % combined_rows;
     let sample = tid.get() / combined_rows;
     let src = sample * (rows as usize) + (col % (rows as usize));
-    let value = if col < rows as usize {
-        stm_l0[src]
-    } else {
-        nstm_l0[src]
-    };
+    let value = if col < rows as usize { stm_l0[src] } else { nstm_l0[src] };
 
     if let Some(out) = combined.get_mut(tid) {
         *out = value;
