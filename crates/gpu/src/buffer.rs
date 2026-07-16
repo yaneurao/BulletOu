@@ -226,7 +226,7 @@ impl<G: Gpu> Buffer<G> {
             stream.memcpy_d2h(guard.ptr(), value.mut_ptr(), guard.bytes())?;
         }
 
-        let mut sync = SyncOnDrop::new(stream.clone());
+        let mut sync = SyncOnDrop::with_capacity(stream.clone(), 1);
         sync.attach(guard)?;
 
         Ok(SyncOnValue::new(sync, value))
@@ -266,7 +266,7 @@ impl<G: Gpu> Buffer<G> {
         }
 
         unsafe {
-            let mut sync = SyncOnDrop::new(stream.clone());
+            let mut sync = SyncOnDrop::with_capacity(stream.clone(), 1);
             let guard = self.clone().acquire(stream.clone())?;
 
             stream.memcpy_h2d(value.ptr(), guard.ptr(), guard.bytes())?;
