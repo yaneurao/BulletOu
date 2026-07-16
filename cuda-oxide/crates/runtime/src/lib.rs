@@ -5,6 +5,7 @@
 //! touching the existing generic Bullet backend.
 
 pub mod nnue;
+pub mod sfnn;
 
 #[cfg(feature = "cuda")]
 use std::{path::Path, sync::Arc};
@@ -25,6 +26,8 @@ pub fn backend_status() -> BackendStatus {
 pub enum Error {
     #[error(transparent)]
     NnueLayout(#[from] nnue::NnueLayoutError),
+    #[error(transparent)]
+    SfnnLayout(#[from] sfnn::SfnnLayoutError),
     #[cfg(feature = "cuda")]
     #[error(transparent)]
     Cuda(#[from] DriverError),
