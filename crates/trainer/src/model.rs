@@ -48,20 +48,20 @@ pub struct Model<G: Gpu> {
     weights: TensorMap<G>,
     shapes: BTreeMap<String, (Shape, Option<usize>)>,
     forward: Function<G>,
-    fwd_bindings: Vec<TensorBinding>,
+    fwd_bindings: Vec<TensorBinding<G>>,
     backward: Function<G>,
-    bwd_bindings: Vec<TensorBinding>,
+    bwd_bindings: Vec<TensorBinding<G>>,
     fwd_output_types: BTreeMap<String, TType>,
     bwd_output_types: BTreeMap<String, TType>,
 }
 
-pub(crate) struct TensorBinding {
+pub(crate) struct TensorBinding<G: Gpu> {
     node: NodeId,
-    source: TensorSource,
+    source: TensorSource<G>,
 }
 
-enum TensorSource {
-    Weight(String),
+enum TensorSource<G: Gpu> {
+    Weight(Arc<Buffer<G>>),
     Input(String),
     Output(String),
     Gradient(String),
@@ -93,7 +93,7 @@ impl<G: Gpu> Model<G> {
         self.forward.execute_binding_refs(
             stream.clone(),
             self.fwd_bindings.iter().map(|binding| {
-                (binding.node, resolve_tensor_ref(&binding.source, &self.weights, inputs, outputs, None).unwrap())
+                (binding.node, resolve_tensor_ref(&binding.source, inputs, outputs, None).unwrap())
             }),
         )
     }
@@ -116,10 +116,7 @@ impl<G: Gpu> Model<G> {
         self.backward.execute_binding_refs(
             stream.clone(),
             self.bwd_bindings.iter().map(|binding| {
-                (
-                    binding.node,
-                    resolve_tensor_ref(&binding.source, &self.weights, inputs, outputs, Some(gradients)).unwrap(),
-                )
+                (binding.node, resolve_tensor_ref(&binding.source, inputs, outputs, Some(gradients)).unwrap())
             }),
         )
     }
@@ -203,12 +200,15 @@ impl<G: Gpu> Model<G> {
     }
 }
 
-pub(crate) fn make_tensor_bindings(map: &BTreeMap<String, NodeId>) -> Vec<TensorBinding> {
+pub(crate) fn make_tensor_bindings<G: Gpu>(
+    map: &BTreeMap<String, NodeId>,
+    weights: &TensorMap<G>,
+) -> Vec<TensorBinding<G>> {
     map.iter()
         .map(|(name, &node)| TensorBinding {
             node,
             source: if let Some(name) = name.strip_prefix("weights/") {
-                TensorSource::Weight(name.to_string())
+                TensorSource::Weight(weights.get(name).unwrap().clone())
             } else if let Some(name) = name.strip_prefix("inputs/") {
                 TensorSource::Input(name.to_string())
             } else if let Some(name) = name.strip_prefix("gradients/") {
@@ -221,14 +221,13 @@ pub(crate) fn make_tensor_bindings(map: &BTreeMap<String, NodeId>) -> Vec<Tensor
 }
 
 fn resolve_tensor_ref<'a, G: Gpu>(
-    source: &TensorSource,
-    weights: &'a TensorMap<G>,
+    source: &'a TensorSource<G>,
     inputs: &'a TensorMap<G>,
     outputs: &'a TensorMap<G>,
     gradients: Option<&'a TensorMap<G>>,
 ) -> Option<&'a Arc<Buffer<G>>> {
     match source {
-        TensorSource::Weight(name) => weights.get(name),
+        TensorSource::Weight(tensor) => Some(tensor),
         TensorSource::Input(name) => inputs.get(name),
         TensorSource::Output(name) => outputs.get(name),
         TensorSource::Gradient(name) => gradients.and_then(|gradients| gradients.get(name)),

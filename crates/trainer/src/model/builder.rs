@@ -299,13 +299,16 @@ impl ModelBuilder {
         bwd.transform(InlineSubgraphs).unwrap();
         bwd.optimise().unwrap();
 
+        let fwd_bindings = make_tensor_bindings(&fwd_map, &weights);
+        let bwd_bindings = make_tensor_bindings(&bwd_map, &weights);
+
         Model {
             weights,
             shapes,
             forward: Function::new(device.clone(), fwd).unwrap(),
-            fwd_bindings: make_tensor_bindings(&fwd_map),
+            fwd_bindings,
             backward: Function::new(device.clone(), bwd).unwrap(),
-            bwd_bindings: make_tensor_bindings(&bwd_map),
+            bwd_bindings,
             fwd_output_types: [("outputs/output".to_string(), fwd_ty)].into(),
             bwd_output_types: [("outputs/loss".to_string(), bwd_ty)].into(),
             device,

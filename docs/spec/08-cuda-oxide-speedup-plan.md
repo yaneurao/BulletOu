@@ -341,6 +341,9 @@ tensor 名を prefix 解決して、直接該当する map から buffer を引�
 `weights/` / `inputs/` / `gradients/` / output のどこを見るかを `TensorSource` として
 保持しておけば、batch 中の `strip_prefix()` と一時 binding 配列 allocation も不要になる。
 batch 中は固定済み binding を走査し、該当する tensor map から `Arc<Buffer>` を clone するだけでよい。
+さらに weight tensor は学習中に同じ buffer を使い続けるため、`TensorBinding` 構築時に
+`Arc<Buffer>` へ直接解決しておく。これにより forward/backward の各 batch で weight 名を
+`BTreeMap` lookup する処理を避け、動的 lookup は input / output / gradient だけに限定する。
 
 kernel launch 引数も同様に、launch ごとに小さな `Vec` を作る必要はない。
 `Function::execute` 内で `max_num_args` 分の引数 buffer を 1 つ確保し、各 kernel launch で
