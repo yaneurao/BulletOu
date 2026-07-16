@@ -267,6 +267,11 @@ input tensor 数ぶん繰り返す無駄を避ける。
 従来は `sync(self)` が `self` を消費したあと `synced=false` のまま drop されるため、
 明示 `sync()` が二重の stream sync になっていた。
 
+learning-rate scalar と gradient-factor scalar の upload も同じ copy stream 上で
+連続して enqueue される。個別の `SyncOnDrop` を個別に `sync()` すると同じ stream を
+2 回待つだけなので、`SyncOnDrop::merge()` で guard をまとめ、update 前に 1 回だけ
+copy stream を同期する。
+
 ### Phase 0.8: one-batch delayed loss readback
 
 loss readback は `outputs/loss` buffer を GPU から CPU に戻すための同期点になる。

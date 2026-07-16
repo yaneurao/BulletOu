@@ -53,6 +53,17 @@ impl<G: Gpu> SyncOnDrop<G> {
 
         Ok(())
     }
+
+    pub fn merge(&mut self, mut other: Self) -> Result<(), G::Error> {
+        if self.stream.as_ref() != other.stream.as_ref() {
+            return Err("Cannot merge stream sync guards from different streams!".to_string().into());
+        }
+
+        self.guards.append(&mut other.guards);
+        other.synced = true;
+
+        Ok(())
+    }
 }
 
 /// Like `SyncOnDrop` but with an attached value

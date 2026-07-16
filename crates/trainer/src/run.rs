@@ -227,8 +227,11 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
         let compute_block1 = unsafe { compute_block1.detach_value() };
 
-        lrdrop.value().map_err(TrainerError::Unexpected)?;
-        gfdrop.value().map_err(TrainerError::Unexpected)?;
+        let mut scalar_upload = unsafe { lrdrop.detach_value() };
+        scalar_upload
+            .merge(unsafe { gfdrop.detach_value() })
+            .map_err(TrainerError::Unexpected)?;
+        scalar_upload.sync().map_err(TrainerError::Unexpected)?;
 
         let compute_block2 = trainer
             .optimiser
