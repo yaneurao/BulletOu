@@ -348,6 +348,10 @@ optimizer の weight ごとの update kernel は `CompiledKernel::execute` を�
 ここでも小さな allocation が積み重なる。可変 batch size の一致確認は `BTreeSet` ではなく
 `Option<usize>` で十分なので、set allocation を避ける。また launch 引数 `Vec` は必要容量を
 事前に確保する。
+さらに `CompiledKernel` にも scratch buffer を持たせ、input/output device pointer、
+launch 引数、device pointer 引数配列を kernel 呼び出しごとに再利用する。guard は
+`SyncOnDrop` に直接 attach し、scratch には launch 中だけ必要な host-side pointer 配列だけを
+置く。
 
 さらに `CompiledKernel::execute_slices` を追加し、Adam/RAdam/Ranger の update 呼び出しでは
 `vec![...]` ではなく stack 上の配列参照を渡す。各 weight ごとの optimizer kernel launch で

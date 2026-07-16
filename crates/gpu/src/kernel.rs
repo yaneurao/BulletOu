@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, ffi::c_void, fmt, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeSet, ffi::c_void, fmt, rc::Rc, sync::Arc};
 
 use bullet_compiler::tensor::{OpType, TType};
 
@@ -73,6 +73,12 @@ impl KernelSrc {
             gdim: self.gdim.clone(),
             bdim: self.bdim.clone(),
             smem: self.smem.clone(),
+            scratch: RefCell::new(CompiledKernelScratch::new(
+                self.inputs.len(),
+                self.outputs.len(),
+                self.arg_order.len() + usize::from(self.requires_var_size_arg),
+                self.arg_order.len(),
+            )),
         })
     }
 }
@@ -101,6 +107,32 @@ pub struct CompiledKernel<G: Gpu> {
     pub(crate) gdim: Rc<dyn Fn(usize) -> Dim3>,
     pub(crate) bdim: Rc<dyn Fn(usize) -> u32>,
     pub(crate) smem: Rc<dyn Fn(usize) -> u32>,
+    scratch: RefCell<CompiledKernelScratch<G>>,
+}
+
+struct CompiledKernelScratch<G: Gpu> {
+    input_ptrs: Vec<G::DevicePtr>,
+    output_ptrs: Vec<G::DevicePtr>,
+    args: Vec<*mut c_void>,
+    ptr_values: Vec<G::DevicePtr>,
+}
+
+impl<G: Gpu> CompiledKernelScratch<G> {
+    fn new(input_count: usize, output_count: usize, max_args: usize, ptr_count: usize) -> Self {
+        Self {
+            input_ptrs: Vec::with_capacity(input_count),
+            output_ptrs: Vec::with_capacity(output_count),
+            args: Vec::with_capacity(max_args),
+            ptr_values: Vec::with_capacity(ptr_count),
+        }
+    }
+
+    fn prepare(&mut self) {
+        self.input_ptrs.clear();
+        self.output_ptrs.clear();
+        self.args.clear();
+        self.ptr_values.clear();
+    }
 }
 
 impl<G: Gpu> fmt::Debug for CompiledKernel<G> {
@@ -137,7 +169,23 @@ impl<G: Gpu> CompiledKernel<G> {
             arg_order.iter().filter_map(|(idx, input)| (!input).then_some(*idx)).collect::<BTreeSet<_>>().len()
         );
 
-        Self { inputs, outputs, kernel, requires_var_size_arg, arg_order, requires_zero, gdim, bdim, smem }
+        let input_count = inputs.len();
+        let output_count = outputs.len();
+        let max_args = arg_order.len() + usize::from(requires_var_size_arg);
+        let ptr_count = arg_order.len();
+
+        Self {
+            inputs,
+            outputs,
+            kernel,
+            requires_var_size_arg,
+            arg_order,
+            requires_zero,
+            gdim,
+            bdim,
+            smem,
+            scratch: RefCell::new(CompiledKernelScratch::new(input_count, output_count, max_args, ptr_count)),
+        }
     }
 
     pub fn execute(
@@ -160,25 +208,18 @@ impl<G: Gpu> CompiledKernel<G> {
         }
 
         let mut sync = SyncOnDrop::with_capacity(stream.clone(), inputs.len() + outputs.len());
-
-        let mut input_guards = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            input_guards.push(input.clone().acquire(stream.clone())?);
-        }
-
-        let mut output_guards = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            output_guards.push(output.clone().acquire(stream.clone())?);
-        }
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.prepare();
 
         let mut var_size = None;
 
-        for (buf, &ttype) in input_guards.iter().zip(&self.inputs).chain(output_guards.iter().zip(&self.outputs)) {
-            if buf.dtype() != ttype.dtype() {
+        for (input, &ttype) in inputs.iter().zip(&self.inputs) {
+            let guard = input.clone().acquire(stream.clone())?;
+            if guard.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());
             }
 
-            let concrete_size = buf.size();
+            let concrete_size = guard.size();
             if let Some(var) = ttype.size().get_var_size(concrete_size) {
                 match var_size {
                     None => var_size = Some(var),
@@ -190,22 +231,47 @@ impl<G: Gpu> CompiledKernel<G> {
             } else if ttype.size().evaluate_constant().unwrap() != concrete_size {
                 return Err("Mismatched sizes!".to_string().into());
             }
+
+            scratch.input_ptrs.push(guard.ptr());
+            sync.attach(guard)?;
+        }
+
+        for (output, &ttype) in outputs.iter().zip(&self.outputs) {
+            let guard = output.clone().acquire(stream.clone())?;
+            if guard.dtype() != ttype.dtype() {
+                return Err("Mismatched dtypes!".to_string().into());
+            }
+
+            let concrete_size = guard.size();
+            if let Some(var) = ttype.size().get_var_size(concrete_size) {
+                match var_size {
+                    None => var_size = Some(var),
+                    Some(old_var) if old_var == var => {}
+                    Some(old_var) => {
+                        return Err(format!("Mismatching batch sizes in inputs: {old_var} != {var}").into());
+                    }
+                }
+            } else if ttype.size().evaluate_constant().unwrap() != concrete_size {
+                return Err("Mismatched sizes!".to_string().into());
+            }
+
+            scratch.output_ptrs.push(guard.ptr());
+            sync.attach(guard)?;
         }
 
         let var = var_size.unwrap_or(1);
 
-        let mut args: Vec<*mut c_void> =
-            Vec::with_capacity(self.arg_order.len() + usize::from(self.requires_var_size_arg));
-
         let size = var as i32;
         if self.requires_var_size_arg {
-            args.push((&size as *const i32).cast_mut().cast());
+            scratch.args.push((&size as *const i32).cast_mut().cast());
         }
 
-        let mut ptrs = vec![Default::default(); self.arg_order.len()];
-        for (i, &(index, is_input)) in self.arg_order.iter().enumerate() {
-            ptrs[i] = if is_input { input_guards[index].ptr() } else { output_guards[index].ptr() };
-            args.push((&ptrs[i] as *const G::DevicePtr).cast_mut().cast());
+        for &(index, is_input) in &self.arg_order {
+            let ptr = if is_input { scratch.input_ptrs[index] } else { scratch.output_ptrs[index] };
+            scratch.ptr_values.push(ptr);
+            let value_idx = scratch.ptr_values.len() - 1;
+            let arg_ptr = (&scratch.ptr_values[value_idx] as *const G::DevicePtr).cast_mut().cast();
+            scratch.args.push(arg_ptr);
         }
 
         unsafe {
@@ -217,17 +283,9 @@ impl<G: Gpu> CompiledKernel<G> {
                 &stream,
                 (self.gdim)(var),
                 (self.bdim)(var),
-                args.as_ptr().cast_mut().cast(),
+                scratch.args.as_ptr().cast_mut().cast(),
                 (self.smem)(var),
             )?;
-        }
-
-        for i in input_guards {
-            sync.attach(i)?;
-        }
-
-        for o in output_guards {
-            sync.attach(o)?;
         }
 
         Ok(SyncOnValue::new(sync, self))
