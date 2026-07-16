@@ -1143,28 +1143,39 @@ impl OptimizerKind {
 }
 
 fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u64 {
-    args.lr_step_positions.unwrap_or_else(|| (args.batch_size as u64).saturating_mul(batches_per_superbatch as u64))
+    args.lr_step_positions
+        .unwrap_or_else(|| (effective_batch_size(args) as u64).saturating_mul(batches_per_superbatch as u64))
 }
 
 const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
+const DEFAULT_BATCH_SIZE_KPPT: usize = 16_384;
+const DEFAULT_BATCH_SIZE_NNUE_SFNN: usize = 65_536;
+
+fn effective_batch_size(args: &Args) -> usize {
+    args.batch_size.unwrap_or_else(|| match args.eval_type() {
+        EvalType::Kppt | EvalType::KppKkpt => DEFAULT_BATCH_SIZE_KPPT,
+        _ => DEFAULT_BATCH_SIZE_NNUE_SFNN,
+    })
+}
 
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
-    if args.batch_size == 0 {
+    let batch_size = effective_batch_size(args);
+    if batch_size == 0 {
         return Err("--batch-size must be > 0.".to_string());
     }
-    let batches = args.positions_per_superbatch / args.batch_size;
+    let batches = args.positions_per_superbatch / batch_size;
     if batches == 0 {
         return Err(format!(
             "--positions-per-superbatch ({}) must be >= --batch-size ({}).",
-            args.positions_per_superbatch, args.batch_size
+            args.positions_per_superbatch, batch_size
         ));
     }
     Ok(batches)
 }
 
 fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
-    Ok(effective_batches_per_superbatch(args)?.saturating_mul(args.batch_size))
+    Ok(effective_batches_per_superbatch(args)?.saturating_mul(effective_batch_size(args)))
 }
 
 fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result<(f32, bool), String> {
@@ -1191,8 +1202,9 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
     if step_positions == 0 {
         return Err("--lr-step-positions must be > 0.".to_string());
     }
-    let total_positions =
-        (superbatches as u128).saturating_mul(batches_per_superbatch as u128).saturating_mul(args.batch_size as u128);
+    let total_positions = (superbatches as u128)
+        .saturating_mul(batches_per_superbatch as u128)
+        .saturating_mul(effective_batch_size(args) as u128);
     let steps = total_positions / (step_positions as u128);
     if steps == 0 {
         return Err(
@@ -1256,9 +1268,12 @@ struct Args {
     #[arg(long)]
     net_id: Option<String>,
 
-    /// Mini-batch size (positions per gradient step).
-    #[arg(long, default_value = "16384")]
-    batch_size: usize,
+    /// Mini-batch size (positions per gradient step). If omitted, BulletOu
+    /// uses 65536 for NNUE/SFNN to match tatara's high-throughput recipe,
+    /// and keeps 16384 for KPPT/KPP_KKPT to avoid increasing their memory
+    /// footprint.
+    #[arg(long)]
+    batch_size: Option<usize>,
 
     /// Target positions consumed per superbatch. The actual value is rounded
     /// down to a multiple of `--batch-size` because the trainer advances in
@@ -1893,7 +1908,7 @@ fn auto_epoch_period(
     data_files: &[String],
     batches_per_superbatch: usize,
 ) -> Result<u64, String> {
-    let sb_size = (batches_per_superbatch as u64) * (args.batch_size as u64);
+    let sb_size = (batches_per_superbatch as u64) * (effective_batch_size(args) as u64);
     if let Some(superbatches) = args.superbatches {
         return Ok(sb_size * (superbatches as u64));
     }
@@ -1973,10 +1988,10 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         paths.len(),
     );
 
-    // Estimate sb count for default settings (batch_size=16384, sb<=100M).
-    let default_batch_size: u64 = 16384;
+    // Estimate sb count for the NNUE/SFNN default settings (batch_size=65536, sb<=100M).
+    let default_batch_size: u64 = DEFAULT_BATCH_SIZE_NNUE_SFNN as u64;
     let default_sb_size: u64 = (DEFAULT_POSITIONS_PER_SUPERBATCH as u64 / default_batch_size) * default_batch_size;
-    // = floor(100M / batch_size) * batch_size = 99,991,552 for batch_size=16384.
+    // = floor(100M / batch_size) * batch_size = 99,942,400 for batch_size=65536.
     let full_sbs = total_positions / default_sb_size;
     let remainder = total_positions % default_sb_size;
     let partial_sb_fraction = remainder as f64 / default_sb_size as f64;
@@ -2450,6 +2465,9 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    if args.batch_size.is_none() {
+        eprintln!("  batch size = {} (auto for {})", effective_batch_size(&args), args.eval_type().cli_name());
+    }
     if args.nnue_pytorch_wrm_loss {
         eprintln!("  nnue-pytorch WRM loss = enabled");
     }
@@ -2489,7 +2507,7 @@ fn main() {
             args.lr_step_positions.map(|v| v.to_string()).unwrap_or_else(|| "one superbatch".to_string()),
             args.superbatches
                 .map(|n| (n as u64)
-                    .saturating_mul(args.batch_size as u64)
+                    .saturating_mul(effective_batch_size(&args) as u64)
                     .saturating_mul(batches_per_superbatch as u64)
                     .to_string())
                 .unwrap_or_else(|| "open-ended".to_string())
@@ -2583,7 +2601,7 @@ fn resume_signature(args: &Args) -> String {
         format!("eval_type={}", args.eval_type().cli_name()),
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
-        format!("batch_size={}", args.batch_size),
+        format!("batch_size={}", effective_batch_size(args)),
         format!("positions_per_superbatch={positions_per_superbatch}"),
         format!("superbatches={superbatches}"),
         format!("lr_schedule={}", args.lr_schedule.cli_name()),
@@ -2985,7 +3003,7 @@ impl LogContext {
             arch: if args.eval_type().uses_arch() { args.arch().cli_name() } else { String::new() },
             lr_start: args.lr,
             lambda: args.lambda,
-            batch_size: args.batch_size,
+            batch_size: effective_batch_size(args),
             batches_per_superbatch,
             teacher_csv: csv_escape(&resolve_teacher_for_log(&args.teacher)),
             epoch_offset: 0,
@@ -3754,7 +3772,7 @@ macro_rules! run_training_inline {
                 net_id: net_id_for_epoch.clone(),
                 eval_scale: args.scale as f32,
                 steps: TrainingSteps {
-                    batch_size: args.batch_size,
+                    batch_size: effective_batch_size(args),
                     batches_per_superbatch,
                     // KPPT family does not get auto-resume yet (the 3-component
                     // assembly makes the bookkeeping non-trivial); always starts at sb=1.
@@ -3774,7 +3792,7 @@ macro_rules! run_training_inline {
                         step_positions: lr_step_positions,
                         period_positions: lr_period,
                         prior_positions: 0,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
@@ -3782,7 +3800,7 @@ macro_rules! run_training_inline {
                         min: args.lr_min,
                         period_positions: lr_period,
                         prior_positions: 0,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
@@ -3790,7 +3808,7 @@ macro_rules! run_training_inline {
                         min: args.lr_min,
                         period_positions: lr_period,
                         prior_positions: 0,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Plateau => LrSchedulerImpl::Fixed(FixedLR { value: args.lr }),
@@ -4755,7 +4773,7 @@ macro_rules! run_training_inline_nnue {
             .max(1)
             .min(end_superbatch)
             .saturating_mul(batches_per_superbatch)
-            .saturating_mul(args.batch_size);
+            .saturating_mul(effective_batch_size(args));
         let new_hcpe_loader =
             |resume_off: u64,
              resume_exact: bool|
@@ -4884,7 +4902,7 @@ macro_rules! run_training_inline_nnue {
                         step_positions: lr_step_positions,
                         period_positions: lr_period,
                         prior_positions: cb_prior_position as u64,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
@@ -4892,7 +4910,7 @@ macro_rules! run_training_inline_nnue {
                         min: args.lr_min,
                         period_positions: lr_period,
                         prior_positions: cb_prior_position as u64,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
@@ -4900,7 +4918,7 @@ macro_rules! run_training_inline_nnue {
                         min: args.lr_min,
                         period_positions: lr_period,
                         prior_positions: cb_prior_position as u64,
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                     }),
                     LrScheduleKind::Plateau => {
@@ -4912,7 +4930,7 @@ macro_rules! run_training_inline_nnue {
                     net_id: net_id_for_epoch.clone(),
                     eval_scale: args.scale as f32,
                     steps: TrainingSteps {
-                        batch_size: args.batch_size,
+                        batch_size: effective_batch_size(args),
                         batches_per_superbatch,
                         start_superbatch: chunk_start,
                         end_superbatch: chunk_end,
@@ -6520,7 +6538,7 @@ mod tests {
         let sig_with = resume_signature(&with_superbatches);
         let sig_without = resume_signature(&without_superbatches);
         assert!(sig_with.contains("schema=bulletou-resume-v2"));
-        assert!(sig_with.contains("positions_per_superbatch=99991552"));
+        assert!(sig_with.contains("positions_per_superbatch=99942400"));
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
@@ -6545,6 +6563,19 @@ mod tests {
 
         assert_eq!(effective_batches_per_superbatch(&args).unwrap(), 610);
         assert_eq!(effective_positions_per_superbatch(&args).unwrap(), 9_994_240);
+    }
+
+    #[test]
+    fn omitted_batch_size_uses_tatara_sized_nnue_default_but_keeps_kppt_legacy_default() {
+        use clap::Parser as _;
+
+        let nnue = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let sfnn = Args::try_parse_from(["bulletou", "--eval-type", "SFNN_HALFKA2", "--teacher", "/dev/null"]).unwrap();
+        let kppt = Args::try_parse_from(["bulletou", "--eval-type", "KPPT", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(effective_batch_size(&nnue), DEFAULT_BATCH_SIZE_NNUE_SFNN);
+        assert_eq!(effective_batch_size(&sfnn), DEFAULT_BATCH_SIZE_NNUE_SFNN);
+        assert_eq!(effective_batch_size(&kppt), DEFAULT_BATCH_SIZE_KPPT);
     }
 
     #[test]

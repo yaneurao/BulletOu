@@ -106,9 +106,9 @@ cosine annealing (`--lr-schedule cos`) を使うときは特に重要 — 1 cycl
 === bulletou: running NNUE_HALFKP (256x2-32-32 ClippedReLU, dual-perspective) ===
 Training Preamble
 Net Name               : shogi_nnue_halfkp
-Batch Size             : 16384
-Batches / Superbatch   : 6103
-Positions / Superbatch : 99991552
+Batch Size             : 65536
+Batches / Superbatch   : 1525
+Positions / Superbatch : 99942400
 ...
 superbatch 1   pos = ... pos/s = ...   loss = ...
 superbatch 2   ...

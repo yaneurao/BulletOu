@@ -91,6 +91,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | Maximum number of epochs. If omitted: no fixed epoch cap | omitted |
 | `--superbatches` | Cap superbatches per epoch | unlimited |
+| `--batch-size` | Positions per gradient step. If omitted, BulletOu uses the tatara-aligned NNUE/SFNN default | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--save-rate` | Save every N superbatches | 1 |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step` / 0.00001 |

@@ -12,7 +12,7 @@ Main flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--batch-size` | Positions per gradient step | 16384 |
+| `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 for NNUE/SFNN to match tatara, and keeps 16384 for KPPT/KPP_KKPT | NNUE/SFNN: 65536, KPPT: 16384 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
 | `--max-epochs` | Maximum number of epochs. `--max-epoch` is also accepted as an alias. For `step` / `geometric` / `cos`, this is the number of LR cycles. For `plateau`, this caps plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |

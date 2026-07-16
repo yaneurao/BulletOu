@@ -85,6 +85,7 @@ To change any of these, pass a different `--tag` and run as a separate experimen
 |---|---|---|
 | 16384 | 100,000,000 | 99,991,552 |
 | 32768 | 100,000,000 | 99,975,168 |
+| 65536 | 100,000,000 | 99,942,400 |
 
 Changing `--batch-size` can slightly change the rounded effective sb_size. If you need an exactly matched LR cycle length, set `--positions-per-superbatch` explicitly as well.
 

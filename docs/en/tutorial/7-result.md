@@ -44,15 +44,15 @@ The loss trajectory of every run, both during training and afterwards, is record
 
 ```csv
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,524288,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,1048576,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,1572864,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,2097152,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,4194304,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,6291456,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100515840,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,102039552,teachers/
 ...
 ```
 
-Bullet writes **one row every 32 batches**. With the default `--positions-per-superbatch 100000000` and `--batch-size 16384`, the effective superbatch is 6103 batches (= 99,991,552 positions), so that's about 191 rows per superbatch. Once `curr_batch` reaches the final batch in the effective superbatch, `superbatch` increments by 1 and `curr_batch` restarts from 1.
+Bullet writes **one row every 32 batches**. With the NNUE/SFNN default (`--positions-per-superbatch 100000000`, omitted `--batch-size` = 65536), the effective superbatch is 1525 batches (= 99,942,400 positions), so that's about 48 rows per superbatch. If you explicitly pass `--batch-size 16384`, the effective superbatch is 6103 batches (= 99,991,552 positions), or about 191 rows. Once `curr_batch` reaches the final batch in the effective superbatch, `superbatch` increments by 1 and `curr_batch` restarts from 1.
 
 ### Column meanings
 
@@ -61,14 +61,14 @@ Bullet writes **one row every 32 batches**. With the default `--positions-per-su
 | `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every effective `--positions-per-superbatch` positions | `1`, `2`, ... |
-| `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `6103` |
+| `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `1525` |
 | `test_value_accuracy` | Validation accuracy from `--test-teacher`. Filled only on sb-boundary rows; otherwise `-` | `0.583784` |
 | `test_value_loss` | Validation loss from `--test-teacher`. Filled only on sb-boundary rows; otherwise `-` | `0.129676` |
 | `train_value_loss` | bullet's per-32-batch averaged loss | `0.234` |
 | `lr_start` | LR at the start of this row's interval. In summary rows, the superbatch start LR | `0.001000` |
 | `lr_end` | LR used by the last batch in this row's interval. In summary rows, the superbatch-end-side LR | `0.000934` |
 | `lambda` | the `--lambda` value (constant per run, fixed 6-decimal) | `1.000000` |
-| `positions` | cumulative teacher positions (**carries across resumes**) | `524288` |
+| `positions` | cumulative teacher positions (**carries across resumes**) | `2097152` |
 | `teacher` | the `--teacher` value | `teachers/` |
 
 NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.

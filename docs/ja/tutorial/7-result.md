@@ -44,15 +44,15 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ```csv
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,524288,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,1048576,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,1572864,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,2097152,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.5891,0.000999,0.000998,1.000000,4194304,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,96,-,-,0.5510,0.000998,0.000997,1.000000,6291456,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,100515840,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,32,-,-,0.4523,0.000934,0.000933,1.000000,102039552,teachers/
 ...
 ```
 
-bullet は **32 batch ごとに 1 行** loss を記録する。デフォルトの `--positions-per-superbatch 100000000` かつ `--batch-size 16384` なら、実効値は 6103 batch (= 99,991,552 局面) で、1 superbatch あたり約 191 行。`curr_batch` 列が実効superbatch内の最終batchに達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
+bullet は **32 batch ごとに 1 行** loss を記録する。NNUE/SFNN のデフォルト (`--positions-per-superbatch 100000000`、`--batch-size` 省略 = 65536) では、実効値は 1525 batch (= 99,942,400 局面) で、1 superbatch あたり約 48 行。`--batch-size 16384` を明示した場合は 6103 batch (= 99,991,552 局面) で約 191 行になる。`curr_batch` 列が実効superbatch内の最終batchに達すると `superbatch` が +1 されて `curr_batch` は 1 から再開する。
 
 ### 列の意味
 
@@ -61,14 +61,14 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト�
 | `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--positions-per-superbatch` の実効局面数ごとに +1 | `1`, `2`, ... |
-| `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `6103` |
+| `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `1525` |
 | `test_value_accuracy` | `--test-teacher` の検証 accuracy。sb 境界行だけ実値、それ以外は `-` | `0.583784` |
 | `test_value_loss` | `--test-teacher` の検証 loss。sb 境界行だけ実値、それ以外は `-` | `0.129676` |
 | `train_value_loss` | bullet が記録する 32-batch 平均 loss | `0.234` |
 | `lr_start` | その行の区間開始時の学習率。summary 行では superbatch 開始 LR | `0.001000` |
 | `lr_end` | その行の最後の batch で使った学習率。summary 行では superbatch 終端側 LR | `0.000934` |
 | `lambda` | `--lambda` 値 (1 run 内で定数、6 桁固定) | `1.000000` |
-| `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `524288` |
+| `positions` | 累計教師局面数 (**resume 跨ぎで累積**) | `2097152` |
 | `teacher` | `--teacher` の値 | `teachers/` |
 
 NNUE 系は `--arch` を `eval` 列に含める (出力ディレクトリ名と同じ命名)。KPPT 系は `--arch` を使わないので `eval` 列に arch は出ない。

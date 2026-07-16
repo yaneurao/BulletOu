@@ -164,20 +164,20 @@ sb 列は intrinsic に **per-epoch カウンタ** (= 各 epoch で 1..`--superb
 
 ```
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,524288,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000999,0.000998,1.000000,1048576,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,2097152,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000999,0.000998,1.000000,4194304,teachers/
 ...
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,6103,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99991552,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1525,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/
 ```
 
-bullet は 32 batch ごとに 1 行 loss を記録するので、1 sb 内に約 191 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
+bullet は 32 batch ごとに 1 行 loss を記録する。NNUE/SFNN のデフォルト batch-size 65536 では、1 sb 内に約 48 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
 
 ### top-level `<output>/summary-learn.log` (= 11 列、sb 境界のみ抽出)
 
 ```
 eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99991552,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199983104,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199884800,teachers/
 ```
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。

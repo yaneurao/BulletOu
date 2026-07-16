@@ -212,6 +212,23 @@ binary crate 側に置く。CPU reference と host 側 helper は library crate 
 高速化の比較では、accuracy / loss が変わったら速度比較にならない。
 まず fp32 の数値同等性を優先する。
 
+### Phase 0.5: 既存 backend での即効改善
+
+cuda-oxide 専用 backend へ進む前の低リスクな改善として、`--batch-size` 省略時の
+デフォルトを NNUE/SFNN だけ `65536` に寄せる。KPPT / KPP_KKPT は今回の高速化対象外
+なので従来どおり `16384` のままにする。
+
+この変更の狙い:
+
+- tatara の代表的な学習条件と同じ batch 粒度に近づける
+- 同じ局面数を処理するときの batch 数を減らし、host 側 batch 構築・GPU step 呼び出し・
+  ログ処理の overhead を減らす
+- `--positions-per-superbatch` 指定時は `floor(positions / batch_size) * batch_size`
+  へ丸める既存仕様を維持する
+
+これは fused kernel 化ではないため、tatara 相当の速度にはまだ届かない。
+本命の改善は Phase 1 以降の NNUE/SFNN 専用 cuda-oxide backend で行う。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
