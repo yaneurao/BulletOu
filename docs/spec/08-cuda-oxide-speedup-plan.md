@@ -390,6 +390,10 @@ batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tenso
 同じく guard list を事前確保する。
 単一 buffer の H2D/D2H copy helper では容量 1 で確保する。
 
+`Function` 内部の NodeId→pointer slot 対応も、実行時に `BTreeMap` を引く必要はない。
+構築時にだけ map を作り、実行時はソート済み slice の binary search にすることで、
+forward/backward の binding 解決で tree node を辿る overhead を減らす。
+
 training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` を batch ごとに
 新規作成する必要はない。loop 外で 2 つの scalar host buffer を確保し、batch ごとに値だけ
 書き換えて H2D copy することで、小さな `Vec<f32>` allocation を避ける。

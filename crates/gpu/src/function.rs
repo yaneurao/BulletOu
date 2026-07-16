@@ -60,7 +60,7 @@ enum Inst<G: Gpu> {
 
 pub struct Function<G: Gpu> {
     device: Arc<Device<G>>,
-    maps: BTreeMap<NodeId, (usize, bool, TType)>,
+    maps: Box<[(NodeId, (usize, bool, TType))]>,
     insts: Box<[Inst<G>]>,
     num_ptrs: usize,
     blas: Option<Blas<G>>,
@@ -230,7 +230,7 @@ impl<G: Gpu> Function<G> {
         let blas = requires_blas.then(|| Blas::new(device.clone()).unwrap());
         Ok(Self {
             device,
-            maps,
+            maps: maps.into_iter().collect::<Vec<_>>().into_boxed_slice(),
             insts: insts.into_boxed_slice(),
             num_ptrs,
             blas,
@@ -297,7 +297,12 @@ impl<G: Gpu> Function<G> {
         let mut var_size = None;
 
         for (name, buf) in inputs {
-            let (idx, is_mut, ty) = *self.maps.get(&name).ok_or("Input not in function!".into())?;
+            let (_, (idx, is_mut, ty)) = *self
+                .maps
+                .binary_search_by_key(&name, |(node, _)| *node)
+                .ok()
+                .map(|idx| &self.maps[idx])
+                .ok_or("Input not in function!".into())?;
             let size = ty.size();
 
             if buf.dtype() != ty.dtype() {
