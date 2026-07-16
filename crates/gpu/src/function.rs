@@ -260,9 +260,10 @@ impl<G: Gpu> Function<G> {
     {
         let mut sync = SyncOnDrop::new(stream.clone());
 
+        let inputs = inputs.into_iter();
         let mut ptrs = vec![G::DevicePtr::default(); self.num_ptrs];
 
-        let mut mutmap = BTreeMap::new();
+        let mut aliases = Vec::with_capacity(inputs.size_hint().0);
         let mut var_size = None;
 
         for (name, buf) in inputs {
@@ -302,10 +303,12 @@ impl<G: Gpu> Function<G> {
             sync.attach(guard)?;
             ptrs[idx] = ptr;
 
-            if let Some(is_alr_mut) = mutmap.insert(ptr, is_mut) {
-                if is_mut || is_alr_mut {
+            if let Some((_, is_alr_mut)) = aliases.iter().find(|(seen_ptr, _)| *seen_ptr == ptr) {
+                if is_mut || *is_alr_mut {
                     return Err("Cannot alias pointers!".to_string().into());
                 }
+            } else {
+                aliases.push((ptr, is_mut));
             }
         }
 

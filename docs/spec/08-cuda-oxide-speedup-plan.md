@@ -354,6 +354,10 @@ forward/backward では `TensorBinding` を事前計算しているが、実行�
 guard を作るため、ownership/sync の意味は変わらず、binding 解決時の atomic refcount 操作を
 減らせる。
 
+`Function` の alias check は入力数が小さいため、毎回 `BTreeMap` を構築するよりも
+`Vec<(DevicePtr, bool)>` の線形探索で十分である。これにより forward/backward 呼び出しごとの
+map node allocation を避ける。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
