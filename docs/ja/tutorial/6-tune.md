@@ -12,6 +12,7 @@
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
+| `--backend` | 学習 backend。現状の実用経路は `bullet`。`cuda-oxide` は NNUE/SFNN 専用高速 backend 用に予約されており、未接続の間は明示エラーになる | `bullet` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |

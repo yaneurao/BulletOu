@@ -242,6 +242,20 @@ tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
 
 この段階では kernel は smoke test 用でよい。
 
+### Phase 1a: backend selector
+
+実装順の最初として、CLI に `--backend` を追加する。
+
+```text
+--backend bullet      # 既定。現行の汎用 Bullet backend
+--backend cuda-oxide  # NNUE/SFNN 専用高速 backend 用に予約
+```
+
+`cuda-oxide` は KPPT / KPP_KKPT を対象にしない。Phase 1a の時点では runtime /
+kernel が未接続なので、`--backend cuda-oxide` は silent fallback せず明示エラーにする。
+これにより、後続 Phase で実装を差し込む CLI 形状だけ先に固定し、既存の `bullet`
+backend の挙動を変えない。
+
 ### Phase 2: dataloader adapter
 
 最初の実験では、既存 BulletOu dataloader を完全流用するより、

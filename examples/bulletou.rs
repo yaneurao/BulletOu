@@ -159,6 +159,25 @@ enum EvalType {
     SfnnKa2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum BackendKind {
+    /// Existing generic Bullet backend. Supports every eval type.
+    Bullet,
+    /// Future NNUE/SFNN-only cuda-oxide backend. The CLI is reserved so
+    /// experiments can grow without changing command shape later.
+    CudaOxide,
+}
+
+impl BackendKind {
+    fn cli_name(self) -> &'static str {
+        match self {
+            BackendKind::Bullet => "bullet",
+            BackendKind::CudaOxide => "cuda-oxide",
+        }
+    }
+}
+
 /// LayerStack bucketing scheme for the SFNN family. Selects which
 /// per-position bucket index is used to choose the active MLP stack
 /// from the LayerStacks array, and implicitly determines the **stack
@@ -1226,6 +1245,12 @@ struct Args {
     #[arg(long, value_enum, required_unless_present = "count_teacher")]
     eval_type: Option<EvalType>,
 
+    /// Training backend. `bullet` is the existing generic backend.
+    /// `cuda-oxide` is reserved for the NNUE/SFNN fast path and currently
+    /// fails fast instead of silently falling back.
+    #[arg(long, value_enum, default_value = "bullet")]
+    backend: BackendKind,
+
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
     /// concatenated), or a comma-separated list of either. Format is
@@ -1660,6 +1685,27 @@ impl Args {
         }
 
         Ok(())
+    }
+
+    fn validate_backend_flags(&self) -> Result<(), String> {
+        match self.backend {
+            BackendKind::Bullet => Ok(()),
+            BackendKind::CudaOxide => {
+                let eval_type = self.eval_type();
+                if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
+                    return Err(format!(
+                        "--backend {} is for NNUE/SFNN eval types; {} remains on --backend bullet",
+                        self.backend.cli_name(),
+                        eval_type.cli_name(),
+                    ));
+                }
+                Err(
+                    "--backend cuda-oxide is reserved for the upcoming NNUE/SFNN fast path; \
+                     the runtime and fused kernels are not wired yet"
+                        .to_string(),
+                )
+            }
+        }
     }
 
     /// Unwrap `eval_type`. clap's `required_unless_present = "count_teacher"`
@@ -2456,6 +2502,10 @@ fn main() {
         }
     }
     if let Err(e) = args.validate_arch_flags() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+    if let Err(e) = args.validate_backend_flags() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -6570,6 +6620,56 @@ mod tests {
         assert_eq!(effective_batch_size(&nnue), DEFAULT_BATCH_SIZE);
         assert_eq!(effective_batch_size(&sfnn), DEFAULT_BATCH_SIZE);
         assert_eq!(effective_batch_size(&kppt), DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn backend_defaults_to_existing_bullet_path() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(args.backend, BackendKind::Bullet);
+        assert!(args.validate_backend_flags().is_ok());
+    }
+
+    #[test]
+    fn cuda_oxide_backend_is_reserved_and_fails_fast() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("reserved"));
+        assert!(err.contains("not wired yet"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_kppt_family() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("NNUE/SFNN"));
+        assert!(err.contains("KPPT"));
     }
 
     #[test]
