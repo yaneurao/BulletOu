@@ -15,9 +15,79 @@ use crate::{
     optimiser::OptimiserState,
     run::{
         dataloader::{DataLoader, PreparedBatchHost},
-        schedule::TrainingSchedule,
+        schedule::{TrainingSchedule, TrainingSteps},
     },
 };
+
+struct PendingLoss<G: Gpu> {
+    copy: SyncOnValue<G, TValue>,
+    superbatch: usize,
+    curr_batch: usize,
+    batch_size: usize,
+}
+
+fn finish_loss<G, O, S, B, C>(
+    trainer: &mut Trainer<G, O, S>,
+    pending: PendingLoss<G>,
+    steps: TrainingSteps,
+    log_rate: usize,
+    timer: &Instant,
+    superbatch_timer: &mut Instant,
+    running_loss: &mut f32,
+    superbatch_positions: &mut usize,
+    batch_callback: &mut B,
+    superbatch_callback: &mut C,
+) -> Result<(), TrainerError<G>>
+where
+    G: Gpu,
+    O: OptimiserState<G>,
+    B: FnMut(&mut Trainer<G, O, S>, usize, usize, f32),
+    C: FnMut(&mut Trainer<G, O, S>, usize),
+{
+    let TValue::F32(loss) = pending
+        .copy
+        .value()
+        .map_err(TrainerError::Unexpected)?
+    else {
+        panic!()
+    };
+    let [loss] = loss[..] else { panic!() };
+    let error = loss / pending.batch_size as f32;
+
+    *running_loss += error;
+    *superbatch_positions += pending.batch_size;
+
+    if pending.curr_batch % log_rate == 0 {
+        logger::report_superbatch_progress(
+            pending.superbatch,
+            steps.batches_per_superbatch,
+            pending.curr_batch,
+            superbatch_timer,
+            *superbatch_positions,
+        );
+    }
+
+    let completed_batch = pending.curr_batch + 1;
+    batch_callback(trainer, pending.superbatch, completed_batch, error);
+
+    if completed_batch % steps.batches_per_superbatch == 0 {
+        let error = *running_loss / steps.batches_per_superbatch as f32;
+        *running_loss = 0.0;
+
+        let total_time = timer.elapsed().as_secs_f32();
+        let sb_time = superbatch_timer.elapsed().as_secs_f32();
+
+        logger::report_superbatch_finished(pending.superbatch, error, sb_time, total_time, *superbatch_positions);
+        logger::report_time_left(steps, pending.superbatch, total_time);
+
+        superbatch_callback(trainer, pending.superbatch);
+
+        *superbatch_positions = 0;
+        *superbatch_timer = Instant::now();
+    }
+
+    Ok(())
+}
 
 pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
     trainer: &mut Trainer<G, O, S>,
@@ -88,8 +158,12 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
     let copy_stream = device.new_stream().map_err(TrainerError::Unexpected)?;
     let compute_stream = device.new_stream().map_err(TrainerError::Unexpected)?;
+    let loss_stream = device.new_stream().map_err(TrainerError::Unexpected)?;
 
-    let outputs = model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?;
+    let outputs = [
+        model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?,
+        model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?,
+    ];
     let gradients = model.make_gradient_tensors().map_err(TrainerError::Unexpected)?;
     let tlr = Buffer::from_host(&device, &TValue::F32(vec![0.0])).map_err(TrainerError::Unexpected)?;
     let tgf = Buffer::from_host(&device, &TValue::F32(vec![0.0])).map_err(TrainerError::Unexpected)?;
@@ -106,6 +180,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         .collect();
 
     let mut batch_queued = true;
+    let mut output_slot = 0usize;
+    let mut pending_loss: Option<PendingLoss<G>> = None;
 
     while batch_queued {
         if superbatch > steps.end_superbatch {
@@ -124,6 +200,9 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
         let lrate = lr(curr_batch, superbatch);
         let this_batch_size = next_batch_size;
+        let batch_superbatch = superbatch;
+        let batch_curr_batch = curr_batch;
+        let batch_ends_superbatch = batch_curr_batch + 1 == steps.batches_per_superbatch;
 
         let lrdrop = TValue::F32(vec![lrate]);
         let lrdrop = tlr.copy_from_host_async(&copy_stream, &lrdrop).map_err(TrainerError::Unexpected)?;
@@ -143,7 +222,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         let compute_block1 = trainer
             .optimiser
             .model
-            .backward(&compute_stream, &batch_on_device, &outputs, &gradients)
+            .backward(&compute_stream, &batch_on_device, &outputs[output_slot], &gradients)
             .map_err(TrainerError::GradientCalculationError)?;
 
         let compute_block1 = unsafe { compute_block1.detach_value() };
@@ -176,52 +255,62 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             compute_block2.sync().map_err(TrainerError::Unexpected)?;
         }
 
-        let loss = outputs.get("outputs/loss").expect("`Trainer` must have a \"loss\" output!");
-        let TValue::F32(loss) = loss
-            .clone()
-            .to_host_async(&copy_stream)
-            .map(SyncOnValue::value)
-            .map_err(TrainerError::Unexpected)?
-            .map_err(TrainerError::Unexpected)?
-        else {
-            panic!()
-        };
-        let [loss] = loss[..] else { panic!() };
-        let error = loss / this_batch_size as f32;
-
-        running_loss += error;
-        superbatch_positions += this_batch_size;
-
-        if curr_batch % schedule.log_rate == 0 {
-            logger::report_superbatch_progress(
-                superbatch,
-                steps.batches_per_superbatch,
-                curr_batch,
-                &superbatch_timer,
-                superbatch_positions,
-            );
+        if let Some(pending) = pending_loss.take() {
+            finish_loss(
+                trainer,
+                pending,
+                steps,
+                schedule.log_rate,
+                &timer,
+                &mut superbatch_timer,
+                &mut running_loss,
+                &mut superbatch_positions,
+                &mut batch_callback,
+                &mut superbatch_callback,
+            )?;
         }
 
+        let loss = outputs[output_slot].get("outputs/loss").expect("`Trainer` must have a \"loss\" output!");
+        let current_loss = loss
+            .clone()
+            .to_host_async(&loss_stream)
+            .map_err(TrainerError::Unexpected)?;
+        let current_loss = PendingLoss {
+            copy: current_loss,
+            superbatch: batch_superbatch,
+            curr_batch: batch_curr_batch,
+            batch_size: this_batch_size,
+        };
+
         curr_batch += 1;
-
-        batch_callback(trainer, superbatch, curr_batch, error);
-
         if curr_batch % steps.batches_per_superbatch == 0 {
-            let error = running_loss / steps.batches_per_superbatch as f32;
-            running_loss = 0.0;
-
-            let total_time = timer.elapsed().as_secs_f32();
-            let sb_time = superbatch_timer.elapsed().as_secs_f32();
-
-            logger::report_superbatch_finished(superbatch, error, sb_time, total_time, superbatch_positions);
-            logger::report_time_left(steps, superbatch, total_time);
-
-            superbatch_callback(trainer, superbatch);
-
             superbatch += 1;
             curr_batch = 0;
-            superbatch_positions = 0;
-            superbatch_timer = Instant::now();
+        }
+
+        // Delay only ordinary batches. The final batch of a superbatch must be
+        // completed immediately because `superbatch_callback` may save the
+        // model, and that save must observe exactly the weights after this
+        // superbatch's last update, not after the next batch.
+        if schedule.delay_loss_readback && batch_queued && !batch_ends_superbatch {
+            pending_loss = Some(current_loss);
+            output_slot ^= 1;
+        } else {
+            finish_loss(
+                trainer,
+                current_loss,
+                steps,
+                schedule.log_rate,
+                &timer,
+                &mut superbatch_timer,
+                &mut running_loss,
+                &mut superbatch_positions,
+                &mut batch_callback,
+                &mut superbatch_callback,
+            )?;
+            if schedule.delay_loss_readback {
+                output_slot ^= 1;
+            }
         }
     }
 

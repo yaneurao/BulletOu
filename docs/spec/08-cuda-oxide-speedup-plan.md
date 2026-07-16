@@ -267,6 +267,33 @@ input tensor 数ぶん繰り返す無駄を避ける。
 従来は `sync(self)` が `self` を消費したあと `synced=false` のまま drop されるため、
 明示 `sync()` が二重の stream sync になっていた。
 
+### Phase 0.8: one-batch delayed loss readback
+
+loss readback は `outputs/loss` buffer を GPU から CPU に戻すための同期点になる。
+ただし、`outputs/loss` を 1 面だけで使っている場合、D2H copy を未同期のまま次 batch の
+backward に進むと、次 batch が同じ output buffer を compute stream で取得できない。
+
+既存 backend では、backward output tensor を 2 面化し、通常 batch では loss D2H を
+1 batch だけ遅延する。
+
+```text
+batch N:
+  output slot 0 に backward
+  loss slot 0 の D2H を loss stream に enqueue して待たない
+
+batch N+1:
+  output slot 1 に backward / update
+  batch N の loss D2H をここで回収
+```
+
+このとき、loss readback 用に upload stream とは別の `loss_stream` を使う。
+同じ stream を使うと、次 batch 冒頭の learning-rate scalar upload が loss readback を
+待ってしまい、遅延の意味が薄くなるためである。
+
+checkpoint の重みタイミングを壊さないため、superbatch 末尾の loss は遅延しない。
+末尾 batch は即座に loss を回収し、running loss を確定してから save callback を呼ぶ。
+したがって、checkpoint は従来通り「その superbatch の最後の update 直後」の重みになる。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
