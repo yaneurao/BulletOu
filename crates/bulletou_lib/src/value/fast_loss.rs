@@ -16,6 +16,7 @@ pub enum ScalarValueLossKind {
 pub struct ScalarValueLossTrace {
     pub kind: ScalarValueLossKind,
     pub per_sample: Vec<f32>,
+    pub mean_output_gradients: Vec<f32>,
     pub weighted_sum: f32,
     pub mean: f32,
 }
@@ -52,23 +53,28 @@ pub fn scalar_value_loss_trace(
     expect_len("entry_weights", outputs.len(), entry_weights.len())?;
 
     let mut per_sample = Vec::with_capacity(outputs.len());
+    let mut mean_output_gradients = Vec::with_capacity(outputs.len());
     let mut weighted_sum = 0.0_f32;
+    let inv_batch = 1.0_f32 / outputs.len() as f32;
     for ((&output, &target), &entry_weight) in outputs.iter().zip(targets).zip(entry_weights) {
-        let loss = match kind {
+        let (loss, output_gradient) = match kind {
             ScalarValueLossKind::SigmoidMse => {
                 let prediction = sigmoid(output);
                 let error = prediction - target;
-                error * error
+                let loss = error * error;
+                let gradient = 2.0 * error * prediction * (1.0 - prediction);
+                (loss, gradient)
             }
-            ScalarValueLossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss(output, target),
+            ScalarValueLossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss_and_gradient(output, target),
         };
         let weighted = entry_weight * loss;
         per_sample.push(weighted);
+        mean_output_gradients.push(entry_weight * output_gradient * inv_batch);
         weighted_sum += weighted;
     }
 
     let mean = weighted_sum / outputs.len() as f32;
-    Ok(ScalarValueLossTrace { kind, per_sample, weighted_sum, mean })
+    Ok(ScalarValueLossTrace { kind, per_sample, mean_output_gradients, weighted_sum, mean })
 }
 
 fn expect_len(name: &'static str, expected: usize, actual: usize) -> Result<(), FastLossError> {
@@ -83,7 +89,7 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
+fn nnue_pytorch_wrm_loss_and_gradient(output: f32, target: f32) -> (f32, f32) {
     const NNUE2SCORE: f32 = 600.0;
     const IN_OFFSET: f32 = 270.0;
     const IN_SCALING: f32 = 340.0;
@@ -93,7 +99,14 @@ fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
     let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
     let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
     let prediction = (1.0 + q - qm) * 0.5;
-    (prediction - target).abs().powf(POW_EXP)
+    let error = prediction - target;
+    let abs_error = error.abs();
+    let loss = abs_error.powf(POW_EXP);
+    let q_prime = q * (1.0 - q);
+    let qm_prime = qm * (1.0 - qm);
+    let prediction_gradient = 0.5 * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
+    let loss_gradient = POW_EXP * error.signum() * abs_error.powf(POW_EXP - 1.0);
+    (loss, loss_gradient * prediction_gradient)
 }
 
 #[cfg(test)]
@@ -110,6 +123,7 @@ mod tests {
 
         assert_eq!(trace.kind, ScalarValueLossKind::SigmoidMse);
         assert_close_slice("per_sample", &trace.per_sample, &[0.014209336, 0.0, 0.028418668]);
+        assert_close_slice("mean_output_gradients", &trace.mean_output_gradients, &[0.008343695, 0.0, -0.01668739]);
         assert_close("weighted_sum", trace.weighted_sum, 0.042628005);
         assert_close("mean", trace.mean, 0.014209335);
     }
@@ -136,6 +150,11 @@ mod tests {
 
         assert_eq!(trace.kind, ScalarValueLossKind::NnuePytorchWrm);
         assert_close_slice("per_sample", &trace.per_sample, &[4.4222793e-8, 0.0, 0.0, 0.022698434, 1.1055698e-8]);
+        assert_close_slice(
+            "mean_output_gradients",
+            &trace.mean_output_gradients,
+            &[3.8956034e-8, -0.0, 0.0, 0.008843387, -9.7390085e-9],
+        );
         assert_close("weighted_sum", trace.weighted_sum, 0.022698488);
         assert_close("mean", trace.mean, 0.0045396974);
     }

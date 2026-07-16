@@ -246,6 +246,12 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
             "  {:<11}: max_abs={} at {}, mean_abs={}",
             cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
         );
+        let gpu_gradients = workspace.mean_output_gradients.to_host_vec(&stream)?;
+        let cmp = compare_slices("mean_grad", &cpu_trace.mean_output_gradients, &gpu_gradients, args.tolerance)?;
+        println!(
+            "  {:<11}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
     }
 
     println!("  compare      : ok");
@@ -622,6 +628,7 @@ struct LossSmokeCase {
 #[derive(Debug, Clone)]
 struct LossSmokeTrace {
     per_sample: Vec<f32>,
+    mean_output_gradients: Vec<f32>,
     weighted_sum: f32,
     mean: f32,
 }
@@ -709,14 +716,18 @@ impl LossSmokeCase {
 
     fn cpu_loss_trace(&self, kind: LossKind) -> LossSmokeTrace {
         let mut per_sample = Vec::with_capacity(self.outputs.len());
+        let mut mean_output_gradients = Vec::with_capacity(self.outputs.len());
         let mut weighted_sum = 0.0_f32;
+        let inv_batch = 1.0_f32 / self.outputs.len() as f32;
         for ((&output, &target), &entry_weight) in self.outputs.iter().zip(&self.targets).zip(&self.entry_weights) {
-            let weighted = entry_weight * loss_value(kind, output, target);
+            let (loss, output_gradient) = loss_value_and_gradient(kind, output, target);
+            let weighted = entry_weight * loss;
             per_sample.push(weighted);
+            mean_output_gradients.push(entry_weight * output_gradient * inv_batch);
             weighted_sum += weighted;
         }
         let mean = weighted_sum / self.outputs.len() as f32;
-        LossSmokeTrace { per_sample, weighted_sum, mean }
+        LossSmokeTrace { per_sample, mean_output_gradients, weighted_sum, mean }
     }
 }
 
@@ -1450,19 +1461,21 @@ fn fill_sfnn_l2_input(l1: &[f32], l1_hidden: usize, out: &mut [f32]) {
 }
 
 #[cfg(feature = "cuda")]
-fn loss_value(kind: LossKind, output: f32, target: f32) -> f32 {
+fn loss_value_and_gradient(kind: LossKind, output: f32, target: f32) -> (f32, f32) {
     match kind {
         LossKind::SigmoidMse => {
             let prediction = sigmoid(output);
             let error = prediction - target;
-            error * error
+            let loss = error * error;
+            let gradient = 2.0 * error * prediction * (1.0 - prediction);
+            (loss, gradient)
         }
-        LossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss(output, target),
+        LossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss_and_gradient(output, target),
     }
 }
 
 #[cfg(feature = "cuda")]
-fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
+fn nnue_pytorch_wrm_loss_and_gradient(output: f32, target: f32) -> (f32, f32) {
     const NNUE2SCORE: f32 = 600.0;
     const IN_OFFSET: f32 = 270.0;
     const IN_SCALING: f32 = 340.0;
@@ -1472,7 +1485,14 @@ fn nnue_pytorch_wrm_loss(output: f32, target: f32) -> f32 {
     let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
     let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
     let prediction = (1.0 + q - qm) * 0.5;
-    (prediction - target).abs().powf(POW_EXP)
+    let error = prediction - target;
+    let abs_error = error.abs();
+    let loss = abs_error.powf(POW_EXP);
+    let q_prime = q * (1.0 - q);
+    let qm_prime = qm * (1.0 - qm);
+    let prediction_gradient = 0.5 * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
+    let loss_gradient = POW_EXP * error.signum() * abs_error.powf(POW_EXP - 1.0);
+    (loss, loss_gradient * prediction_gradient)
 }
 
 #[cfg(feature = "cuda")]

@@ -197,3 +197,27 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - Regression `--loss-kind sigmoid-mse --loss-case weighted --debug-readback`
     remained within tolerance: sum max_abs diff `0.0000000009313226`;
     mean max_abs diff `0.00000000023283064`; per_sample max_abs diff `0`.
+
+### 2026-07-17 CO-009 entry: scalar loss output gradients
+
+- Extended the scalar loss CPU golden with `mean_output_gradients`, i.e.
+  `d(mean_loss) / d(network_output)` for each sample. This is the seed buffer
+  needed by later dense / sparse backward kernels.
+- Extended the cuda-oxide scalar loss workspace with a
+  `mean_output_gradients` device buffer.
+- Updated both loss kernels to write gradients while computing per-sample loss:
+  - sigmoid-MSE:
+    `entry_weight * 2 * (sigmoid(output) - target) * sigmoid(output) *
+    (1 - sigmoid(output)) / batch_size`
+  - WRM: derivative of the existing WRM prediction transform and
+    `abs(prediction - target)^2.5`, also divided by `batch_size`.
+- Validation:
+  - `cargo test -p bulletou_lib fast_loss` succeeded.
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime loss` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--loss-kind sigmoid-mse --loss-case weighted --debug-readback`:
+    `mean_grad` max_abs diff `0.000000000014551915`.
+  - `--loss-kind wrm --loss-case weighted --debug-readback`:
+    `mean_grad` max_abs diff `0.0000000000000035527137`.

@@ -35,6 +35,10 @@ impl ScalarLossLayout {
         self.batch_size
     }
 
+    pub fn mean_output_gradients_len(self) -> usize {
+        self.batch_size
+    }
+
     pub fn reduced_len(self) -> usize {
         1
     }
@@ -114,6 +118,7 @@ impl ScalarLossDeviceBatch {
 pub struct ScalarLossWorkspace {
     pub layout: ScalarLossLayout,
     pub per_sample: DeviceBuffer<f32>,
+    pub mean_output_gradients: DeviceBuffer<f32>,
     pub weighted_sum: DeviceBuffer<f32>,
     pub mean: DeviceBuffer<f32>,
 }
@@ -125,6 +130,7 @@ impl ScalarLossWorkspace {
         Ok(Self {
             layout,
             per_sample: DeviceBuffer::<f32>::zeroed(stream, layout.per_sample_len())?,
+            mean_output_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.mean_output_gradients_len())?,
             weighted_sum: DeviceBuffer::<f32>::zeroed(stream, layout.reduced_len())?,
             mean: DeviceBuffer::<f32>::zeroed(stream, layout.reduced_len())?,
         })
@@ -145,6 +151,7 @@ mod tests {
         let layout = ScalarLossLayout::new(8);
 
         assert_eq!(layout.per_sample_len(), 8);
+        assert_eq!(layout.mean_output_gradients_len(), 8);
         assert_eq!(layout.reduced_len(), 1);
         assert_eq!(ScalarLossLaunchPlan::new(layout).reduce_threads, 8);
     }

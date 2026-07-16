@@ -35,6 +35,7 @@ pub(crate) fn launch_sigmoid_mse_loss(
                 slice(batch.targets),
                 slice(batch.entry_weights),
                 slice_mut(workspace.per_sample),
+                slice_mut(workspace.mean_output_gradients),
                 slice_mut(workspace.weighted_sum),
                 slice_mut(workspace.mean),
                 batch_size
@@ -72,6 +73,7 @@ pub(crate) fn launch_nnue_pytorch_wrm_loss(
                 slice(batch.targets),
                 slice(batch.entry_weights),
                 slice_mut(workspace.per_sample),
+                slice_mut(workspace.mean_output_gradients),
                 slice_mut(workspace.weighted_sum),
                 slice_mut(workspace.mean),
                 batch_size
