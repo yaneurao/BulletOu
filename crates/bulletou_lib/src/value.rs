@@ -3,6 +3,7 @@ mod dataloader;
 pub mod fast_batch;
 pub mod fast_nnue;
 pub mod fast_nnue_fixture;
+pub mod fast_sfnn;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
@@ -23,6 +24,10 @@ pub use fast_nnue::{
 pub use fast_nnue_fixture::{
     NNUE_FORWARD_FIXTURE_MAGIC, NnueForwardFixtureError, write_nnue_forward_fixture,
     write_nnue_forward_fixture_file,
+};
+pub use fast_sfnn::{
+    FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape,
+    SfnnForwardTrace, SfnnForwardWeights, SfnnForwardWorkspaceLayout,
 };
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
