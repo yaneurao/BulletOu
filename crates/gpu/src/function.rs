@@ -78,7 +78,8 @@ pub struct Function<G: Gpu> {
 
 struct FunctionScratch<G: Gpu> {
     ptrs: Vec<G::DevicePtr>,
-    aliases: Vec<(G::DevicePtr, bool)>,
+    seen_ptrs: Vec<G::DevicePtr>,
+    mutable_ptrs: Vec<G::DevicePtr>,
     sizes: Vec<i32>,
     kernel_args: Vec<*mut c_void>,
 }
@@ -87,7 +88,8 @@ impl<G: Gpu> FunctionScratch<G> {
     fn new(num_ptrs: usize, max_num_args: usize) -> Self {
         Self {
             ptrs: vec![G::DevicePtr::default(); num_ptrs],
-            aliases: Vec::new(),
+            seen_ptrs: Vec::new(),
+            mutable_ptrs: Vec::new(),
             sizes: Vec::with_capacity(max_num_args),
             kernel_args: Vec::with_capacity(max_num_args),
         }
@@ -95,7 +97,8 @@ impl<G: Gpu> FunctionScratch<G> {
 
     fn prepare(&mut self, num_ptrs: usize) {
         debug_assert_eq!(self.ptrs.len(), num_ptrs);
-        self.aliases.clear();
+        self.seen_ptrs.clear();
+        self.mutable_ptrs.clear();
         self.sizes.clear();
         self.kernel_args.clear();
     }
@@ -325,9 +328,9 @@ impl<G: Gpu> Function<G> {
         let mut scratch = self.scratch.borrow_mut();
         scratch.prepare(self.num_ptrs);
 
-        let aliases_capacity = scratch.aliases.capacity();
-        if aliases_capacity < input_capacity {
-            scratch.aliases.reserve(input_capacity - aliases_capacity);
+        let seen_capacity = scratch.seen_ptrs.capacity();
+        if seen_capacity < input_capacity {
+            scratch.seen_ptrs.reserve(input_capacity - seen_capacity);
         }
         let mut var_size = None;
 
@@ -368,13 +371,17 @@ impl<G: Gpu> Function<G> {
             sync.attach(guard)?;
             scratch.ptrs[idx] = ptr;
 
-            if let Some((_, is_alr_mut)) = scratch.aliases.iter().find(|(seen_ptr, _)| *seen_ptr == ptr) {
-                if is_mut || *is_alr_mut {
+            if is_mut {
+                if scratch.seen_ptrs.contains(&ptr) {
                     return Err("Cannot alias pointers!".to_string().into());
                 }
+                scratch.mutable_ptrs.push(ptr);
             } else {
-                scratch.aliases.push((ptr, is_mut));
+                if scratch.mutable_ptrs.contains(&ptr) {
+                    return Err("Cannot alias pointers!".to_string().into());
+                }
             }
+            scratch.seen_ptrs.push(ptr);
         }
 
         let var = var_size.unwrap_or(1);

@@ -401,6 +401,9 @@ guard を作るため、ownership/sync の意味は変わらず、binding 解決
 `Function` の alias check は入力数が小さいため、毎回 `BTreeMap` を構築するよりも
 `Vec<(DevicePtr, bool)>` の線形探索で十分である。これにより forward/backward 呼び出しごとの
 map node allocation を避ける。
+その後、alias check は `seen_ptrs` と `mutable_ptrs` に分離する。immutable 同士の同一pointerは
+元々許可されるため、immutable binding ごとに全既出pointerを探さず、mutable pointer との衝突だけを
+確認する。
 
 kernel launch の size 引数用 buffer は `max_num_args` 個をゼロ初期化する必要はない。
 `Vec::with_capacity(max_num_args)` で容量だけ確保し、各 launch で実際に必要な size 引数だけを
