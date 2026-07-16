@@ -158,18 +158,23 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
         if let Ok(next_batch_host) = receiver.recv() {
             next_batch_size = next_batch_host.batch_size;
-            drop(
-                next_batch_host
-                    .copy_to_device_async(&copy_stream, &next_on_device)
-                    .map_err(TrainerError::Unexpected)?,
-            );
+            let next_copy = next_batch_host
+                .copy_to_device_async(&copy_stream, &next_on_device)
+                .map_err(TrainerError::Unexpected)?;
+
+            compute_block1.sync().map_err(TrainerError::Unexpected)?;
+            compute_block2.sync().map_err(TrainerError::Unexpected)?;
+
+            // `next_copy` borrows `next_batch_host`, so keeping it alive until
+            // here preserves the host buffers while H2D copy overlaps the
+            // current batch's compute. Dropping it syncs the copy stream.
+            drop(next_copy);
             std::mem::swap(&mut batch_on_device, &mut next_on_device);
         } else {
             batch_queued = false;
+            compute_block1.sync().map_err(TrainerError::Unexpected)?;
+            compute_block2.sync().map_err(TrainerError::Unexpected)?;
         }
-
-        compute_block1.sync().map_err(TrainerError::Unexpected)?;
-        compute_block2.sync().map_err(TrainerError::Unexpected)?;
 
         let loss = outputs.get("outputs/loss").expect("`Trainer` must have a \"loss\" output!");
         let TValue::F32(loss) = loss

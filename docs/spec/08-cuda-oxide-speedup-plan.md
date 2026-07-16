@@ -244,6 +244,21 @@ training loop では固定値 `32` の同期 channel が使われていた。
 GPU 側を空転させにくくするための土台である。cuda-oxide backend でも同じ考え方で、
 host 側の decode queue と device upload ring を明示的に分離する。
 
+### Phase 0.7: H2D copy / compute overlap
+
+現行 loop では、次 batch の `copy_to_device_async()` の返り値を即 `drop` していた。
+この返り値は `SyncOnDrop` を含むため、即 drop は copy stream の即時同期を意味する。
+
+その結果、次 batch の H2D copy は current batch の GPU compute と十分に overlap せず、
+copy 完了を待ってから current batch の compute sync に進む形になっていた。
+
+既存 backend 側では、次 batch の host buffer を生存させたまま H2D copy を enqueue し、
+current batch の compute sync を先に待ってから copy stream を同期する。これにより、
+次 batch の upload と current batch の backward / optimizer update を重ねられる。
+
+これは cuda-oxide の本命である input upload ring の小さい前段である。
+完全な ring 化ではないが、既存の double buffer 構造のまま安全に overlap を増やせる。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
