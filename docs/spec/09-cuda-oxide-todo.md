@@ -268,3 +268,25 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-009 work: map this generic CReLU backward into the NNUE / SFNN
   stacked layer shapes, then add sparse feature-transformer gradient
   accumulation.
+
+### 2026-07-17 CO-009 NNUE dense-stack backward smoke
+
+- Added `bulletou-cuda-train --nnue-dense-backward-smoke`.
+- The smoke runs the existing NNUE forward launch first, then chains the
+  generic backward kernels across the dense stack:
+  `output -> hidden2 CReLU -> hidden1 CReLU -> combined`.
+- Added CPU scalar golden for the same dense-stack backward path, including
+  output, L2, and L1 weight/bias gradients plus intermediate activation
+  gradients.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--nnue-dense-backward-smoke --debug-readback` tiny case succeeded:
+    max_abs diff `0` for all compared buffers except `combined_grad`
+    max_abs diff `0.0000000004656613`.
+  - `--nnue-dense-backward-smoke --nnue-forward-case halfkp --debug-readback`
+    succeeded for `NNUE_HALFKP_256x2_32_32`: largest observed max_abs diff
+    was `0.0000000004656613` (`outw_grad`).
+- Remaining CO-009 work: sparse feature-transformer gradient accumulation and
+  then the analogous SFNN stacked dense/backward path.

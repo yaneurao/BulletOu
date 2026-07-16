@@ -36,6 +36,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::Loss => run_loss_smoke(args),
         SmokeMode::DenseCReluBackward => run_dense_crelu_backward_smoke(args),
         SmokeMode::DenseOutputBackward => run_dense_output_backward_smoke(args),
+        SmokeMode::NnueDenseBackward => run_nnue_dense_backward_smoke(args),
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
     }
@@ -67,6 +68,7 @@ enum SmokeMode {
     Loss,
     DenseCReluBackward,
     DenseOutputBackward,
+    NnueDenseBackward,
     NnueForward,
     SfnnForward,
 }
@@ -125,6 +127,7 @@ impl Args {
                 "--loss-smoke" => parsed.mode = SmokeMode::Loss,
                 "--dense-crelu-backward-smoke" => parsed.mode = SmokeMode::DenseCReluBackward,
                 "--dense-output-backward-smoke" => parsed.mode = SmokeMode::DenseOutputBackward,
+                "--nnue-dense-backward-smoke" => parsed.mode = SmokeMode::NnueDenseBackward,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
                 "--ptx" => parsed.ptx = Some(required_path_arg(&mut args, "--ptx")?),
@@ -323,6 +326,151 @@ fn run_dense_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         "  {:<11}: max_abs={} at {}, mean_abs={}",
         bias_cmp.name, bias_cmp.max_abs_diff, bias_cmp.max_abs_index, bias_cmp.mean_abs_diff
     );
+    println!("  compare      : ok");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{
+        backward::{DenseCReluBackwardLayout, DenseOutputBackwardLayout},
+        nnue::{
+            NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
+            NnueForwardWorkspace, NnueForwardWorkspaceLayout,
+        },
+        DeviceBuffer,
+    };
+
+    let case = match args.nnue_forward_fixture.as_deref() {
+        Some(path) => NnueForwardCase::read_fixture(path)?,
+        None => NnueForwardCase::new(args.nnue_case),
+    };
+    let cpu_forward_trace = case.cpu_forward_trace();
+    let cpu_trace = case.cpu_dense_backward_trace(&cpu_forward_trace);
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let host_batch = NnueForwardHostBatch {
+        stm_indices: &case.stm,
+        nstm_indices: &case.nstm,
+        batch_size: case.batch_size,
+        max_active: case.max_active,
+    };
+    let host_weights = NnueForwardHostWeights {
+        shape: case.shape,
+        l0w: &case.l0w,
+        l0b: &case.l0b,
+        l1w: &case.l1w,
+        l1b: &case.l1b,
+        l2w: &case.l2w,
+        l2b: &case.l2b,
+        outw: &case.outw,
+        outb: &case.outb,
+    };
+    let device_batch = NnueForwardDeviceBatch::from_host(&stream, &host_batch)?;
+    let device_weights = NnueForwardDeviceWeights::from_host(&stream, &host_weights)?;
+    let forward_layout = NnueForwardWorkspaceLayout::new(case.shape, case.batch_size);
+    let mut forward_workspace = NnueForwardWorkspace::new(&stream, forward_layout)?;
+
+    nnue_forward::launch_nnue_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
+
+    let output_gradients = DeviceBuffer::from_host(&stream, &cpu_trace.output_gradients)?;
+
+    let output_layout = DenseOutputBackwardLayout::new(case.batch_size, case.shape.l3);
+    let mut hidden2_gradients = DeviceBuffer::<f32>::zeroed(&stream, output_layout.input_gradients_len())?;
+    let mut outw_gradients = DeviceBuffer::<f32>::zeroed(&stream, output_layout.weight_len())?;
+    let mut outb_gradient = DeviceBuffer::<f32>::zeroed(&stream, output_layout.bias_len())?;
+    dense_backward::launch_dense_output_backward(
+        &stream,
+        &module,
+        output_layout,
+        &forward_workspace.hidden2,
+        &output_gradients,
+        &device_weights.outw,
+        &mut hidden2_gradients,
+        &mut outw_gradients,
+        &mut outb_gradient,
+    )?;
+
+    let l2_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l2, case.shape.l3);
+    let mut hidden1_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.input_gradients_len())?;
+    let mut l2w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.weight_len())?;
+    let mut l2b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.bias_len())?;
+    dense_backward::launch_dense_crelu_backward(
+        &stream,
+        &module,
+        l2_layout,
+        &forward_workspace.hidden1,
+        &forward_workspace.hidden2,
+        &hidden2_gradients,
+        &device_weights.l2w,
+        &mut hidden1_gradients,
+        &mut l2w_gradients,
+        &mut l2b_gradients,
+    )?;
+
+    let l1_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l1 * 2, case.shape.l2);
+    let mut combined_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.input_gradients_len())?;
+    let mut l1w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.weight_len())?;
+    let mut l1b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.bias_len())?;
+    dense_backward::launch_dense_crelu_backward(
+        &stream,
+        &module,
+        l1_layout,
+        &forward_workspace.combined,
+        &forward_workspace.hidden1,
+        &hidden1_gradients,
+        &device_weights.l1w,
+        &mut combined_gradients,
+        &mut l1w_gradients,
+        &mut l1b_gradients,
+    )?;
+    stream.synchronize()?;
+
+    let gpu_hidden2_gradients = hidden2_gradients.to_host_vec(&stream)?;
+    let gpu_hidden1_gradients = hidden1_gradients.to_host_vec(&stream)?;
+    let gpu_combined_gradients = combined_gradients.to_host_vec(&stream)?;
+    let gpu_outw_gradients = outw_gradients.to_host_vec(&stream)?;
+    let gpu_outb_gradient = outb_gradient.to_host_vec(&stream)?;
+    let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
+    let gpu_l2b_gradients = l2b_gradients.to_host_vec(&stream)?;
+    let gpu_l1w_gradients = l1w_gradients.to_host_vec(&stream)?;
+    let gpu_l1b_gradients = l1b_gradients.to_host_vec(&stream)?;
+
+    let comparisons = [
+        compare_slices("hidden2_grad", &cpu_trace.hidden2_gradients, &gpu_hidden2_gradients, args.tolerance)?,
+        compare_slices("hidden1_grad", &cpu_trace.hidden1_gradients, &gpu_hidden1_gradients, args.tolerance)?,
+        compare_slices("combined_grad", &cpu_trace.combined_gradients, &gpu_combined_gradients, args.tolerance)?,
+        compare_slices("outw_grad", &cpu_trace.outw_gradients, &gpu_outw_gradients, args.tolerance)?,
+        compare_slices("outb_grad", &[cpu_trace.outb_gradient], &gpu_outb_gradient, args.tolerance)?,
+        compare_slices("l2w_grad", &cpu_trace.l2w_gradients, &gpu_l2w_gradients, args.tolerance)?,
+        compare_slices("l2b_grad", &cpu_trace.l2b_gradients, &gpu_l2b_gradients, args.tolerance)?,
+        compare_slices("l1w_grad", &cpu_trace.l1w_gradients, &gpu_l1w_gradients, args.tolerance)?,
+        compare_slices("l1b_grad", &cpu_trace.l1b_gradients, &gpu_l1b_gradients, args.tolerance)?,
+    ];
+
+    println!("bulletou-cuda-train NNUE dense backward smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  batch        : {} samples", case.batch_size);
+    println!(
+        "  shape        : input={} l1={} l2={} l3={}",
+        case.shape.input_size, case.shape.l1, case.shape.l2, case.shape.l3
+    );
+    println!("  tolerance    : {}", args.tolerance);
+    for cmp in comparisons {
+        println!(
+            "  {:<13}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
+    }
     println!("  compare      : ok");
 
     Ok(())
@@ -729,6 +877,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --loss-smoke [--loss-kind sigmoid-mse|wrm] [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
@@ -744,6 +893,8 @@ fn usage() -> &'static str {
      gradients for input, weight, and bias against a CPU scalar golden.\n\
      CO-009 dense CReLU backward smoke: compare CReLU-gated dense layer\n\
      gradients for input, weight, and bias against a CPU scalar golden.\n\
+     CO-009 NNUE dense backward smoke: run NNUE forward, then chain output,\n\
+     hidden2, and hidden1 dense backward kernels against a CPU golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -852,6 +1003,21 @@ struct NnueForwardTrace {
     hidden1: Vec<f32>,
     hidden2: Vec<f32>,
     outputs: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct NnueDenseBackwardTrace {
+    output_gradients: Vec<f32>,
+    hidden2_gradients: Vec<f32>,
+    hidden1_gradients: Vec<f32>,
+    combined_gradients: Vec<f32>,
+    outw_gradients: Vec<f32>,
+    outb_gradient: f32,
+    l2w_gradients: Vec<f32>,
+    l2b_gradients: Vec<f32>,
+    l1w_gradients: Vec<f32>,
+    l1b_gradients: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1168,6 +1334,48 @@ impl NnueForwardCase {
         }
 
         trace
+    }
+
+    fn cpu_dense_backward_trace(&self, forward: &NnueForwardTrace) -> NnueDenseBackwardTrace {
+        let output_gradients = deterministic_f32_vec(self.batch_size, 0xD15E_A5ED, 0.35, 0.0);
+        let (hidden2_gradients, outw_gradients, outb_gradient) = dense_output_backward_trace(
+            &forward.hidden2,
+            &output_gradients,
+            &self.outw,
+            self.batch_size,
+            self.shape.l3,
+        );
+        let (hidden1_gradients, l2w_gradients, l2b_gradients) = dense_crelu_backward_trace(
+            &forward.hidden1,
+            &forward.hidden2,
+            &hidden2_gradients,
+            &self.l2w,
+            self.batch_size,
+            self.shape.l2,
+            self.shape.l3,
+        );
+        let (combined_gradients, l1w_gradients, l1b_gradients) = dense_crelu_backward_trace(
+            &forward.combined,
+            &forward.hidden1,
+            &hidden1_gradients,
+            &self.l1w,
+            self.batch_size,
+            self.shape.l1 * 2,
+            self.shape.l2,
+        );
+
+        NnueDenseBackwardTrace {
+            output_gradients,
+            hidden2_gradients,
+            hidden1_gradients,
+            combined_gradients,
+            outw_gradients,
+            outb_gradient,
+            l2w_gradients,
+            l2b_gradients,
+            l1w_gradients,
+            l1b_gradients,
+        }
     }
 
     fn read_fixture(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Self> {
@@ -1697,6 +1905,68 @@ fn affine_dense(weights: &[f32], bias: &[f32], input: &[f32], rows: usize, out: 
         for row in 0..rows {
             out[row] += weights[base + row] * value;
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dense_output_backward_trace(
+    inputs: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    batch_size: usize,
+    input_len: usize,
+) -> (Vec<f32>, Vec<f32>, f32) {
+    let mut input_gradients = vec![0.0_f32; batch_size * input_len];
+    let mut weight_gradients = vec![0.0_f32; input_len];
+    let mut bias_gradient = 0.0_f32;
+
+    for sample in 0..batch_size {
+        let out_grad = output_gradients[sample];
+        bias_gradient += out_grad;
+        for row in 0..input_len {
+            input_gradients[sample * input_len + row] = out_grad * weights[row];
+            weight_gradients[row] += out_grad * inputs[sample * input_len + row];
+        }
+    }
+
+    (input_gradients, weight_gradients, bias_gradient)
+}
+
+#[cfg(feature = "cuda")]
+fn dense_crelu_backward_trace(
+    inputs: &[f32],
+    activations: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut input_gradients = vec![0.0_f32; batch_size * input_dim];
+    let mut weight_gradients = vec![0.0_f32; input_dim * output_dim];
+    let mut bias_gradients = vec![0.0_f32; output_dim];
+
+    for sample in 0..batch_size {
+        for out_col in 0..output_dim {
+            let idx = sample * output_dim + out_col;
+            let pre_grad = crelu_pre_gradient_from_activation(activations[idx], output_gradients[idx]);
+            bias_gradients[out_col] += pre_grad;
+            for in_col in 0..input_dim {
+                input_gradients[sample * input_dim + in_col] += pre_grad * weights[in_col * output_dim + out_col];
+                weight_gradients[in_col * output_dim + out_col] += pre_grad * inputs[sample * input_dim + in_col];
+            }
+        }
+    }
+
+    (input_gradients, weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn crelu_pre_gradient_from_activation(activation: f32, output_gradient: f32) -> f32 {
+    if activation > 0.0 && activation < 1.0 {
+        output_gradient
+    } else {
+        0.0
     }
 }
 
