@@ -313,6 +313,12 @@ tensor 名を prefix 解決して、直接該当する map から buffer を引�
 減らす。cuda-oxide backend ではさらに進めて、name lookup 自体を build-time layout に
 落とす。
 
+さらに、`Function::execute` に `BTreeMap<NodeId, Buffer>` を渡す必要もない。
+`Function` 側は入力順序を要求せず、NodeId ごとに内部 pointer slot へ配置しているだけなので、
+`execute_bindings` で `(NodeId, Buffer)` の iterator を受け取れるようにする。
+これにより `Model::forward` / `Model::backward` は NodeId→Buffer の中間 `BTreeMap` を作らず、
+小さな binding 配列から直接 kernel 実行へ進める。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

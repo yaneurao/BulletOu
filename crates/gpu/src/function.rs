@@ -238,6 +238,14 @@ impl<G: Gpu> Function<G> {
         stream: Arc<Stream<G>>,
         inputs: &BTreeMap<NodeId, Arc<Buffer<G>>>,
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
+        self.execute_bindings(stream, inputs.iter().map(|(&node, buffer)| (node, buffer.clone())))
+    }
+
+    pub fn execute_bindings(
+        &self,
+        stream: Arc<Stream<G>>,
+        inputs: impl IntoIterator<Item = (NodeId, Arc<Buffer<G>>)>,
+    ) -> Result<SyncOnValue<G, &Self>, G::Error> {
         let mut sync = SyncOnDrop::new(stream.clone());
 
         let mut ptrs = vec![G::DevicePtr::default(); self.num_ptrs];
@@ -246,7 +254,7 @@ impl<G: Gpu> Function<G> {
         let mut var_size = None;
 
         for (name, buf) in inputs {
-            let (idx, is_mut, ty) = *self.maps.get(name).ok_or("Input not in function!".into())?;
+            let (idx, is_mut, ty) = *self.maps.get(&name).ok_or("Input not in function!".into())?;
             let size = ty.size();
 
             if buf.dtype() != ty.dtype() {

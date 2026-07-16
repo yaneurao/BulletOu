@@ -78,12 +78,12 @@ impl<G: Gpu> Model<G> {
         inputs: &TensorMap<G>,
         outputs: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let map = self
+        let bindings = self
             .fwd_map
             .iter()
             .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, None).unwrap()))
-            .collect();
-        self.forward.execute(stream.clone(), &map)
+            .collect::<Vec<_>>();
+        self.forward.execute_bindings(stream.clone(), bindings)
     }
 
     pub fn set_fwd_batch_size(&mut self, batch_size: usize) -> Result<(), G::Error> {
@@ -101,13 +101,13 @@ impl<G: Gpu> Model<G> {
         outputs: &TensorMap<G>,
         gradients: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let map = self
+        let bindings = self
             .bwd_map
             .iter()
             .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, Some(gradients)).unwrap()))
-            .collect();
+            .collect::<Vec<_>>();
 
-        self.backward.execute(stream.clone(), &map)
+        self.backward.execute_bindings(stream.clone(), bindings)
     }
 
     pub fn make_gradient_tensors(&self) -> Result<TensorMap<G>, G::Error> {
