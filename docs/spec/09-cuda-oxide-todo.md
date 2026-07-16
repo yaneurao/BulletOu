@@ -278,9 +278,17 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Extended the smoke with `nnue_l0_crelu_backward`, which splits
   `combined_grad` back into stm/nstm L0 gradients and applies the L0 CReLU
   derivative gate.
+- Extended the smoke with `nnue_l0_sparse_backward`, which computes shared
+  sparse feature-transformer `l0w` / `l0b` gradients from stm/nstm sparse
+  indices and L0 pre-activation gradients.
+- Implementation note: cuda-oxide rev `b5d35e0` rejected `DeviceAtomicF32`
+  atomic RMW during legacy NVVM IR lowering, so this correctness baseline uses
+  a race-free scan kernel: one thread owns each `l0w[feature,row]` or
+  `l0b[row]` gradient element and scans the sparse batch.
 - Added CPU scalar golden for the same dense-stack backward path, including
   output, L2, and L1 weight/bias gradients plus intermediate activation
-  gradients and L0 stm/nstm pre-activation gradients.
+  gradients, L0 stm/nstm pre-activation gradients, and sparse L0 weight/bias
+  gradients.
 - Validation:
   - `cargo check -p bulletou-cuda-train` succeeded.
   - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
@@ -288,9 +296,12 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
   - `--nnue-dense-backward-smoke --debug-readback` tiny case succeeded:
     max_abs diff `0` for all compared buffers except `combined_grad` and
-    `stm_l0_grad`, both max_abs diff `0.0000000004656613`.
+    `stm_l0_grad`, both max_abs diff `0.0000000004656613`, and `l0w_grad`
+    max_abs diff `0.0000000037252903`.
   - `--nnue-dense-backward-smoke --nnue-forward-case halfkp --debug-readback`
     succeeded for `NNUE_HALFKP_256x2_32_32`: largest observed max_abs diff
-    was `0.0000000004656613` (`outw_grad`).
-- Remaining CO-009 work: sparse feature-transformer gradient accumulation and
-  then the analogous SFNN stacked dense/backward path.
+    was `0.0000000004656613` (`outw_grad`); `l0w_grad` max_abs diff
+    `0.00000000000009947598`, `l0b_grad` max_abs diff
+    `0.00000000000017053026`.
+- Remaining CO-009 work: actual optimizer integration / gradient buffer
+  plumbing and the analogous SFNN stacked dense/backward path.

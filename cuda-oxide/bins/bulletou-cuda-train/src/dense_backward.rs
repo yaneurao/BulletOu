@@ -6,6 +6,7 @@ use bulletou_cuda_oxide_runtime::{
     backward::{
         DenseCReluBackwardLaunchPlan, DenseCReluBackwardLayout, DenseOutputBackwardLaunchPlan,
         DenseOutputBackwardLayout, NnueL0CReluBackwardLaunchPlan, NnueL0CReluBackwardLayout,
+        NnueL0SparseBackwardLaunchPlan, NnueL0SparseBackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -131,6 +132,52 @@ pub(crate) fn launch_nnue_l0_crelu_backward(
                 slice_mut(stm_gradients),
                 slice_mut(nstm_gradients),
                 batch,
+                l1
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_nnue_l0_sparse_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: NnueL0SparseBackwardLayout,
+    stm_indices: &DeviceBuffer<i32>,
+    nstm_indices: &DeviceBuffer<i32>,
+    stm_gradients: &DeviceBuffer<f32>,
+    nstm_gradients: &DeviceBuffer<f32>,
+    mut l0w_gradients: &mut DeviceBuffer<f32>,
+    mut l0b_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = NnueL0SparseBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let max_active = layout.max_active as u32;
+    let input_size = layout.input_size as u32;
+    let l1 = layout.l1 as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `nnue_l0_sparse_backward`; each launched
+        // thread owns one output gradient element, so mutable slices are
+        // disjoint.
+        cuda_launch! {
+            kernel: crate::kernels::backward::nnue_l0_sparse_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(stm_indices),
+                slice(nstm_indices),
+                slice(stm_gradients),
+                slice(nstm_gradients),
+                slice_mut(l0w_gradients),
+                slice_mut(l0b_gradients),
+                batch,
+                max_active,
+                input_size,
                 l1
             ]
         }

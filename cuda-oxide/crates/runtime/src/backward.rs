@@ -3,8 +3,13 @@
 pub const DENSE_OUTPUT_BACKWARD_KERNEL: &str = "dense_output_backward";
 pub const DENSE_CRELU_BACKWARD_KERNEL: &str = "dense_crelu_backward";
 pub const NNUE_L0_CRELU_BACKWARD_KERNEL: &str = "nnue_l0_crelu_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 3] =
-    [DENSE_OUTPUT_BACKWARD_KERNEL, DENSE_CRELU_BACKWARD_KERNEL, NNUE_L0_CRELU_BACKWARD_KERNEL];
+pub const NNUE_L0_SPARSE_BACKWARD_KERNEL: &str = "nnue_l0_sparse_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 4] = [
+    DENSE_OUTPUT_BACKWARD_KERNEL,
+    DENSE_CRELU_BACKWARD_KERNEL,
+    NNUE_L0_CRELU_BACKWARD_KERNEL,
+    NNUE_L0_SPARSE_BACKWARD_KERNEL,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLayout {
@@ -128,6 +133,54 @@ impl NnueL0CReluBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueL0SparseBackwardLayout {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub input_size: usize,
+    pub l1: usize,
+}
+
+impl NnueL0SparseBackwardLayout {
+    pub fn new(batch_size: usize, max_active: usize, input_size: usize, l1: usize) -> Self {
+        Self { batch_size, max_active, input_size, l1 }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.max_active == 0 {
+            Err(BackwardLayoutError::EmptySparse)
+        } else if self.input_size == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.l1 == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn sparse_values_len(self) -> usize {
+        self.batch_size * self.max_active
+    }
+
+    pub fn per_perspective_gradient_len(self) -> usize {
+        self.batch_size * self.l1
+    }
+
+    pub fn weight_len(self) -> usize {
+        self.input_size * self.l1
+    }
+
+    pub fn bias_len(self) -> usize {
+        self.l1
+    }
+
+    pub fn gradient_threads(self) -> usize {
+        self.weight_len().max(self.bias_len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -162,6 +215,17 @@ impl NnueL0CReluBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueL0SparseBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl NnueL0SparseBackwardLaunchPlan {
+    pub fn new(layout: NnueL0SparseBackwardLayout) -> Self {
+        Self { threads: layout.gradient_threads().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -170,6 +234,8 @@ pub enum BackwardLayoutError {
     EmptyInput,
     #[error("backward output length must be at least one")]
     EmptyOutput,
+    #[error("backward sparse list must contain at least one slot")]
+    EmptySparse,
 }
 
 #[cfg(test)]
@@ -178,7 +244,10 @@ mod tests {
 
     #[test]
     fn kernel_names_are_stable() {
-        assert_eq!(BACKWARD_KERNEL_NAMES, ["dense_output_backward", "dense_crelu_backward", "nnue_l0_crelu_backward"]);
+        assert_eq!(
+            BACKWARD_KERNEL_NAMES,
+            ["dense_output_backward", "dense_crelu_backward", "nnue_l0_crelu_backward", "nnue_l0_sparse_backward"]
+        );
     }
 
     #[test]
@@ -232,5 +301,37 @@ mod tests {
     fn nnue_l0_crelu_layout_rejects_empty_values() {
         assert_eq!(NnueL0CReluBackwardLayout::new(0, 4).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
         assert_eq!(NnueL0CReluBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
+    }
+
+    #[test]
+    fn nnue_l0_sparse_layout_counts_buffers() {
+        let layout = NnueL0SparseBackwardLayout::new(3, 5, 7, 4);
+
+        assert_eq!(layout.sparse_values_len(), 15);
+        assert_eq!(layout.per_perspective_gradient_len(), 12);
+        assert_eq!(layout.weight_len(), 28);
+        assert_eq!(layout.bias_len(), 4);
+        assert_eq!(layout.gradient_threads(), 28);
+        assert_eq!(NnueL0SparseBackwardLaunchPlan::new(layout).threads, 28);
+    }
+
+    #[test]
+    fn nnue_l0_sparse_layout_rejects_empty_values() {
+        assert_eq!(
+            NnueL0SparseBackwardLayout::new(0, 5, 7, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            NnueL0SparseBackwardLayout::new(3, 0, 7, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptySparse
+        );
+        assert_eq!(
+            NnueL0SparseBackwardLayout::new(3, 5, 0, 4).validate().unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            NnueL0SparseBackwardLayout::new(3, 5, 7, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
     }
 }

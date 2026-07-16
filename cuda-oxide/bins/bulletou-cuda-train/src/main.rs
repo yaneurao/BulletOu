@@ -334,14 +334,15 @@ fn run_dense_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
 #[cfg(feature = "cuda")]
 fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        backward::{DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueL0CReluBackwardLayout},
+        backward::{
+            DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
+        },
         nnue::{
             NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
             NnueForwardWorkspace, NnueForwardWorkspaceLayout,
         },
         DeviceBuffer,
     };
-
     let case = match args.nnue_forward_fixture.as_deref() {
         Some(path) => NnueForwardCase::read_fixture(path)?,
         None => NnueForwardCase::new(args.nnue_case),
@@ -445,6 +446,22 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
         &mut stm_l0_gradients,
         &mut nstm_l0_gradients,
     )?;
+
+    let sparse_l0_layout =
+        NnueL0SparseBackwardLayout::new(case.batch_size, case.max_active, case.shape.input_size, case.shape.l1);
+    let mut l0w_gradients = DeviceBuffer::<f32>::zeroed(&stream, sparse_l0_layout.weight_len())?;
+    let mut l0b_gradients = DeviceBuffer::<f32>::zeroed(&stream, sparse_l0_layout.bias_len())?;
+    dense_backward::launch_nnue_l0_sparse_backward(
+        &stream,
+        &module,
+        sparse_l0_layout,
+        &device_batch.stm_indices,
+        &device_batch.nstm_indices,
+        &stm_l0_gradients,
+        &nstm_l0_gradients,
+        &mut l0w_gradients,
+        &mut l0b_gradients,
+    )?;
     stream.synchronize()?;
 
     let gpu_hidden2_gradients = hidden2_gradients.to_host_vec(&stream)?;
@@ -452,6 +469,8 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
     let gpu_combined_gradients = combined_gradients.to_host_vec(&stream)?;
     let gpu_stm_l0_gradients = stm_l0_gradients.to_host_vec(&stream)?;
     let gpu_nstm_l0_gradients = nstm_l0_gradients.to_host_vec(&stream)?;
+    let gpu_l0w_gradients = l0w_gradients.to_host_vec(&stream)?;
+    let gpu_l0b_gradients = l0b_gradients.to_host_vec(&stream)?;
     let gpu_outw_gradients = outw_gradients.to_host_vec(&stream)?;
     let gpu_outb_gradient = outb_gradient.to_host_vec(&stream)?;
     let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
@@ -465,6 +484,8 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
         compare_slices("combined_grad", &cpu_trace.combined_gradients, &gpu_combined_gradients, args.tolerance)?,
         compare_slices("stm_l0_grad", &cpu_trace.stm_l0_gradients, &gpu_stm_l0_gradients, args.tolerance)?,
         compare_slices("nstm_l0_grad", &cpu_trace.nstm_l0_gradients, &gpu_nstm_l0_gradients, args.tolerance)?,
+        compare_slices("l0w_grad", &cpu_trace.l0w_gradients, &gpu_l0w_gradients, args.tolerance)?,
+        compare_slices("l0b_grad", &cpu_trace.l0b_gradients, &gpu_l0b_gradients, args.tolerance)?,
         compare_slices("outw_grad", &cpu_trace.outw_gradients, &gpu_outw_gradients, args.tolerance)?,
         compare_slices("outb_grad", &[cpu_trace.outb_gradient], &gpu_outb_gradient, args.tolerance)?,
         compare_slices("l2w_grad", &cpu_trace.l2w_gradients, &gpu_l2w_gradients, args.tolerance)?,
@@ -912,7 +933,8 @@ fn usage() -> &'static str {
      CO-009 dense CReLU backward smoke: compare CReLU-gated dense layer\n\
      gradients for input, weight, and bias against a CPU scalar golden.\n\
      CO-009 NNUE dense backward smoke: run NNUE forward, then chain output,\n\
-     hidden2, hidden1, and L0 CReLU split backward kernels against a CPU golden.\n\
+     hidden2, hidden1, L0 CReLU split, and sparse L0 weight/bias backward\n\
+     kernels against a CPU golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1032,6 +1054,8 @@ struct NnueDenseBackwardTrace {
     combined_gradients: Vec<f32>,
     stm_l0_gradients: Vec<f32>,
     nstm_l0_gradients: Vec<f32>,
+    l0w_gradients: Vec<f32>,
+    l0b_gradients: Vec<f32>,
     outw_gradients: Vec<f32>,
     outb_gradient: f32,
     l2w_gradients: Vec<f32>,
@@ -1390,6 +1414,16 @@ impl NnueForwardCase {
             self.batch_size,
             self.shape.l1,
         );
+        let (l0w_gradients, l0b_gradients) = nnue_l0_sparse_backward_trace(
+            &self.stm,
+            &self.nstm,
+            &stm_l0_gradients,
+            &nstm_l0_gradients,
+            self.batch_size,
+            self.max_active,
+            self.shape.input_size,
+            self.shape.l1,
+        );
 
         NnueDenseBackwardTrace {
             output_gradients,
@@ -1398,6 +1432,8 @@ impl NnueForwardCase {
             combined_gradients,
             stm_l0_gradients,
             nstm_l0_gradients,
+            l0w_gradients,
+            l0b_gradients,
             outw_gradients,
             outb_gradient,
             l2w_gradients,
@@ -2018,6 +2054,67 @@ fn nnue_l0_crelu_backward_trace(
     }
 
     (stm_gradients, nstm_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_l0_sparse_backward_trace(
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    stm_gradients: &[f32],
+    nstm_gradients: &[f32],
+    batch_size: usize,
+    max_active: usize,
+    input_size: usize,
+    l1: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut weight_gradients = vec![0.0_f32; input_size * l1];
+    let mut bias_gradients = vec![0.0_f32; l1];
+
+    for sample in 0..batch_size {
+        let sparse_start = sample * max_active;
+        let gradient_start = sample * l1;
+        for row in 0..l1 {
+            let stm_grad = stm_gradients[gradient_start + row];
+            let nstm_grad = nstm_gradients[gradient_start + row];
+            bias_gradients[row] += stm_grad + nstm_grad;
+        }
+
+        accumulate_sparse_l0_weight_gradients(
+            &stm_indices[sparse_start..sparse_start + max_active],
+            &stm_gradients[gradient_start..gradient_start + l1],
+            l1,
+            input_size,
+            &mut weight_gradients,
+        );
+        accumulate_sparse_l0_weight_gradients(
+            &nstm_indices[sparse_start..sparse_start + max_active],
+            &nstm_gradients[gradient_start..gradient_start + l1],
+            l1,
+            input_size,
+            &mut weight_gradients,
+        );
+    }
+
+    (weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn accumulate_sparse_l0_weight_gradients(
+    indices: &[i32],
+    gradients: &[f32],
+    l1: usize,
+    input_size: usize,
+    weight_gradients: &mut [f32],
+) {
+    for &feature in indices {
+        if feature < 0 || feature as usize >= input_size {
+            continue;
+        }
+        let weight_start = feature as usize * l1;
+        for row in 0..l1 {
+            weight_gradients[weight_start + row] += gradients[row];
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
