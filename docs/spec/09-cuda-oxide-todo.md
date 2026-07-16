@@ -44,6 +44,8 @@ status を更新する。
 - in-progress: `nnue_sparse_l0_crelu` kernel 定義を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と CPU golden の L0 出力比較が必要。
 - in-progress: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加済み。CUDA Toolkit 環境で compile / launch 検証が必要。
 - in-progress: host launch sequence を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と 1 batch 最終 output の CPU golden 比較が必要。
+- done: `bulletou-cuda-train --nnue-forward-smoke` CLI と tiny fixed weight / sparse batch の CPU golden 比較を追加。
+- blocked: 現 Windows 環境では CUDA Toolkit v13.1 と RTX 4090 は見えるが、`libclang.dll` と `cargo-oxide` が未導入。`cargo check -p bulletou-cuda-train --features cuda` は bindgen の libclang 探索で停止する。実機 launch 検証には LLVM/libclang と cargo-oxide の導入が必要。
 
 ### CO-006 CUDA 実機検証
 

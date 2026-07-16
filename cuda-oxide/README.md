@@ -28,6 +28,16 @@ tested with:
 cargo run -p bulletou-cuda-train --features cuda -- --ptx /path/to/module.ptx --kernel noop
 ```
 
+CO-006 NNUE forward smoke compares a tiny fixed NNUE batch against a CPU scalar
+golden:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --ptx /path/to/bulletou-cuda-train.ptx
+```
+
+Add `--debug-readback` to compare L0 / concat / hidden buffers as well as the
+final output.
+
 The default build intentionally does not enable CUDA:
 
 ```bash
