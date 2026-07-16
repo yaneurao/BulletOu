@@ -281,7 +281,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
 
         let compute_block2 = trainer
             .optimiser
-            .update(&compute_stream, tgf.clone(), tlr.clone(), &gradients)
+            .update(&compute_stream, &tgf, &tlr, &gradients)
             .map_err(TrainerError::OptimiserUpdateError)?;
 
         if let Some(next_copy) = early_next_copy {

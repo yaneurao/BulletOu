@@ -137,8 +137,8 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
     pub fn update<'a>(
         &'a mut self,
         stream: &Arc<Stream<G>>,
-        gradient_factor: Arc<Buffer<G>>,
-        learning_rate: Arc<Buffer<G>>,
+        gradient_factor: &Arc<Buffer<G>>,
+        learning_rate: &Arc<Buffer<G>>,
         gradients: &TensorMap<G>,
     ) -> OptimiserUpdateResult<'a, G> {
         let mut sync = OptimiserUpdateSync::with_capacity(
@@ -165,8 +165,8 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
                     stream,
                     weight,
                     grads,
-                    &gradient_factor,
-                    &learning_rate,
+                    gradient_factor,
+                    learning_rate,
                 )?;
             }
         } else {
@@ -179,8 +179,8 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
                         stream,
                         weight,
                         grads,
-                        &gradient_factor,
-                        &learning_rate,
+                        gradient_factor,
+                        learning_rate,
                     )?;
                 }
             }

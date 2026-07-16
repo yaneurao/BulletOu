@@ -389,6 +389,8 @@ launch 引数、device pointer 引数配列を kernel 呼び出しごとに再�
 さらに optimizer update の hot path は `Arc<Buffer>` を weight ごとに clone せず、
 `&Arc<Buffer>` の slice を `CompiledKernel::execute_ref_slices` に渡す。
 kernel 実行に必要な buffer lifetime は `BufferGuard` が保持するため、launch 前の参照渡しで十分である。
+training loop から optimizer に渡す learning-rate / gradient-factor buffer も参照渡しにし、
+batch ごとの scalar buffer `Arc` clone を避ける。
 
 forward/backward では `TensorBinding` を事前計算しているが、実行時の binding 解決で
 `Arc<Buffer>` を clone して `Function` に渡す必要はない。`Function::execute_binding_refs`
