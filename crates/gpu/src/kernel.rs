@@ -203,17 +203,40 @@ impl<G: Gpu> CompiledKernel<G> {
         inputs: &[Arc<Buffer<G>>],
         outputs: &[Arc<Buffer<G>>],
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
-        if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
+        self.execute_iter(stream, inputs.iter(), outputs.iter(), inputs.len(), outputs.len())
+    }
+
+    pub fn execute_ref_slices(
+        &self,
+        stream: Arc<Stream<G>>,
+        inputs: &[&Arc<Buffer<G>>],
+        outputs: &[&Arc<Buffer<G>>],
+    ) -> Result<SyncOnValue<G, &Self>, G::Error> {
+        self.execute_iter(stream, inputs.iter().copied(), outputs.iter().copied(), inputs.len(), outputs.len())
+    }
+
+    fn execute_iter<'a, 'b>(
+        &'a self,
+        stream: Arc<Stream<G>>,
+        inputs: impl IntoIterator<Item = &'b Arc<Buffer<G>>>,
+        outputs: impl IntoIterator<Item = &'b Arc<Buffer<G>>>,
+        input_len: usize,
+        output_len: usize,
+    ) -> Result<SyncOnValue<G, &'a Self>, G::Error>
+    where
+        G: 'b,
+    {
+        if input_len != self.inputs.len() || output_len != self.outputs.len() {
             return Err("Mismatched number of inputs/outputs!".to_string().into());
         }
 
-        let mut sync = SyncOnDrop::with_capacity(stream.clone(), inputs.len() + outputs.len());
+        let mut sync = SyncOnDrop::with_capacity(stream.clone(), input_len + output_len);
         let mut scratch = self.scratch.borrow_mut();
         scratch.prepare();
 
         let mut var_size = None;
 
-        for (input, &ttype) in inputs.iter().zip(&self.inputs) {
+        for (input, &ttype) in inputs.into_iter().zip(&self.inputs) {
             let guard = input.acquire(stream.clone())?;
             if guard.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());
@@ -236,7 +259,7 @@ impl<G: Gpu> CompiledKernel<G> {
             sync.attach(guard)?;
         }
 
-        for (output, &ttype) in outputs.iter().zip(&self.outputs) {
+        for (output, &ttype) in outputs.into_iter().zip(&self.outputs) {
             let guard = output.acquire(stream.clone())?;
             if guard.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());

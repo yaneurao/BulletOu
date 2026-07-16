@@ -76,12 +76,18 @@ pub trait OptimiserState<G: Gpu>: Sized {
         &'a mut self,
         sync: &mut OptimiserUpdateSync<'a, G>,
         stream: &Arc<Stream<G>>,
-        weights: Arc<Buffer<G>>,
-        grads: Arc<Buffer<G>>,
-        gradient_factor: Arc<Buffer<G>>,
-        learning_rate: Arc<Buffer<G>>,
+        weights: &Arc<Buffer<G>>,
+        grads: &Arc<Buffer<G>>,
+        gradient_factor: &Arc<Buffer<G>>,
+        learning_rate: &Arc<Buffer<G>>,
     ) -> Result<(), G::Error> {
-        sync.extend_by(self.update(stream, weights, grads, gradient_factor, learning_rate)?);
+        sync.extend_by(self.update(
+            stream,
+            weights.clone(),
+            grads.clone(),
+            gradient_factor.clone(),
+            learning_rate.clone(),
+        )?);
         Ok(())
     }
 
@@ -157,10 +163,10 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
                 single.update_into(
                     &mut sync,
                     stream,
-                    weight.clone(),
-                    grads.clone(),
-                    gradient_factor.clone(),
-                    learning_rate.clone(),
+                    weight,
+                    grads,
+                    &gradient_factor,
+                    &learning_rate,
                 )?;
             }
         } else {
@@ -171,10 +177,10 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
                     single.update_into(
                         &mut sync,
                         stream,
-                        weight.clone(),
-                        grads.clone(),
-                        gradient_factor.clone(),
-                        learning_rate.clone(),
+                        weight,
+                        grads,
+                        &gradient_factor,
+                        &learning_rate,
                     )?;
                 }
             }
@@ -255,10 +261,10 @@ where
         &'a mut self,
         sync: &mut OptimiserUpdateSync<'a, G>,
         stream: &Arc<Stream<G>>,
-        weights: Arc<Buffer<G>>,
-        grads: Arc<Buffer<G>>,
-        gradient_factor: Arc<Buffer<G>>,
-        learning_rate: Arc<Buffer<G>>,
+        weights: &Arc<Buffer<G>>,
+        grads: &Arc<Buffer<G>>,
+        gradient_factor: &Arc<Buffer<G>>,
+        learning_rate: &Arc<Buffer<G>>,
     ) -> Result<(), G::Error> {
         self.optimiser.update_into(sync, stream, weights, grads, gradient_factor, learning_rate)
     }
