@@ -221,3 +221,25 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     `mean_grad` max_abs diff `0.000000000014551915`.
   - `--loss-kind wrm --loss-case weighted --debug-readback`:
     `mean_grad` max_abs diff `0.0000000000000035527137`.
+
+### 2026-07-17 CO-009 dense output backward first slice
+
+- Added cuda-oxide runtime layout for a minimal scalar-output dense backward:
+  `DenseOutputBackwardLayout { batch_size, input_len }`.
+- Added CUDA kernel `dense_output_backward` for affine output layers:
+  - `input_gradients[sample, row] = output_gradient[sample] * weight[row]`
+  - `weight_gradients[row] = sum_s output_gradient[s] * input[s, row]`
+  - `bias_gradient = sum_s output_gradient[s]`
+- Added host launcher and CLI smoke:
+  `bulletou-cuda-train --dense-output-backward-smoke`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--dense-output-backward-smoke --debug-readback`: input_grad max_abs
+    diff `0`; weight_grad max_abs diff `0.0000000037252903`; bias_grad
+    max_abs diff `0`.
+- Remaining CO-009 work: hidden dense layers with activation derivatives,
+  stacked SFNN layout support, and sparse feature-transformer gradient
+  accumulation.

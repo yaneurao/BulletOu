@@ -4,6 +4,7 @@
 //! CO-004 starts with PTX module loading and host/device smoke checks without
 //! touching the existing generic Bullet backend.
 
+pub mod backward;
 pub mod loss;
 pub mod nnue;
 pub mod sfnn;
@@ -25,6 +26,8 @@ pub fn backend_status() -> BackendStatus {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error(transparent)]
+    BackwardLayout(#[from] backward::BackwardLayoutError),
     #[error(transparent)]
     LossLayout(#[from] loss::LossLayoutError),
     #[error(transparent)]
