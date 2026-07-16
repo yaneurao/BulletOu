@@ -30,7 +30,7 @@ impl PreparedBatchHost {
         stream: &Arc<Stream<G>>,
         tensors: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &'a Self>, G::Error> {
-        let mut sync = SyncOnDrop::new(stream.clone());
+        let mut sync = SyncOnDrop::with_capacity(stream.clone(), tensors.len());
 
         for (id, tensor) in tensors {
             let value = self.inputs.get(id).ok_or("Missing input!".into())?;

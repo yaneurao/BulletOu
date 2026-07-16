@@ -364,6 +364,8 @@ push する。事前確保により launch 直前の pointer は安定し、GPU 
 
 `SyncOnDrop` は attach される guard 数が分かっている呼び出し経路では容量を事前確保する。
 `Function::execute_binding_refs` と `CompiledKernel::execute_slices` で guard list の再確保を避ける。
+batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tensor 数に合わせて
+同じく guard list を事前確保する。
 
 ### Phase 1: cuda-oxide runtime skeleton
 
