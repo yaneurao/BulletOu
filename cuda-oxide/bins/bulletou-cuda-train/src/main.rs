@@ -42,6 +42,8 @@ struct Args {
     sfnn_case: SfnnForwardCaseKind,
     nnue_forward_fixture: Option<std::path::PathBuf>,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
+    sfnn_forward_fixture: Option<std::path::PathBuf>,
+    write_sfnn_forward_fixture: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "cuda")]
@@ -81,6 +83,8 @@ impl Args {
             sfnn_case: SfnnForwardCaseKind::Tiny,
             nnue_forward_fixture: None,
             write_nnue_forward_fixture: None,
+            sfnn_forward_fixture: None,
+            write_sfnn_forward_fixture: None,
         };
 
         while let Some(arg) = args.next() {
@@ -107,6 +111,13 @@ impl Args {
                 "--write-nnue-forward-fixture" => {
                     parsed.write_nnue_forward_fixture =
                         Some(required_path_arg(&mut args, "--write-nnue-forward-fixture")?);
+                }
+                "--sfnn-forward-fixture" => {
+                    parsed.sfnn_forward_fixture = Some(required_path_arg(&mut args, "--sfnn-forward-fixture")?);
+                }
+                "--write-sfnn-forward-fixture" => {
+                    parsed.write_sfnn_forward_fixture =
+                        Some(required_path_arg(&mut args, "--write-sfnn-forward-fixture")?);
                 }
                 "--debug-readback" => parsed.debug_readback = true,
                 "--help" | "-h" => usage_success(),
@@ -236,7 +247,13 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
     };
 
-    let case = SfnnForwardCase::new(args.sfnn_case);
+    let case = match &args.sfnn_forward_fixture {
+        Some(path) => SfnnForwardCase::read_fixture(path)?,
+        None => SfnnForwardCase::new(args.sfnn_case),
+    };
+    if let Some(path) = &args.write_sfnn_forward_fixture {
+        case.write_fixture(path)?;
+    }
     let cpu_trace = case.cpu_forward_trace();
     let ptx = match args.ptx {
         Some(ptx) => ptx,
@@ -439,7 +456,7 @@ fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -455,11 +472,16 @@ fn usage() -> &'static str {
      CO-007 SFNN forward smoke: build a fixed SFNN batch, compare the GPU\n\
      launch_sfnn_forward output against a CPU scalar golden, and fail if any\n\
      output differs by more than --tolerance. The default case is tiny; use\n\
-     --sfnn-forward-case halfka2 for SFNN_halfka2_1024_7_64_k3k3."
+     --sfnn-forward-case halfka2 for SFNN_halfka2_1024_7_64_k3k3.\n\
+     --sfnn-forward-fixture loads the same buffers from a simple binary fixture;\n\
+     --write-sfnn-forward-fixture writes the selected/generated case in that format."
 }
 
 #[cfg(feature = "cuda")]
 const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
+
+#[cfg(feature = "cuda")]
+const SFNN_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUSFWD1";
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -923,6 +945,107 @@ impl SfnnForwardCase {
         }
 
         trace
+    }
+
+    fn read_fixture(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Self> {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to open SFNN forward fixture {}: {err}",
+                path.display()
+            ))
+        })?);
+
+        let mut magic = [0_u8; 8];
+        read_exact(&mut reader, &mut magic, "fixture magic")?;
+        if &magic != SFNN_FORWARD_FIXTURE_MAGIC {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "invalid SFNN forward fixture magic in {}",
+                path.display()
+            )));
+        }
+
+        let shape = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+            input_size: read_usize(&mut reader, "shape.input_size")?,
+            ft_size: read_usize(&mut reader, "shape.ft_size")?,
+            l1_hidden: read_usize(&mut reader, "shape.l1_hidden")?,
+            l2_size: read_usize(&mut reader, "shape.l2_size")?,
+            num_stacks: read_usize(&mut reader, "shape.num_stacks")?,
+        };
+        let batch_size = read_usize(&mut reader, "batch_size")?;
+        let max_active = read_usize(&mut reader, "max_active")?;
+        let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
+        let sparse_len = batch_size.saturating_mul(max_active);
+
+        let case = Self {
+            label: "fixture",
+            shape,
+            batch_size,
+            max_active,
+            stm: read_i32_vec(&mut reader, sparse_len, "stm")?,
+            nstm: read_i32_vec(&mut reader, sparse_len, "nstm")?,
+            buckets: read_i32_vec(&mut reader, batch_size, "buckets")?,
+            l0w: read_f32_vec(&mut reader, layout.l0w_len(), "l0w")?,
+            l0b: read_f32_vec(&mut reader, layout.l0b_len(), "l0b")?,
+            l1w: read_f32_vec(&mut reader, layout.l1w_len(), "l1w")?,
+            l1b: read_f32_vec(&mut reader, layout.l1b_len(), "l1b")?,
+            l2w: read_f32_vec(&mut reader, layout.l2w_len(), "l2w")?,
+            l2b: read_f32_vec(&mut reader, layout.l2b_len(), "l2b")?,
+            l3w: read_f32_vec(&mut reader, layout.l3w_len(), "l3w")?,
+            l3b: read_f32_vec(&mut reader, layout.l3b_len(), "l3b")?,
+        };
+
+        let mut trailing = [0_u8; 1];
+        match std::io::Read::read(&mut reader, &mut trailing) {
+            Ok(0) => Ok(case),
+            Ok(_) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "SFNN forward fixture {} has trailing bytes",
+                path.display()
+            ))),
+            Err(err) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read SFNN forward fixture {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_fixture(&self, path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<()> {
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to create SFNN forward fixture {}: {err}",
+                path.display()
+            ))
+        })?);
+
+        write_all(&mut writer, SFNN_FORWARD_FIXTURE_MAGIC, "fixture magic")?;
+        for value in [
+            self.shape.input_size,
+            self.shape.ft_size,
+            self.shape.l1_hidden,
+            self.shape.l2_size,
+            self.shape.num_stacks,
+            self.batch_size,
+            self.max_active,
+        ] {
+            write_u64(&mut writer, value as u64)?;
+        }
+        write_i32_vec(&mut writer, &self.stm, "stm")?;
+        write_i32_vec(&mut writer, &self.nstm, "nstm")?;
+        write_i32_vec(&mut writer, &self.buckets, "buckets")?;
+        write_f32_vec(&mut writer, &self.l0w, "l0w")?;
+        write_f32_vec(&mut writer, &self.l0b, "l0b")?;
+        write_f32_vec(&mut writer, &self.l1w, "l1w")?;
+        write_f32_vec(&mut writer, &self.l1b, "l1b")?;
+        write_f32_vec(&mut writer, &self.l2w, "l2w")?;
+        write_f32_vec(&mut writer, &self.l2b, "l2b")?;
+        write_f32_vec(&mut writer, &self.l3w, "l3w")?;
+        write_f32_vec(&mut writer, &self.l3b, "l3b")?;
+        std::io::Write::flush(&mut writer).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to flush SFNN forward fixture {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(())
     }
 }
 

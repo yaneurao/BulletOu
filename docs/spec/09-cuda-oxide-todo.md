@@ -16,7 +16,7 @@ status を更新する。
 | CO-004 | done | PTX smoke loader | 生成済み PTX を load し、kernel symbol resolve と最小 kernel launch を行う |
 | CO-005 | done | CPU reference test harness | fast backend kernel と既存 Bullet backend の 1 batch 出力比較を作る |
 | CO-006 | done | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる。CPU golden と所有重みレイアウトは追加済み |
-| CO-007 | todo | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |
+| CO-007 | done | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |
 | CO-008 | todo | loss kernel | target transform / sigmoid / loss reduction を fused kernel 化する |
 | CO-009 | todo | backward kernel | dense backward と sparse FT backward を実装する |
 | CO-010 | todo | optimizer kernel | Ranger / RAdam update を fused kernel 化する |
@@ -120,3 +120,16 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - 絶対誤差 `1e-5` 以下で一致する。
 - L0 / concat / L1 / L2 / output のどこで不一致になったかを切り分けられるよう、
   必要なら中間 buffer を host に戻す debug flag を用意する。
+
+### 2026-07-17 CO-007 SFNN forward validation
+
+- Added root-side `fast_sfnn` scalar CPU golden for `SFNN_halfka2_1024_7_64_k3k3`: sparse FT, CReLU, pairwise-mul, LayerStack L1-L3, and PSQT skip.
+- Added cuda-oxide SFNN shape / weight / batch / workspace layout.
+- Added `bulletou-cuda-train --sfnn-forward-smoke` and kernels: `sfnn_sparse_l0_crelu`, `sfnn_pairwise_concat`, `sfnn_stacked_l1`, `sfnn_l2_input`, `sfnn_stacked_l2_crelu`, `sfnn_stacked_l3_output`.
+- WSL2 Ubuntu 24.04 + RTX 4090: `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+- WSL2 Ubuntu 24.04 + RTX 4090: `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train` succeeded.
+- Tiny SFNN smoke: output and debug readback (`stm_l0`, `nstm_l0`, `combined`, `l1`, `l2_input`, `l2`) all had max_abs diff `0`.
+- Full synthetic `SFNN_halfka2_1024_7_64_k3k3` smoke: output max_abs diff `0.0000000037252903`; `l1` / `l2_input` max_abs diff `0.0000000018626451`; all within tolerance.
+- Added root exporter `export_sfnn_forward_fixture` and fixture format `BOUSFWD1`.
+- Exported a HalfKa2 fixture from user-provided HCPE teacher `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`: `target/bulletou-teacher-sfnn-halfka2.sfnnf`, batch_size=2, buckets `[8, 5]`, CPU output `[0.031887285, 0.035274245]`.
+- Ran that teacher fixture through WSL2/cuda-oxide `--sfnn-forward-fixture`: output max_abs diff `0`; `l1` / `l2_input` / `l2` max_abs diff `0.0000000018626451` or less; L0/combined max_abs diff `0`.
