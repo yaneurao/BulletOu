@@ -90,6 +90,19 @@ pub trait OptimiserState<G: Gpu>: Sized {
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G>;
 
+    fn update_into<'a>(
+        &'a mut self,
+        sync: &mut OptimiserUpdateSync<'a, G>,
+        stream: &Arc<Stream<G>>,
+        weights: Arc<Buffer<G>>,
+        grads: Arc<Buffer<G>>,
+        gradient_factor: Arc<Buffer<G>>,
+        learning_rate: Arc<Buffer<G>>,
+    ) -> Result<(), G::Error> {
+        sync.extend_by(self.update(stream, weights, grads, gradient_factor, learning_rate)?);
+        Ok(())
+    }
+
     fn reset(&mut self) -> Result<(), G::Error>;
 
     fn load_from_checkpoint(map: &mut BTreeMap<String, &mut Self>, path: &str) -> Result<(), G::Error>;
@@ -153,13 +166,14 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
             debug_assert_eq!(id, weight_id);
 
             if let Some(grads) = gradients.get(id) {
-                sync.extend_by(single.update(
+                single.update_into(
+                    &mut sync,
                     stream,
                     weight.clone(),
                     grads.clone(),
                     gradient_factor.clone(),
                     learning_rate.clone(),
-                )?);
+                )?;
             }
         }
 
@@ -232,6 +246,18 @@ where
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
         self.optimiser.update(stream, weights, grads, gradient_factor, learning_rate)
+    }
+
+    fn update_into<'a>(
+        &'a mut self,
+        sync: &mut OptimiserUpdateSync<'a, G>,
+        stream: &Arc<Stream<G>>,
+        weights: Arc<Buffer<G>>,
+        grads: Arc<Buffer<G>>,
+        gradient_factor: Arc<Buffer<G>>,
+        learning_rate: Arc<Buffer<G>>,
+    ) -> Result<(), G::Error> {
+        self.optimiser.update_into(sync, stream, weights, grads, gradient_factor, learning_rate)
     }
 
     fn reset(&mut self) -> Result<(), G::Error> {

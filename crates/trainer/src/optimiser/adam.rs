@@ -174,14 +174,26 @@ impl<G: Gpu> OptimiserState<G> for AdamW<G> {
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
         let mut sync = OptimiserUpdateSync::with_capacity(1, 0);
+        self.update_into(&mut sync, stream, weights, grads, gradient_factor, learning_rate)?;
+        Ok(sync)
+    }
 
+    fn update_into<'a>(
+        &'a mut self,
+        sync: &mut OptimiserUpdateSync<'a, G>,
+        stream: &Arc<Stream<G>>,
+        weights: Arc<Buffer<G>>,
+        grads: Arc<Buffer<G>>,
+        gradient_factor: Arc<Buffer<G>>,
+        learning_rate: Arc<Buffer<G>>,
+    ) -> Result<(), G::Error> {
         sync.push_kernel(self.op.execute_slices(
             stream.clone(),
             &[gradient_factor, learning_rate, grads],
             &[weights, self.momentum.clone(), self.velocity.clone()],
         )?);
 
-        Ok(sync)
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), G::Error> {

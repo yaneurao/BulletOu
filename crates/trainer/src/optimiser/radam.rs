@@ -191,6 +191,20 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
         gradient_factor: Arc<Buffer<G>>,
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
+        let mut sync = OptimiserUpdateSync::with_capacity(1, 2);
+        self.update_into(&mut sync, stream, weights, grads, gradient_factor, learning_rate)?;
+        Ok(sync)
+    }
+
+    fn update_into<'a>(
+        &'a mut self,
+        sync: &mut OptimiserUpdateSync<'a, G>,
+        stream: &Arc<Stream<G>>,
+        weights: Arc<Buffer<G>>,
+        grads: Arc<Buffer<G>>,
+        gradient_factor: Arc<Buffer<G>>,
+        learning_rate: Arc<Buffer<G>>,
+    ) -> Result<(), G::Error> {
         assert_eq!(weights.size(), self.momentum.size());
         assert_eq!(weights.size(), self.velocity.size());
 
@@ -218,8 +232,6 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
         self.cpu_step_size.write(0, DValue::F32(step_size));
         self.cpu_denom.write(0, DValue::I32(denom));
 
-        let mut sync = OptimiserUpdateSync::with_capacity(1, 2);
-
         sync.push_copy(self.step_size.copy_from_host_async(stream, &self.cpu_step_size)?);
         sync.push_copy(self.denom.copy_from_host_async(stream, &self.cpu_denom)?);
 
@@ -229,7 +241,7 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
             &[weights, self.momentum.clone(), self.velocity.clone()],
         )?);
 
-        Ok(sync)
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), G::Error> {

@@ -88,15 +88,27 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
         let mut blocks = OptimiserUpdateSync::with_capacity(2, 2);
+        self.update_into(&mut blocks, stream, weights, grads, gradient_factor, learning_rate)?;
+        Ok(blocks)
+    }
 
+    fn update_into<'a>(
+        &'a mut self,
+        blocks: &mut OptimiserUpdateSync<'a, G>,
+        stream: &Arc<Stream<G>>,
+        weights: Arc<Buffer<G>>,
+        grads: Arc<Buffer<G>>,
+        gradient_factor: Arc<Buffer<G>>,
+        learning_rate: Arc<Buffer<G>>,
+    ) -> Result<(), G::Error> {
         self.step += 1;
-        blocks.extend_by(self.inner.update(stream, weights.clone(), grads, gradient_factor, learning_rate)?);
+        self.inner.update_into(blocks, stream, weights.clone(), grads, gradient_factor, learning_rate)?;
 
         if self.step.is_multiple_of(self.k) {
             blocks.push_kernel(self.op.execute_slices(stream.clone(), &[], &[weights, self.slow_params.clone()])?);
         }
 
-        Ok(blocks)
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), G::Error> {

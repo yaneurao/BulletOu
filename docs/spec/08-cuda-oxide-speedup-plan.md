@@ -286,6 +286,9 @@ enqueue されるため、`OptimiserUpdateSync::sync()` が kernel guard ごと�
 optimizer 種別から分かる範囲で容量を事前確保し、update 時の `Vec` 伸長を減らす。
 optimizer state と model weights は同じ重み集合から作られるため、update 時は key lookup ではなく
 sorted map 同士を zip し、weight 取得の `BTreeMap::get` を避ける。
+さらに hot path では optimizer state が小さな `OptimiserUpdateSync` を作って返す代わりに、
+呼び出し側の集約syncへ直接pushする `update_into` を使う。これにより weight ごとの短命な
+kernel/copy list allocation を避ける。
 
 ### Phase 0.8: one-batch delayed loss readback
 
