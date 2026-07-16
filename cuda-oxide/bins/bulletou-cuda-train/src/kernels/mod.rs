@@ -4,9 +4,12 @@
 //! Keep host-only runtime layout code in `bulletou-cuda-oxide-runtime`, but put
 //! device entry points here.
 
+pub(crate) mod loss;
 pub(crate) mod nnue;
 pub(crate) mod sfnn;
 
+#[allow(unused_imports)]
+pub(crate) use loss::*;
 #[allow(unused_imports)]
 pub(crate) use nnue::*;
 #[allow(unused_imports)]

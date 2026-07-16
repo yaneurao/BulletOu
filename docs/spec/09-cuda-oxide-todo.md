@@ -133,3 +133,41 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Added root exporter `export_sfnn_forward_fixture` and fixture format `BOUSFWD1`.
 - Exported a HalfKa2 fixture from user-provided HCPE teacher `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`: `target/bulletou-teacher-sfnn-halfka2.sfnnf`, batch_size=2, buckets `[8, 5]`, CPU output `[0.031887285, 0.035274245]`.
 - Ran that teacher fixture through WSL2/cuda-oxide `--sfnn-forward-fixture`: output max_abs diff `0`; `l1` / `l2_input` / `l2` max_abs diff `0.0000000018626451` or less; L0/combined max_abs diff `0`.
+
+### 2026-07-17 CO-008 scalar loss first slice
+
+- Added root-side scalar CPU golden `fast_loss` for weighted sigmoid-MSE:
+  `entry_weight * (sigmoid(output) - target)^2`, plus `weighted_sum` and
+  `mean = weighted_sum / batch_size`.
+- Added cuda-oxide runtime layout for scalar loss buffers:
+  `outputs`, `targets`, `entry_weights`, `per_sample`, `weighted_sum`, and
+  `mean`.
+- Added CUDA kernel `loss_sigmoid_mse_reduce` and host launcher. Correctness
+  baseline uses one launched thread per sample for `per_sample`; thread 0 also
+  computes `weighted_sum` and `mean`.
+- `f32::exp()` / `f32::exp_m1()` currently route through `std` in this
+  cuda-oxide revision and are rejected by device collection. The kernel uses
+  `core::intrinsics::expf32` behind the crate's CUDA-only nightly feature gate.
+- Because libdevice math makes cuda-oxide emit `bulletou_cuda_train.ll` instead
+  of PTX, the runtime loader now accepts `.ll` artifacts and builds/loads a
+  cubin through cuda-host's LTOIR pipeline. Generated `.cubin`, `.ltoir`,
+  `.options`, and `.target` files are ignored by git.
+- WSL2 Ubuntu 24.04 + RTX 4090 validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime loss` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--loss-smoke --loss-case tiny --debug-readback`: sum max_abs diff
+    `0.0000000037252903`; mean max_abs diff `0.0000000009313226`;
+    per_sample max_abs diff `0`.
+  - `--loss-smoke --loss-case weighted --debug-readback`: sum max_abs diff
+    `0.0000000009313226`; mean max_abs diff `0.00000000023283064`;
+    per_sample max_abs diff `0`.
+- Environment note: Ubuntu noble's `libnvjitlink12` package exposes only
+  versioned symbols such as `__nvJitLinkCreate_12_0`, while this cuda-oxide
+  revision expects `nvJitLinkCreate`. For the above smoke runs, a temporary
+  `/tmp/libnvJitLink_shim.so` was used via `LIBNVJITLINK_PATH`. A proper CUDA
+  Toolkit nvJitLink install or a local cuda-oxide/nvjitlink-sys fix should
+  replace this shim.
+- Remaining CO-008/CO-009 work: WRM value loss / target transform variants,
+  parallel reduction, and backward gradients.

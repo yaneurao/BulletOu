@@ -22,7 +22,11 @@ impl ScalarLossLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), LossLayoutError> {
-        if self.batch_size == 0 { Err(LossLayoutError::EmptyBatch) } else { Ok(()) }
+        if self.batch_size == 0 {
+            Err(LossLayoutError::EmptyBatch)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn per_sample_len(self) -> usize {
@@ -40,10 +44,10 @@ pub struct ScalarLossLaunchPlan {
 }
 
 impl ScalarLossLaunchPlan {
-    pub fn new(_layout: ScalarLossLayout) -> Self {
-        // Correctness baseline: one logical thread loops over the batch and
-        // writes the per-sample losses plus reduced sum/mean.
-        Self { reduce_threads: 1 }
+    pub fn new(layout: ScalarLossLayout) -> Self {
+        // Correctness baseline: one thread per sample writes debug
+        // per-sample loss; thread 0 also computes the reduced sum/mean.
+        Self { reduce_threads: layout.batch_size }
     }
 }
 
@@ -140,7 +144,7 @@ mod tests {
 
         assert_eq!(layout.per_sample_len(), 8);
         assert_eq!(layout.reduced_len(), 1);
-        assert_eq!(ScalarLossLaunchPlan::new(layout).reduce_threads, 1);
+        assert_eq!(ScalarLossLaunchPlan::new(layout).reduce_threads, 8);
     }
 
     #[test]

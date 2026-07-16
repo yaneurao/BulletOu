@@ -1,7 +1,11 @@
 /target
 /cuda-oxide/target
+/cuda-oxide/*.cubin
 /cuda-oxide/*.ll
+/cuda-oxide/*.ltoir
+/cuda-oxide/*.options
 /cuda-oxide/*.ptx
+/cuda-oxide/*.target
 /cuda-oxide/*.nnuef
 /nets
 /checkpoints

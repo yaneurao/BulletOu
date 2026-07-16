@@ -35,6 +35,19 @@ pub enum Error {
     #[error(transparent)]
     Cuda(#[from] DriverError),
     #[cfg(feature = "cuda")]
+    #[error(transparent)]
+    Ltoir(#[from] cuda_host::LtoirError),
+    #[cfg(feature = "cuda")]
+    #[error("failed reading CUDA artifact metadata {path}: {source}")]
+    ArtifactMetadata {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[cfg(feature = "cuda")]
+    #[error("invalid CUDA artifact metadata {path}: {message}")]
+    InvalidArtifactMetadata { path: std::path::PathBuf, message: String },
+    #[cfg(feature = "cuda")]
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(String),
     #[cfg(feature = "cuda")]
@@ -54,8 +67,40 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "cuda")]
 pub fn load_ptx_module(ctx: &Arc<CudaContext>, ptx_path: &Path) -> Result<Arc<CudaModule>> {
+    if is_nvvm_ir_path(ptx_path) {
+        let arch = nvvm_ir_target_arch(ptx_path)?;
+        let cubin_path = cuda_host::ltoir::build_cubin_from_ll(ptx_path, &arch)?;
+        let path = cubin_path.to_str().ok_or_else(|| Error::NonUtf8Path(cubin_path.display().to_string()))?;
+        return Ok(ctx.load_module_from_file(path)?);
+    }
+
     let path = ptx_path.to_str().ok_or_else(|| Error::NonUtf8Path(ptx_path.display().to_string()))?;
     Ok(ctx.load_module_from_file(path)?)
+}
+
+#[cfg(feature = "cuda")]
+fn is_nvvm_ir_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("ll"))
+}
+
+#[cfg(feature = "cuda")]
+fn nvvm_ir_target_arch(ll_path: &Path) -> Result<String> {
+    if let Ok(target) = std::env::var("CUDA_OXIDE_TARGET") {
+        return Ok(target);
+    }
+
+    let target_path = ll_path.with_extension("target");
+    let contents = std::fs::read_to_string(&target_path)
+        .map_err(|source| Error::ArtifactMetadata { path: target_path.clone(), source })?;
+    let target =
+        contents.lines().map(str::trim).find(|line| !line.is_empty() && !line.contains('=')).ok_or_else(|| {
+            Error::InvalidArtifactMetadata {
+                path: target_path.clone(),
+                message: "missing CUDA target line such as sm_89".to_string(),
+            }
+        })?;
+
+    Ok(target.to_string())
 }
 
 #[cfg(feature = "cuda")]

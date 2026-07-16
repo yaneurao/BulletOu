@@ -1,5 +1,11 @@
+#![cfg_attr(feature = "cuda", allow(internal_features))]
+#![cfg_attr(feature = "cuda", feature(core_intrinsics))]
+
 #[cfg(feature = "cuda")]
 mod kernels;
+
+#[cfg(feature = "cuda")]
+mod loss_forward;
 
 #[cfg(feature = "cuda")]
 mod nnue_forward;
@@ -24,6 +30,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
 
     match args.mode {
         SmokeMode::Ptx => run_ptx_smoke(args),
+        SmokeMode::Loss => run_loss_smoke(args),
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
     }
@@ -38,6 +45,7 @@ struct Args {
     device: usize,
     tolerance: f32,
     debug_readback: bool,
+    loss_case: LossCaseKind,
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
     nnue_forward_fixture: Option<std::path::PathBuf>,
@@ -50,8 +58,16 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmokeMode {
     Ptx,
+    Loss,
     NnueForward,
     SfnnForward,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossCaseKind {
+    Tiny,
+    Weighted,
 }
 
 #[cfg(feature = "cuda")]
@@ -79,6 +95,7 @@ impl Args {
             device: 0,
             tolerance: 1.0e-5,
             debug_readback: false,
+            loss_case: LossCaseKind::Tiny,
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
             nnue_forward_fixture: None,
@@ -89,6 +106,7 @@ impl Args {
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--loss-smoke" => parsed.mode = SmokeMode::Loss,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
                 "--ptx" => parsed.ptx = Some(required_path_arg(&mut args, "--ptx")?),
@@ -98,6 +116,9 @@ impl Args {
                 }
                 "--tolerance" => {
                     parsed.tolerance = parse_f32_arg(required_arg(&mut args, "--tolerance")?, "--tolerance")?;
+                }
+                "--loss-case" => {
+                    parsed.loss_case = parse_loss_case(required_arg(&mut args, "--loss-case")?)?;
                 }
                 "--nnue-forward-case" => {
                     parsed.nnue_case = parse_nnue_forward_case(required_arg(&mut args, "--nnue-forward-case")?)?;
@@ -147,6 +168,69 @@ fn run_ptx_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     println!("  kernel    : {}", args.kernel);
     println!("  launch    : ok");
     println!("  roundtrip : {roundtrip_ok}");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::loss::{
+        ScalarLossDeviceBatch, ScalarLossHostBatch, ScalarLossLayout, ScalarLossWorkspace,
+    };
+
+    let case = LossSmokeCase::new(args.loss_case);
+    let cpu_trace = case.cpu_loss_trace();
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let host_batch = ScalarLossHostBatch {
+        outputs: &case.outputs,
+        targets: &case.targets,
+        entry_weights: &case.entry_weights,
+        batch_size: case.outputs.len(),
+    };
+    let device_batch = ScalarLossDeviceBatch::from_host(&stream, &host_batch)?;
+    let layout = ScalarLossLayout::new(case.outputs.len());
+    let mut workspace = ScalarLossWorkspace::new(&stream, layout)?;
+
+    loss_forward::launch_sigmoid_mse_loss(&stream, &module, &device_batch, &mut workspace)?;
+    stream.synchronize()?;
+
+    let gpu_sum = workspace.weighted_sum.to_host_vec(&stream)?;
+    let gpu_mean = workspace.mean.to_host_vec(&stream)?;
+    let sum_cmp = compare_slices("weighted_sum", &[cpu_trace.weighted_sum], &gpu_sum, args.tolerance)?;
+    let mean_cmp = compare_slices("mean", &[cpu_trace.mean], &gpu_mean, args.tolerance)?;
+
+    println!("bulletou-cuda-train scalar loss smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  batch        : {} samples", case.outputs.len());
+    println!("  tolerance    : {}", args.tolerance);
+    println!(
+        "  sum diff     : max_abs={} at {}, mean_abs={}",
+        sum_cmp.max_abs_diff, sum_cmp.max_abs_index, sum_cmp.mean_abs_diff
+    );
+    println!(
+        "  mean diff    : max_abs={} at {}, mean_abs={}",
+        mean_cmp.max_abs_diff, mean_cmp.max_abs_index, mean_cmp.mean_abs_diff
+    );
+
+    if args.debug_readback {
+        let gpu_per_sample = workspace.per_sample.to_host_vec(&stream)?;
+        let cmp = compare_slices("per_sample", &cpu_trace.per_sample, &gpu_per_sample, args.tolerance)?;
+        println!(
+            "  {:<11}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
+    }
+
+    println!("  compare      : ok");
 
     Ok(())
 }
@@ -361,28 +445,31 @@ fn default_nnue_ptx() -> bulletou_cuda_oxide_runtime::Result<std::path::PathBuf>
         bulletou_cuda_oxide_runtime::Error::Smoke("cannot resolve cuda-oxide workspace root".to_string())
     })?;
     let candidates = [
+        manifest_dir.join("bulletou-cuda-train.ll"),
+        workspace_root.join("bulletou-cuda-train.ll"),
+        manifest_dir.join("bulletou_cuda_train.ll"),
+        workspace_root.join("bulletou_cuda_train.ll"),
         manifest_dir.join("bulletou-cuda-train.ptx"),
         workspace_root.join("bulletou-cuda-train.ptx"),
         manifest_dir.join("bulletou_cuda_train.ptx"),
         workspace_root.join("bulletou_cuda_train.ptx"),
+        manifest_dir.join("bulletou-cuda-train.cubin"),
+        workspace_root.join("bulletou-cuda-train.cubin"),
+        manifest_dir.join("bulletou_cuda_train.cubin"),
+        workspace_root.join("bulletou_cuda_train.cubin"),
     ];
 
-    for candidate in candidates {
+    for candidate in &candidates {
         if candidate.exists() {
-            return Ok(candidate);
+            return Ok(candidate.clone());
         }
     }
 
     Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-        "NNUE forward PTX not found. Run cargo-oxide for the binary crate, then pass the generated PTX with --ptx.\n\
+        "CUDA kernel artifact not found. Run cargo-oxide for the binary crate, then pass the generated artifact with --ptx.\n\
          Probed:\n  {}",
-        [
-            manifest_dir.join("bulletou-cuda-train.ptx"),
-            workspace_root.join("bulletou-cuda-train.ptx"),
-            manifest_dir.join("bulletou_cuda_train.ptx"),
-            workspace_root.join("bulletou_cuda_train.ptx"),
-        ]
-        .iter()
+        candidates
+            .iter()
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join("\n  ")
@@ -432,6 +519,15 @@ fn parse_f32_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_run
 }
 
 #[cfg(feature = "cuda")]
+fn parse_loss_case(value: String) -> bulletou_cuda_oxide_runtime::Result<LossCaseKind> {
+    match value.as_str() {
+        "tiny" => Ok(LossCaseKind::Tiny),
+        "weighted" => Ok(LossCaseKind::Weighted),
+        _ => usage_error(format!("--loss-case must be one of: tiny, weighted (got {value})")),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn parse_nnue_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCaseKind> {
     match value.as_str() {
         "tiny" => Ok(NnueForwardCaseKind::Tiny),
@@ -444,9 +540,7 @@ fn parse_nnue_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result<SfnnForwardCaseKind> {
     match value.as_str() {
         "tiny" => Ok(SfnnForwardCaseKind::Tiny),
-        "halfka2" | "halfka2-1024-7-64-k3k3" | "SFNN_halfka2_1024_7_64_k3k3" => {
-            Ok(SfnnForwardCaseKind::Halfka2)
-        }
+        "halfka2" | "halfka2-1024-7-64-k3k3" | "SFNN_halfka2_1024_7_64_k3k3" => Ok(SfnnForwardCaseKind::Halfka2),
         _ => usage_error(format!("--sfnn-forward-case must be one of: tiny, halfka2 (got {value})")),
     }
 }
@@ -455,12 +549,17 @@ fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
+       bulletou-cuda-train --loss-smoke [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
      --ptx is omitted, cuda-oxide/smoke/noop.ptx is used.\n\
+     \n\
+     CO-008 loss smoke: compare the GPU sigmoid-MSE weighted loss reduction\n\
+     against a CPU scalar golden. The kernel writes per-sample weighted loss,\n\
+     weighted_sum, and mean (= weighted_sum / batch_size).\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -482,6 +581,23 @@ const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
 
 #[cfg(feature = "cuda")]
 const SFNN_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUSFWD1";
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct LossSmokeCase {
+    label: &'static str,
+    outputs: Vec<f32>,
+    targets: Vec<f32>,
+    entry_weights: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct LossSmokeTrace {
+    per_sample: Vec<f32>,
+    weighted_sum: f32,
+    mean: f32,
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -543,6 +659,40 @@ struct SfnnForwardTrace {
     l2_input: Vec<f32>,
     l2: Vec<f32>,
     outputs: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl LossSmokeCase {
+    fn new(kind: LossCaseKind) -> Self {
+        match kind {
+            LossCaseKind::Tiny => Self {
+                label: "tiny",
+                outputs: vec![-2.0, 0.0, 2.0],
+                targets: vec![0.0, 0.5, 1.0],
+                entry_weights: vec![1.0, 0.5, 2.0],
+            },
+            LossCaseKind::Weighted => Self {
+                label: "weighted",
+                outputs: vec![-4.0, -1.25, 0.0, 1.5, 4.0],
+                targets: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+                entry_weights: vec![1.0, 0.0, 0.5, 2.0, 0.25],
+            },
+        }
+    }
+
+    fn cpu_loss_trace(&self) -> LossSmokeTrace {
+        let mut per_sample = Vec::with_capacity(self.outputs.len());
+        let mut weighted_sum = 0.0_f32;
+        for ((&output, &target), &entry_weight) in self.outputs.iter().zip(&self.targets).zip(&self.entry_weights) {
+            let prediction = sigmoid(output);
+            let error = prediction - target;
+            let weighted = entry_weight * error * error;
+            per_sample.push(weighted);
+            weighted_sum += weighted;
+        }
+        let mean = weighted_sum / self.outputs.len() as f32;
+        LossSmokeTrace { per_sample, weighted_sum, mean }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -935,13 +1085,9 @@ impl SfnnForwardCase {
             );
             crelu_in_place(&mut trace.l2[l2_start..l2_end]);
 
-            trace.outputs[sample] = affine_stacked_scalar(
-                &self.l3w,
-                &self.l3b,
-                &trace.l2[l2_start..l2_end],
-                self.shape.num_stacks,
-                stack,
-            ) + trace.l1[l1_start + self.shape.l1_hidden];
+            trace.outputs[sample] =
+                affine_stacked_scalar(&self.l3w, &self.l3b, &trace.l2[l2_start..l2_end], self.shape.num_stacks, stack)
+                    + trace.l1[l1_start + self.shape.l1_hidden];
         }
 
         trace
@@ -1268,6 +1414,11 @@ fn fill_sfnn_l2_input(l1: &[f32], l1_hidden: usize, out: &mut [f32]) {
         out[row] = (l1[row].abs() * l1[row].abs() * SCALE).clamp(0.0, 1.0);
         out[l1_hidden + row] = l1[row].clamp(0.0, 1.0);
     }
+}
+
+#[cfg(feature = "cuda")]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 #[cfg(feature = "cuda")]
