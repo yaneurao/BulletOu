@@ -78,8 +78,11 @@ impl<G: Gpu> Model<G> {
         inputs: &TensorMap<G>,
         outputs: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let tensors = collect_map::<G>([("weights/", &self.weights), ("inputs/", inputs), ("", outputs)]);
-        let map = self.fwd_map.iter().map(|(name, &id)| (id, tensors.get(name).unwrap().clone())).collect();
+        let map = self
+            .fwd_map
+            .iter()
+            .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, None).unwrap()))
+            .collect();
         self.forward.execute(stream.clone(), &map)
     }
 
@@ -98,13 +101,11 @@ impl<G: Gpu> Model<G> {
         outputs: &TensorMap<G>,
         gradients: &TensorMap<G>,
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
-        let tensors = collect_map::<G>([
-            ("weights/", &self.weights),
-            ("inputs/", inputs),
-            ("", outputs),
-            ("gradients/", gradients),
-        ]);
-        let map = self.bwd_map.iter().map(|(name, &id)| (id, tensors.get(name).unwrap().clone())).collect();
+        let map = self
+            .bwd_map
+            .iter()
+            .map(|(name, &id)| (id, resolve_tensor(name, &self.weights, inputs, outputs, Some(gradients)).unwrap()))
+            .collect();
 
         self.backward.execute(stream.clone(), &map)
     }
@@ -188,14 +189,20 @@ impl<G: Gpu> Model<G> {
     }
 }
 
-fn collect_map<'a, G: Gpu + 'a>(x: impl AsRef<[(&'a str, &'a TensorMap<G>)]>) -> TensorMap<G> {
-    let mut map = BTreeMap::new();
-
-    for (pre, submap) in x.as_ref() {
-        for (name, value) in submap.iter() {
-            map.insert(format!("{pre}{name}"), value.clone());
-        }
+fn resolve_tensor<G: Gpu>(
+    name: &str,
+    weights: &TensorMap<G>,
+    inputs: &TensorMap<G>,
+    outputs: &TensorMap<G>,
+    gradients: Option<&TensorMap<G>>,
+) -> Option<Arc<Buffer<G>>> {
+    if let Some(name) = name.strip_prefix("weights/") {
+        weights.get(name).cloned()
+    } else if let Some(name) = name.strip_prefix("inputs/") {
+        inputs.get(name).cloned()
+    } else if let Some(name) = name.strip_prefix("gradients/") {
+        gradients.and_then(|gradients| gradients.get(name).cloned())
+    } else {
+        outputs.get(name).cloned()
     }
-
-    map
 }

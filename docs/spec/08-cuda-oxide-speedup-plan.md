@@ -294,6 +294,25 @@ checkpoint の重みタイミングを壊さないため、superbatch 末尾の 
 末尾 batch は即座に loss を回収し、running loss を確定してから save callback を呼ぶ。
 したがって、checkpoint は従来通り「その superbatch の最後の update 直後」の重みになる。
 
+### Phase 0.9: avoid per-batch prefixed tensor map rebuild
+
+現行 `Model::forward` / `Model::backward` は、毎 batch で以下のような中間 map を作っていた。
+
+```text
+weights/<id>   -> weight buffer
+inputs/<id>    -> input buffer
+gradients/<id> -> gradient buffer
+<output id>    -> output buffer
+```
+
+この方式は単純だが、weight 数が多い network では batch ごとに prefix 付き key 文字列と
+`BTreeMap` を作り直すことになる。既存 backend のままでも、ここは `Function` が要求する
+tensor 名を prefix 解決して、直接該当する map から buffer を引けばよい。
+
+この変更は NodeId に渡す buffer 対応を変えず、host 側の余分な allocation / lookup だけを
+減らす。cuda-oxide backend ではさらに進めて、name lookup 自体を build-time layout に
+落とす。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
