@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, ffi::c_void, rc::Rc, sync::Arc};
 
 use bullet_compiler::{
     ir::NodeId,
@@ -299,6 +299,7 @@ impl<G: Gpu> Function<G> {
 
         let var = var_size.unwrap_or(1);
         let mut sizes = vec![0; self.max_num_args];
+        let mut kernel_args: Vec<*mut c_void> = Vec::with_capacity(self.max_num_args);
 
         assert_ne!(var, 0, "Variable size = 0!");
         assert!(self.prealloc_size >= var);
@@ -315,19 +316,18 @@ impl<G: Gpu> Function<G> {
                     }
                     Inst::Free { .. } => {}
                     Inst::LaunchKernel { func, args, gdim, bdim, smem } => {
-                        let mut args: Vec<_> = args
-                            .iter()
-                            .enumerate()
-                            .map(|(i, arg)| match arg {
+                        kernel_args.clear();
+                        for (i, arg) in args.iter().enumerate() {
+                            kernel_args.push(match arg {
                                 Arg::Pointer { idx } => ptrs.as_ptr().add(*idx).cast_mut().cast(),
                                 Arg::Size(size) => {
                                     sizes[i] = size.evaluate(var) as i32;
                                     (&sizes[i] as *const i32).cast_mut().cast()
                                 }
-                            })
-                            .collect();
+                            });
+                        }
 
-                        func.launch(&stream, gdim(var), bdim(var), args.as_mut_ptr(), smem(var))?;
+                        func.launch(&stream, gdim(var), bdim(var), kernel_args.as_mut_ptr(), smem(var))?;
                     }
                     &Inst::Matmul { cfg, a, b, c } => {
                         let handle = self.blas.as_ref().unwrap();

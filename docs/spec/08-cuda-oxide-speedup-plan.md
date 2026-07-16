@@ -329,6 +329,10 @@ tensor 名を prefix 解決して、直接該当する map から buffer を引�
 保持しておけば、batch 中の `strip_prefix()` と一時 binding 配列 allocation も不要になる。
 batch 中は固定済み binding を走査し、該当する tensor map から `Arc<Buffer>` を clone するだけでよい。
 
+kernel launch 引数も同様に、launch ごとに小さな `Vec` を作る必要はない。
+`Function::execute` 内で `max_num_args` 分の引数 buffer を 1 つ確保し、各 kernel launch で
+`clear()` して再利用する。これは GPU 計算順序や数値に影響しない host-side allocation 削減である。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
