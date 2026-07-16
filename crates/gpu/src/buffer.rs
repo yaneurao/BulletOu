@@ -168,7 +168,7 @@ impl<G: Gpu> Buffer<G> {
     pub fn zeroed(device: &Arc<Device<G>>, dtype: DType, size: usize) -> Result<Arc<Self>, G::Error> {
         unsafe {
             let buf = Self::uninit(device, dtype, size)?;
-            device.memset(buf.ptr, buf.bytes(), 0)?;
+            buf.zero()?;
             Ok(buf)
         }
     }
@@ -188,6 +188,10 @@ impl<G: Gpu> Buffer<G> {
 
     pub fn device(&self) -> Arc<Device<G>> {
         self.device.clone()
+    }
+
+    pub fn zero(&self) -> Result<(), G::Error> {
+        unsafe { self.device.memset(self.ptr, self.bytes(), 0) }
     }
 
     pub fn owner(&self) -> Option<Arc<Stream<G>>> {

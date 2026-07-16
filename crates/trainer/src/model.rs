@@ -125,8 +125,7 @@ impl<G: Gpu> Model<G> {
         self.weights()
             .iter()
             .map(|(id, weight)| {
-                Buffer::from_host(&self.device, &TValue::zeros(weight.dtype(), weight.size()))
-                    .map(|buf| (id.clone(), buf))
+                Buffer::zeroed(&self.device, weight.dtype(), weight.size()).map(|buf| (id.clone(), buf))
             })
             .collect()
     }

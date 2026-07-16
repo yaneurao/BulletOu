@@ -327,6 +327,11 @@ checkpoint の重みタイミングを壊さないため、superbatch 末尾の 
 forward/backward の output tensor も実行前に読まれず、`Function::execute` が書き込むため、
 host zero buffer から作らず uninitialised device buffer として確保する。
 
+一方、gradient tensor や optimizer state は初期値として 0 が必要である。
+ここは巨大な host 側 zero `TValue` を作って H2D copy するのではなく、device buffer を確保して
+device memset で 0 初期化する。optimizer reset でも同じ `Buffer::zero()` を使い、
+host zero buffer の生成と転送を避ける。
+
 ### Phase 0.9: avoid per-batch prefixed tensor map rebuild
 
 現行 `Model::forward` / `Model::backward` は、毎 batch で以下のような中間 map を作っていた。

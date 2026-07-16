@@ -159,8 +159,8 @@ impl<G: Gpu> OptimiserState<G> for AdamW<G> {
         let op = default_params.build(size).unwrap().compile(device.clone())?;
 
         Ok(Self {
-            momentum: Buffer::from_host(device, &TValue::zeros(DType::F32, size))?,
-            velocity: Buffer::from_host(device, &TValue::zeros(DType::F32, size))?,
+            momentum: Buffer::zeroed(device, DType::F32, size)?,
+            velocity: Buffer::zeroed(device, DType::F32, size)?,
             op,
         })
     }
@@ -197,9 +197,8 @@ impl<G: Gpu> OptimiserState<G> for AdamW<G> {
     }
 
     fn reset(&mut self) -> Result<(), G::Error> {
-        let size = self.momentum.size();
-        self.momentum.copy_from_host(&TValue::zeros(DType::F32, size))?;
-        self.velocity.copy_from_host(&TValue::zeros(DType::F32, size))?;
+        self.momentum.zero()?;
+        self.velocity.zero()?;
         Ok(())
     }
 

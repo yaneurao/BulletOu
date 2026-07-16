@@ -170,13 +170,13 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
         let op = default_params.build(size).unwrap().compile(device.clone())?;
 
         Ok(Self {
-            momentum: Buffer::from_host(device, &TValue::zeros(DType::F32, size))?,
-            velocity: Buffer::from_host(device, &TValue::zeros(DType::F32, size))?,
+            momentum: Buffer::zeroed(device, DType::F32, size)?,
+            velocity: Buffer::zeroed(device, DType::F32, size)?,
             op,
             params: default_params,
             step: 0,
-            step_size: Buffer::from_host(device, &TValue::zeros(DType::F32, 1))?,
-            denom: Buffer::from_host(device, &TValue::zeros(DType::I32, 1))?,
+            step_size: Buffer::zeroed(device, DType::F32, 1)?,
+            denom: Buffer::zeroed(device, DType::I32, 1)?,
             cpu_step_size: TValue::F32(vec![0.0]),
             cpu_denom: TValue::I32(vec![0]),
         })
@@ -246,9 +246,8 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
 
     fn reset(&mut self) -> Result<(), G::Error> {
         self.step = 0;
-        let size = self.momentum.size();
-        self.momentum.copy_from_host(&TValue::zeros(DType::F32, size))?;
-        self.velocity.copy_from_host(&TValue::zeros(DType::F32, size))?;
+        self.momentum.zero()?;
+        self.velocity.zero()?;
         Ok(())
     }
 
