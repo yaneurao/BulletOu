@@ -324,6 +324,8 @@ checkpoint の重みタイミングを壊さないため、superbatch 末尾の 
 したがって、checkpoint は従来通り「その superbatch の最後の update 直後」の重みになる。
 `outputs/loss` buffer は output tensor 作成後に変わらないため、batch loop の外で `Arc` を
 保持しておき、loss readback のたびに output map を lookup しない。
+forward/backward の output tensor も実行前に読まれず、`Function::execute` が書き込むため、
+host zero buffer から作らず uninitialised device buffer として確保する。
 
 ### Phase 0.9: avoid per-batch prefixed tensor map rebuild
 

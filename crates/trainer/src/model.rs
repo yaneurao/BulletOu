@@ -136,7 +136,8 @@ impl<G: Gpu> Model<G> {
             .iter()
             .map(|(id, ty)| {
                 let size = ty.size().evaluate_constant().expect("`Model` only supports constant-size outputs!");
-                Buffer::from_host(&self.device, &TValue::zeros(ty.dtype(), size)).map(|buf| (id.clone(), buf))
+                // Output tensors are written by `Function::execute` before they are read.
+                unsafe { Buffer::uninit(&self.device, ty.dtype(), size) }.map(|buf| (id.clone(), buf))
             })
             .collect()
     }
@@ -146,7 +147,8 @@ impl<G: Gpu> Model<G> {
             .iter()
             .map(|(id, ty)| {
                 let size = ty.size().evaluate(batch_size);
-                Buffer::from_host(&self.device, &TValue::zeros(ty.dtype(), size)).map(|buf| (id.clone(), buf))
+                // Output tensors are written by `Function::execute` before they are read.
+                unsafe { Buffer::uninit(&self.device, ty.dtype(), size) }.map(|buf| (id.clone(), buf))
             })
             .collect()
     }
