@@ -44,6 +44,23 @@ cargo run -p bulletou-cuda-train --features cuda -- \
   --nnue-forward-smoke --nnue-forward-case halfkp --ptx /path/to/bulletou-cuda-train.ptx
 ```
 
+`--write-nnue-forward-fixture <PATH>` writes the selected smoke case as a simple
+little-endian fixture. `--nnue-forward-fixture <PATH>` reads the same format.
+This is the bridge point for root BulletOu code to export a `FastBatchHost` plus
+`NnueForwardOwnedWeights` without making this nested workspace depend on the
+root workspace:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --nnue-forward-case halfkp \
+  --write-nnue-forward-fixture /tmp/bulletou-halfkp.nnuef \
+  --ptx ./bulletou_cuda_train.ptx
+
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --nnue-forward-fixture /tmp/bulletou-halfkp.nnuef \
+  --ptx ./bulletou_cuda_train.ptx --debug-readback
+```
+
 Add `--debug-readback` to compare L0 / concat / hidden buffers as well as the
 final output.
 
@@ -67,6 +84,7 @@ cargo run -p bulletou-cuda-train --features cuda -- \
 
 `cargo oxide build` writes `bulletou_cuda_train.{ll,opt.ll,ptx}` into this
 workspace root. These are generated artifacts and are intentionally ignored.
+Large `*.nnuef` fixtures are also ignored.
 
 The default build intentionally does not enable CUDA:
 

@@ -35,6 +35,8 @@ struct Args {
     tolerance: f32,
     debug_readback: bool,
     nnue_case: NnueForwardCaseKind,
+    nnue_forward_fixture: Option<std::path::PathBuf>,
+    write_nnue_forward_fixture: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "cuda")]
@@ -63,6 +65,8 @@ impl Args {
             tolerance: 1.0e-5,
             debug_readback: false,
             nnue_case: NnueForwardCaseKind::Tiny,
+            nnue_forward_fixture: None,
+            write_nnue_forward_fixture: None,
         };
 
         while let Some(arg) = args.next() {
@@ -78,6 +82,13 @@ impl Args {
                 }
                 "--nnue-forward-case" => {
                     parsed.nnue_case = parse_nnue_forward_case(required_arg(&mut args, "--nnue-forward-case")?)?;
+                }
+                "--nnue-forward-fixture" => {
+                    parsed.nnue_forward_fixture = Some(required_path_arg(&mut args, "--nnue-forward-fixture")?);
+                }
+                "--write-nnue-forward-fixture" => {
+                    parsed.write_nnue_forward_fixture =
+                        Some(required_path_arg(&mut args, "--write-nnue-forward-fixture")?);
                 }
                 "--debug-readback" => parsed.debug_readback = true,
                 "--help" | "-h" => usage_success(),
@@ -118,7 +129,13 @@ fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         NnueForwardWorkspace, NnueForwardWorkspaceLayout,
     };
 
-    let case = NnueForwardCase::new(args.nnue_case);
+    let case = match &args.nnue_forward_fixture {
+        Some(path) => NnueForwardCase::read_fixture(path)?,
+        None => NnueForwardCase::new(args.nnue_case),
+    };
+    if let Some(path) = &args.write_nnue_forward_fixture {
+        case.write_fixture(path)?;
+    }
     let cpu_trace = case.cpu_forward_trace();
     let ptx = match args.ptx {
         Some(ptx) => ptx,
@@ -300,7 +317,7 @@ fn parse_nnue_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
-       bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -309,8 +326,13 @@ fn usage() -> &'static str {
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
      output differs by more than --tolerance (default 1e-5). The default case\n\
-     is tiny; use --nnue-forward-case halfkp for NNUE_HALFKP_256x2_32_32."
+     is tiny; use --nnue-forward-case halfkp for NNUE_HALFKP_256x2_32_32.\n\
+     --nnue-forward-fixture loads the same buffers from a simple binary fixture;\n\
+     --write-nnue-forward-fixture writes the selected/generated case in that format."
 }
+
+#[cfg(feature = "cuda")]
+const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -480,6 +502,191 @@ impl NnueForwardCase {
 
         trace
     }
+
+    fn read_fixture(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Self> {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to open NNUE forward fixture {}: {err}",
+                path.display()
+            ))
+        })?);
+
+        let mut magic = [0_u8; 8];
+        read_exact(&mut reader, &mut magic, "fixture magic")?;
+        if &magic != NNUE_FORWARD_FIXTURE_MAGIC {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "invalid NNUE forward fixture magic in {}",
+                path.display()
+            )));
+        }
+
+        let shape = bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
+            input_size: read_usize(&mut reader, "shape.input_size")?,
+            l1: read_usize(&mut reader, "shape.l1")?,
+            l2: read_usize(&mut reader, "shape.l2")?,
+            l3: read_usize(&mut reader, "shape.l3")?,
+        };
+        let batch_size = read_usize(&mut reader, "batch_size")?;
+        let max_active = read_usize(&mut reader, "max_active")?;
+        let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+        let sparse_len = batch_size.saturating_mul(max_active);
+
+        let case = Self {
+            label: "fixture",
+            shape,
+            batch_size,
+            max_active,
+            stm: read_i32_vec(&mut reader, sparse_len, "stm")?,
+            nstm: read_i32_vec(&mut reader, sparse_len, "nstm")?,
+            l0w: read_f32_vec(&mut reader, layout.l0w_len(), "l0w")?,
+            l0b: read_f32_vec(&mut reader, layout.l0b_len(), "l0b")?,
+            l1w: read_f32_vec(&mut reader, layout.l1w_len(), "l1w")?,
+            l1b: read_f32_vec(&mut reader, layout.l1b_len(), "l1b")?,
+            l2w: read_f32_vec(&mut reader, layout.l2w_len(), "l2w")?,
+            l2b: read_f32_vec(&mut reader, layout.l2b_len(), "l2b")?,
+            outw: read_f32_vec(&mut reader, layout.outw_len(), "outw")?,
+            outb: read_f32_vec(&mut reader, layout.outb_len(), "outb")?,
+        };
+
+        let mut trailing = [0_u8; 1];
+        match std::io::Read::read(&mut reader, &mut trailing) {
+            Ok(0) => Ok(case),
+            Ok(_) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "NNUE forward fixture {} has trailing bytes",
+                path.display()
+            ))),
+            Err(err) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read NNUE forward fixture {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_fixture(&self, path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<()> {
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to create NNUE forward fixture {}: {err}",
+                path.display()
+            ))
+        })?);
+
+        write_all(&mut writer, NNUE_FORWARD_FIXTURE_MAGIC, "fixture magic")?;
+        for value in
+            [self.shape.input_size, self.shape.l1, self.shape.l2, self.shape.l3, self.batch_size, self.max_active]
+        {
+            write_u64(&mut writer, value as u64)?;
+        }
+        write_i32_vec(&mut writer, &self.stm, "stm")?;
+        write_i32_vec(&mut writer, &self.nstm, "nstm")?;
+        write_f32_vec(&mut writer, &self.l0w, "l0w")?;
+        write_f32_vec(&mut writer, &self.l0b, "l0b")?;
+        write_f32_vec(&mut writer, &self.l1w, "l1w")?;
+        write_f32_vec(&mut writer, &self.l1b, "l1b")?;
+        write_f32_vec(&mut writer, &self.l2w, "l2w")?;
+        write_f32_vec(&mut writer, &self.l2b, "l2b")?;
+        write_f32_vec(&mut writer, &self.outw, "outw")?;
+        write_f32_vec(&mut writer, &self.outb, "outb")?;
+        std::io::Write::flush(&mut writer).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to flush NNUE forward fixture {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn read_usize(reader: &mut impl std::io::Read, name: &'static str) -> bulletou_cuda_oxide_runtime::Result<usize> {
+    let value = read_u64(reader, name)?;
+    usize::try_from(value)
+        .map_err(|_| bulletou_cuda_oxide_runtime::Error::Smoke(format!("{name} value {value} does not fit in usize")))
+}
+
+#[cfg(feature = "cuda")]
+fn read_u64(reader: &mut impl std::io::Read, name: &'static str) -> bulletou_cuda_oxide_runtime::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    read_exact(reader, &mut bytes, name)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(feature = "cuda")]
+fn read_i32_vec(
+    reader: &mut impl std::io::Read,
+    len: usize,
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<i32>> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut bytes = [0_u8; 4];
+        read_exact(reader, &mut bytes, name)?;
+        values.push(i32::from_le_bytes(bytes));
+    }
+    Ok(values)
+}
+
+#[cfg(feature = "cuda")]
+fn read_f32_vec(
+    reader: &mut impl std::io::Read,
+    len: usize,
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut bytes = [0_u8; 4];
+        read_exact(reader, &mut bytes, name)?;
+        values.push(f32::from_le_bytes(bytes));
+    }
+    Ok(values)
+}
+
+#[cfg(feature = "cuda")]
+fn read_exact(
+    reader: &mut impl std::io::Read,
+    bytes: &mut [u8],
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    std::io::Read::read_exact(reader, bytes)
+        .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read {name}: {err}")))
+}
+
+#[cfg(feature = "cuda")]
+fn write_u64(writer: &mut impl std::io::Write, value: u64) -> bulletou_cuda_oxide_runtime::Result<()> {
+    write_all(writer, &value.to_le_bytes(), "u64")
+}
+
+#[cfg(feature = "cuda")]
+fn write_i32_vec(
+    writer: &mut impl std::io::Write,
+    values: &[i32],
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    for &value in values {
+        write_all(writer, &value.to_le_bytes(), name)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn write_f32_vec(
+    writer: &mut impl std::io::Write,
+    values: &[f32],
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    for &value in values {
+        write_all(writer, &value.to_le_bytes(), name)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn write_all(
+    writer: &mut impl std::io::Write,
+    bytes: &[u8],
+    name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    std::io::Write::write_all(writer, bytes)
+        .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to write {name}: {err}")))
 }
 
 #[cfg(feature = "cuda")]

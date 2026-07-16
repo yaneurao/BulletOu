@@ -2,6 +2,7 @@
 /cuda-oxide/target
 /cuda-oxide/*.ll
 /cuda-oxide/*.ptx
+/cuda-oxide/*.nnuef
 /nets
 /checkpoints
 /.cargo
