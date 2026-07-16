@@ -367,6 +367,10 @@ push する。事前確保により launch 直前の pointer は安定し、GPU 
 batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tensor 数に合わせて
 同じく guard list を事前確保する。
 
+training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` を batch ごとに
+新規作成する必要はない。loop 外で 2 つの scalar host buffer を確保し、batch ごとに値だけ
+書き換えて H2D copy することで、小さな `Vec<f32>` allocation を避ける。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

@@ -4,7 +4,7 @@ pub mod schedule;
 
 use std::{sync::mpsc, thread, time::Instant};
 
-use bullet_compiler::tensor::TValue;
+use bullet_compiler::tensor::{DValue, TValue};
 use bullet_gpu::{
     buffer::{Buffer, SyncOnValue},
     runtime::Gpu,
@@ -182,6 +182,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
     let mut batch_queued = true;
     let mut output_slot = 0usize;
     let mut pending_loss: Option<PendingLoss<G>> = None;
+    let mut lr_value = TValue::F32(vec![0.0]);
+    let mut gradient_factor_value = TValue::F32(vec![0.0]);
 
     while batch_queued {
         if superbatch > steps.end_superbatch {
@@ -204,10 +206,12 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         let batch_curr_batch = curr_batch;
         let batch_ends_superbatch = batch_curr_batch + 1 == steps.batches_per_superbatch;
 
-        let lrdrop = TValue::F32(vec![lrate]);
-        let lrdrop = tlr.copy_from_host_async(&copy_stream, &lrdrop).map_err(TrainerError::Unexpected)?;
-        let gfdrop = TValue::F32(vec![1.0 / this_batch_size as f32]);
-        let gfdrop = tgf.copy_from_host_async(&copy_stream, &gfdrop).map_err(TrainerError::Unexpected)?;
+        lr_value.write(0, DValue::F32(lrate));
+        let lrdrop = tlr.copy_from_host_async(&copy_stream, &lr_value).map_err(TrainerError::Unexpected)?;
+        gradient_factor_value.write(0, DValue::F32(1.0 / this_batch_size as f32));
+        let gfdrop = tgf
+            .copy_from_host_async(&copy_stream, &gradient_factor_value)
+            .map_err(TrainerError::Unexpected)?;
 
         if curr_batch == 0 {
             if lrate < prev_lr {
