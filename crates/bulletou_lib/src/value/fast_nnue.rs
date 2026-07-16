@@ -90,6 +90,17 @@ pub struct NnueForwardOwnedWeights {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct NnueForwardTrace {
+    pub layout: NnueForwardWorkspaceLayout,
+    pub stm_l0: Vec<f32>,
+    pub nstm_l0: Vec<f32>,
+    pub combined: Vec<f32>,
+    pub hidden1: Vec<f32>,
+    pub hidden2: Vec<f32>,
+    pub outputs: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum FastNnueError {
     BatchLayout(String),
     MissingWeight { name: &'static str },
@@ -171,6 +182,10 @@ impl NnueForwardOwnedWeights {
     pub fn forward_batch(&self, batch: &FastBatchHost) -> Result<Vec<f32>, FastNnueError> {
         self.as_borrowed().forward_batch(batch)
     }
+
+    pub fn forward_batch_trace(&self, batch: &FastBatchHost) -> Result<NnueForwardTrace, FastNnueError> {
+        self.as_borrowed().forward_batch_trace(batch)
+    }
 }
 
 impl<'a> NnueForwardWeights<'a> {
@@ -188,27 +203,46 @@ impl<'a> NnueForwardWeights<'a> {
     }
 
     pub fn forward_batch(&self, batch: &FastBatchHost) -> Result<Vec<f32>, FastNnueError> {
+        Ok(self.forward_batch_trace(batch)?.outputs)
+    }
+
+    pub fn forward_batch_trace(&self, batch: &FastBatchHost) -> Result<NnueForwardTrace, FastNnueError> {
         self.validate()?;
         batch.validate().map_err(FastNnueError::BatchLayout)?;
 
         let shape = self.shape;
         let batch_size = batch.layout.batch_size;
-        let mut outputs = Vec::with_capacity(batch_size);
-
-        let mut stm_l0 = vec![0.0; shape.l1];
-        let mut nstm_l0 = vec![0.0; shape.l1];
-        let mut combined = vec![0.0; shape.l1 * 2];
-        let mut hidden1 = vec![0.0; shape.l2];
-        let mut hidden2 = vec![0.0; shape.l3];
+        let layout = NnueForwardWorkspaceLayout::new(shape, batch_size);
+        let mut trace = NnueForwardTrace {
+            layout,
+            stm_l0: vec![0.0; layout.l0_len()],
+            nstm_l0: vec![0.0; layout.l0_len()],
+            combined: vec![0.0; layout.combined_len()],
+            hidden1: vec![0.0; layout.hidden1_len()],
+            hidden2: vec![0.0; layout.hidden2_len()],
+            outputs: vec![0.0; layout.output_len()],
+        };
 
         for sample in 0..batch_size {
+            let l0_start = sample * shape.l1;
+            let l0_end = l0_start + shape.l1;
+            let combined_start = sample * shape.l1 * 2;
+            let combined_mid = combined_start + shape.l1;
+            let combined_end = combined_start + shape.l1 * 2;
+            let hidden1_start = sample * shape.l2;
+            let hidden1_end = hidden1_start + shape.l2;
+            let hidden2_start = sample * shape.l3;
+            let hidden2_end = hidden2_start + shape.l3;
+
+            let stm_l0 = &mut trace.stm_l0[l0_start..l0_end];
+            let nstm_l0 = &mut trace.nstm_l0[l0_start..l0_end];
             affine_sparse_padded(
                 self.l0w,
                 self.l0b,
                 shape.l1,
                 shape.input_size,
                 batch.stm_sample(sample).expect("validated batch sample"),
-                &mut stm_l0,
+                stm_l0,
             );
             affine_sparse_padded(
                 self.l0w,
@@ -216,24 +250,26 @@ impl<'a> NnueForwardWeights<'a> {
                 shape.l1,
                 shape.input_size,
                 batch.nstm_sample(sample).expect("validated batch sample"),
-                &mut nstm_l0,
+                nstm_l0,
             );
 
-            crelu_in_place(&mut stm_l0);
-            crelu_in_place(&mut nstm_l0);
-            combined[..shape.l1].copy_from_slice(&stm_l0);
-            combined[shape.l1..].copy_from_slice(&nstm_l0);
+            crelu_in_place(stm_l0);
+            crelu_in_place(nstm_l0);
+            trace.combined[combined_start..combined_mid].copy_from_slice(stm_l0);
+            trace.combined[combined_mid..combined_end].copy_from_slice(nstm_l0);
 
-            affine_dense(self.l1w, self.l1b, &combined, shape.l2, &mut hidden1);
-            crelu_in_place(&mut hidden1);
-            affine_dense(self.l2w, self.l2b, &hidden1, shape.l3, &mut hidden2);
-            crelu_in_place(&mut hidden2);
+            let combined = &trace.combined[combined_start..combined_end];
+            let hidden1 = &mut trace.hidden1[hidden1_start..hidden1_end];
+            affine_dense(self.l1w, self.l1b, combined, shape.l2, hidden1);
+            crelu_in_place(hidden1);
+            let hidden2 = &mut trace.hidden2[hidden2_start..hidden2_end];
+            affine_dense(self.l2w, self.l2b, hidden1, shape.l3, hidden2);
+            crelu_in_place(hidden2);
 
-            let output = dot(self.outw, &hidden2) + self.outb[0];
-            outputs.push(output);
+            trace.outputs[sample] = dot(self.outw, hidden2) + self.outb[0];
         }
 
-        Ok(outputs)
+        Ok(trace)
     }
 }
 
@@ -331,6 +367,36 @@ mod tests {
     }
 
     #[test]
+    fn scalar_trace_exposes_intermediate_activations() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let weights = tiny_weights(shape);
+        let batch = FastBatchHost {
+            layout: FastBatchLayout {
+                batch_size: 1,
+                max_active: 3,
+                output_size: 1,
+                hand_count_dim: 0,
+            },
+            stm: vec![0, 1, -1],
+            nstm: vec![2, -1, -1],
+            buckets: vec![0],
+            targets: vec![0.0],
+            weights: vec![1.0],
+            hand_count: None,
+        };
+
+        let trace = weights.forward_batch_trace(&batch).unwrap();
+
+        assert_eq!(trace.layout, NnueForwardWorkspaceLayout::new(shape, 1));
+        assert_close_slice("stm_l0", &trace.stm_l0, &[0.7, 0.4]);
+        assert_close_slice("nstm_l0", &trace.nstm_l0, &[0.0, 0.7]);
+        assert_close_slice("combined", &trace.combined, &[0.7, 0.4, 0.0, 0.7]);
+        assert_close_slice("hidden1", &trace.hidden1, &[0.86, 0.15]);
+        assert_close_slice("hidden2", &trace.hidden2, &[0.772]);
+        assert_close_slice("outputs", &trace.outputs, &[1.208]);
+    }
+
+    #[test]
     fn owned_weights_delegate_to_borrowed_forward() {
         let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
         let borrowed = tiny_weights(shape);
@@ -418,6 +484,16 @@ mod tests {
             l2b: &[0.2],
             outw: &[1.5],
             outb: &[0.05],
+        }
+    }
+
+    fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{name} length mismatch");
+        for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "{name}[{idx}] mismatch: expected {expected}, got {actual}"
+            );
         }
     }
 }

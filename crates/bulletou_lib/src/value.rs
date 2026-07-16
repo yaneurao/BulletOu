@@ -17,7 +17,7 @@ pub use fast_batch::{
 };
 pub use fast_nnue::{
     FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardWeights,
-    NnueForwardWorkspaceLayout,
+    NnueForwardTrace, NnueForwardWorkspaceLayout,
 };
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
