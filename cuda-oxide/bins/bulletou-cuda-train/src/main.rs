@@ -34,6 +34,7 @@ struct Args {
     device: usize,
     tolerance: f32,
     debug_readback: bool,
+    nnue_case: NnueForwardCaseKind,
 }
 
 #[cfg(feature = "cuda")]
@@ -41,6 +42,13 @@ struct Args {
 enum SmokeMode {
     Ptx,
     NnueForward,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NnueForwardCaseKind {
+    Tiny,
+    Halfkp,
 }
 
 #[cfg(feature = "cuda")]
@@ -54,6 +62,7 @@ impl Args {
             device: 0,
             tolerance: 1.0e-5,
             debug_readback: false,
+            nnue_case: NnueForwardCaseKind::Tiny,
         };
 
         while let Some(arg) = args.next() {
@@ -66,6 +75,9 @@ impl Args {
                 }
                 "--tolerance" => {
                     parsed.tolerance = parse_f32_arg(required_arg(&mut args, "--tolerance")?, "--tolerance")?;
+                }
+                "--nnue-forward-case" => {
+                    parsed.nnue_case = parse_nnue_forward_case(required_arg(&mut args, "--nnue-forward-case")?)?;
                 }
                 "--debug-readback" => parsed.debug_readback = true,
                 "--help" | "-h" => usage_success(),
@@ -103,10 +115,10 @@ fn run_ptx_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
 fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::nnue::{
         NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
-        NnueForwardShape, NnueForwardWorkspace, NnueForwardWorkspaceLayout,
+        NnueForwardWorkspace, NnueForwardWorkspaceLayout,
     };
 
-    let case = TinyNnueForwardCase::new();
+    let case = NnueForwardCase::new(args.nnue_case);
     let cpu_trace = case.cpu_forward_trace();
     let ptx = match args.ptx {
         Some(ptx) => ptx,
@@ -116,8 +128,7 @@ fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
     let stream = ctx.default_stream();
     let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
-    let shape =
-        NnueForwardShape { input_size: case.shape.input_size, l1: case.shape.l1, l2: case.shape.l2, l3: case.shape.l3 };
+    let shape = case.shape;
     let host_batch = NnueForwardHostBatch {
         stm_indices: &case.stm,
         nstm_indices: &case.nstm,
@@ -149,6 +160,7 @@ fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("bulletou-cuda-train NNUE forward smoke");
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
     println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  batch        : {} samples, max_active={}", case.batch_size, case.max_active);
     println!("  tolerance    : {}", args.tolerance);
@@ -276,33 +288,35 @@ fn parse_f32_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_run
 }
 
 #[cfg(feature = "cuda")]
+fn parse_nnue_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCaseKind> {
+    match value.as_str() {
+        "tiny" => Ok(NnueForwardCaseKind::Tiny),
+        "halfkp" | "halfkp-256x2-32-32" | "NNUE_HALFKP_256x2_32_32" => Ok(NnueForwardCaseKind::Halfkp),
+        _ => usage_error(format!("--nnue-forward-case must be one of: tiny, halfkp (got {value})")),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
-       bulletou-cuda-train --nnue-forward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
      --ptx is omitted, cuda-oxide/smoke/noop.ptx is used.\n\
      \n\
-     CO-006 NNUE forward smoke: build a tiny fixed NNUE batch, compare the GPU\n\
+     CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
-     output differs by more than --tolerance (default 1e-5)."
-}
-
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy)]
-struct TinyShape {
-    input_size: usize,
-    l1: usize,
-    l2: usize,
-    l3: usize,
+     output differs by more than --tolerance (default 1e-5). The default case\n\
+     is tiny; use --nnue-forward-case halfkp for NNUE_HALFKP_256x2_32_32."
 }
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
-struct TinyNnueForwardCase {
-    shape: TinyShape,
+struct NnueForwardCase {
+    label: &'static str,
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
     batch_size: usize,
     max_active: usize,
     stm: Vec<i32>,
@@ -319,7 +333,7 @@ struct TinyNnueForwardCase {
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
-struct TinyNnueForwardTrace {
+struct NnueForwardTrace {
     stm_l0: Vec<f32>,
     nstm_l0: Vec<f32>,
     combined: Vec<f32>,
@@ -329,10 +343,18 @@ struct TinyNnueForwardTrace {
 }
 
 #[cfg(feature = "cuda")]
-impl TinyNnueForwardCase {
-    fn new() -> Self {
+impl NnueForwardCase {
+    fn new(kind: NnueForwardCaseKind) -> Self {
+        match kind {
+            NnueForwardCaseKind::Tiny => Self::tiny(),
+            NnueForwardCaseKind::Halfkp => Self::halfkp_256x2_32_32(),
+        }
+    }
+
+    fn tiny() -> Self {
         Self {
-            shape: TinyShape { input_size: 4, l1: 2, l2: 2, l3: 1 },
+            label: "tiny",
+            shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 },
             batch_size: 2,
             max_active: 3,
             stm: vec![0, 1, -1, 3, -1, -1],
@@ -361,12 +383,37 @@ impl TinyNnueForwardCase {
         }
     }
 
-    fn cpu_forward_trace(&self) -> TinyNnueForwardTrace {
+    fn halfkp_256x2_32_32() -> Self {
+        let shape = bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32;
+        let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+        let batch_size = 2;
+        let max_active = 38;
+        let (stm, nstm) = deterministic_sparse_batch(batch_size, max_active, shape.input_size);
+
+        Self {
+            label: "halfkp-256x2-32-32",
+            shape,
+            batch_size,
+            max_active,
+            stm,
+            nstm,
+            l0w: deterministic_f32_vec(layout.l0w_len(), 0x4B1D_5EED, 0.006, 0.0),
+            l0b: deterministic_f32_vec(layout.l0b_len(), 0x10B1_A5ED, 0.025, 0.12),
+            l1w: deterministic_f32_vec(layout.l1w_len(), 0xC1A5_51C1, 0.0015, 0.0),
+            l1b: deterministic_f32_vec(layout.l1b_len(), 0xB1A5_0010, 0.006, 0.03),
+            l2w: deterministic_f32_vec(layout.l2w_len(), 0xD2A5_E002, 0.003, 0.0),
+            l2b: deterministic_f32_vec(layout.l2b_len(), 0xB2A5_0020, 0.004, 0.02),
+            outw: deterministic_f32_vec(layout.outw_len(), 0x0A17_0003, 0.02, 0.0),
+            outb: deterministic_f32_vec(layout.outb_len(), 0x0B17_0004, 0.002, 0.01),
+        }
+    }
+
+    fn cpu_forward_trace(&self) -> NnueForwardTrace {
         let l0_len = self.batch_size * self.shape.l1;
         let combined_len = self.batch_size * self.shape.l1 * 2;
         let hidden1_len = self.batch_size * self.shape.l2;
         let hidden2_len = self.batch_size * self.shape.l3;
-        let mut trace = TinyNnueForwardTrace {
+        let mut trace = NnueForwardTrace {
             stm_l0: vec![0.0; l0_len],
             nstm_l0: vec![0.0; l0_len],
             combined: vec![0.0; combined_len],
@@ -433,6 +480,54 @@ impl TinyNnueForwardCase {
 
         trace
     }
+}
+
+#[cfg(feature = "cuda")]
+fn deterministic_sparse_batch(batch_size: usize, max_active: usize, input_size: usize) -> (Vec<i32>, Vec<i32>) {
+    let mut stm = Vec::with_capacity(batch_size * max_active);
+    let mut nstm = Vec::with_capacity(batch_size * max_active);
+    for sample in 0..batch_size {
+        let active = max_active.saturating_sub(sample % 5);
+        let nstm_active = max_active.saturating_sub((sample + 2) % 7);
+        for slot in 0..max_active {
+            stm.push(if slot < active {
+                deterministic_feature_index(sample, slot, input_size, 0x1357_2468) as i32
+            } else {
+                -1
+            });
+            nstm.push(if slot < nstm_active {
+                deterministic_feature_index(sample, slot, input_size, 0x2468_1357) as i32
+            } else {
+                -1
+            });
+        }
+    }
+    (stm, nstm)
+}
+
+#[cfg(feature = "cuda")]
+fn deterministic_feature_index(sample: usize, slot: usize, input_size: usize, seed: u64) -> usize {
+    let mixed = mix_u64(seed ^ ((sample as u64) << 32) ^ slot as u64);
+    (mixed as usize) % input_size
+}
+
+#[cfg(feature = "cuda")]
+fn deterministic_f32_vec(len: usize, seed: u64, scale: f32, bias: f32) -> Vec<f32> {
+    (0..len)
+        .map(|idx| {
+            let mixed = mix_u64(seed ^ idx as u64);
+            let centered = (mixed % 2001) as i32 - 1000;
+            bias + centered as f32 * (scale / 1000.0)
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn mix_u64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 #[cfg(feature = "cuda")]

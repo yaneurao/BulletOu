@@ -45,7 +45,8 @@ status を更新する。
 - done: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加。WSL2 Ubuntu 24.04 + RTX 4090 で compile / launch を確認。
 - done: host launch sequence を追加。WSL2 Ubuntu 24.04 + RTX 4090 で tiny fixed case の CPU golden 比較を確認。
 - done: `bulletou-cuda-train --nnue-forward-smoke` CLI と tiny fixed weight / sparse batch の CPU golden 比較を追加。
-- in-progress: 実 `NNUE_HALFKP_256x2_32_32` の weight / sparse batch を tiny fixed case ではなく実データ経路から流し、同じ launch sequence で CPU golden と比較する。
+- done: `--nnue-forward-case halfkp` を追加し、`NNUE_HALFKP_256x2_32_32` の実 shape / max_active=38 / 決定論的 synthetic weight + sparse batch で同じ launch sequence を CPU golden と比較。
+- in-progress: root 側 `FastBatchHost` / `NnueForwardOwnedWeights` から nested cuda-oxide 実行へ流す橋渡しを作り、synthetic ではなく既存データ経路の 1 batch で CPU golden と比較する。
 - note: 現 Windows native 環境では RTX 4090 と CUDA Toolkit v13.1 は見える。`cargo-oxide` と Python wheel 由来の `libclang.dll` は導入済み。CUDA 13.1 headers と Python wheel の CUDA 12.9 headers の双方で `cargo check -p bulletou-cuda-train --features cuda` を試したが、pin済み cuda-oxide rev の `cuda-core` が Windows bindgen 生成の `u32` flag / enum と合わず E0308 で停止する。実機 launch 検証は WSL2 Ubuntu 24.04 で進める。
 
 ### 2026-07-16 WSL2 / RTX 4090 検証結果
@@ -59,6 +60,17 @@ status を更新する。
 - `cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --ptx ./bulletou_cuda_train.ptx --debug-readback` は成功。
   - output max_abs diff: `0.00000011920929`
   - `stm_l0` / `nstm_l0` / `combined` / `hidden1` / `hidden2`: max_abs diff `0`
+
+### 2026-07-17 WSL2 / RTX 4090 検証結果
+
+- `--nnue-forward-case halfkp` を追加し、`NNUE_HALFKP_256x2_32_32` の実 shape (`input=125388 l1=256 l2=32 l3=32`) と `max_active=38` で forward smoke を実行。
+- `cargo check`, `cargo test`, `cargo check -p bulletou-cuda-train --features cuda`, `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train` は成功。
+- `cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --nnue-forward-case tiny --ptx ./bulletou_cuda_train.ptx --debug-readback` は成功。
+- `cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --nnue-forward-case halfkp --ptx ./bulletou_cuda_train.ptx --debug-readback` は成功。
+  - output max_abs diff: `0.0000000009313226`
+  - `stm_l0` / `nstm_l0` / `combined`: max_abs diff `0`
+  - `hidden1` max_abs diff: `0.0000000037252903`
+  - `hidden2` max_abs diff: `0.0000000018626451`
 
 ### CO-006 CUDA 実機検証
 
@@ -78,6 +90,14 @@ CUDA_HOME=/usr/local/cuda cargo check -p bulletou-cuda-train --features cuda
 cd cuda-oxide
 CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   --nnue-forward-smoke --device 0
+```
+
+Full HalfKP shape:
+
+```bash
+cd cuda-oxide
+CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --nnue-forward-case halfkp --device 0 --debug-readback
 ```
 
 合格条件:

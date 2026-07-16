@@ -28,11 +28,20 @@ tested with:
 cargo run -p bulletou-cuda-train --features cuda -- --ptx /path/to/module.ptx --kernel noop
 ```
 
-CO-006 NNUE forward smoke compares a tiny fixed NNUE batch against a CPU scalar
-golden:
+CO-006 NNUE forward smoke compares a fixed NNUE batch against a CPU scalar
+golden. The default case is the small `tiny` shape:
 
 ```bash
 cargo run -p bulletou-cuda-train --features cuda -- --nnue-forward-smoke --ptx /path/to/bulletou-cuda-train.ptx
+```
+
+Use `--nnue-forward-case halfkp` to exercise the full
+`NNUE_HALFKP_256x2_32_32` layout with deterministic synthetic weights and
+sparse indices:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --nnue-forward-case halfkp --ptx /path/to/bulletou-cuda-train.ptx
 ```
 
 Add `--debug-readback` to compare L0 / concat / hidden buffers as well as the
@@ -53,7 +62,7 @@ cargo oxide setup
 cargo oxide build --arch sm_89 --features cuda \
   --cargo-target-dir "$CARGO_TARGET_DIR" -- --package bulletou-cuda-train
 cargo run -p bulletou-cuda-train --features cuda -- \
-  --nnue-forward-smoke --ptx ./bulletou_cuda_train.ptx --debug-readback
+  --nnue-forward-smoke --nnue-forward-case halfkp --ptx ./bulletou_cuda_train.ptx --debug-readback
 ```
 
 `cargo oxide build` writes `bulletou_cuda_train.{ll,opt.ll,ptx}` into this
