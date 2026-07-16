@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
     backward::{
-        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnStackedCReluBackwardLaunchPlan,
-        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
+        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnStackedAffineBackwardLaunchPlan,
+        SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout,
+        SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -142,6 +143,54 @@ pub(crate) fn launch_sfnn_l2_input_backward(
                 slice_mut(l1_gradients),
                 batch,
                 l1_hidden
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_stacked_affine_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnStackedAffineBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    buckets: &DeviceBuffer<i32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnStackedAffineBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+    let num_stacks = layout.num_stacks as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_stacked_affine_backward`; all
+        // buffers are device allocations owned by the same CUDA context and
+        // live until the caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_stacked_affine_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(inputs),
+                slice(output_gradients),
+                slice(weights),
+                slice(buckets),
+                slice_mut(input_gradients),
+                slice_mut(weight_gradients),
+                slice_mut(bias_gradients),
+                batch,
+                input_dim,
+                output_dim,
+                num_stacks
             ]
         }
     }?;

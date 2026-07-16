@@ -7,7 +7,8 @@ pub const NNUE_L0_SPARSE_BACKWARD_KERNEL: &str = "nnue_l0_sparse_backward";
 pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
 pub const SFNN_STACKED_CRELU_BACKWARD_KERNEL: &str = "sfnn_stacked_crelu_backward";
 pub const SFNN_L2_INPUT_BACKWARD_KERNEL: &str = "sfnn_l2_input_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 7] = [
+pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 8] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
@@ -15,6 +16,7 @@ pub const BACKWARD_KERNEL_NAMES: [&str; 7] = [
     SFNN_STACKED_L3_BACKWARD_KERNEL,
     SFNN_STACKED_CRELU_BACKWARD_KERNEL,
     SFNN_L2_INPUT_BACKWARD_KERNEL,
+    SFNN_STACKED_AFFINE_BACKWARD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +327,58 @@ impl SfnnL2InputBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnStackedAffineBackwardLayout {
+    pub batch_size: usize,
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub num_stacks: usize,
+}
+
+impl SfnnStackedAffineBackwardLayout {
+    pub fn new(batch_size: usize, input_dim: usize, output_dim: usize, num_stacks: usize) -> Self {
+        Self { batch_size, input_dim, output_dim, num_stacks }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.input_dim == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.output_dim == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else if self.num_stacks == 0 {
+            Err(BackwardLayoutError::EmptyStack)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn input_values_len(self) -> usize {
+        self.batch_size * self.input_dim
+    }
+
+    pub fn output_gradients_len(self) -> usize {
+        self.batch_size * self.output_dim
+    }
+
+    pub fn input_gradients_len(self) -> usize {
+        self.batch_size * self.input_dim
+    }
+
+    pub fn weight_len(self) -> usize {
+        self.input_dim * self.num_stacks * self.output_dim
+    }
+
+    pub fn bias_len(self) -> usize {
+        self.num_stacks * self.output_dim
+    }
+
+    pub fn gradient_threads(self) -> usize {
+        self.input_gradients_len().max(self.weight_len()).max(self.bias_len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -403,6 +457,17 @@ impl SfnnL2InputBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnStackedAffineBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnStackedAffineBackwardLaunchPlan {
+    pub fn new(layout: SfnnStackedAffineBackwardLayout) -> Self {
+        Self { threads: layout.gradient_threads().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -432,7 +497,8 @@ mod tests {
                 "nnue_l0_sparse_backward",
                 "sfnn_stacked_l3_backward",
                 "sfnn_stacked_crelu_backward",
-                "sfnn_l2_input_backward"
+                "sfnn_l2_input_backward",
+                "sfnn_stacked_affine_backward"
             ]
         );
     }
@@ -602,5 +668,38 @@ mod tests {
     fn sfnn_l2_input_layout_rejects_empty_values() {
         assert_eq!(SfnnL2InputBackwardLayout::new(0, 4).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
         assert_eq!(SfnnL2InputBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
+    }
+
+    #[test]
+    fn sfnn_stacked_affine_layout_counts_buffers() {
+        let layout = SfnnStackedAffineBackwardLayout::new(3, 4, 5, 2);
+
+        assert_eq!(layout.input_values_len(), 12);
+        assert_eq!(layout.output_gradients_len(), 15);
+        assert_eq!(layout.input_gradients_len(), 12);
+        assert_eq!(layout.weight_len(), 40);
+        assert_eq!(layout.bias_len(), 10);
+        assert_eq!(layout.gradient_threads(), 40);
+        assert_eq!(SfnnStackedAffineBackwardLaunchPlan::new(layout).threads, 40);
+    }
+
+    #[test]
+    fn sfnn_stacked_affine_layout_rejects_empty_values() {
+        assert_eq!(
+            SfnnStackedAffineBackwardLayout::new(0, 4, 5, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            SfnnStackedAffineBackwardLayout::new(3, 0, 5, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            SfnnStackedAffineBackwardLayout::new(3, 4, 0, 2).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
+        assert_eq!(
+            SfnnStackedAffineBackwardLayout::new(3, 4, 5, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyStack
+        );
     }
 }

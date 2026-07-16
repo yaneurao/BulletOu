@@ -787,7 +787,10 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 #[cfg(feature = "cuda")]
 fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        backward::{SfnnL2InputBackwardLayout, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout},
+        backward::{
+            SfnnL2InputBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
+            SfnnStackedL3BackwardLayout,
+        },
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
             SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
@@ -884,6 +887,24 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &l2_input_gradients,
         &mut l1_gradients,
     )?;
+
+    let l1_layout =
+        SfnnStackedAffineBackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out(), shape.num_stacks);
+    let mut combined_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.input_gradients_len())?;
+    let mut l1w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.weight_len())?;
+    let mut l1b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.bias_len())?;
+    sfnn_backward::launch_sfnn_stacked_affine_backward(
+        &stream,
+        &module,
+        l1_layout,
+        &forward_workspace.combined,
+        &l1_gradients,
+        &device_weights.l1w,
+        &device_batch.buckets,
+        &mut combined_gradients,
+        &mut l1w_gradients,
+        &mut l1b_gradients,
+    )?;
     stream.synchronize()?;
 
     let gpu_l2_gradients = l2_gradients.to_host_vec(&stream)?;
@@ -893,6 +914,9 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
     let gpu_l2_input_gradients = l2_input_gradients.to_host_vec(&stream)?;
     let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
     let gpu_l2b_gradients = l2b_gradients.to_host_vec(&stream)?;
+    let gpu_combined_gradients = combined_gradients.to_host_vec(&stream)?;
+    let gpu_l1w_gradients = l1w_gradients.to_host_vec(&stream)?;
+    let gpu_l1b_gradients = l1b_gradients.to_host_vec(&stream)?;
     let comparisons = [
         compare_slices("l2_grad", &cpu_trace.l2_gradients, &gpu_l2_gradients, args.tolerance)?,
         compare_slices("l1_grad", &cpu_trace.l1_gradients, &gpu_l1_gradients, args.tolerance)?,
@@ -901,6 +925,9 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         compare_slices("l2_in_grad", &cpu_trace.l2_input_gradients, &gpu_l2_input_gradients, args.tolerance)?,
         compare_slices("l2w_grad", &cpu_trace.l2w_gradients, &gpu_l2w_gradients, args.tolerance)?,
         compare_slices("l2b_grad", &cpu_trace.l2b_gradients, &gpu_l2b_gradients, args.tolerance)?,
+        compare_slices("comb_grad", &cpu_trace.combined_gradients, &gpu_combined_gradients, args.tolerance)?,
+        compare_slices("l1w_grad", &cpu_trace.l1w_gradients, &gpu_l1w_gradients, args.tolerance)?,
+        compare_slices("l1b_grad", &cpu_trace.l1b_gradients, &gpu_l1b_gradients, args.tolerance)?,
     ];
 
     println!("bulletou-cuda-train SFNN dense backward smoke");
@@ -1088,7 +1115,8 @@ fn usage() -> &'static str {
      hidden2, hidden1, L0 CReLU split, and sparse L0 weight/bias backward\n\
      kernels against a CPU golden.\n\
      CO-009 SFNN dense backward smoke: run SFNN forward, then chain stacked\n\
-     L3 output backward, L2 CReLU backward, and L2-input transform backward\n\
+     L3 output backward, L2 CReLU backward, L2-input transform backward,\n\
+     and stacked L1 backward\n\
      kernels against a CPU scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
@@ -1262,6 +1290,9 @@ struct SfnnOutputBackwardTrace {
     l2_input_gradients: Vec<f32>,
     l2w_gradients: Vec<f32>,
     l2b_gradients: Vec<f32>,
+    combined_gradients: Vec<f32>,
+    l1w_gradients: Vec<f32>,
+    l1b_gradients: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1901,6 +1932,16 @@ impl SfnnForwardCase {
             self.batch_size,
             self.shape.l1_hidden,
         );
+        let (combined_gradients, l1w_gradients, l1b_gradients) = sfnn_stacked_affine_backward_trace(
+            &forward.combined,
+            &l1_gradients,
+            &self.l1w,
+            &self.buckets,
+            self.batch_size,
+            self.shape.ft_size,
+            self.shape.l1_out(),
+            self.shape.num_stacks,
+        );
 
         SfnnOutputBackwardTrace {
             output_gradients,
@@ -1911,6 +1952,9 @@ impl SfnnForwardCase {
             l2_input_gradients,
             l2w_gradients,
             l2b_gradients,
+            combined_gradients,
+            l1w_gradients,
+            l1b_gradients,
         }
     }
 
@@ -2315,6 +2359,47 @@ fn sfnn_l2_input_backward_trace(
     }
 
     l1_gradients
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_stacked_affine_backward_trace(
+    inputs: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    buckets: &[i32],
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+    num_stacks: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut input_gradients = vec![0.0_f32; batch_size * input_dim];
+    let stack_stride = num_stacks * output_dim;
+    let mut weight_gradients = vec![0.0_f32; input_dim * stack_stride];
+    let mut bias_gradients = vec![0.0_f32; stack_stride];
+
+    for sample in 0..batch_size {
+        let stack_i32 = buckets[sample];
+        if stack_i32 < 0 || stack_i32 as usize >= num_stacks {
+            continue;
+        }
+        let stack = stack_i32 as usize;
+        let sample_input_start = sample * input_dim;
+        let sample_output_start = sample * output_dim;
+
+        for out_col in 0..output_dim {
+            let grad = output_gradients[sample_output_start + out_col];
+            let stacked_out_col = stack * output_dim + out_col;
+            bias_gradients[stacked_out_col] += grad;
+            for in_col in 0..input_dim {
+                let input_value = inputs[sample_input_start + in_col];
+                let weight_idx = in_col * stack_stride + stacked_out_col;
+                input_gradients[sample_input_start + in_col] += grad * weights[weight_idx];
+                weight_gradients[weight_idx] += grad * input_value;
+            }
+        }
+    }
+
+    (input_gradients, weight_gradients, bias_gradients)
 }
 
 #[cfg(feature = "cuda")]
