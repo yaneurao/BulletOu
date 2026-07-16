@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ffi::c_void, fmt, rc::Rc, sync::Arc};
 use bullet_compiler::tensor::{OpType, TType};
 
 use crate::{
-    buffer::{Buffer, BufferGuard, SyncOnDrop, SyncOnValue},
+    buffer::{Buffer, SyncOnDrop, SyncOnValue},
     runtime::{Device, Dim3, Gpu, Kernel, Module, Stream},
 };
 
@@ -146,20 +146,34 @@ impl<G: Gpu> CompiledKernel<G> {
         inputs: Vec<Arc<Buffer<G>>>,
         outputs: Vec<Arc<Buffer<G>>>,
     ) -> Result<SyncOnValue<G, &Self>, G::Error> {
+        self.execute_slices(stream, &inputs, &outputs)
+    }
+
+    pub fn execute_slices(
+        &self,
+        stream: Arc<Stream<G>>,
+        inputs: &[Arc<Buffer<G>>],
+        outputs: &[Arc<Buffer<G>>],
+    ) -> Result<SyncOnValue<G, &Self>, G::Error> {
         let mut sync = SyncOnDrop::new(stream.clone());
-
-        let inputs =
-            inputs.iter().map(|i| i.clone().acquire(stream.clone())).collect::<Result<Vec<BufferGuard<G>>, _>>()?;
-        let outputs =
-            outputs.iter().map(|o| o.clone().acquire(stream.clone())).collect::<Result<Vec<BufferGuard<G>>, _>>()?;
-
-        let mut var_size = None;
 
         if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
             return Err("Mismatched number of inputs/outputs!".to_string().into());
         }
 
-        for (buf, &ttype) in inputs.iter().zip(&self.inputs).chain(outputs.iter().zip(&self.outputs)) {
+        let mut input_guards = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            input_guards.push(input.clone().acquire(stream.clone())?);
+        }
+
+        let mut output_guards = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            output_guards.push(output.clone().acquire(stream.clone())?);
+        }
+
+        let mut var_size = None;
+
+        for (buf, &ttype) in input_guards.iter().zip(&self.inputs).chain(output_guards.iter().zip(&self.outputs)) {
             if buf.dtype() != ttype.dtype() {
                 return Err("Mismatched dtypes!".to_string().into());
             }
@@ -180,7 +194,8 @@ impl<G: Gpu> CompiledKernel<G> {
 
         let var = var_size.unwrap_or(1);
 
-        let mut args: Vec<*mut c_void> = Vec::with_capacity(self.arg_order.len() + usize::from(self.requires_var_size_arg));
+        let mut args: Vec<*mut c_void> =
+            Vec::with_capacity(self.arg_order.len() + usize::from(self.requires_var_size_arg));
 
         let size = var as i32;
         if self.requires_var_size_arg {
@@ -189,7 +204,7 @@ impl<G: Gpu> CompiledKernel<G> {
 
         let mut ptrs = vec![Default::default(); self.arg_order.len()];
         for (i, &(index, is_input)) in self.arg_order.iter().enumerate() {
-            ptrs[i] = if is_input { inputs[index].ptr() } else { outputs[index].ptr() };
+            ptrs[i] = if is_input { input_guards[index].ptr() } else { output_guards[index].ptr() };
             args.push((&ptrs[i] as *const G::DevicePtr).cast_mut().cast());
         }
 
@@ -207,11 +222,11 @@ impl<G: Gpu> CompiledKernel<G> {
             )?;
         }
 
-        for i in inputs {
+        for i in input_guards {
             sync.attach(i)?;
         }
 
-        for o in outputs {
+        for o in output_guards {
             sync.attach(o)?;
         }
 

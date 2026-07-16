@@ -93,7 +93,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         blocks.extend_by(self.inner.update(stream, weights.clone(), grads, gradient_factor, learning_rate)?);
 
         if self.step.is_multiple_of(self.k) {
-            blocks.push_kernel(self.op.execute(stream.clone(), Vec::new(), vec![weights, self.slow_params.clone()])?);
+            blocks.push_kernel(self.op.execute_slices(stream.clone(), &[], &[weights, self.slow_params.clone()])?);
         }
 
         Ok(blocks)

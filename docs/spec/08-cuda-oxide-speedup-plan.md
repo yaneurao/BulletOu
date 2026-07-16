@@ -343,6 +343,11 @@ optimizer の weight ごとの update kernel は `CompiledKernel::execute` を�
 `Option<usize>` で十分なので、set allocation を避ける。また launch 引数 `Vec` は必要容量を
 事前に確保する。
 
+さらに `CompiledKernel::execute_slices` を追加し、Adam/RAdam/Ranger の update 呼び出しでは
+`vec![...]` ではなく stack 上の配列参照を渡す。各 weight ごとの optimizer kernel launch で
+入力/出力 buffer リスト用の heap allocation を避けるための変更であり、GPU kernel の内容や
+同期順序は変えない。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。

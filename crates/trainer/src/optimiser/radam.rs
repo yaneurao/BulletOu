@@ -223,10 +223,10 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
         sync.push_copy(self.step_size.copy_from_host_async(stream, &self.cpu_step_size)?);
         sync.push_copy(self.denom.copy_from_host_async(stream, &self.cpu_denom)?);
 
-        sync.push_kernel(self.op.execute(
+        sync.push_kernel(self.op.execute_slices(
             stream.clone(),
-            vec![gradient_factor, learning_rate, self.step_size.clone(), self.denom.clone(), grads],
-            vec![weights, self.momentum.clone(), self.velocity.clone()],
+            &[gradient_factor, learning_rate, self.step_size.clone(), self.denom.clone(), grads],
+            &[weights, self.momentum.clone(), self.velocity.clone()],
         )?);
 
         Ok(sync)

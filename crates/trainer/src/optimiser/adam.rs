@@ -175,10 +175,10 @@ impl<G: Gpu> OptimiserState<G> for AdamW<G> {
     ) -> OptimiserUpdateResult<'a, G> {
         let mut sync = OptimiserUpdateSync::default();
 
-        sync.push_kernel(self.op.execute(
+        sync.push_kernel(self.op.execute_slices(
             stream.clone(),
-            vec![gradient_factor, learning_rate, grads],
-            vec![weights, self.momentum.clone(), self.velocity.clone()],
+            &[gradient_factor, learning_rate, grads],
+            &[weights, self.momentum.clone(), self.velocity.clone()],
         )?);
 
         Ok(sync)
