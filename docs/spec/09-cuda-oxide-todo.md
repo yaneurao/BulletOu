@@ -76,6 +76,10 @@ status を更新する。
 - tiny fixture write/read roundtrip は成功。fixture size: `204` bytes。
 - halfkp fixture write/read roundtrip は成功。fixture size: 約 `123M`。
 - root 側 exporter unit test は成功。tiny fixture の magic / header / byte length (`204`) を確認。
+- root example `export_nnue_forward_fixture` を追加。root 側の `FastBatchHost` + `NnueForwardOwnedWeights` から `tiny` / `halfkp` fixture を出力でき、HalfKP weights は `optimiser_state/weights.bin` と bundled `state.bin` (`nnue/weights/*`) の両方から読める。
+- `cargo check -p bulletou_lib --example export_nnue_forward_fixture` は成功。
+- root で出力した tiny fixture (`target/bulletou-root-tiny.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.00000011920929`、debug readback buffers は許容誤差内。
+- root で出力した HalfKP fixture (`target/bulletou-root-halfkp.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000009313226`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.0000000037252903`、`hidden2` max_abs diff: `0.0000000018626451`。
 
 ### CO-006 CUDA 実機検証
 

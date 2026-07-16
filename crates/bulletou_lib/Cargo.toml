@@ -88,6 +88,10 @@ name = "bulletou"
 path = "../../examples/bulletou.rs"
 
 [[example]]
+name = "export_nnue_forward_fixture"
+path = "../../examples/export_nnue_forward_fixture.rs"
+
+[[example]]
 name = "shogi_layerstack"
 path = "../../examples/shogi_layerstack.rs"
 
