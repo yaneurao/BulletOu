@@ -25,6 +25,8 @@ pub fn backend_status() -> BackendStatus {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error(transparent)]
+    NnueLayout(#[from] nnue::NnueLayoutError),
     #[cfg(feature = "cuda")]
     #[error(transparent)]
     Cuda(#[from] DriverError),
