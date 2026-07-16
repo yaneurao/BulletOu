@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use bullet_compiler::tensor::TValue;
 use bullet_gpu::{
-    buffer::{Buffer, SyncOnValue},
+    buffer::{Buffer, SyncOnDrop, SyncOnValue},
     kernel::CompiledKernel,
     runtime::{Device, Gpu, Stream},
 };
@@ -42,12 +42,28 @@ impl<'a, G: Gpu> OptimiserUpdateSync<'a, G> {
     }
 
     pub fn sync(self) -> Result<(), G::Error> {
+        let mut merged: Option<SyncOnDrop<G>> = None;
+
+        let merge = |merged: &mut Option<SyncOnDrop<G>>, block: SyncOnDrop<G>| -> Result<(), G::Error> {
+            if let Some(merged) = merged {
+                merged.merge(block)?;
+            } else {
+                *merged = Some(block);
+            }
+
+            Ok(())
+        };
+
         for kernel in self.kernels {
-            kernel.value()?;
+            merge(&mut merged, unsafe { kernel.detach_value() })?;
         }
 
         for copy in self.copies {
-            copy.value()?;
+            merge(&mut merged, unsafe { copy.detach_value() })?;
+        }
+
+        if let Some(merged) = merged {
+            merged.sync()?;
         }
 
         Ok(())

@@ -272,6 +272,11 @@ learning-rate scalar と gradient-factor scalar の upload も同じ copy stream
 2 回待つだけなので、`SyncOnDrop::merge()` で guard をまとめ、update 前に 1 回だけ
 copy stream を同期する。
 
+optimizer update でも同じ問題がある。weight ごとの update kernel は同じ compute stream に
+enqueue されるため、`OptimiserUpdateSync::sync()` が kernel guard ごとに `value()` を呼ぶと、
+同じ stream を weight 数ぶん待つことになる。kernel / copy guard を `SyncOnDrop::merge()` で
+1 つに集約し、optimizer update 全体につき 1 回だけ compute stream を同期する。
+
 ### Phase 0.8: one-batch delayed loss readback
 
 loss readback は `outputs/loss` buffer を GPU から CPU に戻すための同期点になる。
