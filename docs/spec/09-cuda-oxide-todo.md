@@ -44,3 +44,31 @@ status を更新する。
 - in-progress: `nnue_sparse_l0_crelu` kernel 定義を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と CPU golden の L0 出力比較が必要。
 - in-progress: `nnue_concat_l0` / `nnue_dense_l1_crelu` / `nnue_dense_l2_crelu` / `nnue_dense_output` の kernel 定義を追加済み。CUDA Toolkit 環境で compile / launch 検証が必要。
 - in-progress: host launch sequence を追加済み。CUDA Toolkit 環境で feature `cuda` の compile と 1 batch 最終 output の CPU golden 比較が必要。
+
+### CO-006 CUDA 実機検証
+
+このリポジトリの通常 CI / 通常開発環境では CUDA Toolkit がないことがあるため、
+feature `cuda` の検証は CUDA Toolkit が入った環境で行う。
+
+最初の確認:
+
+```bash
+cd cuda-oxide
+CUDA_HOME=/usr/local/cuda cargo check -p bulletou-cuda-train --features cuda
+```
+
+次に追加する検証コマンド:
+
+```bash
+cd cuda-oxide
+CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-forward-smoke --device 0
+```
+
+合格条件:
+
+- tiny shape の固定 weight / 固定 sparse batch を作る。
+- CPU scalar golden と `launch_nnue_forward` の GPU output を比較する。
+- 絶対誤差 `1e-5` 以下で一致する。
+- L0 / concat / L1 / L2 / output のどこで不一致になったかを切り分けられるよう、
+  必要なら中間 buffer を host に戻す debug flag を用意する。
