@@ -327,7 +327,35 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `--sfnn-output-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
     succeeded for `SFNN_halfka2_1024_7_64_k3k3`: all compared buffers
     max_abs diff `0`.
-- Remaining CO-009 work: SFNN pairwise/L0 backward and integration into
+- Remaining CO-009 work: SFNN sparse L0 CReLU backward and integration into
+  trainer gradient buffers.
+
+### 2026-07-17 CO-009 SFNN pairwise backward smoke
+
+- Added cuda-oxide runtime layout for SFNN pairwise-concat backward:
+  `SfnnPairwiseBackwardLayout { batch_size, ft_size }`.
+- Added CUDA kernel `sfnn_pairwise_backward`:
+  - maps `combined_grad[0..ft_size/2]` through the stm pairwise products to
+    `stm_l0_grad`;
+  - maps `combined_grad[ft_size/2..]` through the nstm pairwise products to
+    `nstm_l0_grad`;
+  - uses the same `(127 / 128)` scale as forward.
+- Extended `--sfnn-dense-backward-smoke` to chain:
+  `stacked L3 output backward -> stacked L2 CReLU backward -> L2-input
+  transform backward -> stacked L1 backward -> pairwise backward`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--sfnn-dense-backward-smoke --debug-readback` tiny case succeeded:
+    all compared buffers max_abs diff `0`.
+  - `--sfnn-dense-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
+    succeeded for `SFNN_halfka2_1024_7_64_k3k3`: `stm_l0_grad` max_abs diff
+    `0.000000000014551915`, `nstm_l0_grad` max_abs diff
+    `0.000000000007275958`, and all previous compared buffers remained within
+    tolerance.
+- Remaining CO-009 work: SFNN sparse L0 CReLU backward and integration into
   trainer gradient buffers.
 
 ### 2026-07-17 CO-009 SFNN stacked L1 backward smoke

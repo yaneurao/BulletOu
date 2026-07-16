@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
     backward::{
-        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnStackedAffineBackwardLaunchPlan,
-        SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout,
-        SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
+        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan,
+        SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLaunchPlan, SfnnStackedAffineBackwardLayout,
+        SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan,
+        SfnnStackedL3BackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -191,6 +192,45 @@ pub(crate) fn launch_sfnn_stacked_affine_backward(
                 input_dim,
                 output_dim,
                 num_stacks
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_pairwise_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnPairwiseBackwardLayout,
+    stm_l0: &DeviceBuffer<f32>,
+    nstm_l0: &DeviceBuffer<f32>,
+    combined_gradients: &DeviceBuffer<f32>,
+    mut stm_gradients: &mut DeviceBuffer<f32>,
+    mut nstm_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnPairwiseBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let ft_size = layout.ft_size as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_pairwise_backward`; each thread
+        // writes one stm/nstm L0-gradient element at the same disjoint index.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_pairwise_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(stm_l0),
+                slice(nstm_l0),
+                slice(combined_gradients),
+                slice_mut(stm_gradients),
+                slice_mut(nstm_gradients),
+                batch,
+                ft_size
             ]
         }
     }?;

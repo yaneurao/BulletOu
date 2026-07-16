@@ -8,7 +8,8 @@ pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
 pub const SFNN_STACKED_CRELU_BACKWARD_KERNEL: &str = "sfnn_stacked_crelu_backward";
 pub const SFNN_L2_INPUT_BACKWARD_KERNEL: &str = "sfnn_l2_input_backward";
 pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 8] = [
+pub const SFNN_PAIRWISE_BACKWARD_KERNEL: &str = "sfnn_pairwise_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 9] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
@@ -17,6 +18,7 @@ pub const BACKWARD_KERNEL_NAMES: [&str; 8] = [
     SFNN_STACKED_CRELU_BACKWARD_KERNEL,
     SFNN_L2_INPUT_BACKWARD_KERNEL,
     SFNN_STACKED_AFFINE_BACKWARD_KERNEL,
+    SFNN_PAIRWISE_BACKWARD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +381,36 @@ impl SfnnStackedAffineBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnPairwiseBackwardLayout {
+    pub batch_size: usize,
+    pub ft_size: usize,
+}
+
+impl SfnnPairwiseBackwardLayout {
+    pub fn new(batch_size: usize, ft_size: usize) -> Self {
+        Self { batch_size, ft_size }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.ft_size == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn l0_len(self) -> usize {
+        self.batch_size * self.ft_size
+    }
+
+    pub fn combined_gradients_len(self) -> usize {
+        self.batch_size * self.ft_size
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -468,6 +500,17 @@ impl SfnnStackedAffineBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnPairwiseBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnPairwiseBackwardLaunchPlan {
+    pub fn new(layout: SfnnPairwiseBackwardLayout) -> Self {
+        Self { threads: layout.l0_len().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -498,7 +541,8 @@ mod tests {
                 "sfnn_stacked_l3_backward",
                 "sfnn_stacked_crelu_backward",
                 "sfnn_l2_input_backward",
-                "sfnn_stacked_affine_backward"
+                "sfnn_stacked_affine_backward",
+                "sfnn_pairwise_backward"
             ]
         );
     }
@@ -701,5 +745,20 @@ mod tests {
             SfnnStackedAffineBackwardLayout::new(3, 4, 5, 0).validate().unwrap_err(),
             BackwardLayoutError::EmptyStack
         );
+    }
+
+    #[test]
+    fn sfnn_pairwise_layout_counts_buffers() {
+        let layout = SfnnPairwiseBackwardLayout::new(3, 8);
+
+        assert_eq!(layout.l0_len(), 24);
+        assert_eq!(layout.combined_gradients_len(), 24);
+        assert_eq!(SfnnPairwiseBackwardLaunchPlan::new(layout).threads, 24);
+    }
+
+    #[test]
+    fn sfnn_pairwise_layout_rejects_empty_values() {
+        assert_eq!(SfnnPairwiseBackwardLayout::new(0, 8).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
+        assert_eq!(SfnnPairwiseBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyInput);
     }
 }

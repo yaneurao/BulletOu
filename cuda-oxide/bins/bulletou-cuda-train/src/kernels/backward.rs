@@ -463,6 +463,43 @@ pub fn sfnn_stacked_affine_backward(
     }
 }
 
+#[kernel]
+pub fn sfnn_pairwise_backward(
+    stm_l0: &[f32],
+    nstm_l0: &[f32],
+    combined_gradients: &[f32],
+    mut stm_gradients: DisjointSlice<f32>,
+    mut nstm_gradients: DisjointSlice<f32>,
+    batch: u32,
+    ft_size: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let total = (batch as usize) * (ft_size as usize);
+    if tid_value >= total {
+        return;
+    }
+
+    let ft = ft_size as usize;
+    let pairwise = ft / 2;
+    let sample = tid_value / ft;
+    let col = tid_value - sample * ft;
+    let pair = col / 2;
+    let mate_col = pair * 2 + (1 - (col - pair * 2));
+    let l0_base = sample * ft;
+    let combined_base = sample * ft;
+    let scale = 127.0_f32 / 128.0_f32;
+    let stm_grad = combined_gradients[combined_base + pair] * stm_l0[l0_base + mate_col] * scale;
+    let nstm_grad = combined_gradients[combined_base + pairwise + pair] * nstm_l0[l0_base + mate_col] * scale;
+
+    if let Some(out) = stm_gradients.get_mut(tid) {
+        *out = stm_grad;
+    }
+    if let Some(out) = nstm_gradients.get_mut(thread::index_1d()) {
+        *out = nstm_grad;
+    }
+}
+
 #[cuda_device::device]
 fn dense_crelu_pre_gradient(
     activations: &[f32],
