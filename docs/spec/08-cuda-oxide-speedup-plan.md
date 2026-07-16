@@ -295,6 +295,8 @@ state / weight / gradient をまとめて zip し、gradient 取得の `BTreeMap
 さらに hot path では optimizer state が小さな `OptimiserUpdateSync` を作って返す代わりに、
 呼び出し側の集約syncへ直接pushする `update_into` を使う。これにより weight ごとの短命な
 kernel/copy list allocation を避ける。
+`OptimiserUpdateSync` は kernel 用と copy 用の `SyncOnValue` を別々に保持せず、
+受け取った時点で値を捨てて `SyncOnDrop` だけを 1 本の配列に集約する。
 
 ### Phase 0.8: one-batch delayed loss readback
 

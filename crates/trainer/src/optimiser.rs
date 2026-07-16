@@ -17,56 +17,38 @@ use bullet_gpu::{
 use crate::model::{Model, TensorMap};
 
 pub struct OptimiserUpdateSync<'a, G: Gpu> {
-    kernels: Vec<SyncOnValue<G, &'a CompiledKernel<G>>>,
-    copies: Vec<SyncOnValue<G, &'a TValue>>,
+    blocks: Vec<SyncOnDrop<G>>,
+    _phantom: PhantomData<&'a ()>,
 }
 
 impl<'a, G: Gpu> Default for OptimiserUpdateSync<'a, G> {
     fn default() -> Self {
-        Self { kernels: Vec::new(), copies: Vec::new() }
+        Self { blocks: Vec::new(), _phantom: PhantomData }
     }
 }
 
 impl<'a, G: Gpu> OptimiserUpdateSync<'a, G> {
     pub fn with_capacity(kernels: usize, copies: usize) -> Self {
-        Self { kernels: Vec::with_capacity(kernels), copies: Vec::with_capacity(copies) }
+        Self { blocks: Vec::with_capacity(kernels + copies), _phantom: PhantomData }
     }
 
     pub fn push_kernel(&mut self, val: SyncOnValue<G, &'a CompiledKernel<G>>) {
-        self.kernels.push(val);
+        self.blocks.push(unsafe { val.detach_value() });
     }
 
     pub fn push_copy(&mut self, val: SyncOnValue<G, &'a TValue>) {
-        self.copies.push(val);
+        self.blocks.push(unsafe { val.detach_value() });
     }
 
     pub fn extend_by(&mut self, mut other: Self) {
-        self.kernels.append(&mut other.kernels);
-        self.copies.append(&mut other.copies);
+        self.blocks.append(&mut other.blocks);
     }
 
-    pub fn sync(self) -> Result<(), G::Error> {
-        let mut merged: Option<SyncOnDrop<G>> = None;
-
-        let merge = |merged: &mut Option<SyncOnDrop<G>>, block: SyncOnDrop<G>| -> Result<(), G::Error> {
-            if let Some(merged) = merged {
+    pub fn sync(mut self) -> Result<(), G::Error> {
+        if let Some(mut merged) = self.blocks.pop() {
+            for block in self.blocks {
                 merged.merge(block)?;
-            } else {
-                *merged = Some(block);
             }
-
-            Ok(())
-        };
-
-        for kernel in self.kernels {
-            merge(&mut merged, unsafe { kernel.detach_value() })?;
-        }
-
-        for copy in self.copies {
-            merge(&mut merged, unsafe { copy.detach_value() })?;
-        }
-
-        if let Some(merged) = merged {
             merged.sync()?;
         }
 
