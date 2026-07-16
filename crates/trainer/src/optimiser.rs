@@ -28,6 +28,10 @@ impl<'a, G: Gpu> Default for OptimiserUpdateSync<'a, G> {
 }
 
 impl<'a, G: Gpu> OptimiserUpdateSync<'a, G> {
+    pub fn with_capacity(kernels: usize, copies: usize) -> Self {
+        Self { kernels: Vec::with_capacity(kernels), copies: Vec::with_capacity(copies) }
+    }
+
     pub fn push_kernel(&mut self, val: SyncOnValue<G, &'a CompiledKernel<G>>) {
         self.kernels.push(val);
     }
@@ -136,7 +140,10 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
         learning_rate: Arc<Buffer<G>>,
         gradients: &TensorMap<G>,
     ) -> OptimiserUpdateResult<'a, G> {
-        let mut sync = OptimiserUpdateSync::default();
+        let mut sync = OptimiserUpdateSync::with_capacity(
+            self.state.len() + self.pre_update.len() + self.post_update.len(),
+            self.state.len() * 2,
+        );
 
         for additional in &mut self.pre_update {
             sync.extend_by(additional.apply_update(&self.model)?);

@@ -87,7 +87,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         gradient_factor: Arc<Buffer<G>>,
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
-        let mut blocks = OptimiserUpdateSync::default();
+        let mut blocks = OptimiserUpdateSync::with_capacity(2, 2);
 
         self.step += 1;
         blocks.extend_by(self.inner.update(stream, weights.clone(), grads, gradient_factor, learning_rate)?);

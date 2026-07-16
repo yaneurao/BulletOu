@@ -218,7 +218,7 @@ impl<G: Gpu> OptimiserState<G> for RAdam<G> {
         self.cpu_step_size.write(0, DValue::F32(step_size));
         self.cpu_denom.write(0, DValue::I32(denom));
 
-        let mut sync = OptimiserUpdateSync::default();
+        let mut sync = OptimiserUpdateSync::with_capacity(1, 2);
 
         sync.push_copy(self.step_size.copy_from_host_async(stream, &self.cpu_step_size)?);
         sync.push_copy(self.denom.copy_from_host_async(stream, &self.cpu_denom)?);

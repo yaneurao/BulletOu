@@ -73,7 +73,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for WeightClipping<G, S> {
         gradient_factor: Arc<Buffer<G>>,
         learning_rate: Arc<Buffer<G>>,
     ) -> OptimiserUpdateResult<'a, G> {
-        let mut blocks = OptimiserUpdateSync::default();
+        let mut blocks = OptimiserUpdateSync::with_capacity(2, 0);
 
         if self.placement == Placement::Before {
             blocks.push_kernel(self.op.execute_slices(stream.clone(), &[], &[weights.clone()])?);
