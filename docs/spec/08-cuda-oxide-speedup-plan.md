@@ -417,6 +417,8 @@ batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tenso
 forward/backward の binding 解決で tree node を辿る overhead を減らす。
 Model の forward/backward 経路ではさらに、`TensorBinding` 構築時に `FunctionInput`
 slot まで解決しておき、batch 中は NodeId lookup 自体を行わない。
+一時 buffer の prealloc も pointer slot index で管理し、`Malloc` 命令実行時の
+`BTreeMap` lookup を避ける。
 
 training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` を batch ごとに
 新規作成する必要はない。loop 外で 2 つの scalar host buffer を確保し、batch ごとに値だけ

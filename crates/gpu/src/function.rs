@@ -72,7 +72,7 @@ pub struct Function<G: Gpu> {
     num_ptrs: usize,
     blas: Option<Blas<G>>,
     prealloc_size: usize,
-    preallocs: BTreeMap<usize, G::DevicePtr>,
+    preallocs: Vec<Option<G::DevicePtr>>,
     scratch: RefCell<FunctionScratch<G>>,
 }
 
@@ -114,12 +114,12 @@ impl<G: Gpu> Function<G> {
             return Ok(());
         }
 
-        for &ptr in self.preallocs.values() {
+        for &ptr in self.preallocs.iter().flatten() {
             unsafe { self.device.free(ptr)? };
         }
 
         self.prealloc_size = 0;
-        self.preallocs = BTreeMap::default();
+        self.preallocs.clear();
 
         Ok(())
     }
@@ -242,7 +242,7 @@ impl<G: Gpu> Function<G> {
             num_ptrs,
             blas,
             prealloc_size: 0,
-            preallocs: Default::default(),
+            preallocs: Vec::new(),
             scratch: RefCell::new(FunctionScratch::new(num_ptrs, max_num_args)),
         })
     }
@@ -253,11 +253,12 @@ impl<G: Gpu> Function<G> {
         }
 
         self.dealloc_preallocs()?;
+        self.preallocs = vec![None; self.num_ptrs];
 
         for inst in &self.insts {
             if let &Inst::Malloc { idx, ty } = inst {
                 let bytes = ty.dtype().bytes() * ty.size().evaluate(var_size);
-                self.preallocs.insert(idx, self.device.malloc(bytes)?);
+                self.preallocs[idx] = Some(self.device.malloc(bytes)?);
             }
         }
 
@@ -386,7 +387,7 @@ impl<G: Gpu> Function<G> {
             for inst in &self.insts {
                 match inst {
                     &Inst::Malloc { idx, .. } => {
-                        scratch.ptrs[idx] = *self.preallocs.get(&idx).unwrap();
+                        scratch.ptrs[idx] = self.preallocs[idx].expect("Missing preallocated buffer");
                     }
                     &Inst::Zero { idx, ty } => {
                         let bytes = ty.size().evaluate(var) * ty.dtype().bytes();
