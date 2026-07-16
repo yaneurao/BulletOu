@@ -413,6 +413,8 @@ batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tenso
 単一 buffer の H2D/D2H copy helper では容量 1 で確保する。
 `Buffer::acquire` は返す `BufferGuard` 内で `Arc<Buffer>` を保持するため、呼び出し前に
 余分な `Arc` clone を行わない。
+`SyncOnDrop::attach` の owner stream 確認も、stream `Arc` を clone せずに buffer の owner
+mutex 内で参照比較する。
 
 `Function` 内部の NodeId→pointer slot 対応も、実行時に `BTreeMap` を引く必要はない。
 構築時にだけ map を作り、実行時はソート済み slice の binary search にすることで、

@@ -49,7 +49,7 @@ impl<G: Gpu> SyncOnDrop<G> {
     }
 
     pub fn attach(&mut self, guard: BufferGuard<G>) -> Result<(), G::Error> {
-        if guard.owner().unwrap() != self.stream {
+        if !guard.is_owned_by(&self.stream) {
             return Err("Guard is owned by a different stream!".to_string().into());
         }
 
@@ -320,6 +320,15 @@ impl<G: Gpu> Drop for BufferGuard<G> {
 impl<G: Gpu> BufferGuard<G> {
     pub fn ptr(&self) -> G::DevicePtr {
         self.0.ptr
+    }
+
+    fn is_owned_by(&self, stream: &Arc<Stream<G>>) -> bool {
+        self.0
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(owning, _)| owning.as_ref() == stream.as_ref())
     }
 }
 
