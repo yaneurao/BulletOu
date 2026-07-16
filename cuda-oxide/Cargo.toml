@@ -11,6 +11,11 @@ license = "MIT"
 repository = "https://github.com/jw1912/bullet"
 rust-version = "1.96"
 
+[workspace.dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+thiserror = "2"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 

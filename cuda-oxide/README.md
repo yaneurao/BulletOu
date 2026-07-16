@@ -14,5 +14,21 @@ Initial scope:
 2. launch a smoke kernel
 3. add fixed-layout NNUE / SFNN kernels one by one
 
-Until the runtime is connected, `bins/bulletou-cuda-train` is a fail-fast
-placeholder.
+Current smoke command:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- --ptx /path/to/module.ptx --kernel noop
+```
+
+This loads a generated PTX module, resolves the kernel symbol, and checks a
+host-device-host buffer round trip. Repository-local smoke PTX generation and
+actual launch are the next CO-004 step.
+
+The default build intentionally does not enable CUDA:
+
+```bash
+cargo check
+```
+
+Use the CUDA feature only on a machine with a CUDA Toolkit install root visible
+through `CUDA_HOME`, `CUDA_PATH`, or `CUDA_TOOLKIT_PATH`.

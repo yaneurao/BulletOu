@@ -10,6 +10,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+cuda = ["bulletou-cuda-oxide-runtime/cuda"]
+
 [[bin]]
 name = "bulletou-cuda-train"
 path = "src/main.rs"

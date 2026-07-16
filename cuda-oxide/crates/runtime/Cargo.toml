@@ -10,4 +10,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+cuda = ["dep:cuda-core", "dep:cuda-host"]
+
 [dependencies]
+cuda-core = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }
+thiserror = { workspace = true }

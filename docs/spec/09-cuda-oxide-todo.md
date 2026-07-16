@@ -13,7 +13,7 @@ status を更新する。
 | CO-001 | done | TODO 起票 | このファイルと README へのリンクを追加する |
 | CO-002 | done | fixed-layout batch adapter | 既存 dataloader から `FastBatchHost` を直接列挙できる |
 | CO-003 | done | cuda-oxide crate 境界の作成 | 既存 workspace を巻き込まず、専用 crate / binary の置き場所を作る |
-| CO-004 | in-progress | PTX smoke loader | 生成済み PTX を load し、最小 kernel を launch する |
+| CO-004 | in-progress | PTX smoke loader | 生成済み PTX を load し、kernel symbol resolve と最小 kernel launch を行う |
 | CO-005 | todo | CPU reference test harness | fast backend kernel と既存 Bullet backend の 1 batch 出力比較を作る |
 | CO-006 | todo | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる |
 | CO-007 | todo | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |
@@ -28,6 +28,7 @@ status を更新する。
 
 - 既存 `--backend bullet` は常に動く状態を保つ。
 - cuda-oxide dependency は既存 workspace root に直接入れない。
+- `cuda-oxide/` nested workspace の default build は CUDA Toolkit なしで通る状態を保つ。
 - 数値が変わる高速化は opt-in にする。
 - 速度比較は fp32 baseline の 1 batch 数値一致後に行う。
 - KPPT / KPP_KKPT は今回の cuda-oxide 高速化対象外とする。

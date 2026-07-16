@@ -1,14 +1,70 @@
 //! Host-side boundary for the future BulletOu cuda-oxide backend.
 //!
-//! This crate intentionally has no cuda-oxide dependency yet. CO-003 only
-//! creates the isolated workspace boundary. CO-004 will add PTX loading and a
-//! smoke kernel without touching the root BulletOu workspace.
+//! This crate is intentionally isolated from the root BulletOu workspace.
+//! CO-004 starts with PTX module loading and host/device smoke checks without
+//! touching the existing generic Bullet backend.
+
+#[cfg(feature = "cuda")]
+use std::{path::Path, sync::Arc};
+
+#[cfg(feature = "cuda")]
+pub use cuda_core::{CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
-    SkeletonOnly,
+    PtxSmokeReady,
 }
 
 pub fn backend_status() -> BackendStatus {
-    BackendStatus::SkeletonOnly
+    BackendStatus::PtxSmokeReady
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[cfg(feature = "cuda")]
+    #[error(transparent)]
+    Cuda(#[from] DriverError),
+    #[cfg(feature = "cuda")]
+    #[error("path is not valid UTF-8: {0}")]
+    NonUtf8Path(String),
+    #[cfg(feature = "cuda")]
+    #[error("kernel symbol `{kernel}` was not found in PTX module")]
+    MissingKernel {
+        kernel: String,
+        #[source]
+        source: DriverError,
+    },
+    #[error("cuda feature is disabled; rebuild with `--features cuda`")]
+    CudaFeatureDisabled,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(feature = "cuda")]
+pub fn load_ptx_module(ctx: &Arc<CudaContext>, ptx_path: &Path) -> Result<Arc<CudaModule>> {
+    let path = ptx_path
+        .to_str()
+        .ok_or_else(|| Error::NonUtf8Path(ptx_path.display().to_string()))?;
+    Ok(ctx.load_module_from_file(path)?)
+}
+
+#[cfg(feature = "cuda")]
+pub fn resolve_kernel(module: &Arc<CudaModule>, kernel: &str) -> Result<CudaFunction> {
+    module.load_function(kernel).map_err(|source| Error::MissingKernel {
+        kernel: kernel.to_string(),
+        source,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn host_device_roundtrip(ctx: &Arc<CudaContext>, len: usize) -> Result<bool> {
+    let stream = ctx.default_stream();
+    let host: Vec<f32> = (0..len).map(|idx| idx as f32).collect();
+    let device = DeviceBuffer::from_host(&stream, &host)?;
+    let restored = device.to_host_vec(&stream)?;
+    Ok(restored == host)
+}
+
+pub fn cuda_feature_enabled() -> bool {
+    cfg!(feature = "cuda")
 }
