@@ -193,6 +193,12 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             (id.clone(), buf.unwrap())
         })
         .collect();
+    let mut batch_upload_plan = first_batch
+        .upload_plan(&batch_on_device)
+        .map_err(TrainerError::Unexpected)?;
+    let mut next_upload_plan = first_batch
+        .upload_plan(&next_on_device)
+        .map_err(TrainerError::Unexpected)?;
 
     let mut batch_queued = true;
     let mut output_slot = 0usize;
@@ -249,7 +255,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
                     early_next_batch
                         .as_ref()
                         .unwrap()
-                        .copy_to_device_async(&copy_stream, &next_on_device)
+                        .copy_to_device_with_plan_async(&copy_stream, &next_upload_plan)
                         .map_err(TrainerError::Unexpected)?,
                 );
             }
@@ -287,6 +293,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             drop(next_copy);
             drop(early_next_batch);
             std::mem::swap(&mut batch_on_device, &mut next_on_device);
+            std::mem::swap(&mut batch_upload_plan, &mut next_upload_plan);
         } else if dataloader_exhausted {
             batch_queued = false;
             compute_block1.sync().map_err(TrainerError::Unexpected)?;
@@ -294,7 +301,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         } else if let Ok(next_batch_host) = receiver.recv() {
             next_batch_size = next_batch_host.batch_size;
             let next_copy = next_batch_host
-                .copy_to_device_async(&copy_stream, &next_on_device)
+                .copy_to_device_with_plan_async(&copy_stream, &next_upload_plan)
                 .map_err(TrainerError::Unexpected)?;
 
             compute_block1.sync().map_err(TrainerError::Unexpected)?;
@@ -305,6 +312,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             // current batch's compute. Dropping it syncs the copy stream.
             drop(next_copy);
             std::mem::swap(&mut batch_on_device, &mut next_on_device);
+            std::mem::swap(&mut batch_upload_plan, &mut next_upload_plan);
         } else {
             batch_queued = false;
             compute_block1.sync().map_err(TrainerError::Unexpected)?;

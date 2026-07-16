@@ -428,6 +428,11 @@ training loop の learning-rate / gradient-factor scalar は 1 要素 `TValue` �
 `TensorMap<String, Buffer>` はそのまま維持し、copy 時だけ線形探索で該当 input を引く。
 input 数は 5〜6 個なので tree 構築より安い。
 
+さらに、device batch buffer は double buffer で再利用されるため、最初の batch から
+`PreparedBatchUploadPlan` を作り、host input index と device buffer の対応を保持する。
+通常 batch ではこの plan に従って H2D copy し、input 名の探索を避ける。DataLoader が input
+順序を変えた場合だけ、名前確認の fallback に落とす。
+
 ### Phase 1: cuda-oxide runtime skeleton
 
 tatara の `crates/gpu-runtime` 相当を BulletOu 側に最小移植する。
