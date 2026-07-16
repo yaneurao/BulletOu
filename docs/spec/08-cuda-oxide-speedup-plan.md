@@ -368,6 +368,11 @@ kernel launch の size 引数用 buffer は `max_num_args` 個をゼロ初期化
 `Vec::with_capacity(max_num_args)` で容量だけ確保し、各 launch で実際に必要な size 引数だけを
 push する。事前確保により launch 直前の pointer は安定し、GPU に渡す値は従来と同じである。
 
+さらに `Function` に `FunctionScratch` を持たせ、`ptrs` / `aliases` / `sizes` /
+`kernel_args` を forward/backward 呼び出しごとに再利用する。kernel launch は host pointer 配列を
+launch 呼び出し中に読むだけなので、launch 後に scratch を再利用しても GPU 側の実行内容は変わらない。
+これにより graph 実行ごとの短命な `Vec` allocation を避ける。
+
 `SyncOnDrop` は attach される guard 数が分かっている呼び出し経路では容量を事前確保する。
 `Function::execute_binding_refs` と `CompiledKernel::execute_slices` で guard list の再確保を避ける。
 batch upload の `PreparedBatchHost::copy_to_device_async` でも、device tensor 数に合わせて

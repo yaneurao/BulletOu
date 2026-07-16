@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::c_void, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, ffi::c_void, rc::Rc, sync::Arc};
 
 use bullet_compiler::{
     ir::NodeId,
@@ -64,9 +64,35 @@ pub struct Function<G: Gpu> {
     insts: Box<[Inst<G>]>,
     num_ptrs: usize,
     blas: Option<Blas<G>>,
-    max_num_args: usize,
     prealloc_size: usize,
     preallocs: BTreeMap<usize, G::DevicePtr>,
+    scratch: RefCell<FunctionScratch<G>>,
+}
+
+struct FunctionScratch<G: Gpu> {
+    ptrs: Vec<G::DevicePtr>,
+    aliases: Vec<(G::DevicePtr, bool)>,
+    sizes: Vec<i32>,
+    kernel_args: Vec<*mut c_void>,
+}
+
+impl<G: Gpu> FunctionScratch<G> {
+    fn new(num_ptrs: usize, max_num_args: usize) -> Self {
+        Self {
+            ptrs: Vec::with_capacity(num_ptrs),
+            aliases: Vec::new(),
+            sizes: Vec::with_capacity(max_num_args),
+            kernel_args: Vec::with_capacity(max_num_args),
+        }
+    }
+
+    fn prepare(&mut self, num_ptrs: usize) {
+        self.ptrs.clear();
+        self.ptrs.resize(num_ptrs, G::DevicePtr::default());
+        self.aliases.clear();
+        self.sizes.clear();
+        self.kernel_args.clear();
+    }
 }
 
 impl<G: Gpu> Drop for Function<G> {
@@ -208,9 +234,9 @@ impl<G: Gpu> Function<G> {
             insts: insts.into_boxed_slice(),
             num_ptrs,
             blas,
-            max_num_args,
             prealloc_size: 0,
             preallocs: Default::default(),
+            scratch: RefCell::new(FunctionScratch::new(num_ptrs, max_num_args)),
         })
     }
 
@@ -261,9 +287,13 @@ impl<G: Gpu> Function<G> {
         let inputs = inputs.into_iter();
         let input_capacity = inputs.size_hint().0;
         let mut sync = SyncOnDrop::with_capacity(stream.clone(), input_capacity);
-        let mut ptrs = vec![G::DevicePtr::default(); self.num_ptrs];
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.prepare(self.num_ptrs);
 
-        let mut aliases = Vec::with_capacity(input_capacity);
+        let aliases_capacity = scratch.aliases.capacity();
+        if aliases_capacity < input_capacity {
+            scratch.aliases.reserve(input_capacity - aliases_capacity);
+        }
         let mut var_size = None;
 
         for (name, buf) in inputs {
@@ -301,20 +331,18 @@ impl<G: Gpu> Function<G> {
             let guard = buf.acquire(stream.clone())?;
             let ptr = guard.ptr();
             sync.attach(guard)?;
-            ptrs[idx] = ptr;
+            scratch.ptrs[idx] = ptr;
 
-            if let Some((_, is_alr_mut)) = aliases.iter().find(|(seen_ptr, _)| *seen_ptr == ptr) {
+            if let Some((_, is_alr_mut)) = scratch.aliases.iter().find(|(seen_ptr, _)| *seen_ptr == ptr) {
                 if is_mut || *is_alr_mut {
                     return Err("Cannot alias pointers!".to_string().into());
                 }
             } else {
-                aliases.push((ptr, is_mut));
+                scratch.aliases.push((ptr, is_mut));
             }
         }
 
         let var = var_size.unwrap_or(1);
-        let mut sizes = Vec::with_capacity(self.max_num_args);
-        let mut kernel_args: Vec<*mut c_void> = Vec::with_capacity(self.max_num_args);
 
         assert_ne!(var, 0, "Variable size = 0!");
         assert!(self.prealloc_size >= var);
@@ -323,28 +351,30 @@ impl<G: Gpu> Function<G> {
             for inst in &self.insts {
                 match inst {
                     &Inst::Malloc { idx, .. } => {
-                        ptrs[idx] = *self.preallocs.get(&idx).unwrap();
+                        scratch.ptrs[idx] = *self.preallocs.get(&idx).unwrap();
                     }
                     &Inst::Zero { idx, ty } => {
                         let bytes = ty.size().evaluate(var) * ty.dtype().bytes();
-                        stream.memset(ptrs[idx], bytes, 0)?;
+                        stream.memset(scratch.ptrs[idx], bytes, 0)?;
                     }
                     Inst::Free { .. } => {}
                     Inst::LaunchKernel { func, args, gdim, bdim, smem } => {
-                        kernel_args.clear();
-                        sizes.clear();
+                        scratch.kernel_args.clear();
+                        scratch.sizes.clear();
                         for arg in args {
-                            kernel_args.push(match arg {
-                                Arg::Pointer { idx } => ptrs.as_ptr().add(*idx).cast_mut().cast(),
+                            let ptrs = scratch.ptrs.as_ptr();
+                            let arg_ptr = match arg {
+                                Arg::Pointer { idx } => ptrs.add(*idx).cast_mut().cast(),
                                 Arg::Size(size) => {
-                                    sizes.push(size.evaluate(var) as i32);
-                                    let last = sizes.last().unwrap();
+                                    scratch.sizes.push(size.evaluate(var) as i32);
+                                    let last = scratch.sizes.last().unwrap();
                                     (last as *const i32).cast_mut().cast()
                                 }
-                            });
+                            };
+                            scratch.kernel_args.push(arg_ptr);
                         }
 
-                        func.launch(&stream, gdim(var), bdim(var), kernel_args.as_mut_ptr(), smem(var))?;
+                        func.launch(&stream, gdim(var), bdim(var), scratch.kernel_args.as_mut_ptr(), smem(var))?;
                     }
                     &Inst::Matmul { cfg, a, b, c } => {
                         let handle = self.blas.as_ref().unwrap();
@@ -359,10 +389,17 @@ impl<G: Gpu> Function<G> {
                         };
 
                         if let Some(1) = cfg.batch.evaluate_constant() {
-                            handle.gemm(stream.as_ref(), config, ptrs[a], ptrs[b], ptrs[c])?;
+                            handle.gemm(stream.as_ref(), config, scratch.ptrs[a], scratch.ptrs[b], scratch.ptrs[c])?;
                         } else {
                             let batch = cfg.batch.evaluate(var);
-                            handle.batched_gemm(stream.as_ref(), batch, config, ptrs[a], ptrs[b], ptrs[c])?;
+                            handle.batched_gemm(
+                                stream.as_ref(),
+                                batch,
+                                config,
+                                scratch.ptrs[a],
+                                scratch.ptrs[b],
+                                scratch.ptrs[c],
+                            )?;
                         }
                     }
                 }
