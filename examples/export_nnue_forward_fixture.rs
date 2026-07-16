@@ -1,9 +1,18 @@
 use std::path::PathBuf;
 
-use bulletou_lib::value::{
-    FastBatchHost, FastBatchLayout, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape,
-    write_nnue_forward_fixture_file,
-    yaneuraou_kppt::{extract_component_section, parse_model_weights_bin},
+use bulletou_lib::{
+    game::inputs::ShogiHalfKP,
+    shogi::PackedSfenValue,
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    value::{
+        FastBatchHost, FastBatchLayout, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape,
+        NoOutputBuckets,
+        loader::{
+            DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader,
+        },
+        write_nnue_forward_fixture_file,
+        yaneuraou_kppt::{extract_component_section, parse_model_weights_bin},
+    },
 };
 use clap::{Parser, ValueEnum};
 
@@ -27,6 +36,12 @@ struct Args {
     #[arg(long)]
     weights_bin: Option<PathBuf>,
 
+    /// Optional teacher data path (file, directory, or comma-separated list).
+    /// When present, `--case halfkp` exports the first real loader batch using
+    /// the same ShogiHalfKP prepare path as the trainer.
+    #[arg(long)]
+    teacher: Option<String>,
+
     /// Override synthetic batch size.
     #[arg(long)]
     batch_size: Option<usize>,
@@ -34,6 +49,35 @@ struct Args {
     /// Override padded sparse feature slots per sample.
     #[arg(long)]
     max_active: Option<usize>,
+
+    /// CPU worker threads used while materialising a teacher batch.
+    #[arg(long, default_value = "4")]
+    threads: usize,
+
+    /// Loader read buffer size in MiB for teacher formats that use a read buffer.
+    #[arg(long, default_value = "64")]
+    buffer_mb: usize,
+
+    /// HCPE decode threads. 0 means loader default/auto.
+    #[arg(long, default_value = "0")]
+    loader_threads: usize,
+
+    /// Lambda on teacher eval score when target values are prepared.
+    #[arg(long, default_value = "1.0")]
+    lambda: f32,
+
+    /// Eval-to-score sigmoid scale used while preparing teacher targets.
+    #[arg(long, default_value = "400.0")]
+    scale: f32,
+
+    /// Use nnue-pytorch WRM target conversion while preparing teacher targets.
+    #[arg(long)]
+    nnue_pytorch_wrm_loss: bool,
+
+    /// Drop positions whose |score| >= this by setting entry weight to zero.
+    /// Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,12 +89,26 @@ enum FixtureCase {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if args.weights_bin.is_some() && args.case != FixtureCase::Halfkp {
-        return Err("--weights-bin is only supported with --case halfkp".into());
+        return Err(invalid_input("--weights-bin is only supported with --case halfkp"));
+    }
+    if args.teacher.is_some() && args.case != FixtureCase::Halfkp {
+        return Err(invalid_input("--teacher is only supported with --case halfkp"));
+    }
+    if args.teacher.is_some() && args.max_active.is_some() {
+        return Err(invalid_input(
+            "--max-active cannot be used with --teacher; it comes from ShogiHalfKP::max_active()",
+        ));
+    }
+    if !(0.0..=1.0).contains(&args.lambda) {
+        return Err(invalid_input("--lambda must be in [0, 1]"));
+    }
+    if !(args.scale.is_finite() && args.scale > 0.0) {
+        return Err(invalid_input("--scale must be finite and > 0"));
     }
 
     let fixture = match args.case {
         FixtureCase::Tiny => Fixture::tiny(args.batch_size, args.max_active)?,
-        FixtureCase::Halfkp => Fixture::halfkp(args.batch_size, args.max_active, args.weights_bin.as_ref())?,
+        FixtureCase::Halfkp => Fixture::halfkp(&args)?,
     };
 
     let outputs = fixture.weights.forward_batch(&fixture.batch)?;
@@ -60,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  out        : {}", args.out.display());
     println!("  case       : {}", fixture.label);
     println!("  weights    : {}", fixture.weights_source);
+    println!("  batch src  : {}", fixture.batch_source);
     println!(
         "  shape      : input={} l1={} l2={} l3={}",
         fixture.weights.shape.input_size, fixture.weights.shape.l1, fixture.weights.shape.l2, fixture.weights.shape.l3
@@ -76,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct Fixture {
     label: &'static str,
     weights_source: String,
+    batch_source: String,
     weights: NnueForwardOwnedWeights,
     batch: FastBatchHost,
 }
@@ -91,6 +151,7 @@ impl Fixture {
         Ok(Self {
             label: "tiny",
             weights_source: "deterministic tiny".to_string(),
+            batch_source: "deterministic tiny".to_string(),
             weights: tiny_weights(shape),
             batch: if batch_size == 2 && max_active == 3 {
                 tiny_batch()
@@ -100,33 +161,32 @@ impl Fixture {
         })
     }
 
-    fn halfkp(
-        batch_size: Option<usize>,
-        max_active: Option<usize>,
-        weights_bin: Option<&PathBuf>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn halfkp(args: &Args) -> Result<Self, Box<dyn std::error::Error>> {
         let shape = NNUE_HALFKP_256X2_32_32;
-        let batch_size = batch_size.unwrap_or(2);
-        let max_active = max_active.unwrap_or(38);
+        let batch_size = args.batch_size.unwrap_or(2);
+        let max_active = args.max_active.unwrap_or(38);
         require_nonzero("batch-size", batch_size)?;
         require_nonzero("max-active", max_active)?;
 
-        let (weights, weights_source) = match weights_bin {
+        let (weights, weights_source) = match args.weights_bin.as_ref() {
             Some(path) => (load_halfkp_weights(path)?, path.display().to_string()),
             None => (synthetic_halfkp_weights(shape), "deterministic halfkp".to_string()),
         };
+        let (batch, batch_source) = match args.teacher.as_ref() {
+            Some(_) => load_halfkp_teacher_batch(args)?,
+            None => (synthetic_batch(batch_size, max_active, shape.input_size), "deterministic halfkp".to_string()),
+        };
 
-        Ok(Self {
-            label: "halfkp-256x2-32-32",
-            weights_source,
-            weights,
-            batch: synthetic_batch(batch_size, max_active, shape.input_size),
-        })
+        Ok(Self { label: "halfkp-256x2-32-32", weights_source, batch_source, weights, batch })
     }
 }
 
 fn require_nonzero(name: &'static str, value: usize) -> Result<(), Box<dyn std::error::Error>> {
-    if value == 0 { Err(format!("--{name} must be greater than zero").into()) } else { Ok(()) }
+    if value == 0 { Err(invalid_input(format!("--{name} must be greater than zero"))) } else { Ok(()) }
+}
+
+fn invalid_input(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into()))
 }
 
 fn load_halfkp_weights(path: &PathBuf) -> Result<NnueForwardOwnedWeights, Box<dyn std::error::Error>> {
@@ -139,6 +199,81 @@ fn load_halfkp_weights(path: &PathBuf) -> Result<NnueForwardOwnedWeights, Box<dy
     };
 
     Ok(NnueForwardOwnedWeights::from_weight_map(NNUE_HALFKP_256X2_32_32, &weights)?)
+}
+
+fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box<dyn std::error::Error>> {
+    let teacher = args.teacher.as_ref().expect("checked by caller");
+    let data_files_owned = expand_teacher(teacher).map_err(invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(invalid_input)?;
+    let batch_size = args.batch_size.unwrap_or(2);
+    require_nonzero("batch-size", batch_size)?;
+    let source = format!("{format:?} teacher: {teacher}");
+
+    let batch = match format {
+        DataFormat::Hcpe => {
+            let loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                args.buffer_mb,
+                (|_| true) as fn(&PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(batch_size)
+            .with_loader_threads(args.loader_threads)
+            .with_single_epoch(true);
+            materialise_first_halfkp_batch(loader, args)?
+        }
+        DataFormat::Hcpe3 => {
+            let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
+                .with_buffer_records(batch_size)
+                .with_single_epoch(true);
+            materialise_first_halfkp_batch(loader, args)?
+        }
+        DataFormat::Pack => {
+            let loader =
+                ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true).with_single_epoch(true);
+            materialise_first_halfkp_batch(loader, args)?
+        }
+        DataFormat::Psv => {
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            materialise_first_halfkp_batch(loader, args)?
+        }
+    };
+
+    Ok((batch, source))
+}
+
+fn materialise_first_halfkp_batch<D>(loader: D, args: &Args) -> Result<FastBatchHost, Box<dyn std::error::Error>>
+where
+    D: DataLoader<PackedSfenValue>,
+{
+    let batch_size = args.batch_size.unwrap_or(2);
+    let threads = args.threads.max(1);
+    let score_drop_abs = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
+    let dataloader = DefaultDataLoader::new(
+        ShogiHalfKP,
+        NoOutputBuckets,
+        (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
+        None,
+        args.nnue_pytorch_wrm_loss,
+        false,
+        args.scale,
+        score_drop_abs,
+        loader,
+    );
+    let mut first_batch = None;
+    dataloader.load_and_map_batches(0, batch_size, |batch| {
+        let prepared = dataloader.prepare(batch, threads, 1.0 - args.lambda);
+        first_batch = Some(FastBatchHost::from(prepared));
+        true
+    });
+
+    let batch = first_batch.ok_or_else(|| {
+        invalid_input(format!(
+            "teacher did not yield a complete batch of {batch_size} positions; use a smaller --batch-size"
+        ))
+    })?;
+    batch.validate().map_err(invalid_input)?;
+    Ok(batch)
 }
 
 fn tiny_batch() -> FastBatchHost {

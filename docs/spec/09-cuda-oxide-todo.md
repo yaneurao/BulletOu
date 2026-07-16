@@ -48,6 +48,7 @@ status を更新する。
 - done: `--nnue-forward-case halfkp` を追加し、`NNUE_HALFKP_256x2_32_32` の実 shape / max_active=38 / 決定論的 synthetic weight + sparse batch で同じ launch sequence を CPU golden と比較。
 - done: `--write-nnue-forward-fixture` / `--nnue-forward-fixture` を追加。root workspace へ依存せず、root 側 exporter から `FastBatchHost` + `NnueForwardOwnedWeights` を渡すための little-endian fixture 境界を用意。
 - done: root 側 `write_nnue_forward_fixture` / `write_nnue_forward_fixture_file` を追加。`FastBatchHost` + `NnueForwardWeights` から同じ fixture 形式を書き出せる。
+- done: root example `export_nnue_forward_fixture --teacher` を追加。既存 `expand_teacher` / `infer_data_format` / `HcpeDataLoader` / `Hcpe3DataLoader` / `ShogiPackLoader` / `DirectSequentialDataLoader` と `DefaultDataLoader::prepare(ShogiHalfKP)` を通して、実 teacher の先頭 1 batch を `FastBatchHost` fixture にできる。
 - in-progress: root 側 `FastBatchHost` / `NnueForwardOwnedWeights` から nested cuda-oxide 実行へ流す橋渡しを作り、synthetic ではなく既存データ経路の 1 batch で CPU golden と比較する。
 - note: 現 Windows native 環境では RTX 4090 と CUDA Toolkit v13.1 は見える。`cargo-oxide` と Python wheel 由来の `libclang.dll` は導入済み。CUDA 13.1 headers と Python wheel の CUDA 12.9 headers の双方で `cargo check -p bulletou-cuda-train --features cuda` を試したが、pin済み cuda-oxide rev の `cuda-core` が Windows bindgen 生成の `u32` flag / enum と合わず E0308 で停止する。実機 launch 検証は WSL2 Ubuntu 24.04 で進める。
 
@@ -80,6 +81,7 @@ status を更新する。
 - `cargo check -p bulletou_lib --example export_nnue_forward_fixture` は成功。
 - root で出力した tiny fixture (`target/bulletou-root-tiny.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.00000011920929`、debug readback buffers は許容誤差内。
 - root で出力した HalfKP fixture (`target/bulletou-root-halfkp.nnuef`) を WSL2/cuda-oxide の `--nnue-forward-fixture` で実行し成功。output max_abs diff: `0.0000000009313226`、`stm_l0` / `nstm_l0` / `combined` max_abs diff: `0`、`hidden1` max_abs diff: `0.0000000037252903`、`hidden2` max_abs diff: `0.0000000018626451`。
+- `export_nnue_forward_fixture --teacher` の loader 配線は `cargo check -p bulletou_lib --example export_nnue_forward_fixture` で型検証済み。現 workspace / `C:\shogi` には `.hcpe` / `.hcpe3` / `.pack` / `.psv` teacher が見つからなかったため、実 teacher file での smoke は次回実データ配置後に行う。
 
 ### CO-006 CUDA 実機検証
 
