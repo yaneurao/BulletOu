@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
     backward::{
-        SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan,
-        SfnnStackedL3BackwardLayout,
+        SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout, SfnnStackedCReluBackwardLaunchPlan,
+        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -104,6 +104,44 @@ pub(crate) fn launch_sfnn_stacked_crelu_backward(
                 input_dim,
                 output_dim,
                 num_stacks
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_l2_input_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnL2InputBackwardLayout,
+    l1: &DeviceBuffer<f32>,
+    l2_input: &DeviceBuffer<f32>,
+    l2_input_gradients: &DeviceBuffer<f32>,
+    mut l1_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnL2InputBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let l1_hidden = layout.l1_hidden as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_l2_input_backward`; the kernel has
+        // one writer for each L1 gradient element and only adds to hidden
+        // columns, preserving the L3 skip-column gradient.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_l2_input_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(l1),
+                slice(l2_input),
+                slice(l2_input_gradients),
+                slice_mut(l1_gradients),
+                batch,
+                l1_hidden
             ]
         }
     }?;

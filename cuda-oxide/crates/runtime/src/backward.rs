@@ -6,13 +6,15 @@ pub const NNUE_L0_CRELU_BACKWARD_KERNEL: &str = "nnue_l0_crelu_backward";
 pub const NNUE_L0_SPARSE_BACKWARD_KERNEL: &str = "nnue_l0_sparse_backward";
 pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
 pub const SFNN_STACKED_CRELU_BACKWARD_KERNEL: &str = "sfnn_stacked_crelu_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 6] = [
+pub const SFNN_L2_INPUT_BACKWARD_KERNEL: &str = "sfnn_l2_input_backward";
+pub const BACKWARD_KERNEL_NAMES: [&str; 7] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
     NNUE_L0_SPARSE_BACKWARD_KERNEL,
     SFNN_STACKED_L3_BACKWARD_KERNEL,
     SFNN_STACKED_CRELU_BACKWARD_KERNEL,
+    SFNN_L2_INPUT_BACKWARD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +295,36 @@ impl SfnnStackedCReluBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnL2InputBackwardLayout {
+    pub batch_size: usize,
+    pub l1_hidden: usize,
+}
+
+impl SfnnL2InputBackwardLayout {
+    pub fn new(batch_size: usize, l1_hidden: usize) -> Self {
+        Self { batch_size, l1_hidden }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.l1_hidden == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn l1_len(self) -> usize {
+        self.batch_size * (self.l1_hidden + 1)
+    }
+
+    pub fn l2_input_len(self) -> usize {
+        self.batch_size * self.l1_hidden * 2
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseOutputBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -360,6 +392,17 @@ impl SfnnStackedCReluBackwardLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnL2InputBackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnL2InputBackwardLaunchPlan {
+    pub fn new(layout: SfnnL2InputBackwardLayout) -> Self {
+        Self { threads: layout.l1_len().max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum BackwardLayoutError {
     #[error("backward batch must contain at least one sample")]
@@ -388,7 +431,8 @@ mod tests {
                 "nnue_l0_crelu_backward",
                 "nnue_l0_sparse_backward",
                 "sfnn_stacked_l3_backward",
-                "sfnn_stacked_crelu_backward"
+                "sfnn_stacked_crelu_backward",
+                "sfnn_l2_input_backward"
             ]
         );
     }
@@ -543,5 +587,20 @@ mod tests {
             SfnnStackedCReluBackwardLayout::new(3, 4, 5, 0).validate().unwrap_err(),
             BackwardLayoutError::EmptyStack
         );
+    }
+
+    #[test]
+    fn sfnn_l2_input_layout_counts_buffers() {
+        let layout = SfnnL2InputBackwardLayout::new(3, 4);
+
+        assert_eq!(layout.l1_len(), 15);
+        assert_eq!(layout.l2_input_len(), 24);
+        assert_eq!(SfnnL2InputBackwardLaunchPlan::new(layout).threads, 15);
+    }
+
+    #[test]
+    fn sfnn_l2_input_layout_rejects_empty_values() {
+        assert_eq!(SfnnL2InputBackwardLayout::new(0, 4).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
+        assert_eq!(SfnnL2InputBackwardLayout::new(3, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
     }
 }

@@ -787,7 +787,7 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 #[cfg(feature = "cuda")]
 fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        backward::{SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout},
+        backward::{SfnnL2InputBackwardLayout, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout},
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
             SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
@@ -872,6 +872,17 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &mut l2_input_gradients,
         &mut l2w_gradients,
         &mut l2b_gradients,
+    )?;
+
+    let l2_input_layout = SfnnL2InputBackwardLayout::new(case.batch_size, shape.l1_hidden);
+    sfnn_backward::launch_sfnn_l2_input_backward(
+        &stream,
+        &module,
+        l2_input_layout,
+        &forward_workspace.l1,
+        &forward_workspace.l2_input,
+        &l2_input_gradients,
+        &mut l1_gradients,
     )?;
     stream.synchronize()?;
 
@@ -1077,7 +1088,8 @@ fn usage() -> &'static str {
      hidden2, hidden1, L0 CReLU split, and sparse L0 weight/bias backward\n\
      kernels against a CPU golden.\n\
      CO-009 SFNN dense backward smoke: run SFNN forward, then chain stacked\n\
-     L3 output backward and L2 CReLU backward kernels against a CPU scalar golden.\n\
+     L3 output backward, L2 CReLU backward, and L2-input transform backward\n\
+     kernels against a CPU scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1881,6 +1893,14 @@ impl SfnnForwardCase {
             self.shape.l2_size,
             self.shape.num_stacks,
         );
+        let l1_gradients = sfnn_l2_input_backward_trace(
+            &forward.l1,
+            &forward.l2_input,
+            &l2_input_gradients,
+            l1_gradients,
+            self.batch_size,
+            self.shape.l1_hidden,
+        );
 
         SfnnOutputBackwardTrace {
             output_gradients,
@@ -2265,6 +2285,36 @@ fn sfnn_stacked_crelu_backward_trace(
     }
 
     (input_gradients, weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_l2_input_backward_trace(
+    l1: &[f32],
+    l2_input: &[f32],
+    l2_input_gradients: &[f32],
+    mut l1_gradients: Vec<f32>,
+    batch_size: usize,
+    l1_hidden: usize,
+) -> Vec<f32> {
+    const SCALE: f32 = 127.0 / 128.0;
+    let l1_out = l1_hidden + 1;
+    let l2_input_dim = l1_hidden * 2;
+
+    for sample in 0..batch_size {
+        let l1_base = sample * l1_out;
+        let l2_base = sample * l2_input_dim;
+        for row in 0..l1_hidden {
+            let value = l1[l1_base + row];
+            let square_idx = l2_base + row;
+            let linear_idx = l2_base + l1_hidden + row;
+            let square_grad = crelu_pre_gradient_from_activation(l2_input[square_idx], l2_input_gradients[square_idx])
+                * (2.0 * value * SCALE);
+            let linear_grad = crelu_pre_gradient_from_activation(l2_input[linear_idx], l2_input_gradients[linear_idx]);
+            l1_gradients[l1_base + row] += square_grad + linear_grad;
+        }
+    }
+
+    l1_gradients
 }
 
 #[cfg(feature = "cuda")]

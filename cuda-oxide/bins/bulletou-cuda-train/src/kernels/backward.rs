@@ -353,6 +353,43 @@ pub fn sfnn_stacked_crelu_backward(
     }
 }
 
+#[kernel]
+pub fn sfnn_l2_input_backward(
+    l1: &[f32],
+    l2_input: &[f32],
+    l2_input_gradients: &[f32],
+    mut l1_gradients: DisjointSlice<f32>,
+    batch: u32,
+    l1_hidden: u32,
+) {
+    let tid = thread::index_1d();
+    let hidden = l1_hidden as usize;
+    let l1_out = hidden + 1;
+    let total = (batch as usize) * l1_out;
+    if tid.get() >= total {
+        return;
+    }
+
+    let sample = tid.get() / l1_out;
+    let col = tid.get() - sample * l1_out;
+    if col >= hidden {
+        return;
+    }
+
+    let l2_input_dim = hidden * 2;
+    let l2_base = sample * l2_input_dim;
+    let value = l1[tid.get()];
+    let square_idx = l2_base + col;
+    let linear_idx = l2_base + hidden + col;
+    let square_grad = crelu_pre_gradient_from_value(l2_input[square_idx], l2_input_gradients[square_idx])
+        * (2.0_f32 * value * (127.0_f32 / 128.0_f32));
+    let linear_grad = crelu_pre_gradient_from_value(l2_input[linear_idx], l2_input_gradients[linear_idx]);
+
+    if let Some(out) = l1_gradients.get_mut(tid) {
+        *out += square_grad + linear_grad;
+    }
+}
+
 #[cuda_device::device]
 fn dense_crelu_pre_gradient(
     activations: &[f32],

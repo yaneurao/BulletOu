@@ -327,9 +327,39 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `--sfnn-output-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
     succeeded for `SFNN_halfka2_1024_7_64_k3k3`: all compared buffers
     max_abs diff `0`.
-- Remaining CO-009 work: SFNN L2-input transform backward, stacked L1
-  backward, pairwise/L0 backward, and integration into trainer gradient
-  buffers.
+- Remaining CO-009 work: SFNN stacked L1 backward, pairwise/L0 backward, and
+  integration into trainer gradient buffers.
+
+### 2026-07-17 CO-009 SFNN L2-input transform backward smoke
+
+- Added cuda-oxide runtime layout for the weightless SFNN L2-input transform
+  backward:
+  `SfnnL2InputBackwardLayout { batch_size, l1_hidden }`.
+- Added CUDA kernel `sfnn_l2_input_backward`:
+  - maps gradients from `l2_input[0..l1_hidden]`, the squared/absolute branch,
+    back to `l1[0..l1_hidden]` with derivative
+    `2 * l1_value * (127 / 128)` when the branch is inside CReLU range;
+  - maps gradients from `l2_input[l1_hidden..]`, the linear CReLU branch,
+    back to `l1[0..l1_hidden]`;
+  - adds into the existing `l1_gradients` buffer while preserving the final
+    `l1_hidden` skip-connection column already written by L3 backward.
+- Extended `--sfnn-dense-backward-smoke` to chain:
+  `stacked L3 output backward -> stacked L2 CReLU backward -> L2-input
+  transform backward`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--sfnn-dense-backward-smoke --debug-readback` tiny case succeeded:
+    all compared buffers max_abs diff `0`.
+  - `--sfnn-dense-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
+    succeeded for `SFNN_halfka2_1024_7_64_k3k3`: `l1_grad` max_abs diff
+    `0.000000000007275958`, `l2_in_grad` max_abs diff
+    `0.000000000014551915`, `l2w_grad` max_abs diff
+    `0.0000000000018189894`, and all other compared buffers max_abs diff `0`.
+- Remaining CO-009 work: SFNN stacked L1 backward, pairwise/L0 backward, and
+  integration into trainer gradient buffers.
 
 ### 2026-07-17 CO-009 SFNN L2 CReLU backward smoke
 
