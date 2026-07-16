@@ -189,6 +189,27 @@ pub struct NnueForwardWorkspaceLayout {
     pub batch_size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueForwardLaunchPlan {
+    pub sparse_l0_threads_per_perspective: usize,
+    pub concat_l0_threads: usize,
+    pub dense_l1_threads: usize,
+    pub dense_l2_threads: usize,
+    pub dense_output_threads: usize,
+}
+
+impl NnueForwardLaunchPlan {
+    pub fn new(layout: NnueForwardWorkspaceLayout) -> Self {
+        Self {
+            sparse_l0_threads_per_perspective: layout.l0_len(),
+            concat_l0_threads: layout.combined_len(),
+            dense_l1_threads: layout.hidden1_len(),
+            dense_l2_threads: layout.hidden2_len(),
+            dense_output_threads: layout.output_len(),
+        }
+    }
+}
+
 impl NnueForwardWorkspaceLayout {
     pub fn new(shape: NnueForwardShape, batch_size: usize) -> Self {
         Self { shape, batch_size }
@@ -302,6 +323,19 @@ mod tests {
         assert_eq!(layout.hidden2_len(), 5);
         assert_eq!(layout.output_len(), 5);
         assert_eq!(layout.total_activation_f32_len(), 65);
+    }
+
+    #[test]
+    fn launch_plan_counts_logical_threads() {
+        let shape = tiny_shape();
+        let layout = NnueForwardWorkspaceLayout::new(shape, 5);
+        let plan = NnueForwardLaunchPlan::new(layout);
+
+        assert_eq!(plan.sparse_l0_threads_per_perspective, 10);
+        assert_eq!(plan.concat_l0_threads, 20);
+        assert_eq!(plan.dense_l1_threads, 15);
+        assert_eq!(plan.dense_l2_threads, 5);
+        assert_eq!(plan.dense_output_threads, 5);
     }
 
     #[test]
