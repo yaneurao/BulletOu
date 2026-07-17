@@ -118,6 +118,7 @@ struct Args {
     batch_size: usize,
     buffer_mb: usize,
     loader_threads: usize,
+    teacher_queue_depth: usize,
     threads: usize,
     score_drop_abs: u16,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
@@ -236,6 +237,7 @@ impl Args {
             batch_size: 2,
             buffer_mb: 1,
             loader_threads: 1,
+            teacher_queue_depth: 8,
             threads: 1,
             score_drop_abs: 32_000,
             write_nnue_forward_fixture: None,
@@ -413,6 +415,10 @@ impl Args {
                 "--loader-threads" => {
                     parsed.loader_threads =
                         parse_usize_arg(required_arg(&mut args, "--loader-threads")?, "--loader-threads")?;
+                }
+                "--teacher-queue-depth" => {
+                    parsed.teacher_queue_depth =
+                        parse_usize_arg(required_arg(&mut args, "--teacher-queue-depth")?, "--teacher-queue-depth")?;
                 }
                 "--threads" => {
                     parsed.threads = parse_usize_arg(required_arg(&mut args, "--threads")?, "--threads")?;
@@ -1484,7 +1490,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         })?;
     } else {
         std::thread::scope(|scope| -> bulletou_cuda_oxide_runtime::Result<()> {
-            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let (tx, rx) = std::sync::mpsc::sync_channel(args.teacher_queue_depth.max(1));
             let producer = scope.spawn(move || {
                 bulletou_lib::value::for_each_halfkp_teacher_fast_batch(&teacher_batch_config, train_steps, |loaded| {
                     tx.send(loaded).map_err(|err| format!("teacher batch consumer stopped: {err}"))
@@ -1628,6 +1634,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  steps        : {}", run_steps);
     println!("  loss_points  : {}", losses.len());
     println!("  batches/sb   : {}", args.batches_per_superbatch);
+    println!("  queue_depth  : {}", args.teacher_queue_depth.max(1));
     if use_async_pipeline {
         let interval = if args.loss_readback_interval > 0 {
             args.loss_readback_interval
@@ -5220,7 +5227,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
