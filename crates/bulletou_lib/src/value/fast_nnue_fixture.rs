@@ -3,7 +3,9 @@
 //! The `cuda-oxide/` workspace intentionally does not depend on the root
 //! BulletOu workspace. This tiny binary format is the bridge: root-side code can
 //! export an already-built `FastBatchHost` plus `NnueForwardWeights`, and
-//! `bulletou-cuda-train --nnue-forward-fixture` can consume the file.
+//! `bulletou-cuda-train --nnue-forward-fixture` can consume the file. The
+//! training fixture variant appends the prepared targets and entry weights so
+//! cuda-oxide smokes can exercise loss-driven backward/update paths.
 
 use std::{
     fmt,
@@ -14,6 +16,7 @@ use std::{
 use crate::value::{FastBatchHost, FastNnueError, NnueForwardWeights};
 
 pub const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
+pub const NNUE_TRAIN_FIXTURE_MAGIC: &[u8; 8] = b"BOUNTRN1";
 
 #[derive(Debug)]
 pub enum NnueForwardFixtureError {
@@ -99,6 +102,63 @@ pub fn write_nnue_forward_fixture(
     Ok(())
 }
 
+pub fn write_nnue_train_fixture_file(
+    path: impl AsRef<Path>,
+    weights: NnueForwardWeights<'_>,
+    batch: &FastBatchHost,
+) -> Result<(), NnueForwardFixtureError> {
+    let mut writer = io::BufWriter::new(std::fs::File::create(path)?);
+    write_nnue_train_fixture(&mut writer, weights, batch)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn write_nnue_train_fixture(
+    writer: &mut impl Write,
+    weights: NnueForwardWeights<'_>,
+    batch: &FastBatchHost,
+) -> Result<(), NnueForwardFixtureError> {
+    write_nnue_fixture_header_and_payload(writer, NNUE_TRAIN_FIXTURE_MAGIC, weights, batch)?;
+    write_f32_slice(writer, &batch.targets)?;
+    write_f32_slice(writer, &batch.weights)?;
+    Ok(())
+}
+
+fn write_nnue_fixture_header_and_payload(
+    writer: &mut impl Write,
+    magic: &[u8; 8],
+    weights: NnueForwardWeights<'_>,
+    batch: &FastBatchHost,
+) -> Result<(), NnueForwardFixtureError> {
+    weights.validate()?;
+    batch.validate().map_err(NnueForwardFixtureError::BatchLayout)?;
+
+    writer.write_all(magic)?;
+    for value in [
+        weights.shape.input_size,
+        weights.shape.l1,
+        weights.shape.l2,
+        weights.shape.l3,
+        batch.layout.batch_size,
+        batch.layout.max_active,
+    ] {
+        write_u64(writer, value as u64)?;
+    }
+
+    write_i32_slice(writer, &batch.stm)?;
+    write_i32_slice(writer, &batch.nstm)?;
+    write_f32_slice(writer, weights.l0w)?;
+    write_f32_slice(writer, weights.l0b)?;
+    write_f32_slice(writer, weights.l1w)?;
+    write_f32_slice(writer, weights.l1b)?;
+    write_f32_slice(writer, weights.l2w)?;
+    write_f32_slice(writer, weights.l2b)?;
+    write_f32_slice(writer, weights.outw)?;
+    write_f32_slice(writer, weights.outb)?;
+
+    Ok(())
+}
+
 fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
@@ -142,6 +202,25 @@ mod tests {
     }
 
     #[test]
+    fn writes_tiny_train_fixture_with_targets_and_entry_weights() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let weights = tiny_weights(shape);
+        let mut batch = tiny_batch();
+        batch.targets = vec![0.25, 0.75];
+        batch.weights = vec![1.0, 0.5];
+        let mut bytes = Vec::new();
+
+        write_nnue_train_fixture(&mut bytes, weights, &batch).unwrap();
+
+        assert_eq!(&bytes[..8], NNUE_TRAIN_FIXTURE_MAGIC);
+        assert_eq!(bytes.len(), 220);
+        assert_eq!(f32_at(&bytes, 204), 0.25);
+        assert_eq!(f32_at(&bytes, 208), 0.75);
+        assert_eq!(f32_at(&bytes, 212), 1.0);
+        assert_eq!(f32_at(&bytes, 216), 0.5);
+    }
+
+    #[test]
     fn rejects_invalid_batch_layout() {
         let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
         let weights = tiny_weights(shape);
@@ -156,6 +235,10 @@ mod tests {
 
     fn u64_at(bytes: &[u8], offset: usize) -> u64 {
         u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn f32_at(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
 
     fn tiny_batch() -> FastBatchHost {

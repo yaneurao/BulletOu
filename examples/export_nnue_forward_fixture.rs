@@ -10,7 +10,7 @@ use bulletou_lib::{
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader,
         },
-        write_nnue_forward_fixture_file,
+        write_nnue_forward_fixture_file, write_nnue_train_fixture_file,
         yaneuraou_kppt::{extract_component_section, parse_model_weights_bin},
     },
 };
@@ -24,6 +24,12 @@ struct Args {
     /// accepted by `bulletou-cuda-train --nnue-forward-fixture`.
     #[arg(long)]
     out: PathBuf,
+
+    /// Write a training fixture (`BOUTRN1`) that includes targets and
+    /// entry_weights. By default, this writes the backward-compatible forward
+    /// fixture (`BOUNFWD1`).
+    #[arg(long)]
+    train_fixture: bool,
 
     /// Fixture size/shape. `tiny` is cheap; `halfkp` matches
     /// NNUE_HALFKP_256x2_32_32 and writes roughly 123 MiB.
@@ -112,9 +118,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let outputs = fixture.weights.forward_batch(&fixture.batch)?;
-    write_nnue_forward_fixture_file(&args.out, fixture.weights.as_borrowed(), &fixture.batch)?;
+    if args.train_fixture {
+        write_nnue_train_fixture_file(&args.out, fixture.weights.as_borrowed(), &fixture.batch)?;
+    } else {
+        write_nnue_forward_fixture_file(&args.out, fixture.weights.as_borrowed(), &fixture.batch)?;
+    }
 
-    println!("exported NNUE forward fixture");
+    println!(
+        "exported NNUE {} fixture",
+        if args.train_fixture { "train" } else { "forward" }
+    );
     println!("  out        : {}", args.out.display());
     println!("  case       : {}", fixture.label);
     println!("  weights    : {}", fixture.weights_source);
