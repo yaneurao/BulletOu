@@ -985,6 +985,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   Validation: direct one-step state -> direct one-step resume produced
   `nnue-halfkp-direct-resume-final.nnuef`; its SHA-256 matched the fixture-backed
   one-shot two-step final exactly, with step2 loss matching the one-shot run.
+- Updated `scripts/cuda_oxide_nnue_teacher_smoke.ps1` so
+  `-RunDirectTeacherTrain` also honors `-ResumeTrainStateFixture`: the fixture
+  path uses the existing total-`-TrainSteps` behavior, while the direct path
+  passes `--train-steps (TrainSteps - completed_steps)` to the cuda-oxide
+  binary. Validation with `-ResumeTrainStateFixture` and
+  `-RunDirectTeacherTrain` wrote `nnue-halfkp-direct-resume-script.nnuef`; its
+  SHA-256 matched the fixture-backed one-shot two-step final exactly.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

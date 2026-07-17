@@ -22,6 +22,8 @@ cuda-oxide workspace separate:
    export/apply only the later teacher batches up to -TrainSteps.
    Pass -RunDirectTeacherTrain to also run the cuda-oxide root-loader bridge
    that reads teacher batches directly without intermediate train fixtures.
+   When combined with -ResumeTrainStateFixture, the direct path also resumes
+   from that BOUNRNG1 state and runs the remaining batches up to -TrainSteps.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -307,6 +309,12 @@ if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
     $wslDirectTrainStateFixture = Convert-ToWslPath $DirectTrainStateFixture
     $directTrainStateArg = " --write-nnue-train-state-fixture `"$wslDirectTrainStateFixture`""
 }
+$directResumeTrainStateArg = ""
+$directTrainSteps = $TrainSteps
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    $directResumeTrainStateArg = " --nnue-train-state-fixture `"$wslResumeTrainStateFixture`""
+    $directTrainSteps = $TrainSteps - $resumeCompletedSteps
+}
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
 $fixtureArgsList = @()
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
@@ -416,7 +424,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher" --train-steps $TrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directResumeTrainStateArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
 "@
 
     Invoke-Checked "NNUE direct teacher train loop" {

@@ -123,7 +123,9 @@ the loader starts at `completed_steps` from the state fixture.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
-to save its readback fixtures.
+to save its readback fixtures. If `-ResumeTrainStateFixture` is also supplied,
+the direct path resumes from the same BOUNRNG1 state and runs the remaining
+batches up to `-TrainSteps`.
 
 WSL2 Ubuntu 24.04 validation example:
 
