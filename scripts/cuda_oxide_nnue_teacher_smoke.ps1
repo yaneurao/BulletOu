@@ -26,6 +26,8 @@ cuda-oxide workspace separate:
    from that BOUNRNG1 state and runs the remaining batches up to -TrainSteps.
    Pass -WeightsBin to initialise fixture/direct fresh runs from root
    weights.bin or bundled state.bin weights instead of deterministic weights.
+   Pass -Output with -RunDirectTeacherTrain to write numbered cuda-oxide bridge
+   checkpoints containing trained-forward.nnuef, state.boung, and learn.log.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -55,7 +57,8 @@ param(
     [string]$ResumeTrainStateFixture,
     [switch]$RunDirectTeacherTrain,
     [string]$DirectTrainedForwardFixture,
-    [string]$DirectTrainStateFixture
+    [string]$DirectTrainStateFixture,
+    [string]$Output
 )
 
 $ErrorActionPreference = "Stop"
@@ -181,6 +184,9 @@ if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
 if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
     $RunDirectTeacherTrain = $true
 }
+if (-not [string]::IsNullOrWhiteSpace($Output)) {
+    $RunDirectTeacherTrain = $true
+}
 
 if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
@@ -196,6 +202,10 @@ if (-not [string]::IsNullOrWhiteSpace($WeightsBin) -and -not [string]::IsNullOrW
 
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and -not (Test-Path -LiteralPath $ResumeTrainStateFixture)) {
     throw "Resume train-state fixture not found: $ResumeTrainStateFixture"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($Output)) {
+    New-Item -ItemType Directory -Force -Path $Output | Out-Null
 }
 
 if ([string]::IsNullOrWhiteSpace($Fixture)) {
@@ -336,6 +346,11 @@ if (-not [string]::IsNullOrWhiteSpace($WeightsBin)) {
     $wslWeightsBin = Convert-ToWslPath $WeightsBin
     $directWeightsArg = " --weights-bin `"$wslWeightsBin`""
 }
+$directOutputArg = ""
+if (-not [string]::IsNullOrWhiteSpace($Output)) {
+    $wslOutput = Convert-ToWslPath $Output
+    $directOutputArg = " --output `"$wslOutput`""
+}
 $directResumeTrainStateArg = ""
 $directTrainSteps = $TrainSteps
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
@@ -451,7 +466,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directWeightsArg$directResumeTrainStateArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directWeightsArg$directResumeTrainStateArg$directOutputArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
 "@
 
     Invoke-Checked "NNUE direct teacher train loop" {
@@ -485,4 +500,8 @@ if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
 if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
     Write-Host "direct train state fixture:"
     Write-Host "  $DirectTrainStateFixture"
+}
+if (-not [string]::IsNullOrWhiteSpace($Output)) {
+    Write-Host "direct bridge checkpoint output:"
+    Write-Host "  $Output"
 }

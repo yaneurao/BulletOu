@@ -115,19 +115,26 @@ cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --nnue-teacher-train \
   --teacher /mnt/c/shogi/teacher/yane-distill-hcpe-20260508shuffled/shuffled-001.hcpe \
   --weights-bin /mnt/c/path/to/checkpoint/state.bin \
+  --output /mnt/c/path/to/cuda-oxide-checkpoints \
   --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 
 Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training.
 In this mode `--train-steps` is the number of additional batches to run, and
 the loader starts at `completed_steps` from the state fixture.
+Pass `--output <DIR>` to write a numbered cuda-oxide bridge checkpoint:
+`<DIR>/0001/trained-forward.nnuef`, `<DIR>/0001/state.boung`, and
+`<DIR>/0001/learn.log`. This is not yet the final BulletOu-compatible
+`nn.bin` / `state.bin` checkpoint layout, but it gives the direct trainer a
+stable save/resume artifact while that compatibility layer is being built.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
 to save its readback fixtures. If `-ResumeTrainStateFixture` is also supplied,
 the direct path resumes from the same BOUNRNG1 state and runs the remaining
 batches up to `-TrainSteps`. Use `-WeightsBin <PATH>` to initialise fresh
-fixture/direct runs from root weights.
+fixture/direct runs from root weights. Use `-Output <DIR>` to pass the bridge
+checkpoint output directory to the direct path.
 
 WSL2 Ubuntu 24.04 validation example:
 

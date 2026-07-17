@@ -1005,6 +1005,14 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   teacher train now use the same root weights. Validation with `-RunDirectTeacherTrain`
   wrote `nnue-halfkp-direct-realweights-script.nnuef`, whose SHA-256 matched the
   manual direct real-weights run exactly.
+- Added `--output <DIR>` to `--nnue-teacher-train` as a first numbered
+  cuda-oxide bridge checkpoint writer. It creates `<DIR>/000N/` and writes
+  `trained-forward.nnuef`, `state.boung` (`BOUNRNG1`), and a tab-separated
+  `learn.log`. The PowerShell smoke helper forwards this as `-Output <DIR>`.
+  Validation with actual checkpoint weights and
+  `shuffled-001.hcpe` wrote `target/cuda-oxide-fixtures/nnue-bridge-output-smoke/0001`;
+  `state.boung` had `completed_steps=1`, and `trained-forward.nnuef` passed
+  `--nnue-forward-smoke --debug-readback` (`compare: ok`).
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

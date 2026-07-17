@@ -87,6 +87,7 @@ struct Args {
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     weights_bin: Option<std::path::PathBuf>,
     teacher: Option<String>,
+    output: Option<std::path::PathBuf>,
     train_steps: usize,
     batch_size: usize,
     buffer_mb: usize,
@@ -171,6 +172,7 @@ impl Args {
             nnue_train_fixture_args: Vec::new(),
             weights_bin: None,
             teacher: None,
+            output: None,
             train_steps: 1,
             batch_size: 2,
             buffer_mb: 1,
@@ -250,6 +252,7 @@ impl Args {
                 }
                 "--weights-bin" => parsed.weights_bin = Some(required_path_arg(&mut args, "--weights-bin")?),
                 "--teacher" => parsed.teacher = Some(required_arg(&mut args, "--teacher")?),
+                "--output" => parsed.output = Some(required_path_arg(&mut args, "--output")?),
                 "--train-steps" => {
                     parsed.train_steps = parse_usize_arg(required_arg(&mut args, "--train-steps")?, "--train-steps")?;
                 }
@@ -1189,6 +1192,22 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let state = runner.read_state(&stream)?;
         write_nnue_train_state_fixture(path, shape, completed_step_offset + run_steps, &state)?;
     }
+    let bridge_checkpoint = if let Some(output_dir) = &args.output {
+        let weights = runner.read_weights(&stream)?;
+        let state = runner.read_state(&stream)?;
+        Some(write_nnue_bridge_checkpoint(
+            output_dir,
+            shape,
+            completed_step_offset + run_steps,
+            weights,
+            &state,
+            last_batch,
+            &losses,
+            &sources,
+        )?)
+    } else {
+        None
+    };
 
     println!("bulletou-cuda-train NNUE teacher train");
     println!("  ptx          : {}", ptx.display());
@@ -1206,7 +1225,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     );
     println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
-    for (step, weighted_sum, mean) in losses {
+    for (step, weighted_sum, mean) in &losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
     }
     if let Some(path) = &args.write_nnue_trained_forward_fixture {
@@ -1215,8 +1234,168 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(path) = &args.write_nnue_train_state_fixture {
         println!("  wrote state  : {}", path.display());
     }
+    if let Some(checkpoint) = &bridge_checkpoint {
+        println!("  output       : {}", checkpoint.dir.display());
+        println!("  checkpoint   : {:04}", checkpoint.index);
+        println!("    forward    : {}", checkpoint.forward_path.display());
+        println!("    state      : {}", checkpoint.state_path.display());
+        println!("    learn_log  : {}", checkpoint.learn_log_path.display());
+    }
     println!("  train        : ok");
 
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+struct NnueBridgeCheckpointWrite {
+    index: usize,
+    dir: std::path::PathBuf,
+    forward_path: std::path::PathBuf,
+    state_path: std::path::PathBuf,
+    learn_log_path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_bridge_checkpoint(
+    output_dir: &std::path::Path,
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    completed_steps: usize,
+    weights: nnue_train_step::NnueTrainWeightsReadback,
+    state: &nnue_train_step::NnueTrainStateReadback,
+    last_batch: &NnueTrainBatchCase,
+    losses: &[(usize, f32, f32)],
+    sources: &[String],
+) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeCheckpointWrite> {
+    if losses.len() != sources.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal bridge checkpoint log mismatch: losses={} sources={}",
+            losses.len(),
+            sources.len()
+        )));
+    }
+
+    let (index, dir) = create_next_numbered_checkpoint_dir(output_dir)?;
+    let forward_path = dir.join("trained-forward.nnuef");
+    let state_path = dir.join("state.boung");
+    let learn_log_path = dir.join("learn.log");
+
+    let trained_forward = NnueForwardCase {
+        label: "teacher-trained-bridge-checkpoint",
+        shape,
+        batch_size: last_batch.batch_size,
+        max_active: last_batch.max_active,
+        stm: last_batch.stm.clone(),
+        nstm: last_batch.nstm.clone(),
+        l0w: weights.l0w,
+        l0b: weights.l0b,
+        l1w: weights.l1w,
+        l1b: weights.l1b,
+        l2w: weights.l2w,
+        l2b: weights.l2b,
+        outw: weights.outw,
+        outb: weights.outb,
+    };
+    trained_forward.write_fixture(&forward_path)?;
+    write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
+    write_nnue_bridge_learn_log(&learn_log_path, losses, sources)?;
+
+    Ok(NnueBridgeCheckpointWrite { index, dir, forward_path, state_path, learn_log_path })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn create_next_numbered_checkpoint_dir(
+    output_dir: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<(usize, std::path::PathBuf)> {
+    std::fs::create_dir_all(output_dir).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create checkpoint output dir {}: {err}",
+            output_dir.display()
+        ))
+    })?;
+
+    let mut max_index = 0usize;
+    for entry in std::fs::read_dir(output_dir).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read checkpoint output dir {}: {err}",
+            output_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read checkpoint output entry in {}: {err}",
+                output_dir.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read checkpoint output entry type {}: {err}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let index = name.parse::<usize>().map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to parse checkpoint dir index {}: {err}",
+                entry.path().display()
+            ))
+        })?;
+        max_index = max_index.max(index);
+    }
+
+    let index = max_index + 1;
+    let dir = output_dir.join(format!("{index:04}"));
+    std::fs::create_dir(&dir).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create checkpoint dir {}: {err}",
+            dir.display()
+        ))
+    })?;
+    Ok((index, dir))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_bridge_learn_log(
+    path: &std::path::Path,
+    losses: &[(usize, f32, f32)],
+    sources: &[String],
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?);
+
+    writeln!(writer, "step\tweighted_sum\tmean\tsource").map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?;
+    for ((step, weighted_sum, mean), source) in losses.iter().zip(sources.iter()) {
+        writeln!(writer, "{step}\t{weighted_sum}\t{mean}\t{source}").map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write bridge checkpoint learn.log {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -2654,7 +2833,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--train-steps <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--output <DIR>] [--train-steps <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -2723,7 +2902,8 @@ fn usage() -> &'static str {
      It uses deterministic HalfKP initial weights by default, or --weights-bin\n\
      to load root weights.bin / bundled state.bin weights. It also supports\n\
      --nnue-train-state-fixture resume and the same output fixture/state write\n\
-     flags as --nnue-fixture-train.\n\
+     flags as --nnue-fixture-train. --output writes a numbered cuda-oxide\n\
+     bridge checkpoint with trained-forward.nnuef, state.boung, and learn.log.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
