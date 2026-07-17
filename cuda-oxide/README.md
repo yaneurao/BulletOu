@@ -124,9 +124,13 @@ In this mode `--train-steps` is the number of additional batches to run, and
 the loader starts at `completed_steps` from the state fixture.
 Pass `--output <DIR>` to write a numbered cuda-oxide bridge checkpoint:
 `<DIR>/0001/trained-forward.nnuef`, `<DIR>/0001/state.boung`, and
-`<DIR>/0001/learn.log`. This is not yet the final BulletOu-compatible
-`nn.bin` / `state.bin` checkpoint layout, but it gives the direct trainer a
-stable save/resume artifact while that compatibility layer is being built.
+`<DIR>/0001/learn.log`. If `<DIR>` already contains numbered bridge
+checkpoints, the direct trainer automatically restores the latest
+`state.boung` and writes the next number. In that case omit `--weights-bin`,
+because the restored train state already carries weights and optimizer state.
+This is not yet the final BulletOu-compatible `nn.bin` / `state.bin`
+checkpoint layout, but it gives the direct trainer a stable save/resume
+artifact while that compatibility layer is being built.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`

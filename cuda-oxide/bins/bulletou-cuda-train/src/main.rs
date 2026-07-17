@@ -1047,16 +1047,29 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => default_nnue_ptx()?,
     };
 
-    if args.weights_bin.is_some() && args.nnue_train_state_fixture.is_some() {
+    let output_resume_train_state_fixture = if args.nnue_train_state_fixture.is_none() {
+        match args.output.as_deref() {
+            Some(output_dir) => find_latest_bridge_train_state(output_dir)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let train_state_fixture = args
+        .nnue_train_state_fixture
+        .as_deref()
+        .or(output_resume_train_state_fixture.as_deref());
+
+    if args.weights_bin.is_some() && train_state_fixture.is_some() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--weights-bin cannot be used together with --nnue-train-state-fixture; the train-state fixture already contains weights".to_string(),
+            "--weights-bin cannot be used together with a restored train state; the train-state fixture already contains weights".to_string(),
         ));
     }
     let initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfkp_weights_as_nnue_case(path)?,
         None => NnueForwardCase::new(NnueForwardCaseKind::Halfkp),
     };
-    let restored_state = match args.nnue_train_state_fixture.as_deref() {
+    let restored_state = match train_state_fixture {
         Some(path) => Some(NnueTrainStateCase::read_fixture(path)?),
         None => None,
     };
@@ -1213,6 +1226,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
     println!("  teacher      : {teacher}");
+    if let Some(path) = train_state_fixture {
+        println!("  resume_state : {}", path.display());
+    }
     println!("  batches      : {}", sources.len());
     for (idx, source) in sources.iter().enumerate() {
         println!("    [{}] {}", idx + 1, source);
@@ -1326,28 +1342,9 @@ fn create_next_numbered_checkpoint_dir(
                 output_dir.display()
             ))
         })?;
-        let file_type = entry.file_type().map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "failed to read checkpoint output entry type {}: {err}",
-                entry.path().display()
-            ))
-        })?;
-        if !file_type.is_dir() {
-            continue;
+        if let Some(index) = numbered_checkpoint_dir_index(&entry)? {
+            max_index = max_index.max(index);
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
-        let index = name.parse::<usize>().map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "failed to parse checkpoint dir index {}: {err}",
-                entry.path().display()
-            ))
-        })?;
-        max_index = max_index.max(index);
     }
 
     let index = max_index + 1;
@@ -1359,6 +1356,66 @@ fn create_next_numbered_checkpoint_dir(
         ))
     })?;
     Ok((index, dir))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn find_latest_bridge_train_state(
+    output_dir: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<Option<std::path::PathBuf>> {
+    if !output_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut latest = None;
+    for entry in std::fs::read_dir(output_dir).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read checkpoint output dir {}: {err}",
+            output_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read checkpoint output entry in {}: {err}",
+                output_dir.display()
+            ))
+        })?;
+        let Some(index) = numbered_checkpoint_dir_index(&entry)? else {
+            continue;
+        };
+        let state_path = entry.path().join("state.boung");
+        if state_path.is_file() && latest.as_ref().map_or(true, |(latest_index, _)| index > *latest_index) {
+            latest = Some((index, state_path));
+        }
+    }
+
+    Ok(latest.map(|(_, state_path)| state_path))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn numbered_checkpoint_dir_index(entry: &std::fs::DirEntry) -> bulletou_cuda_oxide_runtime::Result<Option<usize>> {
+    let file_type = entry.file_type().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read checkpoint output entry type {}: {err}",
+            entry.path().display()
+        ))
+    })?;
+    if !file_type.is_dir() {
+        return Ok(None);
+    }
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Ok(None);
+    };
+    if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let index = name.parse::<usize>().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to parse checkpoint dir index {}: {err}",
+            entry.path().display()
+        ))
+    })?;
+    Ok(Some(index))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -2903,7 +2960,8 @@ fn usage() -> &'static str {
      to load root weights.bin / bundled state.bin weights. It also supports\n\
      --nnue-train-state-fixture resume and the same output fixture/state write\n\
      flags as --nnue-fixture-train. --output writes a numbered cuda-oxide\n\
-     bridge checkpoint with trained-forward.nnuef, state.boung, and learn.log.\n\
+     bridge checkpoint with trained-forward.nnuef, state.boung, and learn.log,\n\
+     and auto-resumes the latest numbered state.boung on later runs.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\

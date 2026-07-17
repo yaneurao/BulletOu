@@ -1013,6 +1013,12 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `shuffled-001.hcpe` wrote `target/cuda-oxide-fixtures/nnue-bridge-output-smoke/0001`;
   `state.boung` had `completed_steps=1`, and `trained-forward.nnuef` passed
   `--nnue-forward-smoke --debug-readback` (`compare: ok`).
+- Added bridge checkpoint auto-resume for `--nnue-teacher-train --output`.
+  When no explicit `--nnue-train-state-fixture` is supplied, the direct trainer
+  scans numbered `<output>/000N/state.boung` files, restores the latest one, and
+  writes the next numbered checkpoint. `--weights-bin` is rejected when any train
+  state is restored, because the state already contains weights and optimizer
+  buffers.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
