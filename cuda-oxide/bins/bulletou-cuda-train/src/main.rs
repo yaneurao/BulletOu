@@ -1267,6 +1267,8 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     let use_async_pipeline = save_interval_steps.is_none();
     let mut pending_async_step: Option<PendingAsyncTeacherStep> = None;
+    let mut train_timer: Option<std::time::Instant> = None;
+    let mut train_positions = 0usize;
     let mut run_steps = 0usize;
     let teacher_batch_index = if dataloader_resume_pos.is_some()
         || resume_teacher_matches
@@ -1347,6 +1349,8 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 batch_size: train_batch.batch_size,
                 max_active: train_batch.max_active,
             };
+            train_timer.get_or_insert_with(std::time::Instant::now);
+            train_positions = train_positions.saturating_add(train_batch.batch_size);
 
             if use_async_pipeline {
                 let completed_loss = runner_ref.step_pipelined(
@@ -1448,6 +1452,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         }
     }
 
+    let train_elapsed = train_timer.map(|started| started.elapsed());
     let runner = runner.as_ref().expect("validated non-empty teacher train steps");
     let last_batch = last_batch.as_ref().expect("validated non-empty teacher train steps");
     if let Some(path) = &args.write_nnue_trained_forward_fixture {
@@ -1567,6 +1572,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         } else {
             println!("  save_rate    : final");
         }
+    }
+    if let Some(elapsed) = train_elapsed {
+        let seconds = elapsed.as_secs_f64();
+        let pos_per_sec = train_positions as f64 / seconds.max(1e-9);
+        println!("  throughput   : positions={train_positions} time={seconds:.3}s pos/sec={pos_per_sec:.0}");
     }
     for (step, weighted_sum, mean) in &losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");

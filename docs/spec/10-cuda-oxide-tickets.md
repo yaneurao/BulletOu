@@ -12,7 +12,7 @@ commit each completed slice.
 | BO-CUDA-004 | done | validation metrics integration | cuda-oxide checkpoints write production-compatible `learn.log` / `summary-learn.log` columns including `test_value_accuracy`, `test_value_loss`, and `train_value_loss` |
 | BO-CUDA-005 | done | dataloader resume generalisation | HCPE3, shogipack, multi-teacher specs, and teacher changes have explicit resume behavior and smoke coverage |
 | BO-CUDA-006 | done | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
-| BO-CUDA-007 | todo | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
+| BO-CUDA-007 | done | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
 | BO-CUDA-008 | todo | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 
 ## Notes
@@ -88,3 +88,16 @@ commit each completed slice.
   - WSL: `cargo test -p bulletou-cuda-train --features cuda,root-loader dataloader_pos -- --nocapture`
   - WSL CUDA async final-output smoke on `shuffled-001.hcpe` with `--train-steps 2 --batch-size 2` wrote `0001/{nn.bin,state.boung,state.bin,teacher.txt,dataloader_pos.txt,learn.log,trained-forward.nnuef}`, `summary-learn.log`, and `dataloader_pos.txt = 152,0`.
   - WSL CUDA async-vs-sync baseline smoke on the same teacher produced identical losses: step1 `weighted_sum=0.4999314 mean=0.2499657`, step2 `weighted_sum=0.013783315 mean=0.0068916576`.
+
+### BO-CUDA-007
+
+- Added a cuda-oxide NNUE teacher-train throughput line: `throughput : positions=... time=...s pos/sec=...`.
+- The timer starts when the first prepared training batch is submitted, so it excludes initial teacher prefill in the same spirit as the Bullet backend superbatch timer, and includes the final async loss drain.
+- Validation:
+  - `cargo check -p bulletou-cuda-train`
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`
+  - WSL CUDA throughput smoke on `shuffled-001.hcpe`: `--train-steps 8 --batches-per-superbatch 8 --batch-size 64` printed `throughput : positions=512 time=1.449s pos/sec=353`.
+  - Same-teacher/same-schedule debug benchmark on RTX 4090, fixed 1-superbatch step schedule (`lr=0.01`, `lr_min=0.01`, `lr_step_gamma=1`, Ranger `weight_decay=0.01 beta1=0.99 beta2=0.999 epsilon=1e-8`, `loader_threads=1`, `threads=1`):
+    - 512 positions (`batch_size=64`, 8 batches): Bullet backend `2130 pos/sec`; cuda-oxide `353 pos/sec`.
+    - 8192 positions (`batch_size=1024`, 8 batches): Bullet backend `18109 pos/sec`; cuda-oxide `1037 pos/sec`.
+  - These are debug-build smoke numbers for regression tracking, not final tuned production throughput.
