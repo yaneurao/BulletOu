@@ -12,6 +12,8 @@ cuda-oxide workspace separate:
    a local ignored fixture file under target/.
 2. WSL2/cuda-oxide workspace: build/load the cuda-oxide kernels and run
    --nnue-loss-ranger-step-smoke against that fixture.
+   Pass -RunFixtureTrain to also run the non-comparing --nnue-fixture-train
+   loop against the same fixtures.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -33,7 +35,8 @@ param(
     [string]$LossKind = "sigmoid-mse",
     [int]$TrainSteps = 1,
     [switch]$SkipCudaBuild,
-    [switch]$DebugReadback
+    [switch]$DebugReadback,
+    [switch]$RunFixtureTrain
 )
 
 $ErrorActionPreference = "Stop"
@@ -208,6 +211,21 @@ cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-loss-ranger
 
 Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {
     $shim | wsl -d $WslDistro -- bash -lc $runCommand
+}
+
+if ($RunFixtureTrain) {
+    $fixtureTrainCommand = @"
+cat > /tmp/nvjitlink_shim.c &&
+gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu -lnvJitLink &&
+cd "$wslCudaRoot"
+$cudaEnv
+export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
+cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-fixture-train $fixtureArgs --loss-kind $LossKind$debugFlag
+"@
+
+    Invoke-Checked "NNUE fixture train loop with real teacher fixtures" {
+        $shim | wsl -d $WslDistro -- bash -lc $fixtureTrainCommand
+    }
 }
 
 Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"

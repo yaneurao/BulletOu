@@ -889,6 +889,11 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `cargo check -p bulletou-cuda-train --features cuda`,
   manual `--nnue-fixture-train` on the two real-teacher fixtures, and the
   real-teacher `-TrainSteps 2 -DebugReadback` smoke all passed.
+- Added `-RunFixtureTrain` to `scripts/cuda_oxide_nnue_teacher_smoke.ps1`.
+  When set, the script runs the normal CPU-golden smoke first, then runs the
+  non-comparing `--nnue-fixture-train` loop against the same generated
+  fixtures. Validation with `-SkipCudaBuild -TrainSteps 2 -DebugReadback
+  -RunFixtureTrain` passed.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
