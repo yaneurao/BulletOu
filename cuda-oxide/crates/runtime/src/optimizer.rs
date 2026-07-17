@@ -174,6 +174,47 @@ impl RangerLookaheadParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangerUpdateParams {
+    pub radam: RAdamUpdateParams,
+    pub lookahead: RangerLookaheadParams,
+    pub k: usize,
+}
+
+impl Default for RangerUpdateParams {
+    fn default() -> Self {
+        Self {
+            radam: RAdamUpdateParams {
+                decay: 0.01,
+                beta1: 0.99,
+                beta2: 0.999,
+                min_weight: -1.98,
+                max_weight: 1.98,
+                ..Default::default()
+            },
+            lookahead: RangerLookaheadParams::default(),
+            k: 6,
+        }
+    }
+}
+
+impl RangerUpdateParams {
+    pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
+        self.radam.validate()?;
+        self.lookahead.validate()?;
+        if self.k == 0 {
+            Err(OptimizerLayoutError::InvalidLookaheadPeriod)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn should_lookahead(self) -> std::result::Result<bool, OptimizerLayoutError> {
+        self.validate()?;
+        Ok(self.radam.step.is_multiple_of(self.k))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdamWUpdateLayout {
     pub len: usize,
@@ -264,6 +305,36 @@ impl RangerLookaheadLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangerUpdateLayout {
+    pub len: usize,
+}
+
+impl RangerUpdateLayout {
+    pub fn new(len: usize) -> Self {
+        Self { len }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
+        if self.len == 0 {
+            Err(OptimizerLayoutError::EmptyParameters)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangerUpdateLaunchPlan {
+    pub threads: usize,
+}
+
+impl RangerUpdateLaunchPlan {
+    pub fn new(layout: RangerUpdateLayout) -> Self {
+        Self { threads: layout.len.max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum OptimizerLayoutError {
     #[error("optimizer parameter buffer must contain at least one element")]
@@ -276,6 +347,8 @@ pub enum OptimizerLayoutError {
     InvalidBeta { name: &'static str },
     #[error("optimizer lookahead alpha must be finite and in [0, 1]")]
     InvalidAlpha,
+    #[error("optimizer lookahead period k must be greater than zero")]
+    InvalidLookaheadPeriod,
     #[error("optimizer n_sma_threshold must be finite and non-negative")]
     InvalidNSmaThreshold,
     #[error("optimizer epsilon must be finite and positive")]
@@ -420,5 +493,51 @@ mod tests {
             RangerLookaheadParams { alpha: 1.1 }.validate().unwrap_err(),
             OptimizerLayoutError::InvalidAlpha
         );
+    }
+
+    #[test]
+    fn ranger_update_layout_counts_threads() {
+        let layout = RangerUpdateLayout::new(29);
+
+        assert_eq!(RangerUpdateLaunchPlan::new(layout).threads, 29);
+    }
+
+    #[test]
+    fn ranger_update_layout_rejects_empty_parameters() {
+        assert_eq!(
+            RangerUpdateLayout::new(0).validate().unwrap_err(),
+            OptimizerLayoutError::EmptyParameters
+        );
+    }
+
+    #[test]
+    fn ranger_update_params_validate_defaults() {
+        RangerUpdateParams::default().validate().unwrap();
+    }
+
+    #[test]
+    fn ranger_update_params_reject_invalid_k() {
+        assert_eq!(
+            RangerUpdateParams { k: 0, ..Default::default() }.validate().unwrap_err(),
+            OptimizerLayoutError::InvalidLookaheadPeriod
+        );
+    }
+
+    #[test]
+    fn ranger_update_params_detect_lookahead_step() {
+        assert!(!RangerUpdateParams {
+            radam: RAdamUpdateParams { step: 5, ..Default::default() },
+            k: 3,
+            ..Default::default()
+        }
+        .should_lookahead()
+        .unwrap());
+        assert!(RangerUpdateParams {
+            radam: RAdamUpdateParams { step: 6, ..Default::default() },
+            k: 3,
+            ..Default::default()
+        }
+        .should_lookahead()
+        .unwrap());
     }
 }

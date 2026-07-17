@@ -595,3 +595,29 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-010 work: add full Ranger chain smoke (`RAdam update ->
   conditional Lookahead`), then wire optimizer state buffers into the real
   trainer path.
+
+### 2026-07-17 CO-010 Ranger update chain smoke
+
+- Added cuda-oxide runtime layout/params for the composed Ranger update:
+  `RangerUpdateLayout { len }` and `RangerUpdateParams { radam, lookahead, k }`.
+- Added host launcher `launch_ranger_update`:
+  - always launches the RAdam update for the current step;
+  - launches `ranger_lookahead` only when `step % k == 0`.
+- Added CLI:
+  `bulletou-cuda-train --ranger-update-smoke`.
+- The smoke runs six 7-parameter RAdam steps with `k=3`, so Lookahead fires on
+  steps 3 and 6. It compares final `weights`, `momentum`, `velocity`, and
+  `slow_params` against a CPU scalar golden.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--ranger-update-smoke --debug-readback` succeeded on RTX 4090:
+    Lookahead fired on steps `[3, 6]`; `weights` and `slow_params` max_abs diff
+    `0`, `momentum` max_abs diff `0.00000000011641532`, and `velocity`
+    max_abs diff `0.0000000000009094947`.
+- Remaining CO-010 work: wire optimizer state buffers into the real trainer
+  path.

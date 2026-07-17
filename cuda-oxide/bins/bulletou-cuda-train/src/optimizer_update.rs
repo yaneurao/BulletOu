@@ -6,6 +6,7 @@ use bulletou_cuda_oxide_runtime::{
     optimizer::{
         AdamWUpdateLaunchPlan, AdamWUpdateLayout, AdamWUpdateParams, RAdamUpdateLaunchPlan, RAdamUpdateLayout,
         RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams,
+        RangerUpdateLayout, RangerUpdateParams,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -138,6 +139,45 @@ pub(crate) fn launch_ranger_lookahead(
             ]
         }
     }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_ranger_update(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: RangerUpdateLayout,
+    params: RangerUpdateParams,
+    gradients: &DeviceBuffer<f32>,
+    weights: &mut DeviceBuffer<f32>,
+    momentum: &mut DeviceBuffer<f32>,
+    velocity: &mut DeviceBuffer<f32>,
+    slow_params: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    params.validate()?;
+    launch_radam_update(
+        stream,
+        module,
+        RAdamUpdateLayout::new(layout.len),
+        params.radam,
+        gradients,
+        weights,
+        momentum,
+        velocity,
+    )?;
+
+    if params.should_lookahead()? {
+        launch_ranger_lookahead(
+            stream,
+            module,
+            RangerLookaheadLayout::new(layout.len),
+            params.lookahead,
+            weights,
+            slow_params,
+        )?;
+    }
 
     Ok(())
 }

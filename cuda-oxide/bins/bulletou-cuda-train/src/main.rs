@@ -47,6 +47,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::AdamWUpdate => run_adamw_update_smoke(args),
         SmokeMode::RAdamUpdate => run_radam_update_smoke(args),
         SmokeMode::RangerLookahead => run_ranger_lookahead_smoke(args),
+        SmokeMode::RangerUpdate => run_ranger_update_smoke(args),
         SmokeMode::SfnnOutputBackward => run_sfnn_output_backward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
     }
@@ -83,6 +84,7 @@ enum SmokeMode {
     AdamWUpdate,
     RAdamUpdate,
     RangerLookahead,
+    RangerUpdate,
     SfnnOutputBackward,
     SfnnForward,
 }
@@ -146,6 +148,7 @@ impl Args {
                 "--adamw-update-smoke" => parsed.mode = SmokeMode::AdamWUpdate,
                 "--radam-update-smoke" => parsed.mode = SmokeMode::RAdamUpdate,
                 "--ranger-lookahead-smoke" => parsed.mode = SmokeMode::RangerLookahead,
+                "--ranger-update-smoke" => parsed.mode = SmokeMode::RangerUpdate,
                 "--sfnn-dense-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-output-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
@@ -824,6 +827,78 @@ fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
 }
 
 #[cfg(feature = "cuda")]
+fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{optimizer::RangerUpdateLayout, DeviceBuffer};
+
+    let case = RangerUpdateCase::tiny();
+    let cpu_trace = case.cpu_update_trace()?;
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let layout = RangerUpdateLayout::new(case.weights.len());
+    let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
+    let mut momentum = DeviceBuffer::from_host(&stream, &case.momentum)?;
+    let mut velocity = DeviceBuffer::from_host(&stream, &case.velocity)?;
+    let mut slow_params = DeviceBuffer::from_host(&stream, &case.slow_params)?;
+
+    for step_idx in 0..case.gradients_by_step.len() {
+        let gradients = DeviceBuffer::from_host(&stream, &case.gradients_by_step[step_idx])?;
+        optimizer_update::launch_ranger_update(
+            &stream,
+            &module,
+            layout,
+            case.params_for_step(step_idx + 1),
+            &gradients,
+            &mut weights,
+            &mut momentum,
+            &mut velocity,
+            &mut slow_params,
+        )?;
+    }
+    stream.synchronize()?;
+
+    let gpu_weights = weights.to_host_vec(&stream)?;
+    let gpu_momentum = momentum.to_host_vec(&stream)?;
+    let gpu_velocity = velocity.to_host_vec(&stream)?;
+    let gpu_slow_params = slow_params.to_host_vec(&stream)?;
+    let comparisons = [
+        compare_slices("weights", &cpu_trace.weights, &gpu_weights, args.tolerance)?,
+        compare_slices("momentum", &cpu_trace.momentum, &gpu_momentum, args.tolerance)?,
+        compare_slices("velocity", &cpu_trace.velocity, &gpu_velocity, args.tolerance)?,
+        compare_slices("slow_params", &cpu_trace.slow_params, &gpu_slow_params, args.tolerance)?,
+    ];
+
+    println!("bulletou-cuda-train Ranger update chain smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  len          : {}", case.weights.len());
+    println!("  steps        : {}", case.gradients_by_step.len());
+    println!("  tolerance    : {}", args.tolerance);
+    println!("  params       : k={} alpha={}", case.k, case.lookahead.alpha);
+    for cmp in comparisons {
+        println!(
+            "  {:<11}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
+    }
+    if args.debug_readback {
+        println!("  lookahead at : {:?}", cpu_trace.lookahead_steps);
+        println!("  cpu weights  : {:?}", cpu_trace.weights);
+        println!("  gpu weights  : {:?}", gpu_weights);
+        println!("  gpu slow     : {:?}", gpu_slow_params);
+    }
+    println!("  compare      : ok");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::nnue::{
         NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
@@ -1358,6 +1433,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --ranger-lookahead-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --ranger-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -1390,6 +1466,9 @@ fn usage() -> &'static str {
      rectified denominator branches.\n\
      CO-010 Ranger lookahead smoke: compare the fast/slow parameter\n\
      interpolation kernel against a CPU scalar golden.\n\
+     CO-010 Ranger update smoke: chain RAdam updates with conditional\n\
+     Lookahead steps and compare all optimizer state buffers against a CPU\n\
+     scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1580,6 +1659,113 @@ impl RangerLookaheadCase {
         }
 
         RangerLookaheadTrace { weights: updated.clone(), slow_params: updated }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RangerUpdateCase {
+    label: &'static str,
+    gradients_by_step: Vec<Vec<f32>>,
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    slow_params: Vec<f32>,
+    radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams,
+    lookahead: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams,
+    k: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RangerUpdateTrace {
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    slow_params: Vec<f32>,
+    lookahead_steps: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl RangerUpdateCase {
+    fn tiny() -> Self {
+        Self {
+            label: "tiny-radam-lookahead-k3",
+            gradients_by_step: vec![
+                vec![0.10, -0.20, 5.00, -5.00, 0.00, 0.30, -0.40],
+                vec![0.20, -0.10, 4.00, -3.00, 0.05, -0.20, 0.10],
+                vec![-0.15, 0.25, 3.00, -2.50, -0.05, 0.10, -0.30],
+                vec![0.05, 0.15, -2.00, 2.00, 0.10, -0.15, 0.25],
+                vec![-0.10, -0.05, 1.50, -1.50, -0.10, 0.05, -0.20],
+                vec![0.30, -0.30, 0.75, -0.75, 0.20, -0.10, 0.15],
+            ],
+            weights: vec![0.5, -0.25, 1.2, -1.2, 0.0, 0.75, -0.75],
+            momentum: vec![0.0; 7],
+            velocity: vec![0.0; 7],
+            slow_params: vec![0.0; 7],
+            radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
+                gradient_factor: 0.25,
+                learning_rate: 0.01,
+                step: 1,
+                decay: 0.01,
+                beta1: 0.99,
+                beta2: 0.999,
+                n_sma_threshold: 5.0,
+                epsilon: 1.0e-8,
+                min_weight: -1.0,
+                max_weight: 1.0,
+            },
+            lookahead: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams { alpha: 0.5 },
+            k: 3,
+        }
+    }
+
+    fn params_for_step(&self, step: usize) -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+        bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+            radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams { step, ..self.radam },
+            lookahead: self.lookahead,
+            k: self.k,
+        }
+    }
+
+    fn cpu_update_trace(&self) -> bulletou_cuda_oxide_runtime::Result<RangerUpdateTrace> {
+        let mut weights = self.weights.clone();
+        let mut momentum = self.momentum.clone();
+        let mut velocity = self.velocity.clone();
+        let mut slow_params = self.slow_params.clone();
+        let mut lookahead_steps = Vec::new();
+
+        for (step_idx, gradients) in self.gradients_by_step.iter().enumerate() {
+            let step = step_idx + 1;
+            let params = self.params_for_step(step);
+            let step_scale = params.radam.step_scale()?;
+            let rate = params.radam.learning_rate * step_scale.step_size;
+
+            for idx in 0..weights.len() {
+                let grad = params.radam.gradient_factor * gradients[idx];
+                weights[idx] *= 1.0 - params.radam.decay * rate;
+                momentum[idx] = params.radam.beta1 * momentum[idx] + (1.0 - params.radam.beta1) * grad;
+                velocity[idx] = params.radam.beta2 * velocity[idx] + (1.0 - params.radam.beta2) * grad * grad;
+                let mut value = momentum[idx];
+                if step_scale.use_denom {
+                    value /= velocity[idx].sqrt() + params.radam.epsilon;
+                }
+                weights[idx] -= rate * value;
+                weights[idx] = weights[idx].clamp(params.radam.min_weight, params.radam.max_weight);
+            }
+
+            if params.should_lookahead()? {
+                lookahead_steps.push(step);
+                for idx in 0..weights.len() {
+                    let new_weight =
+                        params.lookahead.alpha * weights[idx] + (1.0 - params.lookahead.alpha) * slow_params[idx];
+                    weights[idx] = new_weight;
+                    slow_params[idx] = new_weight;
+                }
+            }
+        }
+
+        Ok(RangerUpdateTrace { weights, momentum, velocity, slow_params, lookahead_steps })
     }
 }
 
