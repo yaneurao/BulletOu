@@ -24,6 +24,8 @@ cuda-oxide workspace separate:
    that reads teacher batches directly without intermediate train fixtures.
    When combined with -ResumeTrainStateFixture, the direct path also resumes
    from that BOUNRNG1 state and runs the remaining batches up to -TrainSteps.
+   Pass -WeightsBin to initialise fixture/direct fresh runs from root
+   weights.bin or bundled state.bin weights instead of deterministic weights.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -38,6 +40,7 @@ param(
     [int]$LoaderThreads = 1,
     [int]$Threads = 1,
     [int]$ScoreDropAbs = 32000,
+    [string]$WeightsBin,
     [string]$Fixture,
     [string]$WslDistro = "Ubuntu-24.04",
     [string]$CudaArch = "sm_89",
@@ -183,6 +186,14 @@ if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
 }
 
+if (-not [string]::IsNullOrWhiteSpace($WeightsBin) -and -not (Test-Path -LiteralPath $WeightsBin)) {
+    throw "Weights file not found: $WeightsBin"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($WeightsBin) -and -not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    throw "-WeightsBin cannot be combined with -ResumeTrainStateFixture; the train-state fixture already contains weights"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and -not (Test-Path -LiteralPath $ResumeTrainStateFixture)) {
     throw "Resume train-state fixture not found: $ResumeTrainStateFixture"
 }
@@ -257,9 +268,19 @@ if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
     New-Item -ItemType File -Force -Path $DirectTrainStateFixture | Out-Null
 }
 
+$weightsExportArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($WeightsBin)) {
+    $weightsExportArgs = @("--weights-bin", $WeightsBin)
+}
+
 foreach ($spec in $fixtureSpecs) {
     $step = [int]$spec.Step
     $outFixture = $spec.Path
+    $fixtureWeightsArgs = if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and $step -eq 0) {
+        $weightsExportArgs
+    } else {
+        @()
+    }
     Invoke-Checked "export NNUE HalfKP teacher train fixture batch $step" {
         Set-Location $repoRoot
         $fixtureKindFlag = if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and $step -eq 0) {
@@ -271,6 +292,7 @@ foreach ($spec in $fixtureSpecs) {
             --out $outFixture `
             $fixtureKindFlag `
             --case halfkp `
+            $fixtureWeightsArgs `
             --teacher $Teacher `
             --batch-size $BatchSize `
             --batch-index $step `
@@ -308,6 +330,11 @@ $directTrainStateArg = ""
 if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
     $wslDirectTrainStateFixture = Convert-ToWslPath $DirectTrainStateFixture
     $directTrainStateArg = " --write-nnue-train-state-fixture `"$wslDirectTrainStateFixture`""
+}
+$directWeightsArg = ""
+if (-not [string]::IsNullOrWhiteSpace($WeightsBin)) {
+    $wslWeightsBin = Convert-ToWslPath $WeightsBin
+    $directWeightsArg = " --weights-bin `"$wslWeightsBin`""
 }
 $directResumeTrainStateArg = ""
 $directTrainSteps = $TrainSteps
@@ -424,7 +451,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directResumeTrainStateArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directWeightsArg$directResumeTrainStateArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
 "@
 
     Invoke-Checked "NNUE direct teacher train loop" {

@@ -126,7 +126,8 @@ The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
 to save its readback fixtures. If `-ResumeTrainStateFixture` is also supplied,
 the direct path resumes from the same BOUNRNG1 state and runs the remaining
-batches up to `-TrainSteps`.
+batches up to `-TrainSteps`. Use `-WeightsBin <PATH>` to initialise fresh
+fixture/direct runs from root weights.
 
 WSL2 Ubuntu 24.04 validation example:
 

@@ -1000,6 +1000,11 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `checkpoints/NNUE_HALFKP-256x2-32-32-6sb-cos/0031/state.bin` succeeded, wrote
   `nnue-halfkp-direct-realweights-trained.nnuef`, and loading that fixture with
   `--nnue-forward-smoke --debug-readback` passed (`compare: ok`).
+- Added `-WeightsBin <PATH>` to
+  `scripts/cuda_oxide_nnue_teacher_smoke.ps1`; fresh fixture export and direct
+  teacher train now use the same root weights. Validation with `-RunDirectTeacherTrain`
+  wrote `nnue-halfkp-direct-realweights-script.nnuef`, whose SHA-256 matched the
+  manual direct real-weights run exactly.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
