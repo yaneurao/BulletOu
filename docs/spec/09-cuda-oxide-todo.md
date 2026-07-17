@@ -876,6 +876,19 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   trainer loop.
 - Re-ran the same Windows/WSL checks and real-teacher `-TrainSteps 2
   -DebugReadback` smoke; all passed with `compare: ok`.
+- Added `bulletou-cuda-train --nnue-fixture-train`, a minimal non-comparing
+  train loop that consumes the same initial `BOUNTRN1` plus optional
+  `BOUNTRN1`/`BOUNBCH1` batch sequence, runs `NnueLossRangerStepRunner`, and
+  prints GPU loss readbacks for each step. This is still fixture-backed, but it
+  is the first cuda-oxide path shaped like a trainer loop rather than a CPU
+  golden smoke.
+- Factored NNUE train fixture sequence loading so both
+  `--nnue-fixture-train` and `--nnue-loss-ranger-step-smoke` share the same
+  input validation.
+- Validation: Windows `cargo check -p bulletou-cuda-train`, WSL2
+  `cargo check -p bulletou-cuda-train --features cuda`,
+  manual `--nnue-fixture-train` on the two real-teacher fixtures, and the
+  real-teacher `-TrainSteps 2 -DebugReadback` smoke all passed.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
