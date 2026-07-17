@@ -464,6 +464,21 @@ where
     E: fmt::Display,
 {
     let threads = config.threads.max(1);
+    let rayon_pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("bulletou-halfkp-prepare-{index}"))
+                .build()
+                .map_err(|err| {
+                    TeacherBatchError::invalid_input(format!(
+                        "failed to create HalfKP teacher prepare thread pool with {threads} threads: {err}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let dataloader = DefaultDataLoader::new(
         input_getter,
         NoOutputBuckets,
@@ -480,7 +495,10 @@ where
     dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
-        let prepared = dataloader.prepare(batch, threads, 1.0 - config.lambda);
+        let prepared = match rayon_pool.as_ref() {
+            Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+            None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+        };
         if let Some(started) = prepare_started {
             println!(
                 "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",

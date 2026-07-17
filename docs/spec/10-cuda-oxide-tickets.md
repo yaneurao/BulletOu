@@ -477,6 +477,7 @@ commit each completed slice.
   - `--loss-readback-interval <N>` can force a wider interval, e.g. one final loss readback for speed probes;
   - checkpoint/output runs keep the previous all-loss behavior so production logs are not silently weakened.
 - Increased the NNUE teacher producer queue depth from the old fixed `2` batches to a configurable `--teacher-queue-depth` defaulting to `8`, so CPU batch materialisation jitter is less likely to starve the GPU during speed probes.
+- Reused CPU prepare workers through a Rayon thread pool for HalfKP teacher batch materialisation instead of spawning scoped OS threads for every batch. In the contaminated-GPU 8-step profile, prepare mean improved from `9.620ms` to `8.872ms`; final clean speed still needs to be remeasured after the external GPU job exits.
 - Speed measurements before an external GPU load appeared:
   - `BatchSize=8192`, `Threads=8`, LR `0.012`, final-only loss readback: `4194304` positions in `4.143s`, `1012349` pos/s, `test_acc=0.6665039`;
   - this slightly beats tatara's latest final-line speed (`1010364` pos/s) and accuracy (`0.6656`), but not tatara's per-superbatch mean speed (`1136996.6` pos/s).
