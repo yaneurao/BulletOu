@@ -962,6 +962,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   SHA-256 matched the fixture-backed one-shot two-step final exactly
   (`4e0068f5e1bf98855a37f089c1885101e30096eba308596a0289db2d9ad794f3`).
   The direct state fixture header was `BOUNRNG1 completed_steps=2`.
+- Added `-RunDirectTeacherTrain` to
+  `scripts/cuda_oxide_nnue_teacher_smoke.ps1`; optional
+  `-DirectTrainedForwardFixture` / `-DirectTrainStateFixture` forward the direct
+  runner readbacks. Validation with `-SkipCudaBuild -TrainSteps 2
+  -DebugReadback -RunDirectTeacherTrain -DirectTrainedForwardFixture ...`
+  passed, and the direct script fixture SHA-256 matched the fixture-backed
+  one-shot two-step final exactly.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

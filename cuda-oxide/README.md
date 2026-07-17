@@ -116,6 +116,10 @@ cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 
+The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
+Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
+to save its readback fixtures.
+
 WSL2 Ubuntu 24.04 validation example:
 
 ```bash

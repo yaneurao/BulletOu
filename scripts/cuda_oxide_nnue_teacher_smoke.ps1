@@ -20,6 +20,8 @@ cuda-oxide workspace separate:
    and Ranger optimizer state as a BOUNRNG1 train-state fixture.
    Pass -ResumeTrainStateFixture to restore a BOUNRNG1 train-state fixture and
    export/apply only the later teacher batches up to -TrainSteps.
+   Pass -RunDirectTeacherTrain to also run the cuda-oxide root-loader bridge
+   that reads teacher batches directly without intermediate train fixtures.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -45,7 +47,10 @@ param(
     [switch]$RunFixtureTrain,
     [string]$TrainedForwardFixture,
     [string]$TrainStateFixture,
-    [string]$ResumeTrainStateFixture
+    [string]$ResumeTrainStateFixture,
+    [switch]$RunDirectTeacherTrain,
+    [string]$DirectTrainedForwardFixture,
+    [string]$DirectTrainStateFixture
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +66,16 @@ function Convert-ToWslPath {
     }
 
     throw "Cannot convert path to WSL form: $resolved"
+}
+
+function Convert-TeacherSpecToWslPath {
+    param([Parameter(Mandatory = $true)][string]$TeacherSpec)
+
+    $parts = @($TeacherSpec -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
+    if ($parts.Count -eq 0) {
+        throw "Teacher spec is empty"
+    }
+    return (($parts | ForEach-Object { Convert-ToWslPath $_ }) -join ",")
 }
 
 function Invoke-Checked {
@@ -154,6 +169,14 @@ if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
     $RunFixtureTrain = $true
 }
 
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
+    $RunDirectTeacherTrain = $true
+}
+
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
+    $RunDirectTeacherTrain = $true
+}
+
 if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
 }
@@ -216,6 +239,22 @@ if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
     New-Item -ItemType File -Force -Path $TrainStateFixture | Out-Null
 }
 
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
+    $directTrainedFixtureDir = Split-Path -Parent $DirectTrainedForwardFixture
+    if (-not [string]::IsNullOrWhiteSpace($directTrainedFixtureDir)) {
+        New-Item -ItemType Directory -Force -Path $directTrainedFixtureDir | Out-Null
+    }
+    New-Item -ItemType File -Force -Path $DirectTrainedForwardFixture | Out-Null
+}
+
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
+    $directTrainStateFixtureDir = Split-Path -Parent $DirectTrainStateFixture
+    if (-not [string]::IsNullOrWhiteSpace($directTrainStateFixtureDir)) {
+        New-Item -ItemType Directory -Force -Path $directTrainStateFixtureDir | Out-Null
+    }
+    New-Item -ItemType File -Force -Path $DirectTrainStateFixture | Out-Null
+}
+
 foreach ($spec in $fixtureSpecs) {
     $step = [int]$spec.Step
     $outFixture = $spec.Path
@@ -241,6 +280,7 @@ foreach ($spec in $fixtureSpecs) {
 }
 
 $wslCudaRoot = Convert-ToWslPath $cudaRoot
+$wslTeacher = Convert-TeacherSpecToWslPath $Teacher
 $wslFixtures = @($fixturePaths | ForEach-Object { Convert-ToWslPath $_ })
 $trainedForwardArg = ""
 if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
@@ -256,6 +296,16 @@ $resumeTrainStateArg = ""
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
     $wslResumeTrainStateFixture = Convert-ToWslPath $ResumeTrainStateFixture
     $resumeTrainStateArg = " --nnue-train-state-fixture `"$wslResumeTrainStateFixture`""
+}
+$directTrainedForwardArg = ""
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
+    $wslDirectTrainedForwardFixture = Convert-ToWslPath $DirectTrainedForwardFixture
+    $directTrainedForwardArg = " --write-nnue-trained-forward-fixture `"$wslDirectTrainedForwardFixture`""
+}
+$directTrainStateArg = ""
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
+    $wslDirectTrainStateFixture = Convert-ToWslPath $DirectTrainStateFixture
+    $directTrainStateArg = " --write-nnue-train-state-fixture `"$wslDirectTrainStateFixture`""
 }
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
 $fixtureArgsList = @()
@@ -359,7 +409,24 @@ cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-fixture-tra
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+if ($RunDirectTeacherTrain) {
+    $directTeacherCommand = @"
+cat > /tmp/nvjitlink_shim.c &&
+gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu -lnvJitLink &&
+cd "$wslCudaRoot"
+$cudaEnv
+export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher" --train-steps $TrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
+"@
+
+    Invoke-Checked "NNUE direct teacher train loop" {
+        $shim | wsl -d $WslDistro -- bash -lc $directTeacherCommand
+    }
+}
+
+if ($RunDirectTeacherTrain) {
+    Write-Host "OK: cuda-oxide NNUE teacher smoke completed"
+} elseif ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
     Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"
 } else {
     Write-Host "OK: cuda-oxide NNUE train-state resume smoke completed"
@@ -375,4 +442,12 @@ if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
 if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
     Write-Host "train state fixture:"
     Write-Host "  $TrainStateFixture"
+}
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainedForwardFixture)) {
+    Write-Host "direct trained forward fixture:"
+    Write-Host "  $DirectTrainedForwardFixture"
+}
+if (-not [string]::IsNullOrWhiteSpace($DirectTrainStateFixture)) {
+    Write-Host "direct train state fixture:"
+    Write-Host "  $DirectTrainStateFixture"
 }
