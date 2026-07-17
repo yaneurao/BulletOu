@@ -31,6 +31,7 @@ param(
     [string]$CudaArch = "sm_89",
     [ValidateSet("sigmoid-mse", "wrm")]
     [string]$LossKind = "sigmoid-mse",
+    [int]$TrainSteps = 1,
     [switch]$SkipCudaBuild,
     [switch]$DebugReadback
 )
@@ -80,6 +81,10 @@ if ([string]::IsNullOrWhiteSpace($Teacher)) {
     throw "Specify -Teacher, or place .hcpe files under C:\shogi\teacher\yane-distill-hcpe-20260508shuffled"
 }
 
+if ($TrainSteps -lt 1) {
+    throw "-TrainSteps must be >= 1"
+}
+
 if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
 }
@@ -108,6 +113,7 @@ Invoke-Checked "export NNUE HalfKP teacher train fixture" {
 $wslCudaRoot = Convert-ToWslPath $cudaRoot
 $wslFixture = Convert-ToWslPath $Fixture
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
+$fixtureArgs = ((1..$TrainSteps) | ForEach-Object { "--nnue-train-fixture `"$wslFixture`"" }) -join " "
 
 $cudaEnv = @"
 export CUDA_HOME=/usr
@@ -170,7 +176,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-loss-ranger-step-smoke --nnue-train-fixture "$wslFixture" --loss-kind $LossKind$debugFlag
+cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-loss-ranger-step-smoke $fixtureArgs --loss-kind $LossKind$debugFlag
 "@
 
 Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {

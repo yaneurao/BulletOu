@@ -70,7 +70,7 @@ struct Args {
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
     nnue_forward_fixture: Option<std::path::PathBuf>,
-    nnue_train_fixture: Option<std::path::PathBuf>,
+    nnue_train_fixtures: Vec<std::path::PathBuf>,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
     sfnn_forward_fixture: Option<std::path::PathBuf>,
     write_sfnn_forward_fixture: Option<std::path::PathBuf>,
@@ -140,7 +140,7 @@ impl Args {
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
             nnue_forward_fixture: None,
-            nnue_train_fixture: None,
+            nnue_train_fixtures: Vec::new(),
             write_nnue_forward_fixture: None,
             sfnn_forward_fixture: None,
             write_sfnn_forward_fixture: None,
@@ -187,7 +187,7 @@ impl Args {
                     parsed.nnue_forward_fixture = Some(required_path_arg(&mut args, "--nnue-forward-fixture")?);
                 }
                 "--nnue-train-fixture" => {
-                    parsed.nnue_train_fixture = Some(required_path_arg(&mut args, "--nnue-train-fixture")?);
+                    parsed.nnue_train_fixtures.push(required_path_arg(&mut args, "--nnue-train-fixture")?);
                 }
                 "--write-nnue-forward-fixture" => {
                     parsed.write_nnue_forward_fixture =
@@ -759,27 +759,36 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         DeviceBuffer,
     };
 
-    let train_fixture = args
-        .nnue_train_fixture
-        .as_deref()
-        .ok_or_else(|| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(
-                "--nnue-loss-ranger-step-smoke requires --nnue-train-fixture <PATH>".to_string(),
-            )
-        })?;
-    let train_case = NnueTrainCase::read_fixture(train_fixture)?;
-    let case = &train_case.forward;
-    let cpu_forward_trace = case.cpu_forward_trace();
-    let cpu_loss_case = LossSmokeCase {
-        label: "nnue-train-fixture",
-        outputs: cpu_forward_trace.outputs.clone(),
-        targets: train_case.targets.clone(),
-        entry_weights: train_case.entry_weights.clone(),
-    };
-    let cpu_loss_trace = cpu_loss_case.cpu_loss_trace(args.loss_kind);
-    let cpu_trace =
-        case.cpu_dense_backward_trace_with_output_gradients(&cpu_forward_trace, cpu_loss_trace.mean_output_gradients.clone());
-    let params = grouped_ranger_step_params();
+    if args.nnue_train_fixtures.is_empty() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--nnue-loss-ranger-step-smoke requires at least one --nnue-train-fixture <PATH>".to_string(),
+        ));
+    }
+
+    let mut train_cases = Vec::with_capacity(args.nnue_train_fixtures.len());
+    for path in &args.nnue_train_fixtures {
+        train_cases.push(NnueTrainCase::read_fixture(path)?);
+    }
+    ensure_compatible_nnue_train_cases(&train_cases)?;
+
+    let first_case = &train_cases[0].forward;
+    let mut cpu_case = first_case.clone();
+    macro_rules! init_cpu_state {
+        ($field:ident, $momentum:ident, $velocity:ident, $slow_params:ident) => {
+            let mut $momentum = vec![0.0_f32; cpu_case.$field.len()];
+            let mut $velocity = vec![0.0_f32; cpu_case.$field.len()];
+            let mut $slow_params = cpu_case.$field.clone();
+        };
+    }
+    init_cpu_state!(l0w, cpu_l0w_momentum, cpu_l0w_velocity, cpu_l0w_slow);
+    init_cpu_state!(l0b, cpu_l0b_momentum, cpu_l0b_velocity, cpu_l0b_slow);
+    init_cpu_state!(l1w, cpu_l1w_momentum, cpu_l1w_velocity, cpu_l1w_slow);
+    init_cpu_state!(l1b, cpu_l1b_momentum, cpu_l1b_velocity, cpu_l1b_slow);
+    init_cpu_state!(l2w, cpu_l2w_momentum, cpu_l2w_velocity, cpu_l2w_slow);
+    init_cpu_state!(l2b, cpu_l2b_momentum, cpu_l2b_velocity, cpu_l2b_slow);
+    init_cpu_state!(outw, cpu_outw_momentum, cpu_outw_velocity, cpu_outw_slow);
+    init_cpu_state!(outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow);
+
     let ptx = match args.ptx {
         Some(ptx) => ptx,
         None => default_nnue_ptx()?,
@@ -788,206 +797,271 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
     let stream = ctx.default_stream();
     let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
-    let host_batch = NnueForwardHostBatch {
-        stm_indices: &case.stm,
-        nstm_indices: &case.nstm,
-        batch_size: case.batch_size,
-        max_active: case.max_active,
-    };
     let host_weights = NnueForwardHostWeights {
-        shape: case.shape,
-        l0w: &case.l0w,
-        l0b: &case.l0b,
-        l1w: &case.l1w,
-        l1b: &case.l1b,
-        l2w: &case.l2w,
-        l2b: &case.l2b,
-        outw: &case.outw,
-        outb: &case.outb,
+        shape: first_case.shape,
+        l0w: &first_case.l0w,
+        l0b: &first_case.l0b,
+        l1w: &first_case.l1w,
+        l1b: &first_case.l1b,
+        l2w: &first_case.l2w,
+        l2b: &first_case.l2b,
+        outw: &first_case.outw,
+        outb: &first_case.outb,
     };
-    let device_batch = NnueForwardDeviceBatch::from_host(&stream, &host_batch)?;
     let mut device_weights = NnueForwardDeviceWeights::from_host(&stream, &host_weights)?;
     let mut optimizer_states = NnueRangerOptimizerStates::from_host_weights(&stream, &host_weights)?;
-    let forward_layout = NnueForwardWorkspaceLayout::new(case.shape, case.batch_size);
+    let forward_layout = NnueForwardWorkspaceLayout::new(first_case.shape, first_case.batch_size);
     let mut forward_workspace = NnueForwardWorkspace::new(&stream, forward_layout)?;
-    let loss_layout = ScalarLossLayout::new(case.batch_size);
+    let loss_layout = ScalarLossLayout::new(first_case.batch_size);
     let mut loss_workspace = ScalarLossWorkspace::new(&stream, loss_layout)?;
-    let targets = DeviceBuffer::from_host(&stream, &train_case.targets)?;
-    let entry_weights = DeviceBuffer::from_host(&stream, &train_case.entry_weights)?;
-
-    nnue_forward::launch_nnue_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
-    match args.loss_kind {
-        LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
-            &stream,
-            &module,
-            &forward_workspace.output,
-            &targets,
-            &entry_weights,
-            &mut loss_workspace,
-        )?,
-        LossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(
-            &stream,
-            &module,
-            &forward_workspace.output,
-            &targets,
-            &entry_weights,
-            &mut loss_workspace,
-        )?,
-    }
-
-    let backward_layout = NnueBackwardWorkspaceLayout::new(case.shape, case.batch_size, case.max_active);
+    let backward_layout = NnueBackwardWorkspaceLayout::new(first_case.shape, first_case.batch_size, first_case.max_active);
     let mut backward_workspace = NnueBackwardWorkspace::new(&stream, backward_layout)?;
+    let mut comparisons = Vec::new();
 
-    let output_layout = DenseOutputBackwardLayout::new(case.batch_size, case.shape.l3);
-    dense_backward::launch_dense_output_backward(
-        &stream,
-        &module,
-        output_layout,
-        &forward_workspace.hidden2,
-        &loss_workspace.mean_output_gradients,
-        &device_weights.outw,
-        &mut backward_workspace.hidden2_gradients,
-        &mut backward_workspace.outw_gradients,
-        &mut backward_workspace.outb_gradients,
-    )?;
+    for (step_idx, train_case) in train_cases.iter().enumerate() {
+        let step = step_idx + 1;
+        let case = &train_case.forward;
+        cpu_case.batch_size = case.batch_size;
+        cpu_case.max_active = case.max_active;
+        cpu_case.stm.clone_from(&case.stm);
+        cpu_case.nstm.clone_from(&case.nstm);
 
-    let l2_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l2, case.shape.l3);
-    dense_backward::launch_dense_crelu_backward(
-        &stream,
-        &module,
-        l2_layout,
-        &forward_workspace.hidden1,
-        &forward_workspace.hidden2,
-        &backward_workspace.hidden2_gradients,
-        &device_weights.l2w,
-        &mut backward_workspace.hidden1_gradients,
-        &mut backward_workspace.l2w_gradients,
-        &mut backward_workspace.l2b_gradients,
-    )?;
+        let cpu_forward_trace = cpu_case.cpu_forward_trace();
+        let cpu_loss_case = LossSmokeCase {
+            label: "nnue-train-fixture",
+            outputs: cpu_forward_trace.outputs.clone(),
+            targets: train_case.targets.clone(),
+            entry_weights: train_case.entry_weights.clone(),
+        };
+        let cpu_loss_trace = cpu_loss_case.cpu_loss_trace(args.loss_kind);
+        let cpu_trace = cpu_case.cpu_dense_backward_trace_with_output_gradients(
+            &cpu_forward_trace,
+            cpu_loss_trace.mean_output_gradients.clone(),
+        );
+        let params = grouped_ranger_step_params_for_step(step);
 
-    let l1_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l1 * 2, case.shape.l2);
-    dense_backward::launch_dense_crelu_backward(
-        &stream,
-        &module,
-        l1_layout,
-        &forward_workspace.combined,
-        &forward_workspace.hidden1,
-        &backward_workspace.hidden1_gradients,
-        &device_weights.l1w,
-        &mut backward_workspace.combined_gradients,
-        &mut backward_workspace.l1w_gradients,
-        &mut backward_workspace.l1b_gradients,
-    )?;
+        let host_batch = NnueForwardHostBatch {
+            stm_indices: &case.stm,
+            nstm_indices: &case.nstm,
+            batch_size: case.batch_size,
+            max_active: case.max_active,
+        };
+        let device_batch = NnueForwardDeviceBatch::from_host(&stream, &host_batch)?;
+        let targets = DeviceBuffer::from_host(&stream, &train_case.targets)?;
+        let entry_weights = DeviceBuffer::from_host(&stream, &train_case.entry_weights)?;
 
-    let l0_layout = NnueL0CReluBackwardLayout::new(case.batch_size, case.shape.l1);
-    dense_backward::launch_nnue_l0_crelu_backward(
-        &stream,
-        &module,
-        l0_layout,
-        &backward_workspace.combined_gradients,
-        &forward_workspace.stm_l0,
-        &forward_workspace.nstm_l0,
-        &mut backward_workspace.stm_l0_gradients,
-        &mut backward_workspace.nstm_l0_gradients,
-    )?;
+        nnue_forward::launch_nnue_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
+        match args.loss_kind {
+            LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
+                &stream,
+                &module,
+                &forward_workspace.output,
+                &targets,
+                &entry_weights,
+                &mut loss_workspace,
+            )?,
+            LossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(
+                &stream,
+                &module,
+                &forward_workspace.output,
+                &targets,
+                &entry_weights,
+                &mut loss_workspace,
+            )?,
+        }
 
-    let sparse_l0_layout =
-        NnueL0SparseBackwardLayout::new(case.batch_size, case.max_active, case.shape.input_size, case.shape.l1);
-    dense_backward::launch_nnue_l0_sparse_backward(
-        &stream,
-        &module,
-        sparse_l0_layout,
-        &device_batch.stm_indices,
-        &device_batch.nstm_indices,
-        &backward_workspace.stm_l0_gradients,
-        &backward_workspace.nstm_l0_gradients,
-        &mut backward_workspace.l0w_gradients,
-        &mut backward_workspace.l0b_gradients,
-    )?;
+        let output_layout = DenseOutputBackwardLayout::new(case.batch_size, case.shape.l3);
+        dense_backward::launch_dense_output_backward(
+            &stream,
+            &module,
+            output_layout,
+            &forward_workspace.hidden2,
+            &loss_workspace.mean_output_gradients,
+            &device_weights.outw,
+            &mut backward_workspace.hidden2_gradients,
+            &mut backward_workspace.outw_gradients,
+            &mut backward_workspace.outb_gradients,
+        )?;
 
-    optimizer_update::launch_nnue_ranger_update(
-        &stream,
-        &module,
-        params,
-        &mut device_weights,
-        &backward_workspace,
-        &mut optimizer_states,
-    )?;
-    stream.synchronize()?;
+        let l2_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l2, case.shape.l3);
+        dense_backward::launch_dense_crelu_backward(
+            &stream,
+            &module,
+            l2_layout,
+            &forward_workspace.hidden1,
+            &forward_workspace.hidden2,
+            &backward_workspace.hidden2_gradients,
+            &device_weights.l2w,
+            &mut backward_workspace.hidden1_gradients,
+            &mut backward_workspace.l2w_gradients,
+            &mut backward_workspace.l2b_gradients,
+        )?;
 
-    let gpu_weighted_sum = loss_workspace.weighted_sum.to_host_vec(&stream)?;
-    let gpu_mean = loss_workspace.mean.to_host_vec(&stream)?;
-    let mut comparisons = vec![
-        compare_slices("weighted_sum", &[cpu_loss_trace.weighted_sum], &gpu_weighted_sum, args.tolerance)?,
-        compare_slices("loss_mean", &[cpu_loss_trace.mean], &gpu_mean, args.tolerance)?,
-    ];
-    if args.debug_readback {
-        let gpu_per_sample = loss_workspace.per_sample.to_host_vec(&stream)?;
-        let gpu_output_gradients = loss_workspace.mean_output_gradients.to_host_vec(&stream)?;
-        comparisons.push(compare_slices("per_sample", &cpu_loss_trace.per_sample, &gpu_per_sample, args.tolerance)?);
+        let l1_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l1 * 2, case.shape.l2);
+        dense_backward::launch_dense_crelu_backward(
+            &stream,
+            &module,
+            l1_layout,
+            &forward_workspace.combined,
+            &forward_workspace.hidden1,
+            &backward_workspace.hidden1_gradients,
+            &device_weights.l1w,
+            &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1w_gradients,
+            &mut backward_workspace.l1b_gradients,
+        )?;
+
+        let l0_layout = NnueL0CReluBackwardLayout::new(case.batch_size, case.shape.l1);
+        dense_backward::launch_nnue_l0_crelu_backward(
+            &stream,
+            &module,
+            l0_layout,
+            &backward_workspace.combined_gradients,
+            &forward_workspace.stm_l0,
+            &forward_workspace.nstm_l0,
+            &mut backward_workspace.stm_l0_gradients,
+            &mut backward_workspace.nstm_l0_gradients,
+        )?;
+
+        let sparse_l0_layout =
+            NnueL0SparseBackwardLayout::new(case.batch_size, case.max_active, case.shape.input_size, case.shape.l1);
+        dense_backward::launch_nnue_l0_sparse_backward(
+            &stream,
+            &module,
+            sparse_l0_layout,
+            &device_batch.stm_indices,
+            &device_batch.nstm_indices,
+            &backward_workspace.stm_l0_gradients,
+            &backward_workspace.nstm_l0_gradients,
+            &mut backward_workspace.l0w_gradients,
+            &mut backward_workspace.l0b_gradients,
+        )?;
+
+        optimizer_update::launch_nnue_ranger_update(
+            &stream,
+            &module,
+            params,
+            &mut device_weights,
+            &backward_workspace,
+            &mut optimizer_states,
+        )?;
+        stream.synchronize()?;
+
+        let gpu_weighted_sum = loss_workspace.weighted_sum.to_host_vec(&stream)?;
+        let gpu_mean = loss_workspace.mean.to_host_vec(&stream)?;
         comparisons.push(compare_slices(
-            "loss_grad",
-            &cpu_loss_trace.mean_output_gradients,
-            &gpu_output_gradients,
+            format!("step{step}_weighted_sum"),
+            &[cpu_loss_trace.weighted_sum],
+            &gpu_weighted_sum,
             args.tolerance,
         )?);
+        comparisons.push(compare_slices(
+            format!("step{step}_loss_mean"),
+            &[cpu_loss_trace.mean],
+            &gpu_mean,
+            args.tolerance,
+        )?);
+        if args.debug_readback {
+            let gpu_per_sample = loss_workspace.per_sample.to_host_vec(&stream)?;
+            let gpu_output_gradients = loss_workspace.mean_output_gradients.to_host_vec(&stream)?;
+            comparisons.push(compare_slices(
+                format!("step{step}_per_sample"),
+                &cpu_loss_trace.per_sample,
+                &gpu_per_sample,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(
+                format!("step{step}_loss_grad"),
+                &cpu_loss_trace.mean_output_gradients,
+                &gpu_output_gradients,
+                args.tolerance,
+            )?);
+        }
+
+        macro_rules! update_cpu_group {
+            ($field:ident, $momentum:ident, $velocity:ident, $slow_params:ident, $gradients:expr) => {{
+                let expected = cpu_single_ranger_update_trace_from_state(
+                    &cpu_case.$field,
+                    &$momentum,
+                    &$velocity,
+                    &$slow_params,
+                    $gradients,
+                    params,
+                )?;
+                cpu_case.$field = expected.weights;
+                $momentum = expected.momentum;
+                $velocity = expected.velocity;
+                $slow_params = expected.slow_params;
+            }};
+        }
+
+        update_cpu_group!(l0w, cpu_l0w_momentum, cpu_l0w_velocity, cpu_l0w_slow, &cpu_trace.l0w_gradients);
+        update_cpu_group!(l0b, cpu_l0b_momentum, cpu_l0b_velocity, cpu_l0b_slow, &cpu_trace.l0b_gradients);
+        update_cpu_group!(l1w, cpu_l1w_momentum, cpu_l1w_velocity, cpu_l1w_slow, &cpu_trace.l1w_gradients);
+        update_cpu_group!(l1b, cpu_l1b_momentum, cpu_l1b_velocity, cpu_l1b_slow, &cpu_trace.l1b_gradients);
+        update_cpu_group!(l2w, cpu_l2w_momentum, cpu_l2w_velocity, cpu_l2w_slow, &cpu_trace.l2w_gradients);
+        update_cpu_group!(l2b, cpu_l2b_momentum, cpu_l2b_velocity, cpu_l2b_slow, &cpu_trace.l2b_gradients);
+        update_cpu_group!(outw, cpu_outw_momentum, cpu_outw_velocity, cpu_outw_slow, &cpu_trace.outw_gradients);
+        update_cpu_group!(outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow, &[cpu_trace.outb_gradient]);
     }
 
     macro_rules! compare_group {
-        ($field:ident, $weights:expr, $gradients:expr) => {{
-            let expected = cpu_single_ranger_update_trace($weights, $gradients, params)?;
+        ($field:ident, $momentum:ident, $velocity:ident, $slow_params:ident) => {{
             let gpu_weights = device_weights.$field.to_host_vec(&stream)?;
             let gpu_momentum = optimizer_states.$field.momentum.to_host_vec(&stream)?;
             let gpu_velocity = optimizer_states.$field.velocity.to_host_vec(&stream)?;
             let gpu_slow_params = optimizer_states.$field.slow_params.to_host_vec(&stream)?;
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_weights"),
-                &expected.weights,
+                &cpu_case.$field,
                 &gpu_weights,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_momentum"),
-                &expected.momentum,
+                &$momentum,
                 &gpu_momentum,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_velocity"),
-                &expected.velocity,
+                &$velocity,
                 &gpu_velocity,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_slow"),
-                &expected.slow_params,
+                &$slow_params,
                 &gpu_slow_params,
                 args.tolerance,
             )?);
         }};
     }
 
-    compare_group!(l0w, &case.l0w, &cpu_trace.l0w_gradients);
-    compare_group!(l0b, &case.l0b, &cpu_trace.l0b_gradients);
-    compare_group!(l1w, &case.l1w, &cpu_trace.l1w_gradients);
-    compare_group!(l1b, &case.l1b, &cpu_trace.l1b_gradients);
-    compare_group!(l2w, &case.l2w, &cpu_trace.l2w_gradients);
-    compare_group!(l2b, &case.l2b, &cpu_trace.l2b_gradients);
-    compare_group!(outw, &case.outw, &cpu_trace.outw_gradients);
-    compare_group!(outb, &case.outb, &[cpu_trace.outb_gradient]);
+    compare_group!(l0w, cpu_l0w_momentum, cpu_l0w_velocity, cpu_l0w_slow);
+    compare_group!(l0b, cpu_l0b_momentum, cpu_l0b_velocity, cpu_l0b_slow);
+    compare_group!(l1w, cpu_l1w_momentum, cpu_l1w_velocity, cpu_l1w_slow);
+    compare_group!(l1b, cpu_l1b_momentum, cpu_l1b_velocity, cpu_l1b_slow);
+    compare_group!(l2w, cpu_l2w_momentum, cpu_l2w_velocity, cpu_l2w_slow);
+    compare_group!(l2b, cpu_l2b_momentum, cpu_l2b_velocity, cpu_l2b_slow);
+    compare_group!(outw, cpu_outw_momentum, cpu_outw_velocity, cpu_outw_slow);
+    compare_group!(outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow);
 
     println!("bulletou-cuda-train NNUE loss Ranger step smoke");
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
-    println!("  fixture      : {}", train_fixture.display());
+    println!("  fixtures     : {}", args.nnue_train_fixtures.len());
+    for (idx, fixture) in args.nnue_train_fixtures.iter().enumerate() {
+        println!("    [{}] {}", idx + 1, fixture.display());
+    }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
-    println!("  batch        : {} samples", case.batch_size);
+    println!("  batch        : {} samples", first_case.batch_size);
     println!(
         "  shape        : input={} l1={} l2={} l3={}",
-        case.shape.input_size, case.shape.l1, case.shape.l2, case.shape.l3
+        first_case.shape.input_size, first_case.shape.l1, first_case.shape.l2, first_case.shape.l3
     );
     println!("  tolerance    : {}", args.tolerance);
-    println!("  params       : step={} k={} alpha={}", params.radam.step, params.k, params.lookahead.alpha);
+    println!("  params       : steps=1..{} k={} alpha={}", train_cases.len(), grouped_ranger_step_params().k, grouped_ranger_step_params().lookahead.alpha);
     for cmp in comparisons {
         println!(
             "  {:<14}: max_abs={} at {}, mean_abs={}",
@@ -2123,7 +2197,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -2168,9 +2242,10 @@ fn usage() -> &'static str {
      CO-010 NNUE Ranger step smoke: run NNUE forward/backward, then update all\n\
      NNUE parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
-     CO-010 NNUE loss Ranger step smoke: load a BOUNTRN1 fixture with targets\n\
-     and entry weights, run NNUE forward, scalar value loss, backward, and all\n\
-     grouped Ranger updates against CPU scalar goldens.\n\
+     CO-010 NNUE loss Ranger step smoke: load one or more BOUNTRN1 fixtures\n\
+     with targets and entry weights, run NNUE forward, scalar value loss,\n\
+     backward, and grouped Ranger updates while carrying weights/optimizer\n\
+     state across fixtures, then compare against CPU scalar goldens.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
@@ -2488,11 +2563,16 @@ struct SingleRangerUpdateTrace {
 
 #[cfg(feature = "cuda")]
 fn grouped_ranger_step_params() -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+    grouped_ranger_step_params_for_step(1)
+}
+
+#[cfg(feature = "cuda")]
+fn grouped_ranger_step_params_for_step(step: usize) -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
     bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
         radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
             gradient_factor: 0.25,
             learning_rate: 0.01,
-            step: 1,
+            step,
             decay: 0.01,
             beta1: 0.99,
             beta2: 0.999,
@@ -2512,6 +2592,21 @@ fn cpu_single_ranger_update_trace(
     gradients: &[f32],
     params: bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams,
 ) -> bulletou_cuda_oxide_runtime::Result<SingleRangerUpdateTrace> {
+    let momentum = vec![0.0; initial_weights.len()];
+    let velocity = vec![0.0; initial_weights.len()];
+    let slow_params = initial_weights.to_vec();
+    cpu_single_ranger_update_trace_from_state(initial_weights, &momentum, &velocity, &slow_params, gradients, params)
+}
+
+#[cfg(feature = "cuda")]
+fn cpu_single_ranger_update_trace_from_state(
+    initial_weights: &[f32],
+    initial_momentum: &[f32],
+    initial_velocity: &[f32],
+    initial_slow_params: &[f32],
+    gradients: &[f32],
+    params: bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams,
+) -> bulletou_cuda_oxide_runtime::Result<SingleRangerUpdateTrace> {
     if initial_weights.len() != gradients.len() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "Ranger CPU trace length mismatch: weights={}, gradients={}",
@@ -2519,14 +2614,26 @@ fn cpu_single_ranger_update_trace(
             gradients.len()
         )));
     }
+    if initial_weights.len() != initial_momentum.len()
+        || initial_weights.len() != initial_velocity.len()
+        || initial_weights.len() != initial_slow_params.len()
+    {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "Ranger CPU state length mismatch: weights={}, momentum={}, velocity={}, slow_params={}",
+            initial_weights.len(),
+            initial_momentum.len(),
+            initial_velocity.len(),
+            initial_slow_params.len()
+        )));
+    }
 
     params.validate()?;
     let step_scale = params.radam.step_scale()?;
     let rate = params.radam.learning_rate * step_scale.step_size;
     let mut weights = initial_weights.to_vec();
-    let mut momentum = vec![0.0; initial_weights.len()];
-    let mut velocity = vec![0.0; initial_weights.len()];
-    let mut slow_params = initial_weights.to_vec();
+    let mut momentum = initial_momentum.to_vec();
+    let mut velocity = initial_velocity.to_vec();
+    let mut slow_params = initial_slow_params.to_vec();
 
     for idx in 0..weights.len() {
         let grad = params.radam.gradient_factor * gradients[idx];
@@ -3232,6 +3339,44 @@ impl NnueTrainCase {
             ))),
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+fn ensure_compatible_nnue_train_cases(cases: &[NnueTrainCase]) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let Some(first) = cases.first() else {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "NNUE train smoke requires at least one fixture".to_string(),
+        ));
+    };
+    let first = &first.forward;
+    for (idx, case) in cases.iter().enumerate() {
+        let forward = &case.forward;
+        if forward.shape != first.shape
+            || forward.batch_size != first.batch_size
+            || forward.max_active != first.max_active
+        {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "NNUE train fixture #{} has incompatible layout: shape={:?} batch={} max_active={}, expected shape={:?} batch={} max_active={}",
+                idx + 1,
+                forward.shape,
+                forward.batch_size,
+                forward.max_active,
+                first.shape,
+                first.batch_size,
+                first.max_active
+            )));
+        }
+        if case.targets.len() != forward.batch_size || case.entry_weights.len() != forward.batch_size {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "NNUE train fixture #{} target/weight length mismatch: targets={} entry_weights={} batch={}",
+                idx + 1,
+                case.targets.len(),
+                case.entry_weights.len(),
+                forward.batch_size
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -4238,9 +4383,9 @@ fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 #[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SliceComparison {
-    name: &'static str,
+    name: String,
     max_abs_diff: f32,
     max_abs_index: usize,
     mean_abs_diff: f32,
@@ -4248,11 +4393,12 @@ struct SliceComparison {
 
 #[cfg(feature = "cuda")]
 fn compare_slices(
-    name: &'static str,
+    name: impl Into<String>,
     expected: &[f32],
     actual: &[f32],
     tolerance: f32,
 ) -> bulletou_cuda_oxide_runtime::Result<SliceComparison> {
+    let name = name.into();
     if expected.len() != actual.len() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "{name} length mismatch: expected {}, got {}",
