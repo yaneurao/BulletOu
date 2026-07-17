@@ -1074,9 +1074,11 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   Auto-resume fallback was also validated by temporarily hiding
   `0001/state.boung`; `--output` selected `0001/state.bin`, restored
   `resume_hcpe byte_offset=76`, and wrote `0002`.
-- Remaining work: promote the direct cuda-oxide teacher loop from the smoke
-  binary into the end-user BulletOu training CLI, then wire the production
-  schedule, validation metrics, and async input/readback rings around it.
+- Historical remaining work at this checkpoint: promote the direct cuda-oxide
+  teacher loop from the smoke binary into the end-user BulletOu training CLI,
+  then wire the production schedule, validation metrics, and async
+  input/readback rings around it. This was completed later by the BO-CUDA
+  production integration slices (notably BO-CUDA-002/003/006/021).
 
 ### 2026-07-17 CO-010 teacher smoke script
 
