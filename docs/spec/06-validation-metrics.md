@@ -31,6 +31,12 @@
 accuracy = sign_matches / compared
 ```
 
+Diagnostic counters (`pred>=0`, `pred<0`, `zero`) are reported over the
+same decisive subset as `compared`. They do not change the metric; they
+exist to expose short-run cases where the model has not yet learned a
+meaningful sign split and accuracy is effectively the held-out
+Win/Loss class balance.
+
 `game_result == 0` (引き分け) は **必ず両側から除外**する。理由:
 - dlshogi 作者の検証局面集に引き分けが含まれていない (= 本家準拠)
 - 引き分けを `truth=1` 側にバケットすると「model_output ≈ 0 を出すモデル」が draw + win に対し機械的に正解扱いされる構造的バイアスが入る (= `--scale` を小さくすると単調に accuracy が上がる現象の主因)

@@ -27,7 +27,8 @@ commit each completed slice.
 | BO-CUDA-019 | done | NNUE L0 sparse backward scatter optimization | larger same-PSV benchmark exposed the dense gather L0 backward bottleneck; BulletOu now zeroes L0 gradients and atomic-scatters active feature gradients, preserving correctness while greatly improving standard NNUE throughput |
 | BO-CUDA-020 | done | NNUE train-step profiling and WRM loss reduction | parity harness now runs host binaries in release mode by default, `--profile-train-step` reports NNUE stage timings, and WRM loss no longer recomputes every sample serially in thread 0 |
 | BO-CUDA-021 | done | NNUE teacher prepare/GPU pipeline | `--profile-train-step` now exposes CPU batch materialisation time, standard NNUE teacher training overlaps CPU prepare with GPU work via a bounded producer queue, and the tatara parity harness can run realistic multi-threaded prepare |
-| BO-CUDA-022 | todo | remaining tatara accuracy parity | investigate the remaining held-out accuracy mismatch despite matching WRM loss, and run a longer same-PSV comparison to reduce one-superbatch noise |
+| BO-CUDA-022 | done | remaining tatara accuracy parity | validation now reports prediction-sign distribution; the one-superbatch accuracy complement was a short-run all-one-sign prediction artifact, and a 4-superbatch same-PSV run matches tatara accuracy with close WRM loss |
+| BO-CUDA-023 | todo | YaneuraOu quantized eval cross-check | run YaneuraOu `test eval_accuracy` on the exported `nn.bin` from a cuda-oxide checkpoint and compare quantized engine accuracy with BulletOu's f32 checkpoint-time validation |
 
 ## Notes
 
@@ -349,6 +350,22 @@ commit each completed slice.
 
 ### BO-CUDA-022
 
-- Remaining parity work:
-  - investigate the accuracy-sign mismatch / metric-definition mismatch while WRM loss is already close;
-  - run a longer same-PSV comparison after the next accuracy pass, since one-superbatch accuracy is noisy.
+- Added validation prediction-sign diagnostics:
+  - `AccuracyReport` now tracks decisive-position `pred>=0`, `pred<0`, and exact `zero` counts.
+  - NNUE/SFNN cuda-oxide validation logs print those counts next to accuracy/loss. The counters do not change the metric; they make short-run majority-class artifacts visible.
+- Root cause of the apparent one-superbatch mismatch:
+  - The 8192-position held-out PSV has `Win=4043`, `Loss=4149`, `Draw=0`.
+  - The earlier one-superbatch BulletOu metrics run reported `accuracy=49.3530% (4043/8192)`. With diagnostics enabled, the same run showed `pred>=0 8192`, `pred<0 0`, `zero 0`: the model predicted the non-negative side for every held-out position, so the accuracy was exactly the held-out Win ratio.
+  - tatara's `test_acc=0.5065` was the complementary Loss ratio in that short run. This was not a PSV result-sign bug; it was a tiny early-training sign bias while WRM loss was already matching.
+- Longer same-PSV comparison:
+  - Command shape: `TrainPositions=262144`, `TestPositions=8192`, `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=4`, `Threads=8`.
+  - tatara final report: `test_loss=0.070322`, `test_acc=0.5065`.
+  - BulletOu metrics report: `accuracy=50.6470% (4149/8192; pred>=0 0 pred<0 8192 zero 0)`, `loss=0.070590`.
+  - BulletOu speed smoke on the same run: `262144` positions in `0.423s`, `619152 pos/s`.
+
+### BO-CUDA-023
+
+- Next cross-tool validation step:
+  - use the `nn.bin` produced by a cuda-oxide NNUE checkpoint;
+  - load it in YaneuraOu and run `test eval_accuracy <same-test.psv>`;
+  - compare quantized-engine sign accuracy against BulletOu's f32 checkpoint-time validation and document any expected quantization delta.

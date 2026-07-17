@@ -58,6 +58,19 @@ pub struct AccuracyReport {
     /// `(model_out >= 0) == (game_result > 0)` (= sign of the model's
     /// output matches the actual winner).
     pub sign_matches: usize,
+    /// Number of decisive positions whose model output was non-negative
+    /// (`model_output >= 0`). This is diagnostic only; it helps detect
+    /// short validation runs where the network is still effectively a
+    /// majority-class predictor.
+    pub predicted_nonnegative: usize,
+    /// Number of decisive positions whose model output was negative
+    /// (`model_output < 0`). Diagnostic counterpart to
+    /// [`predicted_nonnegative`](Self::predicted_nonnegative).
+    pub predicted_negative: usize,
+    /// Number of decisive positions whose model output was exactly zero.
+    /// These are included in `predicted_nonnegative` because the
+    /// BulletOu/YaneuraOu metric uses `model_output >= 0`.
+    pub predicted_zero: usize,
     /// Number of sampled positions whose game ended in a draw
     /// (`game_result == 0`). Excluded from BOTH `compared` and
     /// `sign_matches` (= excluded from accuracy entirely). Still
@@ -221,6 +234,14 @@ pub fn compute_sign_accuracy_with_loss(
                 // training-loss subset includes it).
             } else {
                 report.compared += 1;
+                if pred {
+                    report.predicted_nonnegative += 1;
+                } else {
+                    report.predicted_negative += 1;
+                }
+                if *m == 0.0 {
+                    report.predicted_zero += 1;
+                }
                 let truth = r > 0;
                 if pred == truth {
                     report.sign_matches += 1;
@@ -230,6 +251,14 @@ pub fn compute_sign_accuracy_with_loss(
             report.drawn_games += 1;
         } else {
             report.compared += 1;
+            if pred {
+                report.predicted_nonnegative += 1;
+            } else {
+                report.predicted_negative += 1;
+            }
+            if *m == 0.0 {
+                report.predicted_zero += 1;
+            }
             if pred == (s > 0) {
                 report.sign_matches += 1;
             }
@@ -512,6 +541,18 @@ mod tests {
         assert_eq!(r.drawn_games, 2);
         assert_eq!(r.loss_sampled, 4, "loss subset still includes draws");
         assert!(r.test_loss.is_some());
+    }
+
+    #[test]
+    fn accuracy_reports_decisive_prediction_sign_distribution() {
+        let m = [0.0, 0.2, -0.1, -0.3, 0.4];
+        let t = [1i16, 2, 3, 4, 5];
+        let game = [1i8, -1, -1, 0, 1];
+        let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
+        assert_eq!(r.compared, 4, "draw is excluded from decisive sign diagnostics");
+        assert_eq!(r.predicted_nonnegative, 3, "zero is counted on the >=0 side");
+        assert_eq!(r.predicted_negative, 1);
+        assert_eq!(r.predicted_zero, 1);
     }
 
     #[test]

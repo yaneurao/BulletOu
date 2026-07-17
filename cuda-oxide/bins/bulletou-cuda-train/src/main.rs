@@ -2173,10 +2173,13 @@ fn run_nnue_bridge_test_pass(
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
     eprintln!(
-        "  cuda-oxide validation: accuracy={:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
+        "  cuda-oxide validation: accuracy={:.4}% ({}/{} decisive; pred>=0 {} pred<0 {} zero {}; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
         accuracy * 100.0,
         report.sign_matches,
         report.compared,
+        report.predicted_nonnegative,
+        report.predicted_negative,
+        report.predicted_zero,
         report.drawn_games,
         report.filtered_by_score_cap,
         loss,
@@ -2275,10 +2278,13 @@ fn run_sfnn_bridge_test_pass(
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
     eprintln!(
-        "  cuda-oxide SFNN validation: accuracy={:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
+        "  cuda-oxide SFNN validation: accuracy={:.4}% ({}/{} decisive; pred>=0 {} pred<0 {} zero {}; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
         accuracy * 100.0,
         report.sign_matches,
         report.compared,
+        report.predicted_nonnegative,
+        report.predicted_negative,
+        report.predicted_zero,
         report.drawn_games,
         report.filtered_by_score_cap,
         loss,
