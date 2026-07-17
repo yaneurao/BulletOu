@@ -1837,12 +1837,6 @@ impl Args {
                         .to_string(),
                 );
             }
-            if self.test_teacher.is_some() {
-                return Err(
-                    "--backend cuda-oxide SFNN_HALFKA2 does not yet support --test-teacher validation metrics"
-                        .to_string(),
-                );
-            }
             if self.sfnn_factorized_l1 {
                 return Err(
                     "--backend cuda-oxide SFNN_HALFKA2 does not yet support --sfnn-factorized-l1".to_string(),
@@ -7364,6 +7358,8 @@ mod tests {
             "cuda-oxide",
             "--cuda-oxide-train-steps",
             "1",
+            "--test-teacher",
+            "/dev/null",
         ])
         .unwrap();
 
@@ -7371,6 +7367,7 @@ mod tests {
         let child_run = cuda_oxide_default_child_run(&args).unwrap();
         let cargo_args = cuda_oxide_cargo_run_args_with_child(&args, &child_run).unwrap();
         assert!(cargo_args.iter().any(|arg| arg == "--sfnn-teacher-train"));
+        assert!(cargo_args.iter().any(|arg| arg == "--test-teacher"));
         let save_rate_idx = cargo_args.iter().position(|arg| arg == "--save-rate").unwrap();
         assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("0"));
     }

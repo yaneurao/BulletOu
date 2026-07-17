@@ -1653,12 +1653,6 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             "--sfnn-teacher-train does not yet support train-state resume".to_string(),
         ));
     }
-    if args.test_teacher.is_some() {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--sfnn-teacher-train does not yet support validation metrics".to_string(),
-        ));
-    }
-
     let ptx = match args.ptx.as_ref() {
         Some(ptx) => ptx.clone(),
         None => default_nnue_ptx()?,
@@ -1697,6 +1691,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         superbatches_per_epoch: args.superbatches_per_epoch,
         lambda: 1.0,
     };
+    let test_cache = load_nnue_bridge_test_cache(&args)?;
 
     let mut runner = None;
     let mut losses = Vec::with_capacity(args.train_steps);
@@ -1797,6 +1792,10 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut bridge_checkpoints = Vec::new();
     if let Some(output_dir) = &args.output {
         let state = runner.read_state(&stream)?;
+        let test_metrics = match &test_cache {
+            Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
+            None => None,
+        };
         bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
             output_dir,
             shape,
@@ -1807,6 +1806,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             &learning_rates,
             &sources,
             &dataloader_positions,
+            test_metrics,
             log_context,
         )?);
     }
@@ -2022,6 +2022,95 @@ fn run_nnue_bridge_test_pass(
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn run_sfnn_bridge_test_pass(
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    state: &sfnn_train_step::SfnnTrainStateReadback,
+    cache: &NnueBridgeTestCache,
+    args: &Args,
+) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeTestMetrics> {
+    use bulletou_lib::{
+        game::{inputs::ShogiHalfKa2, outputs::ShogiLayerStackBucket9},
+        validate::{compute_sign_accuracy_with_loss, ValidationLossKind},
+        value::{
+            loader::{DefaultDataLoader, DirectSequentialDataLoader},
+            FastBatchHost, SfnnForwardWeights,
+        },
+    };
+
+    let root_shape = bulletou_lib::value::SfnnForwardShape {
+        input_size: shape.input_size,
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+    };
+    let forward_weights = SfnnForwardWeights {
+        shape: root_shape,
+        l0w: &state.l0w.weights,
+        l0b: &state.l0b.weights,
+        l1w: &state.l1w.weights,
+        l1b: &state.l1b.weights,
+        l2w: &state.l2w.weights,
+        l2b: &state.l2b.weights,
+        l3w: &state.l3w.weights,
+        l3b: &state.l3b.weights,
+    };
+    forward_weights.validate().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("SFNN validation forward weight shape mismatch: {err}"))
+    })?;
+
+    let empty_files: [&str; 0] = [];
+    let dataloader = DefaultDataLoader::new(
+        ShogiHalfKa2,
+        ShogiLayerStackBucket9::KingRank9,
+        (|_, blend| blend) as fn(&bulletou_lib::shogi::PackedSfenValue, f32) -> f32,
+        None,
+        matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+        false,
+        400.0,
+        (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        DirectSequentialDataLoader::new(&empty_files),
+    );
+
+    let mut outputs = Vec::with_capacity(cache.positions.len());
+    for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
+        let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
+        let batch = FastBatchHost::from(prepared);
+        let mut chunk_outputs = forward_weights.forward_batch(&batch).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!("SFNN validation forward failed: {err}"))
+        })?;
+        outputs.append(&mut chunk_outputs);
+    }
+
+    let loss_kind = match args.loss_kind {
+        LossKind::SigmoidMse => ValidationLossKind::SigmoidMse,
+        LossKind::NnuePytorchWrm => ValidationLossKind::NnuePytorchWrm,
+    };
+    let report = compute_sign_accuracy_with_loss(
+        &outputs,
+        &cache.teacher_scores,
+        &cache.teacher_results,
+        (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        1.0,
+        400.0,
+        loss_kind,
+    );
+    let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
+    let loss = report.test_loss.unwrap_or(f32::NAN);
+    eprintln!(
+        "  cuda-oxide SFNN validation: accuracy={:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
+        accuracy * 100.0,
+        report.sign_matches,
+        report.compared,
+        report.drawn_games,
+        report.filtered_by_score_cap,
+        loss,
+        report.loss_sampled,
+    );
+    Ok(NnueBridgeTestMetrics { accuracy, loss })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn write_nnue_bridge_checkpoint(
     output_dir: &std::path::Path,
     shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
@@ -2128,6 +2217,7 @@ fn write_sfnn_bridge_checkpoint(
     learning_rates: &[f32],
     sources: &[String],
     dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
+    test_metrics: Option<NnueBridgeTestMetrics>,
     log_context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<SfnnBridgeCheckpointWrite> {
     if losses.len() != sources.len() {
@@ -2164,7 +2254,7 @@ fn write_sfnn_bridge_checkpoint(
     write_sfnn_root_state_bin(&state_bin_path, completed_steps, state)?;
     write_bridge_teacher_spec(&teacher_spec_path, teacher_spec)?;
     let dataloader_pos_path = write_nnue_bridge_dataloader_pos(&dataloader_pos_path, dataloader_positions)?;
-    write_sfnn_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, log_context)?;
+    write_sfnn_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, test_metrics, log_context)?;
     append_sfnn_bridge_summary_log(
         &summary_log_path,
         index,
@@ -2172,6 +2262,7 @@ fn write_sfnn_bridge_checkpoint(
         losses,
         learning_rates,
         sources,
+        test_metrics,
         log_context,
     )?;
 
@@ -6318,6 +6409,7 @@ fn write_sfnn_bridge_learn_log(
     losses: &[(usize, f32, f32)],
     learning_rates: &[f32],
     sources: &[String],
+    test_metrics: Option<NnueBridgeTestMetrics>,
     context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
     use std::io::Write as _;
@@ -6338,16 +6430,29 @@ fn write_sfnn_bridge_learn_log(
             path.display()
         ))
     })?;
-    for (((step, _weighted_sum, mean), learning_rate), source) in
-        losses.iter().zip(learning_rates.iter()).zip(sources.iter())
+    for (idx, (((step, _weighted_sum, mean), learning_rate), source)) in
+        losses.iter().zip(learning_rates.iter()).zip(sources.iter()).enumerate()
     {
         let display = bridge_log_display_step(*step, context);
+        let is_last = idx + 1 == losses.len();
+        let test_accuracy = if is_last {
+            test_metrics.map(|m| format!("{:.6}", m.accuracy)).unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
+        let test_loss = if is_last {
+            test_metrics.map(|m| format!("{:.6}", m.loss)).unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
         writeln!(
             writer,
-            "sfnn,{},{},{},-,-,{:.9},{:.9},{:.9},{:.9},{},{}",
+            "sfnn,{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{}",
             display.epoch,
             display.superbatch,
             display.curr_batch,
+            test_accuracy,
+            test_loss,
             mean,
             learning_rate,
             learning_rate,
@@ -6379,6 +6484,7 @@ fn append_sfnn_bridge_summary_log(
     losses: &[(usize, f32, f32)],
     learning_rates: &[f32],
     sources: &[String],
+    test_metrics: Option<NnueBridgeTestMetrics>,
     context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
     use std::io::Write as _;
@@ -6427,12 +6533,16 @@ fn append_sfnn_bridge_summary_log(
     let learning_rate = learning_rates.last().copied().unwrap_or(0.0);
     let source = sources.last().map(String::as_str).unwrap_or("");
     let display = bridge_log_display_step(last_step, context);
+    let test_accuracy = test_metrics.map(|m| format!("{:.6}", m.accuracy)).unwrap_or_else(|| "-".to_string());
+    let test_loss = test_metrics.map(|m| format!("{:.6}", m.loss)).unwrap_or_else(|| "-".to_string());
     let _ = (checkpoint_index, completed_steps);
     writeln!(
         writer,
-        "sfnn,{},{},-,-,{:.9},{:.9},{:.9},{:.9},{},{}",
+        "sfnn,{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{}",
         display.epoch,
         display.superbatch,
+        test_accuracy,
+        test_loss,
         mean,
         learning_rate,
         learning_rate,

@@ -15,6 +15,7 @@ commit each completed slice.
 | BO-CUDA-007 | done | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
 | BO-CUDA-008 | done | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 | BO-CUDA-009 | done | expose SFNN cuda-oxide through BulletOu CLI | `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` launches the SFNN cuda-oxide child trainer and writes the normal output layout |
+| BO-CUDA-010 | done | SFNN validation metrics | `--sfnn-teacher-train --test-teacher` and the BulletOu SFNN cuda-oxide wrapper write `test_value_accuracy` / `test_value_loss` into the normal logs |
 
 ## Notes
 
@@ -121,9 +122,21 @@ commit each completed slice.
 
 - Extended `examples/bulletou --backend cuda-oxide` to accept `--eval-type SFNN_HALFKA2` with the fixed cuda-oxide-supported architecture `--arch SFNN_halfka2_1024_7_64_k3k3`.
 - The BulletOu wrapper now dispatches SFNN runs to the nested `bulletou-cuda-train --sfnn-teacher-train` child and forces `--save-rate 0` for the current final-checkpoint-only SFNN child path.
-- Other SFNN families, the default `SFNN_halfka2_1536_15_32_k3k3` architecture, validation metrics, and production/plateau scheduling remain fail-fast until the corresponding SFNN child features are implemented.
+- Other SFNN families, the default `SFNN_halfka2_1536_15_32_k3k3` architecture, and production/plateau scheduling remain fail-fast until the corresponding SFNN child features are implemented.
 - Validation:
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check --example bulletou`.
   - `cargo check -p bulletou_lib --example bulletou`.
   - WSL CUDA smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` on `shuffled-001.hcpe` streamed one real HCPE batch, launched the nested child with `--sfnn-teacher-train --save-rate 0`, wrote `0001/nn.bin`, `0001/state.bin`, `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.log`, and reported `step1_loss weighted_sum=0.25801346 mean=0.25801346`.
+
+### BO-CUDA-010
+
+- Added SFNN checkpoint-time validation for `bulletou-cuda-train --sfnn-teacher-train --test-teacher`.
+- Validation reads the trained SFNN state back, runs CPU fast HalfKA2 + `ShogiLayerStackBucket9::KingRank9` forward on sampled HCPE positions, and computes `test_value_accuracy` / `test_value_loss` with the same sign/loss helper used by the NNUE bridge path.
+- The BulletOu `--backend cuda-oxide --eval-type SFNN_HALFKA2` wrapper now allows `--test-teacher` in direct SFNN mode and forwards the validation flags to the nested child trainer.
+- Validation:
+  - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
+  - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - `cargo check --example bulletou`.
+  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --test-teacher shuffled-001.hcpe --test-positions 8 --test-batch-size 4 --train-steps 1 --batch-size 1` wrote `test_value_accuracy=0.375000`, `test_value_loss=0.111235`, and `train_value_loss=0.258013457` to both `0001/learn.log` and top-level `summary-learn.log`.
