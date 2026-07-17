@@ -1258,6 +1258,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut checkpoint_dataloader_positions = Vec::new();
     let mut bridge_checkpoints = Vec::new();
     let mut last_batch = None;
+    struct PendingAsyncTeacherStep {
+        step: usize,
+        learning_rate: f32,
+        source: String,
+        dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+        train_batch: NnueTrainBatchCase,
+    }
+    let use_async_pipeline = save_interval_steps.is_none();
+    let mut pending_async_step: Option<PendingAsyncTeacherStep> = None;
     let mut run_steps = 0usize;
     let teacher_batch_index = if dataloader_resume_pos.is_some()
         || resume_teacher_matches
@@ -1338,6 +1347,39 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 batch_size: train_batch.batch_size,
                 max_active: train_batch.max_active,
             };
+
+            if use_async_pipeline {
+                let completed_loss = runner_ref.step_pipelined(
+                    &stream,
+                    &module,
+                    params,
+                    train_loss_kind,
+                    host_batch,
+                    args.debug_readback,
+                    false,
+                )?;
+                if let Some(loss) = completed_loss {
+                    let meta = pending_async_step
+                        .take()
+                        .expect("async NNUE train pipeline returns losses in submission order");
+                    let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
+                    losses.push(loss_entry);
+                    learning_rates.push(meta.learning_rate);
+                    sources.push(meta.source);
+                    dataloader_positions.push(meta.dataloader_pos);
+                    last_batch = Some(meta.train_batch);
+                }
+                pending_async_step = Some(PendingAsyncTeacherStep {
+                    step,
+                    learning_rate,
+                    source,
+                    dataloader_pos,
+                    train_batch,
+                });
+                run_steps += 1;
+                return Ok(());
+            }
+
             runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
             stream.synchronize()?;
 
@@ -1390,6 +1432,21 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             "failed to stream NNUE teacher batches from {teacher}: {err}"
         ))
     })?;
+
+    if use_async_pipeline {
+        let runner_ref = runner.as_mut().expect("validated non-empty teacher train steps");
+        if let Some(loss) = runner_ref.finish_pipelined_loss()? {
+            let meta = pending_async_step
+                .take()
+                .expect("async NNUE train pipeline has final metadata for final loss");
+            let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
+            losses.push(loss_entry);
+            learning_rates.push(meta.learning_rate);
+            sources.push(meta.source);
+            dataloader_positions.push(meta.dataloader_pos);
+            last_batch = Some(meta.train_batch);
+        }
+    }
 
     let runner = runner.as_ref().expect("validated non-empty teacher train steps");
     let last_batch = last_batch.as_ref().expect("validated non-empty teacher train steps");

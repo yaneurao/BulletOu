@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
+    CudaModule, CudaStream, DeviceBuffer, Error, Result,
     backward::{
         DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueBackwardWorkspace, NnueBackwardWorkspaceLayout,
         NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
@@ -20,10 +21,12 @@ use bulletou_cuda_oxide_runtime::{
         NnueForwardWeightLayout, NnueForwardWorkspace, NnueForwardWorkspaceLayout,
     },
     optimizer::{NnueRangerOptimizerHostStates, NnueRangerOptimizerStates, RangerUpdateParams},
-    CudaModule, CudaStream, DeviceBuffer, Error, Result,
 };
+use cuda_core::{CudaEvent, PinnedHostBuffer};
 
 use crate::{dense_backward, loss_forward, nnue_forward, optimizer_update};
+
+const NNUE_TRAIN_PIPELINE_SLOTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NnueTrainLossKind {
@@ -77,18 +80,77 @@ pub(crate) struct NnueTrainStateReadback {
     pub(crate) outb: NnueTrainParamGroupReadback,
 }
 
-pub(crate) struct NnueLossRangerStepRunner {
-    shape: NnueForwardShape,
-    batch_size: usize,
-    max_active: usize,
-    device_weights: NnueForwardDeviceWeights,
-    optimizer_states: NnueRangerOptimizerStates,
+struct PendingLossReadback {
+    slot: usize,
+    include_debug: bool,
+}
+
+struct NnueTrainStepSlot {
     device_batch: NnueForwardDeviceBatch,
     targets: DeviceBuffer<f32>,
     entry_weights: DeviceBuffer<f32>,
     forward_workspace: NnueForwardWorkspace,
     loss_workspace: ScalarLossWorkspace,
     backward_workspace: NnueBackwardWorkspace,
+    upload_stm_indices: PinnedHostBuffer<i32>,
+    upload_nstm_indices: PinnedHostBuffer<i32>,
+    upload_targets: PinnedHostBuffer<f32>,
+    upload_entry_weights: PinnedHostBuffer<f32>,
+    readback_weighted_sum: PinnedHostBuffer<f32>,
+    readback_mean: PinnedHostBuffer<f32>,
+    readback_per_sample: PinnedHostBuffer<f32>,
+    readback_mean_output_gradients: PinnedHostBuffer<f32>,
+    upload_done: Option<CudaEvent>,
+    compute_done: Option<CudaEvent>,
+    readback_done: Option<CudaEvent>,
+}
+
+impl NnueTrainStepSlot {
+    fn new(stream: &Arc<CudaStream>, shape: NnueForwardShape, batch_size: usize, max_active: usize) -> Result<Self> {
+        let sparse_len = batch_size.saturating_mul(max_active);
+        let ctx = stream.context();
+        Ok(Self {
+            device_batch: NnueForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+                nstm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+            },
+            targets: DeviceBuffer::<f32>::zeroed(stream, batch_size)?,
+            entry_weights: DeviceBuffer::<f32>::zeroed(stream, batch_size)?,
+            forward_workspace: NnueForwardWorkspace::new(stream, NnueForwardWorkspaceLayout::new(shape, batch_size))?,
+            loss_workspace: ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?,
+            backward_workspace: NnueBackwardWorkspace::new(
+                stream,
+                NnueBackwardWorkspaceLayout::new(shape, batch_size, max_active),
+            )?,
+            upload_stm_indices: PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?,
+            upload_nstm_indices: PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?,
+            upload_targets: PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?,
+            upload_entry_weights: PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?,
+            readback_weighted_sum: PinnedHostBuffer::<f32>::zeroed(ctx, 1)?,
+            readback_mean: PinnedHostBuffer::<f32>::zeroed(ctx, 1)?,
+            readback_per_sample: PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?,
+            readback_mean_output_gradients: PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?,
+            upload_done: None,
+            compute_done: None,
+            readback_done: None,
+        })
+    }
+}
+
+pub(crate) struct NnueLossRangerStepRunner {
+    shape: NnueForwardShape,
+    batch_size: usize,
+    max_active: usize,
+    device_weights: NnueForwardDeviceWeights,
+    optimizer_states: NnueRangerOptimizerStates,
+    slots: Vec<NnueTrainStepSlot>,
+    upload_stream: Arc<CudaStream>,
+    readback_stream: Arc<CudaStream>,
+    next_slot: usize,
+    last_step_slot: Option<usize>,
+    pending_loss: Option<PendingLossReadback>,
 }
 
 impl NnueLossRangerStepRunner {
@@ -142,20 +204,12 @@ impl NnueLossRangerStepRunner {
         device_weights: NnueForwardDeviceWeights,
         optimizer_states: NnueRangerOptimizerStates,
     ) -> Result<Self> {
-        let sparse_len = batch_size.saturating_mul(max_active);
-        let device_batch = NnueForwardDeviceBatch {
-            batch_size,
-            max_active,
-            stm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
-            nstm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
-        };
-        let targets = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
-        let entry_weights = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
-        let forward_workspace =
-            NnueForwardWorkspace::new(stream, NnueForwardWorkspaceLayout::new(shape, batch_size))?;
-        let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
-        let backward_workspace =
-            NnueBackwardWorkspace::new(stream, NnueBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
+        let upload_stream = stream.fork()?;
+        let readback_stream = stream.fork()?;
+        let mut slots = Vec::with_capacity(NNUE_TRAIN_PIPELINE_SLOTS);
+        for _ in 0..NNUE_TRAIN_PIPELINE_SLOTS {
+            slots.push(NnueTrainStepSlot::new(stream, shape, batch_size, max_active)?);
+        }
 
         Ok(Self {
             shape,
@@ -163,12 +217,12 @@ impl NnueLossRangerStepRunner {
             max_active,
             device_weights,
             optimizer_states,
-            device_batch,
-            targets,
-            entry_weights,
-            forward_workspace,
-            loss_workspace,
-            backward_workspace,
+            slots,
+            upload_stream,
+            readback_stream,
+            next_slot: 0,
+            last_step_slot: None,
+            pending_loss: None,
         })
     }
 
@@ -180,36 +234,189 @@ impl NnueLossRangerStepRunner {
         loss_kind: NnueTrainLossKind,
         batch: NnueTrainStepHostBatch<'_>,
     ) -> Result<()> {
-        self.validate_batch(batch)?;
-        self.device_batch.stm_indices.copy_from_host(stream, batch.stm_indices)?;
-        self.device_batch.nstm_indices.copy_from_host(stream, batch.nstm_indices)?;
-        self.targets.copy_from_host(stream, batch.targets)?;
-        self.entry_weights.copy_from_host(stream, batch.entry_weights)?;
+        let slot = self.next_slot_index();
+        self.synchronize_slot_for_blocking_reuse(slot)?;
+        self.enqueue_step_with_blocking_upload(stream, module, params, loss_kind, batch, slot)?;
+        self.last_step_slot = Some(slot);
+        Ok(())
+    }
 
+    pub(crate) fn step_pipelined(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        params: RangerUpdateParams,
+        loss_kind: NnueTrainLossKind,
+        batch: NnueTrainStepHostBatch<'_>,
+        include_debug_readback: bool,
+        drain_before_enqueue: bool,
+    ) -> Result<Option<NnueTrainStepLossReadback>> {
+        let slot = self.next_slot;
+        let mut previous = self.pending_loss.take();
+        let mut completed = None;
+
+        if drain_before_enqueue || previous.as_ref().is_some_and(|pending| pending.slot == slot) {
+            if let Some(pending) = previous.take() {
+                completed = Some(self.collect_pending_loss(pending)?);
+            }
+        }
+
+        self.prepare_slot_for_async_reuse(slot)?;
+        self.enqueue_step_with_async_upload_and_readback(
+            stream,
+            module,
+            params,
+            loss_kind,
+            batch,
+            slot,
+            include_debug_readback,
+        )?;
+        self.next_slot = (self.next_slot + 1) % self.slots.len();
+        self.last_step_slot = Some(slot);
+
+        if completed.is_none() {
+            if let Some(pending) = previous {
+                completed = Some(self.collect_pending_loss(pending)?);
+            }
+        }
+        self.pending_loss = Some(PendingLossReadback { slot, include_debug: include_debug_readback });
+        Ok(completed)
+    }
+
+    pub(crate) fn finish_pipelined_loss(&mut self) -> Result<Option<NnueTrainStepLossReadback>> {
+        match self.pending_loss.take() {
+            Some(pending) => Ok(Some(self.collect_pending_loss(pending)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn next_slot_index(&mut self) -> usize {
+        let slot = self.next_slot;
+        self.next_slot = (self.next_slot + 1) % self.slots.len();
+        slot
+    }
+
+    fn synchronize_slot_for_blocking_reuse(&mut self, slot: usize) -> Result<()> {
+        if let Some(event) = self.slots[slot].upload_done.take() {
+            event.synchronize()?;
+        }
+        if let Some(event) = self.slots[slot].compute_done.take() {
+            event.synchronize()?;
+        }
+        if let Some(event) = self.slots[slot].readback_done.take() {
+            event.synchronize()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_slot_for_async_reuse(&mut self, slot: usize) -> Result<()> {
+        if let Some(event) = self.slots[slot].upload_done.take() {
+            event.synchronize()?;
+        }
+        if let Some(event) = self.slots[slot].readback_done.take() {
+            event.synchronize()?;
+        }
+        if let Some(event) = self.slots[slot].compute_done.take() {
+            self.upload_stream.wait(&event)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_step_with_blocking_upload(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        params: RangerUpdateParams,
+        loss_kind: NnueTrainLossKind,
+        batch: NnueTrainStepHostBatch<'_>,
+        slot: usize,
+    ) -> Result<()> {
+        self.validate_batch(batch)?;
+        {
+            let slot_ref = &mut self.slots[slot];
+            slot_ref.device_batch.stm_indices.copy_from_host(stream, batch.stm_indices)?;
+            slot_ref.device_batch.nstm_indices.copy_from_host(stream, batch.nstm_indices)?;
+            slot_ref.targets.copy_from_host(stream, batch.targets)?;
+            slot_ref.entry_weights.copy_from_host(stream, batch.entry_weights)?;
+        }
+        self.launch_compute_on_slot(stream, module, params, loss_kind, slot)
+    }
+
+    fn enqueue_step_with_async_upload_and_readback(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        params: RangerUpdateParams,
+        loss_kind: NnueTrainLossKind,
+        batch: NnueTrainStepHostBatch<'_>,
+        slot: usize,
+        include_debug_readback: bool,
+    ) -> Result<()> {
+        self.validate_batch(batch)?;
+        {
+            let slot_ref = &mut self.slots[slot];
+            slot_ref.upload_stm_indices.as_mut_slice().copy_from_slice(batch.stm_indices);
+            slot_ref.upload_nstm_indices.as_mut_slice().copy_from_slice(batch.nstm_indices);
+            slot_ref.upload_targets.as_mut_slice().copy_from_slice(batch.targets);
+            slot_ref.upload_entry_weights.as_mut_slice().copy_from_slice(batch.entry_weights);
+            // SAFETY: the slot's pinned upload buffers are not reused until
+            // `upload_done` is synchronized in `prepare_slot_for_async_reuse`.
+            unsafe {
+                slot_ref
+                    .device_batch
+                    .stm_indices
+                    .copy_from_pinned_host_async(&self.upload_stream, &slot_ref.upload_stm_indices)?;
+                slot_ref
+                    .device_batch
+                    .nstm_indices
+                    .copy_from_pinned_host_async(&self.upload_stream, &slot_ref.upload_nstm_indices)?;
+                slot_ref.targets.copy_from_pinned_host_async(&self.upload_stream, &slot_ref.upload_targets)?;
+                slot_ref
+                    .entry_weights
+                    .copy_from_pinned_host_async(&self.upload_stream, &slot_ref.upload_entry_weights)?;
+            }
+        }
+        let upload_done = self.upload_stream.record_event(None)?;
+        stream.wait(&upload_done)?;
+        self.slots[slot].upload_done = Some(upload_done);
+
+        self.launch_compute_on_slot(stream, module, params, loss_kind, slot)?;
+        self.enqueue_loss_readback(stream, slot, include_debug_readback)
+    }
+
+    fn launch_compute_on_slot(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        params: RangerUpdateParams,
+        loss_kind: NnueTrainLossKind,
+        slot: usize,
+    ) -> Result<()> {
+        let slot_ref = &mut self.slots[slot];
         nnue_forward::launch_nnue_forward(
             stream,
             module,
-            &self.device_batch,
+            &slot_ref.device_batch,
             &self.device_weights,
-            &mut self.forward_workspace,
+            &mut slot_ref.forward_workspace,
         )?;
 
         match loss_kind {
             NnueTrainLossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
                 stream,
                 module,
-                &self.forward_workspace.output,
-                &self.targets,
-                &self.entry_weights,
-                &mut self.loss_workspace,
+                &slot_ref.forward_workspace.output,
+                &slot_ref.targets,
+                &slot_ref.entry_weights,
+                &mut slot_ref.loss_workspace,
             )?,
             NnueTrainLossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(
                 stream,
                 module,
-                &self.forward_workspace.output,
-                &self.targets,
-                &self.entry_weights,
-                &mut self.loss_workspace,
+                &slot_ref.forward_workspace.output,
+                &slot_ref.targets,
+                &slot_ref.entry_weights,
+                &mut slot_ref.loss_workspace,
             )?,
         }
 
@@ -217,66 +424,61 @@ impl NnueLossRangerStepRunner {
             stream,
             module,
             DenseOutputBackwardLayout::new(self.batch_size, self.shape.l3),
-            &self.forward_workspace.hidden2,
-            &self.loss_workspace.mean_output_gradients,
+            &slot_ref.forward_workspace.hidden2,
+            &slot_ref.loss_workspace.mean_output_gradients,
             &self.device_weights.outw,
-            &mut self.backward_workspace.hidden2_gradients,
-            &mut self.backward_workspace.outw_gradients,
-            &mut self.backward_workspace.outb_gradients,
+            &mut slot_ref.backward_workspace.hidden2_gradients,
+            &mut slot_ref.backward_workspace.outw_gradients,
+            &mut slot_ref.backward_workspace.outb_gradients,
         )?;
 
         dense_backward::launch_dense_crelu_backward(
             stream,
             module,
             DenseCReluBackwardLayout::new(self.batch_size, self.shape.l2, self.shape.l3),
-            &self.forward_workspace.hidden1,
-            &self.forward_workspace.hidden2,
-            &self.backward_workspace.hidden2_gradients,
+            &slot_ref.forward_workspace.hidden1,
+            &slot_ref.forward_workspace.hidden2,
+            &slot_ref.backward_workspace.hidden2_gradients,
             &self.device_weights.l2w,
-            &mut self.backward_workspace.hidden1_gradients,
-            &mut self.backward_workspace.l2w_gradients,
-            &mut self.backward_workspace.l2b_gradients,
+            &mut slot_ref.backward_workspace.hidden1_gradients,
+            &mut slot_ref.backward_workspace.l2w_gradients,
+            &mut slot_ref.backward_workspace.l2b_gradients,
         )?;
 
         dense_backward::launch_dense_crelu_backward(
             stream,
             module,
             DenseCReluBackwardLayout::new(self.batch_size, self.shape.l1 * 2, self.shape.l2),
-            &self.forward_workspace.combined,
-            &self.forward_workspace.hidden1,
-            &self.backward_workspace.hidden1_gradients,
+            &slot_ref.forward_workspace.combined,
+            &slot_ref.forward_workspace.hidden1,
+            &slot_ref.backward_workspace.hidden1_gradients,
             &self.device_weights.l1w,
-            &mut self.backward_workspace.combined_gradients,
-            &mut self.backward_workspace.l1w_gradients,
-            &mut self.backward_workspace.l1b_gradients,
+            &mut slot_ref.backward_workspace.combined_gradients,
+            &mut slot_ref.backward_workspace.l1w_gradients,
+            &mut slot_ref.backward_workspace.l1b_gradients,
         )?;
 
         dense_backward::launch_nnue_l0_crelu_backward(
             stream,
             module,
             NnueL0CReluBackwardLayout::new(self.batch_size, self.shape.l1),
-            &self.backward_workspace.combined_gradients,
-            &self.forward_workspace.stm_l0,
-            &self.forward_workspace.nstm_l0,
-            &mut self.backward_workspace.stm_l0_gradients,
-            &mut self.backward_workspace.nstm_l0_gradients,
+            &slot_ref.backward_workspace.combined_gradients,
+            &slot_ref.forward_workspace.stm_l0,
+            &slot_ref.forward_workspace.nstm_l0,
+            &mut slot_ref.backward_workspace.stm_l0_gradients,
+            &mut slot_ref.backward_workspace.nstm_l0_gradients,
         )?;
 
         dense_backward::launch_nnue_l0_sparse_backward(
             stream,
             module,
-            NnueL0SparseBackwardLayout::new(
-                self.batch_size,
-                self.max_active,
-                self.shape.input_size,
-                self.shape.l1,
-            ),
-            &self.device_batch.stm_indices,
-            &self.device_batch.nstm_indices,
-            &self.backward_workspace.stm_l0_gradients,
-            &self.backward_workspace.nstm_l0_gradients,
-            &mut self.backward_workspace.l0w_gradients,
-            &mut self.backward_workspace.l0b_gradients,
+            NnueL0SparseBackwardLayout::new(self.batch_size, self.max_active, self.shape.input_size, self.shape.l1),
+            &slot_ref.device_batch.stm_indices,
+            &slot_ref.device_batch.nstm_indices,
+            &slot_ref.backward_workspace.stm_l0_gradients,
+            &slot_ref.backward_workspace.nstm_l0_gradients,
+            &mut slot_ref.backward_workspace.l0w_gradients,
+            &mut slot_ref.backward_workspace.l0b_gradients,
         )?;
 
         optimizer_update::launch_nnue_ranger_update(
@@ -284,24 +486,75 @@ impl NnueLossRangerStepRunner {
             module,
             params,
             &mut self.device_weights,
-            &self.backward_workspace,
+            &slot_ref.backward_workspace,
             &mut self.optimizer_states,
         )?;
 
+        self.slots[slot].compute_done = Some(stream.record_event(None)?);
         Ok(())
     }
 
-    pub(crate) fn read_loss(
-        &self,
-        stream: &Arc<CudaStream>,
-        include_debug: bool,
-    ) -> Result<NnueTrainStepLossReadback> {
+    fn enqueue_loss_readback(&mut self, stream: &Arc<CudaStream>, slot: usize, include_debug: bool) -> Result<()> {
+        let loss_ready = stream.record_event(None)?;
+        self.readback_stream.wait(&loss_ready)?;
+        {
+            let slot_ref = &mut self.slots[slot];
+            // SAFETY: readback pinned buffers are not read or reused until the
+            // recorded `readback_done` event is synchronized in
+            // `collect_pending_loss` or slot reuse.
+            unsafe {
+                slot_ref
+                    .loss_workspace
+                    .weighted_sum
+                    .copy_to_pinned_host_async(&self.readback_stream, &mut slot_ref.readback_weighted_sum)?;
+                slot_ref
+                    .loss_workspace
+                    .mean
+                    .copy_to_pinned_host_async(&self.readback_stream, &mut slot_ref.readback_mean)?;
+                if include_debug {
+                    slot_ref
+                        .loss_workspace
+                        .per_sample
+                        .copy_to_pinned_host_async(&self.readback_stream, &mut slot_ref.readback_per_sample)?;
+                    slot_ref.loss_workspace.mean_output_gradients.copy_to_pinned_host_async(
+                        &self.readback_stream,
+                        &mut slot_ref.readback_mean_output_gradients,
+                    )?;
+                }
+            }
+        }
+        self.slots[slot].readback_done = Some(self.readback_stream.record_event(None)?);
+        Ok(())
+    }
+
+    fn collect_pending_loss(&mut self, pending: PendingLossReadback) -> Result<NnueTrainStepLossReadback> {
+        let slot_ref = &mut self.slots[pending.slot];
+        let event = slot_ref
+            .readback_done
+            .take()
+            .ok_or_else(|| Error::Smoke("internal NNUE train pipeline loss readback was not enqueued".to_string()))?;
+        event.synchronize()?;
         Ok(NnueTrainStepLossReadback {
-            weighted_sum: self.loss_workspace.weighted_sum.to_host_vec(stream)?,
-            mean: self.loss_workspace.mean.to_host_vec(stream)?,
-            per_sample: include_debug.then(|| self.loss_workspace.per_sample.to_host_vec(stream)).transpose()?,
+            weighted_sum: slot_ref.readback_weighted_sum.as_slice().to_vec(),
+            mean: slot_ref.readback_mean.as_slice().to_vec(),
+            per_sample: pending.include_debug.then(|| slot_ref.readback_per_sample.as_slice().to_vec()),
+            mean_output_gradients: pending
+                .include_debug
+                .then(|| slot_ref.readback_mean_output_gradients.as_slice().to_vec()),
+        })
+    }
+
+    pub(crate) fn read_loss(&self, stream: &Arc<CudaStream>, include_debug: bool) -> Result<NnueTrainStepLossReadback> {
+        let slot_ref = self
+            .last_step_slot
+            .and_then(|slot| self.slots.get(slot))
+            .ok_or_else(|| Error::Smoke("NNUE train-step loss readback requested before any step".to_string()))?;
+        Ok(NnueTrainStepLossReadback {
+            weighted_sum: slot_ref.loss_workspace.weighted_sum.to_host_vec(stream)?,
+            mean: slot_ref.loss_workspace.mean.to_host_vec(stream)?,
+            per_sample: include_debug.then(|| slot_ref.loss_workspace.per_sample.to_host_vec(stream)).transpose()?,
             mean_output_gradients: include_debug
-                .then(|| self.loss_workspace.mean_output_gradients.to_host_vec(stream))
+                .then(|| slot_ref.loss_workspace.mean_output_gradients.to_host_vec(stream))
                 .transpose()?,
         })
     }

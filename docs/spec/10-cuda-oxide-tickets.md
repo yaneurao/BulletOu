@@ -11,7 +11,7 @@ commit each completed slice.
 | BO-CUDA-003 | done | production schedule integration | cuda-oxide path honors `--superbatches`, epoch boundaries, LR schedule, `--save-rate`, positions carry-over, and plateau control in the same user-facing sense as the Bullet backend |
 | BO-CUDA-004 | done | validation metrics integration | cuda-oxide checkpoints write production-compatible `learn.log` / `summary-learn.log` columns including `test_value_accuracy`, `test_value_loss`, and `train_value_loss` |
 | BO-CUDA-005 | done | dataloader resume generalisation | HCPE3, shogipack, multi-teacher specs, and teacher changes have explicit resume behavior and smoke coverage |
-| BO-CUDA-006 | todo | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
+| BO-CUDA-006 | done | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
 | BO-CUDA-007 | todo | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
 | BO-CUDA-008 | todo | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 
@@ -76,3 +76,15 @@ commit each completed slice.
   - WSL CUDA teacher-change smoke: switching to `shuffled-002.hcpe` resumed `state.boung` but printed `teacher changed; starting teacher stream at batch 0` and wrote the new `teacher.txt`.
   - WSL CUDA HCPE3 smoke: `arch000073330000.hcpe3` wrote `0,2`; same-teacher resume printed `resume_data byte_offset=0, plies=2` and wrote `0,4`.
   - WSL CUDA shogipack smoke: synthetic `bo005-tiny.pack` wrote `0,2`; same-teacher resume printed `resume_data byte_offset=0, plies=2` and wrote `0,4`. No non-git `.pack` teacher file was present under the searched local teacher/work directories.
+
+### BO-CUDA-006
+
+- Reworked the NNUE loss/Ranger step runner around a two-slot ring. Each slot owns its device batch/workspaces, pinned host upload buffers, pinned host loss readback buffers, and CUDA events for upload, compute, and readback lifetime tracking.
+- Added an upload stream and readback stream alongside the compute stream. Async steps copy batch inputs from pinned host buffers on the upload stream, make compute wait on the upload event, then copy loss readbacks to pinned host buffers on the readback stream after the compute stream records the loss-ready event.
+- The default final-only teacher train path (`--save-rate 0`) uses the async pipeline and drains the final pending readback before writing outputs. Periodic checkpoint mode remains synchronized so checkpoint state, logs, and save boundaries stay aligned.
+- Validation:
+  - `cargo check -p bulletou-cuda-train`
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`
+  - WSL: `cargo test -p bulletou-cuda-train --features cuda,root-loader dataloader_pos -- --nocapture`
+  - WSL CUDA async final-output smoke on `shuffled-001.hcpe` with `--train-steps 2 --batch-size 2` wrote `0001/{nn.bin,state.boung,state.bin,teacher.txt,dataloader_pos.txt,learn.log,trained-forward.nnuef}`, `summary-learn.log`, and `dataloader_pos.txt = 152,0`.
+  - WSL CUDA async-vs-sync baseline smoke on the same teacher produced identical losses: step1 `weighted_sum=0.4999314 mean=0.2499657`, step2 `weighted_sum=0.013783315 mean=0.0068916576`.
