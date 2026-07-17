@@ -197,6 +197,10 @@ impl NnueL0SparseBackwardLayout {
     pub fn gradient_threads(self) -> usize {
         self.weight_len().max(self.bias_len())
     }
+
+    pub fn scatter_threads(self) -> usize {
+        self.sparse_values_len().saturating_mul(self.l1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,11 +848,12 @@ impl NnueL0CReluBackwardLaunchPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueL0SparseBackwardLaunchPlan {
     pub threads: usize,
+    pub scatter_threads: usize,
 }
 
 impl NnueL0SparseBackwardLaunchPlan {
     pub fn new(layout: NnueL0SparseBackwardLayout) -> Self {
-        Self { threads: layout.gradient_threads().max(1) }
+        Self { threads: layout.gradient_threads().max(1), scatter_threads: layout.scatter_threads().max(1) }
     }
 }
 

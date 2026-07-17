@@ -10,6 +10,7 @@ param(
     [int]$BatchSize = 64,
     [int]$BatchesPerSuperbatch = 1,
     [int]$Superbatches = 1,
+    [switch]$BuildBulletKernel,
     [switch]$BuildTataraKernel,
     [switch]$SkipBulletMetrics
 )
@@ -133,6 +134,11 @@ $testPsv = Join-Path $runDir "test-$TestPositions.psv"
 $tataraOut = Join-Path $runDir "tatara"
 $bulletSpeedOut = Join-Path $runDir "bulletou-speed"
 $bulletMetricsOut = Join-Path $runDir "bulletou-metrics"
+$totalTrainBatches = $Superbatches * $BatchesPerSuperbatch
+$requiredTrainPositions = [int64]$totalTrainBatches * [int64]$BatchSize
+if ([int64]$TrainPositions -lt $requiredTrainPositions) {
+    throw "TrainPositions=$TrainPositions is smaller than Superbatches*BatchesPerSuperbatch*BatchSize=$requiredTrainPositions."
+}
 
 Invoke-LoggedLocal "export train PSV" @(
     "cargo", "run", "-p", "bulletou_lib", "--example", "export_teacher_psv", "--",
@@ -181,9 +187,37 @@ $testPsvWsl = Convert-ToWslPath $testPsv
 $tataraRootWsl = Convert-ToWslPath $tataraRootFull
 $tataraOutWsl = Convert-ToWslPath $tataraOut
 $repoRootWsl = Convert-ToWslPath $repoRoot
-$bulletCubinWsl = "$repoRootWsl/cuda-oxide/target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.cubin"
+$bulletCubin = Join-Path $repoRoot "cuda-oxide\target\cuda-oxide-artifacts\bulletou_cuda_train_bo015.cubin"
+$bulletCubinWsl = Convert-ToWslPath $bulletCubin
 $bulletSpeedOutWsl = Convert-ToWslPath $bulletSpeedOut
 $bulletMetricsOutWsl = Convert-ToWslPath $bulletMetricsOut
+
+if (-not (Test-Path $bulletCubin)) {
+    if (-not $BuildBulletKernel) {
+        throw "BulletOu CUDA artifact not found: $bulletCubin. Re-run with -BuildBulletKernel."
+    }
+}
+if ($BuildBulletKernel) {
+    # cuda-oxide atomic RMW currently needs the sm_100 NVVM IR route; direct
+    # legacy NVVM IR for sm_89 cannot lower atomics.
+    $bulletBuildEnv = "export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
+        "CUDA_HOME=/usr CUDA_PATH=/usr CUDA_TOOLKIT_PATH=/usr " +
+        "CUDA_OXIDE_LIBDEVICE=/usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc " +
+        "LIBCLANG_PATH=/usr/lib/llvm-20/lib " +
+        "LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu " +
+        "CUDA_OXIDE_TARGET=sm_100"
+    $bulletBuildCmd = @(
+        "cd $(Quote-Bash "$repoRootWsl/cuda-oxide")",
+        $bulletBuildEnv,
+        "cargo-oxide build --emit-nvvm-ir --arch sm_100 --features cuda -- --package bulletou-cuda-train --release",
+        "mkdir -p target/cuda-oxide-artifacts",
+        "/usr/bin/llvm-link-20 bulletou_cuda_train.ll /usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc -o target/cuda-oxide-artifacts/bulletou_cuda_train_bo015_linked.bc",
+        "/usr/bin/opt-20 -O2 target/cuda-oxide-artifacts/bulletou_cuda_train_bo015_linked.bc -o target/cuda-oxide-artifacts/bulletou_cuda_train_bo015_opt.bc",
+        "/usr/bin/llc-20 --mtriple=nvptx64-nvidia-cuda --mcpu=$CudaArch -O2 target/cuda-oxide-artifacts/bulletou_cuda_train_bo015_opt.bc -o target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.ptx",
+        "ptxas -arch=$CudaArch target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.ptx -o target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.cubin"
+    ) -join " && "
+    Invoke-LoggedWsl "build BulletOu cuda-oxide kernel" $bulletBuildCmd (Join-Path $runDir "bulletou-kernel-build.log")
+}
 
 # This profile matches BulletOu's current `--loss-kind wrm` constants:
 # nnue2score=600, prediction offset/scaling=270/340, target offset/scaling=270/380,
@@ -229,7 +263,7 @@ $bulletBaseArgs = @(
     "--test-teacher $(Quote-Bash $testPsvWsl)",
     "--test-positions $TestPositions",
     "--test-batch-size $BatchSize",
-    "--train-steps $Superbatches",
+    "--train-steps $totalTrainBatches",
     "--batches-per-superbatch $BatchesPerSuperbatch",
     "--batch-size $BatchSize",
     "--buffer-mb 1",

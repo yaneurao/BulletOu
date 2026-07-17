@@ -1,5 +1,6 @@
 //! Minimal backward kernels for CO-009.
 
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::{kernel, thread, DisjointSlice};
 
 #[kernel]
@@ -148,6 +149,32 @@ pub fn nnue_l0_crelu_backward(
 }
 
 #[kernel]
+pub fn nnue_l0_sparse_zero_gradients(
+    mut l0w_gradients: DisjointSlice<f32>,
+    mut l0b_gradients: DisjointSlice<f32>,
+    input_size: u32,
+    l1: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let rows = l1 as usize;
+    let features = input_size as usize;
+    let weight_len = features * rows;
+
+    if tid_value < weight_len {
+        if let Some(out) = l0w_gradients.get_mut(tid) {
+            *out = 0.0;
+        }
+    }
+
+    if tid_value < rows {
+        if let Some(out) = l0b_gradients.get_mut(thread::index_1d()) {
+            *out = 0.0;
+        }
+    }
+}
+
+#[kernel]
 pub fn nnue_l0_sparse_backward(
     stm_indices: &[i32],
     nstm_indices: &[i32],
@@ -166,40 +193,38 @@ pub fn nnue_l0_sparse_backward(
     let slots = max_active as usize;
     let rows = l1 as usize;
     let features = input_size as usize;
-    let weight_len = features * rows;
+    let scatter_len = batch_size * slots * rows;
 
-    if tid_value < weight_len {
-        let feature = tid_value / rows;
-        let row = tid_value - feature * rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            let sparse_base = sample * slots;
-            let grad_idx = sample * rows + row;
-            let stm_grad = stm_gradients[grad_idx];
-            let nstm_grad = nstm_gradients[grad_idx];
-            for slot in 0..slots {
-                if stm_indices[sparse_base + slot] == feature as i32 {
-                    sum += stm_grad;
-                }
-                if nstm_indices[sparse_base + slot] == feature as i32 {
-                    sum += nstm_grad;
-                }
-            }
+    if tid_value < scatter_len {
+        let row = tid_value % rows;
+        let sparse_entry = tid_value / rows;
+        let sample = sparse_entry / slots;
+        let slot = sparse_entry - sample * slots;
+        let sparse_base = sample * slots + slot;
+
+        let stm_feature = stm_indices[sparse_base];
+        if stm_feature >= 0 && (stm_feature as usize) < features {
+            let weight_idx = (stm_feature as usize) * rows + row;
+            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(stm_gradients[sample * rows + row], AtomicOrdering::Relaxed);
         }
-        if let Some(out) = l0w_gradients.get_mut(tid) {
-            *out = sum;
+
+        let nstm_feature = nstm_indices[sparse_base];
+        if nstm_feature >= 0 && (nstm_feature as usize) < features {
+            let weight_idx = (nstm_feature as usize) * rows + row;
+            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(nstm_gradients[sample * rows + row], AtomicOrdering::Relaxed);
         }
     }
 
-    if tid_value < rows {
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            let grad_idx = sample * rows + tid_value;
-            sum += stm_gradients[grad_idx] + nstm_gradients[grad_idx];
-        }
-        if let Some(out) = l0b_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
-        }
+    if tid_value < batch_size * rows {
+        let row = tid_value % rows;
+        let sample = tid_value / rows;
+        let cell = unsafe { &*(l0b_gradients.as_mut_ptr().add(row) as *const DeviceAtomicF32) };
+        cell.fetch_add(
+            stm_gradients[sample * rows + row] + nstm_gradients[sample * rows + row],
+            AtomicOrdering::Relaxed,
+        );
     }
 }
 

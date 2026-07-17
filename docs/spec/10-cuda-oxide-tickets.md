@@ -24,7 +24,8 @@ commit each completed slice.
 | BO-CUDA-016 | done | SFNN factorized L1 production integration | `--sfnn-teacher-train --sfnn-factorized-l1` and BulletOu `--backend cuda-oxide --sfnn-factorized-l1` can train, checkpoint, resume, validate, and save folded `nn.bin` with shared `l1f` state preserved in root `state.bin` |
 | BO-CUDA-017 | done | tatara parity data bridge | BulletOu can export HCPE/HCPE3/pack/PSV teachers to flat PSV for tatara, and BulletOu validation accepts PSV held-out data so both trainers can consume the same positions |
 | BO-CUDA-018 | done | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
-| BO-CUDA-019 | todo | larger tatara parity benchmark and tuning | run larger same-PSV standard NNUE HalfKP comparisons, then align/tune any remaining loss, schedule, optimizer, checkpoint-overhead, or accuracy gaps toward tatara-equivalent training |
+| BO-CUDA-019 | done | NNUE L0 sparse backward scatter optimization | larger same-PSV benchmark exposed the dense gather L0 backward bottleneck; BulletOu now zeroes L0 gradients and atomic-scatters active feature gradients, preserving correctness while greatly improving standard NNUE throughput |
+| BO-CUDA-020 | todo | remaining tatara speed/accuracy parity | continue standard NNUE HalfKP profiling/tuning from the post-BO-CUDA-019 baseline, close the remaining speed gap to tatara, and verify held-out accuracy over a longer same-PSV run |
 
 ## Notes
 
@@ -268,9 +269,30 @@ commit each completed slice.
 
 ### BO-CUDA-019
 
-- Remaining parity work is to run a larger same-PSV comparison where the throughput numbers are stable enough to be meaningful, then close any measured gaps.
-- Suggested next slice:
-  - increase train/test positions and batches while keeping the same exported PSV bridge;
-  - compare tatara and BulletOu speed with checkpointing disabled or amortized separately;
-  - compare held-out accuracy/loss after enough updates for schedule/optimizer differences to show up;
-  - decide whether BulletOu needs explicit CLI controls for tatara's WRM/Ranger details, e.g. `weight_boost_w2=0.5`, schedule defaults, or validation/reporting normalization.
+- Fixed `scripts/tatara_parity_smoke.ps1` so BulletOu receives `--train-steps Superbatches*BatchesPerSuperbatch`. The first larger run revealed the harness was only advancing one BulletOu batch when `BatchesPerSuperbatch > 1`.
+- Added `-BuildBulletKernel` to the parity harness. The atomic L0 scatter kernel needs the current WSL `sm_100` NVVM IR route (`cargo-oxide build --emit-nvvm-ir --arch sm_100`, then `llvm-link-20` + `opt-20` + `llc-20 --mcpu=sm_89` + `ptxas`) because direct legacy `cargo-oxide build --arch sm_89` cannot lower cuda-oxide atomic RMW yet.
+- Replaced NNUE `nnue_l0_sparse_backward`'s dense gather algorithm:
+  - old shape: one thread per `input_size*l1` weight, scanning every batch sample and sparse slot to find matching active features;
+  - new shape: zero `l0w/l0b` gradients, then launch `batch*max_active*l1` scatter threads that `DeviceAtomicF32::fetch_add` active STM/NSTM feature gradients into `l0w`, plus atomic bias accumulation into `l0b`.
+- Validation:
+  - `rustfmt` on the touched cuda-oxide files.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward::tests::nnue_l0_sparse_layout_counts_buffers`.
+  - `cargo check -p bulletou-cuda-train`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL: `cargo-oxide build --emit-nvvm-ir --arch sm_100 --features cuda -- --package bulletou-cuda-train --release`.
+  - WSL: rebuilt `target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.cubin` via `llvm-link-20` + `opt-20` + `llc-20 --mcpu=sm_89` + `ptxas`; local SHA-256 `344e1ad4c6e48c94020163726e054c6dc068ce2886cce310701e9d9bd1619a04`.
+  - WSL CUDA `--nnue-dense-backward-smoke --nnue-forward-case tiny` matched CPU golden (`l0w_grad` max_abs `0.0000000037252903`, compare `ok`).
+  - WSL CUDA `--nnue-ranger-step-smoke --nnue-forward-case tiny` matched CPU golden (compare `ok`).
+- Same-PSV parity measurement (`TrainPositions=65536`, `TestPositions=8192`, `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=1`):
+  - pre-fix BulletOu speed, after correcting harness but before scatter L0: `65536` positions in `92.171s`, `711 pos/s`;
+  - post-fix BulletOu speed: `65536` positions in `2.971s`, `22058 pos/s`;
+  - tatara speed on the same slice: `104696 pos/s`;
+  - tatara held-out: `test_loss=0.070236`, `test_acc=0.5065`;
+  - BulletOu held-out: `loss=0.069942`, `accuracy=49.3530%`; the metrics run still includes checkpoint/write overhead (`1209 pos/s`) and is not used for speed comparison.
+
+### BO-CUDA-020
+
+- Remaining parity work:
+  - profile the post-scatter baseline (`~22k pos/s`) against tatara (`~105k pos/s`) and identify the next bottleneck;
+  - likely candidates are remaining dense backward kernels, full-parameter Ranger update over `l0w`, atomic contention in L0 scatter, and host/batch transfer overlap;
+  - run a longer same-PSV accuracy comparison after the next speed pass, since the one-superbatch held-out losses are close but accuracy differs by about `1.3pp`.

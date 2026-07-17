@@ -160,14 +160,31 @@ pub(crate) fn launch_nnue_l0_sparse_backward(
     let l1 = layout.l1 as u32;
 
     unsafe {
-        // SAFETY: kernel ABI matches `nnue_l0_sparse_backward`; each launched
-        // thread owns one output gradient element, so mutable slices are
-        // disjoint.
+        // SAFETY: kernel ABI matches `nnue_l0_sparse_zero_gradients`; each
+        // launched thread owns one output gradient element in the zero phase.
+        cuda_launch! {
+            kernel: crate::kernels::backward::nnue_l0_sparse_zero_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice_mut(l0w_gradients),
+                slice_mut(l0b_gradients),
+                input_size,
+                l1
+            ]
+        }
+    }?;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `nnue_l0_sparse_backward`; gradient
+        // writes are shared scatter-adds and are performed through device
+        // atomics inside the kernel.
         cuda_launch! {
             kernel: crate::kernels::backward::nnue_l0_sparse_backward,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.threads),
+            config: cfg_1d(plan.scatter_threads),
             args: [
                 slice(stm_indices),
                 slice(nstm_indices),
