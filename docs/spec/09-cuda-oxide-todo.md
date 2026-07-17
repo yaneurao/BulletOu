@@ -1044,6 +1044,18 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   resumed from `0005/dataloader_pos.txt` (`380,0`), printed
   `resume_hcpe: byte_offset=380`, and wrote `0006/dataloader_pos.txt`
   (`456,0`).
+- Added `--save-rate <N>` for `--nnue-teacher-train --output`. The default
+  `0` preserves the existing final-only checkpoint behaviour; positive values
+  write the same bridge checkpoint layout every `N` streamed teacher batches.
+  This lets longer direct runs produce resumable `state.boung`, root
+  `state.bin`, `nn.bin`, logs, and HCPE `dataloader_pos.txt` without waiting
+  for the whole invocation to finish. Validation with actual checkpoint weights
+  and `shuffled-001.hcpe` ran `--train-steps 2 --save-rate 1`, wrote `0001`
+  and `0002` in one invocation, and `0002/trained-forward.nnuef` passed
+  `--nnue-forward-smoke` (`output max_abs=0.00000011920929`). A follow-up
+  `--train-steps 1 --save-rate 1` resumed from `0002/state.boung` and
+  `dataloader_pos.txt` byte offset `152`, loaded `Hcpe teacher batch 2`, and
+  wrote `0003/dataloader_pos.txt` (`228,0`).
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

@@ -116,7 +116,7 @@ cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --teacher /mnt/c/shogi/teacher/yane-distill-hcpe-20260508shuffled/shuffled-001.hcpe \
   --weights-bin /mnt/c/path/to/checkpoint/state.bin \
   --output /mnt/c/path/to/cuda-oxide-checkpoints \
-  --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
+  --train-steps 2 --save-rate 1 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 
 Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training.
@@ -136,7 +136,9 @@ the direct trainer automatically restores the latest `state.boung` and writes
 the next number. If that checkpoint has `dataloader_pos.txt`, HCPE input resumes
 from its byte offset through the loader's exact resume path. In that case omit
 `--weights-bin`, because the restored train state already carries weights and
-optimizer state.
+optimizer state. By default, `--output` writes one checkpoint at the end of the
+run. Pass `--save-rate <N>` to write the same bridge checkpoint layout every
+`N` direct teacher batches; `--save-rate 0` is the default final-only mode.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
@@ -145,6 +147,8 @@ the direct path resumes from the same BOUNRNG1 state and runs the remaining
 batches up to `-TrainSteps`. Use `-WeightsBin <PATH>` to initialise fresh
 fixture/direct runs from root weights. Use `-Output <DIR>` to pass the bridge
 checkpoint output directory to the direct path.
+Use `-SaveRate <N>` with `-Output` to forward `--save-rate <N>` to the direct
+teacher path.
 
 WSL2 Ubuntu 24.04 validation example:
 

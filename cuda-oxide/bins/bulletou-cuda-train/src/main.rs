@@ -89,6 +89,7 @@ struct Args {
     teacher: Option<String>,
     output: Option<std::path::PathBuf>,
     train_steps: usize,
+    save_rate: usize,
     batch_size: usize,
     buffer_mb: usize,
     loader_threads: usize,
@@ -174,6 +175,7 @@ impl Args {
             teacher: None,
             output: None,
             train_steps: 1,
+            save_rate: 0,
             batch_size: 2,
             buffer_mb: 1,
             loader_threads: 1,
@@ -255,6 +257,9 @@ impl Args {
                 "--output" => parsed.output = Some(required_path_arg(&mut args, "--output")?),
                 "--train-steps" => {
                     parsed.train_steps = parse_usize_arg(required_arg(&mut args, "--train-steps")?, "--train-steps")?;
+                }
+                "--save-rate" => {
+                    parsed.save_rate = parse_usize_arg(required_arg(&mut args, "--save-rate")?, "--save-rate")?;
                 }
                 "--batch-size" => {
                     parsed.batch_size = parse_usize_arg(required_arg(&mut args, "--batch-size")?, "--batch-size")?;
@@ -1107,6 +1112,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut runner = None;
     let mut losses = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
+    let mut checkpoint_losses = Vec::new();
+    let mut checkpoint_sources = Vec::new();
+    let mut bridge_checkpoints = Vec::new();
     let mut last_batch = None;
     let mut run_steps = 0usize;
     let teacher_batch_config = bulletou_lib::value::HalfkpTeacherBatchConfig {
@@ -1174,10 +1182,29 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             stream.synchronize()?;
 
             let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
-            losses.push((step, loss.weighted_sum[0], loss.mean[0]));
-            sources.push(source);
-            last_batch = Some(train_batch);
+            let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
+            losses.push(loss_entry);
+            sources.push(source.clone());
+            checkpoint_losses.push(loss_entry);
+            checkpoint_sources.push(source);
             run_steps += 1;
+            if args.output.is_some() && args.save_rate > 0 && run_steps % args.save_rate == 0 {
+                let weights = runner_ref.read_weights(&stream)?;
+                let state = runner_ref.read_state(&stream)?;
+                bridge_checkpoints.push(write_nnue_bridge_checkpoint(
+                    args.output.as_ref().expect("checked output exists"),
+                    shape,
+                    completed_step_offset + run_steps,
+                    weights,
+                    &state,
+                    &train_batch,
+                    &checkpoint_losses,
+                    &checkpoint_sources,
+                )?);
+                checkpoint_losses.clear();
+                checkpoint_sources.clear();
+            }
+            last_batch = Some(train_batch);
             Ok(())
         },
     )
@@ -1213,22 +1240,35 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let state = runner.read_state(&stream)?;
         write_nnue_train_state_fixture(path, shape, completed_step_offset + run_steps, &state)?;
     }
-    let bridge_checkpoint = if let Some(output_dir) = &args.output {
-        let weights = runner.read_weights(&stream)?;
-        let state = runner.read_state(&stream)?;
-        Some(write_nnue_bridge_checkpoint(
-            output_dir,
-            shape,
-            completed_step_offset + run_steps,
-            weights,
-            &state,
-            last_batch,
-            &losses,
-            &sources,
-        )?)
-    } else {
-        None
-    };
+    if let Some(output_dir) = &args.output {
+        let should_write_final_bridge_checkpoint =
+            args.save_rate == 0 || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
+        if should_write_final_bridge_checkpoint {
+            let checkpoint_loss_entries = if args.save_rate == 0 {
+                losses.as_slice()
+            } else {
+                checkpoint_losses.as_slice()
+            };
+            let checkpoint_source_entries = if args.save_rate == 0 {
+                sources.as_slice()
+            } else {
+                checkpoint_sources.as_slice()
+            };
+
+            let weights = runner.read_weights(&stream)?;
+            let state = runner.read_state(&stream)?;
+            bridge_checkpoints.push(write_nnue_bridge_checkpoint(
+                output_dir,
+                shape,
+                completed_step_offset + run_steps,
+                weights,
+                &state,
+                last_batch,
+                checkpoint_loss_entries,
+                checkpoint_source_entries,
+            )?);
+        }
+    }
 
     println!("bulletou-cuda-train NNUE teacher train");
     println!("  ptx          : {}", ptx.display());
@@ -1252,6 +1292,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     );
     println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
+    if args.output.is_some() {
+        if args.save_rate == 0 {
+            println!("  save_rate    : final");
+        } else {
+            println!("  save_rate    : {}", args.save_rate);
+        }
+    }
     for (step, weighted_sum, mean) in &losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
     }
@@ -1261,7 +1308,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(path) = &args.write_nnue_train_state_fixture {
         println!("  wrote state  : {}", path.display());
     }
-    if let Some(checkpoint) = &bridge_checkpoint {
+    for checkpoint in &bridge_checkpoints {
         println!("  output       : {}", checkpoint.dir.display());
         println!("  checkpoint   : {:04}", checkpoint.index);
         println!("    forward    : {}", checkpoint.forward_path.display());
@@ -3238,7 +3285,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--output <DIR>] [--train-steps <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -3307,9 +3354,11 @@ fn usage() -> &'static str {
      It uses deterministic HalfKP initial weights by default, or --weights-bin\n\
      to load root weights.bin / bundled state.bin weights. It also supports\n\
      --nnue-train-state-fixture resume and the same output fixture/state write\n\
-     flags as --nnue-fixture-train. --output writes a numbered cuda-oxide\n\
-     bridge checkpoint with trained-forward.nnuef, state.boung, and learn.log,\n\
-     and auto-resumes the latest numbered state.boung on later runs.\n\
+     flags as --nnue-fixture-train. --output writes numbered cuda-oxide bridge\n\
+     checkpoints with nn.bin, trained-forward.nnuef, state.boung, root state.bin,\n\
+     dataloader_pos.txt, and learn.log. --save-rate N writes every N batches;\n\
+     the default 0 writes only the final batch. Later runs auto-resume the latest\n\
+     numbered state.boung and HCPE dataloader_pos.txt when present.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\

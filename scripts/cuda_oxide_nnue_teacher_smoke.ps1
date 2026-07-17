@@ -27,7 +27,10 @@ cuda-oxide workspace separate:
    Pass -WeightsBin to initialise fixture/direct fresh runs from root
    weights.bin or bundled state.bin weights instead of deterministic weights.
    Pass -Output with -RunDirectTeacherTrain to write numbered cuda-oxide bridge
-   checkpoints containing trained-forward.nnuef, state.boung, and learn.log.
+   checkpoints containing nn.bin, trained-forward.nnuef, state.boung, root
+   state.bin, dataloader_pos.txt, and learn.log.
+   Pass -SaveRate <N> with -Output to write a bridge checkpoint every N direct
+   teacher batches. The default 0 keeps the historical final-only checkpoint.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -49,6 +52,7 @@ param(
     [ValidateSet("sigmoid-mse", "wrm")]
     [string]$LossKind = "sigmoid-mse",
     [int]$TrainSteps = 1,
+    [int]$SaveRate = 0,
     [switch]$SkipCudaBuild,
     [switch]$DebugReadback,
     [switch]$RunFixtureTrain,
@@ -163,6 +167,12 @@ if ([string]::IsNullOrWhiteSpace($Teacher)) {
 
 if ($TrainSteps -lt 1) {
     throw "-TrainSteps must be >= 1"
+}
+if ($SaveRate -lt 0) {
+    throw "-SaveRate must be >= 0"
+}
+if ($SaveRate -gt 0 -and [string]::IsNullOrWhiteSpace($Output)) {
+    throw "-SaveRate requires -Output"
 }
 
 if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
@@ -351,6 +361,10 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $wslOutput = Convert-ToWslPath $Output
     $directOutputArg = " --output `"$wslOutput`""
 }
+$directSaveRateArg = ""
+if ($SaveRate -gt 0) {
+    $directSaveRateArg = " --save-rate $SaveRate"
+}
 $directResumeTrainStateArg = ""
 $directTrainSteps = $TrainSteps
 if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
@@ -466,7 +480,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directWeightsArg$directResumeTrainStateArg$directOutputArg --train-steps $directTrainSteps --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- --nnue-teacher-train --teacher "$wslTeacher"$directWeightsArg$directResumeTrainStateArg$directOutputArg --train-steps $directTrainSteps$directSaveRateArg --batch-size $BatchSize --buffer-mb $BufferMb --loader-threads $LoaderThreads --threads $Threads --score-drop-abs $ScoreDropAbs --loss-kind $LossKind$debugFlag$directTrainedForwardArg$directTrainStateArg
 "@
 
     Invoke-Checked "NNUE direct teacher train loop" {
