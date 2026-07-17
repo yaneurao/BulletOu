@@ -129,6 +129,10 @@ name = "merge_scores"
 path = "../../examples/merge_scores.rs"
 
 [[example]]
+name = "export_teacher_psv"
+path = "../../examples/export_teacher_psv.rs"
+
+[[example]]
 name = "scan_bad_records"
 path = "../../examples/scan_bad_records.rs"
 

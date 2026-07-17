@@ -65,7 +65,7 @@ use bulletou_lib::{
         schedule::{wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    validate::{compute_sign_accuracy_with_loss, read_random_hcpe_positions, ValidationLossKind},
+    validate::{compute_sign_accuracy_with_loss, read_random_teacher_positions, ValidationLossKind},
     value::{
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
@@ -4830,7 +4830,7 @@ impl TestPositionsCache {
             "  loading {} test positions from {} (seed={}) for per-superbatch validation...",
             args.test_positions, path, args.test_seed
         );
-        match read_random_hcpe_positions(&path, args.test_positions, args.test_seed) {
+        match read_random_teacher_positions(&path, args.test_positions, args.test_seed) {
             Ok(positions) => {
                 let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
                 let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();

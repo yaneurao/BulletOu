@@ -22,6 +22,8 @@ commit each completed slice.
 | BO-CUDA-014 | done | SFNN factorized L1 forward foundation | cuda-oxide SFNN forward/runtime/fixture paths can carry optional shared `l1f` weights and match CPU golden output before training-backward integration |
 | BO-CUDA-015 | done | SFNN factorized L1 backward/Ranger smoke | cuda-oxide SFNN backward/runtime/optimizer paths can compute and update optional shared `l1f` weights, with `factorized-tiny` backward and Ranger-step smokes matching CPU golden |
 | BO-CUDA-016 | done | SFNN factorized L1 production integration | `--sfnn-teacher-train --sfnn-factorized-l1` and BulletOu `--backend cuda-oxide --sfnn-factorized-l1` can train, checkpoint, resume, validate, and save folded `nn.bin` with shared `l1f` state preserved in root `state.bin` |
+| BO-CUDA-017 | done | tatara parity data bridge | BulletOu can export HCPE/HCPE3/pack/PSV teachers to flat PSV for tatara, and BulletOu validation accepts PSV held-out data so both trainers can consume the same positions |
+| BO-CUDA-018 | todo | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
 
 ## Notes
 
@@ -230,3 +232,27 @@ commit each completed slice.
   - WSL CUDA `bulletou-cuda-train --sfnn-teacher-train --sfnn-factorized-l1` on `shuffled-001.hcpe` ran one real HCPE batch, wrote `0001/nn.bin` and `0001/state.bin`, printed `l1_factor : enabled`, ran SFNN validation on 4 held-out positions, and `state.bin` contained `l1fw/l1fb` records for weights, momentum, velocity, slow, and step.
   - WSL CUDA resume smoke from that checkpoint, without passing `--sfnn-factorized-l1`, restored `0001/state.bin`, resumed data at `byte_offset=38, plies=0`, printed `l1_factor : enabled`, wrote `0002`, and preserved `l1fw/l1fb` records.
   - WSL CUDA wrapper smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --sfnn-factorized-l1` ran one real HCPE batch, launched the nested child with `--sfnn-factorized-l1`, wrote `0001/nn.bin` and `0001/state.bin`, and preserved `l1fw/l1fb` records.
+
+### BO-CUDA-017
+
+- Added `export_teacher_psv`, a BulletOu example utility that resolves the normal teacher spec syntax (`.hcpe` / `.hcpe3` / `.pack` / `.psv`, directory, or comma-separated list) and writes the same decoded `PackedSfenValue` stream as flat 40-byte `.psv`.
+- The exporter supports `--positions` and `--start-position` caps for smoke/parity slices, plus HCPE decode controls (`--buffer-mb`, `--loader-threads`). Existing HCPE/HCPE3/pack loaders are reused, so tatara can train on the same decoded positions without modifying tatara.
+- Added `read_random_teacher_positions` for held-out validation. It accepts fixed-record `.hcpe` and `.psv` teacher specs and keeps the old `read_random_hcpe_positions` wrapper for compatibility.
+- BulletOu CPU validation and the cuda-oxide NNUE/SFNN validation cache now use `read_random_teacher_positions`, so `--test-teacher` can be the exported PSV file used by tatara.
+- Validation:
+  - `cargo check -p bulletou_lib --example export_teacher_psv`.
+  - `cargo test -p bulletou_lib validate::tests`.
+  - `cargo check --example bulletou`.
+  - `cargo check -p bulletou-cuda-train`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - Export smoke: `shuffled-001.hcpe` -> `target/tatara-parity/teacher-128.psv` and `yamaoka-floodgate.hcpe` -> `target/tatara-parity/yamaoka-128.psv`, both `128 * 40 = 5120` bytes.
+  - WSL CUDA NNUE smoke on the exported PSV teacher/test slice loaded `32` PSV validation positions and completed one training batch (`step1_loss mean=0.09178529`).
+  - WSL CUDA NNUE checkpoint smoke with `--save-rate 1` wrote `summary-learn.log` from the PSV validation slice with `test_value_accuracy=0.468750` and `test_value_loss=0.118148`.
+
+### BO-CUDA-018
+
+- Remaining parity work is not done yet. The next slice should create a repeatable harness that:
+  - exports a configurable teacher/test PSV slice from `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled` and `C:\shogi\teacher\test\yamaoka-floodgate.hcpe`;
+  - runs tatara `bins/nnue_train` on that PSV with `simple --arch 256x2-32-32` and a documented HalfKP config;
+  - runs BulletOu cuda-oxide standard NNUE HalfKP on the same PSV and records throughput separately from checkpoint-save overhead;
+  - compares held-out accuracy/loss and records whether the current BulletOu WRM constants/schedule need a CLI alignment pass for tatara-equivalent accuracy.

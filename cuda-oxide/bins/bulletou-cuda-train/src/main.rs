@@ -2059,7 +2059,7 @@ fn load_nnue_bridge_test_cache(args: &Args) -> bulletou_cuda_oxide_runtime::Resu
     let Some(path) = args.test_teacher.as_deref() else {
         return Ok(None);
     };
-    let positions = bulletou_lib::validate::read_random_hcpe_positions(path, args.test_positions, args.test_seed)
+    let positions = bulletou_lib::validate::read_random_teacher_positions(path, args.test_positions, args.test_seed)
         .map_err(|err| {
             bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read --test-teacher {path}: {err}"))
         })?;
