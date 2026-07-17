@@ -7,6 +7,7 @@
 pub mod backward;
 pub mod loss;
 pub mod nnue;
+pub mod optimizer;
 pub mod sfnn;
 
 #[cfg(feature = "cuda")]
@@ -32,6 +33,8 @@ pub enum Error {
     LossLayout(#[from] loss::LossLayoutError),
     #[error(transparent)]
     NnueLayout(#[from] nnue::NnueLayoutError),
+    #[error(transparent)]
+    OptimizerLayout(#[from] optimizer::OptimizerLayoutError),
     #[error(transparent)]
     SfnnLayout(#[from] sfnn::SfnnLayoutError),
     #[cfg(feature = "cuda")]

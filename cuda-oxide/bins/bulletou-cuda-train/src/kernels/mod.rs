@@ -7,6 +7,7 @@
 pub(crate) mod backward;
 pub(crate) mod loss;
 pub(crate) mod nnue;
+pub(crate) mod optimizer;
 pub(crate) mod sfnn;
 
 #[allow(unused_imports)]
@@ -15,5 +16,7 @@ pub(crate) use backward::*;
 pub(crate) use loss::*;
 #[allow(unused_imports)]
 pub(crate) use nnue::*;
+#[allow(unused_imports)]
+pub(crate) use optimizer::*;
 #[allow(unused_imports)]
 pub(crate) use sfnn::*;

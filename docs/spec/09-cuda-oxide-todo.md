@@ -512,3 +512,30 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-009 work: SFNN L2-input transform backward, stacked L1
   backward, pairwise/L0 backward, and integration into trainer gradient
   buffers.
+
+### 2026-07-17 CO-010 AdamW update smoke
+
+- Added cuda-oxide runtime layout/params for a fused AdamW-style update:
+  `AdamWUpdateLayout { len }` and `AdamWUpdateParams`.
+- Added CUDA kernel `adamw_update`:
+  - applies `gradient_factor`;
+  - applies decoupled weight decay before the gradient step;
+  - updates momentum and velocity buffers;
+  - divides by `sqrt(velocity) + epsilon`;
+  - clamps the updated weight into `[min_weight, max_weight]`.
+- Added host launcher and CLI:
+  `bulletou-cuda-train --adamw-update-smoke`.
+- The tiny smoke uses 7 parameters to exercise a non-round vector length and
+  clamp behavior.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--adamw-update-smoke --debug-readback` succeeded on RTX 4090:
+    `weights`, `momentum`, and `velocity` all had max_abs diff `0`.
+- Remaining CO-010 work: wire this update into the real trainer parameter
+  groups and reconcile the existing optimizer variant naming (Ranger/RAdam vs
+  current AdamW baseline).
