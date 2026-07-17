@@ -158,6 +158,32 @@ impl<'a> RangerOptimizerHostState<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NnueRangerOptimizerHostStates<'a> {
+    pub l0w: RangerOptimizerHostState<'a>,
+    pub l0b: RangerOptimizerHostState<'a>,
+    pub l1w: RangerOptimizerHostState<'a>,
+    pub l1b: RangerOptimizerHostState<'a>,
+    pub l2w: RangerOptimizerHostState<'a>,
+    pub l2b: RangerOptimizerHostState<'a>,
+    pub outw: RangerOptimizerHostState<'a>,
+    pub outb: RangerOptimizerHostState<'a>,
+}
+
+impl<'a> NnueRangerOptimizerHostStates<'a> {
+    pub fn validate(self, layout: NnueOptimizerStateLayout) -> std::result::Result<(), OptimizerLayoutError> {
+        self.l0w.validate(layout.l0w_state_layout())?;
+        self.l0b.validate(layout.l0b_state_layout())?;
+        self.l1w.validate(layout.l1w_state_layout())?;
+        self.l1b.validate(layout.l1b_state_layout())?;
+        self.l2w.validate(layout.l2w_state_layout())?;
+        self.l2b.validate(layout.l2b_state_layout())?;
+        self.outw.validate(layout.outw_state_layout())?;
+        self.outb.validate(layout.outb_state_layout())?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct RangerOptimizerState {
     pub layout: OptimizerStateLayout,
@@ -322,6 +348,26 @@ impl NnueRangerOptimizerStates {
                 layout.outb_state_layout(),
                 weights.outb,
             )?,
+        })
+    }
+
+    pub fn from_host_states(
+        stream: &CudaStream,
+        weights: NnueForwardWeightLayout,
+        states: NnueRangerOptimizerHostStates<'_>,
+    ) -> Result<Self> {
+        let layout = NnueOptimizerStateLayout::new(weights);
+        states.validate(layout)?;
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::from_host(stream, layout.l0w_state_layout(), states.l0w)?,
+            l0b: RangerOptimizerState::from_host(stream, layout.l0b_state_layout(), states.l0b)?,
+            l1w: RangerOptimizerState::from_host(stream, layout.l1w_state_layout(), states.l1w)?,
+            l1b: RangerOptimizerState::from_host(stream, layout.l1b_state_layout(), states.l1b)?,
+            l2w: RangerOptimizerState::from_host(stream, layout.l2w_state_layout(), states.l2w)?,
+            l2b: RangerOptimizerState::from_host(stream, layout.l2b_state_layout(), states.l2b)?,
+            outw: RangerOptimizerState::from_host(stream, layout.outw_state_layout(), states.outw)?,
+            outb: RangerOptimizerState::from_host(stream, layout.outb_state_layout(), states.outb)?,
         })
     }
 }
@@ -861,6 +907,71 @@ mod tests {
         assert_eq!(layout.parameter_f32_len(), 31);
         assert_eq!(layout.momentum_velocity_state_f32_len(), 62);
         assert_eq!(layout.ranger_state_f32_len(), 93);
+    }
+
+    #[test]
+    fn nnue_ranger_host_states_validate_group_lengths() {
+        let weights =
+            NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
+        let layout = NnueOptimizerStateLayout::new(weights);
+        let l0w_state = RangerOptimizerHostState {
+            momentum: &[0.0; 8],
+            velocity: &[0.0; 8],
+            slow_params: &[0.0; 8],
+        };
+        let l0b_state = RangerOptimizerHostState {
+            momentum: &[0.0; 2],
+            velocity: &[0.0; 2],
+            slow_params: &[0.0; 2],
+        };
+        let l1w_state = RangerOptimizerHostState {
+            momentum: &[0.0; 12],
+            velocity: &[0.0; 12],
+            slow_params: &[0.0; 12],
+        };
+        let l1b_state = RangerOptimizerHostState {
+            momentum: &[0.0; 3],
+            velocity: &[0.0; 3],
+            slow_params: &[0.0; 3],
+        };
+        let len1_state = RangerOptimizerHostState {
+            momentum: &[0.0; 1],
+            velocity: &[0.0; 1],
+            slow_params: &[0.0; 1],
+        };
+
+        NnueRangerOptimizerHostStates {
+            l0w: l0w_state,
+            l0b: l0b_state,
+            l1w: l1w_state,
+            l1b: l1b_state,
+            l2w: l1b_state,
+            l2b: len1_state,
+            outw: len1_state,
+            outb: len1_state,
+        }
+        .validate(layout)
+        .unwrap();
+
+        assert_eq!(
+            NnueRangerOptimizerHostStates {
+                l0w: RangerOptimizerHostState {
+                    momentum: &[0.0; 7],
+                    velocity: &[0.0; 8],
+                    slow_params: &[0.0; 8],
+                },
+                l0b: l0b_state,
+                l1w: l1w_state,
+                l1b: l1b_state,
+                l2w: l1b_state,
+                l2b: len1_state,
+                outw: len1_state,
+                outb: len1_state,
+            }
+            .validate(layout)
+            .unwrap_err(),
+            OptimizerLayoutError::StateLength { name: "momentum", expected: 8, actual: 7 }
+        );
     }
 
     #[test]

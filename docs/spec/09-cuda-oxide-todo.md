@@ -918,6 +918,12 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Added `-TrainStateFixture <PATH>` to
   `scripts/cuda_oxide_nnue_teacher_smoke.ps1`; passing it implies
   `-RunFixtureTrain` and forwards `--write-nnue-train-state-fixture`.
+- Added runtime-side `NnueRangerOptimizerHostStates` validation and
+  `NnueRangerOptimizerStates::from_host_states()`, so a future restore path can
+  upload saved momentum/velocity/slow buffers back to CUDA. Validation:
+  `cargo test -p bulletou-cuda-oxide-runtime optimizer`,
+  Windows `cargo check -p bulletou-cuda-train`, and WSL2
+  `cargo check -p bulletou-cuda-train --features cuda` passed.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
