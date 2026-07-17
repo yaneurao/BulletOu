@@ -1019,6 +1019,11 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   writes the next numbered checkpoint. `--weights-bin` is rejected when any train
   state is restored, because the state already contains weights and optimizer
   buffers.
+- Added root-format `state.bin` beside each bridge checkpoint. It contains
+  `nnue/weights/*`, `nnue/momentum/*`, `nnue/velocity/*`, `nnue/slow/*`, and
+  `nnue/step_ranger/*` records via `write_model_weights_bin`. `state.boung`
+  remains the cuda-oxide exact resume source until the final compatibility
+  layer can restore directly from root `state.bin`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

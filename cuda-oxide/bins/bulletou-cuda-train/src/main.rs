@@ -1255,6 +1255,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("  checkpoint   : {:04}", checkpoint.index);
         println!("    forward    : {}", checkpoint.forward_path.display());
         println!("    state      : {}", checkpoint.state_path.display());
+        println!("    state_bin  : {}", checkpoint.state_bin_path.display());
         println!("    learn_log  : {}", checkpoint.learn_log_path.display());
     }
     println!("  train        : ok");
@@ -1268,6 +1269,7 @@ struct NnueBridgeCheckpointWrite {
     dir: std::path::PathBuf,
     forward_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
+    state_bin_path: std::path::PathBuf,
     learn_log_path: std::path::PathBuf,
 }
 
@@ -1293,6 +1295,7 @@ fn write_nnue_bridge_checkpoint(
     let (index, dir) = create_next_numbered_checkpoint_dir(output_dir)?;
     let forward_path = dir.join("trained-forward.nnuef");
     let state_path = dir.join("state.boung");
+    let state_bin_path = dir.join("state.bin");
     let learn_log_path = dir.join("learn.log");
 
     let trained_forward = NnueForwardCase {
@@ -1313,9 +1316,81 @@ fn write_nnue_bridge_checkpoint(
     };
     trained_forward.write_fixture(&forward_path)?;
     write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
+    write_nnue_root_state_bin(&state_bin_path, completed_steps, state)?;
     write_nnue_bridge_learn_log(&learn_log_path, losses, sources)?;
 
-    Ok(NnueBridgeCheckpointWrite { index, dir, forward_path, state_path, learn_log_path })
+    Ok(NnueBridgeCheckpointWrite { index, dir, forward_path, state_path, state_bin_path, learn_log_path })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_root_state_bin(
+    path: &std::path::Path,
+    completed_steps: usize,
+    state: &nnue_train_step::NnueTrainStateReadback,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create NNUE root state.bin {}: {err}",
+            path.display()
+        ))
+    })?);
+
+    macro_rules! write_section {
+        ($section:literal, $field:ident) => {{
+            let mut records: Vec<(String, &[f32])> = vec![
+                (format!("nnue/{}/l0w", $section), state.l0w.$field.as_slice()),
+                (format!("nnue/{}/l0b", $section), state.l0b.$field.as_slice()),
+                (format!("nnue/{}/l1w", $section), state.l1w.$field.as_slice()),
+                (format!("nnue/{}/l1b", $section), state.l1b.$field.as_slice()),
+                (format!("nnue/{}/l2w", $section), state.l2w.$field.as_slice()),
+                (format!("nnue/{}/l2b", $section), state.l2b.$field.as_slice()),
+                (format!("nnue/{}/outw", $section), state.outw.$field.as_slice()),
+                (format!("nnue/{}/outb", $section), state.outb.$field.as_slice()),
+            ];
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            let chunk =
+                bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+                    records.iter().map(|(id, values)| (id.as_str(), *values)),
+                );
+            writer.write_all(&chunk).map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to write NNUE root state.bin {}: {err}",
+                    path.display()
+                ))
+            })?;
+        }};
+    }
+
+    write_section!("weights", weights);
+    write_section!("momentum", momentum);
+    write_section!("velocity", velocity);
+    write_section!("slow", slow_params);
+
+    let step = completed_steps as f32;
+    let mut step_records: Vec<(String, Vec<f32>)> = ["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "outw", "outb"]
+        .iter()
+        .map(|id| (format!("nnue/step_ranger/{id}"), vec![step]))
+        .collect();
+    step_records.sort_by(|a, b| a.0.cmp(&b.0));
+    let chunk = bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+        step_records.iter().map(|(id, values)| (id.as_str(), values.as_slice())),
+    );
+    writer.write_all(&chunk).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write NNUE root state.bin {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush NNUE root state.bin {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
