@@ -30,6 +30,7 @@ commit each completed slice.
 | BO-CUDA-022 | done | remaining tatara accuracy parity | validation now reports prediction-sign distribution; the one-superbatch accuracy complement was a short-run all-one-sign prediction artifact, and a 4-superbatch same-PSV run matches tatara accuracy with close WRM loss |
 | BO-CUDA-023 | done | YaneuraOu quantized eval cross-check | YaneuraOu `test eval_accuracy` on the cuda-oxide checkpoint `nn.bin` matches BulletOu's f32 checkpoint-time validation on the same held-out PSV |
 | BO-CUDA-024 | done | retire stale legacy cuda-oxide TODO rows | synced the older `09-cuda-oxide-todo.md` CO-008..CO-013 summary rows with the completed BO-CUDA implementation slices |
+| BO-CUDA-025 | done | final folder-teacher parity audit | reran the standard-NNUE parity harness using the requested teacher directory and validation HCPE, confirming same-PSV tatara/BulletOu accuracy parity and BulletOu speed parity |
 
 ## Notes
 
@@ -386,3 +387,23 @@ commit each completed slice.
   - CO-011 async rings/pipeline -> BO-CUDA-006/021;
   - CO-012 checkpoint compatibility -> BO-CUDA-004/012/023;
   - CO-013 speed benchmark -> BO-CUDA-018/020/021/022.
+
+### BO-CUDA-025
+
+- Final audit run used the requested source paths directly:
+  - teacher: `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled` (directory);
+  - validation: `C:\shogi\teacher\test\yamaoka-floodgate.hcpe`;
+  - command shape: `scripts\tatara_parity_smoke.ps1 -Teacher <teacher-dir> -TestTeacher <test-hcpe> -TrainPositions 262144 -TestPositions 8192 -BatchSize 8192 -BatchesPerSuperbatch 8 -Superbatches 4 -Threads 8`.
+- Export evidence:
+  - train export read `input_files=65`, `input_positions=649263458`, wrote `262144` PSV positions;
+  - validation export read `input_files=1`, `input_positions=856923`, wrote `8192` PSV positions.
+- Same-PSV tatara run:
+  - final `test_loss=0.070322`, `test_acc=0.5065`;
+  - reported superbatch speed ranged from `621035` to `2633446 pos/s` on the short 4-superbatch run.
+- Same-PSV BulletOu cuda-oxide run:
+  - speed smoke: `262144` positions in `0.234s`, `1120522 pos/s`;
+  - checkpoint-time validation: `accuracy=50.6470% (4149/8192; pred>=0 0 pred<0 8192 zero 0)`, `loss=0.070590`;
+  - `summary-learn.log`: `test_value_accuracy=0.506470`, `test_value_loss=0.070590`, `train_value_loss=0.100704312`.
+- YaneuraOu quantized cross-check on the same BulletOu checkpoint:
+  - `./YaneuraOu-by-gcc EvalDir <bulletou-metrics/0001> , test eval_accuracy <test-8192.psv> , quit`;
+  - result: `accuracy=50.6470% (4149/8192)`, `drawn=0`, `skipped=0`.
