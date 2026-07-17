@@ -55,6 +55,17 @@ pub(crate) struct NnueTrainParamGroupReadback {
     pub(crate) slow_params: Vec<f32>,
 }
 
+pub(crate) struct NnueTrainWeightsReadback {
+    pub(crate) l0w: Vec<f32>,
+    pub(crate) l0b: Vec<f32>,
+    pub(crate) l1w: Vec<f32>,
+    pub(crate) l1b: Vec<f32>,
+    pub(crate) l2w: Vec<f32>,
+    pub(crate) l2b: Vec<f32>,
+    pub(crate) outw: Vec<f32>,
+    pub(crate) outb: Vec<f32>,
+}
+
 pub(crate) struct NnueTrainStateReadback {
     pub(crate) l0w: NnueTrainParamGroupReadback,
     pub(crate) l0b: NnueTrainParamGroupReadback,
@@ -258,6 +269,19 @@ impl NnueLossRangerStepRunner {
             mean_output_gradients: include_debug
                 .then(|| self.loss_workspace.mean_output_gradients.to_host_vec(stream))
                 .transpose()?,
+        })
+    }
+
+    pub(crate) fn read_weights(&self, stream: &Arc<CudaStream>) -> Result<NnueTrainWeightsReadback> {
+        Ok(NnueTrainWeightsReadback {
+            l0w: self.device_weights.l0w.to_host_vec(stream)?,
+            l0b: self.device_weights.l0b.to_host_vec(stream)?,
+            l1w: self.device_weights.l1w.to_host_vec(stream)?,
+            l1b: self.device_weights.l1b.to_host_vec(stream)?,
+            l2w: self.device_weights.l2w.to_host_vec(stream)?,
+            l2b: self.device_weights.l2b.to_host_vec(stream)?,
+            outw: self.device_weights.outw.to_host_vec(stream)?,
+            outb: self.device_weights.outb.to_host_vec(stream)?,
         })
     }
 

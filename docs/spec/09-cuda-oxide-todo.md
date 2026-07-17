@@ -894,6 +894,14 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   non-comparing `--nnue-fixture-train` loop against the same generated
   fixtures. Validation with `-SkipCudaBuild -TrainSteps 2 -DebugReadback
   -RunFixtureTrain` passed.
+- Added `--write-nnue-trained-forward-fixture <PATH>` to
+  `--nnue-fixture-train`. It reads back final trained weights only (not the
+  full optimizer state), combines them with the last batch layout, and writes a
+  `BOUNFWD1` fixture for follow-up validation.
+- Validation: wrote
+  `target/cuda-oxide-fixtures/nnue-halfkp-trained-forward.nnuef` after the
+  two-step real-teacher fixture train, then loaded it with
+  `--nnue-forward-smoke --debug-readback`; CPU/GPU comparison stayed `ok`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

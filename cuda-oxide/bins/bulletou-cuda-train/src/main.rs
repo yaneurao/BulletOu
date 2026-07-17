@@ -83,6 +83,7 @@ struct Args {
     nnue_forward_fixture: Option<std::path::PathBuf>,
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
+    write_nnue_trained_forward_fixture: Option<std::path::PathBuf>,
     sfnn_forward_fixture: Option<std::path::PathBuf>,
     write_sfnn_forward_fixture: Option<std::path::PathBuf>,
 }
@@ -154,6 +155,7 @@ impl Args {
             nnue_forward_fixture: None,
             nnue_train_fixture_args: Vec::new(),
             write_nnue_forward_fixture: None,
+            write_nnue_trained_forward_fixture: None,
             sfnn_forward_fixture: None,
             write_sfnn_forward_fixture: None,
         };
@@ -212,6 +214,10 @@ impl Args {
                 "--write-nnue-forward-fixture" => {
                     parsed.write_nnue_forward_fixture =
                         Some(required_path_arg(&mut args, "--write-nnue-forward-fixture")?);
+                }
+                "--write-nnue-trained-forward-fixture" => {
+                    parsed.write_nnue_trained_forward_fixture =
+                        Some(required_path_arg(&mut args, "--write-nnue-trained-forward-fixture")?);
                 }
                 "--sfnn-forward-fixture" => {
                     parsed.sfnn_forward_fixture = Some(required_path_arg(&mut args, "--sfnn-forward-fixture")?);
@@ -852,6 +858,28 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         losses.push((step, loss.weighted_sum[0], loss.mean[0]));
     }
 
+    if let Some(path) = &args.write_nnue_trained_forward_fixture {
+        let weights = runner.read_weights(&stream)?;
+        let last_batch = train_batches.last().expect("validated non-empty train batch sequence");
+        let trained_forward = NnueForwardCase {
+            label: "trained-forward-fixture",
+            shape: first_case.shape,
+            batch_size: last_batch.batch_size,
+            max_active: last_batch.max_active,
+            stm: last_batch.stm.clone(),
+            nstm: last_batch.nstm.clone(),
+            l0w: weights.l0w,
+            l0b: weights.l0b,
+            l1w: weights.l1w,
+            l1b: weights.l1b,
+            l2w: weights.l2w,
+            l2b: weights.l2b,
+            outw: weights.outw,
+            outb: weights.outb,
+        };
+        trained_forward.write_fixture(path)?;
+    }
+
     println!("bulletou-cuda-train NNUE fixture train");
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
@@ -871,6 +899,9 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  steps        : {}", losses.len());
     for (step, weighted_sum, mean) in losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
+    }
+    if let Some(path) = &args.write_nnue_trained_forward_fixture {
+        println!("  wrote        : {}", path.display());
     }
     println!("  train        : ok");
 
@@ -2218,7 +2249,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --nnue-fixture-train --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-fixture-train --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -2273,6 +2304,9 @@ fn usage() -> &'static str {
      CO-010 NNUE fixture train: load the same initial BOUNTRN1 plus optional\n\
      BOUNTRN1/BOUNBCH1 batch sequence and run the NNUE loss/Ranger runner\n\
      without CPU-golden comparison, printing GPU loss readbacks for each step.\n\
+     --write-nnue-trained-forward-fixture writes the final trained weights\n\
+     plus the last batch layout as a BOUNFWD1 fixture for follow-up forward\n\
+     validation.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
