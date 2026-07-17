@@ -862,9 +862,7 @@ fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()
             case.params_for_step(step_idx + 1),
             &gradients,
             &mut weights,
-            &mut optimizer_state.momentum,
-            &mut optimizer_state.velocity,
-            &mut optimizer_state.slow_params,
+            &mut optimizer_state,
         )?;
     }
     stream.synchronize()?;

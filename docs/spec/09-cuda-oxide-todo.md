@@ -678,3 +678,30 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-010 work: bind these per-tensor state bundles to actual
   NNUE/SFNN gradient buffers and launch the Ranger update over each parameter
   group in the real trainer path.
+
+### 2026-07-17 CO-010 SFNN Ranger update launcher
+
+- Refactored `launch_ranger_update` to take `RangerOptimizerState` directly
+  instead of separate `momentum`, `velocity`, and `slow_params` buffers.
+  The launcher now verifies the state length matches the update layout before
+  dispatching kernels.
+- Added `launch_sfnn_ranger_update`, which wires SFNN forward weights,
+  `SfnnBackwardWorkspace` gradient buffers, and `SfnnRangerOptimizerStates`
+  together for all 8 SFNN parameter groups:
+  `l0w`, `l0b`, `l1w`, `l1b`, `l2w`, `l2b`, `l3w`, and `l3b`.
+- Added shape guards so SFNN weights, gradients, and optimizer states must
+  agree before any per-tensor update launches.
+- Updated the Ranger chain smoke path to pass the `RangerOptimizerState`
+  wrapper directly.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `--ranger-update-smoke --debug-readback` succeeded on RTX 4090 through the
+    `RangerOptimizerState` launcher path: `weights` and `slow_params` max_abs
+    diff `0`, `momentum` max_abs diff `0.00000000011641532`, and `velocity`
+    max_abs diff `0.0000000000009094947`.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+- Remaining CO-010 work: add the analogous NNUE gradient/state launcher shape,
+  then connect these launchers to the real trainer loop.

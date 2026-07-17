@@ -3,12 +3,14 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
+    backward::SfnnBackwardWorkspace,
     optimizer::{
         AdamWUpdateLaunchPlan, AdamWUpdateLayout, AdamWUpdateParams, RAdamUpdateLaunchPlan, RAdamUpdateLayout,
-        RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams,
-        RangerUpdateLayout, RangerUpdateParams,
+        RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams, RangerOptimizerState,
+        RangerUpdateLayout, RangerUpdateParams, SfnnRangerOptimizerStates,
     },
-    CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
+    sfnn::SfnnForwardDeviceWeights,
+    CudaModule, CudaStream, DeviceBuffer, Error, LaunchConfig, Result,
 };
 use cuda_host::cuda_launch;
 
@@ -151,12 +153,11 @@ pub(crate) fn launch_ranger_update(
     params: RangerUpdateParams,
     gradients: &DeviceBuffer<f32>,
     weights: &mut DeviceBuffer<f32>,
-    momentum: &mut DeviceBuffer<f32>,
-    velocity: &mut DeviceBuffer<f32>,
-    slow_params: &mut DeviceBuffer<f32>,
+    state: &mut RangerOptimizerState,
 ) -> Result<()> {
     layout.validate()?;
     params.validate()?;
+    ensure_ranger_state_len("ranger_update", layout, state)?;
     launch_radam_update(
         stream,
         module,
@@ -164,8 +165,8 @@ pub(crate) fn launch_ranger_update(
         params.radam,
         gradients,
         weights,
-        momentum,
-        velocity,
+        &mut state.momentum,
+        &mut state.velocity,
     )?;
 
     if params.should_lookahead()? {
@@ -175,10 +176,131 @@ pub(crate) fn launch_ranger_update(
             RangerLookaheadLayout::new(layout.len),
             params.lookahead,
             weights,
-            slow_params,
+            &mut state.slow_params,
         )?;
     }
 
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_ranger_update(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    params: RangerUpdateParams,
+    weights: &mut SfnnForwardDeviceWeights,
+    gradients: &SfnnBackwardWorkspace,
+    states: &mut SfnnRangerOptimizerStates,
+) -> Result<()> {
+    ensure_sfnn_update_shapes(weights, gradients, states)?;
+    let layout = states.layout;
+
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l0w_state_layout().state_len()),
+        params,
+        &gradients.l0w_gradients,
+        &mut weights.l0w,
+        &mut states.l0w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l0b_state_layout().state_len()),
+        params,
+        &gradients.l0b_gradients,
+        &mut weights.l0b,
+        &mut states.l0b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l1w_state_layout().state_len()),
+        params,
+        &gradients.l1w_gradients,
+        &mut weights.l1w,
+        &mut states.l1w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l1b_state_layout().state_len()),
+        params,
+        &gradients.l1b_gradients,
+        &mut weights.l1b,
+        &mut states.l1b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l2w_state_layout().state_len()),
+        params,
+        &gradients.l2w_gradients,
+        &mut weights.l2w,
+        &mut states.l2w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l2b_state_layout().state_len()),
+        params,
+        &gradients.l2b_gradients,
+        &mut weights.l2b,
+        &mut states.l2b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l3w_state_layout().state_len()),
+        params,
+        &gradients.l3w_gradients,
+        &mut weights.l3w,
+        &mut states.l3w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l3b_state_layout().state_len()),
+        params,
+        &gradients.l3b_gradients,
+        &mut weights.l3b,
+        &mut states.l3b,
+    )?;
+
+    Ok(())
+}
+
+fn ensure_ranger_state_len(name: &'static str, layout: RangerUpdateLayout, state: &RangerOptimizerState) -> Result<()> {
+    let expected = layout.len;
+    let actual = state.layout.state_len();
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(Error::Smoke(format!(
+            "{name} optimizer state length mismatch: expected {expected}, got {actual}"
+        )))
+    }
+}
+
+fn ensure_sfnn_update_shapes(
+    weights: &SfnnForwardDeviceWeights,
+    gradients: &SfnnBackwardWorkspace,
+    states: &SfnnRangerOptimizerStates,
+) -> Result<()> {
+    let shape = weights.shape;
+    if gradients.layout.shape != shape {
+        return Err(Error::Smoke(format!(
+            "SFNN gradient shape mismatch: weights={shape:?}, gradients={:?}",
+            gradients.layout.shape
+        )));
+    }
+    if states.layout.weights.shape != shape {
+        return Err(Error::Smoke(format!(
+            "SFNN optimizer state shape mismatch: weights={shape:?}, states={:?}",
+            states.layout.weights.shape
+        )));
+    }
     Ok(())
 }
 
