@@ -91,6 +91,17 @@ struct Args {
     output: Option<std::path::PathBuf>,
     train_steps: usize,
     save_rate: usize,
+    batches_per_superbatch: usize,
+    lr_schedule: TrainLrScheduleKind,
+    learning_rate: f32,
+    lr_min: f32,
+    lr_step_gamma: f32,
+    lr_step_positions: Option<u64>,
+    lr_period_positions: u64,
+    optimizer_weight_decay: f32,
+    optimizer_epsilon: f32,
+    optimizer_beta1: f32,
+    optimizer_beta2: f32,
     batch_size: usize,
     buffer_mb: usize,
     loader_threads: usize,
@@ -131,6 +142,15 @@ enum SmokeMode {
 enum LossKind {
     SigmoidMse,
     NnuePytorchWrm,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrainLrScheduleKind {
+    Fixed,
+    Step,
+    Geometric,
+    Cos,
 }
 
 #[cfg(feature = "cuda")]
@@ -178,6 +198,17 @@ impl Args {
             output: None,
             train_steps: 1,
             save_rate: 0,
+            batches_per_superbatch: 1,
+            lr_schedule: TrainLrScheduleKind::Fixed,
+            learning_rate: 0.01,
+            lr_min: 0.01,
+            lr_step_gamma: 1.0,
+            lr_step_positions: None,
+            lr_period_positions: 0,
+            optimizer_weight_decay: 0.01,
+            optimizer_epsilon: 1.0e-8,
+            optimizer_beta1: 0.99,
+            optimizer_beta2: 0.999,
             batch_size: 2,
             buffer_mb: 1,
             loader_threads: 1,
@@ -265,6 +296,46 @@ impl Args {
                 }
                 "--save-rate" => {
                     parsed.save_rate = parse_usize_arg(required_arg(&mut args, "--save-rate")?, "--save-rate")?;
+                }
+                "--batches-per-superbatch" => {
+                    parsed.batches_per_superbatch =
+                        parse_usize_arg(required_arg(&mut args, "--batches-per-superbatch")?, "--batches-per-superbatch")?;
+                }
+                "--lr-schedule" => {
+                    parsed.lr_schedule = parse_train_lr_schedule(required_arg(&mut args, "--lr-schedule")?)?;
+                }
+                "--learning-rate" | "--lr" => {
+                    parsed.learning_rate = parse_f32_arg(required_arg(&mut args, "--learning-rate")?, "--learning-rate")?;
+                }
+                "--lr-min" => {
+                    parsed.lr_min = parse_f32_arg(required_arg(&mut args, "--lr-min")?, "--lr-min")?;
+                }
+                "--lr-step-gamma" => {
+                    parsed.lr_step_gamma = parse_f32_arg(required_arg(&mut args, "--lr-step-gamma")?, "--lr-step-gamma")?;
+                }
+                "--lr-step-positions" => {
+                    parsed.lr_step_positions =
+                        Some(parse_u64_arg(required_arg(&mut args, "--lr-step-positions")?, "--lr-step-positions")?);
+                }
+                "--lr-period-positions" => {
+                    parsed.lr_period_positions =
+                        parse_u64_arg(required_arg(&mut args, "--lr-period-positions")?, "--lr-period-positions")?;
+                }
+                "--optimizer-weight-decay" => {
+                    parsed.optimizer_weight_decay =
+                        parse_f32_arg(required_arg(&mut args, "--optimizer-weight-decay")?, "--optimizer-weight-decay")?;
+                }
+                "--optimizer-epsilon" => {
+                    parsed.optimizer_epsilon =
+                        parse_f32_arg(required_arg(&mut args, "--optimizer-epsilon")?, "--optimizer-epsilon")?;
+                }
+                "--optimizer-beta1" => {
+                    parsed.optimizer_beta1 =
+                        parse_f32_arg(required_arg(&mut args, "--optimizer-beta1")?, "--optimizer-beta1")?;
+                }
+                "--optimizer-beta2" => {
+                    parsed.optimizer_beta2 =
+                        parse_f32_arg(required_arg(&mut args, "--optimizer-beta2")?, "--optimizer-beta2")?;
                 }
                 "--batch-size" => {
                     parsed.batch_size = parse_usize_arg(required_arg(&mut args, "--batch-size")?, "--batch-size")?;
@@ -1051,6 +1122,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             "--nnue-teacher-train requires --batch-size > 0".to_string(),
         ));
     }
+    if args.batches_per_superbatch == 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--nnue-teacher-train requires --batches-per-superbatch > 0".to_string(),
+        ));
+    }
+    validate_nnue_teacher_schedule_args(&args)?;
+    let save_interval_steps = nnue_teacher_save_interval_steps(&args)?;
 
     let ptx = match args.ptx.as_ref() {
         Some(ptx) => ptx.clone(),
@@ -1126,6 +1204,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
     let mut runner = None;
     let mut losses = Vec::with_capacity(args.train_steps);
+    let mut learning_rates = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
     let mut checkpoint_losses = Vec::new();
     let mut checkpoint_sources = Vec::new();
@@ -1184,7 +1263,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
             let runner_ref = runner.as_mut().expect("runner is initialized");
             let step = completed_step_offset + run_steps + 1;
-            let params = grouped_ranger_step_params_for_step(step);
+            let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
+            let params = grouped_ranger_step_params_for_step_with_hyperparams(
+                step,
+                learning_rate,
+                args.optimizer_weight_decay,
+                args.optimizer_beta1,
+                args.optimizer_beta2,
+                args.optimizer_epsilon,
+            );
             let host_batch = NnueTrainStepHostBatch {
                 stm_indices: &train_batch.stm,
                 nstm_indices: &train_batch.nstm,
@@ -1199,11 +1286,14 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
             let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
             losses.push(loss_entry);
+            learning_rates.push(learning_rate);
             sources.push(source.clone());
             checkpoint_losses.push(loss_entry);
             checkpoint_sources.push(source);
             run_steps += 1;
-            if args.output.is_some() && args.save_rate > 0 && run_steps % args.save_rate == 0 {
+            if args.output.is_some()
+                && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false)
+            {
                 let weights = runner_ref.read_weights(&stream)?;
                 let state = runner_ref.read_state(&stream)?;
                 bridge_checkpoints.push(write_nnue_bridge_checkpoint(
@@ -1257,14 +1347,14 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     if let Some(output_dir) = &args.output {
         let should_write_final_bridge_checkpoint =
-            args.save_rate == 0 || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
+            save_interval_steps.is_none() || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
         if should_write_final_bridge_checkpoint {
-            let checkpoint_loss_entries = if args.save_rate == 0 {
+            let checkpoint_loss_entries = if save_interval_steps.is_none() {
                 losses.as_slice()
             } else {
                 checkpoint_losses.as_slice()
             };
-            let checkpoint_source_entries = if args.save_rate == 0 {
+            let checkpoint_source_entries = if save_interval_steps.is_none() {
                 sources.as_slice()
             } else {
                 checkpoint_sources.as_slice()
@@ -1307,11 +1397,23 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     );
     println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
+    println!("  batches/sb   : {}", args.batches_per_superbatch);
+    println!("  lr_schedule  : {}", train_lr_schedule_label(args.lr_schedule));
+    if let Some(first_lr) = learning_rates.first() {
+        println!("  lr_start     : {first_lr}");
+    }
+    if let Some(last_lr) = learning_rates.last() {
+        println!("  lr_last      : {last_lr}");
+    }
     if args.output.is_some() {
-        if args.save_rate == 0 {
-            println!("  save_rate    : final");
+        if let Some(interval) = save_interval_steps {
+            if args.batches_per_superbatch == 1 {
+                println!("  save_rate    : {} batches", args.save_rate);
+            } else {
+                println!("  save_rate    : {} superbatches ({interval} batches)", args.save_rate);
+            }
         } else {
-            println!("  save_rate    : {}", args.save_rate);
+            println!("  save_rate    : final");
         }
     }
     for (step, weighted_sum, mean) in &losses {
@@ -3439,6 +3541,13 @@ fn parse_usize_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_r
 }
 
 #[cfg(feature = "cuda")]
+fn parse_u64_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_runtime::Result<u64> {
+    value.parse().map_err(|_| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("{option} must be a non-negative integer\n\n{}", usage()))
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn parse_u16_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_runtime::Result<u16> {
     value.parse().map_err(|_| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
@@ -3461,6 +3570,17 @@ fn parse_loss_kind(value: String) -> bulletou_cuda_oxide_runtime::Result<LossKin
         "sigmoid-mse" | "sigmoid_mse" => Ok(LossKind::SigmoidMse),
         "wrm" | "nnue-pytorch-wrm" | "nnue_pytorch_wrm" => Ok(LossKind::NnuePytorchWrm),
         _ => usage_error(format!("--loss-kind must be one of: sigmoid-mse, wrm (got {value})")),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn parse_train_lr_schedule(value: String) -> bulletou_cuda_oxide_runtime::Result<TrainLrScheduleKind> {
+    match value.as_str() {
+        "fixed" => Ok(TrainLrScheduleKind::Fixed),
+        "step" => Ok(TrainLrScheduleKind::Step),
+        "geometric" => Ok(TrainLrScheduleKind::Geometric),
+        "cos" | "cosine" => Ok(TrainLrScheduleKind::Cos),
+        _ => usage_error(format!("--lr-schedule must be one of: fixed, step, geometric, cos (got {value})")),
     }
 }
 
@@ -3500,7 +3620,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -3572,8 +3692,10 @@ fn usage() -> &'static str {
      state.bin resume, and the same output fixture/state write flags as\n\
      --nnue-fixture-train. --output writes numbered cuda-oxide bridge\n\
      checkpoints with nn.bin, trained-forward.nnuef, state.boung, root state.bin,\n\
-     dataloader_pos.txt, and learn.log. --save-rate N writes every N batches;\n\
-     the default 0 writes only the final batch. Later runs auto-resume the latest\n\
+     dataloader_pos.txt, and learn.log. --save-rate N writes every N superbatches\n\
+     when --batches-per-superbatch is supplied (default 1, preserving the old\n\
+     every-N-batches smoke behavior); the default 0 writes only the final batch.\n\
+     LR schedule flags set the Ranger learning rate per batch. Later runs auto-resume the latest\n\
      numbered state.boung and HCPE dataloader_pos.txt when present.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
@@ -3897,22 +4019,154 @@ struct SingleRangerUpdateTrace {
 }
 
 #[cfg(feature = "cuda")]
+fn validate_nnue_teacher_schedule_args(args: &Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    if !(args.learning_rate.is_finite() && args.learning_rate > 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--learning-rate must be finite and > 0".to_string(),
+        ));
+    }
+    if !(args.lr_min.is_finite() && args.lr_min >= 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--lr-min must be finite and >= 0".to_string(),
+        ));
+    }
+    if matches!(args.lr_schedule, TrainLrScheduleKind::Step | TrainLrScheduleKind::Geometric) && args.lr_min <= 0.0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--lr-min must be > 0 for --lr-schedule step/geometric".to_string(),
+        ));
+    }
+    if args.lr_min > args.learning_rate {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--lr-min must be <= --learning-rate".to_string(),
+        ));
+    }
+    if !(args.lr_step_gamma.is_finite() && args.lr_step_gamma > 0.0 && args.lr_step_gamma <= 1.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--lr-step-gamma must satisfy 0 < gamma <= 1".to_string(),
+        ));
+    }
+    if matches!(args.lr_step_positions, Some(0)) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--lr-step-positions must be > 0".to_string(),
+        ));
+    }
+    if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--optimizer-weight-decay must be finite and >= 0".to_string(),
+        ));
+    }
+    if !(args.optimizer_epsilon.is_finite() && args.optimizer_epsilon > 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--optimizer-epsilon must be finite and > 0".to_string(),
+        ));
+    }
+    if !(args.optimizer_beta1.is_finite() && args.optimizer_beta1 > 0.0 && args.optimizer_beta1 < 1.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--optimizer-beta1 must satisfy 0 < beta1 < 1".to_string(),
+        ));
+    }
+    if !(args.optimizer_beta2.is_finite() && args.optimizer_beta2 > 0.0 && args.optimizer_beta2 < 1.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--optimizer-beta2 must satisfy 0 < beta2 < 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_teacher_save_interval_steps(args: &Args) -> bulletou_cuda_oxide_runtime::Result<Option<usize>> {
+    if args.save_rate == 0 {
+        return Ok(None);
+    }
+    args.save_rate
+        .checked_mul(args.batches_per_superbatch)
+        .filter(|&interval| interval > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(
+                "--save-rate * --batches-per-superbatch overflowed".to_string(),
+            )
+        })
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_teacher_learning_rate_for_step(args: &Args, step: usize) -> f32 {
+    let total_positions = ((step.saturating_sub(1) as u128).saturating_mul(args.batch_size as u128))
+        .min(u64::MAX as u128) as u64;
+    match args.lr_schedule {
+        TrainLrScheduleKind::Fixed => args.learning_rate,
+        TrainLrScheduleKind::Step => {
+            let step_positions = args.lr_step_positions.unwrap_or_else(|| {
+                (args.batch_size as u64).saturating_mul(args.batches_per_superbatch as u64).max(1)
+            });
+            let epoch_pos = if args.lr_period_positions == 0 {
+                total_positions
+            } else {
+                total_positions % args.lr_period_positions
+            };
+            let drops = epoch_pos / step_positions;
+            let lr = (args.learning_rate as f64) * (args.lr_step_gamma as f64).powf(drops as f64);
+            (lr as f32).max(args.lr_min)
+        }
+        TrainLrScheduleKind::Geometric => {
+            if args.lr_period_positions == 0 {
+                return args.learning_rate;
+            }
+            let t = (total_positions % args.lr_period_positions) as f64 / args.lr_period_positions as f64;
+            let start = args.learning_rate as f64;
+            let min = (args.lr_min as f64).max(1.0e-12);
+            (start * (min / start).powf(t)) as f32
+        }
+        TrainLrScheduleKind::Cos => {
+            if args.lr_period_positions == 0 {
+                return args.learning_rate;
+            }
+            let t = (total_positions % args.lr_period_positions) as f64 / args.lr_period_positions as f64;
+            let cos_val = (std::f64::consts::PI * t).cos();
+            (args.lr_min as f64 + 0.5 * (args.learning_rate - args.lr_min) as f64 * (1.0 + cos_val)) as f32
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn train_lr_schedule_label(kind: TrainLrScheduleKind) -> &'static str {
+    match kind {
+        TrainLrScheduleKind::Fixed => "fixed",
+        TrainLrScheduleKind::Step => "step",
+        TrainLrScheduleKind::Geometric => "geometric",
+        TrainLrScheduleKind::Cos => "cos",
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn grouped_ranger_step_params() -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
     grouped_ranger_step_params_for_step(1)
 }
 
 #[cfg(feature = "cuda")]
 fn grouped_ranger_step_params_for_step(step: usize) -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+    grouped_ranger_step_params_for_step_with_hyperparams(step, 0.01, 0.01, 0.99, 0.999, 1.0e-8)
+}
+
+#[cfg(feature = "cuda")]
+fn grouped_ranger_step_params_for_step_with_hyperparams(
+    step: usize,
+    learning_rate: f32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
     bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
         radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
             gradient_factor: 0.25,
-            learning_rate: 0.01,
+            learning_rate,
             step,
-            decay: 0.01,
-            beta1: 0.99,
-            beta2: 0.999,
+            decay,
+            beta1,
+            beta2,
             n_sma_threshold: 5.0,
-            epsilon: 1.0e-8,
+            epsilon,
             min_weight: -1.98,
             max_weight: 1.98,
         },

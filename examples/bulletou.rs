@@ -1758,12 +1758,25 @@ impl Args {
             ));
         }
 
-        match self.cuda_oxide_train_steps {
-            Some(n) if n > 0 => {}
-            _ => {
+        let direct_steps = self.cuda_oxide_train_steps;
+        let production_schedule = self.superbatches.is_some();
+        match (direct_steps, production_schedule) {
+            (Some(n), false) => {
+                if n == 0 {
+                    return Err("--cuda-oxide-train-steps must be > 0".to_string());
+                }
+            }
+            (None, true) => {}
+            (Some(_), true) => {
                 return Err(
-                    "--backend cuda-oxide currently requires --cuda-oxide-train-steps N \
-                     (direct batch count; --superbatches integration is BO-CUDA-003)"
+                    "--backend cuda-oxide accepts either --cuda-oxide-train-steps or --superbatches, not both"
+                        .to_string(),
+                );
+            }
+            (None, false) => {
+                return Err(
+                    "--backend cuda-oxide requires either --cuda-oxide-train-steps N for a direct smoke run \
+                     or --superbatches N --max-epochs N for production schedule mode"
                         .to_string(),
                 );
             }
@@ -1772,37 +1785,39 @@ impl Args {
             return Err("--batch-size must be > 0 for --backend cuda-oxide".to_string());
         }
 
-        if self.superbatches.is_some() {
+        if production_schedule && self.max_epochs.is_none() {
             return Err(
-                "--backend cuda-oxide does not yet honor --superbatches; use --cuda-oxide-train-steps for BO-CUDA-002"
+                "--backend cuda-oxide production schedule mode currently requires --max-epochs to avoid an unbounded nested run"
                     .to_string(),
             );
         }
-        if self.positions_per_superbatch != DEFAULT_POSITIONS_PER_SUPERBATCH {
-            return Err(
-                "--backend cuda-oxide does not yet honor --positions-per-superbatch; this is BO-CUDA-003 work"
-                    .to_string(),
-            );
-        }
-        if self.max_epochs.is_some() {
-            return Err("--backend cuda-oxide does not yet honor --max-epochs; this is BO-CUDA-003 work".to_string());
-        }
-        if self.lr_schedule != LrScheduleKind::Step || self.lr_step_gamma.is_some() || self.lr_step_positions.is_some() {
-            return Err("--backend cuda-oxide LR schedule integration is BO-CUDA-003; omit LR schedule flags for now".to_string());
-        }
-        if self.lr != 0.000875 || self.lr_min != 0.00001 {
-            return Err("--backend cuda-oxide does not yet honor --lr / --lr-min; this is BO-CUDA-003 work".to_string());
-        }
-        if self.optimizer != OptimizerKind::Ranger
-            || self.optimizer_weight_decay != 0.0
-            || self.optimizer_epsilon.is_some()
-            || self.optimizer_beta1.is_some()
-            || self.optimizer_beta2.is_some()
+        if !production_schedule
+            && (self.positions_per_superbatch != DEFAULT_POSITIONS_PER_SUPERBATCH
+                || self.max_epochs.is_some()
+                || self.lr_schedule != LrScheduleKind::Step
+                || self.lr_step_gamma.is_some()
+                || self.lr_step_positions.is_some()
+                || self.lr != 0.000875
+                || self.lr_min != 0.00001
+                || self.optimizer_weight_decay != 0.0
+                || self.optimizer_epsilon.is_some()
+                || self.optimizer_beta1.is_some()
+                || self.optimizer_beta2.is_some())
         {
             return Err(
-                "--backend cuda-oxide currently uses its fixed Ranger step parameters; optimizer overrides are BO-CUDA-003 work"
+                "--backend cuda-oxide direct-step mode does not honor production schedule flags; \
+                 use --superbatches with --max-epochs instead"
                     .to_string(),
             );
+        }
+        if self.lr_schedule == LrScheduleKind::Plateau {
+            return Err(
+                "--backend cuda-oxide plateau control depends on validation metrics and remains blocked on BO-CUDA-004"
+                    .to_string(),
+            );
+        }
+        if self.optimizer != OptimizerKind::Ranger {
+            return Err("--backend cuda-oxide currently supports only --optimizer ranger".to_string());
         }
         if self.lambda != 1.0 || self.scale != 400 {
             return Err("--backend cuda-oxide currently supports only --lambda 1.0 --scale 400".to_string());
@@ -2725,10 +2740,12 @@ fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
 
     eprintln!("  backend = cuda-oxide direct NNUE HalfKP trainer");
     eprintln!("  cuda-oxide cargo dir = {}", cargo_dir.display());
-    eprintln!(
-        "  cuda-oxide note = production schedule/validation integration is pending \
-         (BO-CUDA-003/004); this path uses the nested trainer's fixed Ranger step parameters"
-    );
+    if cuda_oxide_uses_production_schedule(args) {
+        eprintln!("  cuda-oxide schedule = production superbatches/max-epochs mode");
+    } else {
+        eprintln!("  cuda-oxide schedule = direct train-steps smoke mode");
+    }
+    eprintln!("  cuda-oxide note = validation metrics integration is pending (BO-CUDA-004)");
 
     let status = std::process::Command::new("cargo")
         .current_dir(&cargo_dir)
@@ -2742,6 +2759,10 @@ fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
 }
 
 fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
+    let production_schedule = cuda_oxide_uses_production_schedule(args);
+    let batches_per_superbatch = if production_schedule { effective_batches_per_superbatch(args)? } else { 1 };
+    let train_steps = cuda_oxide_train_steps(args, batches_per_superbatch)?;
+
     let mut cargo_args = vec!["run".to_string()];
     if args.cuda_oxide_release {
         cargo_args.push("--release".to_string());
@@ -2765,7 +2786,10 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
     cargo_args.push(absolutize_path_for_child(&args.output_dir())?.display().to_string());
 
     cargo_args.push("--train-steps".to_string());
-    cargo_args.push(args.cuda_oxide_train_steps.expect("validated cuda-oxide train steps").to_string());
+    cargo_args.push(train_steps.to_string());
+
+    cargo_args.push("--batches-per-superbatch".to_string());
+    cargo_args.push(batches_per_superbatch.to_string());
 
     cargo_args.push("--batch-size".to_string());
     cargo_args.push(effective_batch_size(args).to_string());
@@ -2791,6 +2815,32 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
     cargo_args.push("--loss-kind".to_string());
     cargo_args.push(if args.nnue_pytorch_wrm_loss { "wrm" } else { "sigmoid-mse" }.to_string());
 
+    if production_schedule {
+        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
+        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
+        let lr_period_positions = cuda_oxide_lr_period_positions(args, batches_per_superbatch)?;
+        cargo_args.push("--lr-schedule".to_string());
+        cargo_args.push(args.lr_schedule.cli_name().to_string());
+        cargo_args.push("--learning-rate".to_string());
+        cargo_args.push(args.lr.to_string());
+        cargo_args.push("--lr-min".to_string());
+        cargo_args.push(args.lr_min.to_string());
+        cargo_args.push("--lr-step-gamma".to_string());
+        cargo_args.push(lr_step_gamma.to_string());
+        cargo_args.push("--lr-step-positions".to_string());
+        cargo_args.push(lr_step_positions.to_string());
+        cargo_args.push("--lr-period-positions".to_string());
+        cargo_args.push(lr_period_positions.to_string());
+        cargo_args.push("--optimizer-weight-decay".to_string());
+        cargo_args.push(args.optimizer_weight_decay.to_string());
+        cargo_args.push("--optimizer-epsilon".to_string());
+        cargo_args.push(args.optimizer_epsilon.unwrap_or(0.00000001).to_string());
+        cargo_args.push("--optimizer-beta1".to_string());
+        cargo_args.push(args.optimizer_beta1.unwrap_or(0.99).to_string());
+        cargo_args.push("--optimizer-beta2".to_string());
+        cargo_args.push(args.optimizer_beta2.unwrap_or(0.999).to_string());
+    }
+
     if let Some(ptx) = &args.cuda_oxide_ptx {
         cargo_args.push("--ptx".to_string());
         cargo_args.push(absolutize_path_for_child(ptx)?.display().to_string());
@@ -2804,6 +2854,45 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
     }
 
     Ok(cargo_args)
+}
+
+fn cuda_oxide_uses_production_schedule(args: &Args) -> bool {
+    args.cuda_oxide_train_steps.is_none()
+}
+
+fn cuda_oxide_train_steps(args: &Args, batches_per_superbatch: usize) -> Result<usize, String> {
+    if let Some(steps) = args.cuda_oxide_train_steps {
+        return Ok(steps);
+    }
+    let superbatches = args
+        .superbatches
+        .ok_or_else(|| "--backend cuda-oxide requires --superbatches in production schedule mode".to_string())?;
+    let epochs = args
+        .max_epochs
+        .ok_or_else(|| "--backend cuda-oxide requires --max-epochs in production schedule mode".to_string())?
+        .max(1);
+    superbatches
+        .checked_mul(batches_per_superbatch)
+        .and_then(|steps_per_epoch| steps_per_epoch.checked_mul(epochs))
+        .ok_or_else(|| "cuda-oxide production train step count overflowed".to_string())
+}
+
+fn cuda_oxide_lr_period_positions(args: &Args, batches_per_superbatch: usize) -> Result<u64, String> {
+    if args.lr_schedule == LrScheduleKind::Step && args.superbatches.is_none() {
+        return Ok(0);
+    }
+    let superbatches = args
+        .superbatches
+        .ok_or_else(|| "--backend cuda-oxide requires --superbatches to compute LR period".to_string())?;
+    let positions_per_superbatch = effective_positions_per_superbatch(args)? as u64;
+    let period = positions_per_superbatch
+        .checked_mul(superbatches as u64)
+        .ok_or_else(|| "cuda-oxide LR period overflowed".to_string())?;
+    if period == 0 && matches!(args.lr_schedule, LrScheduleKind::Geometric | LrScheduleKind::Cos) {
+        return Err("--backend cuda-oxide requires a non-zero LR period for geometric/cos schedules".to_string());
+    }
+    let _ = batches_per_superbatch;
+    Ok(period)
 }
 
 fn absolutize_teacher_spec_for_child(spec: &str) -> Result<String, String> {
@@ -6906,7 +6995,7 @@ mod tests {
 
         let err = args.validate_backend_flags().unwrap_err();
         assert!(err.contains("--cuda-oxide-train-steps"));
-        assert!(err.contains("BO-CUDA-003"));
+        assert!(err.contains("--superbatches"));
     }
 
     #[test]
@@ -6954,7 +7043,50 @@ mod tests {
     }
 
     #[test]
-    fn cuda_oxide_backend_rejects_production_schedule_flags_for_now() {
+    fn cuda_oxide_backend_accepts_bounded_production_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_ok());
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_unbounded_production_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("--max-epochs"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_mixed_direct_and_production_schedule() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -6973,8 +7105,8 @@ mod tests {
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains("--superbatches"));
-        assert!(err.contains("BO-CUDA-002"));
+        assert!(err.contains("either"));
+        assert!(err.contains("not both"));
     }
 
     #[test]
