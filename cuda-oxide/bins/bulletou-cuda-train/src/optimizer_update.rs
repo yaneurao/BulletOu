@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
-    backward::SfnnBackwardWorkspace,
+    backward::{NnueBackwardWorkspace, SfnnBackwardWorkspace},
+    nnue::NnueForwardDeviceWeights,
     optimizer::{
-        AdamWUpdateLaunchPlan, AdamWUpdateLayout, AdamWUpdateParams, RAdamUpdateLaunchPlan, RAdamUpdateLayout,
-        RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams, RangerOptimizerState,
-        RangerUpdateLayout, RangerUpdateParams, SfnnRangerOptimizerStates,
+        AdamWUpdateLaunchPlan, AdamWUpdateLayout, AdamWUpdateParams, NnueRangerOptimizerStates, RAdamUpdateLaunchPlan,
+        RAdamUpdateLayout, RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams,
+        RangerOptimizerState, RangerUpdateLayout, RangerUpdateParams, SfnnRangerOptimizerStates,
     },
     sfnn::SfnnForwardDeviceWeights,
     CudaModule, CudaStream, DeviceBuffer, Error, LaunchConfig, Result,
@@ -184,6 +185,94 @@ pub(crate) fn launch_ranger_update(
 }
 
 #[allow(dead_code)]
+pub(crate) fn launch_nnue_ranger_update(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    params: RangerUpdateParams,
+    weights: &mut NnueForwardDeviceWeights,
+    gradients: &NnueBackwardWorkspace,
+    states: &mut NnueRangerOptimizerStates,
+) -> Result<()> {
+    ensure_nnue_update_shapes(weights, gradients, states)?;
+    let layout = states.layout;
+
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l0w_state_layout().state_len()),
+        params,
+        &gradients.l0w_gradients,
+        &mut weights.l0w,
+        &mut states.l0w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l0b_state_layout().state_len()),
+        params,
+        &gradients.l0b_gradients,
+        &mut weights.l0b,
+        &mut states.l0b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l1w_state_layout().state_len()),
+        params,
+        &gradients.l1w_gradients,
+        &mut weights.l1w,
+        &mut states.l1w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l1b_state_layout().state_len()),
+        params,
+        &gradients.l1b_gradients,
+        &mut weights.l1b,
+        &mut states.l1b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l2w_state_layout().state_len()),
+        params,
+        &gradients.l2w_gradients,
+        &mut weights.l2w,
+        &mut states.l2w,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.l2b_state_layout().state_len()),
+        params,
+        &gradients.l2b_gradients,
+        &mut weights.l2b,
+        &mut states.l2b,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.outw_state_layout().state_len()),
+        params,
+        &gradients.outw_gradients,
+        &mut weights.outw,
+        &mut states.outw,
+    )?;
+    launch_ranger_update(
+        stream,
+        module,
+        RangerUpdateLayout::new(layout.outb_state_layout().state_len()),
+        params,
+        &gradients.outb_gradients,
+        &mut weights.outb,
+        &mut states.outb,
+    )?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn launch_sfnn_ranger_update(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
@@ -281,6 +370,27 @@ fn ensure_ranger_state_len(name: &'static str, layout: RangerUpdateLayout, state
             "{name} optimizer state length mismatch: expected {expected}, got {actual}"
         )))
     }
+}
+
+fn ensure_nnue_update_shapes(
+    weights: &NnueForwardDeviceWeights,
+    gradients: &NnueBackwardWorkspace,
+    states: &NnueRangerOptimizerStates,
+) -> Result<()> {
+    let shape = weights.shape;
+    if gradients.layout.shape != shape {
+        return Err(Error::Smoke(format!(
+            "NNUE gradient shape mismatch: weights={shape:?}, gradients={:?}",
+            gradients.layout.shape
+        )));
+    }
+    if states.layout.weights.shape != shape {
+        return Err(Error::Smoke(format!(
+            "NNUE optimizer state shape mismatch: weights={shape:?}, states={:?}",
+            states.layout.weights.shape
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_sfnn_update_shapes(

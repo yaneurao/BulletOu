@@ -705,3 +705,30 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
 - Remaining CO-010 work: add the analogous NNUE gradient/state launcher shape,
   then connect these launchers to the real trainer loop.
+
+### 2026-07-17 CO-010 NNUE Ranger update launcher
+
+- Added `NnueBackwardWorkspaceLayout` and `NnueBackwardWorkspace` to the
+  cuda-oxide runtime. The workspace bundles NNUE dense/sparse backward
+  intermediates and parameter gradients:
+  `hidden2`, `hidden1`, `combined`, STM/NSTM L0 gradients, and `l0w`, `l0b`,
+  `l1w`, `l1b`, `l2w`, `l2b`, `outw`, `outb` gradient buffers.
+- Refactored `--nnue-dense-backward-smoke` to allocate/use the new workspace
+  instead of separate local `DeviceBuffer`s.
+- Added `launch_nnue_ranger_update`, wiring NNUE forward weights,
+  `NnueBackwardWorkspace` parameter gradients, and
+  `NnueRangerOptimizerStates` together for all 8 NNUE parameter groups.
+- Added shape guards so NNUE weights, gradients, and optimizer states must
+  agree before any per-tensor update launches.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded with 25
+    backward tests.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `--nnue-dense-backward-smoke --debug-readback` succeeded on RTX 4090 after
+    the workspace refactor; all gradient comparisons stayed within tolerance.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+- Remaining CO-010 work: connect the NNUE/SFNN Ranger update launchers to the
+  real trainer loop and checkpoint state lifecycle.

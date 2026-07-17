@@ -1,6 +1,6 @@
 //! Fixed-layout backward workspaces for cuda-oxide kernels.
 
-use crate::sfnn::SfnnForwardShape;
+use crate::{nnue::NnueForwardShape, sfnn::SfnnForwardShape};
 
 #[cfg(feature = "cuda")]
 use crate::{CudaStream, DeviceBuffer, Result};
@@ -466,6 +466,137 @@ impl SfnnL0SparseBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueBackwardWorkspaceLayout {
+    pub shape: NnueForwardShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl NnueBackwardWorkspaceLayout {
+    pub fn new(shape: NnueForwardShape, batch_size: usize, max_active: usize) -> Self {
+        Self { shape, batch_size, max_active }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.max_active == 0 {
+            Err(BackwardLayoutError::EmptySparse)
+        } else if self.shape.input_size == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.shape.l1 == 0 || self.shape.l2 == 0 || self.shape.l3 == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn hidden2_gradients_len(self) -> usize {
+        self.batch_size * self.shape.l3
+    }
+
+    pub fn hidden1_gradients_len(self) -> usize {
+        self.batch_size * self.shape.l2
+    }
+
+    pub fn combined_gradients_len(self) -> usize {
+        self.batch_size * self.shape.l1 * 2
+    }
+
+    pub fn l0_gradients_len(self) -> usize {
+        self.batch_size * self.shape.l1
+    }
+
+    pub fn l0w_gradients_len(self) -> usize {
+        self.shape.input_size * self.shape.l1
+    }
+
+    pub fn l0b_gradients_len(self) -> usize {
+        self.shape.l1
+    }
+
+    pub fn l1w_gradients_len(self) -> usize {
+        self.shape.l1 * 2 * self.shape.l2
+    }
+
+    pub fn l1b_gradients_len(self) -> usize {
+        self.shape.l2
+    }
+
+    pub fn l2w_gradients_len(self) -> usize {
+        self.shape.l2 * self.shape.l3
+    }
+
+    pub fn l2b_gradients_len(self) -> usize {
+        self.shape.l3
+    }
+
+    pub fn outw_gradients_len(self) -> usize {
+        self.shape.l3
+    }
+
+    pub fn outb_gradients_len(self) -> usize {
+        1
+    }
+
+    pub fn total_gradient_f32_len(self) -> usize {
+        self.hidden2_gradients_len()
+            .saturating_add(self.hidden1_gradients_len())
+            .saturating_add(self.combined_gradients_len())
+            .saturating_add(self.l0_gradients_len().saturating_mul(2))
+            .saturating_add(self.l0w_gradients_len())
+            .saturating_add(self.l0b_gradients_len())
+            .saturating_add(self.l1w_gradients_len())
+            .saturating_add(self.l1b_gradients_len())
+            .saturating_add(self.l2w_gradients_len())
+            .saturating_add(self.l2b_gradients_len())
+            .saturating_add(self.outw_gradients_len())
+            .saturating_add(self.outb_gradients_len())
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct NnueBackwardWorkspace {
+    pub layout: NnueBackwardWorkspaceLayout,
+    pub hidden2_gradients: DeviceBuffer<f32>,
+    pub hidden1_gradients: DeviceBuffer<f32>,
+    pub combined_gradients: DeviceBuffer<f32>,
+    pub stm_l0_gradients: DeviceBuffer<f32>,
+    pub nstm_l0_gradients: DeviceBuffer<f32>,
+    pub l0w_gradients: DeviceBuffer<f32>,
+    pub l0b_gradients: DeviceBuffer<f32>,
+    pub l1w_gradients: DeviceBuffer<f32>,
+    pub l1b_gradients: DeviceBuffer<f32>,
+    pub l2w_gradients: DeviceBuffer<f32>,
+    pub l2b_gradients: DeviceBuffer<f32>,
+    pub outw_gradients: DeviceBuffer<f32>,
+    pub outb_gradients: DeviceBuffer<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl NnueBackwardWorkspace {
+    pub fn new(stream: &CudaStream, layout: NnueBackwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            hidden2_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden2_gradients_len())?,
+            hidden1_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden1_gradients_len())?,
+            combined_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.combined_gradients_len())?,
+            stm_l0_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0_gradients_len())?,
+            nstm_l0_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0_gradients_len())?,
+            l0w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0w_gradients_len())?,
+            l0b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0b_gradients_len())?,
+            l1w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1w_gradients_len())?,
+            l1b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1b_gradients_len())?,
+            l2w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l2w_gradients_len())?,
+            l2b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l2b_gradients_len())?,
+            outw_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.outw_gradients_len())?,
+            outb_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.outb_gradients_len())?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SfnnBackwardWorkspaceLayout {
     pub shape: SfnnForwardShape,
     pub batch_size: usize,
@@ -840,6 +971,52 @@ mod tests {
         );
         assert_eq!(
             NnueL0SparseBackwardLayout::new(3, 5, 7, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
+    }
+
+    #[test]
+    fn nnue_backward_workspace_layout_counts_buffers() {
+        let shape = NnueForwardShape { input_size: 7, l1: 4, l2: 3, l3: 2 };
+        let layout = NnueBackwardWorkspaceLayout::new(shape, 3, 5);
+
+        assert_eq!(layout.hidden2_gradients_len(), 6);
+        assert_eq!(layout.hidden1_gradients_len(), 9);
+        assert_eq!(layout.combined_gradients_len(), 24);
+        assert_eq!(layout.l0_gradients_len(), 12);
+        assert_eq!(layout.l0w_gradients_len(), 28);
+        assert_eq!(layout.l0b_gradients_len(), 4);
+        assert_eq!(layout.l1w_gradients_len(), 24);
+        assert_eq!(layout.l1b_gradients_len(), 3);
+        assert_eq!(layout.l2w_gradients_len(), 6);
+        assert_eq!(layout.l2b_gradients_len(), 2);
+        assert_eq!(layout.outw_gradients_len(), 2);
+        assert_eq!(layout.outb_gradients_len(), 1);
+        assert_eq!(layout.total_gradient_f32_len(), 133);
+    }
+
+    #[test]
+    fn nnue_backward_workspace_layout_rejects_empty_values() {
+        let shape = NnueForwardShape { input_size: 7, l1: 4, l2: 3, l3: 2 };
+
+        assert_eq!(
+            NnueBackwardWorkspaceLayout::new(shape, 0, 5).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            NnueBackwardWorkspaceLayout::new(shape, 3, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptySparse
+        );
+        assert_eq!(
+            NnueBackwardWorkspaceLayout::new(NnueForwardShape { input_size: 0, ..shape }, 3, 5)
+                .validate()
+                .unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            NnueBackwardWorkspaceLayout::new(NnueForwardShape { l2: 0, ..shape }, 3, 5)
+                .validate()
+                .unwrap_err(),
             BackwardLayoutError::EmptyOutput
         );
     }
