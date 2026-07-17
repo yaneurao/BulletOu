@@ -1257,7 +1257,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    nn_bin     : {}", checkpoint.nn_bin_path.display());
         println!("    state      : {}", checkpoint.state_path.display());
         println!("    state_bin  : {}", checkpoint.state_bin_path.display());
+        if let Some(path) = &checkpoint.dataloader_pos_path {
+            println!("    loader_pos : {}", path.display());
+        }
         println!("    learn_log  : {}", checkpoint.learn_log_path.display());
+        println!("    summary    : {}", checkpoint.summary_log_path.display());
     }
     println!("  train        : ok");
 
@@ -1272,7 +1276,9 @@ struct NnueBridgeCheckpointWrite {
     nn_bin_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
+    dataloader_pos_path: Option<std::path::PathBuf>,
     learn_log_path: std::path::PathBuf,
+    summary_log_path: std::path::PathBuf,
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -1299,7 +1305,9 @@ fn write_nnue_bridge_checkpoint(
     let nn_bin_path = dir.join("nn.bin");
     let state_path = dir.join("state.boung");
     let state_bin_path = dir.join("state.bin");
+    let dataloader_pos_path = dir.join("dataloader_pos.txt");
     let learn_log_path = dir.join("learn.log");
+    let summary_log_path = output_dir.join("summary-learn.log");
 
     let trained_forward = NnueForwardCase {
         label: "teacher-trained-bridge-checkpoint",
@@ -1321,7 +1329,14 @@ fn write_nnue_bridge_checkpoint(
     write_nnue_halfkp_nn_bin(&nn_bin_path, shape, state)?;
     write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
     write_nnue_root_state_bin(&state_bin_path, completed_steps, state)?;
+    let dataloader_pos_path = write_nnue_bridge_dataloader_pos(
+        &dataloader_pos_path,
+        completed_steps,
+        last_batch.batch_size,
+        sources,
+    )?;
     write_nnue_bridge_learn_log(&learn_log_path, losses, sources)?;
+    append_nnue_bridge_summary_log(&summary_log_path, index, completed_steps, losses, sources)?;
 
     Ok(NnueBridgeCheckpointWrite {
         index,
@@ -1330,7 +1345,9 @@ fn write_nnue_bridge_checkpoint(
         nn_bin_path,
         state_path,
         state_bin_path,
+        dataloader_pos_path,
         learn_log_path,
+        summary_log_path,
     })
 }
 
@@ -4587,6 +4604,124 @@ fn write_nnue_train_state_fixture(
     std::io::Write::flush(&mut writer).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to flush NNUE train state fixture {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_bridge_dataloader_pos(
+    path: &std::path::Path,
+    completed_steps: usize,
+    batch_size: usize,
+    sources: &[String],
+) -> bulletou_cuda_oxide_runtime::Result<Option<std::path::PathBuf>> {
+    use std::io::Write as _;
+
+    let writes_hcpe_offset = sources.iter().any(|source| source.starts_with("Hcpe teacher batch "));
+    if !writes_hcpe_offset {
+        return Ok(None);
+    }
+
+    let consumed_records = completed_steps.checked_mul(batch_size).ok_or_else(|| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "dataloader position overflow: completed_steps={completed_steps} batch_size={batch_size}"
+        ))
+    })?;
+    let byte_offset = (consumed_records as u64)
+        .checked_mul(bulletou_lib::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
+        .ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "dataloader byte offset overflow: consumed_records={consumed_records}"
+            ))
+        })?;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create bridge checkpoint dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?);
+    writeln!(writer, "{byte_offset},0").map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write bridge checkpoint dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush bridge checkpoint dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(path.to_path_buf()))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn append_nnue_bridge_summary_log(
+    path: &std::path::Path,
+    checkpoint_index: usize,
+    completed_steps: usize,
+    losses: &[(usize, f32, f32)],
+    sources: &[String],
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let write_header = match std::fs::metadata(path) {
+        Ok(meta) => meta.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to stat bridge summary log {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let mut writer = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to open bridge summary log {}: {err}",
+                    path.display()
+                ))
+            })?,
+    );
+
+    if write_header {
+        writeln!(writer, "checkpoint\tcompleted_steps\tsteps\tlast_step\tweighted_sum\tmean\tsource").map_err(
+            |err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to write bridge summary log header {}: {err}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+
+    let Some((last_step, weighted_sum, mean)) = losses.last().copied() else {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "cannot append bridge summary log without losses".to_string(),
+        ));
+    };
+    let source = sources.last().map(String::as_str).unwrap_or("");
+    writeln!(
+        writer,
+        "{checkpoint_index:04}\t{completed_steps}\t{}\t{last_step}\t{weighted_sum}\t{mean}\t{source}",
+        losses.len()
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to append bridge summary log {}: {err}",
+            path.display()
+        ))
+    })?;
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush bridge summary log {}: {err}",
             path.display()
         ))
     })?;

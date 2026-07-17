@@ -1032,6 +1032,11 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   (`64,217,077` bytes) with `NNUE_VERSION=0x7AF32F16`,
   `network_hash=0x3E5AA6EE`, `ft_hash=0x5D69D7B8`, and
   `fc_hash=0x63337156`.
+- Added HCPE `dataloader_pos.txt` and top-level `summary-learn.log` bridge
+  output. `dataloader_pos.txt` uses the same current direct-resume convention
+  as the trainer (`completed_steps * batch_size * 38,0`). This is sufficient
+  for the current HCPE smoke path; later loader helper work can replace it with
+  the exact consumed-offset handle.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
