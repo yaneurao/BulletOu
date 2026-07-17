@@ -20,6 +20,7 @@ commit each completed slice.
 | BO-CUDA-012 | done | SFNN resume from root `state.bin` | `--sfnn-teacher-train` can auto-resume weights, Ranger state, completed step count, and teacher dataloader position from SFNN bridge checkpoints |
 | BO-CUDA-013 | done | SFNN plateau schedule | BulletOu `--backend cuda-oxide --eval-type SFNN_HALFKA2 --lr-schedule plateau` runs through the generic plateau orchestrator using SFNN validation metrics and auto-resume |
 | BO-CUDA-014 | done | SFNN factorized L1 forward foundation | cuda-oxide SFNN forward/runtime/fixture paths can carry optional shared `l1f` weights and match CPU golden output before training-backward integration |
+| BO-CUDA-015 | done | SFNN factorized L1 backward/Ranger smoke | cuda-oxide SFNN backward/runtime/optimizer paths can compute and update optional shared `l1f` weights, with `factorized-tiny` backward and Ranger-step smokes matching CPU golden |
 
 ## Notes
 
@@ -194,3 +195,20 @@ commit each completed slice.
   - WSL CUDA `--sfnn-forward-smoke --sfnn-forward-case factorized-tiny --debug-readback` matched CPU golden: output max_abs diff `0.000000029802322`; `l1` max_abs diff `0.000000007450581`; compare `ok`.
   - WSL CUDA regression `--sfnn-forward-smoke --sfnn-forward-case tiny --debug-readback` matched CPU golden with all reported max_abs diffs `0`.
   - WSL CUDA fixture round-trip of `factorized-tiny` via `--write-sfnn-forward-fixture` then `--sfnn-forward-fixture` matched CPU golden with output max_abs diff `0.000000029802322`.
+
+### BO-CUDA-015
+
+- Added runtime layout and CUDA kernel `sfnn_shared_l1_backward`.
+- The shared L1 backward pass computes `l1fw` / `l1fb` gradients and adds the shared-L1 contribution into `combined_gradients` before pairwise/L0 backward.
+- Extended SFNN backward workspace with `l1fw_gradients` / `l1fb_gradients`.
+- Extended SFNN Ranger optimizer state/update paths with optional `l1fw` / `l1fb` parameter groups, present only when the forward weights carry shared L1 weights.
+- Enabled `factorized-tiny` for SFNN dense-backward and Ranger-step smokes.
+- Validation:
+  - `cargo check -p bulletou-cuda-train`.
+  - `cargo test -p bulletou-cuda-oxide-runtime sfnn`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL: `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release`.
+  - WSL CUDA smoke used a local cubin produced from `bulletou_cuda_train.ll` via `llvm-link-20` + libdevice, `llc-20`, and `ptxas`.
+  - WSL CUDA `--sfnn-dense-backward-smoke --sfnn-forward-case factorized-tiny` matched CPU golden: `l1fw_grad` max_abs diff `0.000000014901161`; `l1fb_grad` max_abs diff `0.000000059604645`; compare `ok`.
+  - WSL CUDA `--sfnn-ranger-step-smoke --sfnn-forward-case factorized-tiny` matched CPU golden including `l1fw_*` and `l1fb_*` weight/momentum/velocity/slow buffers; compare `ok`.
+  - WSL CUDA regressions `--sfnn-dense-backward-smoke --sfnn-forward-case tiny` and `--sfnn-ranger-step-smoke --sfnn-forward-case tiny` both matched CPU golden; compare `ok`.

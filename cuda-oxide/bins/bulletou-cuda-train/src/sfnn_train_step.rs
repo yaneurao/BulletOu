@@ -5,8 +5,8 @@ use std::sync::Arc;
 use bulletou_cuda_oxide_runtime::{
     backward::{
         SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-        SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
-        SfnnStackedL3BackwardLayout,
+        SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
+        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
     },
     loss::{ScalarLossLayout, ScalarLossWorkspace},
     optimizer::{RangerUpdateParams, SfnnRangerOptimizerHostStates, SfnnRangerOptimizerStates},
@@ -258,6 +258,20 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l1w_gradients,
             &mut self.backward_workspace.l1b_gradients,
         )?;
+        if let Some(l1fw) = &self.device_weights.l1fw {
+            let l1f_layout = SfnnSharedL1BackwardLayout::new(self.batch_size, self.shape.ft_size, self.shape.l1_out());
+            sfnn_backward::launch_sfnn_shared_l1_backward(
+                stream,
+                module,
+                l1f_layout,
+                &self.forward_workspace.combined,
+                &self.backward_workspace.l1_gradients,
+                l1fw,
+                &mut self.backward_workspace.combined_gradients,
+                &mut self.backward_workspace.l1fw_gradients,
+                &mut self.backward_workspace.l1fb_gradients,
+            )?;
+        }
 
         let pairwise_layout = SfnnPairwiseBackwardLayout::new(self.batch_size, self.shape.ft_size);
         sfnn_backward::launch_sfnn_pairwise_backward(

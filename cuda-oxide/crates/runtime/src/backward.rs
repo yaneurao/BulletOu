@@ -13,9 +13,10 @@ pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
 pub const SFNN_STACKED_CRELU_BACKWARD_KERNEL: &str = "sfnn_stacked_crelu_backward";
 pub const SFNN_L2_INPUT_BACKWARD_KERNEL: &str = "sfnn_l2_input_backward";
 pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backward";
+pub const SFNN_SHARED_L1_BACKWARD_KERNEL: &str = "sfnn_shared_l1_backward";
 pub const SFNN_PAIRWISE_BACKWARD_KERNEL: &str = "sfnn_pairwise_backward";
 pub const SFNN_L0_SPARSE_BACKWARD_KERNEL: &str = "sfnn_l0_sparse_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 10] = [
+pub const BACKWARD_KERNEL_NAMES: [&str; 11] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
@@ -24,6 +25,7 @@ pub const BACKWARD_KERNEL_NAMES: [&str; 10] = [
     SFNN_STACKED_CRELU_BACKWARD_KERNEL,
     SFNN_L2_INPUT_BACKWARD_KERNEL,
     SFNN_STACKED_AFFINE_BACKWARD_KERNEL,
+    SFNN_SHARED_L1_BACKWARD_KERNEL,
     SFNN_PAIRWISE_BACKWARD_KERNEL,
     SFNN_L0_SPARSE_BACKWARD_KERNEL,
 ];
@@ -388,6 +390,55 @@ impl SfnnStackedAffineBackwardLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnSharedL1BackwardLayout {
+    pub batch_size: usize,
+    pub input_dim: usize,
+    pub output_dim: usize,
+}
+
+impl SfnnSharedL1BackwardLayout {
+    pub fn new(batch_size: usize, input_dim: usize, output_dim: usize) -> Self {
+        Self { batch_size, input_dim, output_dim }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), BackwardLayoutError> {
+        if self.batch_size == 0 {
+            Err(BackwardLayoutError::EmptyBatch)
+        } else if self.input_dim == 0 {
+            Err(BackwardLayoutError::EmptyInput)
+        } else if self.output_dim == 0 {
+            Err(BackwardLayoutError::EmptyOutput)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn input_values_len(self) -> usize {
+        self.batch_size * self.input_dim
+    }
+
+    pub fn output_gradients_len(self) -> usize {
+        self.batch_size * self.output_dim
+    }
+
+    pub fn input_gradients_len(self) -> usize {
+        self.batch_size * self.input_dim
+    }
+
+    pub fn weight_len(self) -> usize {
+        self.input_dim * self.output_dim
+    }
+
+    pub fn bias_len(self) -> usize {
+        self.output_dim
+    }
+
+    pub fn gradient_threads(self) -> usize {
+        self.input_gradients_len().max(self.weight_len()).max(self.bias_len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SfnnPairwiseBackwardLayout {
     pub batch_size: usize,
     pub ft_size: usize,
@@ -660,6 +711,14 @@ impl SfnnBackwardWorkspaceLayout {
         self.shape.num_stacks * self.shape.l1_out()
     }
 
+    pub fn l1fw_gradients_len(self) -> usize {
+        self.shape.ft_size * self.shape.l1_out()
+    }
+
+    pub fn l1fb_gradients_len(self) -> usize {
+        self.shape.l1_out()
+    }
+
     pub fn l2w_gradients_len(self) -> usize {
         self.shape.l2_in() * self.shape.num_stacks * self.shape.l2_size
     }
@@ -686,6 +745,8 @@ impl SfnnBackwardWorkspaceLayout {
             .saturating_add(self.l0b_gradients_len())
             .saturating_add(self.l1w_gradients_len())
             .saturating_add(self.l1b_gradients_len())
+            .saturating_add(self.l1fw_gradients_len())
+            .saturating_add(self.l1fb_gradients_len())
             .saturating_add(self.l2w_gradients_len())
             .saturating_add(self.l2b_gradients_len())
             .saturating_add(self.l3w_gradients_len())
@@ -708,6 +769,8 @@ pub struct SfnnBackwardWorkspace {
     pub l0b_gradients: DeviceBuffer<f32>,
     pub l1w_gradients: DeviceBuffer<f32>,
     pub l1b_gradients: DeviceBuffer<f32>,
+    pub l1fw_gradients: DeviceBuffer<f32>,
+    pub l1fb_gradients: DeviceBuffer<f32>,
     pub l2w_gradients: DeviceBuffer<f32>,
     pub l2b_gradients: DeviceBuffer<f32>,
     pub l3w_gradients: DeviceBuffer<f32>,
@@ -733,6 +796,8 @@ impl SfnnBackwardWorkspace {
             l0b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0b_gradients_len())?,
             l1w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1w_gradients_len())?,
             l1b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1b_gradients_len())?,
+            l1fw_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1fw_gradients_len())?,
+            l1fb_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l1fb_gradients_len())?,
             l2w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l2w_gradients_len())?,
             l2b_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l2b_gradients_len())?,
             l3w_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l3w_gradients_len())?,
@@ -832,6 +897,17 @@ impl SfnnStackedAffineBackwardLaunchPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnSharedL1BackwardLaunchPlan {
+    pub threads: usize,
+}
+
+impl SfnnSharedL1BackwardLaunchPlan {
+    pub fn new(layout: SfnnSharedL1BackwardLayout) -> Self {
+        Self { threads: layout.gradient_threads().max(1) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SfnnPairwiseBackwardLaunchPlan {
     pub threads: usize,
 }
@@ -884,6 +960,7 @@ mod tests {
                 "sfnn_stacked_crelu_backward",
                 "sfnn_l2_input_backward",
                 "sfnn_stacked_affine_backward",
+                "sfnn_shared_l1_backward",
                 "sfnn_pairwise_backward",
                 "sfnn_l0_sparse_backward"
             ]
@@ -1137,6 +1214,35 @@ mod tests {
     }
 
     #[test]
+    fn sfnn_shared_l1_layout_counts_buffers() {
+        let layout = SfnnSharedL1BackwardLayout::new(3, 4, 5);
+
+        assert_eq!(layout.input_values_len(), 12);
+        assert_eq!(layout.output_gradients_len(), 15);
+        assert_eq!(layout.input_gradients_len(), 12);
+        assert_eq!(layout.weight_len(), 20);
+        assert_eq!(layout.bias_len(), 5);
+        assert_eq!(layout.gradient_threads(), 20);
+        assert_eq!(SfnnSharedL1BackwardLaunchPlan::new(layout).threads, 20);
+    }
+
+    #[test]
+    fn sfnn_shared_l1_layout_rejects_empty_values() {
+        assert_eq!(
+            SfnnSharedL1BackwardLayout::new(0, 4, 5).validate().unwrap_err(),
+            BackwardLayoutError::EmptyBatch
+        );
+        assert_eq!(
+            SfnnSharedL1BackwardLayout::new(3, 0, 5).validate().unwrap_err(),
+            BackwardLayoutError::EmptyInput
+        );
+        assert_eq!(
+            SfnnSharedL1BackwardLayout::new(3, 4, 0).validate().unwrap_err(),
+            BackwardLayoutError::EmptyOutput
+        );
+    }
+
+    #[test]
     fn sfnn_pairwise_layout_counts_buffers() {
         let layout = SfnnPairwiseBackwardLayout::new(3, 8);
 
@@ -1197,11 +1303,13 @@ mod tests {
         assert_eq!(layout.l0b_gradients_len(), 4);
         assert_eq!(layout.l1w_gradients_len(), 24);
         assert_eq!(layout.l1b_gradients_len(), 6);
+        assert_eq!(layout.l1fw_gradients_len(), 12);
+        assert_eq!(layout.l1fb_gradients_len(), 3);
         assert_eq!(layout.l2w_gradients_len(), 24);
         assert_eq!(layout.l2b_gradients_len(), 6);
         assert_eq!(layout.l3w_gradients_len(), 6);
         assert_eq!(layout.l3b_gradients_len(), 2);
-        assert_eq!(layout.total_gradient_f32_len(), 190);
+        assert_eq!(layout.total_gradient_f32_len(), 205);
     }
 
     #[test]

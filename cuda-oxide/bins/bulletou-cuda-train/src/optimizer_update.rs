@@ -320,6 +320,44 @@ pub(crate) fn launch_sfnn_ranger_update(
         &mut weights.l1b,
         &mut states.l1b,
     )?;
+    match (&mut weights.l1fw, &mut states.l1fw) {
+        (Some(l1fw), Some(l1fw_state)) => {
+            launch_ranger_update(
+                stream,
+                module,
+                RangerUpdateLayout::new(layout.l1fw_state_layout().state_len()),
+                params,
+                &gradients.l1fw_gradients,
+                l1fw,
+                l1fw_state,
+            )?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::Smoke(
+                "SFNN shared L1 weight/state mismatch for l1fw update".to_string(),
+            ));
+        }
+    }
+    match (&mut weights.l1fb, &mut states.l1fb) {
+        (Some(l1fb), Some(l1fb_state)) => {
+            launch_ranger_update(
+                stream,
+                module,
+                RangerUpdateLayout::new(layout.l1fb_state_layout().state_len()),
+                params,
+                &gradients.l1fb_gradients,
+                l1fb,
+                l1fb_state,
+            )?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::Smoke(
+                "SFNN shared L1 weight/state mismatch for l1fb update".to_string(),
+            ));
+        }
+    }
     launch_ranger_update(
         stream,
         module,

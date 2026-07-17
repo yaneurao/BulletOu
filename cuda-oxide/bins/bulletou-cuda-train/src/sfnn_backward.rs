@@ -6,8 +6,9 @@ use bulletou_cuda_oxide_runtime::{
     backward::{
         SfnnL0SparseBackwardLaunchPlan, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLaunchPlan,
         SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan, SfnnPairwiseBackwardLayout,
-        SfnnStackedAffineBackwardLaunchPlan, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan,
-        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
+        SfnnSharedL1BackwardLaunchPlan, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLaunchPlan,
+        SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout,
+        SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -192,6 +193,50 @@ pub(crate) fn launch_sfnn_stacked_affine_backward(
                 input_dim,
                 output_dim,
                 num_stacks
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_shared_l1_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnSharedL1BackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnSharedL1BackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_shared_l1_backward`; the kernel
+        // adds into an already initialized input-gradient buffer and writes
+        // one shared L1 weight/bias gradient per launched index.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_shared_l1_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice(inputs),
+                slice(output_gradients),
+                slice(weights),
+                slice_mut(input_gradients),
+                slice_mut(weight_gradients),
+                slice_mut(bias_gradients),
+                batch,
+                input_dim,
+                output_dim
             ]
         }
     }?;

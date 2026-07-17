@@ -4306,8 +4306,8 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
     use bulletou_cuda_oxide_runtime::{
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-            SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
-            SfnnStackedL3BackwardLayout,
+            SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
+            SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
         },
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
@@ -4320,12 +4320,6 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         Some(path) => SfnnForwardCase::read_fixture(path)?,
         None => SfnnForwardCase::new(args.sfnn_case),
     };
-    if case.l1fw.is_some() || case.l1fb.is_some() {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "SFNN factorized L1 backward smoke is not wired yet; use --sfnn-forward-smoke for factorized cases"
-                .to_string(),
-        ));
-    }
     let cpu_forward_trace = case.cpu_forward_trace();
     let cpu_trace = case.cpu_output_backward_trace(&cpu_forward_trace);
     let ptx = match args.ptx {
@@ -4423,6 +4417,20 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &mut backward_workspace.l1w_gradients,
         &mut backward_workspace.l1b_gradients,
     )?;
+    if let Some(l1fw) = &device_weights.l1fw {
+        let l1f_layout = SfnnSharedL1BackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out());
+        sfnn_backward::launch_sfnn_shared_l1_backward(
+            &stream,
+            &module,
+            l1f_layout,
+            &forward_workspace.combined,
+            &backward_workspace.l1_gradients,
+            l1fw,
+            &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1fw_gradients,
+            &mut backward_workspace.l1fb_gradients,
+        )?;
+    }
 
     let pairwise_layout = SfnnPairwiseBackwardLayout::new(case.batch_size, shape.ft_size);
     sfnn_backward::launch_sfnn_pairwise_backward(
@@ -4470,7 +4478,7 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
     let gpu_nstm_l0_pre_gradients = backward_workspace.nstm_l0_pre_gradients.to_host_vec(&stream)?;
     let gpu_l0w_gradients = backward_workspace.l0w_gradients.to_host_vec(&stream)?;
     let gpu_l0b_gradients = backward_workspace.l0b_gradients.to_host_vec(&stream)?;
-    let comparisons = [
+    let mut comparisons = vec![
         compare_slices("l2_grad", &cpu_trace.l2_gradients, &gpu_l2_gradients, args.tolerance)?,
         compare_slices("l1_grad", &cpu_trace.l1_gradients, &gpu_l1_gradients, args.tolerance)?,
         compare_slices("l3w_grad", &cpu_trace.l3w_gradients, &gpu_l3w_gradients, args.tolerance)?,
@@ -4488,6 +4496,12 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         compare_slices("l0w_grad", &cpu_trace.l0w_gradients, &gpu_l0w_gradients, args.tolerance)?,
         compare_slices("l0b_grad", &cpu_trace.l0b_gradients, &gpu_l0b_gradients, args.tolerance)?,
     ];
+    if let (Some(cpu_l1fw), Some(cpu_l1fb)) = (&cpu_trace.l1fw_gradients, &cpu_trace.l1fb_gradients) {
+        let gpu_l1fw_gradients = backward_workspace.l1fw_gradients.to_host_vec(&stream)?;
+        let gpu_l1fb_gradients = backward_workspace.l1fb_gradients.to_host_vec(&stream)?;
+        comparisons.push(compare_slices("l1fw_grad", cpu_l1fw, &gpu_l1fw_gradients, args.tolerance)?);
+        comparisons.push(compare_slices("l1fb_grad", cpu_l1fb, &gpu_l1fb_gradients, args.tolerance)?);
+    }
 
     println!("bulletou-cuda-train SFNN dense backward smoke");
     println!("  ptx          : {}", ptx.display());
@@ -4518,8 +4532,8 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
     use bulletou_cuda_oxide_runtime::{
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-            SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
-            SfnnStackedL3BackwardLayout,
+            SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
+            SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
         },
         optimizer::SfnnRangerOptimizerStates,
         sfnn::{
@@ -4533,12 +4547,6 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         Some(path) => SfnnForwardCase::read_fixture(path)?,
         None => SfnnForwardCase::new(args.sfnn_case),
     };
-    if case.l1fw.is_some() || case.l1fb.is_some() {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "SFNN factorized L1 Ranger-step smoke is not wired yet; use --sfnn-forward-smoke for factorized cases"
-                .to_string(),
-        ));
-    }
     let cpu_forward_trace = case.cpu_forward_trace();
     let cpu_trace = case.cpu_output_backward_trace(&cpu_forward_trace);
     let params = grouped_ranger_step_params();
@@ -4638,6 +4646,20 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         &mut backward_workspace.l1w_gradients,
         &mut backward_workspace.l1b_gradients,
     )?;
+    if let Some(l1fw) = &device_weights.l1fw {
+        let l1f_layout = SfnnSharedL1BackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out());
+        sfnn_backward::launch_sfnn_shared_l1_backward(
+            &stream,
+            &module,
+            l1f_layout,
+            &forward_workspace.combined,
+            &backward_workspace.l1_gradients,
+            l1fw,
+            &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1fw_gradients,
+            &mut backward_workspace.l1fb_gradients,
+        )?;
+    }
 
     let pairwise_layout = SfnnPairwiseBackwardLayout::new(case.batch_size, shape.ft_size);
     sfnn_backward::launch_sfnn_pairwise_backward(
@@ -4717,6 +4739,45 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
     compare_group!(l0b, &case.l0b, &cpu_trace.l0b_gradients);
     compare_group!(l1w, &case.l1w, &cpu_trace.l1w_gradients);
     compare_group!(l1b, &case.l1b, &cpu_trace.l1b_gradients);
+    macro_rules! compare_optional_group {
+        ($name:literal, $weights:expr, $gradients:expr, $device_weights:expr, $state:expr) => {{
+            let expected = cpu_single_ranger_update_trace($weights, $gradients, params)?;
+            let gpu_weights = $device_weights.to_host_vec(&stream)?;
+            let gpu_momentum = $state.momentum.to_host_vec(&stream)?;
+            let gpu_velocity = $state.velocity.to_host_vec(&stream)?;
+            let gpu_slow_params = $state.slow_params.to_host_vec(&stream)?;
+            comparisons.push(compare_slices(concat!($name, "_weights"), &expected.weights, &gpu_weights, args.tolerance)?);
+            comparisons.push(compare_slices(
+                concat!($name, "_momentum"),
+                &expected.momentum,
+                &gpu_momentum,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(
+                concat!($name, "_velocity"),
+                &expected.velocity,
+                &gpu_velocity,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(concat!($name, "_slow"), &expected.slow_params, &gpu_slow_params, args.tolerance)?);
+        }};
+    }
+    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) = (
+        &case.l1fw,
+        &cpu_trace.l1fw_gradients,
+        &device_weights.l1fw,
+        &optimizer_states.l1fw,
+    ) {
+        compare_optional_group!("l1fw", weights, gradients, device_weights, state);
+    }
+    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) = (
+        &case.l1fb,
+        &cpu_trace.l1fb_gradients,
+        &device_weights.l1fb,
+        &optimizer_states.l1fb,
+    ) {
+        compare_optional_group!("l1fb", weights, gradients, device_weights, state);
+    }
     compare_group!(l2w, &case.l2w, &cpu_trace.l2w_gradients);
     compare_group!(l2b, &case.l2b, &cpu_trace.l2b_gradients);
     compare_group!(l3w, &case.l3w, &cpu_trace.l3w_gradients);
@@ -4925,10 +4986,10 @@ fn usage() -> &'static str {
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --ranger-lookahead-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --ranger-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
@@ -5767,6 +5828,8 @@ struct SfnnOutputBackwardTrace {
     combined_gradients: Vec<f32>,
     l1w_gradients: Vec<f32>,
     l1b_gradients: Vec<f32>,
+    l1fw_gradients: Option<Vec<f32>>,
+    l1fb_gradients: Option<Vec<f32>>,
     stm_l0_gradients: Vec<f32>,
     nstm_l0_gradients: Vec<f32>,
     stm_l0_pre_gradients: Vec<f32>,
@@ -6437,6 +6500,8 @@ impl SfnnTrainStateCase {
             l0b: group!(l0b),
             l1w: group!(l1w),
             l1b: group!(l1b),
+            l1fw: None,
+            l1fb: None,
             l2w: group!(l2w),
             l2b: group!(l2b),
             l3w: group!(l3w),
@@ -7122,7 +7187,7 @@ impl SfnnForwardCase {
             self.batch_size,
             self.shape.l1_hidden,
         );
-        let (combined_gradients, l1w_gradients, l1b_gradients) = sfnn_stacked_affine_backward_trace(
+        let (mut combined_gradients, l1w_gradients, l1b_gradients) = sfnn_stacked_affine_backward_trace(
             &forward.combined,
             &l1_gradients,
             &self.l1w,
@@ -7132,6 +7197,21 @@ impl SfnnForwardCase {
             self.shape.l1_out(),
             self.shape.num_stacks,
         );
+        let (l1fw_gradients, l1fb_gradients) = match (&self.l1fw, &self.l1fb) {
+            (Some(l1fw), Some(_l1fb)) => {
+                let (weight_gradients, bias_gradients) = sfnn_shared_l1_backward_trace(
+                    &forward.combined,
+                    &l1_gradients,
+                    l1fw,
+                    &mut combined_gradients,
+                    self.batch_size,
+                    self.shape.ft_size,
+                    self.shape.l1_out(),
+                );
+                (Some(weight_gradients), Some(bias_gradients))
+            }
+            _ => (None, None),
+        };
         let (stm_l0_gradients, nstm_l0_gradients) = sfnn_pairwise_backward_trace(
             &forward.stm_l0,
             &forward.nstm_l0,
@@ -7164,6 +7244,8 @@ impl SfnnForwardCase {
             combined_gradients,
             l1w_gradients,
             l1b_gradients,
+            l1fw_gradients,
+            l1fb_gradients,
             stm_l0_gradients,
             nstm_l0_gradients,
             stm_l0_pre_gradients,
@@ -7684,6 +7766,37 @@ fn sfnn_stacked_affine_backward_trace(
     }
 
     (input_gradients, weight_gradients, bias_gradients)
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_shared_l1_backward_trace(
+    inputs: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    input_gradients: &mut [f32],
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut weight_gradients = vec![0.0_f32; input_dim * output_dim];
+    let mut bias_gradients = vec![0.0_f32; output_dim];
+
+    for sample in 0..batch_size {
+        let sample_input_start = sample * input_dim;
+        let sample_output_start = sample * output_dim;
+        for out_col in 0..output_dim {
+            let grad = output_gradients[sample_output_start + out_col];
+            bias_gradients[out_col] += grad;
+            for in_col in 0..input_dim {
+                let input_value = inputs[sample_input_start + in_col];
+                let weight_idx = in_col * output_dim + out_col;
+                input_gradients[sample_input_start + in_col] += grad * weights[weight_idx];
+                weight_gradients[weight_idx] += grad * input_value;
+            }
+        }
+    }
+
+    (weight_gradients, bias_gradients)
 }
 
 #[cfg(feature = "cuda")]

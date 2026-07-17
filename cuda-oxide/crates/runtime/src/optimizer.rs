@@ -190,6 +190,8 @@ pub struct SfnnRangerOptimizerHostStates<'a> {
     pub l0b: RangerOptimizerHostState<'a>,
     pub l1w: RangerOptimizerHostState<'a>,
     pub l1b: RangerOptimizerHostState<'a>,
+    pub l1fw: Option<RangerOptimizerHostState<'a>>,
+    pub l1fb: Option<RangerOptimizerHostState<'a>>,
     pub l2w: RangerOptimizerHostState<'a>,
     pub l2b: RangerOptimizerHostState<'a>,
     pub l3w: RangerOptimizerHostState<'a>,
@@ -202,6 +204,12 @@ impl<'a> SfnnRangerOptimizerHostStates<'a> {
         self.l0b.validate(layout.l0b_state_layout())?;
         self.l1w.validate(layout.l1w_state_layout())?;
         self.l1b.validate(layout.l1b_state_layout())?;
+        if let Some(state) = self.l1fw {
+            state.validate(layout.l1fw_state_layout())?;
+        }
+        if let Some(state) = self.l1fb {
+            state.validate(layout.l1fb_state_layout())?;
+        }
         self.l2w.validate(layout.l2w_state_layout())?;
         self.l2b.validate(layout.l2b_state_layout())?;
         self.l3w.validate(layout.l3w_state_layout())?;
@@ -424,6 +432,14 @@ impl SfnnOptimizerStateLayout {
         OptimizerStateLayout::new(self.weights.l1b_len())
     }
 
+    pub fn l1fw_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1fw_len())
+    }
+
+    pub fn l1fb_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1fb_len())
+    }
+
     pub fn l2w_state_layout(self) -> OptimizerStateLayout {
         OptimizerStateLayout::new(self.weights.l2w_len())
     }
@@ -468,6 +484,8 @@ pub struct SfnnRangerOptimizerStates {
     pub l0b: RangerOptimizerState,
     pub l1w: RangerOptimizerState,
     pub l1b: RangerOptimizerState,
+    pub l1fw: Option<RangerOptimizerState>,
+    pub l1fb: Option<RangerOptimizerState>,
     pub l2w: RangerOptimizerState,
     pub l2b: RangerOptimizerState,
     pub l3w: RangerOptimizerState,
@@ -484,6 +502,8 @@ impl SfnnRangerOptimizerStates {
             l0b: RangerOptimizerState::new_zeroed(stream, layout.l0b_state_layout())?,
             l1w: RangerOptimizerState::new_zeroed(stream, layout.l1w_state_layout())?,
             l1b: RangerOptimizerState::new_zeroed(stream, layout.l1b_state_layout())?,
+            l1fw: None,
+            l1fb: None,
             l2w: RangerOptimizerState::new_zeroed(stream, layout.l2w_state_layout())?,
             l2b: RangerOptimizerState::new_zeroed(stream, layout.l2b_state_layout())?,
             l3w: RangerOptimizerState::new_zeroed(stream, layout.l3w_state_layout())?,
@@ -500,6 +520,22 @@ impl SfnnRangerOptimizerStates {
             l0b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l0b_state_layout(), weights.l0b)?,
             l1w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1w_state_layout(), weights.l1w)?,
             l1b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1b_state_layout(), weights.l1b)?,
+            l1fw: match weights.l1fw {
+                Some(values) => Some(RangerOptimizerState::zeroed_with_host_slow_params(
+                    stream,
+                    layout.l1fw_state_layout(),
+                    values,
+                )?),
+                None => None,
+            },
+            l1fb: match weights.l1fb {
+                Some(values) => Some(RangerOptimizerState::zeroed_with_host_slow_params(
+                    stream,
+                    layout.l1fb_state_layout(),
+                    values,
+                )?),
+                None => None,
+            },
             l2w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2w_state_layout(), weights.l2w)?,
             l2b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2b_state_layout(), weights.l2b)?,
             l3w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l3w_state_layout(), weights.l3w)?,
@@ -520,6 +556,14 @@ impl SfnnRangerOptimizerStates {
             l0b: RangerOptimizerState::from_host(stream, layout.l0b_state_layout(), states.l0b)?,
             l1w: RangerOptimizerState::from_host(stream, layout.l1w_state_layout(), states.l1w)?,
             l1b: RangerOptimizerState::from_host(stream, layout.l1b_state_layout(), states.l1b)?,
+            l1fw: match states.l1fw {
+                Some(state) => Some(RangerOptimizerState::from_host(stream, layout.l1fw_state_layout(), state)?),
+                None => None,
+            },
+            l1fb: match states.l1fb {
+                Some(state) => Some(RangerOptimizerState::from_host(stream, layout.l1fb_state_layout(), state)?),
+                None => None,
+            },
             l2w: RangerOptimizerState::from_host(stream, layout.l2w_state_layout(), states.l2w)?,
             l2b: RangerOptimizerState::from_host(stream, layout.l2b_state_layout(), states.l2b)?,
             l3w: RangerOptimizerState::from_host(stream, layout.l3w_state_layout(), states.l3w)?,
