@@ -48,7 +48,7 @@ Usage:
         --superbatches 20
 */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bullet_compiler::tensor::TValue;
 use bulletou_lib::{
@@ -165,8 +165,9 @@ enum EvalType {
 enum BackendKind {
     /// Existing generic Bullet backend. Supports every eval type.
     Bullet,
-    /// Future NNUE/SFNN-only cuda-oxide backend. The CLI is reserved so
-    /// experiments can grow without changing command shape later.
+    /// Experimental cuda-oxide fast path. Currently exposes the direct
+    /// NNUE HalfKP teacher loop; schedule / validation integration is
+    /// tracked separately in BO-CUDA-003/004.
     CudaOxide,
 }
 
@@ -1247,10 +1248,47 @@ struct Args {
     eval_type: Option<EvalType>,
 
     /// Training backend. `bullet` is the existing generic backend.
-    /// `cuda-oxide` is reserved for the NNUE/SFNN fast path and currently
-    /// fails fast instead of silently falling back.
+    /// `cuda-oxide` is an experimental direct NNUE HalfKP fast path and
+    /// requires `--cuda-oxide-train-steps`.
     #[arg(long, value_enum, default_value = "bullet")]
     backend: BackendKind,
+
+    /// Temporary cuda-oxide direct-trainer batch count. This is deliberately
+    /// separate from `--superbatches` until BO-CUDA-003 wires the production
+    /// schedule semantics into the cuda-oxide backend.
+    #[arg(long)]
+    cuda_oxide_train_steps: Option<usize>,
+
+    /// Nested cuda-oxide workspace directory used by `--backend cuda-oxide`.
+    /// The wrapper runs `cargo run -p bulletou-cuda-train ...` inside this
+    /// directory. Relative paths are resolved from the current BulletOu
+    /// process directory.
+    #[arg(long, default_value = "cuda-oxide")]
+    cuda_oxide_cargo_dir: PathBuf,
+
+    /// Use `cargo run --release` for the nested cuda-oxide trainer.
+    #[arg(long)]
+    cuda_oxide_release: bool,
+
+    /// CUDA kernel artifact passed through as cuda-oxide's `--ptx`. If
+    /// omitted, the nested trainer probes its normal cuda-oxide workspace
+    /// locations such as `cuda-oxide/bulletou_cuda_train.cubin`.
+    #[arg(long)]
+    cuda_oxide_ptx: Option<PathBuf>,
+
+    /// Optional initial root-format NNUE `state.bin` / weights stream for a
+    /// fresh cuda-oxide run. Do not use together with an already resumable
+    /// cuda-oxide output directory.
+    #[arg(long)]
+    cuda_oxide_weights_bin: Option<PathBuf>,
+
+    /// CUDA device index for the nested cuda-oxide trainer.
+    #[arg(long, default_value = "0")]
+    cuda_oxide_device: usize,
+
+    /// Pass cuda-oxide's debug readback flag through to the nested trainer.
+    #[arg(long)]
+    cuda_oxide_debug_readback: bool,
 
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
@@ -1691,22 +1729,97 @@ impl Args {
     fn validate_backend_flags(&self) -> Result<(), String> {
         match self.backend {
             BackendKind::Bullet => Ok(()),
-            BackendKind::CudaOxide => {
-                let eval_type = self.eval_type();
-                if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
-                    return Err(format!(
-                        "--backend {} is for NNUE/SFNN eval types; {} remains on --backend bullet",
-                        self.backend.cli_name(),
-                        eval_type.cli_name(),
-                    ));
-                }
-                Err(
-                    "--backend cuda-oxide is reserved for the upcoming NNUE/SFNN fast path; \
-                     the runtime and fused kernels are not wired yet"
+            BackendKind::CudaOxide => self.validate_cuda_oxide_backend_options(),
+        }
+    }
+
+    fn validate_cuda_oxide_backend_options(&self) -> Result<(), String> {
+        let eval_type = self.eval_type();
+        if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
+            return Err(format!(
+                "--backend {} is for NNUE/SFNN eval types; {} remains on --backend bullet",
+                self.backend.cli_name(),
+                eval_type.cli_name(),
+            ));
+        }
+        if eval_type != EvalType::NnueHalfkp {
+            return Err(format!(
+                "--backend cuda-oxide currently supports only --eval-type NNUE_HALFKP; {} is tracked by later tickets",
+                eval_type.cli_name()
+            ));
+        }
+
+        let supported_arch = NnueArch::default_for_eval_type(EvalType::NnueHalfkp);
+        if self.arch() != supported_arch {
+            return Err(format!(
+                "--backend cuda-oxide currently supports only --arch {}; got {}",
+                supported_arch.cli_name(),
+                self.arch().cli_name()
+            ));
+        }
+
+        match self.cuda_oxide_train_steps {
+            Some(n) if n > 0 => {}
+            _ => {
+                return Err(
+                    "--backend cuda-oxide currently requires --cuda-oxide-train-steps N \
+                     (direct batch count; --superbatches integration is BO-CUDA-003)"
                         .to_string(),
-                )
+                );
             }
         }
+        if effective_batch_size(self) == 0 {
+            return Err("--batch-size must be > 0 for --backend cuda-oxide".to_string());
+        }
+
+        if self.superbatches.is_some() {
+            return Err(
+                "--backend cuda-oxide does not yet honor --superbatches; use --cuda-oxide-train-steps for BO-CUDA-002"
+                    .to_string(),
+            );
+        }
+        if self.positions_per_superbatch != DEFAULT_POSITIONS_PER_SUPERBATCH {
+            return Err(
+                "--backend cuda-oxide does not yet honor --positions-per-superbatch; this is BO-CUDA-003 work"
+                    .to_string(),
+            );
+        }
+        if self.max_epochs.is_some() {
+            return Err("--backend cuda-oxide does not yet honor --max-epochs; this is BO-CUDA-003 work".to_string());
+        }
+        if self.lr_schedule != LrScheduleKind::Step || self.lr_step_gamma.is_some() || self.lr_step_positions.is_some() {
+            return Err("--backend cuda-oxide LR schedule integration is BO-CUDA-003; omit LR schedule flags for now".to_string());
+        }
+        if self.lr != 0.000875 || self.lr_min != 0.00001 {
+            return Err("--backend cuda-oxide does not yet honor --lr / --lr-min; this is BO-CUDA-003 work".to_string());
+        }
+        if self.optimizer != OptimizerKind::Ranger
+            || self.optimizer_weight_decay != 0.0
+            || self.optimizer_epsilon.is_some()
+            || self.optimizer_beta1.is_some()
+            || self.optimizer_beta2.is_some()
+        {
+            return Err(
+                "--backend cuda-oxide currently uses its fixed Ranger step parameters; optimizer overrides are BO-CUDA-003 work"
+                    .to_string(),
+            );
+        }
+        if self.lambda != 1.0 || self.scale != 400 {
+            return Err("--backend cuda-oxide currently supports only --lambda 1.0 --scale 400".to_string());
+        }
+        if self.test_teacher.is_some() || self.dump_activation_stats {
+            return Err(
+                "--backend cuda-oxide validation / activation metrics are not wired yet; this is BO-CUDA-004 work"
+                    .to_string(),
+            );
+        }
+        if self.no_resume {
+            return Err(
+                "--backend cuda-oxide does not yet implement BulletOu --no-resume semantics; use a fresh --output directory"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Unwrap `eval_type`. clap's `required_unless_present = "count_teacher"`
@@ -2510,6 +2623,22 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    if args.backend == BackendKind::CudaOxide {
+        if args.batch_size.is_none() {
+            eprintln!("  batch size = {} (auto for {})", effective_batch_size(&args), args.eval_type().cli_name());
+        }
+        if args.nnue_pytorch_wrm_loss {
+            eprintln!("  nnue-pytorch WRM loss = enabled");
+        }
+        if let Err(e) = record_invocation_to_tag_txt(&args) {
+            eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
+        }
+        if let Err(e) = run_cuda_oxide_backend(&args) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.batch_size.is_none() {
         eprintln!("  batch size = {} (auto for {})", effective_batch_size(&args), args.eval_type().cli_name());
     }
@@ -2583,6 +2712,113 @@ fn main() {
         EvalType::SfnnHalfka2 => run_sfnn_1536(&args, ShogiHalfKa2, NnueFeatureSet::HalfKa2),
         EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
     }
+}
+
+fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
+    args.validate_cuda_oxide_backend_options()?;
+
+    let cargo_dir = absolutize_path_for_child(&args.cuda_oxide_cargo_dir)?;
+    if !cargo_dir.is_dir() {
+        return Err(format!("--cuda-oxide-cargo-dir is not a directory: {}", cargo_dir.display()));
+    }
+    let cargo_args = cuda_oxide_cargo_run_args(args)?;
+
+    eprintln!("  backend = cuda-oxide direct NNUE HalfKP trainer");
+    eprintln!("  cuda-oxide cargo dir = {}", cargo_dir.display());
+    eprintln!(
+        "  cuda-oxide note = production schedule/validation integration is pending \
+         (BO-CUDA-003/004); this path uses the nested trainer's fixed Ranger step parameters"
+    );
+
+    let status = std::process::Command::new("cargo")
+        .current_dir(&cargo_dir)
+        .args(&cargo_args)
+        .status()
+        .map_err(|e| format!("failed to launch cuda-oxide trainer via cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("cuda-oxide trainer exited with {status}"));
+    }
+    Ok(())
+}
+
+fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
+    let mut cargo_args = vec!["run".to_string()];
+    if args.cuda_oxide_release {
+        cargo_args.push("--release".to_string());
+    }
+    cargo_args.extend(
+        [
+            "-p",
+            "bulletou-cuda-train",
+            "--features",
+            "cuda,root-loader",
+            "--",
+            "--nnue-teacher-train",
+            "--teacher",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    cargo_args.push(absolutize_teacher_spec_for_child(&args.teacher)?);
+
+    cargo_args.push("--output".to_string());
+    cargo_args.push(absolutize_path_for_child(&args.output_dir())?.display().to_string());
+
+    cargo_args.push("--train-steps".to_string());
+    cargo_args.push(args.cuda_oxide_train_steps.expect("validated cuda-oxide train steps").to_string());
+
+    cargo_args.push("--batch-size".to_string());
+    cargo_args.push(effective_batch_size(args).to_string());
+
+    cargo_args.push("--buffer-mb".to_string());
+    cargo_args.push(args.buffer_mb.to_string());
+
+    cargo_args.push("--loader-threads".to_string());
+    cargo_args.push(args.loader_threads.to_string());
+
+    cargo_args.push("--threads".to_string());
+    cargo_args.push(args.threads.to_string());
+
+    cargo_args.push("--score-drop-abs".to_string());
+    cargo_args.push(args.score_drop_abs.to_string());
+
+    cargo_args.push("--save-rate".to_string());
+    cargo_args.push(args.save_rate.to_string());
+
+    cargo_args.push("--device".to_string());
+    cargo_args.push(args.cuda_oxide_device.to_string());
+
+    cargo_args.push("--loss-kind".to_string());
+    cargo_args.push(if args.nnue_pytorch_wrm_loss { "wrm" } else { "sigmoid-mse" }.to_string());
+
+    if let Some(ptx) = &args.cuda_oxide_ptx {
+        cargo_args.push("--ptx".to_string());
+        cargo_args.push(absolutize_path_for_child(ptx)?.display().to_string());
+    }
+    if let Some(weights_bin) = &args.cuda_oxide_weights_bin {
+        cargo_args.push("--weights-bin".to_string());
+        cargo_args.push(absolutize_path_for_child(weights_bin)?.display().to_string());
+    }
+    if args.cuda_oxide_debug_readback {
+        cargo_args.push("--debug-readback".to_string());
+    }
+
+    Ok(cargo_args)
+}
+
+fn absolutize_teacher_spec_for_child(spec: &str) -> Result<String, String> {
+    spec.split(',')
+        .map(|part| absolutize_path_for_child(Path::new(part)).map(|p| p.display().to_string()))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join(","))
+}
+
+fn absolutize_path_for_child(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("failed to resolve current directory: {e}"))?;
+    Ok(cwd.join(path))
 }
 
 /// Record this process's argv into `<output>/tag.txt` so that, weeks
@@ -6634,7 +6870,47 @@ mod tests {
     }
 
     #[test]
-    fn cuda_oxide_backend_is_reserved_and_fails_fast() {
+    fn cuda_oxide_backend_accepts_explicit_halfkp_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_ok());
+    }
+
+    #[test]
+    fn cuda_oxide_backend_requires_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("--cuda-oxide-train-steps"));
+        assert!(err.contains("BO-CUDA-003"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_unwired_sfnn() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -6645,12 +6921,14 @@ mod tests {
             "/dev/null",
             "--backend",
             "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
         ])
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains("reserved"));
-        assert!(err.contains("not wired yet"));
+        assert!(err.contains("NNUE_HALFKP"));
+        assert!(err.contains("SFNN_HALFKA2"));
     }
 
     #[test]
@@ -6665,12 +6943,38 @@ mod tests {
             "/dev/null",
             "--backend",
             "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
         ])
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
         assert!(err.contains("NNUE/SFNN"));
         assert!(err.contains("KPPT"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_production_schedule_flags_for_now() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
+            "--superbatches",
+            "2",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("--superbatches"));
+        assert!(err.contains("BO-CUDA-002"));
     }
 
     #[test]
