@@ -16,6 +16,7 @@ commit each completed slice.
 | BO-CUDA-008 | done | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 | BO-CUDA-009 | done | expose SFNN cuda-oxide through BulletOu CLI | `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` launches the SFNN cuda-oxide child trainer and writes the normal output layout |
 | BO-CUDA-010 | done | SFNN validation metrics | `--sfnn-teacher-train --test-teacher` and the BulletOu SFNN cuda-oxide wrapper write `test_value_accuracy` / `test_value_loss` into the normal logs |
+| BO-CUDA-011 | done | SFNN production schedule / periodic checkpoints | SFNN cuda-oxide child honors `--save-rate` and the BulletOu wrapper accepts bounded `--superbatches` / `--max-epochs` direct production schedule |
 
 ## Notes
 
@@ -121,8 +122,8 @@ commit each completed slice.
 ### BO-CUDA-009
 
 - Extended `examples/bulletou --backend cuda-oxide` to accept `--eval-type SFNN_HALFKA2` with the fixed cuda-oxide-supported architecture `--arch SFNN_halfka2_1024_7_64_k3k3`.
-- The BulletOu wrapper now dispatches SFNN runs to the nested `bulletou-cuda-train --sfnn-teacher-train` child and forces `--save-rate 0` for the current final-checkpoint-only SFNN child path.
-- Other SFNN families, the default `SFNN_halfka2_1536_15_32_k3k3` architecture, and production/plateau scheduling remain fail-fast until the corresponding SFNN child features are implemented.
+- The BulletOu wrapper dispatches SFNN runs to the nested `bulletou-cuda-train --sfnn-teacher-train` child.
+- Other SFNN families, the default `SFNN_halfka2_1536_15_32_k3k3` architecture, and plateau scheduling remain fail-fast until the corresponding SFNN child features are implemented.
 - Validation:
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check --example bulletou`.
@@ -140,3 +141,16 @@ commit each completed slice.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - `cargo check --example bulletou`.
   - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --test-teacher shuffled-001.hcpe --test-positions 8 --test-batch-size 4 --train-steps 1 --batch-size 1` wrote `test_value_accuracy=0.375000`, `test_value_loss=0.111235`, and `train_value_loss=0.258013457` to both `0001/learn.log` and top-level `summary-learn.log`.
+
+### BO-CUDA-011
+
+- Removed the SFNN child trainer's final-checkpoint-only restriction. `--sfnn-teacher-train` now uses the same `--save-rate * --batches-per-superbatch` interval rule as the NNUE bridge path.
+- Periodic SFNN checkpoint writes include `nn.bin`, root `state.bin`, `teacher.txt`, `dataloader_pos.txt`, checkpoint-local `learn.log`, and top-level `summary-learn.log`; validation metrics are computed per saved checkpoint when `--test-teacher` is present.
+- The BulletOu wrapper now forwards SFNN `--save-rate` unchanged and accepts bounded non-plateau production schedule mode (`--superbatches N --max-epochs N`). SFNN plateau scheduling remains fail-fast.
+- Validation:
+  - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
+  - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - `cargo check --example bulletou`.
+  - WSL CUDA periodic smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 2 --batches-per-superbatch 1 --batch-size 1 --save-rate 1 --test-positions 4` wrote both `0001` and `0002`, with `dataloader_pos.txt = 38,0` then `76,0`; `summary-learn.log` had two SFNN rows with train losses `0.258013457` and `0.241245091`.
+  - WSL CUDA wrapper smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --superbatches 1 --max-epochs 1 --positions-per-superbatch 1 --batch-size 1 --save-rate 1` launched the nested child in production schedule mode with `--superbatches-per-epoch 1` and wrote checkpoint `0001`.

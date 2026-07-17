@@ -1830,10 +1830,10 @@ impl Args {
             }
         }
         if eval_type == EvalType::SfnnHalfka2 {
-            if production_schedule {
+            if self.lr_schedule == LrScheduleKind::Plateau {
                 return Err(
-                    "--backend cuda-oxide SFNN_HALFKA2 currently supports only --cuda-oxide-train-steps direct mode; \
-                     production schedule mode remains NNUE_HALFKP-only"
+                    "--backend cuda-oxide SFNN_HALFKA2 does not yet support --lr-schedule plateau; \
+                     use fixed/step/geometric/cos production schedule for now"
                         .to_string(),
                 );
             }
@@ -2868,7 +2868,7 @@ fn cuda_oxide_default_child_run(args: &Args) -> Result<CudaOxideChildRun, String
     Ok(CudaOxideChildRun {
         train_steps,
         batches_per_superbatch,
-        save_rate: if args.eval_type() == EvalType::SfnnHalfka2 { 0 } else { args.save_rate },
+        save_rate: args.save_rate,
         superbatches_per_epoch: production_schedule.then(|| args.superbatches.expect("validated production schedule")),
         lr,
         include_weights_bin: true,
@@ -7369,7 +7369,7 @@ mod tests {
         assert!(cargo_args.iter().any(|arg| arg == "--sfnn-teacher-train"));
         assert!(cargo_args.iter().any(|arg| arg == "--test-teacher"));
         let save_rate_idx = cargo_args.iter().position(|arg| arg == "--save-rate").unwrap();
-        assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("0"));
+        assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("1"));
     }
 
     #[test]
@@ -7414,6 +7414,73 @@ mod tests {
         let err = args.validate_backend_flags().unwrap_err();
         assert!(err.contains("NNUE_HALFKP or SFNN_HALFKA2"));
         assert!(err.contains("SFNN_HALFKA2HM"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_accepts_sfnn_halfka2_production_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--positions-per-superbatch",
+            "2",
+            "--batch-size",
+            "1",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_ok());
+        let child_run = cuda_oxide_default_child_run(&args).unwrap();
+        assert_eq!(child_run.train_steps, 4);
+        assert_eq!(child_run.batches_per_superbatch, 2);
+        assert_eq!(child_run.superbatches_per_epoch, Some(2));
+        assert_eq!(child_run.save_rate, 1);
+        let cargo_args = cuda_oxide_cargo_run_args_with_child(&args, &child_run).unwrap();
+        assert!(cargo_args.iter().any(|arg| arg == "--sfnn-teacher-train"));
+        let save_rate_idx = cargo_args.iter().position(|arg| arg == "--save-rate").unwrap();
+        assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_sfnn_halfka2_plateau_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("SFNN_HALFKA2"));
+        assert!(err.contains("plateau"));
     }
 
     #[test]

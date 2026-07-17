@@ -1643,11 +1643,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         ));
     }
     validate_nnue_teacher_schedule_args(&args)?;
-    if args.save_rate != 0 {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--sfnn-teacher-train currently supports only final checkpoints; use --save-rate 0".to_string(),
-        ));
-    }
+    let save_interval_steps = nnue_teacher_save_interval_steps(&args)?;
     if args.nnue_train_state_fixture.is_some() || args.nnue_train_state_bin.is_some() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
             "--sfnn-teacher-train does not yet support train-state resume".to_string(),
@@ -1698,6 +1694,11 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut learning_rates = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
     let mut dataloader_positions = Vec::with_capacity(args.train_steps);
+    let mut checkpoint_losses = Vec::new();
+    let mut checkpoint_learning_rates = Vec::new();
+    let mut checkpoint_sources = Vec::new();
+    let mut checkpoint_dataloader_positions = Vec::new();
+    let mut bridge_checkpoints = Vec::new();
     let mut last_batch_size = 0usize;
     let mut last_max_active = 0usize;
     let mut train_timer: Option<std::time::Instant> = None;
@@ -1775,9 +1776,40 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             learning_rates.push(learning_rate);
             sources.push(source);
             dataloader_positions.push(dataloader_pos);
+            checkpoint_losses.push((step, loss.weighted_sum[0], loss.mean[0]));
+            checkpoint_learning_rates.push(learning_rate);
+            checkpoint_sources.push(sources.last().expect("just pushed SFNN source").clone());
+            checkpoint_dataloader_positions.push(dataloader_pos);
             last_batch_size = batch.layout.batch_size;
             last_max_active = batch.layout.max_active;
             run_steps += 1;
+
+            if let (Some(output_dir), Some(interval)) = (&args.output, save_interval_steps) {
+                if run_steps % interval == 0 {
+                    let state = runner_ref.read_state(&stream)?;
+                    let test_metrics = match &test_cache {
+                        Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
+                        None => None,
+                    };
+                    bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
+                        output_dir,
+                        shape,
+                        run_steps,
+                        &state,
+                        teacher,
+                        &checkpoint_losses,
+                        &checkpoint_learning_rates,
+                        &checkpoint_sources,
+                        &checkpoint_dataloader_positions,
+                        test_metrics,
+                        log_context,
+                    )?);
+                    checkpoint_losses.clear();
+                    checkpoint_learning_rates.clear();
+                    checkpoint_sources.clear();
+                    checkpoint_dataloader_positions.clear();
+                }
+            }
             Ok(())
         },
     )
@@ -1789,26 +1821,43 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
     let train_elapsed = train_timer.map(|started| started.elapsed());
     let runner = runner.as_ref().expect("validated non-empty teacher train steps");
-    let mut bridge_checkpoints = Vec::new();
     if let Some(output_dir) = &args.output {
-        let state = runner.read_state(&stream)?;
-        let test_metrics = match &test_cache {
-            Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
-            None => None,
-        };
-        bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
-            output_dir,
-            shape,
-            run_steps,
-            &state,
-            teacher,
-            &losses,
-            &learning_rates,
-            &sources,
-            &dataloader_positions,
-            test_metrics,
-            log_context,
-        )?);
+        let should_write_final_bridge_checkpoint =
+            save_interval_steps.is_none() || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
+        if should_write_final_bridge_checkpoint {
+            let checkpoint_loss_entries =
+                if save_interval_steps.is_none() { losses.as_slice() } else { checkpoint_losses.as_slice() };
+            let checkpoint_lr_entries = if save_interval_steps.is_none() {
+                learning_rates.as_slice()
+            } else {
+                checkpoint_learning_rates.as_slice()
+            };
+            let checkpoint_source_entries =
+                if save_interval_steps.is_none() { sources.as_slice() } else { checkpoint_sources.as_slice() };
+            let checkpoint_dataloader_pos_entries = if save_interval_steps.is_none() {
+                dataloader_positions.as_slice()
+            } else {
+                checkpoint_dataloader_positions.as_slice()
+            };
+            let state = runner.read_state(&stream)?;
+            let test_metrics = match &test_cache {
+                Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
+                None => None,
+            };
+            bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
+                output_dir,
+                shape,
+                run_steps,
+                &state,
+                teacher,
+                checkpoint_loss_entries,
+                checkpoint_lr_entries,
+                checkpoint_source_entries,
+                checkpoint_dataloader_pos_entries,
+                test_metrics,
+                log_context,
+            )?);
+        }
     }
 
     println!("bulletou-cuda-train SFNN teacher train");
@@ -4696,7 +4745,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
