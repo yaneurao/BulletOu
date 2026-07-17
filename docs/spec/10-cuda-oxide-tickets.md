@@ -29,6 +29,7 @@ commit each completed slice.
 | BO-CUDA-021 | done | NNUE teacher prepare/GPU pipeline | `--profile-train-step` now exposes CPU batch materialisation time, standard NNUE teacher training overlaps CPU prepare with GPU work via a bounded producer queue, and the tatara parity harness can run realistic multi-threaded prepare |
 | BO-CUDA-022 | done | remaining tatara accuracy parity | validation now reports prediction-sign distribution; the one-superbatch accuracy complement was a short-run all-one-sign prediction artifact, and a 4-superbatch same-PSV run matches tatara accuracy with close WRM loss |
 | BO-CUDA-023 | done | YaneuraOu quantized eval cross-check | YaneuraOu `test eval_accuracy` on the cuda-oxide checkpoint `nn.bin` matches BulletOu's f32 checkpoint-time validation on the same held-out PSV |
+| BO-CUDA-024 | done | retire stale legacy cuda-oxide TODO rows | synced the older `09-cuda-oxide-todo.md` CO-008..CO-013 summary rows with the completed BO-CUDA implementation slices |
 
 ## Notes
 
@@ -374,3 +375,14 @@ commit each completed slice.
   - YaneuraOu quantized `nn.bin`: `accuracy=50.6470% (4149/8192)`, `drawn=0`, `skipped=0`.
   - BulletOu f32 checkpoint-time validation for the same checkpoint/test set: `accuracy=50.6470% (4149/8192; pred>=0 0 pred<0 8192 zero 0)`.
   - No quantization-induced sign flip was observed on this smoke set.
+
+### BO-CUDA-024
+
+- `docs/spec/09-cuda-oxide-todo.md` was the original low-level cuda-oxide bring-up tracker. After BO-CUDA-001..023, its top summary table still showed CO-008..CO-013 as `todo` even though the corresponding implementation work had landed.
+- Updated those legacy rows to `done` and pointed each row at the BO-CUDA slice that completed it:
+  - CO-008 loss kernel -> BO-CUDA-020/022;
+  - CO-009 backward kernels -> BO-CUDA-019/015/016;
+  - CO-010 optimizer kernel/state -> BO-CUDA-012/015/016;
+  - CO-011 async rings/pipeline -> BO-CUDA-006/021;
+  - CO-012 checkpoint compatibility -> BO-CUDA-004/012/023;
+  - CO-013 speed benchmark -> BO-CUDA-018/020/021/022.

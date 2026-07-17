@@ -17,12 +17,12 @@ status を更新する。
 | CO-005 | done | CPU reference test harness | fast backend kernel と既存 Bullet backend の 1 batch 出力比較を作る |
 | CO-006 | done | minimal NNUE forward | `NNUE_HALFKP_256x2_32_32` の 1 batch forward を cuda-oxide で一致させる。CPU golden と所有重みレイアウトは追加済み |
 | CO-007 | done | SFNN forward | `SFNN_halfka2_1024_7_64_k3k3` の forward を cuda-oxide で一致させる |
-| CO-008 | todo | loss kernel | target transform / sigmoid / loss reduction を fused kernel 化する |
-| CO-009 | todo | backward kernel | dense backward と sparse FT backward を実装する |
-| CO-010 | todo | optimizer kernel | Ranger / RAdam update を fused kernel 化する |
-| CO-011 | todo | async rings | input upload ring と loss readback ring を入れる |
-| CO-012 | todo | checkpoint compatibility | `nn.bin` / log / checkpoint layout を既存と揃え、state backend marker を入れる |
-| CO-013 | todo | speed benchmark | 同一 teacher / seed / schedule で existing Bullet backend と positions/sec を比較する |
+| CO-008 | done | loss kernel | target transform / sigmoid / WRM loss reduction は cuda-oxide NNUE/SFNN train path に統合済み (BO-CUDA-020/022) |
+| CO-009 | done | backward kernel | NNUE dense/L0 backward と SFNN backward/factorized L1 backward は train path に統合済み (BO-CUDA-019, BO-CUDA-015/016) |
+| CO-010 | done | optimizer kernel | Ranger/RAdam update と optimizer state checkpoint/resume は NNUE/SFNN train path に統合済み (BO-CUDA-012/015/016) |
+| CO-011 | done | async rings | input upload / loss readback / teacher prepare pipeline は NNUE teacher training に統合済み (BO-CUDA-006/021) |
+| CO-012 | done | checkpoint compatibility | `nn.bin` / `state.bin` / learn.log / validation metrics / YaneuraOu eval_accuracy cross-check 済み (BO-CUDA-004/012/023) |
+| CO-013 | done | speed benchmark | same-PSV tatara parity harness と release-host speed measurements を記録済み (BO-CUDA-018/020/021/022) |
 
 ## 作業原則
 
