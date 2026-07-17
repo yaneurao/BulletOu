@@ -919,11 +919,21 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `scripts/cuda_oxide_nnue_teacher_smoke.ps1`; passing it implies
   `-RunFixtureTrain` and forwards `--write-nnue-train-state-fixture`.
 - Added runtime-side `NnueRangerOptimizerHostStates` validation and
-  `NnueRangerOptimizerStates::from_host_states()`, so a future restore path can
+  `NnueRangerOptimizerStates::from_host_states()`, so the restore path can
   upload saved momentum/velocity/slow buffers back to CUDA. Validation:
   `cargo test -p bulletou-cuda-oxide-runtime optimizer`,
   Windows `cargo check -p bulletou-cuda-train`, and WSL2
   `cargo check -p bulletou-cuda-train --features cuda` passed.
+- Added `--nnue-train-state-fixture <PATH>` restore support to
+  `--nnue-fixture-train`. It reads `BOUNRNG1`, uploads saved weights plus
+  Ranger momentum/velocity/slow buffers, then applies the supplied later
+  `BOUNTRN1`/`BOUNBCH1` fixtures starting at `completed_steps + 1`.
+- Validation: wrote a one-step `BOUNRNG1`, resumed with the second real-teacher
+  batch fixture, and wrote `nnue-halfkp-resume-final.nnuef`; its SHA-256 matched
+  the one-shot two-step `nnue-halfkp-oneshot-final.nnuef` exactly
+  (`4e0068f5e1bf98855a37f089c1885101e30096eba308596a0289db2d9ad794f3`).
+  Loading the resumed final fixture with
+  `--nnue-forward-smoke --debug-readback` also passed (`compare: ok`).
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

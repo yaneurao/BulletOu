@@ -94,6 +94,12 @@ WSL2. Add `-LossKind sigmoid-mse` or `-LossKind wrm` to select the loss smoke,
 batch-only `BOUNBCH1` fixtures and run multiple optimizer steps, and
 `-SkipCudaBuild` to reuse an existing `cargo oxide build` artifact.
 
+The fixture-backed trainer loop is available as `--nnue-fixture-train`. It can
+write a trained forward fixture with `--write-nnue-trained-forward-fixture` and
+a cuda-oxide Ranger checkpoint fixture with `--write-nnue-train-state-fixture`.
+The latter is restored with `--nnue-train-state-fixture`, after which supplied
+later batch fixtures are applied from `completed_steps + 1`.
+
 WSL2 Ubuntu 24.04 validation example:
 
 ```bash

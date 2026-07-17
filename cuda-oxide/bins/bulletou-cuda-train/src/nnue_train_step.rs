@@ -17,9 +17,9 @@ use bulletou_cuda_oxide_runtime::{
     loss::{ScalarLossLayout, ScalarLossWorkspace},
     nnue::{
         NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostWeights, NnueForwardShape,
-        NnueForwardWorkspace, NnueForwardWorkspaceLayout,
+        NnueForwardWeightLayout, NnueForwardWorkspace, NnueForwardWorkspaceLayout,
     },
-    optimizer::{NnueRangerOptimizerStates, RangerUpdateParams},
+    optimizer::{NnueRangerOptimizerHostStates, NnueRangerOptimizerStates, RangerUpdateParams},
     CudaModule, CudaStream, DeviceBuffer, Error, Result,
 };
 
@@ -106,9 +106,43 @@ impl NnueLossRangerStepRunner {
         }
 
         let shape = initial_weights.shape;
-        let sparse_len = batch_size.saturating_mul(max_active);
         let device_weights = NnueForwardDeviceWeights::from_host(stream, initial_weights)?;
         let optimizer_states = NnueRangerOptimizerStates::from_host_weights(stream, initial_weights)?;
+
+        Self::from_device_parts(stream, shape, batch_size, max_active, device_weights, optimizer_states)
+    }
+
+    pub(crate) fn with_optimizer_state(
+        stream: &Arc<CudaStream>,
+        initial_weights: &NnueForwardHostWeights<'_>,
+        optimizer_state: NnueRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        if batch_size == 0 {
+            return Err(Error::Smoke("NNUE train-step runner requires batch_size > 0".to_string()));
+        }
+        if max_active == 0 {
+            return Err(Error::Smoke("NNUE train-step runner requires max_active > 0".to_string()));
+        }
+
+        let shape = initial_weights.shape;
+        let device_weights = NnueForwardDeviceWeights::from_host(stream, initial_weights)?;
+        let optimizer_states =
+            NnueRangerOptimizerStates::from_host_states(stream, NnueForwardWeightLayout::new(shape), optimizer_state)?;
+
+        Self::from_device_parts(stream, shape, batch_size, max_active, device_weights, optimizer_states)
+    }
+
+    fn from_device_parts(
+        stream: &Arc<CudaStream>,
+        shape: NnueForwardShape,
+        batch_size: usize,
+        max_active: usize,
+        device_weights: NnueForwardDeviceWeights,
+        optimizer_states: NnueRangerOptimizerStates,
+    ) -> Result<Self> {
+        let sparse_len = batch_size.saturating_mul(max_active);
         let device_batch = NnueForwardDeviceBatch {
             batch_size,
             max_active,

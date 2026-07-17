@@ -81,6 +81,7 @@ struct Args {
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
     nnue_forward_fixture: Option<std::path::PathBuf>,
+    nnue_train_state_fixture: Option<std::path::PathBuf>,
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
     write_nnue_trained_forward_fixture: Option<std::path::PathBuf>,
@@ -154,6 +155,7 @@ impl Args {
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
             nnue_forward_fixture: None,
+            nnue_train_state_fixture: None,
             nnue_train_fixture_args: Vec::new(),
             write_nnue_forward_fixture: None,
             write_nnue_trained_forward_fixture: None,
@@ -202,6 +204,9 @@ impl Args {
                 }
                 "--nnue-forward-fixture" => {
                     parsed.nnue_forward_fixture = Some(required_path_arg(&mut args, "--nnue-forward-fixture")?);
+                }
+                "--nnue-train-state-fixture" => {
+                    parsed.nnue_train_state_fixture = Some(required_path_arg(&mut args, "--nnue-train-state-fixture")?);
                 }
                 "--nnue-train-fixture" => {
                     parsed
@@ -595,8 +600,8 @@ fn run_nnue_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
     let cpu_forward_trace = case.cpu_forward_trace();
     let cpu_trace = case.cpu_dense_backward_trace(&cpu_forward_trace);
     let params = grouped_ranger_step_params();
-    let ptx = match args.ptx {
-        Some(ptx) => ptx,
+    let ptx = match args.ptx.as_ref() {
+        Some(ptx) => ptx.clone(),
         None => default_nnue_ptx()?,
     };
 
@@ -813,33 +818,74 @@ fn load_nnue_train_fixture_sequence(
 }
 
 #[cfg(feature = "cuda")]
+fn load_nnue_train_batches_from_args(
+    args: &Args,
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    mode_name: &'static str,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<NnueTrainBatchCase>> {
+    if args.nnue_train_fixture_args.is_empty() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "{mode_name} with --nnue-train-state-fixture requires at least one --nnue-train-fixture or --nnue-train-batch-fixture"
+        )));
+    }
+
+    let mut train_batches = Vec::with_capacity(args.nnue_train_fixture_args.len());
+    for input in &args.nnue_train_fixture_args {
+        match input {
+            NnueTrainFixtureArg::Full(path) => {
+                train_batches.push(NnueTrainBatchCase::from_train_case(&NnueTrainCase::read_fixture(path)?));
+            }
+            NnueTrainFixtureArg::Batch(path) => {
+                train_batches.push(NnueTrainBatchCase::read_fixture(path)?);
+            }
+        }
+    }
+    ensure_compatible_nnue_train_batches(shape, &train_batches)?;
+    Ok(train_batches)
+}
+
+#[cfg(feature = "cuda")]
 fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights;
     use nnue_train_step::{NnueLossRangerStepRunner, NnueTrainLossKind, NnueTrainStepHostBatch};
 
-    let (first_train_case, train_batches) = load_nnue_train_fixture_sequence(&args, "--nnue-fixture-train")?;
-    let first_case = &first_train_case.forward;
-    let ptx = match args.ptx {
-        Some(ptx) => ptx,
+    let ptx = match args.ptx.as_ref() {
+        Some(ptx) => ptx.clone(),
         None => default_nnue_ptx()?,
     };
 
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
     let stream = ctx.default_stream();
     let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
-    let host_weights = NnueForwardHostWeights {
-        shape: first_case.shape,
-        l0w: &first_case.l0w,
-        l0b: &first_case.l0b,
-        l1w: &first_case.l1w,
-        l1b: &first_case.l1b,
-        l2w: &first_case.l2w,
-        l2b: &first_case.l2b,
-        outw: &first_case.outw,
-        outb: &first_case.outb,
+    let (shape, completed_step_offset, train_batches, mut runner) = if let Some(path) = &args.nnue_train_state_fixture {
+        let state_case = NnueTrainStateCase::read_fixture(path)?;
+        let train_batches = load_nnue_train_batches_from_args(&args, state_case.shape, "--nnue-fixture-train")?;
+        let first_batch = train_batches.first().expect("validated non-empty train batch sequence");
+        let runner = NnueLossRangerStepRunner::with_optimizer_state(
+            &stream,
+            &state_case.host_weights(),
+            state_case.host_optimizer_states(),
+            first_batch.batch_size,
+            first_batch.max_active,
+        )?;
+        (state_case.shape, state_case.completed_steps, train_batches, runner)
+    } else {
+        let (first_train_case, train_batches) = load_nnue_train_fixture_sequence(&args, "--nnue-fixture-train")?;
+        let first_case = &first_train_case.forward;
+        let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
+            shape: first_case.shape,
+            l0w: &first_case.l0w,
+            l0b: &first_case.l0b,
+            l1w: &first_case.l1w,
+            l1b: &first_case.l1b,
+            l2w: &first_case.l2w,
+            l2b: &first_case.l2b,
+            outw: &first_case.outw,
+            outb: &first_case.outb,
+        };
+        let runner =
+            NnueLossRangerStepRunner::new(&stream, &host_weights, first_case.batch_size, first_case.max_active)?;
+        (first_case.shape, 0, train_batches, runner)
     };
-    let mut runner =
-        NnueLossRangerStepRunner::new(&stream, &host_weights, first_case.batch_size, first_case.max_active)?;
     let train_loss_kind = match args.loss_kind {
         LossKind::SigmoidMse => NnueTrainLossKind::SigmoidMse,
         LossKind::NnuePytorchWrm => NnueTrainLossKind::NnuePytorchWrm,
@@ -847,7 +893,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
     let mut losses = Vec::with_capacity(train_batches.len());
     for (step_idx, train_case) in train_batches.iter().enumerate() {
-        let step = step_idx + 1;
+        let step = completed_step_offset + step_idx + 1;
         let params = grouped_ranger_step_params_for_step(step);
         let host_batch = NnueTrainStepHostBatch {
             stm_indices: &train_case.stm,
@@ -869,7 +915,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let last_batch = train_batches.last().expect("validated non-empty train batch sequence");
         let trained_forward = NnueForwardCase {
             label: "trained-forward-fixture",
-            shape: first_case.shape,
+            shape,
             batch_size: last_batch.batch_size,
             max_active: last_batch.max_active,
             stm: last_batch.stm.clone(),
@@ -887,7 +933,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     if let Some(path) = &args.write_nnue_train_state_fixture {
         let state = runner.read_state(&stream)?;
-        write_nnue_train_state_fixture(path, first_case.shape, train_batches.len(), &state)?;
+        write_nnue_train_state_fixture(path, shape, completed_step_offset + train_batches.len(), &state)?;
     }
 
     println!("bulletou-cuda-train NNUE fixture train");
@@ -901,11 +947,12 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         }
     }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
-    println!("  batch        : {} samples", first_case.batch_size);
+    println!("  batch        : {} samples", train_batches[0].batch_size);
     println!(
         "  shape        : input={} l1={} l2={} l3={}",
-        first_case.shape.input_size, first_case.shape.l1, first_case.shape.l2, first_case.shape.l3
+        shape.input_size, shape.l1, shape.l2, shape.l3
     );
+    println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
     for (step, weighted_sum, mean) in losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
@@ -2262,7 +2309,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --nnue-fixture-train --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -2322,7 +2369,9 @@ fn usage() -> &'static str {
      validation.\n\
      --write-nnue-train-state-fixture writes BOUNRNG1 with final weights,\n\
      Ranger momentum/velocity/slow state, and completed step count. This is\n\
-     the checkpoint/resume bridge format; restore support is added separately.\n\
+     the checkpoint/resume bridge format. --nnue-train-state-fixture restores\n\
+     from BOUNRNG1, then applies the supplied later batch fixtures starting at\n\
+     completed_steps + 1.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
@@ -2825,6 +2874,30 @@ struct NnueTrainCase {
     forward: NnueForwardCase,
     targets: Vec<f32>,
     entry_weights: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct NnueTrainStateGroupCase {
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    slow_params: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct NnueTrainStateCase {
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    completed_steps: usize,
+    l0w: NnueTrainStateGroupCase,
+    l0b: NnueTrainStateGroupCase,
+    l1w: NnueTrainStateGroupCase,
+    l1b: NnueTrainStateGroupCase,
+    l2w: NnueTrainStateGroupCase,
+    l2b: NnueTrainStateGroupCase,
+    outw: NnueTrainStateGroupCase,
+    outb: NnueTrainStateGroupCase,
 }
 
 #[cfg(feature = "cuda")]
@@ -3433,6 +3506,117 @@ impl NnueTrainCase {
                 "failed to read NNUE train fixture {}: {err}",
                 path.display()
             ))),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl NnueTrainStateCase {
+    fn read_fixture(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Self> {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to open NNUE train state fixture {}: {err}",
+                path.display()
+            ))
+        })?);
+
+        let mut magic = [0_u8; 8];
+        read_exact(&mut reader, &mut magic, "fixture magic")?;
+        if &magic != NNUE_TRAIN_STATE_FIXTURE_MAGIC {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "invalid NNUE train state fixture magic in {}",
+                path.display()
+            )));
+        }
+
+        let shape = bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
+            input_size: read_usize(&mut reader, "shape.input_size")?,
+            l1: read_usize(&mut reader, "shape.l1")?,
+            l2: read_usize(&mut reader, "shape.l2")?,
+            l3: read_usize(&mut reader, "shape.l3")?,
+        };
+        let completed_steps = read_usize(&mut reader, "completed_steps")?;
+        let layout =
+            bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+
+        fn read_group(
+            reader: &mut impl std::io::Read,
+            len: usize,
+            name: &'static str,
+        ) -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
+            Ok(NnueTrainStateGroupCase {
+                weights: read_f32_vec(reader, len, name)?,
+                momentum: read_f32_vec(reader, len, name)?,
+                velocity: read_f32_vec(reader, len, name)?,
+                slow_params: read_f32_vec(reader, len, name)?,
+            })
+        }
+
+        let case = Self {
+            shape,
+            completed_steps,
+            l0w: read_group(&mut reader, layout.l0w_len(), "l0w")?,
+            l0b: read_group(&mut reader, layout.l0b_len(), "l0b")?,
+            l1w: read_group(&mut reader, layout.l1w_len(), "l1w")?,
+            l1b: read_group(&mut reader, layout.l1b_len(), "l1b")?,
+            l2w: read_group(&mut reader, layout.l2w_len(), "l2w")?,
+            l2b: read_group(&mut reader, layout.l2b_len(), "l2b")?,
+            outw: read_group(&mut reader, layout.outw_len(), "outw")?,
+            outb: read_group(&mut reader, layout.outb_len(), "outb")?,
+        };
+
+        let mut trailing = [0_u8; 1];
+        match std::io::Read::read(&mut reader, &mut trailing) {
+            Ok(0) => Ok(case),
+            Ok(_) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "NNUE train state fixture {} has trailing bytes",
+                path.display()
+            ))),
+            Err(err) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read NNUE train state fixture {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn host_weights(&self) -> bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights<'_> {
+        bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
+            shape: self.shape,
+            l0w: &self.l0w.weights,
+            l0b: &self.l0b.weights,
+            l1w: &self.l1w.weights,
+            l1b: &self.l1b.weights,
+            l2w: &self.l2w.weights,
+            l2b: &self.l2b.weights,
+            outw: &self.outw.weights,
+            outb: &self.outb.weights,
+        }
+    }
+
+    fn host_optimizer_states(
+        &self,
+    ) -> bulletou_cuda_oxide_runtime::optimizer::NnueRangerOptimizerHostStates<'_> {
+        use bulletou_cuda_oxide_runtime::optimizer::{NnueRangerOptimizerHostStates, RangerOptimizerHostState};
+
+        macro_rules! group {
+            ($field:ident) => {
+                RangerOptimizerHostState {
+                    momentum: &self.$field.momentum,
+                    velocity: &self.$field.velocity,
+                    slow_params: &self.$field.slow_params,
+                }
+            };
+        }
+
+        NnueRangerOptimizerHostStates {
+            l0w: group!(l0w),
+            l0b: group!(l0b),
+            l1w: group!(l1w),
+            l1b: group!(l1b),
+            l2w: group!(l2w),
+            l2b: group!(l2b),
+            outw: group!(outw),
+            outb: group!(outb),
         }
     }
 }
