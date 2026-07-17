@@ -107,7 +107,8 @@ For the first direct loader bridge, build with `--features cuda,root-loader` and
 run `--nnue-teacher-train`. This makes the nested cuda-oxide binary depend on
 root `bulletou_lib` only on demand, reads real teacher batches directly into
 `FastBatchHost`, and feeds them to the NNUE loss/Ranger runner without writing
-intermediate `BOUNTRN1`/`BOUNBCH1` files:
+intermediate `BOUNTRN1`/`BOUNBCH1` files. Multiple batches are streamed through
+one loader pass:
 
 ```bash
 cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \

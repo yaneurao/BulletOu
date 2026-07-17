@@ -969,6 +969,15 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   -DebugReadback -RunDirectTeacherTrain -DirectTrainedForwardFixture ...`
   passed, and the direct script fixture SHA-256 matched the fixture-backed
   one-shot two-step final exactly.
+- Replaced the direct teacher smoke's per-`batch_index` loader reopening with
+  `for_each_halfkp_teacher_fast_batch()`, which streams multiple `FastBatchHost`
+  batches through one loader pass. Validation: `cargo check -p bulletou_lib
+  --example export_nnue_forward_fixture`, `cargo test -p bulletou_lib
+  teacher_batch`, Windows `cargo check -p bulletou-cuda-train`, WSL2
+  `cargo check -p bulletou-cuda-train --features cuda`, WSL2
+  `--features cuda,root-loader`, and a two-step direct teacher train all passed.
+  The streamed direct final fixture SHA-256 again matched the fixture-backed
+  one-shot two-step final exactly.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

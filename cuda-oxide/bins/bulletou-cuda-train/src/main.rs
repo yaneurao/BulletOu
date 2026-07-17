@@ -1067,53 +1067,61 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut losses = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
     let mut last_batch = None;
-    for step_idx in 0..args.train_steps {
-        let loaded = bulletou_lib::value::load_halfkp_teacher_fast_batch(&bulletou_lib::value::HalfkpTeacherBatchConfig {
-            teacher,
-            batch_size: args.batch_size,
-            batch_index: step_idx,
-            buffer_mb: args.buffer_mb,
-            loader_threads: args.loader_threads,
-            threads: args.threads,
-            lambda: 1.0,
-            scale: 400.0,
-            nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
-            score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        })
-        .map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "failed to load NNUE teacher batch {step_idx} from {teacher}: {err}"
-            ))
-        })?;
-        let train_batch = nnue_train_batch_from_root_fast_batch(initial_case.shape.input_size, loaded.batch)?;
-        if runner.is_none() {
-            runner = Some(NnueLossRangerStepRunner::new(
-                &stream,
-                &host_weights,
-                train_batch.batch_size,
-                train_batch.max_active,
-            )?);
-        }
+    let mut completed_steps = 0usize;
+    let teacher_batch_config = bulletou_lib::value::HalfkpTeacherBatchConfig {
+        teacher,
+        batch_size: args.batch_size,
+        batch_index: 0,
+        buffer_mb: args.buffer_mb,
+        loader_threads: args.loader_threads,
+        threads: args.threads,
+        lambda: 1.0,
+        scale: 400.0,
+        nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+    };
+    bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
+        &teacher_batch_config,
+        args.train_steps,
+        |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
+            let source = loaded.source;
+            let train_batch = nnue_train_batch_from_root_fast_batch(initial_case.shape.input_size, loaded.batch)?;
+            if runner.is_none() {
+                runner = Some(NnueLossRangerStepRunner::new(
+                    &stream,
+                    &host_weights,
+                    train_batch.batch_size,
+                    train_batch.max_active,
+                )?);
+            }
 
-        let runner_ref = runner.as_mut().expect("runner is initialized");
-        let step = step_idx + 1;
-        let params = grouped_ranger_step_params_for_step(step);
-        let host_batch = NnueTrainStepHostBatch {
-            stm_indices: &train_batch.stm,
-            nstm_indices: &train_batch.nstm,
-            targets: &train_batch.targets,
-            entry_weights: &train_batch.entry_weights,
-            batch_size: train_batch.batch_size,
-            max_active: train_batch.max_active,
-        };
-        runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
-        stream.synchronize()?;
+            let runner_ref = runner.as_mut().expect("runner is initialized");
+            let step = completed_steps + 1;
+            let params = grouped_ranger_step_params_for_step(step);
+            let host_batch = NnueTrainStepHostBatch {
+                stm_indices: &train_batch.stm,
+                nstm_indices: &train_batch.nstm,
+                targets: &train_batch.targets,
+                entry_weights: &train_batch.entry_weights,
+                batch_size: train_batch.batch_size,
+                max_active: train_batch.max_active,
+            };
+            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
+            stream.synchronize()?;
 
-        let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
-        losses.push((step, loss.weighted_sum[0], loss.mean[0]));
-        sources.push(loaded.source);
-        last_batch = Some(train_batch);
-    }
+            let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
+            losses.push((step, loss.weighted_sum[0], loss.mean[0]));
+            sources.push(source);
+            last_batch = Some(train_batch);
+            completed_steps += 1;
+            Ok(())
+        },
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to stream NNUE teacher batches from {teacher}: {err}"
+        ))
+    })?;
 
     let runner = runner.as_ref().expect("validated non-empty teacher train steps");
     let last_batch = last_batch.as_ref().expect("validated non-empty teacher train steps");
