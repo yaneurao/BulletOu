@@ -123,17 +123,16 @@ Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training.
 In this mode `--train-steps` is the number of additional batches to run, and
 the loader starts at `completed_steps` from the state fixture.
 Pass `--output <DIR>` to write a numbered cuda-oxide bridge checkpoint:
-`<DIR>/0001/trained-forward.nnuef`, `<DIR>/0001/state.boung`,
-`<DIR>/0001/state.bin`, and `<DIR>/0001/learn.log`. `state.boung` is the
-cuda-oxide exact resume artifact; `state.bin` is the root BulletOu record stream
-for NNUE weights, momentum, velocity, Ranger slow weights, and step counters.
-If `<DIR>` already contains numbered bridge checkpoints, the direct trainer
-automatically restores the latest `state.boung` and writes the next number. In
-that case omit `--weights-bin`, because the restored train state already
-carries weights and optimizer state. This is not yet the final
-BulletOu-compatible checkpoint layout because `nn.bin` is still missing, but it
-gives the direct trainer a stable save/resume artifact while that compatibility
-layer is being built.
+`<DIR>/0001/nn.bin`, `<DIR>/0001/trained-forward.nnuef`,
+`<DIR>/0001/state.boung`, `<DIR>/0001/state.bin`, and
+`<DIR>/0001/learn.log`. `nn.bin` is the YaneuraOu/Stockfish-style quantized
+HalfKP network; `state.boung` is the cuda-oxide exact resume artifact;
+`state.bin` is the root BulletOu record stream for NNUE weights, momentum,
+velocity, Ranger slow weights, and step counters. If `<DIR>` already contains
+numbered bridge checkpoints, the direct trainer automatically restores the
+latest `state.boung` and writes the next number. In that case omit
+`--weights-bin`, because the restored train state already carries weights and
+optimizer state.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`

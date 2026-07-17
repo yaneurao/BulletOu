@@ -1254,6 +1254,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("  output       : {}", checkpoint.dir.display());
         println!("  checkpoint   : {:04}", checkpoint.index);
         println!("    forward    : {}", checkpoint.forward_path.display());
+        println!("    nn_bin     : {}", checkpoint.nn_bin_path.display());
         println!("    state      : {}", checkpoint.state_path.display());
         println!("    state_bin  : {}", checkpoint.state_bin_path.display());
         println!("    learn_log  : {}", checkpoint.learn_log_path.display());
@@ -1268,6 +1269,7 @@ struct NnueBridgeCheckpointWrite {
     index: usize,
     dir: std::path::PathBuf,
     forward_path: std::path::PathBuf,
+    nn_bin_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
     learn_log_path: std::path::PathBuf,
@@ -1294,6 +1296,7 @@ fn write_nnue_bridge_checkpoint(
 
     let (index, dir) = create_next_numbered_checkpoint_dir(output_dir)?;
     let forward_path = dir.join("trained-forward.nnuef");
+    let nn_bin_path = dir.join("nn.bin");
     let state_path = dir.join("state.boung");
     let state_bin_path = dir.join("state.bin");
     let learn_log_path = dir.join("learn.log");
@@ -1315,11 +1318,206 @@ fn write_nnue_bridge_checkpoint(
         outb: weights.outb,
     };
     trained_forward.write_fixture(&forward_path)?;
+    write_nnue_halfkp_nn_bin(&nn_bin_path, shape, state)?;
     write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
     write_nnue_root_state_bin(&state_bin_path, completed_steps, state)?;
     write_nnue_bridge_learn_log(&learn_log_path, losses, sources)?;
 
-    Ok(NnueBridgeCheckpointWrite { index, dir, forward_path, state_path, state_bin_path, learn_log_path })
+    Ok(NnueBridgeCheckpointWrite {
+        index,
+        dir,
+        forward_path,
+        nn_bin_path,
+        state_path,
+        state_bin_path,
+        learn_log_path,
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_halfkp_nn_bin(
+    path: &std::path::Path,
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    state: &nnue_train_step::NnueTrainStateReadback,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_lib::value::nnue_save::{
+        header_bytes, ft_hash_bytes, l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd, Activation,
+        NnueFeatureSet,
+    };
+    use std::io::Write as _;
+
+    let feature_set = NnueFeatureSet::HalfKp;
+    if shape.input_size != feature_set.input_size() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "cannot write HalfKP nn.bin for input_size={}, expected {}",
+            shape.input_size,
+            feature_set.input_size()
+        )));
+    }
+
+    let qa: i16 = 127;
+    let qb: i16 = 64;
+    let l1_input_dim = shape.l1 * 2;
+    let l1_bias = l1_bias_scale(Activation::Crelu, false, qa, qb);
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to create NNUE nn.bin {}: {err}", path.display()))
+    })?);
+
+    writer
+        .write_all(&header_bytes(feature_set, shape.l1, shape.l2, shape.l3))
+        .and_then(|_| writer.write_all(&ft_hash_bytes(feature_set, shape.l1)))
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write NNUE nn.bin header {}: {err}",
+                path.display()
+            ))
+        })?;
+    write_quantized_i16(&mut writer, path, "l0b", &state.l0b.weights, qa)?;
+    write_quantized_i16(&mut writer, path, "l0w", &state.l0w.weights, qa)?;
+    writer
+        .write_all(&network_layer_hash_bytes(shape.l1, shape.l2, shape.l3))
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write NNUE nn.bin network hash {}: {err}",
+                path.display()
+            ))
+        })?;
+
+    write_quantized_i32(&mut writer, path, "l1b", &state.l1b.weights, l1_bias)?;
+    let l1w = transpose_input_major_dense_weights(&state.l1w.weights, l1_input_dim, shape.l2)?;
+    let l1w = pad_weights_for_simd(&l1w, shape.l2, l1_input_dim);
+    write_quantized_i8(&mut writer, path, "l1w", &l1w, qb)?;
+
+    write_quantized_i32(&mut writer, path, "l2b", &state.l2b.weights, 127 * i32::from(qb))?;
+    let l2w = transpose_input_major_dense_weights(&state.l2w.weights, shape.l2, shape.l3)?;
+    let l2w = pad_weights_for_simd(&l2w, shape.l3, shape.l2);
+    write_quantized_i8(&mut writer, path, "l2w", &l2w, qb)?;
+
+    write_quantized_i32(&mut writer, path, "outb", &state.outb.weights, 127 * i32::from(qb))?;
+    let outw = transpose_input_major_dense_weights(&state.outw.weights, shape.l3, 1)?;
+    let outw = pad_weights_for_simd(&outw, 1, shape.l3);
+    write_quantized_i8(&mut writer, path, "outw", &outw, qb)?;
+
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to flush NNUE nn.bin {}: {err}", path.display()))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn transpose_input_major_dense_weights(
+    weights: &[f32],
+    input_dim: usize,
+    output_dim: usize,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+    let expected = input_dim.checked_mul(output_dim).ok_or_else(|| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "dense weight shape overflow: input_dim={input_dim} output_dim={output_dim}"
+        ))
+    })?;
+    if weights.len() != expected {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "dense weight length mismatch: got {}, expected input_dim({input_dim}) * output_dim({output_dim}) = {expected}",
+            weights.len()
+        )));
+    }
+    let mut transposed = vec![0.0_f32; weights.len()];
+    for input in 0..input_dim {
+        for output in 0..output_dim {
+            transposed[output * input_dim + input] = weights[input * output_dim + output];
+        }
+    }
+    Ok(transposed)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_quantized_i8(
+    writer: &mut impl std::io::Write,
+    path: &std::path::Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i16,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let mut bytes = Vec::with_capacity(values.len());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        let q = qf as i8;
+        if qf != f64::from(q) {
+            return Err(quantization_error(path, name, "i8", value, qf));
+        }
+        bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_quantized_i16(
+    writer: &mut impl std::io::Write,
+    path: &std::path::Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i16,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i16>());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        let q = qf as i16;
+        if qf != f64::from(q) {
+            return Err(quantization_error(path, name, "i16", value, qf));
+        }
+        bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_quantized_i32(
+    writer: &mut impl std::io::Write,
+    path: &std::path::Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i32,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i32>());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        let q = qf as i32;
+        if qf != f64::from(q) {
+            return Err(quantization_error(path, name, "i32", value, qf));
+        }
+        bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_nnue_bin_chunk(
+    writer: &mut impl std::io::Write,
+    path: &std::path::Path,
+    name: &'static str,
+    bytes: &[u8],
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    writer.write_all(bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write NNUE nn.bin {name} chunk {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn quantization_error(
+    path: &std::path::Path,
+    name: &'static str,
+    target: &'static str,
+    value: f32,
+    quantized: f64,
+) -> bulletou_cuda_oxide_runtime::Error {
+    bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+        "failed to quantize NNUE nn.bin {name} value {value} -> {quantized} as {target} for {}",
+        path.display()
+    ))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]

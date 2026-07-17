@@ -1024,6 +1024,14 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `nnue/step_ranger/*` records via `write_model_weights_bin`. `state.boung`
   remains the cuda-oxide exact resume source until the final compatibility
   layer can restore directly from root `state.bin`.
+- Added HalfKP `nn.bin` output beside each bridge checkpoint. It uses
+  `nnue_save` header/hash/padding helpers and direct quantisation matching the
+  standard CReLU `qa=127`, `qb=64` save path: L0 i16, dense biases i32, dense
+  weights transposed to row-major, SIMD-padded, and quantised to i8. Validation
+  wrote `target/cuda-oxide-fixtures/nnue-bridge-output-smoke/0004/nn.bin`
+  (`64,217,077` bytes) with `NNUE_VERSION=0x7AF32F16`,
+  `network_hash=0x3E5AA6EE`, `ft_hash=0x5D69D7B8`, and
+  `fc_hash=0x63337156`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
