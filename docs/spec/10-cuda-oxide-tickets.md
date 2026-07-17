@@ -28,7 +28,7 @@ commit each completed slice.
 | BO-CUDA-020 | done | NNUE train-step profiling and WRM loss reduction | parity harness now runs host binaries in release mode by default, `--profile-train-step` reports NNUE stage timings, and WRM loss no longer recomputes every sample serially in thread 0 |
 | BO-CUDA-021 | done | NNUE teacher prepare/GPU pipeline | `--profile-train-step` now exposes CPU batch materialisation time, standard NNUE teacher training overlaps CPU prepare with GPU work via a bounded producer queue, and the tatara parity harness can run realistic multi-threaded prepare |
 | BO-CUDA-022 | done | remaining tatara accuracy parity | validation now reports prediction-sign distribution; the one-superbatch accuracy complement was a short-run all-one-sign prediction artifact, and a 4-superbatch same-PSV run matches tatara accuracy with close WRM loss |
-| BO-CUDA-023 | todo | YaneuraOu quantized eval cross-check | run YaneuraOu `test eval_accuracy` on the exported `nn.bin` from a cuda-oxide checkpoint and compare quantized engine accuracy with BulletOu's f32 checkpoint-time validation |
+| BO-CUDA-023 | done | YaneuraOu quantized eval cross-check | YaneuraOu `test eval_accuracy` on the cuda-oxide checkpoint `nn.bin` matches BulletOu's f32 checkpoint-time validation on the same held-out PSV |
 
 ## Notes
 
@@ -365,7 +365,12 @@ commit each completed slice.
 
 ### BO-CUDA-023
 
-- Next cross-tool validation step:
-  - use the `nn.bin` produced by a cuda-oxide NNUE checkpoint;
-  - load it in YaneuraOu and run `test eval_accuracy <same-test.psv>`;
-  - compare quantized-engine sign accuracy against BulletOu's f32 checkpoint-time validation and document any expected quantization delta.
+- Built YaneuraOu NNUE engine under WSL from `C:\shogi\YaneuraOuWorks\YaneuraOu\source` with the default Makefile settings (`YANEURAOU_ENGINE_NNUE`, `TARGET_CPU=AVX2`, `clang++`).
+- Cross-checked the BO-CUDA-022 4-superbatch cuda-oxide checkpoint:
+  - `EvalDir=/mnt/c/shogi/YaneuraOuWorks/BulletOu/target/tatara-parity/parity-20260718-070939/bulletou-metrics/0001`
+  - test PSV: `/mnt/c/shogi/YaneuraOuWorks/BulletOu/target/tatara-parity/parity-20260718-070939/test-8192.psv`
+  - command: `./YaneuraOu-by-gcc EvalDir <checkpoint-dir> , test eval_accuracy <test.psv> , quit`
+- Result:
+  - YaneuraOu quantized `nn.bin`: `accuracy=50.6470% (4149/8192)`, `drawn=0`, `skipped=0`.
+  - BulletOu f32 checkpoint-time validation for the same checkpoint/test set: `accuracy=50.6470% (4149/8192; pred>=0 0 pred<0 8192 zero 0)`.
+  - No quantization-induced sign flip was observed on this smoke set.
