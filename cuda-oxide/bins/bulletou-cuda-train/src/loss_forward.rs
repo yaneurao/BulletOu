@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
-    loss::{LossLayoutError, ScalarLossDeviceBatch, ScalarLossLaunchPlan, ScalarLossWorkspace},
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
+    loss::{LossLayoutError, ScalarLossDeviceBatch, ScalarLossLaunchPlan, ScalarLossWorkspace},
 };
 use cuda_host::cuda_launch;
 
@@ -56,12 +56,12 @@ pub(crate) fn launch_sigmoid_mse_loss_from_buffers(
                 slice(entry_weights),
                 slice_mut(workspace.per_sample),
                 slice_mut(workspace.mean_output_gradients),
-                slice_mut(workspace.weighted_sum),
-                slice_mut(workspace.mean),
                 batch_size
             ]
         }
     }?;
+
+    launch_loss_finalize_from_per_sample(stream, module, workspace, batch_size)?;
 
     Ok(())
 }
@@ -114,6 +114,33 @@ pub(crate) fn launch_nnue_pytorch_wrm_loss_from_buffers(
                 slice(entry_weights),
                 slice_mut(workspace.per_sample),
                 slice_mut(workspace.mean_output_gradients),
+                batch_size
+            ]
+        }
+    }?;
+
+    launch_loss_finalize_from_per_sample(stream, module, workspace, batch_size)?;
+
+    Ok(())
+}
+
+fn launch_loss_finalize_from_per_sample(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    workspace: &mut ScalarLossWorkspace,
+    batch_size: u32,
+) -> Result<()> {
+    unsafe {
+        // SAFETY: kernel ABI matches `loss_finalize_from_per_sample`; all
+        // buffers are device allocations owned by the same CUDA context and
+        // live until the caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::loss::loss_finalize_from_per_sample,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(1),
+            args: [
+                slice(workspace.per_sample),
                 slice_mut(workspace.weighted_sum),
                 slice_mut(workspace.mean),
                 batch_size

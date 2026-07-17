@@ -233,10 +233,11 @@ impl NnueLossRangerStepRunner {
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
         batch: NnueTrainStepHostBatch<'_>,
+        profile: bool,
     ) -> Result<()> {
         let slot = self.next_slot_index();
         self.synchronize_slot_for_blocking_reuse(slot)?;
-        self.enqueue_step_with_blocking_upload(stream, module, params, loss_kind, batch, slot)?;
+        self.enqueue_step_with_blocking_upload(stream, module, params, loss_kind, batch, slot, profile)?;
         self.last_step_slot = Some(slot);
         Ok(())
     }
@@ -250,6 +251,7 @@ impl NnueLossRangerStepRunner {
         batch: NnueTrainStepHostBatch<'_>,
         include_debug_readback: bool,
         drain_before_enqueue: bool,
+        profile: bool,
     ) -> Result<Option<NnueTrainStepLossReadback>> {
         let slot = self.next_slot;
         let mut previous = self.pending_loss.take();
@@ -270,6 +272,7 @@ impl NnueLossRangerStepRunner {
             batch,
             slot,
             include_debug_readback,
+            profile,
         )?;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         self.last_step_slot = Some(slot);
@@ -330,6 +333,7 @@ impl NnueLossRangerStepRunner {
         loss_kind: NnueTrainLossKind,
         batch: NnueTrainStepHostBatch<'_>,
         slot: usize,
+        profile: bool,
     ) -> Result<()> {
         self.validate_batch(batch)?;
         {
@@ -339,7 +343,7 @@ impl NnueLossRangerStepRunner {
             slot_ref.targets.copy_from_host(stream, batch.targets)?;
             slot_ref.entry_weights.copy_from_host(stream, batch.entry_weights)?;
         }
-        self.launch_compute_on_slot(stream, module, params, loss_kind, slot)
+        self.launch_compute_on_slot(stream, module, params, loss_kind, slot, profile)
     }
 
     fn enqueue_step_with_async_upload_and_readback(
@@ -351,6 +355,7 @@ impl NnueLossRangerStepRunner {
         batch: NnueTrainStepHostBatch<'_>,
         slot: usize,
         include_debug_readback: bool,
+        profile: bool,
     ) -> Result<()> {
         self.validate_batch(batch)?;
         {
@@ -380,7 +385,7 @@ impl NnueLossRangerStepRunner {
         stream.wait(&upload_done)?;
         self.slots[slot].upload_done = Some(upload_done);
 
-        self.launch_compute_on_slot(stream, module, params, loss_kind, slot)?;
+        self.launch_compute_on_slot(stream, module, params, loss_kind, slot, profile)?;
         self.enqueue_loss_readback(stream, slot, include_debug_readback)
     }
 
@@ -391,7 +396,17 @@ impl NnueLossRangerStepRunner {
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
         slot: usize,
+        profile: bool,
     ) -> Result<()> {
+        fn profile_stage(stream: &Arc<CudaStream>, mark: &mut std::time::Instant, name: &str) -> Result<()> {
+            stream.synchronize()?;
+            let now = std::time::Instant::now();
+            println!("  profile_step : {name:<16} {:>9.3} ms", now.duration_since(*mark).as_secs_f64() * 1000.0);
+            *mark = now;
+            Ok(())
+        }
+
+        let mut profile_mark = std::time::Instant::now();
         let slot_ref = &mut self.slots[slot];
         nnue_forward::launch_nnue_forward(
             stream,
@@ -400,6 +415,9 @@ impl NnueLossRangerStepRunner {
             &self.device_weights,
             &mut slot_ref.forward_workspace,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "forward")?;
+        }
 
         match loss_kind {
             NnueTrainLossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
@@ -419,6 +437,9 @@ impl NnueLossRangerStepRunner {
                 &mut slot_ref.loss_workspace,
             )?,
         }
+        if profile {
+            profile_stage(stream, &mut profile_mark, "loss")?;
+        }
 
         dense_backward::launch_dense_output_backward(
             stream,
@@ -431,6 +452,9 @@ impl NnueLossRangerStepRunner {
             &mut slot_ref.backward_workspace.outw_gradients,
             &mut slot_ref.backward_workspace.outb_gradients,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "out_bwd")?;
+        }
 
         dense_backward::launch_dense_crelu_backward(
             stream,
@@ -444,6 +468,9 @@ impl NnueLossRangerStepRunner {
             &mut slot_ref.backward_workspace.l2w_gradients,
             &mut slot_ref.backward_workspace.l2b_gradients,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "l2_bwd")?;
+        }
 
         dense_backward::launch_dense_crelu_backward(
             stream,
@@ -457,6 +484,9 @@ impl NnueLossRangerStepRunner {
             &mut slot_ref.backward_workspace.l1w_gradients,
             &mut slot_ref.backward_workspace.l1b_gradients,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "l1_bwd")?;
+        }
 
         dense_backward::launch_nnue_l0_crelu_backward(
             stream,
@@ -468,6 +498,9 @@ impl NnueLossRangerStepRunner {
             &mut slot_ref.backward_workspace.stm_l0_gradients,
             &mut slot_ref.backward_workspace.nstm_l0_gradients,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "l0_crelu")?;
+        }
 
         dense_backward::launch_nnue_l0_sparse_backward(
             stream,
@@ -480,6 +513,9 @@ impl NnueLossRangerStepRunner {
             &mut slot_ref.backward_workspace.l0w_gradients,
             &mut slot_ref.backward_workspace.l0b_gradients,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "l0_sparse")?;
+        }
 
         optimizer_update::launch_nnue_ranger_update(
             stream,
@@ -489,6 +525,9 @@ impl NnueLossRangerStepRunner {
             &slot_ref.backward_workspace,
             &mut self.optimizer_states,
         )?;
+        if profile {
+            profile_stage(stream, &mut profile_mark, "optimizer")?;
+        }
 
         self.slots[slot].compute_done = Some(stream.record_event(None)?);
         Ok(())

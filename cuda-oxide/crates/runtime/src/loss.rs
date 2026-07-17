@@ -5,7 +5,9 @@ use crate::{CudaStream, DeviceBuffer, Result};
 
 pub const LOSS_SIGMOID_MSE_REDUCE_KERNEL: &str = "loss_sigmoid_mse_reduce";
 pub const LOSS_NNUE_PYTORCH_WRM_REDUCE_KERNEL: &str = "loss_nnue_pytorch_wrm_reduce";
-pub const LOSS_KERNEL_NAMES: [&str; 2] = [LOSS_SIGMOID_MSE_REDUCE_KERNEL, LOSS_NNUE_PYTORCH_WRM_REDUCE_KERNEL];
+pub const LOSS_FINALIZE_FROM_PER_SAMPLE_KERNEL: &str = "loss_finalize_from_per_sample";
+pub const LOSS_KERNEL_NAMES: [&str; 3] =
+    [LOSS_SIGMOID_MSE_REDUCE_KERNEL, LOSS_NNUE_PYTORCH_WRM_REDUCE_KERNEL, LOSS_FINALIZE_FROM_PER_SAMPLE_KERNEL];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarLossKind {
@@ -24,11 +26,7 @@ impl ScalarLossLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), LossLayoutError> {
-        if self.batch_size == 0 {
-            Err(LossLayoutError::EmptyBatch)
-        } else {
-            Ok(())
-        }
+        if self.batch_size == 0 { Err(LossLayoutError::EmptyBatch) } else { Ok(()) }
     }
 
     pub fn per_sample_len(self) -> usize {
@@ -51,8 +49,9 @@ pub struct ScalarLossLaunchPlan {
 
 impl ScalarLossLaunchPlan {
     pub fn new(layout: ScalarLossLayout) -> Self {
-        // Correctness baseline: one thread per sample writes debug
-        // per-sample loss; thread 0 also computes the reduced sum/mean.
+        // One thread per sample writes debug per-sample loss and
+        // mean-output gradient; a one-thread finalize kernel sums the
+        // per-sample loss in deterministic order.
         Self { reduce_threads: layout.batch_size }
     }
 }
@@ -143,7 +142,10 @@ mod tests {
 
     #[test]
     fn kernel_names_are_stable() {
-        assert_eq!(LOSS_KERNEL_NAMES, ["loss_sigmoid_mse_reduce", "loss_nnue_pytorch_wrm_reduce"]);
+        assert_eq!(
+            LOSS_KERNEL_NAMES,
+            ["loss_sigmoid_mse_reduce", "loss_nnue_pytorch_wrm_reduce", "loss_finalize_from_per_sample"]
+        );
     }
 
     #[test]

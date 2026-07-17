@@ -12,10 +12,17 @@ param(
     [int]$Superbatches = 1,
     [switch]$BuildBulletKernel,
     [switch]$BuildTataraKernel,
-    [switch]$SkipBulletMetrics
+    [switch]$SkipBulletMetrics,
+    [switch]$DebugHost
 )
 
 $ErrorActionPreference = "Stop"
+$cargoRunProfileArgs = @()
+$cargoRunProfile = ""
+if (-not $DebugHost) {
+    $cargoRunProfileArgs = @("--release")
+    $cargoRunProfile = "--release "
+}
 
 function Resolve-FullPath([string]$Path) {
     if ([System.IO.Path]::IsPathRooted($Path)) {
@@ -140,23 +147,27 @@ if ([int64]$TrainPositions -lt $requiredTrainPositions) {
     throw "TrainPositions=$TrainPositions is smaller than Superbatches*BatchesPerSuperbatch*BatchSize=$requiredTrainPositions."
 }
 
-Invoke-LoggedLocal "export train PSV" @(
-    "cargo", "run", "-p", "bulletou_lib", "--example", "export_teacher_psv", "--",
+Invoke-LoggedLocal "export train PSV" (@(
+    "cargo", "run"
+) + $cargoRunProfileArgs + @(
+    "-p", "bulletou_lib", "--example", "export_teacher_psv", "--",
     "--teacher", $Teacher,
     "--out", $teacherPsv,
     "--positions", "$TrainPositions",
     "--buffer-mb", "1",
     "--loader-threads", "1"
-) (Join-Path $runDir "export-train.log")
+)) (Join-Path $runDir "export-train.log")
 
-Invoke-LoggedLocal "export test PSV" @(
-    "cargo", "run", "-p", "bulletou_lib", "--example", "export_teacher_psv", "--",
+Invoke-LoggedLocal "export test PSV" (@(
+    "cargo", "run"
+) + $cargoRunProfileArgs + @(
+    "-p", "bulletou_lib", "--example", "export_teacher_psv", "--",
     "--teacher", $TestTeacher,
     "--out", $testPsv,
     "--positions", "$TestPositions",
     "--buffer-mb", "1",
     "--loader-threads", "1"
-) (Join-Path $runDir "export-test.log")
+)) (Join-Path $runDir "export-test.log")
 
 $tataraPtx = Join-Path $tataraRootFull "nnue_train.ptx"
 $commonEnv = "export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
@@ -225,7 +236,7 @@ if ($BuildBulletKernel) {
 $tataraArgs = @(
     "cd $(Quote-Bash $tataraRootWsl)",
     $commonEnv,
-    "cargo run --bin nnue-train --",
+    "cargo run ${cargoRunProfile}--bin nnue-train --",
     "--data $(Quote-Bash $teacherPsvWsl)",
     "--test-data $(Quote-Bash $testPsvWsl)",
     "--test-positions $TestPositions",
@@ -257,7 +268,7 @@ $bulletBasePrefix = @(
     $commonEnv
 )
 $bulletBaseArgs = @(
-    "cargo run -p bulletou-cuda-train --features cuda,root-loader --",
+    "cargo run ${cargoRunProfile}-p bulletou-cuda-train --features cuda,root-loader --",
     "--nnue-teacher-train",
     "--teacher $(Quote-Bash $teacherPsvWsl)",
     "--test-teacher $(Quote-Bash $testPsvWsl)",
@@ -289,6 +300,7 @@ if (-not $SkipBulletMetrics) {
 Write-Host ""
 Write-Host "Parity smoke artifacts:"
 Write-Host "  run_dir        $runDir"
+Write-Host "  host_profile   $(if ($DebugHost) { 'debug' } else { 'release' })"
 Write-Host "  train_psv      $teacherPsv"
 Write-Host "  test_psv       $testPsv"
 Write-Host "  tatara_log     $(Join-Path $runDir "tatara.log")"

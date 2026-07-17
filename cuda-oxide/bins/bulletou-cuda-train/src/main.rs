@@ -83,6 +83,7 @@ struct Args {
     device: usize,
     tolerance: f32,
     debug_readback: bool,
+    profile_train_step: bool,
     loss_kind: LossKind,
     loss_case: LossCaseKind,
     nnue_case: NnueForwardCaseKind,
@@ -199,6 +200,7 @@ impl Args {
             device: 0,
             tolerance: 1.0e-5,
             debug_readback: false,
+            profile_train_step: false,
             loss_kind: LossKind::SigmoidMse,
             loss_case: LossCaseKind::Tiny,
             nnue_case: NnueForwardCaseKind::Tiny,
@@ -343,24 +345,30 @@ impl Args {
                     parsed.save_rate = parse_usize_arg(required_arg(&mut args, "--save-rate")?, "--save-rate")?;
                 }
                 "--batches-per-superbatch" => {
-                    parsed.batches_per_superbatch =
-                        parse_usize_arg(required_arg(&mut args, "--batches-per-superbatch")?, "--batches-per-superbatch")?;
+                    parsed.batches_per_superbatch = parse_usize_arg(
+                        required_arg(&mut args, "--batches-per-superbatch")?,
+                        "--batches-per-superbatch",
+                    )?;
                 }
                 "--superbatches-per-epoch" => {
-                    parsed.superbatches_per_epoch =
-                        parse_usize_arg(required_arg(&mut args, "--superbatches-per-epoch")?, "--superbatches-per-epoch")?;
+                    parsed.superbatches_per_epoch = parse_usize_arg(
+                        required_arg(&mut args, "--superbatches-per-epoch")?,
+                        "--superbatches-per-epoch",
+                    )?;
                 }
                 "--lr-schedule" => {
                     parsed.lr_schedule = parse_train_lr_schedule(required_arg(&mut args, "--lr-schedule")?)?;
                 }
                 "--learning-rate" | "--lr" => {
-                    parsed.learning_rate = parse_f32_arg(required_arg(&mut args, "--learning-rate")?, "--learning-rate")?;
+                    parsed.learning_rate =
+                        parse_f32_arg(required_arg(&mut args, "--learning-rate")?, "--learning-rate")?;
                 }
                 "--lr-min" => {
                     parsed.lr_min = parse_f32_arg(required_arg(&mut args, "--lr-min")?, "--lr-min")?;
                 }
                 "--lr-step-gamma" => {
-                    parsed.lr_step_gamma = parse_f32_arg(required_arg(&mut args, "--lr-step-gamma")?, "--lr-step-gamma")?;
+                    parsed.lr_step_gamma =
+                        parse_f32_arg(required_arg(&mut args, "--lr-step-gamma")?, "--lr-step-gamma")?;
                 }
                 "--lr-step-positions" => {
                     parsed.lr_step_positions =
@@ -371,8 +379,10 @@ impl Args {
                         parse_u64_arg(required_arg(&mut args, "--lr-period-positions")?, "--lr-period-positions")?;
                 }
                 "--optimizer-weight-decay" => {
-                    parsed.optimizer_weight_decay =
-                        parse_f32_arg(required_arg(&mut args, "--optimizer-weight-decay")?, "--optimizer-weight-decay")?;
+                    parsed.optimizer_weight_decay = parse_f32_arg(
+                        required_arg(&mut args, "--optimizer-weight-decay")?,
+                        "--optimizer-weight-decay",
+                    )?;
                 }
                 "--optimizer-epsilon" => {
                     parsed.optimizer_epsilon =
@@ -423,6 +433,7 @@ impl Args {
                         Some(required_path_arg(&mut args, "--write-sfnn-forward-fixture")?);
                 }
                 "--debug-readback" => parsed.debug_readback = true,
+                "--profile-train-step" => parsed.profile_train_step = true,
                 "--help" | "-h" => usage_success(),
                 _ => usage_error(format!("unknown argument: {arg}"))?,
             }
@@ -456,7 +467,7 @@ fn run_ptx_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
 
 #[cfg(feature = "cuda")]
 fn run_dense_crelu_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{backward::DenseCReluBackwardLayout, DeviceBuffer};
+    use bulletou_cuda_oxide_runtime::{DeviceBuffer, backward::DenseCReluBackwardLayout};
 
     let case = DenseCReluBackwardCase::tiny();
     let cpu_trace = case.cpu_backward_trace();
@@ -525,7 +536,7 @@ fn run_dense_crelu_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
 
 #[cfg(feature = "cuda")]
 fn run_dense_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{backward::DenseOutputBackwardLayout, DeviceBuffer};
+    use bulletou_cuda_oxide_runtime::{DeviceBuffer, backward::DenseOutputBackwardLayout};
 
     let case = DenseOutputBackwardCase::tiny();
     let cpu_trace = case.cpu_backward_trace();
@@ -592,6 +603,7 @@ fn run_dense_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
 #[cfg(feature = "cuda")]
 fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
+        DeviceBuffer,
         backward::{
             DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueBackwardWorkspace, NnueBackwardWorkspaceLayout,
             NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
@@ -600,7 +612,6 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
             NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
             NnueForwardWorkspace, NnueForwardWorkspaceLayout,
         },
-        DeviceBuffer,
     };
     let case = match args.nnue_forward_fixture.as_deref() {
         Some(path) => NnueForwardCase::read_fixture(path)?,
@@ -766,6 +777,7 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
 #[cfg(feature = "cuda")]
 fn run_nnue_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
+        DeviceBuffer,
         backward::{
             DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueBackwardWorkspace, NnueBackwardWorkspaceLayout,
             NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
@@ -775,7 +787,6 @@ fn run_nnue_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
             NnueForwardWorkspace, NnueForwardWorkspaceLayout,
         },
         optimizer::NnueRangerOptimizerStates,
-        DeviceBuffer,
     };
 
     let case = match args.nnue_forward_fixture.as_deref() {
@@ -1088,7 +1099,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(&stream, &module, params, train_loss_kind, host_batch)?;
+        runner.step(&stream, &module, params, train_loss_kind, host_batch, false)?;
         stream.synchronize()?;
 
         let loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -1133,10 +1144,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
     println!("  batch        : {} samples", train_batches[0].batch_size);
-    println!(
-        "  shape        : input={} l1={} l2={} l3={}",
-        shape.input_size, shape.l1, shape.l2, shape.l3
-    );
+    println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
     for (step, weighted_sum, mean) in losses {
@@ -1177,9 +1185,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         ));
     }
     if args.test_teacher.is_some() && args.test_batch_size == 0 {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--test-batch-size must be > 0".to_string(),
-        ));
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--test-batch-size must be > 0".to_string()));
     }
     validate_nnue_teacher_schedule_args(&args)?;
     let save_interval_steps = nnue_teacher_save_interval_steps(&args)?;
@@ -1210,14 +1216,12 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     } else {
         output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_source())
     };
-    let resume_checkpoint_teacher = output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
+    let resume_checkpoint_teacher =
+        output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
     let resume_teacher_matches = resume_checkpoint_teacher.is_some_and(|stored| stored == teacher);
     let legacy_resume_checkpoint = output_resume_checkpoint.is_some() && resume_checkpoint_teacher.is_none();
     let dataloader_resume_pos = if resume_teacher_matches || legacy_resume_checkpoint {
-        match output_resume_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
-        {
+        match output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref()) {
             Some(path) => parse_bridge_dataloader_pos(path)?,
             None => None,
         }
@@ -1288,7 +1292,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
         train_batch: NnueTrainBatchCase,
     }
-    let use_async_pipeline = save_interval_steps.is_none();
+    let use_async_pipeline = save_interval_steps.is_none() && !args.profile_train_step;
     let mut pending_async_step: Option<PendingAsyncTeacherStep> = None;
     let mut train_timer: Option<std::time::Instant> = None;
     let mut train_positions = 0usize;
@@ -1384,6 +1388,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     host_batch,
                     args.debug_readback,
                     false,
+                    args.profile_train_step,
                 )?;
                 if let Some(loss) = completed_loss {
                     let meta = pending_async_step
@@ -1396,18 +1401,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     dataloader_positions.push(meta.dataloader_pos);
                     last_batch = Some(meta.train_batch);
                 }
-                pending_async_step = Some(PendingAsyncTeacherStep {
-                    step,
-                    learning_rate,
-                    source,
-                    dataloader_pos,
-                    train_batch,
-                });
+                pending_async_step =
+                    Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
                 run_steps += 1;
                 return Ok(());
             }
 
-            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
+            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
             stream.synchronize()?;
 
             let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
@@ -1421,9 +1421,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             checkpoint_sources.push(source);
             checkpoint_dataloader_positions.push(dataloader_pos);
             run_steps += 1;
-            if args.output.is_some()
-                && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false)
-            {
+            if args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false) {
                 let weights = runner_ref.read_weights(&stream)?;
                 let state = runner_ref.read_state(&stream)?;
                 let test_metrics = match &test_cache {
@@ -1463,9 +1461,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if use_async_pipeline {
         let runner_ref = runner.as_mut().expect("validated non-empty teacher train steps");
         if let Some(loss) = runner_ref.finish_pipelined_loss()? {
-            let meta = pending_async_step
-                .take()
-                .expect("async NNUE train pipeline has final metadata for final loss");
+            let meta = pending_async_step.take().expect("async NNUE train pipeline has final metadata for final loss");
             let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
             losses.push(loss_entry);
             learning_rates.push(meta.learning_rate);
@@ -1506,21 +1502,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let should_write_final_bridge_checkpoint =
             save_interval_steps.is_none() || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
         if should_write_final_bridge_checkpoint {
-            let checkpoint_loss_entries = if save_interval_steps.is_none() {
-                losses.as_slice()
-            } else {
-                checkpoint_losses.as_slice()
-            };
+            let checkpoint_loss_entries =
+                if save_interval_steps.is_none() { losses.as_slice() } else { checkpoint_losses.as_slice() };
             let checkpoint_lr_entries = if save_interval_steps.is_none() {
                 learning_rates.as_slice()
             } else {
                 checkpoint_learning_rates.as_slice()
             };
-            let checkpoint_source_entries = if save_interval_steps.is_none() {
-                sources.as_slice()
-            } else {
-                checkpoint_sources.as_slice()
-            };
+            let checkpoint_source_entries =
+                if save_interval_steps.is_none() { sources.as_slice() } else { checkpoint_sources.as_slice() };
             let checkpoint_dataloader_pos_entries = if save_interval_steps.is_none() {
                 dataloader_positions.as_slice()
             } else {
@@ -1571,10 +1561,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
     println!("  batch        : {} samples", last_batch.batch_size);
-    println!(
-        "  shape        : input={} l1={} l2={} l3={}",
-        shape.input_size, shape.l1, shape.l2, shape.l3
-    );
+    println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
     println!("  batches/sb   : {}", args.batches_per_superbatch);
@@ -1668,14 +1655,12 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         .nnue_train_state_bin
         .as_deref()
         .or_else(|| output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_path.as_path()));
-    let resume_checkpoint_teacher = output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
+    let resume_checkpoint_teacher =
+        output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
     let resume_teacher_matches = resume_checkpoint_teacher.is_some_and(|stored| stored == teacher);
     let legacy_resume_checkpoint = output_resume_checkpoint.is_some() && resume_checkpoint_teacher.is_none();
     let dataloader_resume_pos = if resume_teacher_matches || legacy_resume_checkpoint {
-        match output_resume_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
-        {
+        match output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref()) {
             Some(path) => parse_bridge_dataloader_pos(path)?,
             None => None,
         }
@@ -1971,7 +1956,8 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(last_lr) = learning_rates.last() {
         println!("  lr_last      : {last_lr}");
     }
-    let factorized_l1 = restored_state.as_ref().map(SfnnTrainStateCase::has_factorized_l1).unwrap_or(initial_case.l1fw.is_some());
+    let factorized_l1 =
+        restored_state.as_ref().map(SfnnTrainStateCase::has_factorized_l1).unwrap_or(initial_case.l1fw.is_some());
     println!("  l1_factor    : {}", if factorized_l1 { "enabled" } else { "disabled" });
     if let Some(elapsed) = train_elapsed {
         let seconds = elapsed.as_secs_f64();
@@ -2078,10 +2064,10 @@ fn run_nnue_bridge_test_pass(
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeTestMetrics> {
     use bulletou_lib::{
         game::inputs::ShogiHalfKP,
-        validate::{compute_sign_accuracy_with_loss, ValidationLossKind},
+        validate::{ValidationLossKind, compute_sign_accuracy_with_loss},
         value::{
+            FastBatchHost, NnueForwardWeights, NoOutputBuckets,
             loader::{DefaultDataLoader, DirectSequentialDataLoader},
-            FastBatchHost, NoOutputBuckets, NnueForwardWeights,
         },
     };
 
@@ -2123,9 +2109,9 @@ fn run_nnue_bridge_test_pass(
     for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
         let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
         let batch = FastBatchHost::from(prepared);
-        let mut chunk_outputs = forward_weights.forward_batch(&batch).map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}"))
-        })?;
+        let mut chunk_outputs = forward_weights
+            .forward_batch(&batch)
+            .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}")))?;
         outputs.append(&mut chunk_outputs);
     }
 
@@ -2166,10 +2152,10 @@ fn run_sfnn_bridge_test_pass(
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeTestMetrics> {
     use bulletou_lib::{
         game::{inputs::ShogiHalfKa2, outputs::ShogiLayerStackBucket9},
-        validate::{compute_sign_accuracy_with_loss, ValidationLossKind},
+        validate::{ValidationLossKind, compute_sign_accuracy_with_loss},
         value::{
-            loader::{DefaultDataLoader, DirectSequentialDataLoader},
             FastBatchHost, SfnnForwardWeights,
+            loader::{DefaultDataLoader, DirectSequentialDataLoader},
         },
     };
 
@@ -2184,13 +2170,7 @@ fn run_sfnn_bridge_test_pass(
     let mut folded_l1b = state.l1b.weights.clone();
     match (&state.l1fw, &state.l1fb) {
         (Some(l1fw), Some(l1fb)) => {
-            fold_sfnn_factorized_l1(
-                shape,
-                &l1fw.weights,
-                &l1fb.weights,
-                &mut folded_l1w,
-                &mut folded_l1b,
-            )?;
+            fold_sfnn_factorized_l1(shape, &l1fw.weights, &l1fb.weights, &mut folded_l1w, &mut folded_l1b)?;
         }
         (None, None) => {}
         _ => {
@@ -2481,8 +2461,8 @@ fn write_nnue_halfkp_nn_bin(
     state: &nnue_train_step::NnueTrainStateReadback,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_lib::value::nnue_save::{
-        header_bytes, ft_hash_bytes, l1_bias_scale, network_layer_hash_bytes, pad_weights_for_simd, Activation,
-        NnueFeatureSet,
+        Activation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale, network_layer_hash_bytes,
+        pad_weights_for_simd,
     };
     use std::io::Write as _;
 
@@ -2515,14 +2495,12 @@ fn write_nnue_halfkp_nn_bin(
         })?;
     write_quantized_i16(&mut writer, path, "l0b", &state.l0b.weights, qa)?;
     write_quantized_i16(&mut writer, path, "l0w", &state.l0w.weights, qa)?;
-    writer
-        .write_all(&network_layer_hash_bytes(shape.l1, shape.l2, shape.l3))
-        .map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "failed to write NNUE nn.bin network hash {}: {err}",
-                path.display()
-            ))
-        })?;
+    writer.write_all(&network_layer_hash_bytes(shape.l1, shape.l2, shape.l3)).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write NNUE nn.bin network hash {}: {err}",
+            path.display()
+        ))
+    })?;
 
     write_quantized_i32(&mut writer, path, "l1b", &state.l1b.weights, l1_bias)?;
     let l1w = transpose_input_major_dense_weights(&state.l1w.weights, l1_input_dim, shape.l2)?;
@@ -2698,10 +2676,9 @@ fn write_nnue_root_state_bin(
                 (format!("nnue/{}/outb", $section), state.outb.$field.as_slice()),
             ];
             records.sort_by(|a, b| a.0.cmp(&b.0));
-            let chunk =
-                bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
-                    records.iter().map(|(id, values)| (id.as_str(), *values)),
-                );
+            let chunk = bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+                records.iter().map(|(id, values)| (id.as_str(), *values)),
+            );
             writer.write_all(&chunk).map_err(|err| {
                 bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                     "failed to write NNUE root state.bin {}: {err}",
@@ -2751,7 +2728,7 @@ fn write_sfnn_halfka2_nn_bin(
         trainer::save::ModelWeights,
         value::{
             nnue_save::NnueFeatureSet,
-            nnue_save_sfnn1536::{build_sfnn_1536_save_format, Sfnn1536SaveParams},
+            nnue_save_sfnn1536::{Sfnn1536SaveParams, build_sfnn_1536_save_format},
         },
     };
 
@@ -2863,10 +2840,9 @@ fn write_sfnn_root_state_bin(
                 }
             }
             records.sort_by(|a, b| a.0.cmp(&b.0));
-            let chunk =
-                bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
-                    records.iter().map(|(id, values)| (id.as_str(), *values)),
-                );
+            let chunk = bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+                records.iter().map(|(id, values)| (id.as_str(), *values)),
+            );
             writer.write_all(&chunk).map_err(|err| {
                 bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                     "failed to write SFNN root state.bin {}: {err}",
@@ -2895,10 +2871,8 @@ fn write_sfnn_root_state_bin(
             ));
         }
     }
-    let mut step_records: Vec<(String, Vec<f32>)> = step_ids
-        .iter()
-        .map(|id| (format!("nnue/step_ranger/{id}"), vec![step]))
-        .collect();
+    let mut step_records: Vec<(String, Vec<f32>)> =
+        step_ids.iter().map(|id| (format!("nnue/step_ranger/{id}"), vec![step])).collect();
     step_records.sort_by(|a, b| a.0.cmp(&b.0));
     let chunk = bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
         step_records.iter().map(|(id, values)| (id.as_str(), values.as_slice())),
@@ -2951,10 +2925,7 @@ fn create_next_numbered_checkpoint_dir(
     let index = max_index + 1;
     let dir = output_dir.join(format!("{index:04}"));
     std::fs::create_dir(&dir).map_err(|err| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "failed to create checkpoint dir {}: {err}",
-            dir.display()
-        ))
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to create checkpoint dir {}: {err}", dir.display()))
     })?;
     Ok((index, dir))
 }
@@ -3057,7 +3028,8 @@ fn find_latest_bridge_checkpoint(
             };
             let dataloader_pos_path = entry.path().join(BRIDGE_DATALOADER_POS_NAME);
             let dataloader_pos_path = dataloader_pos_path.is_file().then_some(dataloader_pos_path);
-            latest = Some((index, BridgeResumeCheckpoint { state_path, state_kind, teacher_spec, dataloader_pos_path }));
+            latest =
+                Some((index, BridgeResumeCheckpoint { state_path, state_kind, teacher_spec, dataloader_pos_path }));
         }
     }
 
@@ -3271,9 +3243,9 @@ fn validate_sfnn_teacher_fast_batch(
     shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
     batch: &bulletou_lib::value::FastBatchHost,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
-    batch.validate().map_err(|err| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!("SFNN teacher batch layout error: {err}"))
-    })?;
+    batch
+        .validate()
+        .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("SFNN teacher batch layout error: {err}")))?;
     if batch.layout.output_size != 1 {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "SFNN teacher train requires output_size=1, got {}",
@@ -3308,7 +3280,9 @@ fn validate_sfnn_teacher_fast_batch(
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
-fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCase> {
+fn load_root_halfkp_weights_as_nnue_case(
+    path: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCase> {
     let bytes = std::fs::read(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read root NNUE weights {}: {err}", path.display()))
     })?;
@@ -3323,17 +3297,16 @@ fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cud
     } else {
         bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights")
     };
-    let root_weights =
-        bulletou_lib::value::NnueForwardOwnedWeights::from_weight_map(
-            bulletou_lib::value::NNUE_HALFKP_256X2_32_32,
-            &weights,
-        )
-        .map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "failed to load HalfKP NNUE weights {}: {err}",
-                path.display()
-            ))
-        })?;
+    let root_weights = bulletou_lib::value::NnueForwardOwnedWeights::from_weight_map(
+        bulletou_lib::value::NNUE_HALFKP_256X2_32_32,
+        &weights,
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to load HalfKP NNUE weights {}: {err}",
+            path.display()
+        ))
+    })?;
 
     Ok(NnueForwardCase {
         label: "root-weights",
@@ -3360,7 +3333,9 @@ fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cud
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
-fn load_root_halfka2_weights_as_sfnn_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<SfnnForwardCase> {
+fn load_root_halfka2_weights_as_sfnn_case(
+    path: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<SfnnForwardCase> {
     let bytes = std::fs::read(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read root SFNN weights {}: {err}", path.display()))
     })?;
@@ -3414,7 +3389,9 @@ fn load_root_halfka2_weights_as_sfnn_case(path: &std::path::Path) -> bulletou_cu
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
-fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateCase> {
+fn load_root_halfkp_train_state_case(
+    path: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateCase> {
     let bytes = std::fs::read(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to read root NNUE train state {}: {err}",
@@ -3478,14 +3455,15 @@ fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_ox
         Ok(values.clone())
     }
 
-    let group = |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
-        Ok(NnueTrainStateGroupCase {
-            weights: take_record(path, "weights", &weights, id, expected_len)?,
-            momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
-            velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
-            slow_params: take_record(path, "slow", slow, id, expected_len)?,
-        })
-    };
+    let group =
+        |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
+            Ok(NnueTrainStateGroupCase {
+                weights: take_record(path, "weights", &weights, id, expected_len)?,
+                momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
+                velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
+                slow_params: take_record(path, "slow", slow, id, expected_len)?,
+            })
+        };
 
     Ok(NnueTrainStateCase {
         shape,
@@ -3503,7 +3481,9 @@ fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_ox
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
-fn load_root_halfka2_train_state_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<SfnnTrainStateCase> {
+fn load_root_halfka2_train_state_case(
+    path: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<SfnnTrainStateCase> {
     let bytes = std::fs::read(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to read root SFNN train state {}: {err}",
@@ -3568,24 +3548,22 @@ fn load_root_halfka2_train_state_case(path: &std::path::Path) -> bulletou_cuda_o
         Ok(values.clone())
     }
 
-    let group = |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
-        Ok(NnueTrainStateGroupCase {
-            weights: take_record(path, "weights", &weights, id, expected_len)?,
-            momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
-            velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
-            slow_params: take_record(path, "slow", slow, id, expected_len)?,
-        })
-    };
-    let optional_group =
-        |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<Option<NnueTrainStateGroupCase>> {
-            let present =
-                weights.contains_key(id) || momentum.contains_key(id) || velocity.contains_key(id) || slow.contains_key(id);
-            if present {
-                Ok(Some(group(id, expected_len)?))
-            } else {
-                Ok(None)
-            }
+    let group =
+        |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
+            Ok(NnueTrainStateGroupCase {
+                weights: take_record(path, "weights", &weights, id, expected_len)?,
+                momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
+                velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
+                slow_params: take_record(path, "slow", slow, id, expected_len)?,
+            })
         };
+    let optional_group = |id: &'static str,
+                          expected_len: usize|
+     -> bulletou_cuda_oxide_runtime::Result<Option<NnueTrainStateGroupCase>> {
+        let present =
+            weights.contains_key(id) || momentum.contains_key(id) || velocity.contains_key(id) || slow.contains_key(id);
+        if present { Ok(Some(group(id, expected_len)?)) } else { Ok(None) }
+    };
     let l1fw = optional_group("l1fw", layout.l1fw_len())?;
     let l1fb = optional_group("l1fb", layout.l1fb_len())?;
     if l1fw.is_some() != l1fb.is_some() {
@@ -3667,8 +3645,7 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
     use bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights;
     use nnue_train_step::{NnueLossRangerStepRunner, NnueTrainLossKind, NnueTrainStepHostBatch};
 
-    let (first_train_case, train_batches) =
-        load_nnue_train_fixture_sequence(&args, "--nnue-loss-ranger-step-smoke")?;
+    let (first_train_case, train_batches) = load_nnue_train_fixture_sequence(&args, "--nnue-loss-ranger-step-smoke")?;
 
     let first_case = &first_train_case.forward;
     let mut cpu_case = first_case.clone();
@@ -3744,7 +3721,7 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(&stream, &module, params, train_loss_kind, host_batch)?;
+        runner.step(&stream, &module, params, train_loss_kind, host_batch, false)?;
         stream.synchronize()?;
 
         let gpu_loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -3762,10 +3739,8 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         )?);
         if args.debug_readback {
             let gpu_per_sample = gpu_loss.per_sample.as_ref().expect("debug loss readback requested");
-            let gpu_output_gradients = gpu_loss
-                .mean_output_gradients
-                .as_ref()
-                .expect("debug loss gradient readback requested");
+            let gpu_output_gradients =
+                gpu_loss.mean_output_gradients.as_ref().expect("debug loss gradient readback requested");
             comparisons.push(compare_slices(
                 format!("step{step}_per_sample"),
                 &cpu_loss_trace.per_sample,
@@ -4030,7 +4005,7 @@ fn run_adamw_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
 #[cfg(feature = "cuda")]
 fn run_radam_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{optimizer::RAdamUpdateLayout, DeviceBuffer};
+    use bulletou_cuda_oxide_runtime::{DeviceBuffer, optimizer::RAdamUpdateLayout};
 
     let cases = RAdamUpdateCase::cases();
     let ptx = match args.ptx {
@@ -4113,7 +4088,7 @@ fn run_radam_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
 #[cfg(feature = "cuda")]
 fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{optimizer::RangerLookaheadLayout, DeviceBuffer};
+    use bulletou_cuda_oxide_runtime::{DeviceBuffer, optimizer::RangerLookaheadLayout};
 
     let case = RangerLookaheadCase::tiny();
     let cpu_trace = case.cpu_lookahead_trace();
@@ -4129,14 +4104,7 @@ fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
     let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
     let mut slow_params = DeviceBuffer::from_host(&stream, &case.slow_params)?;
 
-    optimizer_update::launch_ranger_lookahead(
-        &stream,
-        &module,
-        layout,
-        case.params,
-        &mut weights,
-        &mut slow_params,
-    )?;
+    optimizer_update::launch_ranger_lookahead(&stream, &module, layout, case.params, &mut weights, &mut slow_params)?;
     stream.synchronize()?;
 
     let gpu_weights = weights.to_host_vec(&stream)?;
@@ -4172,8 +4140,8 @@ fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
 #[cfg(feature = "cuda")]
 fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
-        optimizer::{OptimizerStateLayout, RangerOptimizerHostState, RangerOptimizerState, RangerUpdateLayout},
         DeviceBuffer,
+        optimizer::{OptimizerStateLayout, RangerOptimizerHostState, RangerOptimizerState, RangerUpdateLayout},
     };
 
     let case = RangerUpdateCase::tiny();
@@ -4189,11 +4157,8 @@ fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()
     let layout = RangerUpdateLayout::new(case.weights.len());
     let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
     let state_layout = OptimizerStateLayout::new(case.weights.len());
-    let host_state = RangerOptimizerHostState {
-        momentum: &case.momentum,
-        velocity: &case.velocity,
-        slow_params: &case.slow_params,
-    };
+    let host_state =
+        RangerOptimizerHostState { momentum: &case.momentum, velocity: &case.velocity, slow_params: &case.slow_params };
     let mut optimizer_state = RangerOptimizerState::from_host(&stream, state_layout, host_state)?;
 
     for step_idx in 0..case.gradients_by_step.len() {
@@ -4438,6 +4403,7 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 #[cfg(feature = "cuda")]
 fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
+        DeviceBuffer,
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
             SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
@@ -4447,7 +4413,6 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
             SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
         },
-        DeviceBuffer,
     };
 
     let case = match &args.sfnn_forward_fixture {
@@ -4664,6 +4629,7 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
 #[cfg(feature = "cuda")]
 fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
+        DeviceBuffer,
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
             SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
@@ -4674,7 +4640,6 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
             SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
         },
-        DeviceBuffer,
     };
 
     let case = match args.sfnn_forward_fixture.as_deref() {
@@ -4880,7 +4845,12 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
             let gpu_momentum = $state.momentum.to_host_vec(&stream)?;
             let gpu_velocity = $state.velocity.to_host_vec(&stream)?;
             let gpu_slow_params = $state.slow_params.to_host_vec(&stream)?;
-            comparisons.push(compare_slices(concat!($name, "_weights"), &expected.weights, &gpu_weights, args.tolerance)?);
+            comparisons.push(compare_slices(
+                concat!($name, "_weights"),
+                &expected.weights,
+                &gpu_weights,
+                args.tolerance,
+            )?);
             comparisons.push(compare_slices(
                 concat!($name, "_momentum"),
                 &expected.momentum,
@@ -4893,23 +4863,22 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
                 &gpu_velocity,
                 args.tolerance,
             )?);
-            comparisons.push(compare_slices(concat!($name, "_slow"), &expected.slow_params, &gpu_slow_params, args.tolerance)?);
+            comparisons.push(compare_slices(
+                concat!($name, "_slow"),
+                &expected.slow_params,
+                &gpu_slow_params,
+                args.tolerance,
+            )?);
         }};
     }
-    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) = (
-        &case.l1fw,
-        &cpu_trace.l1fw_gradients,
-        &device_weights.l1fw,
-        &optimizer_states.l1fw,
-    ) {
+    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) =
+        (&case.l1fw, &cpu_trace.l1fw_gradients, &device_weights.l1fw, &optimizer_states.l1fw)
+    {
         compare_optional_group!("l1fw", weights, gradients, device_weights, state);
     }
-    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) = (
-        &case.l1fb,
-        &cpu_trace.l1fb_gradients,
-        &device_weights.l1fb,
-        &optimizer_states.l1fb,
-    ) {
+    if let (Some(weights), Some(gradients), Some(device_weights), Some(state)) =
+        (&case.l1fb, &cpu_trace.l1fb_gradients, &device_weights.l1fb, &optimizer_states.l1fb)
+    {
         compare_optional_group!("l1fb", weights, gradients, device_weights, state);
     }
     compare_group!(l2w, &case.l2w, &cpu_trace.l2w_gradients);
@@ -4988,11 +4957,7 @@ fn default_nnue_ptx() -> bulletou_cuda_oxide_runtime::Result<std::path::PathBuf>
     Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
         "CUDA kernel artifact not found. Run cargo-oxide for the binary crate, then pass the generated artifact with --ptx.\n\
          Probed:\n  {}",
-        candidates
-            .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n  ")
+        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ")
     )))
 }
 
@@ -5041,10 +5006,7 @@ fn parse_u64_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_run
 #[cfg(feature = "cuda")]
 fn parse_u16_arg(value: String, option: &'static str) -> bulletou_cuda_oxide_runtime::Result<u16> {
     value.parse().map_err(|_| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "{option} must be an integer in [0, 65535]\n\n{}",
-            usage()
-        ))
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("{option} must be an integer in [0, 65535]\n\n{}", usage()))
     })
 }
 
@@ -5112,7 +5074,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -5314,10 +5276,7 @@ struct RAdamUpdateTrace {
 #[cfg(feature = "cuda")]
 impl RAdamUpdateCase {
     fn cases() -> [Self; 2] {
-        [
-            Self::new("warmup-no-denom", 1),
-            Self::new("rectified-denom", 6),
-        ]
+        [Self::new("warmup-no-denom", 1), Self::new("rectified-denom", 6)]
     }
 
     fn new(label: &'static str, step: usize) -> Self {
@@ -5522,14 +5481,10 @@ struct SingleRangerUpdateTrace {
 #[cfg(feature = "cuda")]
 fn validate_nnue_teacher_schedule_args(args: &Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     if !(args.learning_rate.is_finite() && args.learning_rate > 0.0) {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--learning-rate must be finite and > 0".to_string(),
-        ));
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--learning-rate must be finite and > 0".to_string()));
     }
     if !(args.lr_min.is_finite() && args.lr_min >= 0.0) {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--lr-min must be finite and >= 0".to_string(),
-        ));
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--lr-min must be finite and >= 0".to_string()));
     }
     if matches!(args.lr_schedule, TrainLrScheduleKind::Step | TrainLrScheduleKind::Geometric) && args.lr_min <= 0.0 {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
@@ -5537,9 +5492,7 @@ fn validate_nnue_teacher_schedule_args(args: &Args) -> bulletou_cuda_oxide_runti
         ));
     }
     if args.lr_min > args.learning_rate {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--lr-min must be <= --learning-rate".to_string(),
-        ));
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--lr-min must be <= --learning-rate".to_string()));
     }
     if !(args.lr_step_gamma.is_finite() && args.lr_step_gamma > 0.0 && args.lr_step_gamma <= 1.0) {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
@@ -5547,9 +5500,7 @@ fn validate_nnue_teacher_schedule_args(args: &Args) -> bulletou_cuda_oxide_runti
         ));
     }
     if matches!(args.lr_step_positions, Some(0)) {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--lr-step-positions must be > 0".to_string(),
-        ));
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--lr-step-positions must be > 0".to_string()));
     }
     if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
@@ -5579,27 +5530,21 @@ fn nnue_teacher_save_interval_steps(args: &Args) -> bulletou_cuda_oxide_runtime:
     if args.save_rate == 0 {
         return Ok(None);
     }
-    args.save_rate
-        .checked_mul(args.batches_per_superbatch)
-        .filter(|&interval| interval > 0)
-        .map(Some)
-        .ok_or_else(|| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(
-                "--save-rate * --batches-per-superbatch overflowed".to_string(),
-            )
-        })
+    args.save_rate.checked_mul(args.batches_per_superbatch).filter(|&interval| interval > 0).map(Some).ok_or_else(
+        || bulletou_cuda_oxide_runtime::Error::Smoke("--save-rate * --batches-per-superbatch overflowed".to_string()),
+    )
 }
 
 #[cfg(feature = "cuda")]
 fn nnue_teacher_learning_rate_for_step(args: &Args, step: usize) -> f32 {
-    let total_positions = ((step.saturating_sub(1) as u128).saturating_mul(args.batch_size as u128))
-        .min(u64::MAX as u128) as u64;
+    let total_positions =
+        ((step.saturating_sub(1) as u128).saturating_mul(args.batch_size as u128)).min(u64::MAX as u128) as u64;
     match args.lr_schedule {
         TrainLrScheduleKind::Fixed => args.learning_rate,
         TrainLrScheduleKind::Step => {
-            let step_positions = args.lr_step_positions.unwrap_or_else(|| {
-                (args.batch_size as u64).saturating_mul(args.batches_per_superbatch as u64).max(1)
-            });
+            let step_positions = args
+                .lr_step_positions
+                .unwrap_or_else(|| (args.batch_size as u64).saturating_mul(args.batches_per_superbatch as u64).max(1));
             let epoch_pos = if args.lr_period_positions == 0 {
                 total_positions
             } else {
@@ -6044,11 +5989,7 @@ impl DenseCReluBackwardCase {
     fn crelu_pre_gradient(&self, sample: usize, out_col: usize) -> f32 {
         let idx = sample * self.output_dim + out_col;
         let activation = self.activations[idx];
-        if activation > 0.0 && activation < 1.0 {
-            self.output_gradients[idx]
-        } else {
-            0.0
-        }
+        if activation > 0.0 && activation < 1.0 { self.output_gradients[idx] } else { 0.0 }
     }
 }
 
@@ -6525,8 +6466,7 @@ impl NnueTrainStateCase {
             l3: read_usize(&mut reader, "shape.l3")?,
         };
         let completed_steps = read_usize(&mut reader, "completed_steps")?;
-        let layout =
-            bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+        let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
 
         fn read_group(
             reader: &mut impl std::io::Read,
@@ -6582,9 +6522,7 @@ impl NnueTrainStateCase {
         }
     }
 
-    fn host_optimizer_states(
-        &self,
-    ) -> bulletou_cuda_oxide_runtime::optimizer::NnueRangerOptimizerHostStates<'_> {
+    fn host_optimizer_states(&self) -> bulletou_cuda_oxide_runtime::optimizer::NnueRangerOptimizerHostStates<'_> {
         use bulletou_cuda_oxide_runtime::optimizer::{NnueRangerOptimizerHostStates, RangerOptimizerHostState};
 
         macro_rules! group {
@@ -6642,9 +6580,7 @@ impl SfnnTrainStateCase {
         }
     }
 
-    fn host_optimizer_states(
-        &self,
-    ) -> bulletou_cuda_oxide_runtime::optimizer::SfnnRangerOptimizerHostStates<'_> {
+    fn host_optimizer_states(&self) -> bulletou_cuda_oxide_runtime::optimizer::SfnnRangerOptimizerHostStates<'_> {
         use bulletou_cuda_oxide_runtime::optimizer::{RangerOptimizerHostState, SfnnRangerOptimizerHostStates};
 
         macro_rules! group {
@@ -6869,18 +6805,13 @@ fn append_nnue_bridge_summary_log(
             )));
         }
     };
-    let mut writer = std::io::BufWriter::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|err| {
-                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                    "failed to open bridge summary log {}: {err}",
-                    path.display()
-                ))
-            })?,
-    );
+    let mut writer =
+        std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to open bridge summary log {}: {err}",
+                path.display()
+            ))
+        })?);
 
     if write_header {
         writeln!(
@@ -7031,18 +6962,13 @@ fn append_sfnn_bridge_summary_log(
             )));
         }
     };
-    let mut writer = std::io::BufWriter::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|err| {
-                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                    "failed to open SFNN bridge summary log {}: {err}",
-                    path.display()
-                ))
-            })?,
-    );
+    let mut writer =
+        std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to open SFNN bridge summary log {}: {err}",
+                path.display()
+            ))
+        })?);
 
     if write_header {
         writeln!(
@@ -7108,7 +7034,10 @@ fn ensure_compatible_nnue_train_batches(
         ));
     };
     for (idx, case) in cases.iter().enumerate() {
-        if case.input_size != shape.input_size || case.batch_size != first.batch_size || case.max_active != first.max_active {
+        if case.input_size != shape.input_size
+            || case.batch_size != first.batch_size
+            || case.max_active != first.max_active
+        {
             return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                 "NNUE train batch #{} has incompatible layout: input={} batch={} max_active={}, expected input={} batch={} max_active={}",
                 idx + 1,
@@ -7488,21 +7417,19 @@ impl SfnnForwardCase {
         let mut l1f_flag = [0_u8; 1];
         match std::io::Read::read(&mut reader, &mut l1f_flag) {
             Ok(0) => return Ok(case),
-            Ok(1) => {
-                match l1f_flag[0] {
-                    0 => {}
-                    1 => {
-                        case.l1fw = Some(read_f32_vec(&mut reader, layout.l1fw_len(), "l1fw")?);
-                        case.l1fb = Some(read_f32_vec(&mut reader, layout.l1fb_len(), "l1fb")?);
-                    }
-                    value => {
-                        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                            "SFNN forward fixture {} has invalid l1f flag {value}",
-                            path.display()
-                        )));
-                    }
+            Ok(1) => match l1f_flag[0] {
+                0 => {}
+                1 => {
+                    case.l1fw = Some(read_f32_vec(&mut reader, layout.l1fw_len(), "l1fw")?);
+                    case.l1fb = Some(read_f32_vec(&mut reader, layout.l1fb_len(), "l1fb")?);
                 }
-            }
+                value => {
+                    return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                        "SFNN forward fixture {} has invalid l1f flag {value}",
+                        path.display()
+                    )));
+                }
+            },
             Ok(_) => unreachable!("single-byte read returned more than one byte"),
             Err(err) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                 "failed to read SFNN forward fixture {}: {err}",
@@ -8179,11 +8106,7 @@ fn accumulate_sparse_l0_weight_gradients(
 
 #[cfg(feature = "cuda")]
 fn crelu_pre_gradient_from_activation(activation: f32, output_gradient: f32) -> f32 {
-    if activation > 0.0 && activation < 1.0 {
-        output_gradient
-    } else {
-        0.0
-    }
+    if activation > 0.0 && activation < 1.0 { output_gradient } else { 0.0 }
 }
 
 #[cfg(feature = "cuda")]

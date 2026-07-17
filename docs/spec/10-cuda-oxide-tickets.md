@@ -25,7 +25,8 @@ commit each completed slice.
 | BO-CUDA-017 | done | tatara parity data bridge | BulletOu can export HCPE/HCPE3/pack/PSV teachers to flat PSV for tatara, and BulletOu validation accepts PSV held-out data so both trainers can consume the same positions |
 | BO-CUDA-018 | done | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
 | BO-CUDA-019 | done | NNUE L0 sparse backward scatter optimization | larger same-PSV benchmark exposed the dense gather L0 backward bottleneck; BulletOu now zeroes L0 gradients and atomic-scatters active feature gradients, preserving correctness while greatly improving standard NNUE throughput |
-| BO-CUDA-020 | todo | remaining tatara speed/accuracy parity | continue standard NNUE HalfKP profiling/tuning from the post-BO-CUDA-019 baseline, close the remaining speed gap to tatara, and verify held-out accuracy over a longer same-PSV run |
+| BO-CUDA-020 | done | NNUE train-step profiling and WRM loss reduction | parity harness now runs host binaries in release mode by default, `--profile-train-step` reports NNUE stage timings, and WRM loss no longer recomputes every sample serially in thread 0 |
+| BO-CUDA-021 | todo | remaining tatara speed/accuracy parity | continue standard NNUE HalfKP tuning from the post-BO-CUDA-020 baseline, close the remaining optimizer/dense/transfer speed gap to tatara, and verify held-out accuracy over a longer same-PSV run |
 
 ## Notes
 
@@ -292,7 +293,34 @@ commit each completed slice.
 
 ### BO-CUDA-020
 
+- Updated `scripts/tatara_parity_smoke.ps1` so host binaries run under `cargo run --release` by default. `-DebugHost` restores the old debug-host behavior when needed.
+  - This supersedes the BO-CUDA-019 short-run speed line (`~22k pos/s`), which was contaminated by debug host execution.
+- Added `--profile-train-step` to `bulletou-cuda-train --nnue-teacher-train`.
+  - Profiling disables the async ring for that run and synchronizes after each NNUE stage.
+  - Reported stages: `forward`, `loss`, `out_bwd`, `l2_bwd`, `l1_bwd`, `l0_crelu`, `l0_sparse`, `optimizer`.
+- Reworked scalar loss kernels:
+  - old WRM behavior: one thread per sample wrote per-sample/gradient, but thread 0 recomputed the whole batch loss serially for `weighted_sum` / `mean`;
+  - new behavior: one thread per sample writes `per_sample` and `mean_output_gradients`, then `loss_finalize_from_per_sample` sums the already-computed per-sample values in deterministic order.
+- Validation:
+  - `rustfmt --edition 2024` on touched cuda-oxide files.
+  - `cargo test -p bulletou-cuda-oxide-runtime loss::tests`.
+  - `cargo check -p bulletou-cuda-train`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL: `cargo-oxide build --emit-nvvm-ir --arch sm_100 --features cuda -- --package bulletou-cuda-train --release`.
+  - WSL: rebuilt `target/cuda-oxide-artifacts/bulletou_cuda_train_bo015.cubin` via `llvm-link-20` + `opt-20` + `llc-20 --mcpu=sm_89` + `ptxas`; local SHA-256 `2a4795651ed46270c12e942d9ffaa7e79056ce2b56fccce54e696f645698814b`.
+  - WSL CUDA `--loss-smoke --loss-kind wrm --loss-case weighted` matched CPU golden (compare `ok`).
+  - WSL CUDA `--nnue-ranger-step-smoke --nnue-forward-case tiny` matched CPU golden (compare `ok`).
+- Stage profile on a PSV `batch_size=8192` teacher batch:
+  - before loss split: `loss` was `6.938 ms`;
+  - after loss split: `loss` is `0.685 ms`;
+  - remaining large stages after this pass: `optimizer` `5.587 ms`, `l1_bwd` `3.967 ms`, `l2_bwd` `2.937 ms`, `forward` `2.343 ms`, `l0_sparse` `1.983 ms`.
+- Same-PSV release-host parity measurements (`TrainPositions=65536`, `TestPositions=8192`, `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=1`, speed smoke only):
+  - pre-loss-split BulletOu release speed: `65536` positions in `0.275s`, `238720 pos/s`;
+  - post-loss-split BulletOu release speed: `65536` positions in `0.248s`, `264119 pos/s`;
+  - tatara reported `698269 pos/s` on the pre-loss-split run and `468829 pos/s` on the post-loss-split run; these one-superbatch lines are short and noisy, but BulletOu still trails tatara materially.
+
+### BO-CUDA-021
+
 - Remaining parity work:
-  - profile the post-scatter baseline (`~22k pos/s`) against tatara (`~105k pos/s`) and identify the next bottleneck;
-  - likely candidates are remaining dense backward kernels, full-parameter Ranger update over `l0w`, atomic contention in L0 scatter, and host/batch transfer overlap;
-  - run a longer same-PSV accuracy comparison after the next speed pass, since the one-superbatch held-out losses are close but accuracy differs by about `1.3pp`.
+  - optimize the post-BO-CUDA-020 bottlenecks: full-parameter Ranger update over `l0w`, remaining dense backward kernels, atomic contention in L0 scatter, and host/batch transfer overlap;
+  - run a longer same-PSV accuracy comparison after the next speed pass, since the one-superbatch held-out losses are close but accuracy still needs a less noisy check.
