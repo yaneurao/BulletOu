@@ -18,6 +18,7 @@ commit each completed slice.
 | BO-CUDA-010 | done | SFNN validation metrics | `--sfnn-teacher-train --test-teacher` and the BulletOu SFNN cuda-oxide wrapper write `test_value_accuracy` / `test_value_loss` into the normal logs |
 | BO-CUDA-011 | done | SFNN production schedule / periodic checkpoints | SFNN cuda-oxide child honors `--save-rate` and the BulletOu wrapper accepts bounded `--superbatches` / `--max-epochs` direct production schedule |
 | BO-CUDA-012 | done | SFNN resume from root `state.bin` | `--sfnn-teacher-train` can auto-resume weights, Ranger state, completed step count, and teacher dataloader position from SFNN bridge checkpoints |
+| BO-CUDA-013 | done | SFNN plateau schedule | BulletOu `--backend cuda-oxide --eval-type SFNN_HALFKA2 --lr-schedule plateau` runs through the generic plateau orchestrator using SFNN validation metrics and auto-resume |
 
 ## Notes
 
@@ -124,7 +125,7 @@ commit each completed slice.
 
 - Extended `examples/bulletou --backend cuda-oxide` to accept `--eval-type SFNN_HALFKA2` with the fixed cuda-oxide-supported architecture `--arch SFNN_halfka2_1024_7_64_k3k3`.
 - The BulletOu wrapper dispatches SFNN runs to the nested `bulletou-cuda-train --sfnn-teacher-train` child.
-- Other SFNN families, the default `SFNN_halfka2_1536_15_32_k3k3` architecture, and plateau scheduling remain fail-fast until the corresponding SFNN child features are implemented.
+- Other SFNN families and the default `SFNN_halfka2_1536_15_32_k3k3` architecture remain fail-fast until the corresponding SFNN child features are implemented.
 - Validation:
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check --example bulletou`.
@@ -147,7 +148,7 @@ commit each completed slice.
 
 - Removed the SFNN child trainer's final-checkpoint-only restriction. `--sfnn-teacher-train` now uses the same `--save-rate * --batches-per-superbatch` interval rule as the NNUE bridge path.
 - Periodic SFNN checkpoint writes include `nn.bin`, root `state.bin`, `teacher.txt`, `dataloader_pos.txt`, checkpoint-local `learn.log`, and top-level `summary-learn.log`; validation metrics are computed per saved checkpoint when `--test-teacher` is present.
-- The BulletOu wrapper now forwards SFNN `--save-rate` unchanged and accepts bounded non-plateau production schedule mode (`--superbatches N --max-epochs N`). SFNN plateau scheduling remains fail-fast.
+- The BulletOu wrapper now forwards SFNN `--save-rate` unchanged and accepts bounded non-plateau production schedule mode (`--superbatches N --max-epochs N`). Plateau scheduling is enabled by BO-CUDA-013.
 - Validation:
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
@@ -166,3 +167,12 @@ commit each completed slice.
   - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - WSL CUDA resume smoke on `shuffled-001.hcpe`: first `--sfnn-teacher-train --train-steps 1 --save-rate 1 --output /tmp/bo012-sfnn-resume-smoke` wrote `0001` with `dataloader_pos.txt = 38,0`; the second identical run printed `resume_state : .../0001/state.bin`, `resume_data : byte_offset=38, plies=0`, `start_step : 2`, consumed teacher batch 1, wrote `0002/dataloader_pos.txt = 76,0`, and produced `step2_loss weighted_sum=0.24124509 mean=0.24124509`.
+
+### BO-CUDA-013
+
+- Removed the SFNN plateau fail-fast in `examples/bulletou --backend cuda-oxide`.
+- The existing cuda-oxide plateau orchestrator now works for `SFNN_HALFKA2`: each plateau superbatch launches the SFNN child trainer with fixed LR, `--save-rate 1`, validation flags, and the SFNN trainer's checkpoint auto-resume from BO-CUDA-012.
+- Validation:
+  - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
+  - `cargo check --example bulletou`.
+  - WSL CUDA plateau smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --lr-schedule plateau --superbatches 1 --max-epochs 1 --positions-per-superbatch 1 --batch-size 1 --save-rate 1 --test-teacher shuffled-001.hcpe --test-positions 4 --test-batch-size 4` launched the nested SFNN child with `--lr-schedule fixed --learning-rate 0.000875`, wrote `0001/dataloader_pos.txt = 38,0`, wrote validation metrics `test_value_accuracy=0.666667` and `test_value_loss=0.138324`, and the plateau orchestrator printed `initial validation metrics = loss=0.138324, accuracy=0.666667`.
