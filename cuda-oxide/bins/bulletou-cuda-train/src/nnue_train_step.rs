@@ -250,6 +250,7 @@ impl NnueLossRangerStepRunner {
         loss_kind: NnueTrainLossKind,
         batch: NnueTrainStepHostBatch<'_>,
         include_debug_readback: bool,
+        readback_loss: bool,
         drain_before_enqueue: bool,
         profile: bool,
     ) -> Result<Option<NnueTrainStepLossReadback>> {
@@ -272,6 +273,7 @@ impl NnueLossRangerStepRunner {
             batch,
             slot,
             include_debug_readback,
+            readback_loss,
             profile,
         )?;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
@@ -282,7 +284,9 @@ impl NnueLossRangerStepRunner {
                 completed = Some(self.collect_pending_loss(pending)?);
             }
         }
-        self.pending_loss = Some(PendingLossReadback { slot, include_debug: include_debug_readback });
+        if readback_loss {
+            self.pending_loss = Some(PendingLossReadback { slot, include_debug: include_debug_readback });
+        }
         Ok(completed)
     }
 
@@ -355,6 +359,7 @@ impl NnueLossRangerStepRunner {
         batch: NnueTrainStepHostBatch<'_>,
         slot: usize,
         include_debug_readback: bool,
+        readback_loss: bool,
         profile: bool,
     ) -> Result<()> {
         self.validate_batch(batch)?;
@@ -386,7 +391,10 @@ impl NnueLossRangerStepRunner {
         self.slots[slot].upload_done = Some(upload_done);
 
         self.launch_compute_on_slot(stream, module, params, loss_kind, slot, profile)?;
-        self.enqueue_loss_readback(stream, slot, include_debug_readback)
+        if readback_loss {
+            self.enqueue_loss_readback(stream, slot, include_debug_readback)?;
+        }
+        Ok(())
     }
 
     fn launch_compute_on_slot(

@@ -102,6 +102,7 @@ struct Args {
     output: Option<std::path::PathBuf>,
     train_steps: usize,
     save_rate: usize,
+    loss_readback_interval: usize,
     batches_per_superbatch: usize,
     superbatches_per_epoch: usize,
     lr_schedule: TrainLrScheduleKind,
@@ -219,6 +220,7 @@ impl Args {
             output: None,
             train_steps: 1,
             save_rate: 0,
+            loss_readback_interval: 0,
             batches_per_superbatch: 1,
             superbatches_per_epoch: 0,
             lr_schedule: TrainLrScheduleKind::Fixed,
@@ -343,6 +345,12 @@ impl Args {
                 }
                 "--save-rate" => {
                     parsed.save_rate = parse_usize_arg(required_arg(&mut args, "--save-rate")?, "--save-rate")?;
+                }
+                "--loss-readback-interval" => {
+                    parsed.loss_readback_interval = parse_usize_arg(
+                        required_arg(&mut args, "--loss-readback-interval")?,
+                        "--loss-readback-interval",
+                    )?;
                 }
                 "--batches-per-superbatch" => {
                     parsed.batches_per_superbatch = parse_usize_arg(
@@ -1380,6 +1388,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             train_positions = train_positions.saturating_add(train_batch.batch_size);
 
             if use_async_pipeline {
+                let periodic_loss_readback = if args.loss_readback_interval > 0 {
+                    step % args.loss_readback_interval == 0
+                } else {
+                    step % args.batches_per_superbatch == 0
+                };
+                let readback_loss = args.output.is_some()
+                    || args.debug_readback
+                    || step == completed_step_offset + args.train_steps
+                    || periodic_loss_readback;
                 let completed_loss = runner_ref.step_pipelined(
                     &stream,
                     &module,
@@ -1387,6 +1404,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     train_loss_kind,
                     host_batch,
                     args.debug_readback,
+                    readback_loss,
                     false,
                     args.profile_train_step,
                 )?;
@@ -1401,8 +1419,10 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     dataloader_positions.push(meta.dataloader_pos);
                     last_batch = Some(meta.train_batch);
                 }
-                pending_async_step =
-                    Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
+                if readback_loss {
+                    pending_async_step =
+                        Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
+                }
                 run_steps += 1;
                 return Ok(());
             }
@@ -1535,6 +1555,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let state = runner.read_state(&stream)?;
         write_nnue_train_state_fixture(path, shape, completed_step_offset + run_steps, &state)?;
     }
+    let mut final_test_metrics = None;
     if let Some(output_dir) = &args.output {
         let should_write_final_bridge_checkpoint =
             save_interval_steps.is_none() || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
@@ -1560,6 +1581,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
                 None => None,
             };
+            final_test_metrics = test_metrics;
             bridge_checkpoints.push(write_nnue_bridge_checkpoint(
                 output_dir,
                 shape,
@@ -1576,6 +1598,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 log_context,
             )?);
         }
+    } else if let Some(cache) = &test_cache {
+        let weights = runner.read_weights(&stream)?;
+        final_test_metrics = Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?);
     }
 
     println!("bulletou-cuda-train NNUE teacher train");
@@ -1600,8 +1625,17 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  batch        : {} samples", last_batch.batch_size);
     println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  start_step   : {}", completed_step_offset + 1);
-    println!("  steps        : {}", losses.len());
+    println!("  steps        : {}", run_steps);
+    println!("  loss_points  : {}", losses.len());
     println!("  batches/sb   : {}", args.batches_per_superbatch);
+    if use_async_pipeline {
+        let interval = if args.loss_readback_interval > 0 {
+            args.loss_readback_interval
+        } else {
+            args.batches_per_superbatch
+        };
+        println!("  loss_readback: every {interval} batches");
+    }
     println!("  lr_schedule  : {}", train_lr_schedule_label(args.lr_schedule));
     if let Some(first_lr) = learning_rates.first() {
         println!("  lr_start     : {first_lr}");
@@ -1624,6 +1658,10 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let seconds = elapsed.as_secs_f64();
         let pos_per_sec = train_positions as f64 / seconds.max(1e-9);
         println!("  throughput   : positions={train_positions} time={seconds:.3}s pos/sec={pos_per_sec:.0}");
+    }
+    if let Some(metrics) = final_test_metrics {
+        println!("  test_loss    : {}", metrics.loss);
+        println!("  test_acc     : {}", metrics.accuracy);
     }
     for (step, weighted_sum, mean) in &losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
@@ -5182,7 +5220,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\

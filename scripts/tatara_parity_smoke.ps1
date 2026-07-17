@@ -289,7 +289,9 @@ $bulletBaseArgs = @(
     "--ptx $(Quote-Bash $bulletCubinWsl)"
 )
 
-$bulletSpeedCmd = ($bulletBasePrefix + (($bulletBaseArgs) -join " ")) -join " && "
+$bulletSpeedCmd = ($bulletBasePrefix + (($bulletBaseArgs + @(
+    "--loss-readback-interval $totalTrainBatches"
+)) -join " ")) -join " && "
 Invoke-LoggedWsl "BulletOu cuda-oxide speed smoke" $bulletSpeedCmd (Join-Path $runDir "bulletou-speed.log")
 
 if (-not $SkipBulletMetrics) {

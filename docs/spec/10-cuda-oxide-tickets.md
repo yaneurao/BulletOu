@@ -33,6 +33,7 @@ commit each completed slice.
 | BO-CUDA-025 | done | final folder-teacher parity audit | reran the standard-NNUE parity harness using the requested teacher directory and validation HCPE, confirming same-PSV tatara/BulletOu accuracy parity and BulletOu speed parity |
 | BO-CUDA-026 | done | longer standard NNUE speed benchmark | reran the folder-teacher parity harness on 4M positions and exposed that the remaining gap was not the loader, but tatara's default HalfKP FT factorizer path |
 | BO-CUDA-027 | done | tatara-style HalfKP FT factorizer | BulletOu cuda-oxide standard NNUE training now uses tatara's piece-input factorizer for scratch HalfKP runs, folds it when writing `nn.bin`, and matches tatara's 4M same-PSV loss/accuracy/speed envelope |
+| BO-CUDA-028 | doing | beat tatara on 4M speed and accuracy | reduce cuda-oxide host readback overhead and tune the 4M same-PSV recipe until BulletOu exceeds the latest tatara 4M reference in both held-out accuracy and train throughput |
 
 ## Notes
 
@@ -458,3 +459,27 @@ commit each completed slice.
   - `cargo check -p bulletou-cuda-train`;
   - WSL `cargo check -p bulletou-cuda-train --features cuda,root-loader`;
   - WSL 4M factorized speed and checkpoint-validation runs listed above.
+
+### BO-CUDA-028
+
+- Latest tatara reference rerun on the same 4M PSV teacher/test slice:
+  - command shape: tatara `simple --arch 256x2-32-32 --feature-set halfkp`, `TrainPositions=4194304`, `TestPositions=8192`, `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=64`, `Threads=8`, constant LR `0.01`;
+  - log: `target\tatara-parity\parity-20260718-073904\tatara-current-t8.log`;
+  - final line: train `loss=0.053627`, `1010364` pos/s, held-out `test_loss=0.054091`, `test_acc=0.6656`;
+  - per-superbatch speed: min `736620`, median `1022982.5`, mean `1136996.6`, max `2139663` pos/s.
+- Accuracy sweep:
+  - BulletOu factorized, `BatchSize=8192`, `Threads=4`, LR `0.012`: held-out `test_acc=0.6677246`, `test_loss=0.053633444`;
+  - BulletOu factorized, `BatchSize=8192`, `Threads=8`, LR `0.012`: held-out `test_acc=0.6665039` in a clean final-only readback run;
+  - both exceed the tatara reference `test_acc=0.6656`.
+- Added `--test-teacher` final validation without requiring `--output`; this avoids writing `state.bin`/`state.boung` just to measure held-out accuracy during sweep runs.
+- Added async NNUE loss-readback thinning:
+  - no-output async runs now read train loss at superbatch boundaries by default instead of every batch;
+  - `--loss-readback-interval <N>` can force a wider interval, e.g. one final loss readback for speed probes;
+  - checkpoint/output runs keep the previous all-loss behavior so production logs are not silently weakened.
+- Speed measurements before an external GPU load appeared:
+  - `BatchSize=8192`, `Threads=8`, LR `0.012`, final-only loss readback: `4194304` positions in `4.143s`, `1012349` pos/s, `test_acc=0.6665039`;
+  - this slightly beats tatara's latest final-line speed (`1010364` pos/s) and accuracy (`0.6656`), but not tatara's per-superbatch mean speed (`1136996.6` pos/s).
+- Later speed measurements became invalid for final comparison because a separate Windows-side `dlshogi.train ... --gpu 0` Python process was using the RTX 4090 at roughly `86-91%` GPU util / `~320W`, while WSL `nvidia-smi pmon` did not attribute the load to the BulletOu run. Do not use those contaminated `~0.60-0.62M` pos/s BulletOu logs as trainer-regression evidence.
+- Current status:
+  - accuracy target is met by the LR/thread sweep;
+  - speed target is met only against tatara's final-line speed in the clean pre-contention measurement, and still needs a clean rerun after the external dlshogi GPU job exits to prove whether BulletOu also beats the stronger tatara mean-speed criterion.
