@@ -84,6 +84,7 @@ struct Args {
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     write_nnue_forward_fixture: Option<std::path::PathBuf>,
     write_nnue_trained_forward_fixture: Option<std::path::PathBuf>,
+    write_nnue_train_state_fixture: Option<std::path::PathBuf>,
     sfnn_forward_fixture: Option<std::path::PathBuf>,
     write_sfnn_forward_fixture: Option<std::path::PathBuf>,
 }
@@ -156,6 +157,7 @@ impl Args {
             nnue_train_fixture_args: Vec::new(),
             write_nnue_forward_fixture: None,
             write_nnue_trained_forward_fixture: None,
+            write_nnue_train_state_fixture: None,
             sfnn_forward_fixture: None,
             write_sfnn_forward_fixture: None,
         };
@@ -218,6 +220,10 @@ impl Args {
                 "--write-nnue-trained-forward-fixture" => {
                     parsed.write_nnue_trained_forward_fixture =
                         Some(required_path_arg(&mut args, "--write-nnue-trained-forward-fixture")?);
+                }
+                "--write-nnue-train-state-fixture" => {
+                    parsed.write_nnue_train_state_fixture =
+                        Some(required_path_arg(&mut args, "--write-nnue-train-state-fixture")?);
                 }
                 "--sfnn-forward-fixture" => {
                     parsed.sfnn_forward_fixture = Some(required_path_arg(&mut args, "--sfnn-forward-fixture")?);
@@ -879,6 +885,10 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         };
         trained_forward.write_fixture(path)?;
     }
+    if let Some(path) = &args.write_nnue_train_state_fixture {
+        let state = runner.read_state(&stream)?;
+        write_nnue_train_state_fixture(path, first_case.shape, train_batches.len(), &state)?;
+    }
 
     println!("bulletou-cuda-train NNUE fixture train");
     println!("  ptx          : {}", ptx.display());
@@ -902,6 +912,9 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     if let Some(path) = &args.write_nnue_trained_forward_fixture {
         println!("  wrote        : {}", path.display());
+    }
+    if let Some(path) = &args.write_nnue_train_state_fixture {
+        println!("  wrote state  : {}", path.display());
     }
     println!("  train        : ok");
 
@@ -2249,7 +2262,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --nnue-fixture-train --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-fixture-train --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -2307,6 +2320,9 @@ fn usage() -> &'static str {
      --write-nnue-trained-forward-fixture writes the final trained weights\n\
      plus the last batch layout as a BOUNFWD1 fixture for follow-up forward\n\
      validation.\n\
+     --write-nnue-train-state-fixture writes BOUNRNG1 with final weights,\n\
+     Ranger momentum/velocity/slow state, and completed step count. This is\n\
+     the checkpoint/resume bridge format; restore support is added separately.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
@@ -2334,6 +2350,9 @@ const NNUE_TRAIN_FIXTURE_MAGIC: &[u8; 8] = b"BOUNTRN1";
 
 #[cfg(feature = "cuda")]
 const NNUE_TRAIN_BATCH_FIXTURE_MAGIC: &[u8; 8] = b"BOUNBCH1";
+
+#[cfg(feature = "cuda")]
+const NNUE_TRAIN_STATE_FIXTURE_MAGIC: &[u8; 8] = b"BOUNRNG1";
 
 #[cfg(feature = "cuda")]
 const SFNN_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUSFWD1";
@@ -3479,6 +3498,52 @@ impl NnueTrainBatchCase {
             ))),
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+fn write_nnue_train_state_fixture(
+    path: &std::path::Path,
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    completed_steps: usize,
+    state: &nnue_train_step::NnueTrainStateReadback,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create NNUE train state fixture {}: {err}",
+            path.display()
+        ))
+    })?);
+
+    write_all(&mut writer, NNUE_TRAIN_STATE_FIXTURE_MAGIC, "fixture magic")?;
+    for value in [shape.input_size, shape.l1, shape.l2, shape.l3, completed_steps] {
+        write_u64(&mut writer, value as u64)?;
+    }
+
+    macro_rules! write_group {
+        ($group:expr, $name:literal) => {{
+            write_f32_vec(&mut writer, &$group.weights, concat!($name, ".weights"))?;
+            write_f32_vec(&mut writer, &$group.momentum, concat!($name, ".momentum"))?;
+            write_f32_vec(&mut writer, &$group.velocity, concat!($name, ".velocity"))?;
+            write_f32_vec(&mut writer, &$group.slow_params, concat!($name, ".slow_params"))?;
+        }};
+    }
+
+    write_group!(state.l0w, "l0w");
+    write_group!(state.l0b, "l0b");
+    write_group!(state.l1w, "l1w");
+    write_group!(state.l1b, "l1b");
+    write_group!(state.l2w, "l2w");
+    write_group!(state.l2b, "l2b");
+    write_group!(state.outw, "outw");
+    write_group!(state.outb, "outb");
+
+    std::io::Write::flush(&mut writer).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush NNUE train state fixture {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]

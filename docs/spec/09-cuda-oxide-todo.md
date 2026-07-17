@@ -909,6 +909,15 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   with `-SkipCudaBuild -TrainSteps 2 -DebugReadback -RunFixtureTrain
   -TrainedForwardFixture target/cuda-oxide-fixtures/nnue-halfkp-trained-forward-script.nnuef`
   passed and wrote the requested `BOUNFWD1` fixture.
+- Added `BOUNRNG1`, a cuda-oxide-only NNUE Ranger train-state fixture format:
+  `shape`, `completed_steps`, then each NNUE parameter group as
+  `weights/momentum/velocity/slow_params`. `--nnue-fixture-train` can write it
+  with `--write-nnue-train-state-fixture <PATH>`. Validation wrote
+  `target/cuda-oxide-fixtures/nnue-halfkp-train-state.boung`; header magic was
+  `BOUNRNG1`, `completed_steps=2`, and the file size was `513873472` bytes.
+- Added `-TrainStateFixture <PATH>` to
+  `scripts/cuda_oxide_nnue_teacher_smoke.ps1`; passing it implies
+  `-RunFixtureTrain` and forwards `--write-nnue-train-state-fixture`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

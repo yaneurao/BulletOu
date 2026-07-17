@@ -16,6 +16,8 @@ cuda-oxide workspace separate:
    loop against the same fixtures.
    Pass -TrainedForwardFixture with -RunFixtureTrain to write the final
    trained weights as a BOUNFWD1 forward fixture.
+   Pass -TrainStateFixture with -RunFixtureTrain to write the final weights
+   and Ranger optimizer state as a BOUNRNG1 train-state fixture.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -39,7 +41,8 @@ param(
     [switch]$SkipCudaBuild,
     [switch]$DebugReadback,
     [switch]$RunFixtureTrain,
-    [string]$TrainedForwardFixture
+    [string]$TrainedForwardFixture,
+    [string]$TrainStateFixture
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +98,10 @@ if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
     $RunFixtureTrain = $true
 }
 
+if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
+    $RunFixtureTrain = $true
+}
+
 if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
 }
@@ -128,6 +135,14 @@ if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
     New-Item -ItemType File -Force -Path $TrainedForwardFixture | Out-Null
 }
 
+if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
+    $trainStateFixtureDir = Split-Path -Parent $TrainStateFixture
+    if (-not [string]::IsNullOrWhiteSpace($trainStateFixtureDir)) {
+        New-Item -ItemType Directory -Force -Path $trainStateFixtureDir | Out-Null
+    }
+    New-Item -ItemType File -Force -Path $TrainStateFixture | Out-Null
+}
+
 for ($step = 0; $step -lt $TrainSteps; $step++) {
     $outFixture = $fixturePaths[$step]
     Invoke-Checked "export NNUE HalfKP teacher train fixture batch $step" {
@@ -153,6 +168,11 @@ $trainedForwardArg = ""
 if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
     $wslTrainedForwardFixture = Convert-ToWslPath $TrainedForwardFixture
     $trainedForwardArg = " --write-nnue-trained-forward-fixture `"$wslTrainedForwardFixture`""
+}
+$trainStateArg = ""
+if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
+    $wslTrainStateFixture = Convert-ToWslPath $TrainStateFixture
+    $trainStateArg = " --write-nnue-train-state-fixture `"$wslTrainStateFixture`""
 }
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
 $fixtureArgsList = @()
@@ -240,7 +260,7 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-fixture-train $fixtureArgs --loss-kind $LossKind$debugFlag$trainedForwardArg
+cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-fixture-train $fixtureArgs --loss-kind $LossKind$debugFlag$trainedForwardArg$trainStateArg
 "@
 
     Invoke-Checked "NNUE fixture train loop with real teacher fixtures" {
@@ -256,4 +276,8 @@ foreach ($path in $fixturePaths) {
 if (-not [string]::IsNullOrWhiteSpace($TrainedForwardFixture)) {
     Write-Host "trained forward fixture:"
     Write-Host "  $TrainedForwardFixture"
+}
+if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
+    Write-Host "train state fixture:"
+    Write-Host "  $TrainStateFixture"
 }
