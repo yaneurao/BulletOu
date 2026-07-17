@@ -103,6 +103,19 @@ The helper script exposes the restore path as `-ResumeTrainStateFixture`: it
 reads `completed_steps` from `BOUNRNG1`, exports only later teacher batches, and
 runs the fixture-backed resume loop.
 
+For the first direct loader bridge, build with `--features cuda,root-loader` and
+run `--nnue-teacher-train`. This makes the nested cuda-oxide binary depend on
+root `bulletou_lib` only on demand, reads real teacher batches directly into
+`FastBatchHost`, and feeds them to the NNUE loss/Ranger runner without writing
+intermediate `BOUNTRN1`/`BOUNBCH1` files:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
+  --nnue-teacher-train \
+  --teacher /mnt/c/shogi/teacher/yane-distill-hcpe-20260508shuffled/shuffled-001.hcpe \
+  --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
+```
+
 WSL2 Ubuntu 24.04 validation example:
 
 ```bash

@@ -950,6 +950,18 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `cargo check -p bulletou_lib --example export_nnue_forward_fixture`,
   `cargo test -p bulletou_lib teacher_batch`, and a real HCPE
   `--batch-fixture --batch-index 1` export all passed.
+- Added optional cuda-oxide feature `root-loader` and
+  `bulletou-cuda-train --nnue-teacher-train`. This keeps the default nested
+  workspace independent of root loader dependencies, but allows
+  `--features cuda,root-loader` to call `load_halfkp_teacher_fast_batch()`
+  directly, feed real teacher batches into `NnueLossRangerStepRunner`, and
+  write the same trained forward/state fixtures as `--nnue-fixture-train`.
+- Validation: WSL2 `cargo check -p bulletou-cuda-train --features cuda` and
+  `--features cuda,root-loader` passed. A two-step direct teacher train against
+  `shuffled-001.hcpe` wrote `nnue-halfkp-direct-teacher-final.nnuef`; its
+  SHA-256 matched the fixture-backed one-shot two-step final exactly
+  (`4e0068f5e1bf98855a37f089c1885101e30096eba308596a0289db2d9ad794f3`).
+  The direct state fixture header was `BOUNRNG1 completed_steps=2`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
