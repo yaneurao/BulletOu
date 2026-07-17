@@ -825,6 +825,11 @@ impl<T: Fn(&PackedSfenValue) -> bool> ShogiPackLoader<T> {
         self
     }
 
+    pub fn with_buffer_records(mut self, records: usize) -> Self {
+        self.buffer_size = records.max(1);
+        self
+    }
+
     /// 再開位置の (byte offset, plies) を指定。`byte_offset` の位置に
     /// game header (= read_one_game の `start_flag` byte) があることが前提。
     pub fn with_resume_offset(mut self, byte_offset: u64, plies: usize) -> Self {
@@ -1010,7 +1015,7 @@ where
         // `next_after_push = (current_game_offset, ply+1)` を更新し、Vec<PSV>
         // と共に buffer 段に送る。
         let (expand_tx, expand_rx) =
-            mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(16);
+            mpsc::sync_channel::<(Vec<(PackedSfenValue, u64, usize)>, u64, usize)>(16);
         let (expand_stop_tx, expand_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
@@ -1050,8 +1055,8 @@ where
                             skipped_legacy += 1;
                             continue;
                         }
-                        positions.push(psv);
                         next_after_push = (game_offset, i + 1);
+                        positions.push((psv, next_after_push.0, next_after_push.1));
                     }
                 }
 
@@ -1096,12 +1101,13 @@ where
             let mut latest_attached: (u64, usize) = (0, 0);
 
             'dataloading: while let Ok((positions, next_off, next_plies)) = expand_rx.recv() {
-                if !positions.is_empty() {
+                let is_sweep_end = positions.is_empty();
+                if is_sweep_end {
                     latest_attached = (next_off, next_plies);
                 }
-                let is_sweep_end = positions.is_empty();
-                for entry in positions {
+                for (entry, entry_off, entry_plies) in positions {
                     read_buffer.push(entry);
+                    latest_attached = (entry_off, entry_plies);
 
                     if read_buffer.len() >= buffer_size {
                         if buffer_stop_rx.try_recv().unwrap_or(false)
@@ -1136,9 +1142,9 @@ where
         // read buffer を `f` に渡し、終了後に consumed_offset/plies を更新。
         use std::sync::atomic::Ordering;
         'dataloading: while let Ok((read_buffer, next_off, next_plies)) = buffer_rx.recv() {
-            let stop = f(&read_buffer);
             consumed_offset.store(next_off, Ordering::Release);
             consumed_plies.store(next_plies, Ordering::Release);
+            let stop = f(&read_buffer);
             if stop {
                 buffer_stop_tx.send(true).ok();
                 break 'dataloading;

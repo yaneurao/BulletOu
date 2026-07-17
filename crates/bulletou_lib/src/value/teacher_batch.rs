@@ -1,7 +1,7 @@
 //! Teacher-to-`FastBatchHost` helpers shared by fixture exporters and future
 //! fast backend trainers.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::atomic::Ordering};
 
 use crate::{
     game::inputs::ShogiHalfKP,
@@ -16,15 +16,21 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeacherDataloaderPos {
+    pub byte_offset: u64,
+    pub plies: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct HalfkpTeacherBatchConfig<'a> {
     pub teacher: &'a str,
     pub batch_size: usize,
     pub batch_index: usize,
-    /// Exact concatenated HCPE byte offset to resume from. When set, the HCPE
-    /// loader starts from this offset instead of deriving an offset from
-    /// `batch_index`; `batch_index` is still used for source labels.
-    pub hcpe_resume_offset: Option<u64>,
+    /// Exact concatenated dataloader position to resume from. When set,
+    /// supported loaders start from this position instead of deriving a skip
+    /// from `batch_index`; `batch_index` is still used for source labels.
+    pub dataloader_resume_pos: Option<TeacherDataloaderPos>,
     pub buffer_mb: usize,
     /// HCPE decode threads. `0` means loader default/auto.
     pub loader_threads: usize,
@@ -44,6 +50,7 @@ pub struct HalfkpTeacherBatchConfig<'a> {
 pub struct HalfkpTeacherBatch {
     pub batch: FastBatchHost,
     pub source: String,
+    pub dataloader_pos: Option<TeacherDataloaderPos>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,30 +117,95 @@ where
             .with_buffer_records(config.batch_size)
             .with_loader_threads(config.loader_threads)
             .with_single_epoch(true);
-            let loader_start_batch = if let Some(offset) = config.hcpe_resume_offset {
-                loader = loader.with_exact_resume_offset(offset);
+            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+                if pos.plies != 0 {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position must have plies=0, got {}",
+                        pos.plies
+                    )));
+                }
+                loader = loader.with_exact_resume_offset(pos.byte_offset);
+                (0, pos.byte_offset)
+            } else {
+                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
+                    TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
+                        config.batch_index, config.batch_size
+                    ))
+                })?;
+                let base_byte_offset = (consumed_records as u64)
+                    .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
+                    .ok_or_else(|| {
+                        TeacherBatchError::invalid_input(format!(
+                            "HCPE dataloader resume byte offset overflow: consumed_records={consumed_records}"
+                        ))
+                    })?;
+                (config.batch_index, base_byte_offset)
+            };
+            visit_halfkp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                move |visited_batches| hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches),
+                visitor,
+            )
+        }
+        DataFormat::Hcpe3 => {
+            let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(true);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
                 config.batch_index
             };
-            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, visitor)
-        }
-        DataFormat::Hcpe3 => {
-            let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
-                .with_buffer_records(config.batch_size)
-                .with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
+            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| {
+                Some(TeacherDataloaderPos {
+                    byte_offset: offset_handle.load(Ordering::Acquire),
+                    plies: plies_handle.load(Ordering::Acquire),
+                })
+            }, visitor)
         }
         DataFormat::Pack => {
-            let loader =
-                ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true).with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
+            let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(true);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| {
+                Some(TeacherDataloaderPos {
+                    byte_offset: offset_handle.load(Ordering::Acquire),
+                    plies: plies_handle.load(Ordering::Acquire),
+                })
+            }, visitor)
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
+            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
         }
     }
+}
+
+fn hcpe_dataloader_pos_after_batch(
+    base_byte_offset: u64,
+    batch_size: usize,
+    visited_batches: usize,
+) -> Option<TeacherDataloaderPos> {
+    let completed_batches = visited_batches.checked_add(1)?;
+    let consumed_records = completed_batches.checked_mul(batch_size)?;
+    let consumed_bytes = (consumed_records as u64).checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)?;
+    Some(TeacherDataloaderPos { byte_offset: base_byte_offset.checked_add(consumed_bytes)?, plies: 0 })
 }
 
 fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
@@ -149,16 +221,18 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     Ok(())
 }
 
-fn visit_halfkp_batches<D, F, E>(
+fn visit_halfkp_batches<D, P, F, E>(
     loader: D,
     format: DataFormat,
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
     loader_start_batch: usize,
+    mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
 where
     D: DataLoader<PackedSfenValue>,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
     F: FnMut(HalfkpTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
@@ -186,7 +260,8 @@ where
         }
 
         let source = format!("{format:?} teacher batch {batch_index}: {}", config.teacher);
-        if let Err(err) = visitor(HalfkpTeacherBatch { batch, source }) {
+        let dataloader_pos = dataloader_pos(visited_batches);
+        if let Err(err) = visitor(HalfkpTeacherBatch { batch, source, dataloader_pos }) {
             visit_error = Some(TeacherBatchError::invalid_input(format!(
                 "teacher batch callback failed at batch {batch_index}: {err}"
             )));
@@ -213,13 +288,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn tmp_teacher_path(name: &str, ext: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bulletou_teacher_batch_test_{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("teacher.{ext}"));
+        fs::write(&path, b"").unwrap();
+        path
+    }
+
+    fn write_tiny_pack(path: &std::path::Path) {
+        let mut bytes = Vec::new();
+        bytes.push(1); // hirate start position
+        for (move16, eval) in [
+            (59u16 | (60u16 << 7), 10i16),
+            (21u16 | (20u16 << 7), -20i16),
+            (14u16 | (15u16 << 7), 30i16),
+            (66u16 | (65u16 << 7), -40i16),
+        ] {
+            bytes.extend_from_slice(&move16.to_le_bytes());
+            bytes.extend_from_slice(&eval.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(1u16 | (1u16 << 7)).to_le_bytes()); // black-win end marker
+        bytes.push(0); // reason
+        fs::write(path, bytes).unwrap();
+    }
 
     fn config() -> HalfkpTeacherBatchConfig<'static> {
         HalfkpTeacherBatchConfig {
             teacher: "missing.hcpe",
             batch_size: 2,
             batch_index: 0,
-            hcpe_resume_offset: None,
+            dataloader_resume_pos: None,
             buffer_mb: 1,
             loader_threads: 1,
             threads: 1,
@@ -250,5 +352,42 @@ mod tests {
     fn zero_batch_count_does_not_touch_missing_teacher() {
         let visited = for_each_halfkp_teacher_fast_batch(&config(), 0, |_| Ok::<(), TeacherBatchError>(())).unwrap();
         assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn hcpe_resume_rejects_nonzero_plies() {
+        let path = tmp_teacher_path("hcpe_resume_rejects_nonzero_plies", "hcpe");
+        let teacher = path.to_string_lossy().into_owned();
+        let mut config = config();
+        config.teacher = Box::leak(teacher.into_boxed_str());
+        config.dataloader_resume_pos = Some(TeacherDataloaderPos { byte_offset: 0, plies: 1 });
+
+        let err =
+            for_each_halfkp_teacher_fast_batch(&config, 1, |_| Ok::<(), TeacherBatchError>(())).unwrap_err();
+        assert!(err.to_string().contains("plies=0"));
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pack_resume_position_roundtrips() {
+        let path = tmp_teacher_path("pack_resume_position_roundtrips", "pack");
+        write_tiny_pack(&path);
+        let teacher = path.to_string_lossy().into_owned();
+        let mut config = config();
+        config.teacher = Box::leak(teacher.into_boxed_str());
+        config.batch_size = 2;
+
+        let first = load_halfkp_teacher_fast_batch(&config).unwrap();
+        assert!(first.source.starts_with("Pack teacher batch 0"));
+        assert_eq!(first.dataloader_pos, Some(TeacherDataloaderPos { byte_offset: 0, plies: 2 }));
+
+        config.batch_index = 1;
+        config.dataloader_resume_pos = first.dataloader_pos;
+        let second = load_halfkp_teacher_fast_batch(&config).unwrap();
+        assert!(second.source.starts_with("Pack teacher batch 1"));
+        assert_eq!(second.dataloader_pos, Some(TeacherDataloaderPos { byte_offset: 0, plies: 4 }));
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

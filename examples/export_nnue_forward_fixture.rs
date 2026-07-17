@@ -309,7 +309,7 @@ fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box
         teacher,
         batch_size,
         batch_index: args.batch_index,
-        hcpe_resume_offset: None,
+        dataloader_resume_pos: None,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,

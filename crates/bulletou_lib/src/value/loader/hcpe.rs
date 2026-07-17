@@ -306,8 +306,8 @@ where
         let rx = inner.rx.as_ref().expect("rx held until drop");
 
         while let Ok((buf, offset_at_send)) = rx.recv() {
-            let stop = f(&buf);
             consumed_offset.store(offset_at_send, Ordering::Release);
+            let stop = f(&buf);
             if stop {
                 break;
             }

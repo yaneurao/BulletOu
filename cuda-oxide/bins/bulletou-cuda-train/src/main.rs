@@ -1187,12 +1187,19 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     } else {
         output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_source())
     };
-    let hcpe_resume_offset = match output_resume_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
-    {
-        Some(path) => parse_hcpe_dataloader_pos(path)?,
-        None => None,
+    let resume_checkpoint_teacher = output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
+    let resume_teacher_matches = resume_checkpoint_teacher.is_some_and(|stored| stored == teacher);
+    let legacy_resume_checkpoint = output_resume_checkpoint.is_some() && resume_checkpoint_teacher.is_none();
+    let dataloader_resume_pos = if resume_teacher_matches || legacy_resume_checkpoint {
+        match output_resume_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
+        {
+            Some(path) => parse_bridge_dataloader_pos(path)?,
+            None => None,
+        }
+    } else {
+        None
     };
 
     if args.weights_bin.is_some() && train_state_source.is_some() {
@@ -1244,17 +1251,28 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut losses = Vec::with_capacity(args.train_steps);
     let mut learning_rates = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
+    let mut dataloader_positions = Vec::with_capacity(args.train_steps);
     let mut checkpoint_losses = Vec::new();
     let mut checkpoint_learning_rates = Vec::new();
     let mut checkpoint_sources = Vec::new();
+    let mut checkpoint_dataloader_positions = Vec::new();
     let mut bridge_checkpoints = Vec::new();
     let mut last_batch = None;
     let mut run_steps = 0usize;
+    let teacher_batch_index = if dataloader_resume_pos.is_some()
+        || resume_teacher_matches
+        || legacy_resume_checkpoint
+        || output_resume_checkpoint.is_none()
+    {
+        completed_step_offset
+    } else {
+        0
+    };
     let teacher_batch_config = bulletou_lib::value::HalfkpTeacherBatchConfig {
         teacher,
         batch_size: args.batch_size,
-        batch_index: completed_step_offset,
-        hcpe_resume_offset,
+        batch_index: teacher_batch_index,
+        dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -1268,6 +1286,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         args.train_steps,
         |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
             let source = loaded.source;
+            let dataloader_pos = loaded.dataloader_pos;
             let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
             if runner.is_none() {
                 runner = Some(match restored_state.as_ref() {
@@ -1327,9 +1346,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             losses.push(loss_entry);
             learning_rates.push(learning_rate);
             sources.push(source.clone());
+            dataloader_positions.push(dataloader_pos);
             checkpoint_losses.push(loss_entry);
             checkpoint_learning_rates.push(learning_rate);
             checkpoint_sources.push(source);
+            checkpoint_dataloader_positions.push(dataloader_pos);
             run_steps += 1;
             if args.output.is_some()
                 && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false)
@@ -1347,15 +1368,18 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     weights,
                     &state,
                     &train_batch,
+                    teacher,
                     &checkpoint_losses,
                     &checkpoint_learning_rates,
                     &checkpoint_sources,
+                    &checkpoint_dataloader_positions,
                     test_metrics,
                     log_context,
                 )?);
                 checkpoint_losses.clear();
                 checkpoint_learning_rates.clear();
                 checkpoint_sources.clear();
+                checkpoint_dataloader_positions.clear();
             }
             last_batch = Some(train_batch);
             Ok(())
@@ -1412,6 +1436,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             } else {
                 checkpoint_sources.as_slice()
             };
+            let checkpoint_dataloader_pos_entries = if save_interval_steps.is_none() {
+                dataloader_positions.as_slice()
+            } else {
+                checkpoint_dataloader_positions.as_slice()
+            };
 
             let weights = runner.read_weights(&stream)?;
             let state = runner.read_state(&stream)?;
@@ -1426,9 +1455,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 weights,
                 &state,
                 last_batch,
+                teacher,
                 checkpoint_loss_entries,
                 checkpoint_lr_entries,
                 checkpoint_source_entries,
+                checkpoint_dataloader_pos_entries,
                 test_metrics,
                 log_context,
             )?);
@@ -1442,8 +1473,12 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(source) = train_state_source {
         println!("  resume_state : {} ({})", source.path().display(), source.label());
     }
-    if let Some(offset) = hcpe_resume_offset {
-        println!("  resume_hcpe  : byte_offset={offset}");
+    if let Some(pos) = dataloader_resume_pos {
+        println!("  resume_data  : byte_offset={}, plies={}", pos.byte_offset, pos.plies);
+    } else if resume_checkpoint_teacher.is_some_and(|stored_teacher| stored_teacher != teacher) {
+        let stored_teacher = resume_checkpoint_teacher.expect("checked resume checkpoint teacher");
+        println!("  resume_data  : teacher changed; starting teacher stream at batch 0");
+        println!("    previous   : {stored_teacher}");
     }
     println!("  batches      : {}", sources.len());
     for (idx, source) in sources.iter().enumerate() {
@@ -1492,6 +1527,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    nn_bin     : {}", checkpoint.nn_bin_path.display());
         println!("    state      : {}", checkpoint.state_path.display());
         println!("    state_bin  : {}", checkpoint.state_bin_path.display());
+        println!("    teacher    : {}", checkpoint.teacher_spec_path.display());
         if let Some(path) = &checkpoint.dataloader_pos_path {
             println!("    loader_pos : {}", path.display());
         }
@@ -1511,10 +1547,17 @@ struct NnueBridgeCheckpointWrite {
     nn_bin_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
+    teacher_spec_path: std::path::PathBuf,
     dataloader_pos_path: Option<std::path::PathBuf>,
     learn_log_path: std::path::PathBuf,
     summary_log_path: std::path::PathBuf,
 }
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+const BRIDGE_TEACHER_SPEC_NAME: &str = "teacher.txt";
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+const BRIDGE_DATALOADER_POS_NAME: &str = "dataloader_pos.txt";
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
 #[derive(Debug, Clone, Copy)]
@@ -1651,9 +1694,11 @@ fn write_nnue_bridge_checkpoint(
     weights: nnue_train_step::NnueTrainWeightsReadback,
     state: &nnue_train_step::NnueTrainStateReadback,
     last_batch: &NnueTrainBatchCase,
+    teacher_spec: &str,
     losses: &[(usize, f32, f32)],
     learning_rates: &[f32],
     sources: &[String],
+    dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
     test_metrics: Option<NnueBridgeTestMetrics>,
     log_context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeCheckpointWrite> {
@@ -1671,13 +1716,21 @@ fn write_nnue_bridge_checkpoint(
             learning_rates.len()
         )));
     }
+    if losses.len() != dataloader_positions.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal bridge checkpoint dataloader position mismatch: losses={} dataloader_positions={}",
+            losses.len(),
+            dataloader_positions.len()
+        )));
+    }
 
     let (index, dir) = create_next_numbered_checkpoint_dir(output_dir)?;
     let forward_path = dir.join("trained-forward.nnuef");
     let nn_bin_path = dir.join("nn.bin");
     let state_path = dir.join("state.boung");
     let state_bin_path = dir.join("state.bin");
-    let dataloader_pos_path = dir.join("dataloader_pos.txt");
+    let teacher_spec_path = dir.join(BRIDGE_TEACHER_SPEC_NAME);
+    let dataloader_pos_path = dir.join(BRIDGE_DATALOADER_POS_NAME);
     let learn_log_path = dir.join("learn.log");
     let summary_log_path = output_dir.join("summary-learn.log");
 
@@ -1701,12 +1754,8 @@ fn write_nnue_bridge_checkpoint(
     write_nnue_halfkp_nn_bin(&nn_bin_path, shape, state)?;
     write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
     write_nnue_root_state_bin(&state_bin_path, completed_steps, state)?;
-    let dataloader_pos_path = write_nnue_bridge_dataloader_pos(
-        &dataloader_pos_path,
-        completed_steps,
-        last_batch.batch_size,
-        sources,
-    )?;
+    write_bridge_teacher_spec(&teacher_spec_path, teacher_spec)?;
+    let dataloader_pos_path = write_nnue_bridge_dataloader_pos(&dataloader_pos_path, dataloader_positions)?;
     write_nnue_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, test_metrics, log_context)?;
     append_nnue_bridge_summary_log(
         &summary_log_path,
@@ -1726,6 +1775,7 @@ fn write_nnue_bridge_checkpoint(
         nn_bin_path,
         state_path,
         state_bin_path,
+        teacher_spec_path,
         dataloader_pos_path,
         learn_log_path,
         summary_log_path,
@@ -2073,6 +2123,7 @@ enum BridgeResumeStateKind {
 struct BridgeResumeCheckpoint {
     state_path: std::path::PathBuf,
     state_kind: BridgeResumeStateKind,
+    teacher_spec: Option<String>,
     dataloader_pos_path: Option<std::path::PathBuf>,
 }
 
@@ -2122,9 +2173,21 @@ fn find_latest_bridge_checkpoint(
         if let Some((state_path, state_kind)) = state
             && latest.as_ref().map_or(true, |(latest_index, _)| index > *latest_index)
         {
-            let dataloader_pos_path = entry.path().join("dataloader_pos.txt");
+            let teacher_spec_path = entry.path().join(BRIDGE_TEACHER_SPEC_NAME);
+            let teacher_spec = if teacher_spec_path.is_file() {
+                let text = std::fs::read_to_string(&teacher_spec_path).map_err(|err| {
+                    bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                        "failed to read bridge checkpoint teacher spec {}: {err}",
+                        teacher_spec_path.display()
+                    ))
+                })?;
+                Some(text.trim_end_matches(|ch| ch == '\r' || ch == '\n').to_string())
+            } else {
+                None
+            };
+            let dataloader_pos_path = entry.path().join(BRIDGE_DATALOADER_POS_NAME);
             let dataloader_pos_path = dataloader_pos_path.is_file().then_some(dataloader_pos_path);
-            latest = Some((index, BridgeResumeCheckpoint { state_path, state_kind, dataloader_pos_path }));
+            latest = Some((index, BridgeResumeCheckpoint { state_path, state_kind, teacher_spec, dataloader_pos_path }));
         }
     }
 
@@ -2159,7 +2222,9 @@ fn numbered_checkpoint_dir_index(entry: &std::fs::DirEntry) -> bulletou_cuda_oxi
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
-fn parse_hcpe_dataloader_pos(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Option<u64>> {
+fn parse_bridge_dataloader_pos(
+    path: &std::path::Path,
+) -> bulletou_cuda_oxide_runtime::Result<Option<bulletou_lib::value::TeacherDataloaderPos>> {
     let text = std::fs::read_to_string(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to read bridge checkpoint dataloader_pos.txt {}: {err}",
@@ -2182,19 +2247,13 @@ fn parse_hcpe_dataloader_pos(path: &std::path::Path) -> bulletou_cuda_oxide_runt
             path.display()
         ))
     })?;
-    let plies = plies.trim().parse::<u64>().map_err(|err| {
+    let plies = plies.trim().parse::<usize>().map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "invalid plies in dataloader_pos.txt {}: {err}",
             path.display()
         ))
     })?;
-    if plies != 0 {
-        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "HCPE dataloader_pos.txt {} must have plies=0, got {plies}",
-            path.display()
-        )));
-    }
-    Ok(Some(offset))
+    Ok(Some(bulletou_lib::value::TeacherDataloaderPos { byte_offset: offset, plies }))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -3969,11 +4028,11 @@ fn usage() -> &'static str {
      state.bin resume, and the same output fixture/state write flags as\n\
      --nnue-fixture-train. --output writes numbered cuda-oxide bridge\n\
      checkpoints with nn.bin, trained-forward.nnuef, state.boung, root state.bin,\n\
-     dataloader_pos.txt, and learn.log. --save-rate N writes every N superbatches\n\
+     teacher.txt, dataloader_pos.txt, and learn.log. --save-rate N writes every N superbatches\n\
      when --batches-per-superbatch is supplied (default 1, preserving the old\n\
      every-N-batches smoke behavior); the default 0 writes only the final batch.\n\
      LR schedule flags set the Ranger learning rate per batch. Later runs auto-resume the latest\n\
-     numbered state.boung and HCPE dataloader_pos.txt when present.\n\
+     numbered state.boung and HCPE/HCPE3/pack dataloader_pos.txt when the teacher spec matches.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
@@ -5465,31 +5524,40 @@ fn write_nnue_train_state_fixture(
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_bridge_teacher_spec(path: &std::path::Path, teacher_spec: &str) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create bridge checkpoint teacher spec {}: {err}",
+            path.display()
+        ))
+    })?);
+    writeln!(writer, "{teacher_spec}").map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write bridge checkpoint teacher spec {}: {err}",
+            path.display()
+        ))
+    })?;
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush bridge checkpoint teacher spec {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn write_nnue_bridge_dataloader_pos(
     path: &std::path::Path,
-    completed_steps: usize,
-    batch_size: usize,
-    sources: &[String],
+    dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
 ) -> bulletou_cuda_oxide_runtime::Result<Option<std::path::PathBuf>> {
     use std::io::Write as _;
 
-    let writes_hcpe_offset = sources.iter().any(|source| source.starts_with("Hcpe teacher batch "));
-    if !writes_hcpe_offset {
+    let Some(pos) = dataloader_positions.iter().rev().find_map(|pos| *pos) else {
         return Ok(None);
-    }
-
-    let consumed_records = completed_steps.checked_mul(batch_size).ok_or_else(|| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "dataloader position overflow: completed_steps={completed_steps} batch_size={batch_size}"
-        ))
-    })?;
-    let byte_offset = (consumed_records as u64)
-        .checked_mul(bulletou_lib::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
-        .ok_or_else(|| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "dataloader byte offset overflow: consumed_records={consumed_records}"
-            ))
-        })?;
+    };
 
     let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
@@ -5497,7 +5565,7 @@ fn write_nnue_bridge_dataloader_pos(
             path.display()
         ))
     })?);
-    writeln!(writer, "{byte_offset},0").map_err(|err| {
+    writeln!(writer, "{},{}", pos.byte_offset, pos.plies).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to write bridge checkpoint dataloader_pos.txt {}: {err}",
             path.display()
@@ -6685,4 +6753,46 @@ fn compare_slices(
     let mean_abs_diff = if expected.is_empty() { 0.0 } else { sum_abs_diff / expected.len() as f32 };
 
     Ok(SliceComparison { name, max_abs_diff, max_abs_index, mean_abs_diff })
+}
+
+#[cfg(all(test, feature = "cuda", feature = "root-loader"))]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bulletou_cuda_train_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_bridge_dataloader_pos_accepts_nonzero_plies() {
+        let dir = tmp_dir("parse_bridge_dataloader_pos_accepts_nonzero_plies");
+        let path = dir.join(BRIDGE_DATALOADER_POS_NAME);
+        std::fs::write(&path, "123,45\n").unwrap();
+
+        let pos = parse_bridge_dataloader_pos(&path).unwrap().unwrap();
+        assert_eq!(pos, bulletou_lib::value::TeacherDataloaderPos { byte_offset: 123, plies: 45 });
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_nnue_bridge_dataloader_pos_uses_last_available_position() {
+        let dir = tmp_dir("write_nnue_bridge_dataloader_pos_uses_last_available_position");
+        let path = dir.join(BRIDGE_DATALOADER_POS_NAME);
+        let positions = [
+            None,
+            Some(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 11, plies: 2 }),
+            None,
+            Some(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 99, plies: 7 }),
+        ];
+
+        let written = write_nnue_bridge_dataloader_pos(&path, &positions).unwrap().unwrap();
+        assert_eq!(written, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "99,7\n");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -42,8 +42,8 @@ pub use fast_sfnn_fixture::{
     write_sfnn_forward_fixture_file,
 };
 pub use teacher_batch::{
-    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, TeacherBatchError, for_each_halfkp_teacher_fast_batch,
-    load_halfkp_teacher_fast_batch,
+    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, TeacherBatchError, TeacherDataloaderPos,
+    for_each_halfkp_teacher_fast_batch, load_halfkp_teacher_fast_batch,
 };
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{

@@ -344,9 +344,9 @@ where
 
         use std::sync::atomic::Ordering;
         while let Ok((buf, next_offset, next_plies)) = rx.recv() {
-            let stop = f(&buf);
             consumed_offset.store(next_offset, Ordering::Release);
             consumed_plies.store(next_plies, Ordering::Release);
+            let stop = f(&buf);
             if stop {
                 break;
             }
