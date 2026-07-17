@@ -165,9 +165,7 @@ enum EvalType {
 enum BackendKind {
     /// Existing generic Bullet backend. Supports every eval type.
     Bullet,
-    /// Experimental cuda-oxide fast path. Currently exposes the direct
-    /// NNUE HalfKP teacher loop; schedule / validation integration is
-    /// tracked separately in BO-CUDA-003/004.
+    /// Experimental cuda-oxide fast path for fixed NNUE/SFNN layouts.
     CudaOxide,
 }
 
@@ -1248,8 +1246,8 @@ struct Args {
     eval_type: Option<EvalType>,
 
     /// Training backend. `bullet` is the existing generic backend.
-    /// `cuda-oxide` is an experimental direct NNUE HalfKP fast path and
-    /// requires `--cuda-oxide-train-steps`.
+    /// `cuda-oxide` is an experimental fixed-layout NNUE/SFNN fast path and
+    /// either requires `--cuda-oxide-train-steps` or a bounded production schedule.
     #[arg(long, value_enum, default_value = "bullet")]
     backend: BackendKind,
 
@@ -1742,14 +1740,14 @@ impl Args {
                 eval_type.cli_name(),
             ));
         }
-        if eval_type != EvalType::NnueHalfkp {
+        if !matches!(eval_type, EvalType::NnueHalfkp | EvalType::SfnnHalfka2) {
             return Err(format!(
-                "--backend cuda-oxide currently supports only --eval-type NNUE_HALFKP; {} is tracked by later tickets",
+                "--backend cuda-oxide currently supports only --eval-type NNUE_HALFKP or SFNN_HALFKA2; {} is tracked by later tickets",
                 eval_type.cli_name()
             ));
         }
 
-        let supported_arch = NnueArch::default_for_eval_type(EvalType::NnueHalfkp);
+        let supported_arch = cuda_oxide_supported_arch(eval_type);
         if self.arch() != supported_arch {
             return Err(format!(
                 "--backend cuda-oxide currently supports only --arch {}; got {}",
@@ -1828,6 +1826,26 @@ impl Args {
                 return Err(
                     "--backend cuda-oxide --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions"
                         .to_string(),
+                );
+            }
+        }
+        if eval_type == EvalType::SfnnHalfka2 {
+            if production_schedule {
+                return Err(
+                    "--backend cuda-oxide SFNN_HALFKA2 currently supports only --cuda-oxide-train-steps direct mode; \
+                     production schedule mode remains NNUE_HALFKP-only"
+                        .to_string(),
+                );
+            }
+            if self.test_teacher.is_some() {
+                return Err(
+                    "--backend cuda-oxide SFNN_HALFKA2 does not yet support --test-teacher validation metrics"
+                        .to_string(),
+                );
+            }
+            if self.sfnn_factorized_l1 {
+                return Err(
+                    "--backend cuda-oxide SFNN_HALFKA2 does not yet support --sfnn-factorized-l1".to_string(),
                 );
             }
         }
@@ -2751,7 +2769,7 @@ fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
         return Err(format!("--cuda-oxide-cargo-dir is not a directory: {}", cargo_dir.display()));
     }
 
-    eprintln!("  backend = cuda-oxide direct NNUE HalfKP trainer");
+    eprintln!("  backend = cuda-oxide direct {} trainer", args.eval_type().cli_name());
     eprintln!("  cuda-oxide cargo dir = {}", cargo_dir.display());
     if args.lr_schedule == LrScheduleKind::Plateau {
         eprintln!("  cuda-oxide schedule = production plateau orchestration mode");
@@ -2764,6 +2782,29 @@ fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
 
     let child_run = cuda_oxide_default_child_run(args)?;
     run_cuda_oxide_child(args, &cargo_dir, &child_run)
+}
+
+fn cuda_oxide_supported_arch(eval_type: EvalType) -> NnueArch {
+    match eval_type {
+        EvalType::NnueHalfkp => NnueArch::default_for_eval_type(EvalType::NnueHalfkp),
+        EvalType::SfnnHalfka2 => NnueArch::new(
+            NnueArchFamily::Sfnn,
+            NnueArchFeature::Halfka2,
+            1024,
+            7,
+            64,
+            Some(LayerStackMode::Kingrank3by3),
+        ),
+        other => unreachable!("cuda-oxide unsupported eval type reached arch selection: {other:?}"),
+    }
+}
+
+fn cuda_oxide_child_trainer_flag(eval_type: EvalType) -> &'static str {
+    match eval_type {
+        EvalType::NnueHalfkp => "--nnue-teacher-train",
+        EvalType::SfnnHalfka2 => "--sfnn-teacher-train",
+        other => unreachable!("cuda-oxide unsupported eval type reached child trainer selection: {other:?}"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2833,7 +2874,7 @@ fn cuda_oxide_default_child_run(args: &Args) -> Result<CudaOxideChildRun, String
     Ok(CudaOxideChildRun {
         train_steps,
         batches_per_superbatch,
-        save_rate: args.save_rate,
+        save_rate: if args.eval_type() == EvalType::SfnnHalfka2 { 0 } else { args.save_rate },
         superbatches_per_epoch: production_schedule.then(|| args.superbatches.expect("validated production schedule")),
         lr,
         include_weights_bin: true,
@@ -2876,12 +2917,12 @@ fn cuda_oxide_cargo_run_args_with_child(args: &Args, child_run: &CudaOxideChildR
             "--features",
             "cuda,root-loader",
             "--",
-            "--nnue-teacher-train",
-            "--teacher",
         ]
         .into_iter()
         .map(str::to_string),
     );
+    cargo_args.push(cuda_oxide_child_trainer_flag(args.eval_type()).to_string());
+    cargo_args.push("--teacher".to_string());
     cargo_args.push(absolutize_teacher_spec_for_child(&args.teacher)?);
 
     cargo_args.push("--output".to_string());
@@ -7308,7 +7349,34 @@ mod tests {
     }
 
     #[test]
-    fn cuda_oxide_backend_rejects_unwired_sfnn() {
+    fn cuda_oxide_backend_accepts_sfnn_halfka2_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_ok());
+        let child_run = cuda_oxide_default_child_run(&args).unwrap();
+        let cargo_args = cuda_oxide_cargo_run_args_with_child(&args, &child_run).unwrap();
+        assert!(cargo_args.iter().any(|arg| arg == "--sfnn-teacher-train"));
+        let save_rate_idx = cargo_args.iter().position(|arg| arg == "--save-rate").unwrap();
+        assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_sfnn_default_arch() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -7325,8 +7393,30 @@ mod tests {
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains("NNUE_HALFKP"));
-        assert!(err.contains("SFNN_HALFKA2"));
+        assert!(err.contains("SFNN_halfka2_1024_7_64_k3k3"));
+        assert!(err.contains("SFNN_halfka2_1536_15_32_k3k3"));
+    }
+
+    #[test]
+    fn cuda_oxide_backend_rejects_unwired_sfnn_family() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2HM",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--cuda-oxide-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("NNUE_HALFKP or SFNN_HALFKA2"));
+        assert!(err.contains("SFNN_HALFKA2HM"));
     }
 
     #[test]
