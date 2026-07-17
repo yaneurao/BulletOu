@@ -36,6 +36,22 @@ impl<G: Gpu> From<&Model<G>> for ModelWeights {
 }
 
 impl ModelWeights {
+    pub fn from_f32_values<I, K>(weights: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Vec<f32>)>,
+        K: Into<String>,
+    {
+        Self {
+            stores: weights
+                .into_iter()
+                .map(|(id, values)| {
+                    let shape = Shape::new(values.len(), 1);
+                    (id.into(), ShapedTValue { values: TValue::F32(values), shape })
+                })
+                .collect(),
+        }
+    }
+
     pub fn get(&self, id: &str) -> ShapedTValue {
         self.stores.get(id).cloned().unwrap()
     }
