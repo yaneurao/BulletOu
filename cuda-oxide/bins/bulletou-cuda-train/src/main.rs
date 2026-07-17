@@ -88,10 +88,15 @@ struct Args {
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     weights_bin: Option<std::path::PathBuf>,
     teacher: Option<String>,
+    test_teacher: Option<String>,
+    test_positions: usize,
+    test_batch_size: usize,
+    test_seed: u64,
     output: Option<std::path::PathBuf>,
     train_steps: usize,
     save_rate: usize,
     batches_per_superbatch: usize,
+    superbatches_per_epoch: usize,
     lr_schedule: TrainLrScheduleKind,
     learning_rate: f32,
     lr_min: f32,
@@ -195,10 +200,15 @@ impl Args {
             nnue_train_fixture_args: Vec::new(),
             weights_bin: None,
             teacher: None,
+            test_teacher: None,
+            test_positions: 100_000,
+            test_batch_size: 1024,
+            test_seed: 0,
             output: None,
             train_steps: 1,
             save_rate: 0,
             batches_per_superbatch: 1,
+            superbatches_per_epoch: 0,
             lr_schedule: TrainLrScheduleKind::Fixed,
             learning_rate: 0.01,
             lr_min: 0.01,
@@ -290,6 +300,18 @@ impl Args {
                 }
                 "--weights-bin" => parsed.weights_bin = Some(required_path_arg(&mut args, "--weights-bin")?),
                 "--teacher" => parsed.teacher = Some(required_arg(&mut args, "--teacher")?),
+                "--test-teacher" => parsed.test_teacher = Some(required_arg(&mut args, "--test-teacher")?),
+                "--test-positions" => {
+                    parsed.test_positions =
+                        parse_usize_arg(required_arg(&mut args, "--test-positions")?, "--test-positions")?;
+                }
+                "--test-batch-size" => {
+                    parsed.test_batch_size =
+                        parse_usize_arg(required_arg(&mut args, "--test-batch-size")?, "--test-batch-size")?;
+                }
+                "--test-seed" => {
+                    parsed.test_seed = parse_u64_arg(required_arg(&mut args, "--test-seed")?, "--test-seed")?;
+                }
                 "--output" => parsed.output = Some(required_path_arg(&mut args, "--output")?),
                 "--train-steps" => {
                     parsed.train_steps = parse_usize_arg(required_arg(&mut args, "--train-steps")?, "--train-steps")?;
@@ -300,6 +322,10 @@ impl Args {
                 "--batches-per-superbatch" => {
                     parsed.batches_per_superbatch =
                         parse_usize_arg(required_arg(&mut args, "--batches-per-superbatch")?, "--batches-per-superbatch")?;
+                }
+                "--superbatches-per-epoch" => {
+                    parsed.superbatches_per_epoch =
+                        parse_usize_arg(required_arg(&mut args, "--superbatches-per-epoch")?, "--superbatches-per-epoch")?;
                 }
                 "--lr-schedule" => {
                     parsed.lr_schedule = parse_train_lr_schedule(required_arg(&mut args, "--lr-schedule")?)?;
@@ -1127,6 +1153,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             "--nnue-teacher-train requires --batches-per-superbatch > 0".to_string(),
         ));
     }
+    if args.test_teacher.is_some() && args.test_batch_size == 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--test-batch-size must be > 0".to_string(),
+        ));
+    }
     validate_nnue_teacher_schedule_args(&args)?;
     let save_interval_steps = nnue_teacher_save_interval_steps(&args)?;
 
@@ -1201,12 +1232,20 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         LossKind::SigmoidMse => NnueTrainLossKind::SigmoidMse,
         LossKind::NnuePytorchWrm => NnueTrainLossKind::NnuePytorchWrm,
     };
+    let test_cache = load_nnue_bridge_test_cache(&args)?;
+    let log_context = NnueBridgeLogContext {
+        batch_size: args.batch_size,
+        batches_per_superbatch: args.batches_per_superbatch,
+        superbatches_per_epoch: args.superbatches_per_epoch,
+        lambda: 1.0,
+    };
 
     let mut runner = None;
     let mut losses = Vec::with_capacity(args.train_steps);
     let mut learning_rates = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
     let mut checkpoint_losses = Vec::new();
+    let mut checkpoint_learning_rates = Vec::new();
     let mut checkpoint_sources = Vec::new();
     let mut bridge_checkpoints = Vec::new();
     let mut last_batch = None;
@@ -1289,6 +1328,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             learning_rates.push(learning_rate);
             sources.push(source.clone());
             checkpoint_losses.push(loss_entry);
+            checkpoint_learning_rates.push(learning_rate);
             checkpoint_sources.push(source);
             run_steps += 1;
             if args.output.is_some()
@@ -1296,6 +1336,10 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             {
                 let weights = runner_ref.read_weights(&stream)?;
                 let state = runner_ref.read_state(&stream)?;
+                let test_metrics = match &test_cache {
+                    Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
+                    None => None,
+                };
                 bridge_checkpoints.push(write_nnue_bridge_checkpoint(
                     args.output.as_ref().expect("checked output exists"),
                     shape,
@@ -1304,9 +1348,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     &state,
                     &train_batch,
                     &checkpoint_losses,
+                    &checkpoint_learning_rates,
                     &checkpoint_sources,
+                    test_metrics,
+                    log_context,
                 )?);
                 checkpoint_losses.clear();
+                checkpoint_learning_rates.clear();
                 checkpoint_sources.clear();
             }
             last_batch = Some(train_batch);
@@ -1354,6 +1402,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             } else {
                 checkpoint_losses.as_slice()
             };
+            let checkpoint_lr_entries = if save_interval_steps.is_none() {
+                learning_rates.as_slice()
+            } else {
+                checkpoint_learning_rates.as_slice()
+            };
             let checkpoint_source_entries = if save_interval_steps.is_none() {
                 sources.as_slice()
             } else {
@@ -1362,6 +1415,10 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 
             let weights = runner.read_weights(&stream)?;
             let state = runner.read_state(&stream)?;
+            let test_metrics = match &test_cache {
+                Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
+                None => None,
+            };
             bridge_checkpoints.push(write_nnue_bridge_checkpoint(
                 output_dir,
                 shape,
@@ -1370,7 +1427,10 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 &state,
                 last_batch,
                 checkpoint_loss_entries,
+                checkpoint_lr_entries,
                 checkpoint_source_entries,
+                test_metrics,
+                log_context,
             )?);
         }
     }
@@ -1457,6 +1517,133 @@ struct NnueBridgeCheckpointWrite {
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Debug, Clone, Copy)]
+struct NnueBridgeTestMetrics {
+    accuracy: f32,
+    loss: f32,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Clone)]
+struct NnueBridgeTestCache {
+    positions: Vec<bulletou_lib::shogi::PackedSfenValue>,
+    teacher_scores: Vec<i16>,
+    teacher_results: Vec<i8>,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Debug, Clone, Copy)]
+struct NnueBridgeLogContext {
+    batch_size: usize,
+    batches_per_superbatch: usize,
+    superbatches_per_epoch: usize,
+    lambda: f32,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn load_nnue_bridge_test_cache(args: &Args) -> bulletou_cuda_oxide_runtime::Result<Option<NnueBridgeTestCache>> {
+    let Some(path) = args.test_teacher.as_deref() else {
+        return Ok(None);
+    };
+    let positions = bulletou_lib::validate::read_random_hcpe_positions(path, args.test_positions, args.test_seed)
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read --test-teacher {path}: {err}"))
+        })?;
+    let teacher_scores = positions.iter().map(|p| p.score()).collect();
+    let teacher_results = positions.iter().map(|p| p.game_result()).collect();
+    eprintln!("  cuda-oxide validation: loaded {} test positions from {path}", positions.len());
+    Ok(Some(NnueBridgeTestCache { positions, teacher_scores, teacher_results }))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn run_nnue_bridge_test_pass(
+    shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
+    weights: &nnue_train_step::NnueTrainWeightsReadback,
+    cache: &NnueBridgeTestCache,
+    args: &Args,
+) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeTestMetrics> {
+    use bulletou_lib::{
+        game::inputs::ShogiHalfKP,
+        validate::{compute_sign_accuracy_with_loss, ValidationLossKind},
+        value::{
+            loader::{DefaultDataLoader, DirectSequentialDataLoader},
+            FastBatchHost, NoOutputBuckets, NnueForwardWeights,
+        },
+    };
+
+    let root_shape = bulletou_lib::value::NnueForwardShape {
+        input_size: shape.input_size,
+        l1: shape.l1,
+        l2: shape.l2,
+        l3: shape.l3,
+    };
+    let forward_weights = NnueForwardWeights {
+        shape: root_shape,
+        l0w: &weights.l0w,
+        l0b: &weights.l0b,
+        l1w: &weights.l1w,
+        l1b: &weights.l1b,
+        l2w: &weights.l2w,
+        l2b: &weights.l2b,
+        outw: &weights.outw,
+        outb: &weights.outb,
+    };
+    forward_weights.validate().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward weight shape mismatch: {err}"))
+    })?;
+
+    let empty_files: [&str; 0] = [];
+    let dataloader = DefaultDataLoader::new(
+        ShogiHalfKP,
+        NoOutputBuckets,
+        (|_, blend| blend) as fn(&bulletou_lib::shogi::PackedSfenValue, f32) -> f32,
+        None,
+        matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+        false,
+        400.0,
+        (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        DirectSequentialDataLoader::new(&empty_files),
+    );
+
+    let mut outputs = Vec::with_capacity(cache.positions.len());
+    for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
+        let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
+        let batch = FastBatchHost::from(prepared);
+        let mut chunk_outputs = forward_weights.forward_batch(&batch).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}"))
+        })?;
+        outputs.append(&mut chunk_outputs);
+    }
+
+    let loss_kind = match args.loss_kind {
+        LossKind::SigmoidMse => ValidationLossKind::SigmoidMse,
+        LossKind::NnuePytorchWrm => ValidationLossKind::NnuePytorchWrm,
+    };
+    let report = compute_sign_accuracy_with_loss(
+        &outputs,
+        &cache.teacher_scores,
+        &cache.teacher_results,
+        (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        1.0,
+        400.0,
+        loss_kind,
+    );
+    let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
+    let loss = report.test_loss.unwrap_or(f32::NAN);
+    eprintln!(
+        "  cuda-oxide validation: accuracy={:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
+        accuracy * 100.0,
+        report.sign_matches,
+        report.compared,
+        report.drawn_games,
+        report.filtered_by_score_cap,
+        loss,
+        report.loss_sampled,
+    );
+    Ok(NnueBridgeTestMetrics { accuracy, loss })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn write_nnue_bridge_checkpoint(
     output_dir: &std::path::Path,
     shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
@@ -1465,13 +1652,23 @@ fn write_nnue_bridge_checkpoint(
     state: &nnue_train_step::NnueTrainStateReadback,
     last_batch: &NnueTrainBatchCase,
     losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
     sources: &[String],
+    test_metrics: Option<NnueBridgeTestMetrics>,
+    log_context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeCheckpointWrite> {
     if losses.len() != sources.len() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "internal bridge checkpoint log mismatch: losses={} sources={}",
             losses.len(),
             sources.len()
+        )));
+    }
+    if losses.len() != learning_rates.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal bridge checkpoint LR log mismatch: losses={} learning_rates={}",
+            losses.len(),
+            learning_rates.len()
         )));
     }
 
@@ -1510,8 +1707,17 @@ fn write_nnue_bridge_checkpoint(
         last_batch.batch_size,
         sources,
     )?;
-    write_nnue_bridge_learn_log(&learn_log_path, losses, sources)?;
-    append_nnue_bridge_summary_log(&summary_log_path, index, completed_steps, losses, sources)?;
+    write_nnue_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, test_metrics, log_context)?;
+    append_nnue_bridge_summary_log(
+        &summary_log_path,
+        index,
+        completed_steps,
+        losses,
+        learning_rates,
+        sources,
+        test_metrics,
+        log_context,
+    )?;
 
     Ok(NnueBridgeCheckpointWrite {
         index,
@@ -1992,10 +2198,48 @@ fn parse_hcpe_dataloader_pos(path: &std::path::Path) -> bulletou_cuda_oxide_runt
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Debug, Clone, Copy)]
+struct NnueBridgeDisplayStep {
+    epoch: usize,
+    superbatch: usize,
+    curr_batch: usize,
+    positions: u64,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn bridge_log_display_step(step: usize, context: NnueBridgeLogContext) -> NnueBridgeDisplayStep {
+    let batches_per_superbatch = context.batches_per_superbatch.max(1);
+    let global_superbatch = (step.saturating_sub(1) / batches_per_superbatch) + 1;
+    let curr_batch = ((step.saturating_sub(1) % batches_per_superbatch) + 1).min(batches_per_superbatch);
+    let (epoch, superbatch) = if context.superbatches_per_epoch == 0 {
+        (1, global_superbatch)
+    } else {
+        (
+            (global_superbatch.saturating_sub(1) / context.superbatches_per_epoch) + 1,
+            ((global_superbatch.saturating_sub(1) % context.superbatches_per_epoch) + 1),
+        )
+    };
+    let positions = (step as u128).saturating_mul(context.batch_size as u128).min(u64::MAX as u128) as u64;
+    NnueBridgeDisplayStep { epoch, superbatch, curr_batch, positions }
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn write_nnue_bridge_learn_log(
     path: &std::path::Path,
     losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
     sources: &[String],
+    test_metrics: Option<NnueBridgeTestMetrics>,
+    context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
     use std::io::Write as _;
 
@@ -2006,14 +2250,47 @@ fn write_nnue_bridge_learn_log(
         ))
     })?);
 
-    writeln!(writer, "step\tweighted_sum\tmean\tsource").map_err(|err| {
+    writeln!(
+        writer,
+        "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher"
+    )
+    .map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to write bridge checkpoint learn.log {}: {err}",
             path.display()
         ))
     })?;
-    for ((step, weighted_sum, mean), source) in losses.iter().zip(sources.iter()) {
-        writeln!(writer, "{step}\t{weighted_sum}\t{mean}\t{source}").map_err(|err| {
+    for (idx, (((step, _weighted_sum, mean), learning_rate), source)) in
+        losses.iter().zip(learning_rates.iter()).zip(sources.iter()).enumerate()
+    {
+        let display = bridge_log_display_step(*step, context);
+        let is_last = idx + 1 == losses.len();
+        let test_accuracy = if is_last {
+            test_metrics.map(|m| format!("{:.6}", m.accuracy)).unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
+        let test_loss = if is_last {
+            test_metrics.map(|m| format!("{:.6}", m.loss)).unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
+        writeln!(
+            writer,
+            "nnue,{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{}",
+            display.epoch,
+            display.superbatch,
+            display.curr_batch,
+            test_accuracy,
+            test_loss,
+            mean,
+            learning_rate,
+            learning_rate,
+            context.lambda,
+            display.positions,
+            csv_escape(source),
+        )
+        .map_err(|err| {
             bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                 "failed to write bridge checkpoint learn.log {}: {err}",
                 path.display()
@@ -5241,7 +5518,10 @@ fn append_nnue_bridge_summary_log(
     checkpoint_index: usize,
     completed_steps: usize,
     losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
     sources: &[String],
+    test_metrics: Option<NnueBridgeTestMetrics>,
+    context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<()> {
     use std::io::Write as _;
 
@@ -5269,26 +5549,42 @@ fn append_nnue_bridge_summary_log(
     );
 
     if write_header {
-        writeln!(writer, "checkpoint\tcompleted_steps\tsteps\tlast_step\tweighted_sum\tmean\tsource").map_err(
-            |err| {
-                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                    "failed to write bridge summary log header {}: {err}",
-                    path.display()
-                ))
-            },
-        )?;
+        writeln!(
+            writer,
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher"
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write bridge summary log header {}: {err}",
+                path.display()
+            ))
+        })?;
     }
 
-    let Some((last_step, weighted_sum, mean)) = losses.last().copied() else {
+    let Some((last_step, _weighted_sum, mean)) = losses.last().copied() else {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
             "cannot append bridge summary log without losses".to_string(),
         ));
     };
+    let learning_rate = learning_rates.last().copied().unwrap_or(0.0);
     let source = sources.last().map(String::as_str).unwrap_or("");
+    let display = bridge_log_display_step(last_step, context);
+    let test_accuracy = test_metrics.map(|m| format!("{:.6}", m.accuracy)).unwrap_or_else(|| "-".to_string());
+    let test_loss = test_metrics.map(|m| format!("{:.6}", m.loss)).unwrap_or_else(|| "-".to_string());
+    let _ = (checkpoint_index, completed_steps);
     writeln!(
         writer,
-        "{checkpoint_index:04}\t{completed_steps}\t{}\t{last_step}\t{weighted_sum}\t{mean}\t{source}",
-        losses.len()
+        "nnue,{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{}",
+        display.epoch,
+        display.superbatch,
+        test_accuracy,
+        test_loss,
+        mean,
+        learning_rate,
+        learning_rate,
+        context.lambda,
+        display.positions,
+        csv_escape(source),
     )
     .map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(

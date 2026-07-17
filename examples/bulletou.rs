@@ -1822,10 +1822,9 @@ impl Args {
         if self.lambda != 1.0 || self.scale != 400 {
             return Err("--backend cuda-oxide currently supports only --lambda 1.0 --scale 400".to_string());
         }
-        if self.test_teacher.is_some() || self.dump_activation_stats {
+        if self.dump_activation_stats {
             return Err(
-                "--backend cuda-oxide validation / activation metrics are not wired yet; this is BO-CUDA-004 work"
-                    .to_string(),
+                "--backend cuda-oxide activation metrics are not wired yet; this remains CPU/Bullet-only".to_string(),
             );
         }
         if self.no_resume {
@@ -2790,6 +2789,10 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
 
     cargo_args.push("--batches-per-superbatch".to_string());
     cargo_args.push(batches_per_superbatch.to_string());
+    if production_schedule {
+        cargo_args.push("--superbatches-per-epoch".to_string());
+        cargo_args.push(args.superbatches.expect("validated production schedule").to_string());
+    }
 
     cargo_args.push("--batch-size".to_string());
     cargo_args.push(effective_batch_size(args).to_string());
@@ -2814,6 +2817,17 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
 
     cargo_args.push("--loss-kind".to_string());
     cargo_args.push(if args.nnue_pytorch_wrm_loss { "wrm" } else { "sigmoid-mse" }.to_string());
+
+    if let Some(test_teacher) = &args.test_teacher {
+        cargo_args.push("--test-teacher".to_string());
+        cargo_args.push(absolutize_path_for_child(test_teacher)?.display().to_string());
+        cargo_args.push("--test-positions".to_string());
+        cargo_args.push(args.test_positions.to_string());
+        cargo_args.push("--test-batch-size".to_string());
+        cargo_args.push(args.test_batch_size.to_string());
+        cargo_args.push("--test-seed".to_string());
+        cargo_args.push(args.test_seed.to_string());
+    }
 
     if production_schedule {
         let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
