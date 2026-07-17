@@ -648,3 +648,33 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     max_abs diff `0.0000000000009094947`.
 - Remaining CO-010 work: wire these state objects to real NNUE/SFNN parameter
   groups.
+
+### 2026-07-17 CO-010 NNUE/SFNN optimizer state bundles
+
+- Added runtime layouts that mirror the real network parameter groups:
+  - `NnueOptimizerStateLayout` maps NNUE `l0w`, `l0b`, `l1w`, `l1b`,
+    `l2w`, `l2b`, `outw`, and `outb` to per-tensor
+    `OptimizerStateLayout`s.
+  - `SfnnOptimizerStateLayout` maps SFNN `l0w`, `l0b`, `l1w`, `l1b`,
+    `l2w`, `l2b`, `l3w`, and `l3b` to per-tensor
+    `OptimizerStateLayout`s.
+- Added CUDA-gated ownership bundles:
+  - `NnueRangerOptimizerStates`;
+  - `SfnnRangerOptimizerStates`.
+- Added `RangerOptimizerState::zeroed_with_host_slow_params` so real trainer
+  initialization can zero `momentum`/`velocity` while copying `slow_params`
+  from the current weights. This avoids the Lookahead state accidentally
+  starting from all zeros when weights are loaded or randomly initialized.
+- Added optimizer layout unit tests for tiny NNUE/SFNN shapes, including total
+  parameter count and total Ranger state count.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded with 25
+    optimizer tests.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+- Remaining CO-010 work: bind these per-tensor state bundles to actual
+  NNUE/SFNN gradient buffers and launch the Ranger update over each parameter
+  group in the real trainer path.

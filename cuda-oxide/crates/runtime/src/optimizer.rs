@@ -1,7 +1,11 @@
 //! Optimizer workspaces and launch layouts for cuda-oxide kernels.
 
+use crate::{nnue::NnueForwardWeightLayout, sfnn::SfnnForwardWeightLayout};
+
 #[cfg(feature = "cuda")]
-use crate::{CudaStream, DeviceBuffer, Result};
+use crate::{
+    nnue::NnueForwardHostWeights, sfnn::SfnnForwardHostWeights, CudaStream, DeviceBuffer, Result,
+};
 
 pub const ADAMW_UPDATE_KERNEL: &str = "adamw_update";
 pub const RADAM_UPDATE_KERNEL: &str = "radam_update";
@@ -185,6 +189,249 @@ impl RangerOptimizerState {
             momentum: DeviceBuffer::from_host(stream, state.momentum)?,
             velocity: DeviceBuffer::from_host(stream, state.velocity)?,
             slow_params: DeviceBuffer::from_host(stream, state.slow_params)?,
+        })
+    }
+
+    pub fn zeroed_with_host_slow_params(
+        stream: &CudaStream,
+        layout: OptimizerStateLayout,
+        slow_params: &[f32],
+    ) -> Result<Self> {
+        layout.validate()?;
+        expect_state_len("slow_params", layout.state_len(), slow_params.len())?;
+        Ok(Self {
+            layout,
+            momentum: DeviceBuffer::zeroed(stream, layout.state_len())?,
+            velocity: DeviceBuffer::zeroed(stream, layout.state_len())?,
+            slow_params: DeviceBuffer::from_host(stream, slow_params)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueOptimizerStateLayout {
+    pub weights: NnueForwardWeightLayout,
+}
+
+impl NnueOptimizerStateLayout {
+    pub fn new(weights: NnueForwardWeightLayout) -> Self {
+        Self { weights }
+    }
+
+    pub fn l0w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l0w_len())
+    }
+
+    pub fn l0b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l0b_len())
+    }
+
+    pub fn l1w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1w_len())
+    }
+
+    pub fn l1b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1b_len())
+    }
+
+    pub fn l2w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l2w_len())
+    }
+
+    pub fn l2b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l2b_len())
+    }
+
+    pub fn outw_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.outw_len())
+    }
+
+    pub fn outb_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.outb_len())
+    }
+
+    pub fn parameter_f32_len(self) -> usize {
+        self.weights
+            .l0w_len()
+            .saturating_add(self.weights.l0b_len())
+            .saturating_add(self.weights.l1w_len())
+            .saturating_add(self.weights.l1b_len())
+            .saturating_add(self.weights.l2w_len())
+            .saturating_add(self.weights.l2b_len())
+            .saturating_add(self.weights.outw_len())
+            .saturating_add(self.weights.outb_len())
+    }
+
+    pub fn momentum_velocity_state_f32_len(self) -> usize {
+        self.parameter_f32_len().saturating_mul(2)
+    }
+
+    pub fn ranger_state_f32_len(self) -> usize {
+        self.parameter_f32_len().saturating_mul(3)
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct NnueRangerOptimizerStates {
+    pub layout: NnueOptimizerStateLayout,
+    pub l0w: RangerOptimizerState,
+    pub l0b: RangerOptimizerState,
+    pub l1w: RangerOptimizerState,
+    pub l1b: RangerOptimizerState,
+    pub l2w: RangerOptimizerState,
+    pub l2b: RangerOptimizerState,
+    pub outw: RangerOptimizerState,
+    pub outb: RangerOptimizerState,
+}
+
+#[cfg(feature = "cuda")]
+impl NnueRangerOptimizerStates {
+    pub fn new_zeroed(stream: &CudaStream, weights: NnueForwardWeightLayout) -> Result<Self> {
+        let layout = NnueOptimizerStateLayout::new(weights);
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::new_zeroed(stream, layout.l0w_state_layout())?,
+            l0b: RangerOptimizerState::new_zeroed(stream, layout.l0b_state_layout())?,
+            l1w: RangerOptimizerState::new_zeroed(stream, layout.l1w_state_layout())?,
+            l1b: RangerOptimizerState::new_zeroed(stream, layout.l1b_state_layout())?,
+            l2w: RangerOptimizerState::new_zeroed(stream, layout.l2w_state_layout())?,
+            l2b: RangerOptimizerState::new_zeroed(stream, layout.l2b_state_layout())?,
+            outw: RangerOptimizerState::new_zeroed(stream, layout.outw_state_layout())?,
+            outb: RangerOptimizerState::new_zeroed(stream, layout.outb_state_layout())?,
+        })
+    }
+
+    pub fn from_host_weights(stream: &CudaStream, weights: &NnueForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        let layout = NnueOptimizerStateLayout::new(NnueForwardWeightLayout::new(weights.shape));
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l0w_state_layout(), weights.l0w)?,
+            l0b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l0b_state_layout(), weights.l0b)?,
+            l1w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1w_state_layout(), weights.l1w)?,
+            l1b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1b_state_layout(), weights.l1b)?,
+            l2w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2w_state_layout(), weights.l2w)?,
+            l2b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2b_state_layout(), weights.l2b)?,
+            outw: RangerOptimizerState::zeroed_with_host_slow_params(
+                stream,
+                layout.outw_state_layout(),
+                weights.outw,
+            )?,
+            outb: RangerOptimizerState::zeroed_with_host_slow_params(
+                stream,
+                layout.outb_state_layout(),
+                weights.outb,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnOptimizerStateLayout {
+    pub weights: SfnnForwardWeightLayout,
+}
+
+impl SfnnOptimizerStateLayout {
+    pub fn new(weights: SfnnForwardWeightLayout) -> Self {
+        Self { weights }
+    }
+
+    pub fn l0w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l0w_len())
+    }
+
+    pub fn l0b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l0b_len())
+    }
+
+    pub fn l1w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1w_len())
+    }
+
+    pub fn l1b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l1b_len())
+    }
+
+    pub fn l2w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l2w_len())
+    }
+
+    pub fn l2b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l2b_len())
+    }
+
+    pub fn l3w_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l3w_len())
+    }
+
+    pub fn l3b_state_layout(self) -> OptimizerStateLayout {
+        OptimizerStateLayout::new(self.weights.l3b_len())
+    }
+
+    pub fn parameter_f32_len(self) -> usize {
+        self.weights
+            .l0w_len()
+            .saturating_add(self.weights.l0b_len())
+            .saturating_add(self.weights.l1w_len())
+            .saturating_add(self.weights.l1b_len())
+            .saturating_add(self.weights.l2w_len())
+            .saturating_add(self.weights.l2b_len())
+            .saturating_add(self.weights.l3w_len())
+            .saturating_add(self.weights.l3b_len())
+    }
+
+    pub fn momentum_velocity_state_f32_len(self) -> usize {
+        self.parameter_f32_len().saturating_mul(2)
+    }
+
+    pub fn ranger_state_f32_len(self) -> usize {
+        self.parameter_f32_len().saturating_mul(3)
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct SfnnRangerOptimizerStates {
+    pub layout: SfnnOptimizerStateLayout,
+    pub l0w: RangerOptimizerState,
+    pub l0b: RangerOptimizerState,
+    pub l1w: RangerOptimizerState,
+    pub l1b: RangerOptimizerState,
+    pub l2w: RangerOptimizerState,
+    pub l2b: RangerOptimizerState,
+    pub l3w: RangerOptimizerState,
+    pub l3b: RangerOptimizerState,
+}
+
+#[cfg(feature = "cuda")]
+impl SfnnRangerOptimizerStates {
+    pub fn new_zeroed(stream: &CudaStream, weights: SfnnForwardWeightLayout) -> Result<Self> {
+        let layout = SfnnOptimizerStateLayout::new(weights);
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::new_zeroed(stream, layout.l0w_state_layout())?,
+            l0b: RangerOptimizerState::new_zeroed(stream, layout.l0b_state_layout())?,
+            l1w: RangerOptimizerState::new_zeroed(stream, layout.l1w_state_layout())?,
+            l1b: RangerOptimizerState::new_zeroed(stream, layout.l1b_state_layout())?,
+            l2w: RangerOptimizerState::new_zeroed(stream, layout.l2w_state_layout())?,
+            l2b: RangerOptimizerState::new_zeroed(stream, layout.l2b_state_layout())?,
+            l3w: RangerOptimizerState::new_zeroed(stream, layout.l3w_state_layout())?,
+            l3b: RangerOptimizerState::new_zeroed(stream, layout.l3b_state_layout())?,
+        })
+    }
+
+    pub fn from_host_weights(stream: &CudaStream, weights: &SfnnForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        let layout = SfnnOptimizerStateLayout::new(SfnnForwardWeightLayout::new(weights.shape));
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l0w_state_layout(), weights.l0w)?,
+            l0b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l0b_state_layout(), weights.l0b)?,
+            l1w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1w_state_layout(), weights.l1w)?,
+            l1b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1b_state_layout(), weights.l1b)?,
+            l2w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2w_state_layout(), weights.l2w)?,
+            l2b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2b_state_layout(), weights.l2b)?,
+            l3w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l3w_state_layout(), weights.l3w)?,
+            l3b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l3b_state_layout(), weights.l3b)?,
         })
     }
 }
@@ -507,6 +754,10 @@ fn expect_state_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        nnue::{NnueForwardShape, NnueForwardWeightLayout},
+        sfnn::{SfnnForwardShape, SfnnForwardWeightLayout},
+    };
 
     #[test]
     fn optimizer_kernel_names_are_stable() {
@@ -591,6 +842,49 @@ mod tests {
                 .unwrap_err(),
             OptimizerLayoutError::StateLength { name: "slow_params", expected: 3, actual: 2 }
         );
+    }
+
+    #[test]
+    fn nnue_optimizer_state_layout_counts_parameter_groups() {
+        let weights =
+            NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
+        let layout = NnueOptimizerStateLayout::new(weights);
+
+        assert_eq!(layout.l0w_state_layout().state_len(), 8);
+        assert_eq!(layout.l0b_state_layout().state_len(), 2);
+        assert_eq!(layout.l1w_state_layout().state_len(), 12);
+        assert_eq!(layout.l1b_state_layout().state_len(), 3);
+        assert_eq!(layout.l2w_state_layout().state_len(), 3);
+        assert_eq!(layout.l2b_state_layout().state_len(), 1);
+        assert_eq!(layout.outw_state_layout().state_len(), 1);
+        assert_eq!(layout.outb_state_layout().state_len(), 1);
+        assert_eq!(layout.parameter_f32_len(), 31);
+        assert_eq!(layout.momentum_velocity_state_f32_len(), 62);
+        assert_eq!(layout.ranger_state_f32_len(), 93);
+    }
+
+    #[test]
+    fn sfnn_optimizer_state_layout_counts_parameter_groups() {
+        let weights = SfnnForwardWeightLayout::new(SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 3,
+            num_stacks: 2,
+        });
+        let layout = SfnnOptimizerStateLayout::new(weights);
+
+        assert_eq!(layout.l0w_state_layout().state_len(), 16);
+        assert_eq!(layout.l0b_state_layout().state_len(), 4);
+        assert_eq!(layout.l1w_state_layout().state_len(), 24);
+        assert_eq!(layout.l1b_state_layout().state_len(), 6);
+        assert_eq!(layout.l2w_state_layout().state_len(), 24);
+        assert_eq!(layout.l2b_state_layout().state_len(), 6);
+        assert_eq!(layout.l3w_state_layout().state_len(), 6);
+        assert_eq!(layout.l3b_state_layout().state_len(), 2);
+        assert_eq!(layout.parameter_f32_len(), 88);
+        assert_eq!(layout.momentum_velocity_state_f32_len(), 176);
+        assert_eq!(layout.ranger_state_f32_len(), 264);
     }
 
     #[test]
