@@ -1063,6 +1063,17 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   extraction ignores them. Validation wrote
   `target/cuda-oxide-fixtures/nnue-backend-marker-smoke-20260717/0001/state.bin`;
   its first record was `meta/state_backend/cuda-oxide`, length `1`, value `1`.
+- Completed BO-CUDA-001: added `--nnue-train-state-bin <PATH>` to restore
+  cuda-oxide NNUE training from root-format `state.bin`, including weights,
+  momentum, velocity, slow weights, and `step_ranger` completed step. Bridge
+  `--output` auto-resume still prefers `state.boung`, but falls back to
+  `state.bin` if the exact fixture is absent. Validation resumed the same
+  `0001` checkpoint via `state.bin` and `state.boung`; both ran step2 with
+  loss `0.031774815` and wrote identical final fixtures with SHA-256
+  `07424BCDCA1802127E16AF14DF3887A26AC72A5FB7FA5D176704497C17E27396`.
+  Auto-resume fallback was also validated by temporarily hiding
+  `0001/state.boung`; `--output` selected `0001/state.bin`, restored
+  `resume_hcpe byte_offset=76`, and wrote `0002`.
 - Remaining work: promote the direct cuda-oxide teacher loop from the smoke
   binary into the end-user BulletOu training CLI, then wire the production
   schedule, validation metrics, and async input/readback rings around it.

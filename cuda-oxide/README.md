@@ -119,9 +119,11 @@ cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --train-steps 2 --save-rate 1 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 
-Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training.
-In this mode `--train-steps` is the number of additional batches to run, and
-the loader starts at `completed_steps` from the state fixture.
+Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training
+from the exact cuda-oxide state fixture, or `--nnue-train-state-bin <PATH>` to
+resume from root-format `state.bin`. In this mode `--train-steps` is the number
+of additional batches to run, and the loader starts at `completed_steps` from
+the restored state.
 Pass `--output <DIR>` to write a numbered cuda-oxide bridge checkpoint:
 `<DIR>/0001/nn.bin`, `<DIR>/0001/trained-forward.nnuef`,
 `<DIR>/0001/state.boung`, `<DIR>/0001/state.bin`, and
@@ -134,10 +136,12 @@ velocity, Ranger slow weights, step counters, and the
 current direct resume path, and append one row to top-level
 `summary-learn.log`. If `<DIR>` already contains numbered bridge checkpoints,
 the direct trainer automatically restores the latest `state.boung` and writes
-the next number. If that checkpoint has `dataloader_pos.txt`, HCPE input resumes
-from its byte offset through the loader's exact resume path. In that case omit
-`--weights-bin`, because the restored train state already carries weights and
-optimizer state. By default, `--output` writes one checkpoint at the end of the
+the next number. If `state.boung` is absent but `state.bin` exists, it restores
+from the root-format `state.bin` instead. If that checkpoint has
+`dataloader_pos.txt`, HCPE input resumes from its byte offset through the
+loader's exact resume path. In that case omit `--weights-bin`, because the
+restored train state already carries weights and optimizer state. By default,
+`--output` writes one checkpoint at the end of the
 run. Pass `--save-rate <N>` to write the same bridge checkpoint layout every
 `N` direct teacher batches; `--save-rate 0` is the default final-only mode.
 

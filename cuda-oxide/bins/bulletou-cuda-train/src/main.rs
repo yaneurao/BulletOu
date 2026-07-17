@@ -84,6 +84,7 @@ struct Args {
     sfnn_case: SfnnForwardCaseKind,
     nnue_forward_fixture: Option<std::path::PathBuf>,
     nnue_train_state_fixture: Option<std::path::PathBuf>,
+    nnue_train_state_bin: Option<std::path::PathBuf>,
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
     weights_bin: Option<std::path::PathBuf>,
     teacher: Option<String>,
@@ -170,6 +171,7 @@ impl Args {
             sfnn_case: SfnnForwardCaseKind::Tiny,
             nnue_forward_fixture: None,
             nnue_train_state_fixture: None,
+            nnue_train_state_bin: None,
             nnue_train_fixture_args: Vec::new(),
             weights_bin: None,
             teacher: None,
@@ -241,6 +243,9 @@ impl Args {
                 }
                 "--nnue-train-state-fixture" => {
                     parsed.nnue_train_state_fixture = Some(required_path_arg(&mut args, "--nnue-train-state-fixture")?);
+                }
+                "--nnue-train-state-bin" => {
+                    parsed.nnue_train_state_bin = Some(required_path_arg(&mut args, "--nnue-train-state-bin")?);
                 }
                 "--nnue-train-fixture" => {
                     parsed
@@ -1052,7 +1057,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => default_nnue_ptx()?,
     };
 
-    let output_resume_checkpoint = if args.nnue_train_state_fixture.is_none() {
+    if args.nnue_train_state_fixture.is_some() && args.nnue_train_state_bin.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--nnue-train-state-fixture and --nnue-train-state-bin cannot be used together".to_string(),
+        ));
+    }
+
+    let output_resume_checkpoint = if args.nnue_train_state_fixture.is_none() && args.nnue_train_state_bin.is_none() {
         match args.output.as_deref() {
             Some(output_dir) => find_latest_bridge_checkpoint(output_dir)?,
             None => None,
@@ -1060,10 +1071,13 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     } else {
         None
     };
-    let train_state_fixture = args
-        .nnue_train_state_fixture
-        .as_deref()
-        .or(output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_path.as_path()));
+    let train_state_source = if let Some(path) = args.nnue_train_state_fixture.as_deref() {
+        Some(NnueTrainStateSource::BoungFixture(path))
+    } else if let Some(path) = args.nnue_train_state_bin.as_deref() {
+        Some(NnueTrainStateSource::RootStateBin(path))
+    } else {
+        output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_source())
+    };
     let hcpe_resume_offset = match output_resume_checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
@@ -1072,7 +1086,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => None,
     };
 
-    if args.weights_bin.is_some() && train_state_fixture.is_some() {
+    if args.weights_bin.is_some() && train_state_source.is_some() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
             "--weights-bin cannot be used together with a restored train state; the train-state fixture already contains weights".to_string(),
         ));
@@ -1081,8 +1095,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         Some(path) => load_root_halfkp_weights_as_nnue_case(path)?,
         None => NnueForwardCase::new(NnueForwardCaseKind::Halfkp),
     };
-    let restored_state = match train_state_fixture {
-        Some(path) => Some(NnueTrainStateCase::read_fixture(path)?),
+    let restored_state = match train_state_source {
+        Some(NnueTrainStateSource::BoungFixture(path)) => Some(NnueTrainStateCase::read_fixture(path)?),
+        Some(NnueTrainStateSource::RootStateBin(path)) => Some(load_root_halfkp_train_state_case(path)?),
         None => None,
     };
     let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
@@ -1274,8 +1289,8 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  ptx          : {}", ptx.display());
     println!("  device       : {}", args.device);
     println!("  teacher      : {teacher}");
-    if let Some(path) = train_state_fixture {
-        println!("  resume_state : {}", path.display());
+    if let Some(source) = train_state_source {
+        println!("  resume_state : {} ({})", source.path().display(), source.label());
     }
     if let Some(offset) = hcpe_resume_offset {
         println!("  resume_hcpe  : byte_offset={offset}");
@@ -1717,9 +1732,50 @@ fn create_next_numbered_checkpoint_dir(
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Debug, Clone, Copy)]
+enum NnueTrainStateSource<'a> {
+    BoungFixture(&'a std::path::Path),
+    RootStateBin(&'a std::path::Path),
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+impl<'a> NnueTrainStateSource<'a> {
+    fn path(self) -> &'a std::path::Path {
+        match self {
+            Self::BoungFixture(path) | Self::RootStateBin(path) => path,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BoungFixture(_) => "state.boung",
+            Self::RootStateBin(_) => "state.bin",
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeResumeStateKind {
+    BoungFixture,
+    RootStateBin,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 struct BridgeResumeCheckpoint {
     state_path: std::path::PathBuf,
+    state_kind: BridgeResumeStateKind,
     dataloader_pos_path: Option<std::path::PathBuf>,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+impl BridgeResumeCheckpoint {
+    fn state_source(&self) -> NnueTrainStateSource<'_> {
+        match self.state_kind {
+            BridgeResumeStateKind::BoungFixture => NnueTrainStateSource::BoungFixture(&self.state_path),
+            BridgeResumeStateKind::RootStateBin => NnueTrainStateSource::RootStateBin(&self.state_path),
+        }
+    }
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -1746,11 +1802,21 @@ fn find_latest_bridge_checkpoint(
         let Some(index) = numbered_checkpoint_dir_index(&entry)? else {
             continue;
         };
-        let state_path = entry.path().join("state.boung");
-        if state_path.is_file() && latest.as_ref().map_or(true, |(latest_index, _)| index > *latest_index) {
+        let boung_path = entry.path().join("state.boung");
+        let state_bin_path = entry.path().join("state.bin");
+        let state = if boung_path.is_file() {
+            Some((boung_path, BridgeResumeStateKind::BoungFixture))
+        } else if state_bin_path.is_file() {
+            Some((state_bin_path, BridgeResumeStateKind::RootStateBin))
+        } else {
+            None
+        };
+        if let Some((state_path, state_kind)) = state
+            && latest.as_ref().map_or(true, |(latest_index, _)| index > *latest_index)
+        {
             let dataloader_pos_path = entry.path().join("dataloader_pos.txt");
             let dataloader_pos_path = dataloader_pos_path.is_file().then_some(dataloader_pos_path);
-            latest = Some((index, BridgeResumeCheckpoint { state_path, dataloader_pos_path }));
+            latest = Some((index, BridgeResumeCheckpoint { state_path, state_kind, dataloader_pos_path }));
         }
     }
 
@@ -1940,6 +2006,145 @@ fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cud
         l2b: root_weights.l2b,
         outw: root_weights.outw,
         outb: root_weights.outb,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
+fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateCase> {
+    let bytes = std::fs::read(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read root NNUE train state {}: {err}",
+            path.display()
+        ))
+    })?;
+    let records = bulletou_lib::value::yaneuraou_kppt::parse_model_weights_bin(&bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to parse root NNUE train state {}: {err}",
+            path.display()
+        ))
+    })?;
+    match bulletou_lib::value::yaneuraou_kppt::detect_state_backend(&records).as_deref() {
+        Some(bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_BULLET)
+        | Some(bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_CUDA_OXIDE)
+        | None => {}
+        Some(backend) => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "unsupported root NNUE train state backend marker {backend:?} in {}",
+                path.display()
+            )));
+        }
+    }
+
+    let root_shape = bulletou_lib::value::NNUE_HALFKP_256X2_32_32;
+    let shape = bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
+        input_size: root_shape.input_size,
+        l1: root_shape.l1,
+        l2: root_shape.l2,
+        l3: root_shape.l3,
+    };
+    let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+    let weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
+    let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "momentum");
+    let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "velocity");
+    let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "slow");
+    let slow = if slow.is_empty() { &weights } else { &slow };
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "step_ranger");
+    let completed_steps = read_root_state_completed_steps(path, &steps)?;
+
+    fn take_record(
+        path: &std::path::Path,
+        section: &'static str,
+        map: &std::collections::BTreeMap<String, Vec<f32>>,
+        id: &'static str,
+        expected_len: usize,
+    ) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+        let values = map.get(id).ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root NNUE train state {} is missing nnue/{section}/{id}",
+                path.display()
+            ))
+        })?;
+        if values.len() != expected_len {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root NNUE train state {} record nnue/{section}/{id} has len {}, expected {expected_len}",
+                path.display(),
+                values.len()
+            )));
+        }
+        Ok(values.clone())
+    }
+
+    let group = |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
+        Ok(NnueTrainStateGroupCase {
+            weights: take_record(path, "weights", &weights, id, expected_len)?,
+            momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
+            velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
+            slow_params: take_record(path, "slow", slow, id, expected_len)?,
+        })
+    };
+
+    Ok(NnueTrainStateCase {
+        shape,
+        completed_steps,
+        l0w: group("l0w", layout.l0w_len())?,
+        l0b: group("l0b", layout.l0b_len())?,
+        l1w: group("l1w", layout.l1w_len())?,
+        l1b: group("l1b", layout.l1b_len())?,
+        l2w: group("l2w", layout.l2w_len())?,
+        l2b: group("l2b", layout.l2b_len())?,
+        outw: group("outw", layout.outw_len())?,
+        outb: group("outb", layout.outb_len())?,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
+fn read_root_state_completed_steps(
+    path: &std::path::Path,
+    steps: &std::collections::BTreeMap<String, Vec<f32>>,
+) -> bulletou_cuda_oxide_runtime::Result<usize> {
+    if steps.is_empty() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "root NNUE train state {} has no nnue/step_ranger/* records",
+            path.display()
+        )));
+    }
+
+    let mut completed_steps = None;
+    for (id, values) in steps {
+        if values.len() != 1 {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root NNUE train state {} record nnue/step_ranger/{id} has len {}, expected 1",
+                path.display(),
+                values.len()
+            )));
+        }
+        let value = values[0];
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f32 {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root NNUE train state {} record nnue/step_ranger/{id} has invalid step value {value}",
+                path.display()
+            )));
+        }
+        let step = value as usize;
+        match completed_steps {
+            Some(existing) if existing != step => {
+                return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "root NNUE train state {} has inconsistent step_ranger values: {existing} and {step}",
+                    path.display()
+                )));
+            }
+            Some(_) => {}
+            None => completed_steps = Some(step),
+        }
+    }
+
+    completed_steps.ok_or_else(|| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "root NNUE train state {} has no usable nnue/step_ranger/* records",
+            path.display()
+        ))
     })
 }
 
@@ -3295,7 +3500,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -3363,8 +3568,9 @@ fn usage() -> &'static str {
      the NNUE loss/Ranger runner without writing BOUNTRN1/BOUNBCH1 fixtures.\n\
      It uses deterministic HalfKP initial weights by default, or --weights-bin\n\
      to load root weights.bin / bundled state.bin weights. It also supports\n\
-     --nnue-train-state-fixture resume and the same output fixture/state write\n\
-     flags as --nnue-fixture-train. --output writes numbered cuda-oxide bridge\n\
+     --nnue-train-state-fixture resume, --nnue-train-state-bin root-format\n\
+     state.bin resume, and the same output fixture/state write flags as\n\
+     --nnue-fixture-train. --output writes numbered cuda-oxide bridge\n\
      checkpoints with nn.bin, trained-forward.nnuef, state.boung, root state.bin,\n\
      dataloader_pos.txt, and learn.log. --save-rate N writes every N batches;\n\
      the default 0 writes only the final batch. Later runs auto-resume the latest\n\
