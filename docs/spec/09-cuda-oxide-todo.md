@@ -902,6 +902,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `target/cuda-oxide-fixtures/nnue-halfkp-trained-forward.nnuef` after the
   two-step real-teacher fixture train, then loaded it with
   `--nnue-forward-smoke --debug-readback`; CPU/GPU comparison stayed `ok`.
+- Added `-TrainedForwardFixture <PATH>` to
+  `scripts/cuda_oxide_nnue_teacher_smoke.ps1`. Passing this path implies
+  `-RunFixtureTrain` and forwards
+  `--write-nnue-trained-forward-fixture` to the cuda-oxide binary. Validation
+  with `-SkipCudaBuild -TrainSteps 2 -DebugReadback -RunFixtureTrain
+  -TrainedForwardFixture target/cuda-oxide-fixtures/nnue-halfkp-trained-forward-script.nnuef`
+  passed and wrote the requested `BOUNFWD1` fixture.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
