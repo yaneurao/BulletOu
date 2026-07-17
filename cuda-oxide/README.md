@@ -114,6 +114,7 @@ one loader pass:
 cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --nnue-teacher-train \
   --teacher /mnt/c/shogi/teacher/yane-distill-hcpe-20260508shuffled/shuffled-001.hcpe \
+  --weights-bin /mnt/c/path/to/checkpoint/state.bin \
   --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 

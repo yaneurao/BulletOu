@@ -992,6 +992,14 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   binary. Validation with `-ResumeTrainStateFixture` and
   `-RunDirectTeacherTrain` wrote `nnue-halfkp-direct-resume-script.nnuef`; its
   SHA-256 matched the fixture-backed one-shot two-step final exactly.
+- Added `--weights-bin <PATH>` to `--nnue-teacher-train` for loading root
+  `weights.bin` or bundled `state.bin` NNUE weights before streaming teacher
+  batches. `--weights-bin` is rejected together with `--nnue-train-state-fixture`
+  because the latter already carries weights and optimizer state. Validation:
+  direct one-step teacher train from
+  `checkpoints/NNUE_HALFKP-256x2-32-32-6sb-cos/0031/state.bin` succeeded, wrote
+  `nnue-halfkp-direct-realweights-trained.nnuef`, and loading that fixture with
+  `--nnue-forward-smoke --debug-readback` passed (`compare: ok`).
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

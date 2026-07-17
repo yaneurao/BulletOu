@@ -85,6 +85,7 @@ struct Args {
     nnue_forward_fixture: Option<std::path::PathBuf>,
     nnue_train_state_fixture: Option<std::path::PathBuf>,
     nnue_train_fixture_args: Vec<NnueTrainFixtureArg>,
+    weights_bin: Option<std::path::PathBuf>,
     teacher: Option<String>,
     train_steps: usize,
     batch_size: usize,
@@ -168,6 +169,7 @@ impl Args {
             nnue_forward_fixture: None,
             nnue_train_state_fixture: None,
             nnue_train_fixture_args: Vec::new(),
+            weights_bin: None,
             teacher: None,
             train_steps: 1,
             batch_size: 2,
@@ -246,6 +248,7 @@ impl Args {
                         .nnue_train_fixture_args
                         .push(NnueTrainFixtureArg::Batch(required_path_arg(&mut args, "--nnue-train-batch-fixture")?));
                 }
+                "--weights-bin" => parsed.weights_bin = Some(required_path_arg(&mut args, "--weights-bin")?),
                 "--teacher" => parsed.teacher = Some(required_arg(&mut args, "--teacher")?),
                 "--train-steps" => {
                     parsed.train_steps = parse_usize_arg(required_arg(&mut args, "--train-steps")?, "--train-steps")?;
@@ -1041,7 +1044,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => default_nnue_ptx()?,
     };
 
-    let initial_case = NnueForwardCase::new(NnueForwardCaseKind::Halfkp);
+    if args.weights_bin.is_some() && args.nnue_train_state_fixture.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--weights-bin cannot be used together with --nnue-train-state-fixture; the train-state fixture already contains weights".to_string(),
+        ));
+    }
+    let initial_case = match args.weights_bin.as_deref() {
+        Some(path) => load_root_halfkp_weights_as_nnue_case(path)?,
+        None => NnueForwardCase::new(NnueForwardCaseKind::Halfkp),
+    };
     let restored_state = match args.nnue_train_state_fixture.as_deref() {
         Some(path) => Some(NnueTrainStateCase::read_fixture(path)?),
         None => None,
@@ -1236,6 +1247,58 @@ fn nnue_train_batch_from_root_fast_batch(
         nstm: batch.nstm,
         targets: batch.targets,
         entry_weights: batch.weights,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
+fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCase> {
+    let bytes = std::fs::read(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read root NNUE weights {}: {err}", path.display()))
+    })?;
+    let records = bulletou_lib::value::yaneuraou_kppt::parse_model_weights_bin(&bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to parse root NNUE weights {}: {err}",
+            path.display()
+        ))
+    })?;
+    let weights = if records.contains_key("l0w") {
+        records
+    } else {
+        bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights")
+    };
+    let root_weights =
+        bulletou_lib::value::NnueForwardOwnedWeights::from_weight_map(
+            bulletou_lib::value::NNUE_HALFKP_256X2_32_32,
+            &weights,
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to load HalfKP NNUE weights {}: {err}",
+                path.display()
+            ))
+        })?;
+
+    Ok(NnueForwardCase {
+        label: "root-weights",
+        shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
+            input_size: root_weights.shape.input_size,
+            l1: root_weights.shape.l1,
+            l2: root_weights.shape.l2,
+            l3: root_weights.shape.l3,
+        },
+        batch_size: 0,
+        max_active: 0,
+        stm: Vec::new(),
+        nstm: Vec::new(),
+        l0w: root_weights.l0w,
+        l0b: root_weights.l0b,
+        l1w: root_weights.l1w,
+        l1b: root_weights.l1b,
+        l2w: root_weights.l2w,
+        l2b: root_weights.l2b,
+        outw: root_weights.outw,
+        outb: root_weights.outb,
     })
 }
 
@@ -2591,7 +2654,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--train-steps <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--train-steps <N>] [--batch-size <N>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -2657,8 +2720,10 @@ fn usage() -> &'static str {
      CO-010 NNUE teacher train: when built with --features cuda,root-loader,\n\
      read real teacher batches through bulletou_lib and feed them directly to\n\
      the NNUE loss/Ranger runner without writing BOUNTRN1/BOUNBCH1 fixtures.\n\
-     The current smoke uses deterministic HalfKP initial weights and the same\n\
-     output fixture/state write flags as --nnue-fixture-train.\n\
+     It uses deterministic HalfKP initial weights by default, or --weights-bin\n\
+     to load root weights.bin / bundled state.bin weights. It also supports\n\
+     --nnue-train-state-fixture resume and the same output fixture/state write\n\
+     flags as --nnue-fixture-train.\n\
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
