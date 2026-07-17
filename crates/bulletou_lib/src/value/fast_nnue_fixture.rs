@@ -13,10 +13,11 @@ use std::{
     path::Path,
 };
 
-use crate::value::{FastBatchHost, FastNnueError, NnueForwardWeights};
+use crate::value::{FastBatchHost, FastNnueError, NnueForwardShape, NnueForwardWeights};
 
 pub const NNUE_FORWARD_FIXTURE_MAGIC: &[u8; 8] = b"BOUNFWD1";
 pub const NNUE_TRAIN_FIXTURE_MAGIC: &[u8; 8] = b"BOUNTRN1";
+pub const NNUE_TRAIN_BATCH_FIXTURE_MAGIC: &[u8; 8] = b"BOUNBCH1";
 
 #[derive(Debug)]
 pub enum NnueForwardFixtureError {
@@ -124,6 +125,36 @@ pub fn write_nnue_train_fixture(
     Ok(())
 }
 
+pub fn write_nnue_train_batch_fixture_file(
+    path: impl AsRef<Path>,
+    shape: NnueForwardShape,
+    batch: &FastBatchHost,
+) -> Result<(), NnueForwardFixtureError> {
+    let mut writer = io::BufWriter::new(std::fs::File::create(path)?);
+    write_nnue_train_batch_fixture(&mut writer, shape, batch)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn write_nnue_train_batch_fixture(
+    writer: &mut impl Write,
+    shape: NnueForwardShape,
+    batch: &FastBatchHost,
+) -> Result<(), NnueForwardFixtureError> {
+    batch.validate().map_err(NnueForwardFixtureError::BatchLayout)?;
+
+    writer.write_all(NNUE_TRAIN_BATCH_FIXTURE_MAGIC)?;
+    for value in [shape.input_size, batch.layout.batch_size, batch.layout.max_active] {
+        write_u64(writer, value as u64)?;
+    }
+
+    write_i32_slice(writer, &batch.stm)?;
+    write_i32_slice(writer, &batch.nstm)?;
+    write_f32_slice(writer, &batch.targets)?;
+    write_f32_slice(writer, &batch.weights)?;
+    Ok(())
+}
+
 fn write_nnue_fixture_header_and_payload(
     writer: &mut impl Write,
     magic: &[u8; 8],
@@ -218,6 +249,27 @@ mod tests {
         assert_eq!(f32_at(&bytes, 208), 0.75);
         assert_eq!(f32_at(&bytes, 212), 1.0);
         assert_eq!(f32_at(&bytes, 216), 0.5);
+    }
+
+    #[test]
+    fn writes_tiny_train_batch_fixture_without_weights() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let mut batch = tiny_batch();
+        batch.targets = vec![0.25, 0.75];
+        batch.weights = vec![1.0, 0.5];
+        let mut bytes = Vec::new();
+
+        write_nnue_train_batch_fixture(&mut bytes, shape, &batch).unwrap();
+
+        assert_eq!(&bytes[..8], NNUE_TRAIN_BATCH_FIXTURE_MAGIC);
+        assert_eq!(bytes.len(), 96);
+        assert_eq!(u64_at(&bytes, 8), 4);
+        assert_eq!(u64_at(&bytes, 16), 2);
+        assert_eq!(u64_at(&bytes, 24), 3);
+        assert_eq!(f32_at(&bytes, 80), 0.25);
+        assert_eq!(f32_at(&bytes, 84), 0.75);
+        assert_eq!(f32_at(&bytes, 88), 1.0);
+        assert_eq!(f32_at(&bytes, 92), 0.5);
     }
 
     #[test]

@@ -27,8 +27,9 @@ pub use fast_nnue::{
     NnueForwardTrace, NnueForwardWorkspaceLayout,
 };
 pub use fast_nnue_fixture::{
-    NNUE_FORWARD_FIXTURE_MAGIC, NNUE_TRAIN_FIXTURE_MAGIC, NnueForwardFixtureError,
-    write_nnue_forward_fixture, write_nnue_forward_fixture_file, write_nnue_train_fixture,
+    NNUE_FORWARD_FIXTURE_MAGIC, NNUE_TRAIN_BATCH_FIXTURE_MAGIC, NNUE_TRAIN_FIXTURE_MAGIC,
+    NnueForwardFixtureError, write_nnue_forward_fixture, write_nnue_forward_fixture_file,
+    write_nnue_train_batch_fixture, write_nnue_train_batch_fixture_file, write_nnue_train_fixture,
     write_nnue_train_fixture_file,
 };
 pub use fast_sfnn::{

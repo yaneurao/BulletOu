@@ -10,7 +10,7 @@ use bulletou_lib::{
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader,
         },
-        write_nnue_forward_fixture_file, write_nnue_train_fixture_file,
+        write_nnue_forward_fixture_file, write_nnue_train_batch_fixture_file, write_nnue_train_fixture_file,
         yaneuraou_kppt::{extract_component_section, parse_model_weights_bin},
     },
 };
@@ -30,6 +30,10 @@ struct Args {
     /// fixture (`BOUNFWD1`).
     #[arg(long)]
     train_fixture: bool,
+
+    /// Write a batch-only training fixture (`BOUNBCH1`) with no weights.
+    #[arg(long)]
+    batch_fixture: bool,
 
     /// Fixture size/shape. `tiny` is cheap; `halfkp` matches
     /// NNUE_HALFKP_256x2_32_32 and writes roughly 123 MiB.
@@ -101,6 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.weights_bin.is_some() && args.case != FixtureCase::Halfkp {
         return Err(invalid_input("--weights-bin is only supported with --case halfkp"));
     }
+    if args.train_fixture && args.batch_fixture {
+        return Err(invalid_input("--train-fixture and --batch-fixture are mutually exclusive"));
+    }
     if args.teacher.is_some() && args.case != FixtureCase::Halfkp {
         return Err(invalid_input("--teacher is only supported with --case halfkp"));
     }
@@ -125,7 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let outputs = fixture.weights.forward_batch(&fixture.batch)?;
-    if args.train_fixture {
+    if args.batch_fixture {
+        write_nnue_train_batch_fixture_file(&args.out, fixture.weights.shape, &fixture.batch)?;
+    } else if args.train_fixture {
         write_nnue_train_fixture_file(&args.out, fixture.weights.as_borrowed(), &fixture.batch)?;
     } else {
         write_nnue_forward_fixture_file(&args.out, fixture.weights.as_borrowed(), &fixture.batch)?;
@@ -133,7 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "exported NNUE {} fixture",
-        if args.train_fixture { "train" } else { "forward" }
+        if args.batch_fixture {
+            "train-batch"
+        } else if args.train_fixture {
+            "train"
+        } else {
+            "forward"
+        }
     );
     println!("  out        : {}", args.out.display());
     println!("  case       : {}", fixture.label);

@@ -795,6 +795,9 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     weights.
 - Added the `BOUNTRN1` fixture format: the existing `BOUNNUE1` forward payload
   followed by `targets[batch]` and `entry_weights[batch]`.
+- Added the `BOUNBCH1` train-batch fixture format for subsequent steps:
+  `input_size`, `batch_size`, `max_active`, sparse `stm`/`nstm`, `targets`,
+  and `entry_weights`, but no repeated weight payload.
 - Added `bulletou-cuda-train --nnue-loss-ranger-step-smoke`, which reads the
   train fixture and runs GPU NNUE forward -> loss -> backward -> all grouped
   NNUE Ranger updates against a scalar CPU golden.
@@ -802,6 +805,8 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   The first fixture supplies the initial weights; subsequent fixtures supply
   batch/target/entry-weight data while GPU and CPU weights plus Ranger
   optimizer state are carried across steps.
+  It also accepts `--nnue-train-batch-fixture <PATH>` after the initial full
+  fixture so later steps can use `BOUNBCH1` batch-only payloads.
 - Refactored the GPU train-step launch sequence into
   `bulletou-cuda-train/src/nnue_train_step.rs` as
   `NnueLossRangerStepRunner`. The runner owns persistent device weights,
@@ -844,6 +849,10 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   tolerance.
 - Re-ran the same `-TrainSteps 2 -DebugReadback` validation after the
   `NnueLossRangerStepRunner` extraction; results remained `compare: ok`.
+- Updated the script so `step0` is a full `BOUNTRN1` fixture and `step1+` are
+  batch-only `BOUNBCH1` fixtures. Re-ran `-TrainSteps 2 -DebugReadback`;
+  `bulletou-cuda-train` printed `full` then `batch`, and the comparison stayed
+  `ok`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
@@ -863,9 +872,10 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   5. runs `bulletou-cuda-train --nnue-loss-ranger-step-smoke
      --nnue-train-fixture` against the generated teacher fixture.
 - Added `-TrainSteps <N>` to generate batch-indexed train fixtures
-  (`step0`, `step1`, ...) and run them through multiple NNUE loss/Ranger
-  update steps without changing the root/cuda-oxide workspace isolation
-  boundary.
+  (`step0`, `step1`, ...). `step0` is a full `BOUNTRN1` fixture with initial
+  weights; later steps are `BOUNBCH1` batch-only fixtures. The smoke runs them
+  through multiple NNUE loss/Ranger update steps without changing the
+  root/cuda-oxide workspace isolation boundary.
 - Validation:
   - `powershell -ExecutionPolicy Bypass -File
     scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild` succeeded using

@@ -114,9 +114,10 @@ for ($step = 0; $step -lt $TrainSteps; $step++) {
     $outFixture = $fixturePaths[$step]
     Invoke-Checked "export NNUE HalfKP teacher train fixture batch $step" {
         Set-Location $repoRoot
+        $fixtureKindFlag = if ($step -eq 0) { "--train-fixture" } else { "--batch-fixture" }
         cargo run -p bulletou_lib --example export_nnue_forward_fixture --release -- `
             --out $outFixture `
-            --train-fixture `
+            $fixtureKindFlag `
             --case halfkp `
             --teacher $Teacher `
             --batch-size $BatchSize `
@@ -131,7 +132,15 @@ for ($step = 0; $step -lt $TrainSteps; $step++) {
 $wslCudaRoot = Convert-ToWslPath $cudaRoot
 $wslFixtures = @($fixturePaths | ForEach-Object { Convert-ToWslPath $_ })
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
-$fixtureArgs = ($wslFixtures | ForEach-Object { "--nnue-train-fixture `"$_`"" }) -join " "
+$fixtureArgsList = @()
+for ($step = 0; $step -lt $TrainSteps; $step++) {
+    if ($step -eq 0) {
+        $fixtureArgsList += "--nnue-train-fixture `"$($wslFixtures[$step])`""
+    } else {
+        $fixtureArgsList += "--nnue-train-batch-fixture `"$($wslFixtures[$step])`""
+    }
+}
+$fixtureArgs = $fixtureArgsList -join " "
 
 $cudaEnv = @"
 export CUDA_HOME=/usr
