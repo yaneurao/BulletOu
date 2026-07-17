@@ -44,6 +44,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::DenseOutputBackward => run_dense_output_backward_smoke(args),
         SmokeMode::NnueDenseBackward => run_nnue_dense_backward_smoke(args),
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
+        SmokeMode::NnueRangerStep => run_nnue_ranger_step_smoke(args),
         SmokeMode::AdamWUpdate => run_adamw_update_smoke(args),
         SmokeMode::RAdamUpdate => run_radam_update_smoke(args),
         SmokeMode::RangerLookahead => run_ranger_lookahead_smoke(args),
@@ -81,6 +82,7 @@ enum SmokeMode {
     DenseOutputBackward,
     NnueDenseBackward,
     NnueForward,
+    NnueRangerStep,
     AdamWUpdate,
     RAdamUpdate,
     RangerLookahead,
@@ -145,6 +147,7 @@ impl Args {
                 "--dense-output-backward-smoke" => parsed.mode = SmokeMode::DenseOutputBackward,
                 "--nnue-dense-backward-smoke" => parsed.mode = SmokeMode::NnueDenseBackward,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
+                "--nnue-ranger-step-smoke" => parsed.mode = SmokeMode::NnueRangerStep,
                 "--adamw-update-smoke" => parsed.mode = SmokeMode::AdamWUpdate,
                 "--radam-update-smoke" => parsed.mode = SmokeMode::RAdamUpdate,
                 "--ranger-lookahead-smoke" => parsed.mode = SmokeMode::RangerLookahead,
@@ -519,6 +522,208 @@ fn run_nnue_dense_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Res
     for cmp in comparisons {
         println!(
             "  {:<13}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
+    }
+    println!("  compare      : ok");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_nnue_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{
+        backward::{
+            DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueBackwardWorkspace, NnueBackwardWorkspaceLayout,
+            NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
+        },
+        nnue::{
+            NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
+            NnueForwardWorkspace, NnueForwardWorkspaceLayout,
+        },
+        optimizer::NnueRangerOptimizerStates,
+        DeviceBuffer,
+    };
+
+    let case = match args.nnue_forward_fixture.as_deref() {
+        Some(path) => NnueForwardCase::read_fixture(path)?,
+        None => NnueForwardCase::new(args.nnue_case),
+    };
+    let cpu_forward_trace = case.cpu_forward_trace();
+    let cpu_trace = case.cpu_dense_backward_trace(&cpu_forward_trace);
+    let params = nnue_ranger_step_params();
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let host_batch = NnueForwardHostBatch {
+        stm_indices: &case.stm,
+        nstm_indices: &case.nstm,
+        batch_size: case.batch_size,
+        max_active: case.max_active,
+    };
+    let host_weights = NnueForwardHostWeights {
+        shape: case.shape,
+        l0w: &case.l0w,
+        l0b: &case.l0b,
+        l1w: &case.l1w,
+        l1b: &case.l1b,
+        l2w: &case.l2w,
+        l2b: &case.l2b,
+        outw: &case.outw,
+        outb: &case.outb,
+    };
+    let device_batch = NnueForwardDeviceBatch::from_host(&stream, &host_batch)?;
+    let mut device_weights = NnueForwardDeviceWeights::from_host(&stream, &host_weights)?;
+    let mut optimizer_states = NnueRangerOptimizerStates::from_host_weights(&stream, &host_weights)?;
+    let forward_layout = NnueForwardWorkspaceLayout::new(case.shape, case.batch_size);
+    let mut forward_workspace = NnueForwardWorkspace::new(&stream, forward_layout)?;
+
+    nnue_forward::launch_nnue_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
+
+    let output_gradients = DeviceBuffer::from_host(&stream, &cpu_trace.output_gradients)?;
+    let backward_layout = NnueBackwardWorkspaceLayout::new(case.shape, case.batch_size, case.max_active);
+    let mut backward_workspace = NnueBackwardWorkspace::new(&stream, backward_layout)?;
+
+    let output_layout = DenseOutputBackwardLayout::new(case.batch_size, case.shape.l3);
+    dense_backward::launch_dense_output_backward(
+        &stream,
+        &module,
+        output_layout,
+        &forward_workspace.hidden2,
+        &output_gradients,
+        &device_weights.outw,
+        &mut backward_workspace.hidden2_gradients,
+        &mut backward_workspace.outw_gradients,
+        &mut backward_workspace.outb_gradients,
+    )?;
+
+    let l2_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l2, case.shape.l3);
+    dense_backward::launch_dense_crelu_backward(
+        &stream,
+        &module,
+        l2_layout,
+        &forward_workspace.hidden1,
+        &forward_workspace.hidden2,
+        &backward_workspace.hidden2_gradients,
+        &device_weights.l2w,
+        &mut backward_workspace.hidden1_gradients,
+        &mut backward_workspace.l2w_gradients,
+        &mut backward_workspace.l2b_gradients,
+    )?;
+
+    let l1_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l1 * 2, case.shape.l2);
+    dense_backward::launch_dense_crelu_backward(
+        &stream,
+        &module,
+        l1_layout,
+        &forward_workspace.combined,
+        &forward_workspace.hidden1,
+        &backward_workspace.hidden1_gradients,
+        &device_weights.l1w,
+        &mut backward_workspace.combined_gradients,
+        &mut backward_workspace.l1w_gradients,
+        &mut backward_workspace.l1b_gradients,
+    )?;
+
+    let l0_layout = NnueL0CReluBackwardLayout::new(case.batch_size, case.shape.l1);
+    dense_backward::launch_nnue_l0_crelu_backward(
+        &stream,
+        &module,
+        l0_layout,
+        &backward_workspace.combined_gradients,
+        &forward_workspace.stm_l0,
+        &forward_workspace.nstm_l0,
+        &mut backward_workspace.stm_l0_gradients,
+        &mut backward_workspace.nstm_l0_gradients,
+    )?;
+
+    let sparse_l0_layout =
+        NnueL0SparseBackwardLayout::new(case.batch_size, case.max_active, case.shape.input_size, case.shape.l1);
+    dense_backward::launch_nnue_l0_sparse_backward(
+        &stream,
+        &module,
+        sparse_l0_layout,
+        &device_batch.stm_indices,
+        &device_batch.nstm_indices,
+        &backward_workspace.stm_l0_gradients,
+        &backward_workspace.nstm_l0_gradients,
+        &mut backward_workspace.l0w_gradients,
+        &mut backward_workspace.l0b_gradients,
+    )?;
+
+    optimizer_update::launch_nnue_ranger_update(
+        &stream,
+        &module,
+        params,
+        &mut device_weights,
+        &backward_workspace,
+        &mut optimizer_states,
+    )?;
+    stream.synchronize()?;
+
+    let mut comparisons = Vec::new();
+    macro_rules! compare_group {
+        ($field:ident, $weights:expr, $gradients:expr) => {{
+            let expected = cpu_single_ranger_update_trace($weights, $gradients, params)?;
+            let gpu_weights = device_weights.$field.to_host_vec(&stream)?;
+            let gpu_momentum = optimizer_states.$field.momentum.to_host_vec(&stream)?;
+            let gpu_velocity = optimizer_states.$field.velocity.to_host_vec(&stream)?;
+            let gpu_slow_params = optimizer_states.$field.slow_params.to_host_vec(&stream)?;
+            comparisons.push(compare_slices(
+                concat!(stringify!($field), "_weights"),
+                &expected.weights,
+                &gpu_weights,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(
+                concat!(stringify!($field), "_momentum"),
+                &expected.momentum,
+                &gpu_momentum,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(
+                concat!(stringify!($field), "_velocity"),
+                &expected.velocity,
+                &gpu_velocity,
+                args.tolerance,
+            )?);
+            comparisons.push(compare_slices(
+                concat!(stringify!($field), "_slow"),
+                &expected.slow_params,
+                &gpu_slow_params,
+                args.tolerance,
+            )?);
+        }};
+    }
+
+    compare_group!(l0w, &case.l0w, &cpu_trace.l0w_gradients);
+    compare_group!(l0b, &case.l0b, &cpu_trace.l0b_gradients);
+    compare_group!(l1w, &case.l1w, &cpu_trace.l1w_gradients);
+    compare_group!(l1b, &case.l1b, &cpu_trace.l1b_gradients);
+    compare_group!(l2w, &case.l2w, &cpu_trace.l2w_gradients);
+    compare_group!(l2b, &case.l2b, &cpu_trace.l2b_gradients);
+    compare_group!(outw, &case.outw, &cpu_trace.outw_gradients);
+    compare_group!(outb, &case.outb, &[cpu_trace.outb_gradient]);
+
+    println!("bulletou-cuda-train NNUE Ranger step smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  batch        : {} samples", case.batch_size);
+    println!(
+        "  shape        : input={} l1={} l2={} l3={}",
+        case.shape.input_size, case.shape.l1, case.shape.l2, case.shape.l3
+    );
+    println!("  tolerance    : {}", args.tolerance);
+    println!("  params       : step={} k={} alpha={}", params.radam.step, params.k, params.lookahead.alpha);
+    for cmp in comparisons {
+        println!(
+            "  {:<14}: max_abs={} at {}, mean_abs={}",
             cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
         );
     }
@@ -1425,6 +1630,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --ranger-lookahead-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -1464,6 +1670,9 @@ fn usage() -> &'static str {
      CO-010 Ranger update smoke: chain RAdam updates with conditional\n\
      Lookahead steps and compare all optimizer state buffers against a CPU\n\
      scalar golden.\n\
+     CO-010 NNUE Ranger step smoke: run NNUE forward/backward, then update all\n\
+     NNUE parameter groups with the Ranger launcher and compare weights plus\n\
+     optimizer state buffers against CPU scalar goldens.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1762,6 +1971,81 @@ impl RangerUpdateCase {
 
         Ok(RangerUpdateTrace { weights, momentum, velocity, slow_params, lookahead_steps })
     }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct SingleRangerUpdateTrace {
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    slow_params: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_ranger_step_params() -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+    bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
+        radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
+            gradient_factor: 0.25,
+            learning_rate: 0.01,
+            step: 1,
+            decay: 0.01,
+            beta1: 0.99,
+            beta2: 0.999,
+            n_sma_threshold: 5.0,
+            epsilon: 1.0e-8,
+            min_weight: -1.98,
+            max_weight: 1.98,
+        },
+        lookahead: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams { alpha: 0.5 },
+        k: 1,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cpu_single_ranger_update_trace(
+    initial_weights: &[f32],
+    gradients: &[f32],
+    params: bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams,
+) -> bulletou_cuda_oxide_runtime::Result<SingleRangerUpdateTrace> {
+    if initial_weights.len() != gradients.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "Ranger CPU trace length mismatch: weights={}, gradients={}",
+            initial_weights.len(),
+            gradients.len()
+        )));
+    }
+
+    params.validate()?;
+    let step_scale = params.radam.step_scale()?;
+    let rate = params.radam.learning_rate * step_scale.step_size;
+    let mut weights = initial_weights.to_vec();
+    let mut momentum = vec![0.0; initial_weights.len()];
+    let mut velocity = vec![0.0; initial_weights.len()];
+    let mut slow_params = initial_weights.to_vec();
+
+    for idx in 0..weights.len() {
+        let grad = params.radam.gradient_factor * gradients[idx];
+        weights[idx] *= 1.0 - params.radam.decay * rate;
+        momentum[idx] = params.radam.beta1 * momentum[idx] + (1.0 - params.radam.beta1) * grad;
+        velocity[idx] = params.radam.beta2 * velocity[idx] + (1.0 - params.radam.beta2) * grad * grad;
+        let mut value = momentum[idx];
+        if step_scale.use_denom {
+            value /= velocity[idx].sqrt() + params.radam.epsilon;
+        }
+        weights[idx] -= rate * value;
+        weights[idx] = weights[idx].clamp(params.radam.min_weight, params.radam.max_weight);
+    }
+
+    if params.should_lookahead()? {
+        for idx in 0..weights.len() {
+            let new_weight = params.lookahead.alpha * weights[idx] + (1.0 - params.lookahead.alpha) * slow_params[idx];
+            weights[idx] = new_weight;
+            slow_params[idx] = new_weight;
+        }
+    }
+
+    Ok(SingleRangerUpdateTrace { weights, momentum, velocity, slow_params })
 }
 
 #[cfg(feature = "cuda")]

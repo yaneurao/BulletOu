@@ -732,3 +732,27 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
 - Remaining CO-010 work: connect the NNUE/SFNN Ranger update launchers to the
   real trainer loop and checkpoint state lifecycle.
+
+### 2026-07-17 CO-010 NNUE Ranger step smoke
+
+- Added `--nnue-ranger-step-smoke`, which runs the full NNUE forward/backward
+  smoke path and then calls `launch_nnue_ranger_update` over all 8 NNUE
+  parameter groups:
+  `l0w`, `l0b`, `l1w`, `l1b`, `l2w`, `l2b`, `outw`, and `outb`.
+- Added a scalar CPU one-step Ranger golden for per-parameter-group checks.
+  The smoke validates final `weights`, `momentum`, `velocity`, and
+  `slow_params` buffers for every NNUE parameter tensor.
+- The smoke uses `k=1` so the first update also exercises the Lookahead path
+  through the grouped launcher, not only the RAdam path.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--nnue-ranger-step-smoke --debug-readback` succeeded on RTX 4090; all
+    NNUE parameter-group weight/state comparisons stayed within the default
+    `1e-5` tolerance.
+- Remaining CO-010 work: add the analogous SFNN grouped Ranger step smoke,
+  then connect the NNUE/SFNN update launchers to the real trainer loop and
+  checkpoint state lifecycle.
