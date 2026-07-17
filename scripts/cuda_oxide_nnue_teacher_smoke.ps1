@@ -18,6 +18,8 @@ cuda-oxide workspace separate:
    trained weights as a BOUNFWD1 forward fixture.
    Pass -TrainStateFixture with -RunFixtureTrain to write the final weights
    and Ranger optimizer state as a BOUNRNG1 train-state fixture.
+   Pass -ResumeTrainStateFixture to restore a BOUNRNG1 train-state fixture and
+   export/apply only the later teacher batches up to -TrainSteps.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -42,7 +44,8 @@ param(
     [switch]$DebugReadback,
     [switch]$RunFixtureTrain,
     [string]$TrainedForwardFixture,
-    [string]$TrainStateFixture
+    [string]$TrainStateFixture,
+    [string]$ResumeTrainStateFixture
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,6 +73,51 @@ function Invoke-Checked {
     & $Command
     if ($LASTEXITCODE -ne 0) {
         throw "$Label failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Read-ExactBytes {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $bytes = [byte[]]::new($Count)
+    $offset = 0
+    while ($offset -lt $Count) {
+        $read = $Stream.Read($bytes, $offset, $Count - $offset)
+        if ($read -eq 0) {
+            throw "Unexpected EOF while reading $Name"
+        }
+        $offset += $read
+    }
+    return $bytes
+}
+
+function Read-NnueTrainStateCompletedSteps {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $stream = [System.IO.File]::OpenRead($resolved)
+    try {
+        $magic = [System.Text.Encoding]::ASCII.GetString((Read-ExactBytes $stream 8 "BOUNRNG1 magic"))
+        if ($magic -ne "BOUNRNG1") {
+            throw "Invalid BOUNRNG1 train-state fixture magic: $resolved"
+        }
+
+        $values = @()
+        for ($i = 0; $i -lt 5; $i++) {
+            $values += [System.BitConverter]::ToUInt64((Read-ExactBytes $stream 8 "BOUNRNG1 header value $i"), 0)
+        }
+
+        if ($values[4] -gt [int]::MaxValue) {
+            throw "completed_steps is too large for this script: $($values[4])"
+        }
+        return [int]$values[4]
+    }
+    finally {
+        $stream.Dispose()
     }
 }
 
@@ -102,25 +150,50 @@ if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
     $RunFixtureTrain = $true
 }
 
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    $RunFixtureTrain = $true
+}
+
 if (-not (Test-Path -LiteralPath $Teacher)) {
     throw "Teacher file not found: $Teacher"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and -not (Test-Path -LiteralPath $ResumeTrainStateFixture)) {
+    throw "Resume train-state fixture not found: $ResumeTrainStateFixture"
 }
 
 if ([string]::IsNullOrWhiteSpace($Fixture)) {
     $Fixture = Join-Path $repoRoot "target\cuda-oxide-fixtures\nnue-halfkp-teacher-train-b$BatchSize.bin"
 }
 
-$fixturePaths = @()
-if ($TrainSteps -eq 1) {
-    $fixturePaths += $Fixture
-} else {
-    $fixtureDir = Split-Path -Parent $Fixture
-    $fixtureStem = [System.IO.Path]::GetFileNameWithoutExtension($Fixture)
-    $fixtureExt = [System.IO.Path]::GetExtension($Fixture)
-    for ($step = 0; $step -lt $TrainSteps; $step++) {
-        $fixturePaths += (Join-Path $fixtureDir "$fixtureStem-step$step$fixtureExt")
+$resumeCompletedSteps = 0
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    $resumeCompletedSteps = Read-NnueTrainStateCompletedSteps $ResumeTrainStateFixture
+    if ($TrainSteps -le $resumeCompletedSteps) {
+        throw "-TrainSteps ($TrainSteps) must be greater than completed_steps ($resumeCompletedSteps) in -ResumeTrainStateFixture"
     }
 }
+
+$fixtureDir = Split-Path -Parent $Fixture
+if ([string]::IsNullOrWhiteSpace($fixtureDir)) {
+    $fixtureDir = "."
+}
+$fixtureStem = [System.IO.Path]::GetFileNameWithoutExtension($Fixture)
+$fixtureExt = [System.IO.Path]::GetExtension($Fixture)
+$firstFixtureStep = if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) { 0 } else { $resumeCompletedSteps }
+$fixtureSpecs = @()
+for ($step = $firstFixtureStep; $step -lt $TrainSteps; $step++) {
+    $path = if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and $TrainSteps -eq 1 -and $step -eq 0) {
+        $Fixture
+    } else {
+        Join-Path $fixtureDir "$fixtureStem-step$step$fixtureExt"
+    }
+    $fixtureSpecs += [pscustomobject]@{
+        Step = $step
+        Path = $path
+    }
+}
+$fixturePaths = @($fixtureSpecs | ForEach-Object { $_.Path })
 
 foreach ($path in $fixturePaths) {
     $fixtureDir = Split-Path -Parent $path
@@ -143,11 +216,16 @@ if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
     New-Item -ItemType File -Force -Path $TrainStateFixture | Out-Null
 }
 
-for ($step = 0; $step -lt $TrainSteps; $step++) {
-    $outFixture = $fixturePaths[$step]
+foreach ($spec in $fixtureSpecs) {
+    $step = [int]$spec.Step
+    $outFixture = $spec.Path
     Invoke-Checked "export NNUE HalfKP teacher train fixture batch $step" {
         Set-Location $repoRoot
-        $fixtureKindFlag = if ($step -eq 0) { "--train-fixture" } else { "--batch-fixture" }
+        $fixtureKindFlag = if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and $step -eq 0) {
+            "--train-fixture"
+        } else {
+            "--batch-fixture"
+        }
         cargo run -p bulletou_lib --example export_nnue_forward_fixture --release -- `
             --out $outFixture `
             $fixtureKindFlag `
@@ -174,13 +252,22 @@ if (-not [string]::IsNullOrWhiteSpace($TrainStateFixture)) {
     $wslTrainStateFixture = Convert-ToWslPath $TrainStateFixture
     $trainStateArg = " --write-nnue-train-state-fixture `"$wslTrainStateFixture`""
 }
+$resumeTrainStateArg = ""
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    $wslResumeTrainStateFixture = Convert-ToWslPath $ResumeTrainStateFixture
+    $resumeTrainStateArg = " --nnue-train-state-fixture `"$wslResumeTrainStateFixture`""
+}
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
 $fixtureArgsList = @()
-for ($step = 0; $step -lt $TrainSteps; $step++) {
-    if ($step -eq 0) {
-        $fixtureArgsList += "--nnue-train-fixture `"$($wslFixtures[$step])`""
+if (-not [string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    $fixtureArgsList += $resumeTrainStateArg.Trim()
+}
+for ($i = 0; $i -lt $fixtureSpecs.Count; $i++) {
+    $step = [int]$fixtureSpecs[$i].Step
+    if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture) -and $step -eq 0) {
+        $fixtureArgsList += "--nnue-train-fixture `"$($wslFixtures[$i])`""
     } else {
-        $fixtureArgsList += "--nnue-train-batch-fixture `"$($wslFixtures[$step])`""
+        $fixtureArgsList += "--nnue-train-batch-fixture `"$($wslFixtures[$i])`""
     }
 }
 $fixtureArgs = $fixtureArgsList -join " "
@@ -249,8 +336,12 @@ export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
 cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-loss-ranger-step-smoke $fixtureArgs --loss-kind $LossKind$debugFlag
 "@
 
-Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {
-    $shim | wsl -d $WslDistro -- bash -lc $runCommand
+if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {
+        $shim | wsl -d $WslDistro -- bash -lc $runCommand
+    }
+} else {
+    Write-Host "==> skip CPU-golden loss smoke when restoring BOUNRNG1 state"
 }
 
 if ($RunFixtureTrain) {
@@ -268,7 +359,11 @@ cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-fixture-tra
     }
 }
 
-Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"
+if ([string]::IsNullOrWhiteSpace($ResumeTrainStateFixture)) {
+    Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"
+} else {
+    Write-Host "OK: cuda-oxide NNUE train-state resume smoke completed"
+}
 Write-Host "fixtures:"
 foreach ($path in $fixturePaths) {
     Write-Host "  $path"

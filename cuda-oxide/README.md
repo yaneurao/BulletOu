@@ -99,6 +99,9 @@ write a trained forward fixture with `--write-nnue-trained-forward-fixture` and
 a cuda-oxide Ranger checkpoint fixture with `--write-nnue-train-state-fixture`.
 The latter is restored with `--nnue-train-state-fixture`, after which supplied
 later batch fixtures are applied from `completed_steps + 1`.
+The helper script exposes the restore path as `-ResumeTrainStateFixture`: it
+reads `completed_steps` from `BOUNRNG1`, exports only later teacher batches, and
+runs the fixture-backed resume loop.
 
 WSL2 Ubuntu 24.04 validation example:
 

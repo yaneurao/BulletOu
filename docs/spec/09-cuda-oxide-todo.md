@@ -934,6 +934,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   (`4e0068f5e1bf98855a37f089c1885101e30096eba308596a0289db2d9ad794f3`).
   Loading the resumed final fixture with
   `--nnue-forward-smoke --debug-readback` also passed (`compare: ok`).
+- Added `-ResumeTrainStateFixture <PATH>` to
+  `scripts/cuda_oxide_nnue_teacher_smoke.ps1`. The script reads
+  `completed_steps` from `BOUNRNG1`, exports only later batch-only fixtures,
+  skips the CPU-golden smoke, and runs the fixture train loop through
+  `--nnue-train-state-fixture`. Validation with `-SkipCudaBuild -TrainSteps 2`
+  and the one-step state wrote `nnue-halfkp-resume-final-script.nnuef`; its
+  SHA-256 matched the one-shot two-step fixture exactly.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
