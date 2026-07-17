@@ -14,6 +14,9 @@ mod loss_forward;
 mod nnue_forward;
 
 #[cfg(feature = "cuda")]
+mod nnue_train_step;
+
+#[cfg(feature = "cuda")]
 mod optimizer_update;
 
 #[cfg(feature = "cuda")]
@@ -745,19 +748,8 @@ fn run_nnue_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
 
 #[cfg(feature = "cuda")]
 fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{
-        backward::{
-            DenseCReluBackwardLayout, DenseOutputBackwardLayout, NnueBackwardWorkspace, NnueBackwardWorkspaceLayout,
-            NnueL0CReluBackwardLayout, NnueL0SparseBackwardLayout,
-        },
-        loss::{ScalarLossLayout, ScalarLossWorkspace},
-        nnue::{
-            NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
-            NnueForwardWorkspace, NnueForwardWorkspaceLayout,
-        },
-        optimizer::NnueRangerOptimizerStates,
-        DeviceBuffer,
-    };
+    use bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights;
+    use nnue_train_step::{NnueLossRangerStepRunner, NnueTrainLossKind, NnueTrainStepHostBatch};
 
     if args.nnue_train_fixtures.is_empty() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
@@ -808,14 +800,12 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         outw: &first_case.outw,
         outb: &first_case.outb,
     };
-    let mut device_weights = NnueForwardDeviceWeights::from_host(&stream, &host_weights)?;
-    let mut optimizer_states = NnueRangerOptimizerStates::from_host_weights(&stream, &host_weights)?;
-    let forward_layout = NnueForwardWorkspaceLayout::new(first_case.shape, first_case.batch_size);
-    let mut forward_workspace = NnueForwardWorkspace::new(&stream, forward_layout)?;
-    let loss_layout = ScalarLossLayout::new(first_case.batch_size);
-    let mut loss_workspace = ScalarLossWorkspace::new(&stream, loss_layout)?;
-    let backward_layout = NnueBackwardWorkspaceLayout::new(first_case.shape, first_case.batch_size, first_case.max_active);
-    let mut backward_workspace = NnueBackwardWorkspace::new(&stream, backward_layout)?;
+    let mut runner =
+        NnueLossRangerStepRunner::new(&stream, &host_weights, first_case.batch_size, first_case.max_active)?;
+    let train_loss_kind = match args.loss_kind {
+        LossKind::SigmoidMse => NnueTrainLossKind::SigmoidMse,
+        LossKind::NnuePytorchWrm => NnueTrainLossKind::NnuePytorchWrm,
+    };
     let mut comparisons = Vec::new();
 
     for (step_idx, train_case) in train_cases.iter().enumerate() {
@@ -840,115 +830,19 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         );
         let params = grouped_ranger_step_params_for_step(step);
 
-        let host_batch = NnueForwardHostBatch {
+        let host_batch = NnueTrainStepHostBatch {
             stm_indices: &case.stm,
             nstm_indices: &case.nstm,
+            targets: &train_case.targets,
+            entry_weights: &train_case.entry_weights,
             batch_size: case.batch_size,
             max_active: case.max_active,
         };
-        let device_batch = NnueForwardDeviceBatch::from_host(&stream, &host_batch)?;
-        let targets = DeviceBuffer::from_host(&stream, &train_case.targets)?;
-        let entry_weights = DeviceBuffer::from_host(&stream, &train_case.entry_weights)?;
-
-        nnue_forward::launch_nnue_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
-        match args.loss_kind {
-            LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
-                &stream,
-                &module,
-                &forward_workspace.output,
-                &targets,
-                &entry_weights,
-                &mut loss_workspace,
-            )?,
-            LossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(
-                &stream,
-                &module,
-                &forward_workspace.output,
-                &targets,
-                &entry_weights,
-                &mut loss_workspace,
-            )?,
-        }
-
-        let output_layout = DenseOutputBackwardLayout::new(case.batch_size, case.shape.l3);
-        dense_backward::launch_dense_output_backward(
-            &stream,
-            &module,
-            output_layout,
-            &forward_workspace.hidden2,
-            &loss_workspace.mean_output_gradients,
-            &device_weights.outw,
-            &mut backward_workspace.hidden2_gradients,
-            &mut backward_workspace.outw_gradients,
-            &mut backward_workspace.outb_gradients,
-        )?;
-
-        let l2_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l2, case.shape.l3);
-        dense_backward::launch_dense_crelu_backward(
-            &stream,
-            &module,
-            l2_layout,
-            &forward_workspace.hidden1,
-            &forward_workspace.hidden2,
-            &backward_workspace.hidden2_gradients,
-            &device_weights.l2w,
-            &mut backward_workspace.hidden1_gradients,
-            &mut backward_workspace.l2w_gradients,
-            &mut backward_workspace.l2b_gradients,
-        )?;
-
-        let l1_layout = DenseCReluBackwardLayout::new(case.batch_size, case.shape.l1 * 2, case.shape.l2);
-        dense_backward::launch_dense_crelu_backward(
-            &stream,
-            &module,
-            l1_layout,
-            &forward_workspace.combined,
-            &forward_workspace.hidden1,
-            &backward_workspace.hidden1_gradients,
-            &device_weights.l1w,
-            &mut backward_workspace.combined_gradients,
-            &mut backward_workspace.l1w_gradients,
-            &mut backward_workspace.l1b_gradients,
-        )?;
-
-        let l0_layout = NnueL0CReluBackwardLayout::new(case.batch_size, case.shape.l1);
-        dense_backward::launch_nnue_l0_crelu_backward(
-            &stream,
-            &module,
-            l0_layout,
-            &backward_workspace.combined_gradients,
-            &forward_workspace.stm_l0,
-            &forward_workspace.nstm_l0,
-            &mut backward_workspace.stm_l0_gradients,
-            &mut backward_workspace.nstm_l0_gradients,
-        )?;
-
-        let sparse_l0_layout =
-            NnueL0SparseBackwardLayout::new(case.batch_size, case.max_active, case.shape.input_size, case.shape.l1);
-        dense_backward::launch_nnue_l0_sparse_backward(
-            &stream,
-            &module,
-            sparse_l0_layout,
-            &device_batch.stm_indices,
-            &device_batch.nstm_indices,
-            &backward_workspace.stm_l0_gradients,
-            &backward_workspace.nstm_l0_gradients,
-            &mut backward_workspace.l0w_gradients,
-            &mut backward_workspace.l0b_gradients,
-        )?;
-
-        optimizer_update::launch_nnue_ranger_update(
-            &stream,
-            &module,
-            params,
-            &mut device_weights,
-            &backward_workspace,
-            &mut optimizer_states,
-        )?;
+        runner.step(&stream, &module, params, train_loss_kind, host_batch)?;
         stream.synchronize()?;
 
-        let gpu_weighted_sum = loss_workspace.weighted_sum.to_host_vec(&stream)?;
-        let gpu_mean = loss_workspace.mean.to_host_vec(&stream)?;
+        let gpu_weighted_sum = runner.loss_workspace.weighted_sum.to_host_vec(&stream)?;
+        let gpu_mean = runner.loss_workspace.mean.to_host_vec(&stream)?;
         comparisons.push(compare_slices(
             format!("step{step}_weighted_sum"),
             &[cpu_loss_trace.weighted_sum],
@@ -962,8 +856,8 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
             args.tolerance,
         )?);
         if args.debug_readback {
-            let gpu_per_sample = loss_workspace.per_sample.to_host_vec(&stream)?;
-            let gpu_output_gradients = loss_workspace.mean_output_gradients.to_host_vec(&stream)?;
+            let gpu_per_sample = runner.loss_workspace.per_sample.to_host_vec(&stream)?;
+            let gpu_output_gradients = runner.loss_workspace.mean_output_gradients.to_host_vec(&stream)?;
             comparisons.push(compare_slices(
                 format!("step{step}_per_sample"),
                 &cpu_loss_trace.per_sample,
@@ -1007,10 +901,10 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
 
     macro_rules! compare_group {
         ($field:ident, $momentum:ident, $velocity:ident, $slow_params:ident) => {{
-            let gpu_weights = device_weights.$field.to_host_vec(&stream)?;
-            let gpu_momentum = optimizer_states.$field.momentum.to_host_vec(&stream)?;
-            let gpu_velocity = optimizer_states.$field.velocity.to_host_vec(&stream)?;
-            let gpu_slow_params = optimizer_states.$field.slow_params.to_host_vec(&stream)?;
+            let gpu_weights = runner.device_weights.$field.to_host_vec(&stream)?;
+            let gpu_momentum = runner.optimizer_states.$field.momentum.to_host_vec(&stream)?;
+            let gpu_velocity = runner.optimizer_states.$field.velocity.to_host_vec(&stream)?;
+            let gpu_slow_params = runner.optimizer_states.$field.slow_params.to_host_vec(&stream)?;
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_weights"),
                 &cpu_case.$field,

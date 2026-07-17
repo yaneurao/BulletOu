@@ -802,6 +802,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   The first fixture supplies the initial weights; subsequent fixtures supply
   batch/target/entry-weight data while GPU and CPU weights plus Ranger
   optimizer state are carried across steps.
+- Refactored the GPU train-step launch sequence into
+  `bulletou-cuda-train/src/nnue_train_step.rs` as
+  `NnueLossRangerStepRunner`. The runner owns persistent device weights,
+  Ranger optimizer state, and workspaces, and each `step()` accepts one
+  fixed-layout host batch plus targets/entry weights. This keeps the fixture
+  smoke as a caller while exposing the shape needed by the future streaming
+  trainer loop.
 - Ran `bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture`
   against that fixture in WSL2 Ubuntu-24.04 on RTX 4090.
 - Result: the full HalfKP-sized path succeeded:
@@ -835,6 +842,8 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `step1_*` and `step2_*` loss buffers matched exactly, and final
   weights/momentum/velocity/slow parameters matched CPU goldens within
   tolerance.
+- Re-ran the same `-TrainSteps 2 -DebugReadback` validation after the
+  `NnueLossRangerStepRunner` extraction; results remained `compare: ok`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
