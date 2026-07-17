@@ -13,7 +13,7 @@ commit each completed slice.
 | BO-CUDA-005 | done | dataloader resume generalisation | HCPE3, shogipack, multi-teacher specs, and teacher changes have explicit resume behavior and smoke coverage |
 | BO-CUDA-006 | done | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
 | BO-CUDA-007 | done | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
-| BO-CUDA-008 | todo | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
+| BO-CUDA-008 | doing | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 
 ## Notes
 

@@ -4,7 +4,10 @@
 use std::{error::Error, fmt, sync::atomic::Ordering};
 
 use crate::{
-    game::inputs::ShogiHalfKP,
+    game::{
+        inputs::{ShogiHalfKa2, ShogiHalfKP},
+        outputs::ShogiLayerStackBucket9,
+    },
     shogi::PackedSfenValue,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     value::{
@@ -48,6 +51,28 @@ pub struct HalfkpTeacherBatchConfig<'a> {
 
 #[derive(Debug, Clone)]
 pub struct HalfkpTeacherBatch {
+    pub batch: FastBatchHost,
+    pub source: String,
+    pub dataloader_pos: Option<TeacherDataloaderPos>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SfnnTeacherBatchConfig<'a> {
+    pub teacher: &'a str,
+    pub batch_size: usize,
+    pub batch_index: usize,
+    pub dataloader_resume_pos: Option<TeacherDataloaderPos>,
+    pub buffer_mb: usize,
+    pub loader_threads: usize,
+    pub threads: usize,
+    pub lambda: f32,
+    pub scale: f32,
+    pub nnue_pytorch_wrm_loss: bool,
+    pub score_drop_abs: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SfnnTeacherBatch {
     pub batch: FastBatchHost,
     pub source: String,
     pub dataloader_pos: Option<TeacherDataloaderPos>,
@@ -197,6 +222,114 @@ where
     }
 }
 
+pub fn for_each_sfnn_halfka2_teacher_fast_batch<F, E>(
+    config: &SfnnTeacherBatchConfig<'_>,
+    batch_count: usize,
+    visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    validate_sfnn_config(config)?;
+    if batch_count == 0 {
+        return Ok(0);
+    }
+
+    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
+
+    match format {
+        DataFormat::Hcpe => {
+            let mut loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                config.buffer_mb,
+                (|_| true) as fn(&PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(config.batch_size)
+            .with_loader_threads(config.loader_threads)
+            .with_single_epoch(true);
+            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+                if pos.plies != 0 {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position must have plies=0, got {}",
+                        pos.plies
+                    )));
+                }
+                loader = loader.with_exact_resume_offset(pos.byte_offset);
+                (0, pos.byte_offset)
+            } else {
+                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
+                    TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
+                        config.batch_index, config.batch_size
+                    ))
+                })?;
+                let base_byte_offset = (consumed_records as u64)
+                    .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
+                    .ok_or_else(|| {
+                        TeacherBatchError::invalid_input(format!(
+                            "HCPE dataloader resume byte offset overflow: consumed_records={consumed_records}"
+                        ))
+                    })?;
+                (config.batch_index, base_byte_offset)
+            };
+            visit_sfnn_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                move |visited_batches| hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches),
+                visitor,
+            )
+        }
+        DataFormat::Hcpe3 => {
+            let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(true);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_sfnn_batches(loader, format, config, batch_count, loader_start_batch, |_| {
+                Some(TeacherDataloaderPos {
+                    byte_offset: offset_handle.load(Ordering::Acquire),
+                    plies: plies_handle.load(Ordering::Acquire),
+                })
+            }, visitor)
+        }
+        DataFormat::Pack => {
+            let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(true);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_sfnn_batches(loader, format, config, batch_count, loader_start_batch, |_| {
+                Some(TeacherDataloaderPos {
+                    byte_offset: offset_handle.load(Ordering::Acquire),
+                    plies: plies_handle.load(Ordering::Acquire),
+                })
+            }, visitor)
+        }
+        DataFormat::Psv => {
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            visit_sfnn_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
+        }
+    }
+}
+
 fn hcpe_dataloader_pos_after_batch(
     base_byte_offset: u64,
     batch_size: usize,
@@ -209,6 +342,19 @@ fn hcpe_dataloader_pos_after_batch(
 }
 
 fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
+    if config.batch_size == 0 {
+        return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
+    }
+    if !(0.0..=1.0).contains(&config.lambda) {
+        return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
+    }
+    if !(config.scale.is_finite() && config.scale > 0.0) {
+        return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
+    }
+    Ok(())
+}
+
+fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
     }
@@ -278,6 +424,70 @@ where
     if visited_batches != batch_count {
         return Err(TeacherBatchError::invalid_input(format!(
             "teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+            config.batch_index, config.batch_size
+        )));
+    }
+
+    Ok(visited_batches)
+}
+
+fn visit_sfnn_batches<D, P, F, E>(
+    loader: D,
+    format: DataFormat,
+    config: &SfnnTeacherBatchConfig<'_>,
+    batch_count: usize,
+    loader_start_batch: usize,
+    mut dataloader_pos: P,
+    mut visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    D: DataLoader<PackedSfenValue>,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
+    F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    let threads = config.threads.max(1);
+    let dataloader = DefaultDataLoader::new(
+        ShogiHalfKa2,
+        ShogiLayerStackBucket9::KingRank9,
+        (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
+        None,
+        config.nnue_pytorch_wrm_loss,
+        false,
+        config.scale,
+        config.score_drop_abs,
+        loader,
+    );
+    let mut visited_batches = 0usize;
+    let mut visit_error = None;
+    dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+        let batch_index = config.batch_index + visited_batches;
+        let prepared = dataloader.prepare(batch, threads, 1.0 - config.lambda);
+        let batch = FastBatchHost::from(prepared);
+        if let Err(err) = batch.validate() {
+            visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+            return true;
+        }
+
+        let source = format!("{format:?} SFNN teacher batch {batch_index}: {}", config.teacher);
+        let dataloader_pos = dataloader_pos(visited_batches);
+        if let Err(err) = visitor(SfnnTeacherBatch { batch, source, dataloader_pos }) {
+            visit_error = Some(TeacherBatchError::invalid_input(format!(
+                "SFNN teacher batch callback failed at batch {batch_index}: {err}"
+            )));
+            return true;
+        }
+
+        visited_batches += 1;
+        visited_batches >= batch_count
+    });
+
+    if let Some(err) = visit_error {
+        return Err(err);
+    }
+    if visited_batches != batch_count {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "SFNN teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
             config.batch_index, config.batch_size
         )));
     }
