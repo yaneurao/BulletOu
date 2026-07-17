@@ -97,6 +97,7 @@ struct Args {
     test_positions: usize,
     test_batch_size: usize,
     test_seed: u64,
+    sfnn_factorized_l1: bool,
     output: Option<std::path::PathBuf>,
     train_steps: usize,
     save_rate: usize,
@@ -212,6 +213,7 @@ impl Args {
             test_positions: 100_000,
             test_batch_size: 1024,
             test_seed: 0,
+            sfnn_factorized_l1: false,
             output: None,
             train_steps: 1,
             save_rate: 0,
@@ -329,6 +331,9 @@ impl Args {
                 }
                 "--test-seed" => {
                     parsed.test_seed = parse_u64_arg(required_arg(&mut args, "--test-seed")?, "--test-seed")?;
+                }
+                "--sfnn-factorized-l1" => {
+                    parsed.sfnn_factorized_l1 = true;
                 }
                 "--output" => parsed.output = Some(required_path_arg(&mut args, "--output")?),
                 "--train-steps" => {
@@ -1687,14 +1692,22 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 .to_string(),
         ));
     }
-    let initial_case = match args.weights_bin.as_deref() {
+    let mut initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfka2_weights_as_sfnn_case(path)?,
         None => SfnnForwardCase::new(SfnnForwardCaseKind::Halfka2),
     };
-    let restored_state = match train_state_source {
+    if args.sfnn_factorized_l1 {
+        initial_case.ensure_zero_factorized_l1();
+    }
+    let mut restored_state = match train_state_source {
         Some(path) => Some(load_root_halfka2_train_state_case(path)?),
         None => None,
     };
+    if args.sfnn_factorized_l1 {
+        if let Some(state) = &mut restored_state {
+            state.ensure_zero_factorized_l1();
+        }
+    }
     let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
     if shape != bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3 {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
@@ -1958,6 +1971,8 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(last_lr) = learning_rates.last() {
         println!("  lr_last      : {last_lr}");
     }
+    let factorized_l1 = restored_state.as_ref().map(SfnnTrainStateCase::has_factorized_l1).unwrap_or(initial_case.l1fw.is_some());
+    println!("  l1_factor    : {}", if factorized_l1 { "enabled" } else { "disabled" });
     if let Some(elapsed) = train_elapsed {
         let seconds = elapsed.as_secs_f64();
         let pos_per_sec = train_positions as f64 / seconds.max(1e-9);
@@ -2165,12 +2180,31 @@ fn run_sfnn_bridge_test_pass(
         l2_size: shape.l2_size,
         num_stacks: shape.num_stacks,
     };
+    let mut folded_l1w = state.l1w.weights.clone();
+    let mut folded_l1b = state.l1b.weights.clone();
+    match (&state.l1fw, &state.l1fb) {
+        (Some(l1fw), Some(l1fb)) => {
+            fold_sfnn_factorized_l1(
+                shape,
+                &l1fw.weights,
+                &l1fb.weights,
+                &mut folded_l1w,
+                &mut folded_l1b,
+            )?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+                "SFNN validation received incomplete factorized L1 state".to_string(),
+            ));
+        }
+    }
     let forward_weights = SfnnForwardWeights {
         shape: root_shape,
         l0w: &state.l0w.weights,
         l0b: &state.l0b.weights,
-        l1w: &state.l1w.weights,
-        l1b: &state.l1b.weights,
+        l1w: &folded_l1w,
+        l1b: &folded_l1b,
         l2w: &state.l2w.weights,
         l2b: &state.l2b.weights,
         l3w: &state.l3w.weights,
@@ -2229,6 +2263,47 @@ fn run_sfnn_bridge_test_pass(
         report.loss_sampled,
     );
     Ok(NnueBridgeTestMetrics { accuracy, loss })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn fold_sfnn_factorized_l1(
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    l1fw: &[f32],
+    l1fb: &[f32],
+    l1w: &mut [f32],
+    l1b: &mut [f32],
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
+    let expected = [
+        ("l1fw", layout.l1fw_len(), l1fw.len()),
+        ("l1fb", layout.l1fb_len(), l1fb.len()),
+        ("l1w", layout.l1w_len(), l1w.len()),
+        ("l1b", layout.l1b_len(), l1b.len()),
+    ];
+    for (name, expected, actual) in expected {
+        if expected != actual {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "cannot fold SFNN factorized L1: {name} len {actual}, expected {expected}"
+            )));
+        }
+    }
+
+    let l1_out = shape.l1_out();
+    let stack_stride = shape.num_stacks.saturating_mul(l1_out);
+    for stack in 0..shape.num_stacks {
+        let bias_base = stack * l1_out;
+        for row in 0..l1_out {
+            l1b[bias_base + row] += l1fb[row];
+        }
+        for input in 0..shape.ft_size {
+            let base = input * stack_stride + stack * l1_out;
+            let shared_base = input * l1_out;
+            for row in 0..l1_out {
+                l1w[base + row] += l1fw[shared_base + row];
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -2689,7 +2764,7 @@ fn write_sfnn_halfka2_nn_bin(
         )));
     }
 
-    let graph = ModelWeights::from_f32_values([
+    let mut graph_records = vec![
         ("l0w", state.l0w.weights.clone()),
         ("l0b", state.l0b.weights.clone()),
         ("l1w", state.l1w.weights.clone()),
@@ -2698,7 +2773,21 @@ fn write_sfnn_halfka2_nn_bin(
         ("l2b", state.l2b.weights.clone()),
         ("l3w", state.l3w.weights.clone()),
         ("l3b", state.l3b.weights.clone()),
-    ]);
+    ];
+    let factorized_l1 = match (&state.l1fw, &state.l1fb) {
+        (Some(l1fw), Some(l1fb)) => {
+            graph_records.push(("l1fw", l1fw.weights.clone()));
+            graph_records.push(("l1fb", l1fb.weights.clone()));
+            true
+        }
+        (None, None) => false,
+        _ => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+                "cannot write SFNN nn.bin with incomplete factorized L1 state".to_string(),
+            ));
+        }
+    };
+    let graph = ModelWeights::from_f32_values(graph_records);
     let formats = build_sfnn_1536_save_format(Sfnn1536SaveParams {
         feature_set,
         input_size: shape.input_size,
@@ -2706,7 +2795,7 @@ fn write_sfnn_halfka2_nn_bin(
         l1_hidden: shape.l1_hidden,
         l2_size: shape.l2_size,
         num_stacks: shape.num_stacks,
-        factorized_l1: false,
+        factorized_l1,
     });
 
     let mut bytes = Vec::new();
@@ -2761,6 +2850,18 @@ fn write_sfnn_root_state_bin(
                 (format!("nnue/{}/l3w", $section), state.l3w.$field.as_slice()),
                 (format!("nnue/{}/l3b", $section), state.l3b.$field.as_slice()),
             ];
+            match (&state.l1fw, &state.l1fb) {
+                (Some(l1fw), Some(l1fb)) => {
+                    records.push((format!("nnue/{}/l1fw", $section), l1fw.$field.as_slice()));
+                    records.push((format!("nnue/{}/l1fb", $section), l1fb.$field.as_slice()));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+                        "cannot write SFNN root state.bin with incomplete factorized L1 state".to_string(),
+                    ));
+                }
+            }
             records.sort_by(|a, b| a.0.cmp(&b.0));
             let chunk =
                 bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
@@ -2781,7 +2882,20 @@ fn write_sfnn_root_state_bin(
     write_section!("slow", slow_params);
 
     let step = completed_steps as f32;
-    let mut step_records: Vec<(String, Vec<f32>)> = ["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"]
+    let mut step_ids = vec!["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"];
+    match (&state.l1fw, &state.l1fb) {
+        (Some(_), Some(_)) => {
+            step_ids.push("l1fw");
+            step_ids.push("l1fb");
+        }
+        (None, None) => {}
+        _ => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+                "cannot write SFNN root state.bin step records with incomplete factorized L1 state".to_string(),
+            ));
+        }
+    }
+    let mut step_records: Vec<(String, Vec<f32>)> = step_ids
         .iter()
         .map(|id| (format!("nnue/step_ranger/{id}"), vec![step]))
         .collect();
@@ -3462,6 +3576,24 @@ fn load_root_halfka2_train_state_case(path: &std::path::Path) -> bulletou_cuda_o
             slow_params: take_record(path, "slow", slow, id, expected_len)?,
         })
     };
+    let optional_group =
+        |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<Option<NnueTrainStateGroupCase>> {
+            let present =
+                weights.contains_key(id) || momentum.contains_key(id) || velocity.contains_key(id) || slow.contains_key(id);
+            if present {
+                Ok(Some(group(id, expected_len)?))
+            } else {
+                Ok(None)
+            }
+        };
+    let l1fw = optional_group("l1fw", layout.l1fw_len())?;
+    let l1fb = optional_group("l1fb", layout.l1fb_len())?;
+    if l1fw.is_some() != l1fb.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "root SFNN train state {} has incomplete factorized L1 records; expected both l1fw and l1fb",
+            path.display()
+        )));
+    }
 
     Ok(SfnnTrainStateCase {
         shape,
@@ -3470,6 +3602,8 @@ fn load_root_halfka2_train_state_case(path: &std::path::Path) -> bulletou_cuda_o
         l0b: group("l0b", layout.l0b_len())?,
         l1w: group("l1w", layout.l1w_len())?,
         l1b: group("l1b", layout.l1b_len())?,
+        l1fw,
+        l1fb,
         l2w: group("l2w", layout.l2w_len())?,
         l2b: group("l2b", layout.l2b_len())?,
         l3w: group("l3w", layout.l3w_len())?,
@@ -4990,7 +5124,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -5064,6 +5198,8 @@ fn usage() -> &'static str {
      them directly to the SFNN loss/Ranger runner. --output writes numbered\n\
      bridge checkpoints with YaneuraOu-compatible nn.bin, root-format state.bin,\n\
      teacher.txt, dataloader_pos.txt, learn.log, and summary-learn.log.\n\
+     --sfnn-factorized-l1 zero-initializes nnue-pytorch-style shared L1 weights\n\
+     for new runs; resumed state.bin files keep their stored l1fw/l1fb records.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -5708,6 +5844,16 @@ struct NnueTrainStateGroupCase {
 }
 
 #[cfg(feature = "cuda")]
+fn zero_train_state_group(len: usize) -> NnueTrainStateGroupCase {
+    NnueTrainStateGroupCase {
+        weights: vec![0.0; len],
+        momentum: vec![0.0; len],
+        velocity: vec![0.0; len],
+        slow_params: vec![0.0; len],
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 struct NnueTrainStateCase {
     shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape,
@@ -5796,6 +5942,8 @@ struct SfnnTrainStateCase {
     l0b: NnueTrainStateGroupCase,
     l1w: NnueTrainStateGroupCase,
     l1b: NnueTrainStateGroupCase,
+    l1fw: Option<NnueTrainStateGroupCase>,
+    l1fb: Option<NnueTrainStateGroupCase>,
     l2w: NnueTrainStateGroupCase,
     l2b: NnueTrainStateGroupCase,
     l3w: NnueTrainStateGroupCase,
@@ -6464,6 +6612,20 @@ impl NnueTrainStateCase {
 
 #[cfg(feature = "cuda")]
 impl SfnnTrainStateCase {
+    fn ensure_zero_factorized_l1(&mut self) {
+        let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(self.shape);
+        if self.l1fw.is_none() {
+            self.l1fw = Some(zero_train_state_group(layout.l1fw_len()));
+        }
+        if self.l1fb.is_none() {
+            self.l1fb = Some(zero_train_state_group(layout.l1fb_len()));
+        }
+    }
+
+    fn has_factorized_l1(&self) -> bool {
+        self.l1fw.is_some() && self.l1fb.is_some()
+    }
+
     fn host_weights(&self) -> bulletou_cuda_oxide_runtime::sfnn::SfnnForwardHostWeights<'_> {
         bulletou_cuda_oxide_runtime::sfnn::SfnnForwardHostWeights {
             shape: self.shape,
@@ -6471,8 +6633,8 @@ impl SfnnTrainStateCase {
             l0b: &self.l0b.weights,
             l1w: &self.l1w.weights,
             l1b: &self.l1b.weights,
-            l1fw: None,
-            l1fb: None,
+            l1fw: self.l1fw.as_ref().map(|group| group.weights.as_slice()),
+            l1fb: self.l1fb.as_ref().map(|group| group.weights.as_slice()),
             l2w: &self.l2w.weights,
             l2b: &self.l2b.weights,
             l3w: &self.l3w.weights,
@@ -6500,8 +6662,16 @@ impl SfnnTrainStateCase {
             l0b: group!(l0b),
             l1w: group!(l1w),
             l1b: group!(l1b),
-            l1fw: None,
-            l1fb: None,
+            l1fw: self.l1fw.as_ref().map(|group| RangerOptimizerHostState {
+                momentum: &group.momentum,
+                velocity: &group.velocity,
+                slow_params: &group.slow_params,
+            }),
+            l1fb: self.l1fb.as_ref().map(|group| RangerOptimizerHostState {
+                momentum: &group.momentum,
+                velocity: &group.velocity,
+                slow_params: &group.slow_params,
+            }),
             l2w: group!(l2w),
             l2b: group!(l2b),
             l3w: group!(l3w),
@@ -6970,6 +7140,16 @@ impl SfnnForwardCase {
             SfnnForwardCaseKind::Tiny => Self::tiny(),
             SfnnForwardCaseKind::FactorizedTiny => Self::factorized_tiny(),
             SfnnForwardCaseKind::Halfka2 => Self::halfka2_1024_7_64_k3k3(),
+        }
+    }
+
+    fn ensure_zero_factorized_l1(&mut self) {
+        let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(self.shape);
+        if self.l1fw.is_none() {
+            self.l1fw = Some(vec![0.0; layout.l1fw_len()]);
+        }
+        if self.l1fb.is_none() {
+            self.l1fb = Some(vec![0.0; layout.l1fb_len()]);
         }
     }
 

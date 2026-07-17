@@ -21,6 +21,7 @@ commit each completed slice.
 | BO-CUDA-013 | done | SFNN plateau schedule | BulletOu `--backend cuda-oxide --eval-type SFNN_HALFKA2 --lr-schedule plateau` runs through the generic plateau orchestrator using SFNN validation metrics and auto-resume |
 | BO-CUDA-014 | done | SFNN factorized L1 forward foundation | cuda-oxide SFNN forward/runtime/fixture paths can carry optional shared `l1f` weights and match CPU golden output before training-backward integration |
 | BO-CUDA-015 | done | SFNN factorized L1 backward/Ranger smoke | cuda-oxide SFNN backward/runtime/optimizer paths can compute and update optional shared `l1f` weights, with `factorized-tiny` backward and Ranger-step smokes matching CPU golden |
+| BO-CUDA-016 | done | SFNN factorized L1 production integration | `--sfnn-teacher-train --sfnn-factorized-l1` and BulletOu `--backend cuda-oxide --sfnn-factorized-l1` can train, checkpoint, resume, validate, and save folded `nn.bin` with shared `l1f` state preserved in root `state.bin` |
 
 ## Notes
 
@@ -212,3 +213,20 @@ commit each completed slice.
   - WSL CUDA `--sfnn-dense-backward-smoke --sfnn-forward-case factorized-tiny` matched CPU golden: `l1fw_grad` max_abs diff `0.000000014901161`; `l1fb_grad` max_abs diff `0.000000059604645`; compare `ok`.
   - WSL CUDA `--sfnn-ranger-step-smoke --sfnn-forward-case factorized-tiny` matched CPU golden including `l1fw_*` and `l1fb_*` weight/momentum/velocity/slow buffers; compare `ok`.
   - WSL CUDA regressions `--sfnn-dense-backward-smoke --sfnn-forward-case tiny` and `--sfnn-ranger-step-smoke --sfnn-forward-case tiny` both matched CPU golden; compare `ok`.
+
+### BO-CUDA-016
+
+- Added `--sfnn-factorized-l1` to `bulletou-cuda-train --sfnn-teacher-train`.
+- New SFNN cuda-oxide teacher runs can zero-initialize optional shared L1 weights (`l1fw`, `l1fb`) and optimizer state.
+- Root `state.bin` write/read now preserves optional `nnue/{weights,momentum,velocity,slow,step_ranger}/l1fw` and `l1fb` records; resuming a factorized state keeps the shared L1 path even if the new invocation omits the initialization flag.
+- SFNN validation folds `l1fw/l1fb` into the per-bucket `l1w/l1b` CPU fast-forward view, matching the `nn.bin` save semantics.
+- SFNN `nn.bin` saving now passes `factorized_l1=true` when shared L1 state is present, so the saved YaneuraOu-compatible weights fold the shared term into every bucket.
+- The BulletOu wrapper no longer rejects `--backend cuda-oxide --eval-type SFNN_HALFKA2 --sfnn-factorized-l1`; it forwards `--sfnn-factorized-l1` to the nested child trainer.
+- Validation:
+  - `cargo check -p bulletou-cuda-train`.
+  - `cargo test --example bulletou cuda_oxide_backend`.
+  - `cargo test -p bulletou-cuda-oxide-runtime sfnn`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL CUDA `bulletou-cuda-train --sfnn-teacher-train --sfnn-factorized-l1` on `shuffled-001.hcpe` ran one real HCPE batch, wrote `0001/nn.bin` and `0001/state.bin`, printed `l1_factor : enabled`, ran SFNN validation on 4 held-out positions, and `state.bin` contained `l1fw/l1fb` records for weights, momentum, velocity, slow, and step.
+  - WSL CUDA resume smoke from that checkpoint, without passing `--sfnn-factorized-l1`, restored `0001/state.bin`, resumed data at `byte_offset=38, plies=0`, printed `l1_factor : enabled`, wrote `0002`, and preserved `l1fw/l1fb` records.
+  - WSL CUDA wrapper smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --sfnn-factorized-l1` ran one real HCPE batch, launched the nested child with `--sfnn-factorized-l1`, wrote `0001/nn.bin` and `0001/state.bin`, and preserved `l1fw/l1fb` records.

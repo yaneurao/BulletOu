@@ -56,6 +56,8 @@ pub(crate) struct SfnnTrainStateReadback {
     pub(crate) l0b: SfnnTrainParamGroupReadback,
     pub(crate) l1w: SfnnTrainParamGroupReadback,
     pub(crate) l1b: SfnnTrainParamGroupReadback,
+    pub(crate) l1fw: Option<SfnnTrainParamGroupReadback>,
+    pub(crate) l1fb: Option<SfnnTrainParamGroupReadback>,
     pub(crate) l2w: SfnnTrainParamGroupReadback,
     pub(crate) l2b: SfnnTrainParamGroupReadback,
     pub(crate) l3w: SfnnTrainParamGroupReadback,
@@ -331,12 +333,33 @@ impl SfnnLossRangerStepRunner {
                 }
             };
         }
+        macro_rules! read_optional_group {
+            ($field:ident) => {
+                match (&self.device_weights.$field, &self.optimizer_states.$field) {
+                    (Some(weights), Some(state)) => Some(SfnnTrainParamGroupReadback {
+                        weights: weights.to_host_vec(stream)?,
+                        momentum: state.momentum.to_host_vec(stream)?,
+                        velocity: state.velocity.to_host_vec(stream)?,
+                        slow_params: state.slow_params.to_host_vec(stream)?,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(Error::Smoke(format!(
+                            "SFNN optional optimizer state mismatch for {}",
+                            stringify!($field)
+                        )));
+                    }
+                }
+            };
+        }
 
         Ok(SfnnTrainStateReadback {
             l0w: read_group!(l0w),
             l0b: read_group!(l0b),
             l1w: read_group!(l1w),
             l1b: read_group!(l1b),
+            l1fw: read_optional_group!(l1fw),
+            l1fb: read_optional_group!(l1fb),
             l2w: read_group!(l2w),
             l2b: read_group!(l2b),
             l3w: read_group!(l3w),
