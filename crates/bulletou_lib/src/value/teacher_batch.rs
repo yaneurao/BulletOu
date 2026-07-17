@@ -21,6 +21,10 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub teacher: &'a str,
     pub batch_size: usize,
     pub batch_index: usize,
+    /// Exact concatenated HCPE byte offset to resume from. When set, the HCPE
+    /// loader starts from this offset instead of deriving an offset from
+    /// `batch_index`; `batch_index` is still used for source labels.
+    pub hcpe_resume_offset: Option<u64>,
     pub buffer_mb: usize,
     /// HCPE decode threads. `0` means loader default/auto.
     pub loader_threads: usize,
@@ -98,7 +102,7 @@ where
 
     match format {
         DataFormat::Hcpe => {
-            let loader = HcpeDataLoader::new_concat_multiple(
+            let mut loader = HcpeDataLoader::new_concat_multiple(
                 &data_files_ref,
                 config.buffer_mb,
                 (|_| true) as fn(&PackedSfenValue) -> bool,
@@ -106,22 +110,28 @@ where
             .with_buffer_records(config.batch_size)
             .with_loader_threads(config.loader_threads)
             .with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, visitor)
+            let loader_start_batch = if let Some(offset) = config.hcpe_resume_offset {
+                loader = loader.with_exact_resume_offset(offset);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, visitor)
         }
         DataFormat::Hcpe3 => {
             let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
                 .with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, visitor)
+            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
         }
         DataFormat::Pack => {
             let loader =
                 ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true).with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, visitor)
+            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
-            visit_halfkp_batches(loader, format, config, batch_count, visitor)
+            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, visitor)
         }
     }
 }
@@ -144,6 +154,7 @@ fn visit_halfkp_batches<D, F, E>(
     format: DataFormat,
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
+    loader_start_batch: usize,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
 where
@@ -165,7 +176,7 @@ where
     );
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    dataloader.load_and_map_batches(config.batch_index, config.batch_size, |batch| {
+    dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepared = dataloader.prepare(batch, threads, 1.0 - config.lambda);
         let batch = FastBatchHost::from(prepared);
@@ -208,6 +219,7 @@ mod tests {
             teacher: "missing.hcpe",
             batch_size: 2,
             batch_index: 0,
+            hcpe_resume_offset: None,
             buffer_mb: 1,
             loader_threads: 1,
             threads: 1,

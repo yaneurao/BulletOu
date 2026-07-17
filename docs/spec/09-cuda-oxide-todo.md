@@ -1037,6 +1037,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   as the trainer (`completed_steps * batch_size * 38,0`). This is sufficient
   for the current HCPE smoke path; later loader helper work can replace it with
   the exact consumed-offset handle.
+- Wired bridge `dataloader_pos.txt` back into direct teacher resume. The
+  HalfKP teacher helper now accepts `hcpe_resume_offset`; `--output`
+  auto-resume reads the latest `<output>/000N/dataloader_pos.txt` and passes
+  the byte offset to `HcpeDataLoader::with_exact_resume_offset()`. Validation
+  resumed from `0005/dataloader_pos.txt` (`380,0`), printed
+  `resume_hcpe: byte_offset=380`, and wrote `0006/dataloader_pos.txt`
+  (`456,0`).
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

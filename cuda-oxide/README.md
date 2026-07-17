@@ -133,8 +133,10 @@ velocity, Ranger slow weights, and step counters. HCPE runs also write
 current direct resume path, and append one row to top-level
 `summary-learn.log`. If `<DIR>` already contains numbered bridge checkpoints,
 the direct trainer automatically restores the latest `state.boung` and writes
-the next number. In that case omit `--weights-bin`, because the restored train
-state already carries weights and optimizer state.
+the next number. If that checkpoint has `dataloader_pos.txt`, HCPE input resumes
+from its byte offset through the loader's exact resume path. In that case omit
+`--weights-bin`, because the restored train state already carries weights and
+optimizer state.
 
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`

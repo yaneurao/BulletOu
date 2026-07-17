@@ -1047,9 +1047,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => default_nnue_ptx()?,
     };
 
-    let output_resume_train_state_fixture = if args.nnue_train_state_fixture.is_none() {
+    let output_resume_checkpoint = if args.nnue_train_state_fixture.is_none() {
         match args.output.as_deref() {
-            Some(output_dir) => find_latest_bridge_train_state(output_dir)?,
+            Some(output_dir) => find_latest_bridge_checkpoint(output_dir)?,
             None => None,
         }
     } else {
@@ -1058,7 +1058,14 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let train_state_fixture = args
         .nnue_train_state_fixture
         .as_deref()
-        .or(output_resume_train_state_fixture.as_deref());
+        .or(output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_path.as_path()));
+    let hcpe_resume_offset = match output_resume_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
+    {
+        Some(path) => parse_hcpe_dataloader_pos(path)?,
+        None => None,
+    };
 
     if args.weights_bin.is_some() && train_state_fixture.is_some() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
@@ -1106,6 +1113,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         teacher,
         batch_size: args.batch_size,
         batch_index: completed_step_offset,
+        hcpe_resume_offset,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -1228,6 +1236,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  teacher      : {teacher}");
     if let Some(path) = train_state_fixture {
         println!("  resume_state : {}", path.display());
+    }
+    if let Some(offset) = hcpe_resume_offset {
+        println!("  resume_hcpe  : byte_offset={offset}");
     }
     println!("  batches      : {}", sources.len());
     for (idx, source) in sources.iter().enumerate() {
@@ -1649,9 +1660,15 @@ fn create_next_numbered_checkpoint_dir(
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
-fn find_latest_bridge_train_state(
+struct BridgeResumeCheckpoint {
+    state_path: std::path::PathBuf,
+    dataloader_pos_path: Option<std::path::PathBuf>,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn find_latest_bridge_checkpoint(
     output_dir: &std::path::Path,
-) -> bulletou_cuda_oxide_runtime::Result<Option<std::path::PathBuf>> {
+) -> bulletou_cuda_oxide_runtime::Result<Option<BridgeResumeCheckpoint>> {
     if !output_dir.exists() {
         return Ok(None);
     }
@@ -1674,11 +1691,13 @@ fn find_latest_bridge_train_state(
         };
         let state_path = entry.path().join("state.boung");
         if state_path.is_file() && latest.as_ref().map_or(true, |(latest_index, _)| index > *latest_index) {
-            latest = Some((index, state_path));
+            let dataloader_pos_path = entry.path().join("dataloader_pos.txt");
+            let dataloader_pos_path = dataloader_pos_path.is_file().then_some(dataloader_pos_path);
+            latest = Some((index, BridgeResumeCheckpoint { state_path, dataloader_pos_path }));
         }
     }
 
-    Ok(latest.map(|(_, state_path)| state_path))
+    Ok(latest.map(|(_, checkpoint)| checkpoint))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -1706,6 +1725,45 @@ fn numbered_checkpoint_dir_index(entry: &std::fs::DirEntry) -> bulletou_cuda_oxi
         ))
     })?;
     Ok(Some(index))
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn parse_hcpe_dataloader_pos(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<Option<u64>> {
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read bridge checkpoint dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    let line = text.lines().find(|line| !line.trim().is_empty());
+    let Some(line) = line else {
+        return Ok(None);
+    };
+    let Some((offset, plies)) = line.trim().split_once(',') else {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "invalid dataloader_pos.txt {}: expected `<byte_offset>,<plies>`",
+            path.display()
+        )));
+    };
+    let offset = offset.trim().parse::<u64>().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "invalid byte offset in dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    let plies = plies.trim().parse::<u64>().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "invalid plies in dataloader_pos.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    if plies != 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "HCPE dataloader_pos.txt {} must have plies=0, got {plies}",
+            path.display()
+        )));
+    }
+    Ok(Some(offset))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
