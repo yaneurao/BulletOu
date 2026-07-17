@@ -621,3 +621,30 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     max_abs diff `0.0000000000009094947`.
 - Remaining CO-010 work: wire optimizer state buffers into the real trainer
   path.
+
+### 2026-07-17 CO-010 optimizer state buffers
+
+- Added cuda-oxide runtime ownership structs for optimizer state buffers:
+  - `OptimizerStateLayout { len }`;
+  - `MomentumVelocityDeviceState` for AdamW/RAdam-style `momentum` and
+    `velocity` buffers;
+  - `RangerOptimizerState` for Ranger `momentum`, `velocity`, and
+    `slow_params` buffers.
+- Added host-state validation helpers for loading state buffers from checkpoint
+  or fixture data before uploading to CUDA.
+- Refactored `--ranger-update-smoke` to allocate and pass
+  `RangerOptimizerState` instead of naked `DeviceBuffer` fields, matching the
+  ownership boundary needed by the future trainer path.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--ranger-update-smoke --debug-readback` succeeded on RTX 4090 through the
+    `RangerOptimizerState` wrapper path: `weights` and `slow_params` max_abs
+    diff `0`, `momentum` max_abs diff `0.00000000011641532`, and `velocity`
+    max_abs diff `0.0000000000009094947`.
+- Remaining CO-010 work: wire these state objects to real NNUE/SFNN parameter
+  groups.

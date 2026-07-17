@@ -1,5 +1,8 @@
 //! Optimizer workspaces and launch layouts for cuda-oxide kernels.
 
+#[cfg(feature = "cuda")]
+use crate::{CudaStream, DeviceBuffer, Result};
+
 pub const ADAMW_UPDATE_KERNEL: &str = "adamw_update";
 pub const RADAM_UPDATE_KERNEL: &str = "radam_update";
 pub const RANGER_LOOKAHEAD_KERNEL: &str = "ranger_lookahead";
@@ -55,6 +58,134 @@ impl AdamWUpdateParams {
         } else {
             Ok(())
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptimizerStateLayout {
+    pub len: usize,
+}
+
+impl OptimizerStateLayout {
+    pub fn new(len: usize) -> Self {
+        Self { len }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
+        if self.len == 0 {
+            Err(OptimizerLayoutError::EmptyParameters)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn state_len(self) -> usize {
+        self.len
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MomentumVelocityHostState<'a> {
+    pub momentum: &'a [f32],
+    pub velocity: &'a [f32],
+}
+
+impl<'a> MomentumVelocityHostState<'a> {
+    pub fn validate(self, layout: OptimizerStateLayout) -> std::result::Result<(), OptimizerLayoutError> {
+        layout.validate()?;
+        expect_state_len("momentum", layout.state_len(), self.momentum.len())?;
+        expect_state_len("velocity", layout.state_len(), self.velocity.len())?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct MomentumVelocityDeviceState {
+    pub layout: OptimizerStateLayout,
+    pub momentum: DeviceBuffer<f32>,
+    pub velocity: DeviceBuffer<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl MomentumVelocityDeviceState {
+    pub fn new_zeroed(stream: &CudaStream, layout: OptimizerStateLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            momentum: DeviceBuffer::zeroed(stream, layout.state_len())?,
+            velocity: DeviceBuffer::zeroed(stream, layout.state_len())?,
+        })
+    }
+
+    pub fn from_host(
+        stream: &CudaStream,
+        layout: OptimizerStateLayout,
+        state: MomentumVelocityHostState<'_>,
+    ) -> Result<Self> {
+        state.validate(layout)?;
+        Ok(Self {
+            layout,
+            momentum: DeviceBuffer::from_host(stream, state.momentum)?,
+            velocity: DeviceBuffer::from_host(stream, state.velocity)?,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub type AdamWOptimizerState = MomentumVelocityDeviceState;
+
+#[cfg(feature = "cuda")]
+pub type RAdamOptimizerState = MomentumVelocityDeviceState;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RangerOptimizerHostState<'a> {
+    pub momentum: &'a [f32],
+    pub velocity: &'a [f32],
+    pub slow_params: &'a [f32],
+}
+
+impl<'a> RangerOptimizerHostState<'a> {
+    pub fn validate(self, layout: OptimizerStateLayout) -> std::result::Result<(), OptimizerLayoutError> {
+        layout.validate()?;
+        expect_state_len("momentum", layout.state_len(), self.momentum.len())?;
+        expect_state_len("velocity", layout.state_len(), self.velocity.len())?;
+        expect_state_len("slow_params", layout.state_len(), self.slow_params.len())?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct RangerOptimizerState {
+    pub layout: OptimizerStateLayout,
+    pub momentum: DeviceBuffer<f32>,
+    pub velocity: DeviceBuffer<f32>,
+    pub slow_params: DeviceBuffer<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl RangerOptimizerState {
+    pub fn new_zeroed(stream: &CudaStream, layout: OptimizerStateLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            momentum: DeviceBuffer::zeroed(stream, layout.state_len())?,
+            velocity: DeviceBuffer::zeroed(stream, layout.state_len())?,
+            slow_params: DeviceBuffer::zeroed(stream, layout.state_len())?,
+        })
+    }
+
+    pub fn from_host(
+        stream: &CudaStream,
+        layout: OptimizerStateLayout,
+        state: RangerOptimizerHostState<'_>,
+    ) -> Result<Self> {
+        state.validate(layout)?;
+        Ok(Self {
+            layout,
+            momentum: DeviceBuffer::from_host(stream, state.momentum)?,
+            velocity: DeviceBuffer::from_host(stream, state.velocity)?,
+            slow_params: DeviceBuffer::from_host(stream, state.slow_params)?,
+        })
     }
 }
 
@@ -355,8 +486,22 @@ pub enum OptimizerLayoutError {
     InvalidEpsilon,
     #[error("optimizer clamp range must be finite and min <= max")]
     InvalidClamp,
+    #[error("optimizer state length mismatch for {name}: expected {expected}, got {actual}")]
+    StateLength { name: &'static str, expected: usize, actual: usize },
     #[error("optimizer parameter {name} must be finite")]
     NonFiniteParam { name: &'static str },
+}
+
+fn expect_state_len(
+    name: &'static str,
+    expected: usize,
+    actual: usize,
+) -> std::result::Result<(), OptimizerLayoutError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(OptimizerLayoutError::StateLength { name, expected, actual })
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +552,44 @@ mod tests {
                 .validate()
                 .unwrap_err(),
             OptimizerLayoutError::InvalidClamp
+        );
+    }
+
+    #[test]
+    fn optimizer_state_layout_rejects_empty_parameters() {
+        assert_eq!(
+            OptimizerStateLayout::new(0).validate().unwrap_err(),
+            OptimizerLayoutError::EmptyParameters
+        );
+    }
+
+    #[test]
+    fn momentum_velocity_host_state_validates_lengths() {
+        let layout = OptimizerStateLayout::new(3);
+        MomentumVelocityHostState { momentum: &[0.0; 3], velocity: &[0.0; 3] }
+            .validate(layout)
+            .unwrap();
+
+        assert_eq!(
+            MomentumVelocityHostState { momentum: &[0.0; 2], velocity: &[0.0; 3] }
+                .validate(layout)
+                .unwrap_err(),
+            OptimizerLayoutError::StateLength { name: "momentum", expected: 3, actual: 2 }
+        );
+    }
+
+    #[test]
+    fn ranger_optimizer_host_state_validates_lengths() {
+        let layout = OptimizerStateLayout::new(3);
+        RangerOptimizerHostState { momentum: &[0.0; 3], velocity: &[0.0; 3], slow_params: &[0.0; 3] }
+            .validate(layout)
+            .unwrap();
+
+        assert_eq!(
+            RangerOptimizerHostState { momentum: &[0.0; 3], velocity: &[0.0; 3], slow_params: &[0.0; 2] }
+                .validate(layout)
+                .unwrap_err(),
+            OptimizerLayoutError::StateLength { name: "slow_params", expected: 3, actual: 2 }
         );
     }
 

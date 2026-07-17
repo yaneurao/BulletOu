@@ -828,7 +828,10 @@ fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
 
 #[cfg(feature = "cuda")]
 fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::{optimizer::RangerUpdateLayout, DeviceBuffer};
+    use bulletou_cuda_oxide_runtime::{
+        optimizer::{OptimizerStateLayout, RangerOptimizerHostState, RangerOptimizerState, RangerUpdateLayout},
+        DeviceBuffer,
+    };
 
     let case = RangerUpdateCase::tiny();
     let cpu_trace = case.cpu_update_trace()?;
@@ -842,9 +845,13 @@ fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()
     let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
     let layout = RangerUpdateLayout::new(case.weights.len());
     let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
-    let mut momentum = DeviceBuffer::from_host(&stream, &case.momentum)?;
-    let mut velocity = DeviceBuffer::from_host(&stream, &case.velocity)?;
-    let mut slow_params = DeviceBuffer::from_host(&stream, &case.slow_params)?;
+    let state_layout = OptimizerStateLayout::new(case.weights.len());
+    let host_state = RangerOptimizerHostState {
+        momentum: &case.momentum,
+        velocity: &case.velocity,
+        slow_params: &case.slow_params,
+    };
+    let mut optimizer_state = RangerOptimizerState::from_host(&stream, state_layout, host_state)?;
 
     for step_idx in 0..case.gradients_by_step.len() {
         let gradients = DeviceBuffer::from_host(&stream, &case.gradients_by_step[step_idx])?;
@@ -855,17 +862,17 @@ fn run_ranger_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()
             case.params_for_step(step_idx + 1),
             &gradients,
             &mut weights,
-            &mut momentum,
-            &mut velocity,
-            &mut slow_params,
+            &mut optimizer_state.momentum,
+            &mut optimizer_state.velocity,
+            &mut optimizer_state.slow_params,
         )?;
     }
     stream.synchronize()?;
 
     let gpu_weights = weights.to_host_vec(&stream)?;
-    let gpu_momentum = momentum.to_host_vec(&stream)?;
-    let gpu_velocity = velocity.to_host_vec(&stream)?;
-    let gpu_slow_params = slow_params.to_host_vec(&stream)?;
+    let gpu_momentum = optimizer_state.momentum.to_host_vec(&stream)?;
+    let gpu_velocity = optimizer_state.velocity.to_host_vec(&stream)?;
+    let gpu_slow_params = optimizer_state.slow_params.to_host_vec(&stream)?;
     let comparisons = [
         compare_slices("weights", &cpu_trace.weights, &gpu_weights, args.tolerance)?,
         compare_slices("momentum", &cpu_trace.momentum, &gpu_momentum, args.tolerance)?,
