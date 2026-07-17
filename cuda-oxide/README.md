@@ -76,8 +76,8 @@ cargo run -p bulletou-cuda-train --features cuda -- \
 ```
 
 For the current Windows + WSL2 development setup, the root workspace can export
-a real HCPE teacher batch and immediately validate the cuda-oxide NNUE update
-path with:
+a real HCPE teacher batch and immediately validate the cuda-oxide NNUE
+forward -> loss -> backward -> Ranger update path with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File ..\scripts\cuda_oxide_nnue_teacher_smoke.ps1 `
@@ -86,9 +86,11 @@ powershell -ExecutionPolicy Bypass -File ..\scripts\cuda_oxide_nnue_teacher_smok
 
 If `-Teacher` is omitted, the script uses the first `.hcpe` file under
 `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled` when that directory
-exists. The generated fixture is written under `target/cuda-oxide-fixtures/`
-and is intentionally ignored by git. Add `-SkipCudaBuild` to reuse an existing
-`cargo oxide build` artifact.
+exists. The script runs the root exporter with `--train-fixture`, writes an
+ignored `BOUNTRN1` train fixture under `target/cuda-oxide-fixtures/`, then runs
+`bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture` in
+WSL2. Add `-LossKind sigmoid-mse` or `-LossKind wrm` to select the loss smoke,
+and `-SkipCudaBuild` to reuse an existing `cargo oxide build` artifact.
 
 WSL2 Ubuntu 24.04 validation example:
 
@@ -110,7 +112,7 @@ cargo run -p bulletou-cuda-train --features cuda -- \
 
 `cargo oxide build` writes `bulletou_cuda_train.{ll,opt.ll,ptx}` into this
 workspace root. These are generated artifacts and are intentionally ignored.
-Large `*.nnuef` fixtures are also ignored.
+Large forward/train fixtures are also ignored.
 
 The default build intentionally does not enable CUDA:
 

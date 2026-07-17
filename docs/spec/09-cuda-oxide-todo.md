@@ -781,26 +781,41 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-010 work: connect the NNUE/SFNN update launchers to the real
   trainer loop and checkpoint state lifecycle.
 
-### 2026-07-17 CO-010 real HCPE teacher fixture smoke
+### 2026-07-17 CO-010 real HCPE teacher train fixture smoke
 
-- Generated a real HalfKP NNUE fixture from one user-provided HCPE teacher
+- Generated a real HalfKP NNUE train fixture from one user-provided HCPE teacher
   file:
   `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`.
 - The fixture was written under `target/cuda-oxide-fixtures/` so it remains a
   local ignored artifact. It used:
-  - `export_nnue_forward_fixture --case halfkp`;
+  - `export_nnue_forward_fixture --train-fixture --case halfkp`;
   - `--batch-size 2`;
   - deterministic synthetic HalfKP weights;
-  - the first materialised HCPE loader batch.
-- Ran `bulletou-cuda-train --nnue-ranger-step-smoke --nnue-forward-fixture`
+  - the first materialised HCPE loader batch, including loss targets and entry
+    weights.
+- Added the `BOUNTRN1` fixture format: the existing `BOUNNUE1` forward payload
+  followed by `targets[batch]` and `entry_weights[batch]`.
+- Added `bulletou-cuda-train --nnue-loss-ranger-step-smoke`, which reads the
+  train fixture and runs GPU NNUE forward -> loss -> backward -> all grouped
+  NNUE Ranger updates against a scalar CPU golden.
+- Ran `bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture`
   against that fixture in WSL2 Ubuntu-24.04 on RTX 4090.
 - Result: the full HalfKP-sized path succeeded:
-  real teacher batch decode -> fixture load -> NNUE forward -> dense/sparse
-  backward -> all 8 grouped NNUE Ranger updates -> CPU golden comparison for
-  `weights`, `momentum`, `velocity`, and `slow_params`.
+  real teacher batch decode -> train fixture load -> NNUE forward -> weighted
+  loss -> dense/sparse backward from loss gradients -> all 8 grouped NNUE
+  Ranger updates -> CPU golden comparison for loss buffers, `weights`,
+  `momentum`, `velocity`, and `slow_params`.
 - Observed shape/batch:
   `input=125388`, `l1=256`, `l2=32`, `l3=32`, `batch=2`,
   `max_active=38`.
+- Validation commands/results:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - WSL2 `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - WSL2 `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded.
+  - `--nnue-loss-ranger-step-smoke --debug-readback` succeeded with
+    `weighted_sum`, `loss_mean`, `per_sample`, and `loss_grad` max_abs diff
+    `0`; all 8 Ranger-updated parameter/state groups were within tolerance.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
@@ -811,12 +826,14 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   real-teacher validation bridge without mixing root and cuda-oxide workspace
   dependencies.
 - The script:
-  1. runs root `export_nnue_forward_fixture --case halfkp` on Windows;
-  2. writes the ignored fixture under `target/cuda-oxide-fixtures/`;
+  1. runs root `export_nnue_forward_fixture --train-fixture --case halfkp` on
+     Windows;
+  2. writes the ignored `BOUNTRN1` fixture under
+     `target/cuda-oxide-fixtures/`;
   3. optionally runs `cargo oxide build` in WSL2;
   4. creates the temporary nvJitLink shim;
-  5. runs `bulletou-cuda-train --nnue-ranger-step-smoke --nnue-forward-fixture`
-     against the generated teacher fixture.
+  5. runs `bulletou-cuda-train --nnue-loss-ranger-step-smoke
+     --nnue-train-fixture` against the generated teacher fixture.
 - Validation:
   - `powershell -ExecutionPolicy Bypass -File
     scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild` succeeded using

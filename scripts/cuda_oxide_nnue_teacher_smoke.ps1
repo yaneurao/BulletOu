@@ -1,16 +1,17 @@
 <#
 .SYNOPSIS
-Generate a HalfKP NNUE fixture from one teacher file, then run the cuda-oxide
-NNUE Ranger step smoke against it in WSL2.
+Generate a HalfKP NNUE train fixture from one teacher file, then run the
+cuda-oxide NNUE loss/Ranger step smoke against it in WSL2.
 
 .DESCRIPTION
 This script intentionally keeps the root BulletOu workspace and the nested
 cuda-oxide workspace separate:
 
-1. Windows/root workspace: run export_nnue_forward_fixture to materialise one
-   real teacher batch into a local ignored fixture file under target/.
+1. Windows/root workspace: run export_nnue_forward_fixture --train-fixture to
+   materialise one real teacher batch, targets, entry weights, and weights into
+   a local ignored fixture file under target/.
 2. WSL2/cuda-oxide workspace: build/load the cuda-oxide kernels and run
-   --nnue-ranger-step-smoke against that fixture.
+   --nnue-loss-ranger-step-smoke against that fixture.
 
 The WSL nvJitLink shim is temporary. Ubuntu's CUDA 12.0 libnvJitLink exposes
 versioned symbols, while the current cuda-oxide revision expects unversioned
@@ -28,6 +29,8 @@ param(
     [string]$Fixture,
     [string]$WslDistro = "Ubuntu-24.04",
     [string]$CudaArch = "sm_89",
+    [ValidateSet("sigmoid-mse", "wrm")]
+    [string]$LossKind = "sigmoid-mse",
     [switch]$SkipCudaBuild,
     [switch]$DebugReadback
 )
@@ -82,16 +85,17 @@ if (-not (Test-Path -LiteralPath $Teacher)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Fixture)) {
-    $Fixture = Join-Path $repoRoot "target\cuda-oxide-fixtures\nnue-halfkp-teacher-b$BatchSize.bin"
+    $Fixture = Join-Path $repoRoot "target\cuda-oxide-fixtures\nnue-halfkp-teacher-train-b$BatchSize.bin"
 }
 
 $fixtureDir = Split-Path -Parent $Fixture
 New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
 
-Invoke-Checked "export NNUE HalfKP teacher fixture" {
+Invoke-Checked "export NNUE HalfKP teacher train fixture" {
     Set-Location $repoRoot
     cargo run -p bulletou_lib --example export_nnue_forward_fixture --release -- `
         --out $Fixture `
+        --train-fixture `
         --case halfkp `
         --teacher $Teacher `
         --batch-size $BatchSize `
@@ -166,12 +170,12 @@ gcc -shared -fPIC -o /tmp/libnvJitLink_shim.so /tmp/nvjitlink_shim.c -L/usr/lib/
 cd "$wslCudaRoot"
 $cudaEnv
 export LIBNVJITLINK_PATH=/tmp/libnvJitLink_shim.so
-cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-ranger-step-smoke --nnue-forward-fixture "$wslFixture"$debugFlag
+cargo run -p bulletou-cuda-train --features cuda --release -- --nnue-loss-ranger-step-smoke --nnue-train-fixture "$wslFixture" --loss-kind $LossKind$debugFlag
 "@
 
-Invoke-Checked "NNUE Ranger step smoke with real teacher fixture" {
+Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {
     $shim | wsl -d $WslDistro -- bash -lc $runCommand
 }
 
-Write-Host "OK: cuda-oxide NNUE teacher smoke completed"
+Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"
 Write-Host "fixture: $Fixture"

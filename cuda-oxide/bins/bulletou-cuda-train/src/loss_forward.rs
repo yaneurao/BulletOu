@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
     loss::{LossLayoutError, ScalarLossDeviceBatch, ScalarLossLaunchPlan, ScalarLossWorkspace},
-    CudaModule, CudaStream, LaunchConfig, Result,
+    CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
 use cuda_host::cuda_launch;
 
@@ -16,6 +16,26 @@ pub(crate) fn launch_sigmoid_mse_loss(
     workspace: &mut ScalarLossWorkspace,
 ) -> Result<()> {
     validate_loss_layout(batch, workspace)?;
+    launch_sigmoid_mse_loss_from_buffers(
+        stream,
+        module,
+        &batch.outputs,
+        &batch.targets,
+        &batch.entry_weights,
+        workspace,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sigmoid_mse_loss_from_buffers(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    outputs: &DeviceBuffer<f32>,
+    targets: &DeviceBuffer<f32>,
+    entry_weights: &DeviceBuffer<f32>,
+    workspace: &mut ScalarLossWorkspace,
+) -> Result<()> {
+    workspace.layout.validate()?;
 
     let layout = workspace.layout;
     let plan = ScalarLossLaunchPlan::new(layout);
@@ -31,9 +51,9 @@ pub(crate) fn launch_sigmoid_mse_loss(
             module: module.clone(),
             config: cfg_1d(plan.reduce_threads),
             args: [
-                slice(batch.outputs),
-                slice(batch.targets),
-                slice(batch.entry_weights),
+                slice(outputs),
+                slice(targets),
+                slice(entry_weights),
                 slice_mut(workspace.per_sample),
                 slice_mut(workspace.mean_output_gradients),
                 slice_mut(workspace.weighted_sum),
@@ -54,6 +74,26 @@ pub(crate) fn launch_nnue_pytorch_wrm_loss(
     workspace: &mut ScalarLossWorkspace,
 ) -> Result<()> {
     validate_loss_layout(batch, workspace)?;
+    launch_nnue_pytorch_wrm_loss_from_buffers(
+        stream,
+        module,
+        &batch.outputs,
+        &batch.targets,
+        &batch.entry_weights,
+        workspace,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_nnue_pytorch_wrm_loss_from_buffers(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    outputs: &DeviceBuffer<f32>,
+    targets: &DeviceBuffer<f32>,
+    entry_weights: &DeviceBuffer<f32>,
+    workspace: &mut ScalarLossWorkspace,
+) -> Result<()> {
+    workspace.layout.validate()?;
 
     let layout = workspace.layout;
     let plan = ScalarLossLaunchPlan::new(layout);
@@ -69,9 +109,9 @@ pub(crate) fn launch_nnue_pytorch_wrm_loss(
             module: module.clone(),
             config: cfg_1d(plan.reduce_threads),
             args: [
-                slice(batch.outputs),
-                slice(batch.targets),
-                slice(batch.entry_weights),
+                slice(outputs),
+                slice(targets),
+                slice(entry_weights),
                 slice_mut(workspace.per_sample),
                 slice_mut(workspace.mean_output_gradients),
                 slice_mut(workspace.weighted_sum),
