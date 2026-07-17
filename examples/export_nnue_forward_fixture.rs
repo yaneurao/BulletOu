@@ -108,6 +108,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.train_fixture && args.batch_fixture {
         return Err(invalid_input("--train-fixture and --batch-fixture are mutually exclusive"));
     }
+    if args.batch_fixture && args.weights_bin.is_some() {
+        return Err(invalid_input("--weights-bin cannot be used with --batch-fixture; no weights are written"));
+    }
     if args.teacher.is_some() && args.case != FixtureCase::Halfkp {
         return Err(invalid_input("--teacher is only supported with --case halfkp"));
     }
@@ -124,6 +127,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !(args.scale.is_finite() && args.scale > 0.0) {
         return Err(invalid_input("--scale must be finite and > 0"));
+    }
+
+    if args.batch_fixture {
+        let fixture = BatchOnlyFixture::new(&args)?;
+        write_nnue_train_batch_fixture_file(&args.out, fixture.shape, &fixture.batch)?;
+
+        println!("exported NNUE train-batch fixture");
+        println!("  out        : {}", args.out.display());
+        println!("  case       : {}", fixture.label);
+        println!("  weights    : not included");
+        println!("  batch src  : {}", fixture.batch_source);
+        println!(
+            "  shape      : input={} l1={} l2={} l3={}",
+            fixture.shape.input_size, fixture.shape.l1, fixture.shape.l2, fixture.shape.l3
+        );
+        println!(
+            "  batch      : {} samples, max_active={}",
+            fixture.batch.layout.batch_size, fixture.batch.layout.max_active
+        );
+
+        return Ok(());
     }
 
     let fixture = match args.case {
@@ -213,6 +237,56 @@ impl Fixture {
         };
 
         Ok(Self { label: "halfkp-256x2-32-32", weights_source, batch_source, weights, batch })
+    }
+}
+
+struct BatchOnlyFixture {
+    label: &'static str,
+    batch_source: String,
+    shape: NnueForwardShape,
+    batch: FastBatchHost,
+}
+
+impl BatchOnlyFixture {
+    fn new(args: &Args) -> Result<Self, Box<dyn std::error::Error>> {
+        match args.case {
+            FixtureCase::Tiny => Self::tiny(args.batch_size, args.max_active),
+            FixtureCase::Halfkp => Self::halfkp(args),
+        }
+    }
+
+    fn tiny(batch_size: Option<usize>, max_active: Option<usize>) -> Result<Self, Box<dyn std::error::Error>> {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let batch_size = batch_size.unwrap_or(2);
+        let max_active = max_active.unwrap_or(3);
+        require_nonzero("batch-size", batch_size)?;
+        require_nonzero("max-active", max_active)?;
+
+        Ok(Self {
+            label: "tiny",
+            batch_source: "deterministic tiny".to_string(),
+            shape,
+            batch: if batch_size == 2 && max_active == 3 {
+                tiny_batch()
+            } else {
+                synthetic_batch(batch_size, max_active, shape.input_size)
+            },
+        })
+    }
+
+    fn halfkp(args: &Args) -> Result<Self, Box<dyn std::error::Error>> {
+        let shape = NNUE_HALFKP_256X2_32_32;
+        let batch_size = args.batch_size.unwrap_or(2);
+        let max_active = args.max_active.unwrap_or(38);
+        require_nonzero("batch-size", batch_size)?;
+        require_nonzero("max-active", max_active)?;
+
+        let (batch, batch_source) = match args.teacher.as_ref() {
+            Some(_) => load_halfkp_teacher_batch(args)?,
+            None => (synthetic_batch(batch_size, max_active, shape.input_size), "deterministic halfkp".to_string()),
+        };
+
+        Ok(Self { label: "halfkp-256x2-32-32", batch_source, shape, batch })
     }
 }
 

@@ -853,6 +853,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   batch-only `BOUNBCH1` fixtures. Re-ran `-TrainSteps 2 -DebugReadback`;
   `bulletou-cuda-train` printed `full` then `batch`, and the comparison stayed
   `ok`.
+- Updated `export_nnue_forward_fixture --batch-fixture` so it no longer
+  materialises weights or computes the CPU forward output. Batch-only exports
+  now load/materialise only the `FastBatchHost` payload plus the NNUE shape,
+  write `BOUNBCH1`, and print `weights: not included`.
+- Re-ran `scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild
+  -TrainSteps 2 -DebugReadback`; step0 remained `BOUNTRN1`, step1 was the
+  lighter `BOUNBCH1`, and `bulletou-cuda-train` still reported `compare: ok`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
