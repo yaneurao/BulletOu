@@ -1811,10 +1811,25 @@ impl Args {
             );
         }
         if self.lr_schedule == LrScheduleKind::Plateau {
-            return Err(
-                "--backend cuda-oxide plateau control depends on validation metrics and remains blocked on BO-CUDA-004"
-                    .to_string(),
-            );
+            if !production_schedule {
+                return Err(
+                    "--backend cuda-oxide plateau control requires --superbatches N --max-epochs N; \
+                     direct-step mode cannot retry validation-bounded superbatches"
+                        .to_string(),
+                );
+            }
+            if self.test_teacher.is_none() {
+                return Err(
+                    "--backend cuda-oxide --lr-schedule plateau requires --test-teacher so validation metrics can be monitored"
+                        .to_string(),
+                );
+            }
+            if self.save_rate != 1 {
+                return Err(
+                    "--backend cuda-oxide --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions"
+                        .to_string(),
+                );
+            }
         }
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-oxide currently supports only --optimizer ranger".to_string());
@@ -2735,33 +2750,121 @@ fn run_cuda_oxide_backend(args: &Args) -> Result<(), String> {
     if !cargo_dir.is_dir() {
         return Err(format!("--cuda-oxide-cargo-dir is not a directory: {}", cargo_dir.display()));
     }
-    let cargo_args = cuda_oxide_cargo_run_args(args)?;
 
     eprintln!("  backend = cuda-oxide direct NNUE HalfKP trainer");
     eprintln!("  cuda-oxide cargo dir = {}", cargo_dir.display());
-    if cuda_oxide_uses_production_schedule(args) {
+    if args.lr_schedule == LrScheduleKind::Plateau {
+        eprintln!("  cuda-oxide schedule = production plateau orchestration mode");
+        return run_cuda_oxide_plateau_backend(args, &cargo_dir);
+    } else if cuda_oxide_uses_production_schedule(args) {
         eprintln!("  cuda-oxide schedule = production superbatches/max-epochs mode");
     } else {
         eprintln!("  cuda-oxide schedule = direct train-steps smoke mode");
     }
-    eprintln!("  cuda-oxide note = validation metrics integration is pending (BO-CUDA-004)");
 
-    let status = std::process::Command::new("cargo")
-        .current_dir(&cargo_dir)
-        .args(&cargo_args)
-        .status()
-        .map_err(|e| format!("failed to launch cuda-oxide trainer via cargo: {e}"))?;
-    if !status.success() {
-        return Err(format!("cuda-oxide trainer exited with {status}"));
-    }
-    Ok(())
+    let child_run = cuda_oxide_default_child_run(args)?;
+    run_cuda_oxide_child(args, &cargo_dir, &child_run)
 }
 
-fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CudaOxideChildLrSchedule {
+    Fixed,
+    Step,
+    Geometric,
+    Cos,
+}
+
+impl CudaOxideChildLrSchedule {
+    fn cli_name(self) -> &'static str {
+        match self {
+            CudaOxideChildLrSchedule::Fixed => "fixed",
+            CudaOxideChildLrSchedule::Step => "step",
+            CudaOxideChildLrSchedule::Geometric => "geometric",
+            CudaOxideChildLrSchedule::Cos => "cos",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CudaOxideChildLr {
+    schedule: CudaOxideChildLrSchedule,
+    learning_rate: f32,
+    lr_min: f32,
+    lr_step_gamma: f32,
+    lr_step_positions: u64,
+    lr_period_positions: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CudaOxideChildRun {
+    train_steps: usize,
+    batches_per_superbatch: usize,
+    save_rate: usize,
+    superbatches_per_epoch: Option<usize>,
+    lr: Option<CudaOxideChildLr>,
+    include_weights_bin: bool,
+}
+
+fn cuda_oxide_default_child_run(args: &Args) -> Result<CudaOxideChildRun, String> {
     let production_schedule = cuda_oxide_uses_production_schedule(args);
     let batches_per_superbatch = if production_schedule { effective_batches_per_superbatch(args)? } else { 1 };
     let train_steps = cuda_oxide_train_steps(args, batches_per_superbatch)?;
+    let lr = if production_schedule {
+        let schedule = match args.lr_schedule {
+            LrScheduleKind::Step => CudaOxideChildLrSchedule::Step,
+            LrScheduleKind::Geometric => CudaOxideChildLrSchedule::Geometric,
+            LrScheduleKind::Cos => CudaOxideChildLrSchedule::Cos,
+            LrScheduleKind::Plateau => {
+                return Err("cuda-oxide plateau must be run through the plateau orchestrator".to_string());
+            }
+        };
+        Some(CudaOxideChildLr {
+            schedule,
+            learning_rate: args.lr,
+            lr_min: args.lr_min,
+            lr_step_gamma: effective_lr_step_gamma(args, batches_per_superbatch)?.0,
+            lr_step_positions: effective_lr_step_positions(args, batches_per_superbatch),
+            lr_period_positions: cuda_oxide_lr_period_positions(args, batches_per_superbatch)?,
+        })
+    } else {
+        None
+    };
 
+    Ok(CudaOxideChildRun {
+        train_steps,
+        batches_per_superbatch,
+        save_rate: args.save_rate,
+        superbatches_per_epoch: production_schedule.then(|| args.superbatches.expect("validated production schedule")),
+        lr,
+        include_weights_bin: true,
+    })
+}
+
+fn cuda_oxide_plateau_child_run(
+    args: &Args,
+    batches_per_superbatch: usize,
+    superbatches_per_epoch: usize,
+    learning_rate: f32,
+    include_weights_bin: bool,
+) -> CudaOxideChildRun {
+    CudaOxideChildRun {
+        train_steps: batches_per_superbatch,
+        batches_per_superbatch,
+        save_rate: 1,
+        superbatches_per_epoch: Some(superbatches_per_epoch),
+        lr: Some(CudaOxideChildLr {
+            schedule: CudaOxideChildLrSchedule::Fixed,
+            learning_rate,
+            lr_min: args.lr_min,
+            lr_step_gamma: 1.0,
+            lr_step_positions: 1,
+            lr_period_positions: 0,
+        }),
+        include_weights_bin,
+    }
+}
+
+fn cuda_oxide_cargo_run_args_with_child(args: &Args, child_run: &CudaOxideChildRun) -> Result<Vec<String>, String> {
     let mut cargo_args = vec!["run".to_string()];
     if args.cuda_oxide_release {
         cargo_args.push("--release".to_string());
@@ -2785,13 +2888,13 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
     cargo_args.push(absolutize_path_for_child(&args.output_dir())?.display().to_string());
 
     cargo_args.push("--train-steps".to_string());
-    cargo_args.push(train_steps.to_string());
+    cargo_args.push(child_run.train_steps.to_string());
 
     cargo_args.push("--batches-per-superbatch".to_string());
-    cargo_args.push(batches_per_superbatch.to_string());
-    if production_schedule {
+    cargo_args.push(child_run.batches_per_superbatch.to_string());
+    if let Some(superbatches_per_epoch) = child_run.superbatches_per_epoch {
         cargo_args.push("--superbatches-per-epoch".to_string());
-        cargo_args.push(args.superbatches.expect("validated production schedule").to_string());
+        cargo_args.push(superbatches_per_epoch.to_string());
     }
 
     cargo_args.push("--batch-size".to_string());
@@ -2810,7 +2913,7 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
     cargo_args.push(args.score_drop_abs.to_string());
 
     cargo_args.push("--save-rate".to_string());
-    cargo_args.push(args.save_rate.to_string());
+    cargo_args.push(child_run.save_rate.to_string());
 
     cargo_args.push("--device".to_string());
     cargo_args.push(args.cuda_oxide_device.to_string());
@@ -2829,22 +2932,19 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
         cargo_args.push(args.test_seed.to_string());
     }
 
-    if production_schedule {
-        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
-        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
-        let lr_period_positions = cuda_oxide_lr_period_positions(args, batches_per_superbatch)?;
+    if let Some(lr) = child_run.lr {
         cargo_args.push("--lr-schedule".to_string());
-        cargo_args.push(args.lr_schedule.cli_name().to_string());
+        cargo_args.push(lr.schedule.cli_name().to_string());
         cargo_args.push("--learning-rate".to_string());
-        cargo_args.push(args.lr.to_string());
+        cargo_args.push(lr.learning_rate.to_string());
         cargo_args.push("--lr-min".to_string());
-        cargo_args.push(args.lr_min.to_string());
+        cargo_args.push(lr.lr_min.to_string());
         cargo_args.push("--lr-step-gamma".to_string());
-        cargo_args.push(lr_step_gamma.to_string());
+        cargo_args.push(lr.lr_step_gamma.to_string());
         cargo_args.push("--lr-step-positions".to_string());
-        cargo_args.push(lr_step_positions.to_string());
+        cargo_args.push(lr.lr_step_positions.to_string());
         cargo_args.push("--lr-period-positions".to_string());
-        cargo_args.push(lr_period_positions.to_string());
+        cargo_args.push(lr.lr_period_positions.to_string());
         cargo_args.push("--optimizer-weight-decay".to_string());
         cargo_args.push(args.optimizer_weight_decay.to_string());
         cargo_args.push("--optimizer-epsilon".to_string());
@@ -2859,15 +2959,180 @@ fn cuda_oxide_cargo_run_args(args: &Args) -> Result<Vec<String>, String> {
         cargo_args.push("--ptx".to_string());
         cargo_args.push(absolutize_path_for_child(ptx)?.display().to_string());
     }
-    if let Some(weights_bin) = &args.cuda_oxide_weights_bin {
-        cargo_args.push("--weights-bin".to_string());
-        cargo_args.push(absolutize_path_for_child(weights_bin)?.display().to_string());
+    if child_run.include_weights_bin {
+        if let Some(weights_bin) = &args.cuda_oxide_weights_bin {
+            cargo_args.push("--weights-bin".to_string());
+            cargo_args.push(absolutize_path_for_child(weights_bin)?.display().to_string());
+        }
     }
     if args.cuda_oxide_debug_readback {
         cargo_args.push("--debug-readback".to_string());
     }
 
     Ok(cargo_args)
+}
+
+fn run_cuda_oxide_child(args: &Args, cargo_dir: &Path, child_run: &CudaOxideChildRun) -> Result<(), String> {
+    let cargo_args = cuda_oxide_cargo_run_args_with_child(args, child_run)?;
+    let status = std::process::Command::new("cargo")
+        .current_dir(cargo_dir)
+        .args(&cargo_args)
+        .status()
+        .map_err(|e| format!("failed to launch cuda-oxide trainer via cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("cuda-oxide trainer exited with {status}"));
+    }
+    Ok(())
+}
+
+fn run_cuda_oxide_plateau_backend(args: &Args, cargo_dir: &Path) -> Result<(), String> {
+    let output_dir = absolutize_path_for_child(&args.output_dir())?;
+    let batches_per_superbatch = effective_batches_per_superbatch(args)?;
+    let superbatches_per_epoch =
+        args.superbatches.ok_or_else(|| "--backend cuda-oxide plateau requires --superbatches".to_string())?;
+    let max_epochs =
+        args.max_epochs.ok_or_else(|| "--backend cuda-oxide plateau requires --max-epochs".to_string())?.max(1);
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let mut previous_epoch_final_metrics: Option<PlateauMetrics> = None;
+
+    for epoch in 1..=max_epochs {
+        print_epoch_banner(epoch, max_epochs);
+        let mut plateau_state = PlateauLrState::new(
+            args.lr,
+            args.lr_min,
+            args.lr_plateau_factor,
+            args.lr_plateau_min_delta,
+            args.lr_plateau_monitor,
+        );
+        let mut plateau_epoch_final_metrics: Option<PlateauMetrics> = None;
+        let mut superbatch = 1usize;
+        'epoch: while superbatch <= superbatches_per_epoch {
+            let include_weights_bin =
+                args.cuda_oxide_weights_bin.is_some() && latest_checkpoint_dir(&output_dir).is_none();
+            let child_run = cuda_oxide_plateau_child_run(
+                args,
+                batches_per_superbatch,
+                superbatches_per_epoch,
+                plateau_state.current_lr,
+                include_weights_bin,
+            );
+            eprintln!(
+                "  cuda-oxide plateau: epoch {epoch}/{max_epochs}, superbatch {superbatch}/{superbatches_per_epoch}, lr {}",
+                plateau_state.current_lr
+            );
+            run_cuda_oxide_child(args, cargo_dir, &child_run)?;
+
+            let metrics = read_latest_nnue_test_metrics_in_top_level_log(&top_level_log).ok_or_else(|| {
+                format!(
+                    "cuda-oxide plateau requires numeric validation metrics in {}; \
+                     check that --test-teacher is readable and the child trainer wrote summary-learn.log",
+                    top_level_log.display()
+                )
+            })?;
+            let action = plateau_state.observe(metrics);
+            let retry_same_superbatch = plateau_action_retries_teacher(action);
+            let reject_checkpoint = plateau_action_rejects_update(action);
+            if reject_checkpoint {
+                let removed = remove_latest_numbered_checkpoint(&output_dir)?;
+                trim_last_top_level_summary_row(&top_level_log)?;
+                eprintln!("  cuda-oxide plateau: discarded rejected checkpoint {}", removed.display());
+            }
+
+            let current_lr = plateau_state.current_lr;
+            let monitor_label = args.lr_plateau_monitor.label();
+            match action {
+                PlateauAction::First { metrics } => {
+                    eprintln!(
+                        "  plateau: initial validation metrics = {}; lr stays {current_lr}",
+                        plateau_metrics_text(metrics)
+                    );
+                }
+                PlateauAction::Improved { old_best, new_best } => {
+                    eprintln!(
+                        "  plateau: {monitor_label} improved (best {} -> {}); lr stays {}",
+                        plateau_metrics_text(old_best),
+                        plateau_metrics_text(new_best),
+                        current_lr,
+                    );
+                }
+                PlateauAction::Keep { metrics, best } => {
+                    eprintln!(
+                        "  plateau: {monitor_label} did not improve (current {}, best {}); lr stays {}",
+                        plateau_metrics_text(metrics),
+                        plateau_metrics_text(best),
+                        current_lr,
+                    );
+                }
+                PlateauAction::Reduced { old_lr, new_lr, metrics, best } => {
+                    eprintln!(
+                        "  plateau: {monitor_label} did not improve (current {}, best {}); lr {old_lr} -> {new_lr}",
+                        plateau_metrics_text(metrics),
+                        plateau_metrics_text(best),
+                    );
+                }
+                PlateauAction::ScheduledFinal { old_lr, min_lr, metrics, best } => {
+                    eprintln!(
+                        "  plateau: {monitor_label} did not improve (current {}, best {}); \
+                         next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
+                         (old lr {old_lr})",
+                        plateau_metrics_text(metrics),
+                        plateau_metrics_text(best),
+                    );
+                }
+                PlateauAction::FinalImproved { old_best, new_best } => {
+                    plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                    mark_latest_checkpoint_epoch_done(&output_dir);
+                    eprintln!(
+                        "  plateau: final lr_min superbatch improved {monitor_label} (best {} -> {}); \
+                         accepting it and ending this epoch.",
+                        plateau_metrics_text(old_best),
+                        plateau_metrics_text(new_best),
+                    );
+                    break 'epoch;
+                }
+                PlateauAction::FinalRejected { metrics, best } => {
+                    plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                    mark_latest_checkpoint_epoch_done(&output_dir);
+                    eprintln!(
+                        "  plateau: final lr_min superbatch did not improve {monitor_label} (current {}, best {}); \
+                         discarding it and ending this epoch.",
+                        plateau_metrics_text(metrics),
+                        plateau_metrics_text(best),
+                    );
+                    break 'epoch;
+                }
+            }
+
+            if retry_same_superbatch {
+                eprintln!(
+                    "  cuda-oxide plateau: retrying superbatch {superbatch} at lowered lr {}",
+                    plateau_state.current_lr
+                );
+                continue 'epoch;
+            }
+            superbatch = superbatch.saturating_add(1);
+        }
+
+        if let Some(current_metrics) = plateau_epoch_final_metrics {
+            if epoch_final_should_stop(
+                previous_epoch_final_metrics,
+                current_metrics,
+                PlateauMonitor::LossOrAccuracy,
+                0.0,
+            ) {
+                let previous_metrics = previous_epoch_final_metrics.expect("checked by predicate");
+                eprintln!(
+                    "  plateau: epoch-final validation metrics did not improve from previous epoch \
+                     (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
+                    previous_metrics.loss, current_metrics.loss, previous_metrics.accuracy, current_metrics.accuracy
+                );
+                break;
+            }
+            previous_epoch_final_metrics = Some(current_metrics);
+        }
+    }
+
+    Ok(())
 }
 
 fn cuda_oxide_uses_production_schedule(args: &Args) -> bool {
@@ -3069,6 +3334,36 @@ fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::
 
 fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     find_latest_state_bin_raw(output_dir).and_then(|p| p.parent().map(|dir| dir.to_path_buf()))
+}
+
+fn remove_latest_numbered_checkpoint(output_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dir = latest_checkpoint_dir(output_dir)
+        .ok_or_else(|| format!("no numbered checkpoint with state.bin found under {}", output_dir.display()))?;
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| format!("failed to remove rejected checkpoint {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+fn trim_last_top_level_summary_row(top_level_log: &std::path::Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(top_level_log)
+        .map_err(|e| format!("failed to read {} before trimming rejected plateau row: {e}", top_level_log.display()))?;
+    let mut lines: Vec<&str> = content.lines().collect();
+    let Some(idx) = lines.iter().rposition(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#') && !line.starts_with("eval,")
+    }) else {
+        return Err(format!(
+            "failed to trim rejected plateau row from {}: no data rows found",
+            top_level_log.display()
+        ));
+    };
+    lines.remove(idx);
+    let mut next = lines.join("\n");
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    std::fs::write(top_level_log, next)
+        .map_err(|e| format!("failed to rewrite {} after trimming rejected plateau row: {e}", top_level_log.display()))
 }
 
 fn latest_checkpoint_has_file(output_dir: &std::path::Path, filename: &str) -> bool {
@@ -7079,6 +7374,57 @@ mod tests {
     }
 
     #[test]
+    fn cuda_oxide_backend_accepts_bounded_plateau_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "/dev/null",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_ok());
+    }
+
+    #[test]
+    fn cuda_oxide_backend_plateau_requires_test_teacher() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-oxide",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains("--test-teacher"));
+    }
+
+    #[test]
     fn cuda_oxide_backend_rejects_unbounded_production_schedule() {
         use clap::Parser as _;
 
@@ -7336,6 +7682,31 @@ mod tests {
         std::fs::create_dir(&d2).unwrap();
         std::fs::write(d2.join("state.bin"), b"dummy").unwrap();
         assert!(!latest_checkpoint_has_file(&tmp, PLATEAU_EPOCH_DONE_NAME));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn trim_last_top_level_summary_row_drops_only_last_data_row() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-trim-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("summary-learn.log");
+        std::fs::write(
+            &log,
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher\n\
+             nnue,1,1,0.5,0.10,0.01,0.001,0.001,1.0,10,t.hcpe\n\
+             nnue,1,2,0.4,0.20,0.02,0.0005,0.0005,1.0,20,t.hcpe\n",
+        )
+        .unwrap();
+
+        trim_last_top_level_summary_row(&log).unwrap();
+        let content = std::fs::read_to_string(&log).unwrap();
+        assert!(content.contains("nnue,1,1,0.5,0.10"));
+        assert!(!content.contains("nnue,1,2,0.4,0.20"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
