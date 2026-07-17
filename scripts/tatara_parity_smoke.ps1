@@ -10,6 +10,7 @@ param(
     [int]$BatchSize = 64,
     [int]$BatchesPerSuperbatch = 1,
     [int]$Superbatches = 1,
+    [int]$Threads = 8,
     [switch]$BuildBulletKernel,
     [switch]$BuildTataraKernel,
     [switch]$SkipBulletMetrics,
@@ -246,7 +247,7 @@ $tataraArgs = @(
     "--superbatches $Superbatches",
     "--batches-per-superbatch $BatchesPerSuperbatch",
     "--batch-size $BatchSize",
-    "--threads 1",
+    "--threads $Threads",
     "--save-rate $Superbatches",
     "--scale 600",
     "--win-rate-model",
@@ -279,10 +280,11 @@ $bulletBaseArgs = @(
     "--batch-size $BatchSize",
     "--buffer-mb 1",
     "--loader-threads 1",
-    "--threads 1",
+    "--threads $Threads",
     "--loss-kind wrm",
     "--learning-rate 0.01",
     "--lr-schedule fixed",
+    "--optimizer-weight-decay 0",
     "--ptx $(Quote-Bash $bulletCubinWsl)"
 )
 
@@ -301,6 +303,7 @@ Write-Host ""
 Write-Host "Parity smoke artifacts:"
 Write-Host "  run_dir        $runDir"
 Write-Host "  host_profile   $(if ($DebugHost) { 'debug' } else { 'release' })"
+Write-Host "  threads        $Threads"
 Write-Host "  train_psv      $teacherPsv"
 Write-Host "  test_psv       $testPsv"
 Write-Host "  tatara_log     $(Join-Path $runDir "tatara.log")"

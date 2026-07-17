@@ -26,7 +26,8 @@ commit each completed slice.
 | BO-CUDA-018 | done | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
 | BO-CUDA-019 | done | NNUE L0 sparse backward scatter optimization | larger same-PSV benchmark exposed the dense gather L0 backward bottleneck; BulletOu now zeroes L0 gradients and atomic-scatters active feature gradients, preserving correctness while greatly improving standard NNUE throughput |
 | BO-CUDA-020 | done | NNUE train-step profiling and WRM loss reduction | parity harness now runs host binaries in release mode by default, `--profile-train-step` reports NNUE stage timings, and WRM loss no longer recomputes every sample serially in thread 0 |
-| BO-CUDA-021 | todo | remaining tatara speed/accuracy parity | continue standard NNUE HalfKP tuning from the post-BO-CUDA-020 baseline, close the remaining optimizer/dense/transfer speed gap to tatara, and verify held-out accuracy over a longer same-PSV run |
+| BO-CUDA-021 | done | NNUE teacher prepare/GPU pipeline | `--profile-train-step` now exposes CPU batch materialisation time, standard NNUE teacher training overlaps CPU prepare with GPU work via a bounded producer queue, and the tatara parity harness can run realistic multi-threaded prepare |
+| BO-CUDA-022 | todo | remaining tatara accuracy parity | investigate the remaining held-out accuracy mismatch despite matching WRM loss, and run a longer same-PSV comparison to reduce one-superbatch noise |
 
 ## Notes
 
@@ -321,6 +322,33 @@ commit each completed slice.
 
 ### BO-CUDA-021
 
+- Extended `HalfkpTeacherBatchConfig` with `profile_prepare`.
+  - `bulletou-cuda-train --nnue-teacher-train --profile-train-step` now prints `profile_teacher : ... prepare ... ms` before the GPU stage profile.
+  - On the same PSV `batch_size=8192` slice, CPU HalfKP materialisation was the real post-BO-CUDA-020 bottleneck: with `--threads 1`, prepare was about `31-35 ms/batch`, while the GPU stages summed to roughly `7-8 ms/batch`.
+  - With `--threads 8`, prepare dropped to about `7-9 ms/batch`.
+- Reworked standard NNUE teacher training so non-profile runs use a bounded producer/consumer queue:
+  - producer thread streams and materialises teacher batches;
+  - consumer thread keeps the existing cuda-oxide async upload/readback ring and GPU step logic;
+  - `--profile-train-step` keeps the old serial path so CPU/GPU timing remains easy to read.
+- Updated `scripts/tatara_parity_smoke.ps1`:
+  - added `-Threads <N>` (default `8`) and passes it to both tatara and BulletOu;
+  - passes `--optimizer-weight-decay 0` to BulletOu so the parity run matches tatara's default `weight_decay=0.0`.
+- Validation:
+  - `cargo check -p bulletou_lib --example export_nnue_forward_fixture`.
+  - `cargo check -p bulletou-cuda-train`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL release host build: `cargo build --release -p bulletou-cuda-train --features cuda,root-loader`.
+- Same-PSV speed measurements (`TrainPositions=65536`, `TestPositions=8192`, `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=1`):
+  - direct `target/release` BulletOu, `--threads 1`, producer/consumer enabled: `65536` positions in `0.186s`, `352672 pos/s`;
+  - parity harness, `-Threads 8`: tatara `520491 pos/s`, BulletOu `489083 pos/s`;
+  - warm direct `target/release` BulletOu, `--threads 8`: `65536` positions in `0.085s`, `771281 pos/s`.
+  - These one-superbatch speed lines are short and noisy, but BulletOu is now in tatara's observed speed range on this slice.
+- Same-PSV BulletOu metrics run with checkpoint/validation overhead excluded from speed comparison:
+  - held-out `loss=0.069941`, `accuracy=49.3530%`;
+  - tatara on the matching harness run reported `test_loss=0.070236`, `test_acc=0.5065`.
+
+### BO-CUDA-022
+
 - Remaining parity work:
-  - optimize the post-BO-CUDA-020 bottlenecks: full-parameter Ranger update over `l0w`, remaining dense backward kernels, atomic contention in L0 scatter, and host/batch transfer overlap;
-  - run a longer same-PSV accuracy comparison after the next speed pass, since the one-superbatch held-out losses are close but accuracy still needs a less noisy check.
+  - investigate the accuracy-sign mismatch / metric-definition mismatch while WRM loss is already close;
+  - run a longer same-PSV comparison after the next accuracy pass, since one-superbatch accuracy is noisy.

@@ -1318,145 +1318,187 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         scale: 400.0,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        profile_prepare: args.profile_train_step,
     };
-    bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
-        &teacher_batch_config,
-        args.train_steps,
-        |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
-            let source = loaded.source;
-            let dataloader_pos = loaded.dataloader_pos;
-            let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
-            if runner.is_none() {
-                runner = Some(match restored_state.as_ref() {
-                    Some(state) => NnueLossRangerStepRunner::with_optimizer_state(
+    let mut handle_loaded_batch = |loaded: bulletou_lib::value::HalfkpTeacherBatch| -> bulletou_cuda_oxide_runtime::Result<()> {
+        let source = loaded.source;
+        let dataloader_pos = loaded.dataloader_pos;
+        let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
+        if runner.is_none() {
+            runner = Some(match restored_state.as_ref() {
+                Some(state) => NnueLossRangerStepRunner::with_optimizer_state(
+                    &stream,
+                    &state.host_weights(),
+                    state.host_optimizer_states(),
+                    train_batch.batch_size,
+                    train_batch.max_active,
+                )?,
+                None => {
+                    let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
+                        shape: initial_case.shape,
+                        l0w: &initial_case.l0w,
+                        l0b: &initial_case.l0b,
+                        l1w: &initial_case.l1w,
+                        l1b: &initial_case.l1b,
+                        l2w: &initial_case.l2w,
+                        l2b: &initial_case.l2b,
+                        outw: &initial_case.outw,
+                        outb: &initial_case.outb,
+                    };
+                    NnueLossRangerStepRunner::new(
                         &stream,
-                        &state.host_weights(),
-                        state.host_optimizer_states(),
+                        &host_weights,
                         train_batch.batch_size,
                         train_batch.max_active,
-                    )?,
-                    None => {
-                        let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
-                            shape: initial_case.shape,
-                            l0w: &initial_case.l0w,
-                            l0b: &initial_case.l0b,
-                            l1w: &initial_case.l1w,
-                            l1b: &initial_case.l1b,
-                            l2w: &initial_case.l2w,
-                            l2b: &initial_case.l2b,
-                            outw: &initial_case.outw,
-                            outb: &initial_case.outb,
-                        };
-                        NnueLossRangerStepRunner::new(
-                            &stream,
-                            &host_weights,
-                            train_batch.batch_size,
-                            train_batch.max_active,
-                        )?
-                    }
-                });
-            }
-
-            let runner_ref = runner.as_mut().expect("runner is initialized");
-            let step = completed_step_offset + run_steps + 1;
-            let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
-            let params = grouped_ranger_step_params_for_step_with_hyperparams(
-                step,
-                learning_rate,
-                args.optimizer_weight_decay,
-                args.optimizer_beta1,
-                args.optimizer_beta2,
-                args.optimizer_epsilon,
-            );
-            let host_batch = NnueTrainStepHostBatch {
-                stm_indices: &train_batch.stm,
-                nstm_indices: &train_batch.nstm,
-                targets: &train_batch.targets,
-                entry_weights: &train_batch.entry_weights,
-                batch_size: train_batch.batch_size,
-                max_active: train_batch.max_active,
-            };
-            train_timer.get_or_insert_with(std::time::Instant::now);
-            train_positions = train_positions.saturating_add(train_batch.batch_size);
-
-            if use_async_pipeline {
-                let completed_loss = runner_ref.step_pipelined(
-                    &stream,
-                    &module,
-                    params,
-                    train_loss_kind,
-                    host_batch,
-                    args.debug_readback,
-                    false,
-                    args.profile_train_step,
-                )?;
-                if let Some(loss) = completed_loss {
-                    let meta = pending_async_step
-                        .take()
-                        .expect("async NNUE train pipeline returns losses in submission order");
-                    let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
-                    losses.push(loss_entry);
-                    learning_rates.push(meta.learning_rate);
-                    sources.push(meta.source);
-                    dataloader_positions.push(meta.dataloader_pos);
-                    last_batch = Some(meta.train_batch);
+                    )?
                 }
-                pending_async_step =
-                    Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
-                run_steps += 1;
-                return Ok(());
+            });
+        }
+
+        let runner_ref = runner.as_mut().expect("runner is initialized");
+        let step = completed_step_offset + run_steps + 1;
+        let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
+        let params = grouped_ranger_step_params_for_step_with_hyperparams(
+            step,
+            learning_rate,
+            args.optimizer_weight_decay,
+            args.optimizer_beta1,
+            args.optimizer_beta2,
+            args.optimizer_epsilon,
+        );
+        let host_batch = NnueTrainStepHostBatch {
+            stm_indices: &train_batch.stm,
+            nstm_indices: &train_batch.nstm,
+            targets: &train_batch.targets,
+            entry_weights: &train_batch.entry_weights,
+            batch_size: train_batch.batch_size,
+            max_active: train_batch.max_active,
+        };
+        train_timer.get_or_insert_with(std::time::Instant::now);
+        train_positions = train_positions.saturating_add(train_batch.batch_size);
+
+        if use_async_pipeline {
+            let completed_loss = runner_ref.step_pipelined(
+                &stream,
+                &module,
+                params,
+                train_loss_kind,
+                host_batch,
+                args.debug_readback,
+                false,
+                args.profile_train_step,
+            )?;
+            if let Some(loss) = completed_loss {
+                let meta = pending_async_step
+                    .take()
+                    .expect("async NNUE train pipeline returns losses in submission order");
+                let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
+                losses.push(loss_entry);
+                learning_rates.push(meta.learning_rate);
+                sources.push(meta.source);
+                dataloader_positions.push(meta.dataloader_pos);
+                last_batch = Some(meta.train_batch);
             }
-
-            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
-            stream.synchronize()?;
-
-            let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
-            let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
-            losses.push(loss_entry);
-            learning_rates.push(learning_rate);
-            sources.push(source.clone());
-            dataloader_positions.push(dataloader_pos);
-            checkpoint_losses.push(loss_entry);
-            checkpoint_learning_rates.push(learning_rate);
-            checkpoint_sources.push(source);
-            checkpoint_dataloader_positions.push(dataloader_pos);
+            pending_async_step =
+                Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
             run_steps += 1;
-            if args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false) {
-                let weights = runner_ref.read_weights(&stream)?;
-                let state = runner_ref.read_state(&stream)?;
-                let test_metrics = match &test_cache {
-                    Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
-                    None => None,
-                };
-                bridge_checkpoints.push(write_nnue_bridge_checkpoint(
-                    args.output.as_ref().expect("checked output exists"),
-                    shape,
-                    completed_step_offset + run_steps,
-                    weights,
-                    &state,
-                    &train_batch,
-                    teacher,
-                    &checkpoint_losses,
-                    &checkpoint_learning_rates,
-                    &checkpoint_sources,
-                    &checkpoint_dataloader_positions,
-                    test_metrics,
-                    log_context,
-                )?);
-                checkpoint_losses.clear();
-                checkpoint_learning_rates.clear();
-                checkpoint_sources.clear();
-                checkpoint_dataloader_positions.clear();
+            return Ok(());
+        }
+
+        runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
+        stream.synchronize()?;
+
+        let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
+        let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
+        losses.push(loss_entry);
+        learning_rates.push(learning_rate);
+        sources.push(source.clone());
+        dataloader_positions.push(dataloader_pos);
+        checkpoint_losses.push(loss_entry);
+        checkpoint_learning_rates.push(learning_rate);
+        checkpoint_sources.push(source);
+        checkpoint_dataloader_positions.push(dataloader_pos);
+        run_steps += 1;
+        if args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false) {
+            let weights = runner_ref.read_weights(&stream)?;
+            let state = runner_ref.read_state(&stream)?;
+            let test_metrics = match &test_cache {
+                Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
+                None => None,
+            };
+            bridge_checkpoints.push(write_nnue_bridge_checkpoint(
+                args.output.as_ref().expect("checked output exists"),
+                shape,
+                completed_step_offset + run_steps,
+                weights,
+                &state,
+                &train_batch,
+                teacher,
+                &checkpoint_losses,
+                &checkpoint_learning_rates,
+                &checkpoint_sources,
+                &checkpoint_dataloader_positions,
+                test_metrics,
+                log_context,
+            )?);
+            checkpoint_losses.clear();
+            checkpoint_learning_rates.clear();
+            checkpoint_sources.clear();
+            checkpoint_dataloader_positions.clear();
+        }
+        last_batch = Some(train_batch);
+        Ok(())
+    };
+
+    let train_steps = args.train_steps;
+    if args.profile_train_step {
+        bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
+            &teacher_batch_config,
+            train_steps,
+            |loaded| handle_loaded_batch(loaded),
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to stream NNUE teacher batches from {teacher}: {err}"
+            ))
+        })?;
+    } else {
+        std::thread::scope(|scope| -> bulletou_cuda_oxide_runtime::Result<()> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let producer = scope.spawn(move || {
+                bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
+                    &teacher_batch_config,
+                    train_steps,
+                    |loaded| {
+                        tx.send(loaded)
+                            .map_err(|err| format!("teacher batch consumer stopped: {err}"))
+                    },
+                )
+            });
+
+            let mut consumer_result: bulletou_cuda_oxide_runtime::Result<()> = Ok(());
+            while let Ok(loaded) = rx.recv() {
+                if let Err(err) = handle_loaded_batch(loaded) {
+                    consumer_result = Err(err);
+                    break;
+                }
             }
-            last_batch = Some(train_batch);
+            drop(rx);
+
+            let producer_result = producer.join().map_err(|_| {
+                bulletou_cuda_oxide_runtime::Error::Smoke("NNUE teacher batch producer panicked".to_string())
+            })?;
+            if let Err(err) = consumer_result {
+                return Err(err);
+            }
+            producer_result.map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to stream NNUE teacher batches from {teacher}: {err}"
+                ))
+            })?;
             Ok(())
-        },
-    )
-    .map_err(|err| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "failed to stream NNUE teacher batches from {teacher}: {err}"
-        ))
-    })?;
+        })?;
+    }
 
     if use_async_pipeline {
         let runner_ref = runner.as_mut().expect("validated non-empty teacher train steps");

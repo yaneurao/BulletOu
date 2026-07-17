@@ -317,6 +317,7 @@ fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box
         scale: args.scale,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        profile_prepare: false,
     })?;
 
     Ok((loaded.batch, loaded.source))

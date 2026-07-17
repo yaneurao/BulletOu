@@ -47,6 +47,8 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub nnue_pytorch_wrm_loss: bool,
     /// Drop positions whose absolute teacher score is at least this value.
     pub score_drop_abs: Option<u16>,
+    /// Print CPU batch materialisation timing for profiling runs.
+    pub profile_prepare: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +400,14 @@ where
     let mut visit_error = None;
     dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
+        let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let prepared = dataloader.prepare(batch, threads, 1.0 - config.lambda);
+        if let Some(started) = prepare_started {
+            println!(
+                "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let batch = FastBatchHost::from(prepared);
         if let Err(err) = batch.validate() {
             visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
@@ -539,6 +548,7 @@ mod tests {
             scale: 400.0,
             nnue_pytorch_wrm_loss: false,
             score_drop_abs: Some(32_000),
+            profile_prepare: false,
         }
     }
 
