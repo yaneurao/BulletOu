@@ -407,3 +407,25 @@ commit each completed slice.
 - YaneuraOu quantized cross-check on the same BulletOu checkpoint:
   - `./YaneuraOu-by-gcc EvalDir <bulletou-metrics/0001> , test eval_accuracy <test-8192.psv> , quit`;
   - result: `accuracy=50.6470% (4149/8192)`, `drawn=0`, `skipped=0`.
+
+### BO-CUDA-026
+
+- Re-ran the folder-teacher parity benchmark with a longer training slice because the BO-CUDA-025 speed smoke (`0.234s`) was too short/noisy for a useful speed comparison.
+- Harness run:
+  - run directory: `target\tatara-parity\parity-20260718-073904`;
+  - command shape: `scripts\tatara_parity_smoke.ps1 -Teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled -TestTeacher C:\shogi\teacher\test\yamaoka-floodgate.hcpe -TrainPositions 4194304 -TestPositions 8192 -BatchSize 8192 -BatchesPerSuperbatch 8 -Superbatches 64 -Threads 8`.
+- Export evidence:
+  - train export read `input_files=65`, `input_positions=649263458`, wrote `4194304` PSV positions (`167772160` bytes);
+  - validation export read `input_files=1`, `input_positions=856923`, wrote `8192` PSV positions (`327680` bytes).
+- Same-PSV tatara validation run:
+  - final report: train `loss=0.054048`, `test_loss=0.054207`, `test_acc=0.6630`;
+  - per-superbatch reported training speed over 64 superbatches: min `531384`, median `1021295`, mean `1190192`, max `2214292` pos/s;
+  - `done in 12s` includes the external validation pass after every superbatch, so it is not directly comparable with BulletOu's no-output speed smoke.
+- Clean speed-only comparison on the already-exported `teacher-4194304.psv`:
+  - tatara with held-out validation disabled still wrote its default checkpoints, so its wall-clock `done in 34s` is checkpoint-I/O contaminated; the per-superbatch training-speed statistics were min `508949`, median `1028940.5`, mean `1116150.3`, max `1874347` pos/s;
+  - BulletOu cuda-oxide with validation/output disabled processed `4194304` positions in `7.083s`, `592156` pos/s, final `step512_loss mean=0.061553404`;
+  - on this longer clean run, BulletOu is roughly `53%` of tatara's mean per-superbatch training throughput (`592156 / 1116150.3`), so standard NNUE cuda-oxide training still trails tatara materially after the async loader and loss-kernel fixes.
+- Same-PSV BulletOu checkpoint/validation run:
+  - checkpoint-time validation: `accuracy=65.0635% (5330/8192; pred>=0 4139 pred<0 4053 zero 0)`, `loss=0.055417`;
+  - `summary-learn.log`: `test_value_accuracy=0.650635`, `test_value_loss=0.055417`, `train_value_loss=0.061433263`;
+  - metrics-run throughput (`82659` pos/s) is intentionally not used for speed comparison because it includes checkpoint serialization and validation overhead.
