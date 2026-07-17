@@ -25,7 +25,7 @@ struct Args {
     #[arg(long)]
     out: PathBuf,
 
-    /// Write a training fixture (`BOUTRN1`) that includes targets and
+    /// Write a training fixture (`BOUNTRN1`) that includes targets and
     /// entry_weights. By default, this writes the backward-compatible forward
     /// fixture (`BOUNFWD1`).
     #[arg(long)]
@@ -51,6 +51,10 @@ struct Args {
     /// Override synthetic batch size.
     #[arg(long)]
     batch_size: Option<usize>,
+
+    /// Zero-based teacher batch index to export when --teacher is used.
+    #[arg(long, default_value = "0")]
+    batch_index: usize,
 
     /// Override padded sparse feature slots per sample.
     #[arg(long)]
@@ -104,6 +108,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(invalid_input(
             "--max-active cannot be used with --teacher; it comes from ShogiHalfKP::max_active()",
         ));
+    }
+    if args.batch_index != 0 && args.teacher.is_none() {
+        return Err(invalid_input("--batch-index requires --teacher"));
     }
     if !(0.0..=1.0).contains(&args.lambda) {
         return Err(invalid_input("--lambda must be in [0, 1]"));
@@ -221,7 +228,7 @@ fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box
     let format = infer_data_format(&data_files_ref).map_err(invalid_input)?;
     let batch_size = args.batch_size.unwrap_or(2);
     require_nonzero("batch-size", batch_size)?;
-    let source = format!("{format:?} teacher: {teacher}");
+    let source = format!("{format:?} teacher batch {}: {teacher}", args.batch_index);
 
     let batch = match format {
         DataFormat::Hcpe => {
@@ -273,16 +280,23 @@ where
         score_drop_abs,
         loader,
     );
-    let mut first_batch = None;
+    let mut selected_batch = None;
+    let mut seen_batches = 0usize;
     dataloader.load_and_map_batches(0, batch_size, |batch| {
+        if seen_batches != args.batch_index {
+            seen_batches += 1;
+            return false;
+        }
+
         let prepared = dataloader.prepare(batch, threads, 1.0 - args.lambda);
-        first_batch = Some(FastBatchHost::from(prepared));
+        selected_batch = Some(FastBatchHost::from(prepared));
         true
     });
 
-    let batch = first_batch.ok_or_else(|| {
+    let batch = selected_batch.ok_or_else(|| {
         invalid_input(format!(
-            "teacher did not yield a complete batch of {batch_size} positions; use a smaller --batch-size"
+            "teacher did not yield complete batch index {} of {batch_size} positions; use a smaller --batch-size or batch-index",
+            args.batch_index
         ))
     })?;
     batch.validate().map_err(invalid_input)?;

@@ -93,27 +93,45 @@ if ([string]::IsNullOrWhiteSpace($Fixture)) {
     $Fixture = Join-Path $repoRoot "target\cuda-oxide-fixtures\nnue-halfkp-teacher-train-b$BatchSize.bin"
 }
 
-$fixtureDir = Split-Path -Parent $Fixture
-New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
+$fixturePaths = @()
+if ($TrainSteps -eq 1) {
+    $fixturePaths += $Fixture
+} else {
+    $fixtureDir = Split-Path -Parent $Fixture
+    $fixtureStem = [System.IO.Path]::GetFileNameWithoutExtension($Fixture)
+    $fixtureExt = [System.IO.Path]::GetExtension($Fixture)
+    for ($step = 0; $step -lt $TrainSteps; $step++) {
+        $fixturePaths += (Join-Path $fixtureDir "$fixtureStem-step$step$fixtureExt")
+    }
+}
 
-Invoke-Checked "export NNUE HalfKP teacher train fixture" {
-    Set-Location $repoRoot
-    cargo run -p bulletou_lib --example export_nnue_forward_fixture --release -- `
-        --out $Fixture `
-        --train-fixture `
-        --case halfkp `
-        --teacher $Teacher `
-        --batch-size $BatchSize `
-        --buffer-mb $BufferMb `
-        --loader-threads $LoaderThreads `
-        --threads $Threads `
-        --score-drop-abs $ScoreDropAbs
+foreach ($path in $fixturePaths) {
+    $fixtureDir = Split-Path -Parent $path
+    New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
+}
+
+for ($step = 0; $step -lt $TrainSteps; $step++) {
+    $outFixture = $fixturePaths[$step]
+    Invoke-Checked "export NNUE HalfKP teacher train fixture batch $step" {
+        Set-Location $repoRoot
+        cargo run -p bulletou_lib --example export_nnue_forward_fixture --release -- `
+            --out $outFixture `
+            --train-fixture `
+            --case halfkp `
+            --teacher $Teacher `
+            --batch-size $BatchSize `
+            --batch-index $step `
+            --buffer-mb $BufferMb `
+            --loader-threads $LoaderThreads `
+            --threads $Threads `
+            --score-drop-abs $ScoreDropAbs
+    }
 }
 
 $wslCudaRoot = Convert-ToWslPath $cudaRoot
-$wslFixture = Convert-ToWslPath $Fixture
+$wslFixtures = @($fixturePaths | ForEach-Object { Convert-ToWslPath $_ })
 $debugFlag = if ($DebugReadback) { " --debug-readback" } else { "" }
-$fixtureArgs = ((1..$TrainSteps) | ForEach-Object { "--nnue-train-fixture `"$wslFixture`"" }) -join " "
+$fixtureArgs = ($wslFixtures | ForEach-Object { "--nnue-train-fixture `"$_`"" }) -join " "
 
 $cudaEnv = @"
 export CUDA_HOME=/usr
@@ -184,4 +202,7 @@ Invoke-Checked "NNUE loss Ranger step smoke with real teacher fixture" {
 }
 
 Write-Host "OK: cuda-oxide NNUE teacher loss smoke completed"
-Write-Host "fixture: $Fixture"
+Write-Host "fixtures:"
+foreach ($path in $fixturePaths) {
+    Write-Host "  $path"
+}

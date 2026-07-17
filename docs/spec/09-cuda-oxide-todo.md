@@ -820,11 +820,21 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `--nnue-loss-ranger-step-smoke --debug-readback` succeeded with
     `weighted_sum`, `loss_mean`, `per_sample`, and `loss_grad` max_abs diff
     `0`; all 8 Ranger-updated parameter/state groups were within tolerance.
-  - Re-ran the same real teacher train fixture twice in one invocation by
-    passing `--nnue-train-fixture` twice. This validated multi-step state
-    carry: `step1_*` and `step2_*` loss buffers matched exactly, and final
-    weights/momentum/velocity/slow parameters matched CPU goldens within
-    tolerance.
+- Re-ran the same real teacher train fixture twice in one invocation by
+  passing `--nnue-train-fixture` twice. This validated multi-step state
+  carry: `step1_*` and `step2_*` loss buffers matched exactly, and final
+  weights/momentum/velocity/slow parameters matched CPU goldens within
+  tolerance.
+- Added `export_nnue_forward_fixture --batch-index <N>` for teacher-backed
+  fixtures, so the bridge can materialise distinct real teacher batches while
+  still keeping the root and cuda-oxide workspaces isolated.
+- Validation with `scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild
+  -TrainSteps 2 -DebugReadback` succeeded. The script exported batch-indexed
+  fixtures `step0` and `step1` from
+  `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`;
+  `step1_*` and `step2_*` loss buffers matched exactly, and final
+  weights/momentum/velocity/slow parameters matched CPU goldens within
+  tolerance.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
@@ -843,9 +853,10 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   4. creates the temporary nvJitLink shim;
   5. runs `bulletou-cuda-train --nnue-loss-ranger-step-smoke
      --nnue-train-fixture` against the generated teacher fixture.
-- Added `-TrainSteps <N>` to repeat the generated fixture through multiple
-  NNUE loss/Ranger update steps without changing the root/cuda-oxide workspace
-  isolation boundary.
+- Added `-TrainSteps <N>` to generate batch-indexed train fixtures
+  (`step0`, `step1`, ...) and run them through multiple NNUE loss/Ranger
+  update steps without changing the root/cuda-oxide workspace isolation
+  boundary.
 - Validation:
   - `powershell -ExecutionPolicy Bypass -File
     scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild` succeeded using

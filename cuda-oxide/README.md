@@ -90,7 +90,8 @@ exists. The script runs the root exporter with `--train-fixture`, writes an
 ignored `BOUNTRN1` train fixture under `target/cuda-oxide-fixtures/`, then runs
 `bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture` in
 WSL2. Add `-LossKind sigmoid-mse` or `-LossKind wrm` to select the loss smoke,
-`-TrainSteps 2` to repeat the fixture through multiple optimizer steps, and
+`-TrainSteps 2` to export consecutive teacher batches and run multiple
+optimizer steps, and
 `-SkipCudaBuild` to reuse an existing `cargo oxide build` artifact.
 
 WSL2 Ubuntu 24.04 validation example:
