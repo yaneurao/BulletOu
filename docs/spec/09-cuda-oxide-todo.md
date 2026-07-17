@@ -860,6 +860,15 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Re-ran `scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild
   -TrainSteps 2 -DebugReadback`; step0 remained `BOUNTRN1`, step1 was the
   lighter `BOUNBCH1`, and `bulletou-cuda-train` still reported `compare: ok`.
+- Updated `NnueLossRangerStepRunner` to own fixed-layout device buffers for
+  `stm_indices`, `nstm_indices`, `targets`, and `entry_weights`. Each `step()`
+  now refills those buffers with `DeviceBuffer::copy_from_host()` instead of
+  allocating fresh device buffers per batch. This is still the safe synchronous
+  copy path, but it removes allocator churn and matches the future streaming
+  trainer boundary.
+- Re-ran Windows `cargo check -p bulletou-cuda-train`, WSL2
+  `cargo check -p bulletou-cuda-train --features cuda`, and the real-teacher
+  `-TrainSteps 2 -DebugReadback` smoke; all passed.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

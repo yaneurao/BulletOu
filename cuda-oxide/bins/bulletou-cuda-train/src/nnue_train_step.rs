@@ -1,10 +1,11 @@
 //! Host-side NNUE train-step runner used by the cuda-oxide smoke harness.
 //!
 //! This is deliberately still small and explicit: it owns the persistent
-//! device weights, Ranger state, and workspaces, while each call to `step`
-//! uploads one fixed-layout host batch and enqueues forward -> loss ->
-//! backward -> Ranger update.  The fixture smoke can drive this today; the
-//! real trainer loop can later feed the same runner from a dataloader stream.
+//! device weights, Ranger state, fixed-layout batch buffers, and workspaces,
+//! while each call to `step` refills the batch buffers and enqueues forward ->
+//! loss -> backward -> Ranger update.  The fixture smoke can drive this today;
+//! the real trainer loop can later feed the same runner from a dataloader
+//! stream.
 
 use std::sync::Arc;
 
@@ -15,8 +16,8 @@ use bulletou_cuda_oxide_runtime::{
     },
     loss::{ScalarLossLayout, ScalarLossWorkspace},
     nnue::{
-        NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
-        NnueForwardShape, NnueForwardWorkspace, NnueForwardWorkspaceLayout,
+        NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostWeights, NnueForwardShape,
+        NnueForwardWorkspace, NnueForwardWorkspaceLayout,
     },
     optimizer::{NnueRangerOptimizerStates, RangerUpdateParams},
     CudaModule, CudaStream, DeviceBuffer, Error, Result,
@@ -46,6 +47,9 @@ pub(crate) struct NnueLossRangerStepRunner {
     max_active: usize,
     pub(crate) device_weights: NnueForwardDeviceWeights,
     pub(crate) optimizer_states: NnueRangerOptimizerStates,
+    device_batch: NnueForwardDeviceBatch,
+    targets: DeviceBuffer<f32>,
+    entry_weights: DeviceBuffer<f32>,
     forward_workspace: NnueForwardWorkspace,
     pub(crate) loss_workspace: ScalarLossWorkspace,
     backward_workspace: NnueBackwardWorkspace,
@@ -66,8 +70,17 @@ impl NnueLossRangerStepRunner {
         }
 
         let shape = initial_weights.shape;
+        let sparse_len = batch_size.saturating_mul(max_active);
         let device_weights = NnueForwardDeviceWeights::from_host(stream, initial_weights)?;
         let optimizer_states = NnueRangerOptimizerStates::from_host_weights(stream, initial_weights)?;
+        let device_batch = NnueForwardDeviceBatch {
+            batch_size,
+            max_active,
+            stm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+            nstm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+        };
+        let targets = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
+        let entry_weights = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
         let forward_workspace =
             NnueForwardWorkspace::new(stream, NnueForwardWorkspaceLayout::new(shape, batch_size))?;
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
@@ -80,6 +93,9 @@ impl NnueLossRangerStepRunner {
             max_active,
             device_weights,
             optimizer_states,
+            device_batch,
+            targets,
+            entry_weights,
             forward_workspace,
             loss_workspace,
             backward_workspace,
@@ -95,21 +111,15 @@ impl NnueLossRangerStepRunner {
         batch: NnueTrainStepHostBatch<'_>,
     ) -> Result<()> {
         self.validate_batch(batch)?;
-
-        let host_batch = NnueForwardHostBatch {
-            stm_indices: batch.stm_indices,
-            nstm_indices: batch.nstm_indices,
-            batch_size: batch.batch_size,
-            max_active: batch.max_active,
-        };
-        let device_batch = NnueForwardDeviceBatch::from_host(stream, &host_batch)?;
-        let targets = DeviceBuffer::from_host(stream, batch.targets)?;
-        let entry_weights = DeviceBuffer::from_host(stream, batch.entry_weights)?;
+        self.device_batch.stm_indices.copy_from_host(stream, batch.stm_indices)?;
+        self.device_batch.nstm_indices.copy_from_host(stream, batch.nstm_indices)?;
+        self.targets.copy_from_host(stream, batch.targets)?;
+        self.entry_weights.copy_from_host(stream, batch.entry_weights)?;
 
         nnue_forward::launch_nnue_forward(
             stream,
             module,
-            &device_batch,
+            &self.device_batch,
             &self.device_weights,
             &mut self.forward_workspace,
         )?;
@@ -119,16 +129,16 @@ impl NnueLossRangerStepRunner {
                 stream,
                 module,
                 &self.forward_workspace.output,
-                &targets,
-                &entry_weights,
+                &self.targets,
+                &self.entry_weights,
                 &mut self.loss_workspace,
             )?,
             NnueTrainLossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(
                 stream,
                 module,
                 &self.forward_workspace.output,
-                &targets,
-                &entry_weights,
+                &self.targets,
+                &self.entry_weights,
                 &mut self.loss_workspace,
             )?,
         }
@@ -191,8 +201,8 @@ impl NnueLossRangerStepRunner {
                 self.shape.input_size,
                 self.shape.l1,
             ),
-            &device_batch.stm_indices,
-            &device_batch.nstm_indices,
+            &self.device_batch.stm_indices,
+            &self.device_batch.nstm_indices,
             &self.backward_workspace.stm_l0_gradients,
             &self.backward_workspace.nstm_l0_gradients,
             &mut self.backward_workspace.l0w_gradients,
