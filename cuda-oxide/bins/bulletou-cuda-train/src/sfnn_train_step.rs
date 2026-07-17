@@ -9,10 +9,10 @@ use bulletou_cuda_oxide_runtime::{
         SfnnStackedL3BackwardLayout,
     },
     loss::{ScalarLossLayout, ScalarLossWorkspace},
-    optimizer::{RangerUpdateParams, SfnnRangerOptimizerStates},
+    optimizer::{RangerUpdateParams, SfnnRangerOptimizerHostStates, SfnnRangerOptimizerStates},
     sfnn::{
         SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostWeights, SfnnForwardShape,
-        SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
+        SfnnForwardWeightLayout, SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
     },
     CudaModule, CudaStream, DeviceBuffer, Error, Result,
 };
@@ -88,6 +88,48 @@ impl SfnnLossRangerStepRunner {
         let sparse_len = batch_size.saturating_mul(max_active);
         let device_weights = SfnnForwardDeviceWeights::from_host(stream, weights)?;
         let optimizer_states = SfnnRangerOptimizerStates::from_host_weights(stream, weights)?;
+        let device_batch = SfnnForwardDeviceBatch {
+            batch_size,
+            max_active,
+            stm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+            nstm_indices: DeviceBuffer::<i32>::zeroed(stream, sparse_len)?,
+            buckets: DeviceBuffer::<i32>::zeroed(stream, batch_size)?,
+        };
+        let targets = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
+        let entry_weights = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
+        let forward_workspace = SfnnForwardWorkspace::new(stream, SfnnForwardWorkspaceLayout::new(shape, batch_size))?;
+        let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
+        let backward_workspace =
+            SfnnBackwardWorkspace::new(stream, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
+
+        Ok(Self {
+            shape,
+            batch_size,
+            max_active,
+            device_weights,
+            optimizer_states,
+            device_batch,
+            targets,
+            entry_weights,
+            forward_workspace,
+            loss_workspace,
+            backward_workspace,
+        })
+    }
+
+    pub(crate) fn with_optimizer_state(
+        stream: &Arc<CudaStream>,
+        weights: &SfnnForwardHostWeights<'_>,
+        optimizer_state: SfnnRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        weights.validate()?;
+        let shape = weights.shape;
+        let sparse_len = batch_size.saturating_mul(max_active);
+        let device_weights = SfnnForwardDeviceWeights::from_host(stream, weights)?;
+        let optimizer_states =
+            SfnnRangerOptimizerStates::from_host_states(stream, SfnnForwardWeightLayout::new(shape), optimizer_state)?;
         let device_batch = SfnnForwardDeviceBatch {
             batch_size,
             max_active,

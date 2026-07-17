@@ -1644,20 +1644,57 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     validate_nnue_teacher_schedule_args(&args)?;
     let save_interval_steps = nnue_teacher_save_interval_steps(&args)?;
-    if args.nnue_train_state_fixture.is_some() || args.nnue_train_state_bin.is_some() {
+    if args.nnue_train_state_fixture.is_some() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
-            "--sfnn-teacher-train does not yet support train-state resume".to_string(),
+            "--sfnn-teacher-train supports root state.bin resume only; use --nnue-train-state-bin or --output auto-resume"
+                .to_string(),
         ));
     }
+    let output_resume_checkpoint = if args.nnue_train_state_bin.is_none() {
+        match args.output.as_deref() {
+            Some(output_dir) => find_latest_bridge_checkpoint(output_dir)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let train_state_source = args
+        .nnue_train_state_bin
+        .as_deref()
+        .or_else(|| output_resume_checkpoint.as_ref().map(|checkpoint| checkpoint.state_path.as_path()));
+    let resume_checkpoint_teacher = output_resume_checkpoint.as_ref().and_then(|checkpoint| checkpoint.teacher_spec.as_deref());
+    let resume_teacher_matches = resume_checkpoint_teacher.is_some_and(|stored| stored == teacher);
+    let legacy_resume_checkpoint = output_resume_checkpoint.is_some() && resume_checkpoint_teacher.is_none();
+    let dataloader_resume_pos = if resume_teacher_matches || legacy_resume_checkpoint {
+        match output_resume_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.dataloader_pos_path.as_deref())
+        {
+            Some(path) => parse_bridge_dataloader_pos(path)?,
+            None => None,
+        }
+    } else {
+        None
+    };
     let ptx = match args.ptx.as_ref() {
         Some(ptx) => ptx.clone(),
         None => default_nnue_ptx()?,
     };
+    if args.weights_bin.is_some() && train_state_source.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--weights-bin cannot be used together with a restored train state; the train-state already contains weights"
+                .to_string(),
+        ));
+    }
     let initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfka2_weights_as_sfnn_case(path)?,
         None => SfnnForwardCase::new(SfnnForwardCaseKind::Halfka2),
     };
-    let shape = initial_case.shape;
+    let restored_state = match train_state_source {
+        Some(path) => Some(load_root_halfka2_train_state_case(path)?),
+        None => None,
+    };
+    let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
     if shape != bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3 {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "--sfnn-teacher-train currently supports only SFNN HalfKA2 shape input={} ft={} h1={} h2={} stacks={}, but weights have input={} ft={} h1={} h2={} stacks={}",
@@ -1673,6 +1710,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             shape.num_stacks
         )));
     }
+    let completed_step_offset = restored_state.as_ref().map(|state| state.completed_steps).unwrap_or(0);
 
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
     let stream = ctx.default_stream();
@@ -1704,11 +1742,20 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut train_timer: Option<std::time::Instant> = None;
     let mut train_positions = 0usize;
     let mut run_steps = 0usize;
+    let teacher_batch_index = if dataloader_resume_pos.is_some()
+        || resume_teacher_matches
+        || legacy_resume_checkpoint
+        || output_resume_checkpoint.is_none()
+    {
+        completed_step_offset
+    } else {
+        0
+    };
     let teacher_batch_config = bulletou_lib::value::teacher_batch::SfnnTeacherBatchConfig {
         teacher,
         batch_size: args.batch_size,
-        batch_index: 0,
-        dataloader_resume_pos: None,
+        batch_index: teacher_batch_index,
+        dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -1727,26 +1774,37 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             let batch = loaded.batch;
             validate_sfnn_teacher_fast_batch(shape, &batch)?;
             if runner.is_none() {
-                let host_weights = SfnnForwardHostWeights {
-                    shape,
-                    l0w: &initial_case.l0w,
-                    l0b: &initial_case.l0b,
-                    l1w: &initial_case.l1w,
-                    l1b: &initial_case.l1b,
-                    l2w: &initial_case.l2w,
-                    l2b: &initial_case.l2b,
-                    l3w: &initial_case.l3w,
-                    l3b: &initial_case.l3b,
-                };
-                runner = Some(SfnnLossRangerStepRunner::new(
-                    &stream,
-                    &host_weights,
-                    batch.layout.batch_size,
-                    batch.layout.max_active,
-                )?);
+                runner = Some(match restored_state.as_ref() {
+                    Some(state) => SfnnLossRangerStepRunner::with_optimizer_state(
+                        &stream,
+                        &state.host_weights(),
+                        state.host_optimizer_states(),
+                        batch.layout.batch_size,
+                        batch.layout.max_active,
+                    )?,
+                    None => {
+                        let host_weights = SfnnForwardHostWeights {
+                            shape,
+                            l0w: &initial_case.l0w,
+                            l0b: &initial_case.l0b,
+                            l1w: &initial_case.l1w,
+                            l1b: &initial_case.l1b,
+                            l2w: &initial_case.l2w,
+                            l2b: &initial_case.l2b,
+                            l3w: &initial_case.l3w,
+                            l3b: &initial_case.l3b,
+                        };
+                        SfnnLossRangerStepRunner::new(
+                            &stream,
+                            &host_weights,
+                            batch.layout.batch_size,
+                            batch.layout.max_active,
+                        )?
+                    }
+                });
             }
 
-            let step = run_steps + 1;
+            let step = completed_step_offset + run_steps + 1;
             let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
             let params = grouped_ranger_step_params_for_step_with_hyperparams(
                 step,
@@ -1794,7 +1852,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
                         output_dir,
                         shape,
-                        run_steps,
+                        completed_step_offset + run_steps,
                         &state,
                         teacher,
                         &checkpoint_losses,
@@ -1847,7 +1905,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
                 output_dir,
                 shape,
-                run_steps,
+                completed_step_offset + run_steps,
                 &state,
                 teacher,
                 checkpoint_loss_entries,
@@ -1867,6 +1925,16 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     if let Some(path) = &args.weights_bin {
         println!("  weights      : {}", path.display());
     }
+    if let Some(path) = train_state_source {
+        println!("  resume_state : {} (state.bin)", path.display());
+    }
+    if let Some(pos) = dataloader_resume_pos {
+        println!("  resume_data  : byte_offset={}, plies={}", pos.byte_offset, pos.plies);
+    } else if resume_checkpoint_teacher.is_some_and(|stored_teacher| stored_teacher != teacher) {
+        let stored_teacher = resume_checkpoint_teacher.expect("checked resume checkpoint teacher");
+        println!("  resume_data  : teacher changed; starting teacher stream at batch 0");
+        println!("    previous   : {stored_teacher}");
+    }
     println!("  batches      : {}", sources.len());
     for (idx, source) in sources.iter().enumerate() {
         println!("    [{}] {}", idx + 1, source);
@@ -1877,6 +1945,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         "  shape        : input={} ft={} h1={} h2={} stacks={}",
         shape.input_size, shape.ft_size, shape.l1_hidden, shape.l2_size, shape.num_stacks
     );
+    println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
     println!("  batches/sb   : {}", args.batches_per_superbatch);
     println!("  lr_schedule  : {}", train_lr_schedule_label(args.lr_schedule));
@@ -3265,7 +3334,7 @@ fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_ox
     let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "slow");
     let slow = if slow.is_empty() { &weights } else { &slow };
     let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "step_ranger");
-    let completed_steps = read_root_state_completed_steps(path, &steps)?;
+    let completed_steps = read_root_state_completed_steps(path, "root NNUE train state", &steps)?;
 
     fn take_record(
         path: &std::path::Path,
@@ -3315,13 +3384,104 @@ fn load_root_halfkp_train_state_case(path: &std::path::Path) -> bulletou_cuda_ox
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
+fn load_root_halfka2_train_state_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<SfnnTrainStateCase> {
+    let bytes = std::fs::read(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to read root SFNN train state {}: {err}",
+            path.display()
+        ))
+    })?;
+    let records = bulletou_lib::value::yaneuraou_kppt::parse_model_weights_bin(&bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to parse root SFNN train state {}: {err}",
+            path.display()
+        ))
+    })?;
+    match bulletou_lib::value::yaneuraou_kppt::detect_state_backend(&records).as_deref() {
+        Some(bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_BULLET)
+        | Some(bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_CUDA_OXIDE)
+        | None => {}
+        Some(backend) => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "unsupported root SFNN train state backend marker {backend:?} in {}",
+                path.display()
+            )));
+        }
+    }
+
+    let root_shape = bulletou_lib::value::SFNN_HALFKA2_1024_7_64_K3K3;
+    let shape = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+        input_size: root_shape.input_size,
+        ft_size: root_shape.ft_size,
+        l1_hidden: root_shape.l1_hidden,
+        l2_size: root_shape.l2_size,
+        num_stacks: root_shape.num_stacks,
+    };
+    let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
+    let weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
+    let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "momentum");
+    let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "velocity");
+    let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "slow");
+    let slow = if slow.is_empty() { &weights } else { &slow };
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "step_ranger");
+    let completed_steps = read_root_state_completed_steps(path, "root SFNN train state", &steps)?;
+
+    fn take_record(
+        path: &std::path::Path,
+        section: &'static str,
+        map: &std::collections::BTreeMap<String, Vec<f32>>,
+        id: &'static str,
+        expected_len: usize,
+    ) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+        let values = map.get(id).ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root SFNN train state {} is missing nnue/{section}/{id}",
+                path.display()
+            ))
+        })?;
+        if values.len() != expected_len {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "root SFNN train state {} record nnue/{section}/{id} has len {}, expected {expected_len}",
+                path.display(),
+                values.len()
+            )));
+        }
+        Ok(values.clone())
+    }
+
+    let group = |id: &'static str, expected_len: usize| -> bulletou_cuda_oxide_runtime::Result<NnueTrainStateGroupCase> {
+        Ok(NnueTrainStateGroupCase {
+            weights: take_record(path, "weights", &weights, id, expected_len)?,
+            momentum: take_record(path, "momentum", &momentum, id, expected_len)?,
+            velocity: take_record(path, "velocity", &velocity, id, expected_len)?,
+            slow_params: take_record(path, "slow", slow, id, expected_len)?,
+        })
+    };
+
+    Ok(SfnnTrainStateCase {
+        shape,
+        completed_steps,
+        l0w: group("l0w", layout.l0w_len())?,
+        l0b: group("l0b", layout.l0b_len())?,
+        l1w: group("l1w", layout.l1w_len())?,
+        l1b: group("l1b", layout.l1b_len())?,
+        l2w: group("l2w", layout.l2w_len())?,
+        l2b: group("l2b", layout.l2b_len())?,
+        l3w: group("l3w", layout.l3w_len())?,
+        l3b: group("l3b", layout.l3b_len())?,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
 fn read_root_state_completed_steps(
     path: &std::path::Path,
+    state_label: &'static str,
     steps: &std::collections::BTreeMap<String, Vec<f32>>,
 ) -> bulletou_cuda_oxide_runtime::Result<usize> {
     if steps.is_empty() {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "root NNUE train state {} has no nnue/step_ranger/* records",
+            "{state_label} {} has no nnue/step_ranger/* records",
             path.display()
         )));
     }
@@ -3330,7 +3490,7 @@ fn read_root_state_completed_steps(
     for (id, values) in steps {
         if values.len() != 1 {
             return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "root NNUE train state {} record nnue/step_ranger/{id} has len {}, expected 1",
+                "{state_label} {} record nnue/step_ranger/{id} has len {}, expected 1",
                 path.display(),
                 values.len()
             )));
@@ -3338,7 +3498,7 @@ fn read_root_state_completed_steps(
         let value = values[0];
         if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f32 {
             return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                "root NNUE train state {} record nnue/step_ranger/{id} has invalid step value {value}",
+                "{state_label} {} record nnue/step_ranger/{id} has invalid step value {value}",
                 path.display()
             )));
         }
@@ -3346,7 +3506,7 @@ fn read_root_state_completed_steps(
         match completed_steps {
             Some(existing) if existing != step => {
                 return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-                    "root NNUE train state {} has inconsistent step_ranger values: {existing} and {step}",
+                    "{state_label} {} has inconsistent step_ranger values: {existing} and {step}",
                     path.display()
                 )));
             }
@@ -3357,7 +3517,7 @@ fn read_root_state_completed_steps(
 
     completed_steps.ok_or_else(|| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "root NNUE train state {} has no usable nnue/step_ranger/* records",
+            "{state_label} {} has no usable nnue/step_ranger/* records",
             path.display()
         ))
     })
@@ -4745,7 +4905,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -5541,6 +5701,21 @@ struct SfnnForwardCase {
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
+struct SfnnTrainStateCase {
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    completed_steps: usize,
+    l0w: NnueTrainStateGroupCase,
+    l0b: NnueTrainStateGroupCase,
+    l1w: NnueTrainStateGroupCase,
+    l1b: NnueTrainStateGroupCase,
+    l2w: NnueTrainStateGroupCase,
+    l2b: NnueTrainStateGroupCase,
+    l3w: NnueTrainStateGroupCase,
+    l3b: NnueTrainStateGroupCase,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
 struct SfnnForwardTrace {
     stm_l0: Vec<f32>,
     nstm_l0: Vec<f32>,
@@ -6193,6 +6368,50 @@ impl NnueTrainStateCase {
             l2b: group!(l2b),
             outw: group!(outw),
             outb: group!(outb),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl SfnnTrainStateCase {
+    fn host_weights(&self) -> bulletou_cuda_oxide_runtime::sfnn::SfnnForwardHostWeights<'_> {
+        bulletou_cuda_oxide_runtime::sfnn::SfnnForwardHostWeights {
+            shape: self.shape,
+            l0w: &self.l0w.weights,
+            l0b: &self.l0b.weights,
+            l1w: &self.l1w.weights,
+            l1b: &self.l1b.weights,
+            l2w: &self.l2w.weights,
+            l2b: &self.l2b.weights,
+            l3w: &self.l3w.weights,
+            l3b: &self.l3b.weights,
+        }
+    }
+
+    fn host_optimizer_states(
+        &self,
+    ) -> bulletou_cuda_oxide_runtime::optimizer::SfnnRangerOptimizerHostStates<'_> {
+        use bulletou_cuda_oxide_runtime::optimizer::{RangerOptimizerHostState, SfnnRangerOptimizerHostStates};
+
+        macro_rules! group {
+            ($field:ident) => {
+                RangerOptimizerHostState {
+                    momentum: &self.$field.momentum,
+                    velocity: &self.$field.velocity,
+                    slow_params: &self.$field.slow_params,
+                }
+            };
+        }
+
+        SfnnRangerOptimizerHostStates {
+            l0w: group!(l0w),
+            l0b: group!(l0b),
+            l1w: group!(l1w),
+            l1b: group!(l1b),
+            l2w: group!(l2w),
+            l2b: group!(l2b),
+            l3w: group!(l3w),
+            l3b: group!(l3b),
         }
     }
 }

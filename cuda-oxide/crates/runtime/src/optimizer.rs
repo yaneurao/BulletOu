@@ -184,6 +184,32 @@ impl<'a> NnueRangerOptimizerHostStates<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnRangerOptimizerHostStates<'a> {
+    pub l0w: RangerOptimizerHostState<'a>,
+    pub l0b: RangerOptimizerHostState<'a>,
+    pub l1w: RangerOptimizerHostState<'a>,
+    pub l1b: RangerOptimizerHostState<'a>,
+    pub l2w: RangerOptimizerHostState<'a>,
+    pub l2b: RangerOptimizerHostState<'a>,
+    pub l3w: RangerOptimizerHostState<'a>,
+    pub l3b: RangerOptimizerHostState<'a>,
+}
+
+impl<'a> SfnnRangerOptimizerHostStates<'a> {
+    pub fn validate(self, layout: SfnnOptimizerStateLayout) -> std::result::Result<(), OptimizerLayoutError> {
+        self.l0w.validate(layout.l0w_state_layout())?;
+        self.l0b.validate(layout.l0b_state_layout())?;
+        self.l1w.validate(layout.l1w_state_layout())?;
+        self.l1b.validate(layout.l1b_state_layout())?;
+        self.l2w.validate(layout.l2w_state_layout())?;
+        self.l2b.validate(layout.l2b_state_layout())?;
+        self.l3w.validate(layout.l3w_state_layout())?;
+        self.l3b.validate(layout.l3b_state_layout())?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct RangerOptimizerState {
     pub layout: OptimizerStateLayout,
@@ -478,6 +504,26 @@ impl SfnnRangerOptimizerStates {
             l2b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2b_state_layout(), weights.l2b)?,
             l3w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l3w_state_layout(), weights.l3w)?,
             l3b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l3b_state_layout(), weights.l3b)?,
+        })
+    }
+
+    pub fn from_host_states(
+        stream: &CudaStream,
+        weights: SfnnForwardWeightLayout,
+        states: SfnnRangerOptimizerHostStates<'_>,
+    ) -> Result<Self> {
+        let layout = SfnnOptimizerStateLayout::new(weights);
+        states.validate(layout)?;
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::from_host(stream, layout.l0w_state_layout(), states.l0w)?,
+            l0b: RangerOptimizerState::from_host(stream, layout.l0b_state_layout(), states.l0b)?,
+            l1w: RangerOptimizerState::from_host(stream, layout.l1w_state_layout(), states.l1w)?,
+            l1b: RangerOptimizerState::from_host(stream, layout.l1b_state_layout(), states.l1b)?,
+            l2w: RangerOptimizerState::from_host(stream, layout.l2w_state_layout(), states.l2w)?,
+            l2b: RangerOptimizerState::from_host(stream, layout.l2b_state_layout(), states.l2b)?,
+            l3w: RangerOptimizerState::from_host(stream, layout.l3w_state_layout(), states.l3w)?,
+            l3b: RangerOptimizerState::from_host(stream, layout.l3b_state_layout(), states.l3b)?,
         })
     }
 }

@@ -17,6 +17,7 @@ commit each completed slice.
 | BO-CUDA-009 | done | expose SFNN cuda-oxide through BulletOu CLI | `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` launches the SFNN cuda-oxide child trainer and writes the normal output layout |
 | BO-CUDA-010 | done | SFNN validation metrics | `--sfnn-teacher-train --test-teacher` and the BulletOu SFNN cuda-oxide wrapper write `test_value_accuracy` / `test_value_loss` into the normal logs |
 | BO-CUDA-011 | done | SFNN production schedule / periodic checkpoints | SFNN cuda-oxide child honors `--save-rate` and the BulletOu wrapper accepts bounded `--superbatches` / `--max-epochs` direct production schedule |
+| BO-CUDA-012 | done | SFNN resume from root `state.bin` | `--sfnn-teacher-train` can auto-resume weights, Ranger state, completed step count, and teacher dataloader position from SFNN bridge checkpoints |
 
 ## Notes
 
@@ -154,3 +155,14 @@ commit each completed slice.
   - `cargo check --example bulletou`.
   - WSL CUDA periodic smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 2 --batches-per-superbatch 1 --batch-size 1 --save-rate 1 --test-positions 4` wrote both `0001` and `0002`, with `dataloader_pos.txt = 38,0` then `76,0`; `summary-learn.log` had two SFNN rows with train losses `0.258013457` and `0.241245091`.
   - WSL CUDA wrapper smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --superbatches 1 --max-epochs 1 --positions-per-superbatch 1 --batch-size 1 --save-rate 1` launched the nested child in production schedule mode with `--superbatches-per-epoch 1` and wrote checkpoint `0001`.
+
+### BO-CUDA-012
+
+- Added SFNN root `state.bin` restore for the same `nnue/{weights,momentum,velocity,slow,step_ranger}/...` component layout written by SFNN bridge checkpoints.
+- Added SFNN runner construction from restored weights plus Ranger momentum/velocity/slow state, so later runs continue optimizer state rather than only loading weights.
+- `--sfnn-teacher-train --output` now auto-resumes the latest numbered SFNN checkpoint; when `teacher.txt` matches, it also resumes `dataloader_pos.txt`. Explicit root-state restore is available through the existing `--nnue-train-state-bin <PATH>` option.
+- Validation:
+  - `cargo check -p bulletou-cuda-oxide-runtime` from the nested `cuda-oxide` workspace.
+  - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL CUDA resume smoke on `shuffled-001.hcpe`: first `--sfnn-teacher-train --train-steps 1 --save-rate 1 --output /tmp/bo012-sfnn-resume-smoke` wrote `0001` with `dataloader_pos.txt = 38,0`; the second identical run printed `resume_state : .../0001/state.bin`, `resume_data : byte_offset=38, plies=0`, `start_step : 2`, consumed teacher batch 1, wrote `0002/dataloader_pos.txt = 76,0`, and produced `step2_loss weighted_sum=0.24124509 mean=0.24124509`.
