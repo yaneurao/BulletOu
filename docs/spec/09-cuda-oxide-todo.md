@@ -869,6 +869,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Re-ran Windows `cargo check -p bulletou-cuda-train`, WSL2
   `cargo check -p bulletou-cuda-train --features cuda`, and the real-teacher
   `-TrainSteps 2 -DebugReadback` smoke; all passed.
+- Added `NnueLossRangerStepRunner::read_loss()` and `read_state()` so the
+  fixture smoke no longer reaches into runner-owned device weights, optimizer
+  states, or loss workspace directly. This keeps the smoke as a consumer of the
+  runner API and makes the same runner shape easier to reuse from a real
+  trainer loop.
+- Re-ran the same Windows/WSL checks and real-teacher `-TrainSteps 2
+  -DebugReadback` smoke; all passed with `compare: ok`.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

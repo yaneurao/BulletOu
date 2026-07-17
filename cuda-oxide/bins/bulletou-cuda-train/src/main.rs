@@ -871,33 +871,35 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         runner.step(&stream, &module, params, train_loss_kind, host_batch)?;
         stream.synchronize()?;
 
-        let gpu_weighted_sum = runner.loss_workspace.weighted_sum.to_host_vec(&stream)?;
-        let gpu_mean = runner.loss_workspace.mean.to_host_vec(&stream)?;
+        let gpu_loss = runner.read_loss(&stream, args.debug_readback)?;
         comparisons.push(compare_slices(
             format!("step{step}_weighted_sum"),
             &[cpu_loss_trace.weighted_sum],
-            &gpu_weighted_sum,
+            &gpu_loss.weighted_sum,
             args.tolerance,
         )?);
         comparisons.push(compare_slices(
             format!("step{step}_loss_mean"),
             &[cpu_loss_trace.mean],
-            &gpu_mean,
+            &gpu_loss.mean,
             args.tolerance,
         )?);
         if args.debug_readback {
-            let gpu_per_sample = runner.loss_workspace.per_sample.to_host_vec(&stream)?;
-            let gpu_output_gradients = runner.loss_workspace.mean_output_gradients.to_host_vec(&stream)?;
+            let gpu_per_sample = gpu_loss.per_sample.as_ref().expect("debug loss readback requested");
+            let gpu_output_gradients = gpu_loss
+                .mean_output_gradients
+                .as_ref()
+                .expect("debug loss gradient readback requested");
             comparisons.push(compare_slices(
                 format!("step{step}_per_sample"),
                 &cpu_loss_trace.per_sample,
-                &gpu_per_sample,
+                gpu_per_sample,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 format!("step{step}_loss_grad"),
                 &cpu_loss_trace.mean_output_gradients,
-                &gpu_output_gradients,
+                gpu_output_gradients,
                 args.tolerance,
             )?);
         }
@@ -929,47 +931,44 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
         update_cpu_group!(outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow, &[cpu_trace.outb_gradient]);
     }
 
+    let gpu_state = runner.read_state(&stream)?;
     macro_rules! compare_group {
-        ($field:ident, $momentum:ident, $velocity:ident, $slow_params:ident) => {{
-            let gpu_weights = runner.device_weights.$field.to_host_vec(&stream)?;
-            let gpu_momentum = runner.optimizer_states.$field.momentum.to_host_vec(&stream)?;
-            let gpu_velocity = runner.optimizer_states.$field.velocity.to_host_vec(&stream)?;
-            let gpu_slow_params = runner.optimizer_states.$field.slow_params.to_host_vec(&stream)?;
+        ($group:expr, $field:ident, $momentum:ident, $velocity:ident, $slow_params:ident) => {{
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_weights"),
                 &cpu_case.$field,
-                &gpu_weights,
+                &$group.weights,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_momentum"),
                 &$momentum,
-                &gpu_momentum,
+                &$group.momentum,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_velocity"),
                 &$velocity,
-                &gpu_velocity,
+                &$group.velocity,
                 args.tolerance,
             )?);
             comparisons.push(compare_slices(
                 concat!(stringify!($field), "_slow"),
                 &$slow_params,
-                &gpu_slow_params,
+                &$group.slow_params,
                 args.tolerance,
             )?);
         }};
     }
 
-    compare_group!(l0w, cpu_l0w_momentum, cpu_l0w_velocity, cpu_l0w_slow);
-    compare_group!(l0b, cpu_l0b_momentum, cpu_l0b_velocity, cpu_l0b_slow);
-    compare_group!(l1w, cpu_l1w_momentum, cpu_l1w_velocity, cpu_l1w_slow);
-    compare_group!(l1b, cpu_l1b_momentum, cpu_l1b_velocity, cpu_l1b_slow);
-    compare_group!(l2w, cpu_l2w_momentum, cpu_l2w_velocity, cpu_l2w_slow);
-    compare_group!(l2b, cpu_l2b_momentum, cpu_l2b_velocity, cpu_l2b_slow);
-    compare_group!(outw, cpu_outw_momentum, cpu_outw_velocity, cpu_outw_slow);
-    compare_group!(outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow);
+    compare_group!(gpu_state.l0w, l0w, cpu_l0w_momentum, cpu_l0w_velocity, cpu_l0w_slow);
+    compare_group!(gpu_state.l0b, l0b, cpu_l0b_momentum, cpu_l0b_velocity, cpu_l0b_slow);
+    compare_group!(gpu_state.l1w, l1w, cpu_l1w_momentum, cpu_l1w_velocity, cpu_l1w_slow);
+    compare_group!(gpu_state.l1b, l1b, cpu_l1b_momentum, cpu_l1b_velocity, cpu_l1b_slow);
+    compare_group!(gpu_state.l2w, l2w, cpu_l2w_momentum, cpu_l2w_velocity, cpu_l2w_slow);
+    compare_group!(gpu_state.l2b, l2b, cpu_l2b_momentum, cpu_l2b_velocity, cpu_l2b_slow);
+    compare_group!(gpu_state.outw, outw, cpu_outw_momentum, cpu_outw_velocity, cpu_outw_slow);
+    compare_group!(gpu_state.outb, outb, cpu_outb_momentum, cpu_outb_velocity, cpu_outb_slow);
 
     println!("bulletou-cuda-train NNUE loss Ranger step smoke");
     println!("  ptx          : {}", ptx.display());

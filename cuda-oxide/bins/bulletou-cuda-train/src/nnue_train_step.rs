@@ -41,17 +41,42 @@ pub(crate) struct NnueTrainStepHostBatch<'a> {
     pub(crate) max_active: usize,
 }
 
+pub(crate) struct NnueTrainStepLossReadback {
+    pub(crate) weighted_sum: Vec<f32>,
+    pub(crate) mean: Vec<f32>,
+    pub(crate) per_sample: Option<Vec<f32>>,
+    pub(crate) mean_output_gradients: Option<Vec<f32>>,
+}
+
+pub(crate) struct NnueTrainParamGroupReadback {
+    pub(crate) weights: Vec<f32>,
+    pub(crate) momentum: Vec<f32>,
+    pub(crate) velocity: Vec<f32>,
+    pub(crate) slow_params: Vec<f32>,
+}
+
+pub(crate) struct NnueTrainStateReadback {
+    pub(crate) l0w: NnueTrainParamGroupReadback,
+    pub(crate) l0b: NnueTrainParamGroupReadback,
+    pub(crate) l1w: NnueTrainParamGroupReadback,
+    pub(crate) l1b: NnueTrainParamGroupReadback,
+    pub(crate) l2w: NnueTrainParamGroupReadback,
+    pub(crate) l2b: NnueTrainParamGroupReadback,
+    pub(crate) outw: NnueTrainParamGroupReadback,
+    pub(crate) outb: NnueTrainParamGroupReadback,
+}
+
 pub(crate) struct NnueLossRangerStepRunner {
     shape: NnueForwardShape,
     batch_size: usize,
     max_active: usize,
-    pub(crate) device_weights: NnueForwardDeviceWeights,
-    pub(crate) optimizer_states: NnueRangerOptimizerStates,
+    device_weights: NnueForwardDeviceWeights,
+    optimizer_states: NnueRangerOptimizerStates,
     device_batch: NnueForwardDeviceBatch,
     targets: DeviceBuffer<f32>,
     entry_weights: DeviceBuffer<f32>,
     forward_workspace: NnueForwardWorkspace,
-    pub(crate) loss_workspace: ScalarLossWorkspace,
+    loss_workspace: ScalarLossWorkspace,
     backward_workspace: NnueBackwardWorkspace,
 }
 
@@ -219,6 +244,45 @@ impl NnueLossRangerStepRunner {
         )?;
 
         Ok(())
+    }
+
+    pub(crate) fn read_loss(
+        &self,
+        stream: &Arc<CudaStream>,
+        include_debug: bool,
+    ) -> Result<NnueTrainStepLossReadback> {
+        Ok(NnueTrainStepLossReadback {
+            weighted_sum: self.loss_workspace.weighted_sum.to_host_vec(stream)?,
+            mean: self.loss_workspace.mean.to_host_vec(stream)?,
+            per_sample: include_debug.then(|| self.loss_workspace.per_sample.to_host_vec(stream)).transpose()?,
+            mean_output_gradients: include_debug
+                .then(|| self.loss_workspace.mean_output_gradients.to_host_vec(stream))
+                .transpose()?,
+        })
+    }
+
+    pub(crate) fn read_state(&self, stream: &Arc<CudaStream>) -> Result<NnueTrainStateReadback> {
+        macro_rules! read_group {
+            ($field:ident) => {
+                NnueTrainParamGroupReadback {
+                    weights: self.device_weights.$field.to_host_vec(stream)?,
+                    momentum: self.optimizer_states.$field.momentum.to_host_vec(stream)?,
+                    velocity: self.optimizer_states.$field.velocity.to_host_vec(stream)?,
+                    slow_params: self.optimizer_states.$field.slow_params.to_host_vec(stream)?,
+                }
+            };
+        }
+
+        Ok(NnueTrainStateReadback {
+            l0w: read_group!(l0w),
+            l0b: read_group!(l0b),
+            l1w: read_group!(l1w),
+            l1b: read_group!(l1b),
+            l2w: read_group!(l2w),
+            l2b: read_group!(l2b),
+            outw: read_group!(outw),
+            outb: read_group!(outb),
+        })
     }
 
     fn validate_batch(&self, batch: NnueTrainStepHostBatch<'_>) -> Result<()> {
