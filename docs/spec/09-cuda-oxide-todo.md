@@ -780,3 +780,27 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     `1e-5` tolerance.
 - Remaining CO-010 work: connect the NNUE/SFNN update launchers to the real
   trainer loop and checkpoint state lifecycle.
+
+### 2026-07-17 CO-010 real HCPE teacher fixture smoke
+
+- Generated a real HalfKP NNUE fixture from one user-provided HCPE teacher
+  file:
+  `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`.
+- The fixture was written under `target/cuda-oxide-fixtures/` so it remains a
+  local ignored artifact. It used:
+  - `export_nnue_forward_fixture --case halfkp`;
+  - `--batch-size 2`;
+  - deterministic synthetic HalfKP weights;
+  - the first materialised HCPE loader batch.
+- Ran `bulletou-cuda-train --nnue-ranger-step-smoke --nnue-forward-fixture`
+  against that fixture in WSL2 Ubuntu-24.04 on RTX 4090.
+- Result: the full HalfKP-sized path succeeded:
+  real teacher batch decode -> fixture load -> NNUE forward -> dense/sparse
+  backward -> all 8 grouped NNUE Ranger updates -> CPU golden comparison for
+  `weights`, `momentum`, `velocity`, and `slow_params`.
+- Observed shape/batch:
+  `input=125388`, `l1=256`, `l2=32`, `l3=32`, `batch=2`,
+  `max_active=38`.
+- Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
+  trainer loop so batches can stream directly from the loader instead of being
+  materialised as fixture files first.
