@@ -128,7 +128,8 @@ Pass `--output <DIR>` to write a numbered cuda-oxide bridge checkpoint:
 `<DIR>/0001/learn.log`. `nn.bin` is the YaneuraOu/Stockfish-style quantized
 HalfKP network; `state.boung` is the cuda-oxide exact resume artifact;
 `state.bin` is the root BulletOu record stream for NNUE weights, momentum,
-velocity, Ranger slow weights, and step counters. HCPE runs also write
+velocity, Ranger slow weights, step counters, and the
+`meta/state_backend/cuda-oxide` marker. HCPE runs also write
 `dataloader_pos.txt` using the same fixed-record offset convention as the
 current direct resume path, and append one row to top-level
 `summary-learn.log`. If `<DIR>` already contains numbered bridge checkpoints,

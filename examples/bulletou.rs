@@ -76,7 +76,8 @@ use bulletou_lib::{
             build_sfnn_1536_save_format, Sfnn1536SaveParams, LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION,
         },
         yaneuraou_kppt::{
-            bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, unbundle_component_state, KppFormat,
+            bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, unbundle_component_state,
+            write_state_backend_marker, KppFormat, STATE_BACKEND_BULLET,
         },
         ValueTrainer, ValueTrainerBuilder,
     },
@@ -3672,7 +3673,7 @@ fn assemble_numbered_dirs(
         std::fs::copy(kpp_dir.join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
         // bundle the three components' resume state (Adam weights + momentum + velocity)
         // into a single `state.bin` so the dir holds everything needed to resume.
-        let mut state_buf: Vec<u8> = Vec::new();
+        let mut state_buf: Vec<u8> = write_state_backend_marker(STATE_BACKEND_BULLET);
         bundle_component_state(&mut state_buf, "kk", &kk_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kkp", &kkp_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
@@ -4132,7 +4133,7 @@ fn run_kppt_kpp_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std:
 /// will rename it to `learn.log` alongside the dir's number-rename.
 fn convert_save_dir_to_nnue_layout(dir: &std::path::Path) -> std::io::Result<()> {
     let optimiser_state = dir.join("optimiser_state");
-    let mut state_buf: Vec<u8> = Vec::new();
+    let mut state_buf: Vec<u8> = write_state_backend_marker(STATE_BACKEND_BULLET);
     bundle_component_state(&mut state_buf, "nnue", &optimiser_state)?;
     std::fs::write(dir.join("state.bin"), &state_buf)?;
 

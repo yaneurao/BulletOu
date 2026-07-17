@@ -1610,6 +1610,16 @@ fn write_nnue_root_state_bin(
         ))
     })?);
 
+    let marker = bulletou_lib::value::yaneuraou_kppt::write_state_backend_marker(
+        bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_CUDA_OXIDE,
+    );
+    writer.write_all(&marker).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write NNUE root state.bin backend marker {}: {err}",
+            path.display()
+        ))
+    })?;
+
     macro_rules! write_section {
         ($section:literal, $field:ident) => {{
             let mut records: Vec<(String, &[f32])> = vec![

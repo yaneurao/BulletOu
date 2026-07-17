@@ -1056,9 +1056,16 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `--train-steps 1 --save-rate 1` resumed from `0002/state.boung` and
   `dataloader_pos.txt` byte offset `152`, loaded `Hcpe teacher batch 2`, and
   wrote `0003/dataloader_pos.txt` (`228,0`).
-- Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
-  trainer loop so batches can stream directly from the loader instead of being
-  materialised as fixture files first.
+- Added a root `state.bin` backend marker. Normal BulletOu checkpoint writers
+  now prepend `meta/state_backend/bullet`; cuda-oxide bridge checkpoints prepend
+  `meta/state_backend/cuda-oxide`. Both records contain one f32 value `1.0`,
+  so the existing `state.bin` parser can read them and existing component
+  extraction ignores them. Validation wrote
+  `target/cuda-oxide-fixtures/nnue-backend-marker-smoke-20260717/0001/state.bin`;
+  its first record was `meta/state_backend/cuda-oxide`, length `1`, value `1`.
+- Remaining work: promote the direct cuda-oxide teacher loop from the smoke
+  binary into the end-user BulletOu training CLI, then wire the production
+  schedule, validation metrics, and async input/readback rings around it.
 
 ### 2026-07-17 CO-010 teacher smoke script
 

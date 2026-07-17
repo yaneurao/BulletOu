@@ -178,6 +178,32 @@ pub fn write_model_weights_bin<'a>(
     buf
 }
 
+pub const STATE_BACKEND_RECORD_PREFIX: &str = "meta/state_backend/";
+pub const STATE_BACKEND_MARKER_VALUE: f32 = 1.0;
+pub const STATE_BACKEND_BULLET: &str = "bullet";
+pub const STATE_BACKEND_CUDA_OXIDE: &str = "cuda-oxide";
+
+pub fn state_backend_record_id(backend: &str) -> String {
+    format!("{STATE_BACKEND_RECORD_PREFIX}{backend}")
+}
+
+pub fn write_state_backend_marker(backend: &str) -> Vec<u8> {
+    let id = state_backend_record_id(backend);
+    let value = [STATE_BACKEND_MARKER_VALUE];
+    write_model_weights_bin([(id.as_str(), value.as_slice())])
+}
+
+pub fn detect_state_backend(records: &BTreeMap<String, Vec<f32>>) -> Option<String> {
+    records.iter().find_map(|(id, values)| {
+        if values.as_slice() != [STATE_BACKEND_MARKER_VALUE] {
+            return None;
+        }
+        id.strip_prefix(STATE_BACKEND_RECORD_PREFIX)
+            .filter(|backend| !backend.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
 /// Bundle one component's `optimiser_state/` files into the running combined-state buffer
 /// `out`, with every record's ID prefixed by
 /// `<component>/<section>/` so the three components do not clash on shared
@@ -511,6 +537,25 @@ mod tests {
         let map = parse_model_weights_bin(&buf).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["hello"], vec![1.5, -2.25]);
+    }
+
+    #[test]
+    fn state_backend_marker_round_trip_and_component_extract_ignores_meta() {
+        let mut buf = write_state_backend_marker(STATE_BACKEND_CUDA_OXIDE);
+        let records = [
+            ("nnue/weights/l0w", [1.0f32, 2.0].as_slice()),
+            ("nnue/weights/l0b", [3.0f32].as_slice()),
+        ];
+        buf.extend_from_slice(&write_model_weights_bin(records));
+
+        let map = parse_model_weights_bin(&buf).unwrap();
+        assert_eq!(detect_state_backend(&map).as_deref(), Some(STATE_BACKEND_CUDA_OXIDE));
+
+        let nnue_weights = extract_component_section(&map, "nnue", "weights");
+        assert_eq!(nnue_weights.len(), 2);
+        assert_eq!(nnue_weights["l0w"], vec![1.0, 2.0]);
+        assert_eq!(nnue_weights["l0b"], vec![3.0]);
+        assert!(!nnue_weights.contains_key(&state_backend_record_id(STATE_BACKEND_CUDA_OXIDE)));
     }
 
     #[test]

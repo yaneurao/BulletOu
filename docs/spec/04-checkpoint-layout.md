@@ -86,6 +86,24 @@ record を必要なだけ連結したものが `state.bin`。
 - KPPT save (3 component): `kk/weights/kkw`, `kk/momentum/kkw`, `kk/velocity/kkw`, `kkp/weights/kkpw`, ..., `kpp/velocity/kppw`
 - NNUE_HALFKP save (1 component): `nnue/weights/l0w`, `nnue/weights/l0b`, `nnue/weights/l1w`, ..., `nnue/velocity/outb`
 
+### meta records
+
+`state.bin` may also contain non-component metadata records. They use the same
+record stream encoding but do not follow the `<component>/<section>/<weight_id>`
+shape, so component restore helpers ignore them naturally.
+
+Current backend marker:
+
+```text
+meta/state_backend/bullet       -> [1.0]
+meta/state_backend/cuda-oxide   -> [1.0]
+```
+
+The marker records which backend wrote the optimizer state. Model weights can
+still be extracted from compatible `*/weights/*` records, but an incompatible
+optimizer-state resume can be rejected explicitly instead of failing later in a
+backend-specific loader.
+
 ### 生成・展開 API
 
 `bulletou_lib::value::yaneuraou_kppt` モジュール内 (歴史的経緯で KPPT モジュール下にあるが、API 自体は generic):
