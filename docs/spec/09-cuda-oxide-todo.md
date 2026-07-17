@@ -327,8 +327,36 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   - `--sfnn-output-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
     succeeded for `SFNN_halfka2_1024_7_64_k3k3`: all compared buffers
     max_abs diff `0`.
-- Remaining CO-009 work: gradient-buffer ownership/plumbing and optimizer
-  integration in the trainer.
+- Remaining CO-009 work: optimizer update kernel / trainer loop integration.
+
+### 2026-07-17 CO-009 SFNN backward workspace ownership
+
+- Added cuda-oxide runtime workspace ownership for the SFNN backward pass:
+  `SfnnBackwardWorkspaceLayout { shape, batch_size, max_active }` and
+  `SfnnBackwardWorkspace`.
+- The workspace now owns all reusable SFNN gradient buffers after the scalar
+  output seed:
+  - intermediate gradients: `l2_gradients`, `l1_gradients`,
+    `l2_input_gradients`, `combined_gradients`, `stm_l0_gradients`,
+    `nstm_l0_gradients`, `stm_l0_pre_gradients`, `nstm_l0_pre_gradients`;
+  - parameter gradients: `l0w/l0b`, `l1w/l1b`, `l2w/l2b`, and `l3w/l3b`.
+- Updated `--sfnn-dense-backward-smoke` to allocate this workspace once and
+  pass its buffers through the existing backward launch chain instead of
+  scattering `DeviceBuffer::zeroed` calls through the smoke function.
+- The output seed remains outside the backward workspace so the real trainer
+  can pass loss-produced `mean_output_gradients` directly into the backward
+  chain.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime backward` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release` succeeded.
+  - `--sfnn-dense-backward-smoke --debug-readback` tiny case succeeded with
+    the same comparison results as before the refactor.
+  - `--sfnn-dense-backward-smoke --sfnn-forward-case halfka2 --debug-readback`
+    succeeded for `SFNN_halfka2_1024_7_64_k3k3`; the largest observed max_abs
+    diff remained `0.00000000005820766` (`comb_grad`).
+- Remaining CO-009 work: optimizer update kernel / trainer loop integration.
 
 ### 2026-07-17 CO-009 SFNN sparse L0 CReLU backward smoke
 

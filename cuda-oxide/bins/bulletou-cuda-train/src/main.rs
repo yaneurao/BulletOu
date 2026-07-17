@@ -788,8 +788,9 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::{
         backward::{
-            SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLayout,
-            SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
+            SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
+            SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
+            SfnnStackedL3BackwardLayout,
         },
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
@@ -835,15 +836,13 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
     let device_weights = SfnnForwardDeviceWeights::from_host(&stream, &host_weights)?;
     let forward_layout = SfnnForwardWorkspaceLayout::new(shape, case.batch_size);
     let mut forward_workspace = SfnnForwardWorkspace::new(&stream, forward_layout)?;
+    let backward_layout = SfnnBackwardWorkspaceLayout::new(shape, case.batch_size, case.max_active);
+    let mut backward_workspace = SfnnBackwardWorkspace::new(&stream, backward_layout)?;
 
     sfnn_forward::launch_sfnn_forward(&stream, &module, &device_batch, &device_weights, &mut forward_workspace)?;
 
     let layout = SfnnStackedL3BackwardLayout::new(case.batch_size, shape.l2_size, shape.l1_out(), shape.num_stacks);
     let output_gradients = DeviceBuffer::from_host(&stream, &cpu_trace.output_gradients)?;
-    let mut l2_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.input_gradients_len())?;
-    let mut l1_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.l1_gradients_len())?;
-    let mut l3w_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.weight_len())?;
-    let mut l3b_gradients = DeviceBuffer::<f32>::zeroed(&stream, layout.bias_len())?;
     sfnn_backward::launch_sfnn_stacked_l3_backward(
         &stream,
         &module,
@@ -852,29 +851,26 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &output_gradients,
         &device_weights.l3w,
         &device_batch.buckets,
-        &mut l2_gradients,
-        &mut l1_gradients,
-        &mut l3w_gradients,
-        &mut l3b_gradients,
+        &mut backward_workspace.l2_gradients,
+        &mut backward_workspace.l1_gradients,
+        &mut backward_workspace.l3w_gradients,
+        &mut backward_workspace.l3b_gradients,
     )?;
 
     let l2_layout =
         SfnnStackedCReluBackwardLayout::new(case.batch_size, shape.l2_in(), shape.l2_size, shape.num_stacks);
-    let mut l2_input_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.input_gradients_len())?;
-    let mut l2w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.weight_len())?;
-    let mut l2b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l2_layout.bias_len())?;
     sfnn_backward::launch_sfnn_stacked_crelu_backward(
         &stream,
         &module,
         l2_layout,
         &forward_workspace.l2_input,
         &forward_workspace.l2,
-        &l2_gradients,
+        &backward_workspace.l2_gradients,
         &device_weights.l2w,
         &device_batch.buckets,
-        &mut l2_input_gradients,
-        &mut l2w_gradients,
-        &mut l2b_gradients,
+        &mut backward_workspace.l2_input_gradients,
+        &mut backward_workspace.l2w_gradients,
+        &mut backward_workspace.l2b_gradients,
     )?;
 
     let l2_input_layout = SfnnL2InputBackwardLayout::new(case.batch_size, shape.l1_hidden);
@@ -884,47 +880,38 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         l2_input_layout,
         &forward_workspace.l1,
         &forward_workspace.l2_input,
-        &l2_input_gradients,
-        &mut l1_gradients,
+        &backward_workspace.l2_input_gradients,
+        &mut backward_workspace.l1_gradients,
     )?;
 
     let l1_layout =
         SfnnStackedAffineBackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out(), shape.num_stacks);
-    let mut combined_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.input_gradients_len())?;
-    let mut l1w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.weight_len())?;
-    let mut l1b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l1_layout.bias_len())?;
     sfnn_backward::launch_sfnn_stacked_affine_backward(
         &stream,
         &module,
         l1_layout,
         &forward_workspace.combined,
-        &l1_gradients,
+        &backward_workspace.l1_gradients,
         &device_weights.l1w,
         &device_batch.buckets,
-        &mut combined_gradients,
-        &mut l1w_gradients,
-        &mut l1b_gradients,
+        &mut backward_workspace.combined_gradients,
+        &mut backward_workspace.l1w_gradients,
+        &mut backward_workspace.l1b_gradients,
     )?;
 
     let pairwise_layout = SfnnPairwiseBackwardLayout::new(case.batch_size, shape.ft_size);
-    let mut stm_l0_gradients = DeviceBuffer::<f32>::zeroed(&stream, pairwise_layout.l0_len())?;
-    let mut nstm_l0_gradients = DeviceBuffer::<f32>::zeroed(&stream, pairwise_layout.l0_len())?;
     sfnn_backward::launch_sfnn_pairwise_backward(
         &stream,
         &module,
         pairwise_layout,
         &forward_workspace.stm_l0,
         &forward_workspace.nstm_l0,
-        &combined_gradients,
-        &mut stm_l0_gradients,
-        &mut nstm_l0_gradients,
+        &backward_workspace.combined_gradients,
+        &mut backward_workspace.stm_l0_gradients,
+        &mut backward_workspace.nstm_l0_gradients,
     )?;
 
     let l0_layout = SfnnL0SparseBackwardLayout::new(case.batch_size, case.max_active, shape.input_size, shape.ft_size);
-    let mut stm_l0_pre_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.l0_len())?;
-    let mut nstm_l0_pre_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.l0_len())?;
-    let mut l0w_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.weight_len())?;
-    let mut l0b_gradients = DeviceBuffer::<f32>::zeroed(&stream, l0_layout.bias_len())?;
     sfnn_backward::launch_sfnn_l0_sparse_backward(
         &stream,
         &module,
@@ -933,31 +920,31 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         &device_batch.nstm_indices,
         &forward_workspace.stm_l0,
         &forward_workspace.nstm_l0,
-        &stm_l0_gradients,
-        &nstm_l0_gradients,
-        &mut stm_l0_pre_gradients,
-        &mut nstm_l0_pre_gradients,
-        &mut l0w_gradients,
-        &mut l0b_gradients,
+        &backward_workspace.stm_l0_gradients,
+        &backward_workspace.nstm_l0_gradients,
+        &mut backward_workspace.stm_l0_pre_gradients,
+        &mut backward_workspace.nstm_l0_pre_gradients,
+        &mut backward_workspace.l0w_gradients,
+        &mut backward_workspace.l0b_gradients,
     )?;
     stream.synchronize()?;
 
-    let gpu_l2_gradients = l2_gradients.to_host_vec(&stream)?;
-    let gpu_l1_gradients = l1_gradients.to_host_vec(&stream)?;
-    let gpu_l3w_gradients = l3w_gradients.to_host_vec(&stream)?;
-    let gpu_l3b_gradients = l3b_gradients.to_host_vec(&stream)?;
-    let gpu_l2_input_gradients = l2_input_gradients.to_host_vec(&stream)?;
-    let gpu_l2w_gradients = l2w_gradients.to_host_vec(&stream)?;
-    let gpu_l2b_gradients = l2b_gradients.to_host_vec(&stream)?;
-    let gpu_combined_gradients = combined_gradients.to_host_vec(&stream)?;
-    let gpu_l1w_gradients = l1w_gradients.to_host_vec(&stream)?;
-    let gpu_l1b_gradients = l1b_gradients.to_host_vec(&stream)?;
-    let gpu_stm_l0_gradients = stm_l0_gradients.to_host_vec(&stream)?;
-    let gpu_nstm_l0_gradients = nstm_l0_gradients.to_host_vec(&stream)?;
-    let gpu_stm_l0_pre_gradients = stm_l0_pre_gradients.to_host_vec(&stream)?;
-    let gpu_nstm_l0_pre_gradients = nstm_l0_pre_gradients.to_host_vec(&stream)?;
-    let gpu_l0w_gradients = l0w_gradients.to_host_vec(&stream)?;
-    let gpu_l0b_gradients = l0b_gradients.to_host_vec(&stream)?;
+    let gpu_l2_gradients = backward_workspace.l2_gradients.to_host_vec(&stream)?;
+    let gpu_l1_gradients = backward_workspace.l1_gradients.to_host_vec(&stream)?;
+    let gpu_l3w_gradients = backward_workspace.l3w_gradients.to_host_vec(&stream)?;
+    let gpu_l3b_gradients = backward_workspace.l3b_gradients.to_host_vec(&stream)?;
+    let gpu_l2_input_gradients = backward_workspace.l2_input_gradients.to_host_vec(&stream)?;
+    let gpu_l2w_gradients = backward_workspace.l2w_gradients.to_host_vec(&stream)?;
+    let gpu_l2b_gradients = backward_workspace.l2b_gradients.to_host_vec(&stream)?;
+    let gpu_combined_gradients = backward_workspace.combined_gradients.to_host_vec(&stream)?;
+    let gpu_l1w_gradients = backward_workspace.l1w_gradients.to_host_vec(&stream)?;
+    let gpu_l1b_gradients = backward_workspace.l1b_gradients.to_host_vec(&stream)?;
+    let gpu_stm_l0_gradients = backward_workspace.stm_l0_gradients.to_host_vec(&stream)?;
+    let gpu_nstm_l0_gradients = backward_workspace.nstm_l0_gradients.to_host_vec(&stream)?;
+    let gpu_stm_l0_pre_gradients = backward_workspace.stm_l0_pre_gradients.to_host_vec(&stream)?;
+    let gpu_nstm_l0_pre_gradients = backward_workspace.nstm_l0_pre_gradients.to_host_vec(&stream)?;
+    let gpu_l0w_gradients = backward_workspace.l0w_gradients.to_host_vec(&stream)?;
+    let gpu_l0b_gradients = backward_workspace.l0b_gradients.to_host_vec(&stream)?;
     let comparisons = [
         compare_slices("l2_grad", &cpu_trace.l2_gradients, &gpu_l2_gradients, args.tolerance)?,
         compare_slices("l1_grad", &cpu_trace.l1_gradients, &gpu_l1_gradients, args.tolerance)?,
