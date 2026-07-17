@@ -23,7 +23,8 @@ commit each completed slice.
 | BO-CUDA-015 | done | SFNN factorized L1 backward/Ranger smoke | cuda-oxide SFNN backward/runtime/optimizer paths can compute and update optional shared `l1f` weights, with `factorized-tiny` backward and Ranger-step smokes matching CPU golden |
 | BO-CUDA-016 | done | SFNN factorized L1 production integration | `--sfnn-teacher-train --sfnn-factorized-l1` and BulletOu `--backend cuda-oxide --sfnn-factorized-l1` can train, checkpoint, resume, validate, and save folded `nn.bin` with shared `l1f` state preserved in root `state.bin` |
 | BO-CUDA-017 | done | tatara parity data bridge | BulletOu can export HCPE/HCPE3/pack/PSV teachers to flat PSV for tatara, and BulletOu validation accepts PSV held-out data so both trainers can consume the same positions |
-| BO-CUDA-018 | todo | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
+| BO-CUDA-018 | done | tatara parity benchmark harness | run standard NNUE HalfKP BulletOu cuda-oxide and tatara on the same exported PSV teacher/test slices, collect comparable train throughput and held-out accuracy/loss, and record any remaining loss/schedule mismatches |
+| BO-CUDA-019 | todo | larger tatara parity benchmark and tuning | run larger same-PSV standard NNUE HalfKP comparisons, then align/tune any remaining loss, schedule, optimizer, checkpoint-overhead, or accuracy gaps toward tatara-equivalent training |
 
 ## Notes
 
@@ -251,8 +252,25 @@ commit each completed slice.
 
 ### BO-CUDA-018
 
-- Remaining parity work is not done yet. The next slice should create a repeatable harness that:
-  - exports a configurable teacher/test PSV slice from `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled` and `C:\shogi\teacher\test\yamaoka-floodgate.hcpe`;
-  - runs tatara `bins/nnue_train` on that PSV with `simple --arch 256x2-32-32` and a documented HalfKP config;
-  - runs BulletOu cuda-oxide standard NNUE HalfKP on the same PSV and records throughput separately from checkpoint-save overhead;
-  - compares held-out accuracy/loss and records whether the current BulletOu WRM constants/schedule need a CLI alignment pass for tatara-equivalent accuracy.
+- Added `scripts/tatara_parity_smoke.ps1`, a repeatable Windows/WSL harness that:
+  - exports configurable train/test PSV slices from `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` and `C:\shogi\teacher\test\yamaoka-floodgate.hcpe`;
+  - runs tatara `nnue-train` on the exported PSV with `simple --arch 256x2-32-32`, `--feature-set halfkp`, and a WRM profile matching BulletOu's current `--loss-kind wrm` constants (`scale=600`, prediction `offset/scaling=270/340`, target `offset/scaling=270/380`, `nnue2score=600`, `loss-pow-exp=2.5`);
+  - runs BulletOu cuda-oxide standard NNUE HalfKP on the same train/test PSV slice;
+  - separates the BulletOu speed smoke from the checkpoint/validation smoke, so checkpoint serialization overhead does not pollute the primary throughput line.
+- The harness can build tatara's PTX via `-BuildTataraKernel` using the current WSL CUDA/LLVM-20 route when `tatara\nnue_train.ptx` is absent.
+- Validation command:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tatara_parity_smoke.ps1 -TrainPositions 128 -TestPositions 128 -BatchSize 64 -BatchesPerSuperbatch 1 -Superbatches 1`.
+- Validation result from `target\tatara-parity\parity-20260718-062118`:
+  - PSV export wrote `teacher-128.psv` and `test-128.psv`, both `128 * 40 = 5120` bytes.
+  - tatara: train `loss=0.091041`, toy throughput line `1825 pos/s`, held-out `test_loss=0.117308`, `test_acc=0.5000`.
+  - BulletOu speed smoke: train `step1_loss mean=0.09178529`, throughput line `556 pos/s`.
+  - BulletOu metrics smoke: held-out `accuracy=50.0000%`, `loss=0.116964`; the printed `pos/sec=1` is expected checkpoint/write overhead and is intentionally not used as the speed comparison.
+
+### BO-CUDA-019
+
+- Remaining parity work is to run a larger same-PSV comparison where the throughput numbers are stable enough to be meaningful, then close any measured gaps.
+- Suggested next slice:
+  - increase train/test positions and batches while keeping the same exported PSV bridge;
+  - compare tatara and BulletOu speed with checkpointing disabled or amortized separately;
+  - compare held-out accuracy/loss after enough updates for schedule/optimizer differences to show up;
+  - decide whether BulletOu needs explicit CLI controls for tatara's WRM/Ranger details, e.g. `weight_boost_w2=0.5`, schedule defaults, or validation/reporting normalization.
