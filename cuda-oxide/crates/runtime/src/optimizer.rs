@@ -2,7 +2,9 @@
 
 pub const ADAMW_UPDATE_KERNEL: &str = "adamw_update";
 pub const RADAM_UPDATE_KERNEL: &str = "radam_update";
-pub const OPTIMIZER_KERNEL_NAMES: [&str; 2] = [ADAMW_UPDATE_KERNEL, RADAM_UPDATE_KERNEL];
+pub const RANGER_LOOKAHEAD_KERNEL: &str = "ranger_lookahead";
+pub const OPTIMIZER_KERNEL_NAMES: [&str; 3] =
+    [ADAMW_UPDATE_KERNEL, RADAM_UPDATE_KERNEL, RANGER_LOOKAHEAD_KERNEL];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdamWUpdateParams {
@@ -151,6 +153,27 @@ pub struct RAdamStepScale {
     pub use_denom: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangerLookaheadParams {
+    pub alpha: f32,
+}
+
+impl Default for RangerLookaheadParams {
+    fn default() -> Self {
+        Self { alpha: 0.5 }
+    }
+}
+
+impl RangerLookaheadParams {
+    pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
+        if self.alpha.is_finite() && (0.0..=1.0).contains(&self.alpha) {
+            Ok(())
+        } else {
+            Err(OptimizerLayoutError::InvalidAlpha)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdamWUpdateLayout {
     pub len: usize,
@@ -211,6 +234,36 @@ impl RAdamUpdateLaunchPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangerLookaheadLayout {
+    pub len: usize,
+}
+
+impl RangerLookaheadLayout {
+    pub fn new(len: usize) -> Self {
+        Self { len }
+    }
+
+    pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
+        if self.len == 0 {
+            Err(OptimizerLayoutError::EmptyParameters)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangerLookaheadLaunchPlan {
+    pub threads: usize,
+}
+
+impl RangerLookaheadLaunchPlan {
+    pub fn new(layout: RangerLookaheadLayout) -> Self {
+        Self { threads: layout.len.max(1) }
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum OptimizerLayoutError {
     #[error("optimizer parameter buffer must contain at least one element")]
@@ -221,6 +274,8 @@ pub enum OptimizerLayoutError {
     InvalidStep,
     #[error("optimizer {name} must be finite and in [0, 1)")]
     InvalidBeta { name: &'static str },
+    #[error("optimizer lookahead alpha must be finite and in [0, 1]")]
+    InvalidAlpha,
     #[error("optimizer n_sma_threshold must be finite and non-negative")]
     InvalidNSmaThreshold,
     #[error("optimizer epsilon must be finite and positive")]
@@ -237,7 +292,7 @@ mod tests {
 
     #[test]
     fn optimizer_kernel_names_are_stable() {
-        assert_eq!(OPTIMIZER_KERNEL_NAMES, ["adamw_update", "radam_update"]);
+        assert_eq!(OPTIMIZER_KERNEL_NAMES, ["adamw_update", "radam_update", "ranger_lookahead"]);
     }
 
     #[test]
@@ -332,6 +387,38 @@ mod tests {
         assert_eq!(
             RAdamUpdateParams { beta2: 1.0, ..Default::default() }.validate().unwrap_err(),
             OptimizerLayoutError::InvalidBeta { name: "beta2" }
+        );
+    }
+
+    #[test]
+    fn ranger_lookahead_layout_counts_threads() {
+        let layout = RangerLookaheadLayout::new(23);
+
+        assert_eq!(RangerLookaheadLaunchPlan::new(layout).threads, 23);
+    }
+
+    #[test]
+    fn ranger_lookahead_layout_rejects_empty_parameters() {
+        assert_eq!(
+            RangerLookaheadLayout::new(0).validate().unwrap_err(),
+            OptimizerLayoutError::EmptyParameters
+        );
+    }
+
+    #[test]
+    fn ranger_lookahead_params_validate_defaults() {
+        RangerLookaheadParams::default().validate().unwrap();
+    }
+
+    #[test]
+    fn ranger_lookahead_params_reject_invalid_alpha() {
+        assert_eq!(
+            RangerLookaheadParams { alpha: -0.1 }.validate().unwrap_err(),
+            OptimizerLayoutError::InvalidAlpha
+        );
+        assert_eq!(
+            RangerLookaheadParams { alpha: 1.1 }.validate().unwrap_err(),
+            OptimizerLayoutError::InvalidAlpha
         );
     }
 }

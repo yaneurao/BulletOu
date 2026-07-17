@@ -82,6 +82,28 @@ pub fn radam_update(
     }
 }
 
+#[kernel]
+pub fn ranger_lookahead(
+    mut weights: DisjointSlice<f32>,
+    mut slow_params: DisjointSlice<f32>,
+    len: u32,
+    alpha: f32,
+) {
+    let tid = thread::index_1d();
+    let idx = tid.get();
+    if idx >= len as usize {
+        return;
+    }
+
+    unsafe {
+        let weight = weights.get_unchecked_mut(idx);
+        let slow = slow_params.get_unchecked_mut(idx);
+        let new_weight = alpha * *weight + (1.0_f32 - alpha) * *slow;
+        *weight = new_weight;
+        *slow = new_weight;
+    }
+}
+
 #[device]
 fn clamp_f32(value: f32, min_value: f32, max_value: f32) -> f32 {
     if value < min_value {

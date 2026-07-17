@@ -46,6 +46,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
         SmokeMode::AdamWUpdate => run_adamw_update_smoke(args),
         SmokeMode::RAdamUpdate => run_radam_update_smoke(args),
+        SmokeMode::RangerLookahead => run_ranger_lookahead_smoke(args),
         SmokeMode::SfnnOutputBackward => run_sfnn_output_backward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
     }
@@ -81,6 +82,7 @@ enum SmokeMode {
     NnueForward,
     AdamWUpdate,
     RAdamUpdate,
+    RangerLookahead,
     SfnnOutputBackward,
     SfnnForward,
 }
@@ -143,6 +145,7 @@ impl Args {
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
                 "--adamw-update-smoke" => parsed.mode = SmokeMode::AdamWUpdate,
                 "--radam-update-smoke" => parsed.mode = SmokeMode::RAdamUpdate,
+                "--ranger-lookahead-smoke" => parsed.mode = SmokeMode::RangerLookahead,
                 "--sfnn-dense-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-output-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
@@ -763,6 +766,64 @@ fn run_radam_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 }
 
 #[cfg(feature = "cuda")]
+fn run_ranger_lookahead_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{optimizer::RangerLookaheadLayout, DeviceBuffer};
+
+    let case = RangerLookaheadCase::tiny();
+    let cpu_trace = case.cpu_lookahead_trace();
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let layout = RangerLookaheadLayout::new(case.weights.len());
+    let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
+    let mut slow_params = DeviceBuffer::from_host(&stream, &case.slow_params)?;
+
+    optimizer_update::launch_ranger_lookahead(
+        &stream,
+        &module,
+        layout,
+        case.params,
+        &mut weights,
+        &mut slow_params,
+    )?;
+    stream.synchronize()?;
+
+    let gpu_weights = weights.to_host_vec(&stream)?;
+    let gpu_slow_params = slow_params.to_host_vec(&stream)?;
+    let comparisons = [
+        compare_slices("weights", &cpu_trace.weights, &gpu_weights, args.tolerance)?,
+        compare_slices("slow_params", &cpu_trace.slow_params, &gpu_slow_params, args.tolerance)?,
+    ];
+
+    println!("bulletou-cuda-train Ranger lookahead smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  case         : {}", case.label);
+    println!("  len          : {}", case.weights.len());
+    println!("  tolerance    : {}", args.tolerance);
+    println!("  params       : alpha={}", case.params.alpha);
+    for cmp in comparisons {
+        println!(
+            "  {:<11}: max_abs={} at {}, mean_abs={}",
+            cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+        );
+    }
+    if args.debug_readback {
+        println!("  cpu weights  : {:?}", cpu_trace.weights);
+        println!("  gpu weights  : {:?}", gpu_weights);
+        println!("  gpu slow     : {:?}", gpu_slow_params);
+    }
+    println!("  compare      : ok");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn run_nnue_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     use bulletou_cuda_oxide_runtime::nnue::{
         NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch, NnueForwardHostWeights,
@@ -1296,6 +1357,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --ranger-lookahead-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -1326,6 +1388,8 @@ fn usage() -> &'static str {
      CO-010 RAdam update smoke: compare the fused RAdam weight/momentum/\n\
      velocity update against CPU scalar goldens for both the warmup and\n\
      rectified denominator branches.\n\
+     CO-010 Ranger lookahead smoke: compare the fast/slow parameter\n\
+     interpolation kernel against a CPU scalar golden.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1479,6 +1543,43 @@ impl RAdamUpdateCase {
         }
 
         Ok(RAdamUpdateTrace { weights, momentum, velocity, step_scale })
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RangerLookaheadCase {
+    label: &'static str,
+    weights: Vec<f32>,
+    slow_params: Vec<f32>,
+    params: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RangerLookaheadTrace {
+    weights: Vec<f32>,
+    slow_params: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl RangerLookaheadCase {
+    fn tiny() -> Self {
+        Self {
+            label: "tiny-alpha-035",
+            weights: vec![0.5, -0.25, 1.0, -1.0, 0.0, 0.75, -0.75],
+            slow_params: vec![0.0, -0.5, 0.25, -0.25, 1.0, -1.0, 0.2],
+            params: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams { alpha: 0.35 },
+        }
+    }
+
+    fn cpu_lookahead_trace(&self) -> RangerLookaheadTrace {
+        let mut updated = Vec::with_capacity(self.weights.len());
+        for (&weight, &slow) in self.weights.iter().zip(&self.slow_params) {
+            updated.push(self.params.alpha * weight + (1.0 - self.params.alpha) * slow);
+        }
+
+        RangerLookaheadTrace { weights: updated.clone(), slow_params: updated }
     }
 }
 

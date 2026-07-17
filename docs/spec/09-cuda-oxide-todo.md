@@ -570,3 +570,28 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
     `0` for `weights`, `momentum`, and `velocity`.
 - Remaining CO-010 work: add Lookahead/Ranger smoke, then wire optimizer state
   buffers into the real trainer path.
+
+### 2026-07-17 CO-010 Ranger Lookahead smoke
+
+- Added cuda-oxide runtime layout/params for the Ranger lookahead step:
+  `RangerLookaheadLayout { len }` and `RangerLookaheadParams { alpha }`.
+- Added CUDA kernel `ranger_lookahead` matching the existing
+  `crates/trainer/src/optimiser/ranger.rs` formula:
+  `new = alpha * fast + (1 - alpha) * slow`, then write `new` to both fast and
+  slow parameter buffers.
+- Added host launcher and CLI:
+  `bulletou-cuda-train --ranger-lookahead-smoke`.
+- The smoke uses a 7-parameter tiny case with `alpha=0.35` to exercise a
+  non-round vector length and non-default interpolation factor.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--ranger-lookahead-smoke --debug-readback` succeeded on RTX 4090:
+    `weights` and `slow_params` both had max_abs diff `0`.
+- Remaining CO-010 work: add full Ranger chain smoke (`RAdam update ->
+  conditional Lookahead`), then wire optimizer state buffers into the real
+  trainer path.

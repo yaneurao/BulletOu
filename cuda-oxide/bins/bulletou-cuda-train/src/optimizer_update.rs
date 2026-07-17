@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bulletou_cuda_oxide_runtime::{
     optimizer::{
         AdamWUpdateLaunchPlan, AdamWUpdateLayout, AdamWUpdateParams, RAdamUpdateLaunchPlan, RAdamUpdateLayout,
-        RAdamUpdateParams,
+        RAdamUpdateParams, RangerLookaheadLaunchPlan, RangerLookaheadLayout, RangerLookaheadParams,
     },
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
@@ -100,6 +100,41 @@ pub(crate) fn launch_radam_update(
                 params.epsilon,
                 params.min_weight,
                 params.max_weight
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_ranger_lookahead(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: RangerLookaheadLayout,
+    params: RangerLookaheadParams,
+    mut weights: &mut DeviceBuffer<f32>,
+    mut slow_params: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    params.validate()?;
+    let plan = RangerLookaheadLaunchPlan::new(layout);
+    let len = layout.len as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `ranger_lookahead`; all buffers are
+        // device allocations owned by the same CUDA context and live until the
+        // caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::optimizer::ranger_lookahead,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice_mut(weights),
+                slice_mut(slow_params),
+                len,
+                params.alpha
             ]
         }
     }?;
