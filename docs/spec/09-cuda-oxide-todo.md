@@ -804,3 +804,20 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
+
+### 2026-07-17 CO-010 teacher smoke script
+
+- Added `scripts/cuda_oxide_nnue_teacher_smoke.ps1` to automate the current
+  real-teacher validation bridge without mixing root and cuda-oxide workspace
+  dependencies.
+- The script:
+  1. runs root `export_nnue_forward_fixture --case halfkp` on Windows;
+  2. writes the ignored fixture under `target/cuda-oxide-fixtures/`;
+  3. optionally runs `cargo oxide build` in WSL2;
+  4. creates the temporary nvJitLink shim;
+  5. runs `bulletou-cuda-train --nnue-ranger-step-smoke --nnue-forward-fixture`
+     against the generated teacher fixture.
+- Validation:
+  - `powershell -ExecutionPolicy Bypass -File
+    scripts/cuda_oxide_nnue_teacher_smoke.ps1 -SkipCudaBuild` succeeded using
+    `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe`.

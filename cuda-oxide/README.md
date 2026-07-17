@@ -64,6 +64,32 @@ cargo run -p bulletou-cuda-train --features cuda -- \
 Add `--debug-readback` to compare L0 / concat / hidden buffers as well as the
 final output.
 
+CO-010 Ranger step smokes run the full fixed-layout forward/backward path and
+then update every parameter group through the grouped Ranger launcher:
+
+```bash
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --nnue-ranger-step-smoke --nnue-forward-case halfkp
+
+cargo run -p bulletou-cuda-train --features cuda -- \
+  --sfnn-ranger-step-smoke --sfnn-forward-case halfka2
+```
+
+For the current Windows + WSL2 development setup, the root workspace can export
+a real HCPE teacher batch and immediately validate the cuda-oxide NNUE update
+path with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ..\scripts\cuda_oxide_nnue_teacher_smoke.ps1 `
+  -Teacher C:\path\to\teacher.hcpe
+```
+
+If `-Teacher` is omitted, the script uses the first `.hcpe` file under
+`C:\shogi\teacher\yane-distill-hcpe-20260508shuffled` when that directory
+exists. The generated fixture is written under `target/cuda-oxide-fixtures/`
+and is intentionally ignored by git. Add `-SkipCudaBuild` to reuse an existing
+`cargo oxide build` artifact.
+
 WSL2 Ubuntu 24.04 validation example:
 
 ```bash
