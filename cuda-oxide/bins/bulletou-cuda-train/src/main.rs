@@ -26,6 +26,9 @@ mod sfnn_backward;
 mod sfnn_forward;
 
 #[cfg(feature = "cuda")]
+mod sfnn_train_step;
+
+#[cfg(feature = "cuda")]
 #[allow(unused_imports)]
 pub(crate) use kernels::*;
 
@@ -59,6 +62,8 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::SfnnOutputBackward => run_sfnn_output_backward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
         SmokeMode::SfnnRangerStep => run_sfnn_ranger_step_smoke(args),
+        #[cfg(feature = "root-loader")]
+        SmokeMode::SfnnTeacherTrain => run_sfnn_teacher_train(args),
     }
 }
 
@@ -140,6 +145,8 @@ enum SmokeMode {
     SfnnOutputBackward,
     SfnnForward,
     SfnnRangerStep,
+    #[cfg(feature = "root-loader")]
+    SfnnTeacherTrain,
 }
 
 #[cfg(feature = "cuda")]
@@ -259,6 +266,16 @@ impl Args {
                 "--sfnn-output-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
                 "--sfnn-ranger-step-smoke" => parsed.mode = SmokeMode::SfnnRangerStep,
+                "--sfnn-teacher-train" => {
+                    #[cfg(feature = "root-loader")]
+                    {
+                        parsed.mode = SmokeMode::SfnnTeacherTrain;
+                    }
+                    #[cfg(not(feature = "root-loader"))]
+                    {
+                        return usage_error("--sfnn-teacher-train requires building with --features cuda,root-loader");
+                    }
+                }
                 "--ptx" => parsed.ptx = Some(required_path_arg(&mut args, "--ptx")?),
                 "--kernel" => parsed.kernel = required_arg(&mut args, "--kernel")?,
                 "--device" => {
@@ -1606,6 +1623,245 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
+fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::sfnn::SfnnForwardHostWeights;
+    use sfnn_train_step::{SfnnLossRangerStepRunner, SfnnTrainLossKind, SfnnTrainStepHostBatch};
+
+    let teacher = args.teacher.as_deref().ok_or_else(|| {
+        bulletou_cuda_oxide_runtime::Error::Smoke("--sfnn-teacher-train requires --teacher <PATH>".to_string())
+    })?;
+    if args.train_steps == 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--sfnn-teacher-train requires --train-steps > 0".to_string(),
+        ));
+    }
+    if args.batch_size == 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--sfnn-teacher-train requires --batch-size > 0".to_string(),
+        ));
+    }
+    validate_nnue_teacher_schedule_args(&args)?;
+    if args.save_rate != 0 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--sfnn-teacher-train currently supports only final checkpoints; use --save-rate 0".to_string(),
+        ));
+    }
+    if args.nnue_train_state_fixture.is_some() || args.nnue_train_state_bin.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--sfnn-teacher-train does not yet support train-state resume".to_string(),
+        ));
+    }
+    if args.test_teacher.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--sfnn-teacher-train does not yet support validation metrics".to_string(),
+        ));
+    }
+
+    let ptx = match args.ptx.as_ref() {
+        Some(ptx) => ptx.clone(),
+        None => default_nnue_ptx()?,
+    };
+    let initial_case = match args.weights_bin.as_deref() {
+        Some(path) => load_root_halfka2_weights_as_sfnn_case(path)?,
+        None => SfnnForwardCase::new(SfnnForwardCaseKind::Halfka2),
+    };
+    let shape = initial_case.shape;
+    if shape != bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "--sfnn-teacher-train currently supports only SFNN HalfKA2 shape input={} ft={} h1={} h2={} stacks={}, but weights have input={} ft={} h1={} h2={} stacks={}",
+            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.input_size,
+            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.ft_size,
+            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.l1_hidden,
+            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.l2_size,
+            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.num_stacks,
+            shape.input_size,
+            shape.ft_size,
+            shape.l1_hidden,
+            shape.l2_size,
+            shape.num_stacks
+        )));
+    }
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+    let train_loss_kind = match args.loss_kind {
+        LossKind::SigmoidMse => SfnnTrainLossKind::SigmoidMse,
+        LossKind::NnuePytorchWrm => SfnnTrainLossKind::NnuePytorchWrm,
+    };
+    let log_context = NnueBridgeLogContext {
+        batch_size: args.batch_size,
+        batches_per_superbatch: args.batches_per_superbatch,
+        superbatches_per_epoch: args.superbatches_per_epoch,
+        lambda: 1.0,
+    };
+
+    let mut runner = None;
+    let mut losses = Vec::with_capacity(args.train_steps);
+    let mut learning_rates = Vec::with_capacity(args.train_steps);
+    let mut sources = Vec::with_capacity(args.train_steps);
+    let mut dataloader_positions = Vec::with_capacity(args.train_steps);
+    let mut last_batch_size = 0usize;
+    let mut last_max_active = 0usize;
+    let mut train_timer: Option<std::time::Instant> = None;
+    let mut train_positions = 0usize;
+    let mut run_steps = 0usize;
+    let teacher_batch_config = bulletou_lib::value::teacher_batch::SfnnTeacherBatchConfig {
+        teacher,
+        batch_size: args.batch_size,
+        batch_index: 0,
+        dataloader_resume_pos: None,
+        buffer_mb: args.buffer_mb,
+        loader_threads: args.loader_threads,
+        threads: args.threads,
+        lambda: 1.0,
+        scale: 400.0,
+        nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+    };
+
+    bulletou_lib::value::teacher_batch::for_each_sfnn_halfka2_teacher_fast_batch(
+        &teacher_batch_config,
+        args.train_steps,
+        |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
+            let source = loaded.source;
+            let dataloader_pos = loaded.dataloader_pos;
+            let batch = loaded.batch;
+            validate_sfnn_teacher_fast_batch(shape, &batch)?;
+            if runner.is_none() {
+                let host_weights = SfnnForwardHostWeights {
+                    shape,
+                    l0w: &initial_case.l0w,
+                    l0b: &initial_case.l0b,
+                    l1w: &initial_case.l1w,
+                    l1b: &initial_case.l1b,
+                    l2w: &initial_case.l2w,
+                    l2b: &initial_case.l2b,
+                    l3w: &initial_case.l3w,
+                    l3b: &initial_case.l3b,
+                };
+                runner = Some(SfnnLossRangerStepRunner::new(
+                    &stream,
+                    &host_weights,
+                    batch.layout.batch_size,
+                    batch.layout.max_active,
+                )?);
+            }
+
+            let step = run_steps + 1;
+            let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
+            let params = grouped_ranger_step_params_for_step_with_hyperparams(
+                step,
+                learning_rate,
+                args.optimizer_weight_decay,
+                args.optimizer_beta1,
+                args.optimizer_beta2,
+                args.optimizer_epsilon,
+            );
+            let host_batch = SfnnTrainStepHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                buckets: &batch.buckets,
+                targets: &batch.targets,
+                entry_weights: &batch.weights,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            };
+            train_timer.get_or_insert_with(std::time::Instant::now);
+            train_positions = train_positions.saturating_add(batch.layout.batch_size);
+            let runner_ref = runner.as_mut().expect("runner is initialized");
+            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
+            stream.synchronize()?;
+
+            let loss = runner_ref.read_loss(&stream)?;
+            losses.push((step, loss.weighted_sum[0], loss.mean[0]));
+            learning_rates.push(learning_rate);
+            sources.push(source);
+            dataloader_positions.push(dataloader_pos);
+            last_batch_size = batch.layout.batch_size;
+            last_max_active = batch.layout.max_active;
+            run_steps += 1;
+            Ok(())
+        },
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to stream SFNN teacher batches from {teacher}: {err}"
+        ))
+    })?;
+
+    let train_elapsed = train_timer.map(|started| started.elapsed());
+    let runner = runner.as_ref().expect("validated non-empty teacher train steps");
+    let mut bridge_checkpoints = Vec::new();
+    if let Some(output_dir) = &args.output {
+        let state = runner.read_state(&stream)?;
+        bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
+            output_dir,
+            shape,
+            run_steps,
+            &state,
+            teacher,
+            &losses,
+            &learning_rates,
+            &sources,
+            &dataloader_positions,
+            log_context,
+        )?);
+    }
+
+    println!("bulletou-cuda-train SFNN teacher train");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  teacher      : {teacher}");
+    if let Some(path) = &args.weights_bin {
+        println!("  weights      : {}", path.display());
+    }
+    println!("  batches      : {}", sources.len());
+    for (idx, source) in sources.iter().enumerate() {
+        println!("    [{}] {}", idx + 1, source);
+    }
+    println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
+    println!("  batch        : {} samples, max_active={}", last_batch_size, last_max_active);
+    println!(
+        "  shape        : input={} ft={} h1={} h2={} stacks={}",
+        shape.input_size, shape.ft_size, shape.l1_hidden, shape.l2_size, shape.num_stacks
+    );
+    println!("  steps        : {}", losses.len());
+    println!("  batches/sb   : {}", args.batches_per_superbatch);
+    println!("  lr_schedule  : {}", train_lr_schedule_label(args.lr_schedule));
+    if let Some(first_lr) = learning_rates.first() {
+        println!("  lr_start     : {first_lr}");
+    }
+    if let Some(last_lr) = learning_rates.last() {
+        println!("  lr_last      : {last_lr}");
+    }
+    if let Some(elapsed) = train_elapsed {
+        let seconds = elapsed.as_secs_f64();
+        let pos_per_sec = train_positions as f64 / seconds.max(1e-9);
+        println!("  throughput   : positions={train_positions} time={seconds:.3}s pos/sec={pos_per_sec:.0}");
+    }
+    for (step, weighted_sum, mean) in &losses {
+        println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
+    }
+    for checkpoint in &bridge_checkpoints {
+        println!("  output       : {}", checkpoint.dir.display());
+        println!("  checkpoint   : {:04}", checkpoint.index);
+        println!("    nn_bin     : {}", checkpoint.nn_bin_path.display());
+        println!("    state_bin  : {}", checkpoint.state_bin_path.display());
+        println!("    teacher    : {}", checkpoint.teacher_spec_path.display());
+        if let Some(path) = &checkpoint.dataloader_pos_path {
+            println!("    loader_pos : {}", path.display());
+        }
+        println!("    learn_log  : {}", checkpoint.learn_log_path.display());
+        println!("    summary    : {}", checkpoint.summary_log_path.display());
+    }
+    println!("  train        : ok");
+
+    Ok(())
+}
+
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
 struct NnueBridgeCheckpointWrite {
     index: usize,
@@ -1613,6 +1869,18 @@ struct NnueBridgeCheckpointWrite {
     forward_path: std::path::PathBuf,
     nn_bin_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
+    state_bin_path: std::path::PathBuf,
+    teacher_spec_path: std::path::PathBuf,
+    dataloader_pos_path: Option<std::path::PathBuf>,
+    learn_log_path: std::path::PathBuf,
+    summary_log_path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+struct SfnnBridgeCheckpointWrite {
+    index: usize,
+    dir: std::path::PathBuf,
+    nn_bin_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
     teacher_spec_path: std::path::PathBuf,
     dataloader_pos_path: Option<std::path::PathBuf>,
@@ -1841,6 +2109,76 @@ fn write_nnue_bridge_checkpoint(
         forward_path,
         nn_bin_path,
         state_path,
+        state_bin_path,
+        teacher_spec_path,
+        dataloader_pos_path,
+        learn_log_path,
+        summary_log_path,
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_sfnn_bridge_checkpoint(
+    output_dir: &std::path::Path,
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    completed_steps: usize,
+    state: &sfnn_train_step::SfnnTrainStateReadback,
+    teacher_spec: &str,
+    losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
+    sources: &[String],
+    dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
+    log_context: NnueBridgeLogContext,
+) -> bulletou_cuda_oxide_runtime::Result<SfnnBridgeCheckpointWrite> {
+    if losses.len() != sources.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal SFNN bridge checkpoint log mismatch: losses={} sources={}",
+            losses.len(),
+            sources.len()
+        )));
+    }
+    if losses.len() != learning_rates.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal SFNN bridge checkpoint LR log mismatch: losses={} learning_rates={}",
+            losses.len(),
+            learning_rates.len()
+        )));
+    }
+    if losses.len() != dataloader_positions.len() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "internal SFNN bridge checkpoint dataloader position mismatch: losses={} dataloader_positions={}",
+            losses.len(),
+            dataloader_positions.len()
+        )));
+    }
+
+    let (index, dir) = create_next_numbered_checkpoint_dir(output_dir)?;
+    let nn_bin_path = dir.join("nn.bin");
+    let state_bin_path = dir.join("state.bin");
+    let teacher_spec_path = dir.join(BRIDGE_TEACHER_SPEC_NAME);
+    let dataloader_pos_path = dir.join(BRIDGE_DATALOADER_POS_NAME);
+    let learn_log_path = dir.join("learn.log");
+    let summary_log_path = output_dir.join("summary-learn.log");
+
+    write_sfnn_halfka2_nn_bin(&nn_bin_path, shape, state)?;
+    write_sfnn_root_state_bin(&state_bin_path, completed_steps, state)?;
+    write_bridge_teacher_spec(&teacher_spec_path, teacher_spec)?;
+    let dataloader_pos_path = write_nnue_bridge_dataloader_pos(&dataloader_pos_path, dataloader_positions)?;
+    write_sfnn_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, log_context)?;
+    append_sfnn_bridge_summary_log(
+        &summary_log_path,
+        index,
+        completed_steps,
+        losses,
+        learning_rates,
+        sources,
+        log_context,
+    )?;
+
+    Ok(SfnnBridgeCheckpointWrite {
+        index,
+        dir,
+        nn_bin_path,
         state_bin_path,
         teacher_spec_path,
         dataloader_pos_path,
@@ -2110,6 +2448,145 @@ fn write_nnue_root_state_bin(
     writer.flush().map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to flush NNUE root state.bin {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_sfnn_halfka2_nn_bin(
+    path: &std::path::Path,
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    state: &sfnn_train_step::SfnnTrainStateReadback,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_lib::{
+        trainer::save::ModelWeights,
+        value::{
+            nnue_save::NnueFeatureSet,
+            nnue_save_sfnn1536::{build_sfnn_1536_save_format, Sfnn1536SaveParams},
+        },
+    };
+
+    let feature_set = NnueFeatureSet::HalfKa2;
+    if shape.input_size != feature_set.input_size() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "cannot write SFNN HalfKA2 nn.bin for input_size={}, expected {}",
+            shape.input_size,
+            feature_set.input_size()
+        )));
+    }
+
+    let graph = ModelWeights::from_f32_values([
+        ("l0w", state.l0w.weights.clone()),
+        ("l0b", state.l0b.weights.clone()),
+        ("l1w", state.l1w.weights.clone()),
+        ("l1b", state.l1b.weights.clone()),
+        ("l2w", state.l2w.weights.clone()),
+        ("l2b", state.l2b.weights.clone()),
+        ("l3w", state.l3w.weights.clone()),
+        ("l3b", state.l3b.weights.clone()),
+    ]);
+    let formats = build_sfnn_1536_save_format(Sfnn1536SaveParams {
+        feature_set,
+        input_size: shape.input_size,
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+        factorized_l1: false,
+    });
+
+    let mut bytes = Vec::new();
+    for format in formats {
+        let chunk = format.write_to_byte_buffer(&graph).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to serialise SFNN nn.bin chunk {}: {err}",
+                path.display()
+            ))
+        })?;
+        bytes.extend_from_slice(&chunk);
+    }
+    std::fs::write(path, bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to write SFNN nn.bin {}: {err}", path.display()))
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_sfnn_root_state_bin(
+    path: &std::path::Path,
+    completed_steps: usize,
+    state: &sfnn_train_step::SfnnTrainStateReadback,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create SFNN root state.bin {}: {err}",
+            path.display()
+        ))
+    })?);
+
+    let marker = bulletou_lib::value::yaneuraou_kppt::write_state_backend_marker(
+        bulletou_lib::value::yaneuraou_kppt::STATE_BACKEND_CUDA_OXIDE,
+    );
+    writer.write_all(&marker).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write SFNN root state.bin backend marker {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    macro_rules! write_section {
+        ($section:literal, $field:ident) => {{
+            let mut records: Vec<(String, &[f32])> = vec![
+                (format!("nnue/{}/l0w", $section), state.l0w.$field.as_slice()),
+                (format!("nnue/{}/l0b", $section), state.l0b.$field.as_slice()),
+                (format!("nnue/{}/l1w", $section), state.l1w.$field.as_slice()),
+                (format!("nnue/{}/l1b", $section), state.l1b.$field.as_slice()),
+                (format!("nnue/{}/l2w", $section), state.l2w.$field.as_slice()),
+                (format!("nnue/{}/l2b", $section), state.l2b.$field.as_slice()),
+                (format!("nnue/{}/l3w", $section), state.l3w.$field.as_slice()),
+                (format!("nnue/{}/l3b", $section), state.l3b.$field.as_slice()),
+            ];
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            let chunk =
+                bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+                    records.iter().map(|(id, values)| (id.as_str(), *values)),
+                );
+            writer.write_all(&chunk).map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to write SFNN root state.bin {}: {err}",
+                    path.display()
+                ))
+            })?;
+        }};
+    }
+
+    write_section!("weights", weights);
+    write_section!("momentum", momentum);
+    write_section!("velocity", velocity);
+    write_section!("slow", slow_params);
+
+    let step = completed_steps as f32;
+    let mut step_records: Vec<(String, Vec<f32>)> = ["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"]
+        .iter()
+        .map(|id| (format!("nnue/step_ranger/{id}"), vec![step]))
+        .collect();
+    step_records.sort_by(|a, b| a.0.cmp(&b.0));
+    let chunk = bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(
+        step_records.iter().map(|(id, values)| (id.as_str(), values.as_slice())),
+    );
+    writer.write_all(&chunk).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write SFNN root state.bin {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush SFNN root state.bin {}: {err}",
             path.display()
         ))
     })?;
@@ -2464,6 +2941,47 @@ fn nnue_train_batch_from_root_fast_batch(
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
+fn validate_sfnn_teacher_fast_batch(
+    shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
+    batch: &bulletou_lib::value::FastBatchHost,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    batch.validate().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("SFNN teacher batch layout error: {err}"))
+    })?;
+    if batch.layout.output_size != 1 {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "SFNN teacher train requires output_size=1, got {}",
+            batch.layout.output_size
+        )));
+    }
+    if batch.layout.hand_count_dim != 0 || batch.hand_count.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "SFNN teacher train does not accept hand_count side inputs".to_string(),
+        ));
+    }
+    for (sample, &bucket) in batch.buckets.iter().enumerate() {
+        if bucket < 0 || bucket as usize >= shape.num_stacks {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "SFNN teacher batch bucket out of range at sample {sample}: got {bucket}, expected 0..{}",
+                shape.num_stacks.saturating_sub(1)
+            )));
+        }
+    }
+    for (name, values) in [("stm", batch.stm.as_slice()), ("nstm", batch.nstm.as_slice())] {
+        for (idx, &feature) in values.iter().enumerate() {
+            if feature < -1 || (feature >= 0 && feature as usize >= shape.input_size) {
+                return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "SFNN teacher batch {name}[{idx}] feature out of range: got {feature}, expected -1 or 0..{}",
+                    shape.input_size.saturating_sub(1)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
 fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<NnueForwardCase> {
     let bytes = std::fs::read(path).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read root NNUE weights {}: {err}", path.display()))
@@ -2511,6 +3029,58 @@ fn load_root_halfkp_weights_as_nnue_case(path: &std::path::Path) -> bulletou_cud
         l2b: root_weights.l2b,
         outw: root_weights.outw,
         outb: root_weights.outb,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "root-loader")]
+fn load_root_halfka2_weights_as_sfnn_case(path: &std::path::Path) -> bulletou_cuda_oxide_runtime::Result<SfnnForwardCase> {
+    let bytes = std::fs::read(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read root SFNN weights {}: {err}", path.display()))
+    })?;
+    let records = bulletou_lib::value::yaneuraou_kppt::parse_model_weights_bin(&bytes).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to parse root SFNN weights {}: {err}",
+            path.display()
+        ))
+    })?;
+    let weights = if records.contains_key("l0w") {
+        records
+    } else {
+        bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights")
+    };
+    let root_shape = bulletou_lib::value::SFNN_HALFKA2_1024_7_64_K3K3;
+    let root_weights =
+        bulletou_lib::value::SfnnForwardOwnedWeights::from_weight_map(root_shape, &weights).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to load HalfKA2 SFNN weights {}: {err}",
+                path.display()
+            ))
+        })?;
+    let shape = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+        input_size: root_weights.shape.input_size,
+        ft_size: root_weights.shape.ft_size,
+        l1_hidden: root_weights.shape.l1_hidden,
+        l2_size: root_weights.shape.l2_size,
+        num_stacks: root_weights.shape.num_stacks,
+    };
+
+    Ok(SfnnForwardCase {
+        label: "root-weights",
+        shape,
+        batch_size: 0,
+        max_active: 0,
+        stm: Vec::new(),
+        nstm: Vec::new(),
+        buckets: Vec::new(),
+        l0w: root_weights.l0w,
+        l0b: root_weights.l0b,
+        l1w: root_weights.l1w,
+        l1b: root_weights.l1b,
+        l2w: root_weights.l2w,
+        l2b: root_weights.l2b,
+        l3w: root_weights.l3w,
+        l3b: root_weights.l3b,
     })
 }
 
@@ -4035,6 +4605,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -4103,6 +4674,11 @@ fn usage() -> &'static str {
      CO-010 SFNN Ranger step smoke: run SFNN forward/backward, then update all\n\
      SFNN parameter groups with the Ranger launcher and compare weights plus\n\
      optimizer state buffers against CPU scalar goldens.\n\
+     CO-010 SFNN teacher train: when built with --features cuda,root-loader,\n\
+     read real HalfKA2/LayerStack teacher batches through bulletou_lib and feed\n\
+     them directly to the SFNN loss/Ranger runner. --output writes numbered\n\
+     bridge checkpoints with YaneuraOu-compatible nn.bin, root-format state.bin,\n\
+     teacher.txt, dataloader_pos.txt, learn.log, and summary-learn.log.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -5730,6 +6306,149 @@ fn append_nnue_bridge_summary_log(
     writer.flush().map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to flush bridge summary log {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_sfnn_bridge_learn_log(
+    path: &std::path::Path,
+    losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
+    sources: &[String],
+    context: NnueBridgeLogContext,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create SFNN bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?);
+    writeln!(
+        writer,
+        "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher"
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write SFNN bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?;
+    for (((step, _weighted_sum, mean), learning_rate), source) in
+        losses.iter().zip(learning_rates.iter()).zip(sources.iter())
+    {
+        let display = bridge_log_display_step(*step, context);
+        writeln!(
+            writer,
+            "sfnn,{},{},{},-,-,{:.9},{:.9},{:.9},{:.9},{},{}",
+            display.epoch,
+            display.superbatch,
+            display.curr_batch,
+            mean,
+            learning_rate,
+            learning_rate,
+            context.lambda,
+            display.positions,
+            csv_escape(source),
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write SFNN bridge checkpoint learn.log {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush SFNN bridge checkpoint learn.log {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn append_sfnn_bridge_summary_log(
+    path: &std::path::Path,
+    checkpoint_index: usize,
+    completed_steps: usize,
+    losses: &[(usize, f32, f32)],
+    learning_rates: &[f32],
+    sources: &[String],
+    context: NnueBridgeLogContext,
+) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use std::io::Write as _;
+
+    let write_header = match std::fs::metadata(path) {
+        Ok(meta) => meta.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to stat SFNN bridge summary log {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let mut writer = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to open SFNN bridge summary log {}: {err}",
+                    path.display()
+                ))
+            })?,
+    );
+
+    if write_header {
+        writeln!(
+            writer,
+            "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher"
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write SFNN bridge summary log header {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+
+    let Some((last_step, _weighted_sum, mean)) = losses.last().copied() else {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "cannot append SFNN bridge summary log without losses".to_string(),
+        ));
+    };
+    let learning_rate = learning_rates.last().copied().unwrap_or(0.0);
+    let source = sources.last().map(String::as_str).unwrap_or("");
+    let display = bridge_log_display_step(last_step, context);
+    let _ = (checkpoint_index, completed_steps);
+    writeln!(
+        writer,
+        "sfnn,{},{},-,-,{:.9},{:.9},{:.9},{:.9},{},{}",
+        display.epoch,
+        display.superbatch,
+        mean,
+        learning_rate,
+        learning_rate,
+        context.lambda,
+        display.positions,
+        csv_escape(source),
+    )
+    .map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to append SFNN bridge summary log {}: {err}",
+            path.display()
+        ))
+    })?;
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush SFNN bridge summary log {}: {err}",
             path.display()
         ))
     })?;

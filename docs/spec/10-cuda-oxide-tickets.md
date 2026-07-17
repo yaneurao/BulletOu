@@ -13,7 +13,7 @@ commit each completed slice.
 | BO-CUDA-005 | done | dataloader resume generalisation | HCPE3, shogipack, multi-teacher specs, and teacher changes have explicit resume behavior and smoke coverage |
 | BO-CUDA-006 | done | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
 | BO-CUDA-007 | done | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
-| BO-CUDA-008 | doing | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
+| BO-CUDA-008 | done | SFNN training integration | SFNN cuda-oxide training path can stream real teacher batches and write compatible checkpoints |
 
 ## Notes
 
@@ -101,3 +101,17 @@ commit each completed slice.
     - 512 positions (`batch_size=64`, 8 batches): Bullet backend `2130 pos/sec`; cuda-oxide `353 pos/sec`.
     - 8192 positions (`batch_size=1024`, 8 batches): Bullet backend `18109 pos/sec`; cuda-oxide `1037 pos/sec`.
   - These are debug-build smoke numbers for regression tracking, not final tuned production throughput.
+
+### BO-CUDA-008
+
+- Added a host-side SFNN loss/Ranger train-step runner for cuda-oxide.
+- Added `bulletou-cuda-train --sfnn-teacher-train` for the fixed HalfKA2 / `SFNN_halfka2_1024_7_64_k3k3` path.
+- The SFNN teacher path streams real `ShogiHalfKa2` + `ShogiLayerStackBucket9::KingRank9` batches from `bulletou_lib`, supports deterministic initial weights or `--weights-bin`, and feeds batches directly to the SFNN forward/loss/backward/Ranger kernels.
+- `--output` writes numbered bridge checkpoints with YaneuraOu-compatible `nn.bin`, root-format `state.bin` under the usual `nnue/*` component records, `teacher.txt`, `dataloader_pos.txt`, `learn.log`, and `summary-learn.log`.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - `cargo test -p bulletou_lib teacher_batch -- --nocapture`.
+  - WSL: `cargo test -p bulletou-cuda-train --features cuda,root-loader dataloader_pos -- --nocapture`.
+  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 1 --batch-size 1 --output /tmp/bo008-sfnn-output-smoke` streamed one real HCPE batch, printed `step1_loss weighted_sum=0.25801346 mean=0.25801346`, and wrote `0001/nn.bin` (129 MiB), `0001/state.bin` (2.1 GiB), `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.log`.
+  - The smoke `nn.bin` advertised `ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)[131949->1024x2],Network=SFNN-1024{LayerStack=9}`, and `state.bin` contained `nnue/weights/l0w` plus `nnue/step_ranger/l3w` records.
