@@ -898,8 +898,7 @@ where
         // 空 Vec は sweep 終了マーカー (buffer 段の tail flush 用)。
         // 初回 sweep のみ resume_offset で開始ファイル + 開始 offset を決める。
         let reader_buffer_size = 256;
-        let (reader_tx, reader_rx) =
-            mpsc::sync_channel::<Vec<(u64, RawGameData)>>(8);
+        let (reader_tx, reader_rx) = mpsc::sync_channel::<Vec<(u64, RawGameData)>>(8);
         let (reader_stop_tx, reader_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
@@ -909,31 +908,30 @@ where
 
             'dataloading: loop {
                 // 初回 sweep の場合は resume_offset を含むファイルを探す。
-                let (first_file_idx_this_sweep, in_file_seek_this_sweep) =
-                    if first_sweep && resume_offset > 0 {
-                        let mut cumulative: u64 = 0;
-                        let mut idx = file_paths.len();
-                        let mut seek_off: u64 = 0;
-                        for (i, p) in file_paths.iter().enumerate() {
-                            let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                            if cumulative + sz > resume_offset {
-                                idx = i;
-                                seek_off = resume_offset - cumulative;
-                                break;
-                            }
-                            cumulative += sz;
+                let (first_file_idx_this_sweep, in_file_seek_this_sweep) = if first_sweep && resume_offset > 0 {
+                    let mut cumulative: u64 = 0;
+                    let mut idx = file_paths.len();
+                    let mut seek_off: u64 = 0;
+                    for (i, p) in file_paths.iter().enumerate() {
+                        let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        if cumulative + sz > resume_offset {
+                            idx = i;
+                            seek_off = resume_offset - cumulative;
+                            break;
                         }
-                        if idx >= file_paths.len() {
-                            // resume_offset がすべてのファイルサイズの合計を超え →
-                            // sweep 終わりとして downstream に sweep 終了マーカーだけ
-                            // 流して終了 (single_epoch なら break、それ以外も break)。
-                            let _ = reader_tx.send(Vec::new());
-                            break 'dataloading;
-                        }
-                        (idx, seek_off)
-                    } else {
-                        (0usize, 0u64)
-                    };
+                        cumulative += sz;
+                    }
+                    if idx >= file_paths.len() {
+                        // resume_offset がすべてのファイルサイズの合計を超え →
+                        // sweep 終わりとして downstream に sweep 終了マーカーだけ
+                        // 流して終了 (single_epoch なら break、それ以外も break)。
+                        let _ = reader_tx.send(Vec::new());
+                        break 'dataloading;
+                    }
+                    (idx, seek_off)
+                } else {
+                    (0usize, 0u64)
+                };
 
                 // ファイル列を順に walk。current_global_offset は連結ストリーム
                 // 上の絶対 byte offset。各 game の (offset, data) を buffer に
@@ -962,9 +960,7 @@ where
                     if idx == first_file_idx_this_sweep && in_file_seek_this_sweep > 0 {
                         // BufReader 内部の Seek 経由
                         // (`seek` は trait method なのでフィールドアクセス必要)
-                        if let Err(e) =
-                            cursor.reader.seek(std::io::SeekFrom::Start(in_file_seek_this_sweep))
-                        {
+                        if let Err(e) = cursor.reader.seek(std::io::SeekFrom::Start(in_file_seek_this_sweep)) {
                             eprintln!("[ShogiPackLoader] seek error in {file_path}: {e}");
                             continue;
                         }
@@ -980,9 +976,7 @@ where
                         buffer.push(game);
 
                         if buffer.len() >= reader_buffer_size {
-                            if reader_stop_rx.try_recv().unwrap_or(false)
-                                || reader_tx.send(buffer).is_err()
-                            {
+                            if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err() {
                                 break 'dataloading;
                             }
                             buffer = Vec::with_capacity(reader_buffer_size);
@@ -991,14 +985,12 @@ where
                 }
 
                 if !buffer.is_empty() {
-                    if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err()
-                    {
+                    if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(buffer).is_err() {
                         break;
                     }
                     buffer = Vec::with_capacity(reader_buffer_size);
                 }
-                if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err()
-                {
+                if reader_stop_rx.try_recv().unwrap_or(false) || reader_tx.send(Vec::new()).is_err() {
                     break;
                 }
 
@@ -1014,8 +1006,7 @@ where
         // (初回 sweep のみ) は resume_plies 個の ply を skip。各 push 後に
         // `next_after_push = (current_game_offset, ply+1)` を更新し、Vec<PSV>
         // と共に buffer 段に送る。
-        let (expand_tx, expand_rx) =
-            mpsc::sync_channel::<(Vec<(PackedSfenValue, u64, usize)>, u64, usize)>(16);
+        let (expand_tx, expand_rx) = mpsc::sync_channel::<(Vec<(PackedSfenValue, u64, usize)>, u64, usize)>(16);
         let (expand_stop_tx, expand_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
@@ -1061,11 +1052,7 @@ where
                 }
 
                 let send_needed = is_sweep_end || !positions.is_empty();
-                if send_needed
-                    && expand_tx
-                        .send((positions, next_after_push.0, next_after_push.1))
-                        .is_err()
-                {
+                if send_needed && expand_tx.send((positions, next_after_push.0, next_after_push.1)).is_err() {
                     reader_stop_tx.send(true).ok();
                     break 'dataloading;
                 }
@@ -1092,8 +1079,7 @@ where
         // buffer_size に達したら入力順のまま `(buf, latest_offset, latest_plies)`
         // を送る。latest は「buffer 蓄積中に最後に受信した値」(= input order
         // の最後の push に対応)。
-        let (buffer_tx, buffer_rx) =
-            mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
         let (buffer_stop_tx, buffer_stop_rx) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {
@@ -1111,9 +1097,7 @@ where
 
                     if read_buffer.len() >= buffer_size {
                         if buffer_stop_rx.try_recv().unwrap_or(false)
-                            || buffer_tx
-                                .send((read_buffer, latest_attached.0, latest_attached.1))
-                                .is_err()
+                            || buffer_tx.send((read_buffer, latest_attached.0, latest_attached.1)).is_err()
                         {
                             expand_stop_tx.send(true).ok();
                             break 'dataloading;
@@ -1125,9 +1109,7 @@ where
 
                 if is_sweep_end && !read_buffer.is_empty() {
                     if buffer_stop_rx.try_recv().unwrap_or(false)
-                        || buffer_tx
-                            .send((read_buffer, latest_attached.0, latest_attached.1))
-                            .is_err()
+                        || buffer_tx.send((read_buffer, latest_attached.0, latest_attached.1)).is_err()
                     {
                         expand_stop_tx.send(true).ok();
                         break 'dataloading;

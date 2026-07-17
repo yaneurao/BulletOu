@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
+    CudaModule, CudaStream, DeviceBuffer, Error, Result,
     backward::{
         SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
         SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
@@ -14,7 +15,6 @@ use bulletou_cuda_oxide_runtime::{
         SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostWeights, SfnnForwardShape,
         SfnnForwardWeightLayout, SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
     },
-    CudaModule, CudaStream, DeviceBuffer, Error, Result,
 };
 
 use crate::{loss_forward, optimizer_update, sfnn_backward, sfnn_forward};
@@ -203,8 +203,12 @@ impl SfnnLossRangerStepRunner {
             )?,
         }
 
-        let l3_layout =
-            SfnnStackedL3BackwardLayout::new(self.batch_size, self.shape.l2_size, self.shape.l1_out(), self.shape.num_stacks);
+        let l3_layout = SfnnStackedL3BackwardLayout::new(
+            self.batch_size,
+            self.shape.l2_size,
+            self.shape.l1_out(),
+            self.shape.num_stacks,
+        );
         sfnn_backward::launch_sfnn_stacked_l3_backward(
             stream,
             module,
@@ -219,8 +223,12 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l3b_gradients,
         )?;
 
-        let l2_layout =
-            SfnnStackedCReluBackwardLayout::new(self.batch_size, self.shape.l2_in(), self.shape.l2_size, self.shape.num_stacks);
+        let l2_layout = SfnnStackedCReluBackwardLayout::new(
+            self.batch_size,
+            self.shape.l2_in(),
+            self.shape.l2_size,
+            self.shape.num_stacks,
+        );
         sfnn_backward::launch_sfnn_stacked_crelu_backward(
             stream,
             module,
@@ -246,8 +254,12 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l1_gradients,
         )?;
 
-        let l1_layout =
-            SfnnStackedAffineBackwardLayout::new(self.batch_size, self.shape.ft_size, self.shape.l1_out(), self.shape.num_stacks);
+        let l1_layout = SfnnStackedAffineBackwardLayout::new(
+            self.batch_size,
+            self.shape.ft_size,
+            self.shape.l1_out(),
+            self.shape.num_stacks,
+        );
         sfnn_backward::launch_sfnn_stacked_affine_backward(
             stream,
             module,
@@ -287,8 +299,12 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.nstm_l0_gradients,
         )?;
 
-        let l0_layout =
-            SfnnL0SparseBackwardLayout::new(self.batch_size, self.max_active, self.shape.input_size, self.shape.ft_size);
+        let l0_layout = SfnnL0SparseBackwardLayout::new(
+            self.batch_size,
+            self.max_active,
+            self.shape.input_size,
+            self.shape.ft_size,
+        );
         sfnn_backward::launch_sfnn_l0_sparse_backward(
             stream,
             module,

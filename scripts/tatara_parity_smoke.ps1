@@ -281,6 +281,7 @@ $bulletBaseArgs = @(
     "--buffer-mb 1",
     "--loader-threads 1",
     "--threads $Threads",
+    "--score-drop-abs 0",
     "--loss-kind wrm",
     "--learning-rate 0.01",
     "--lr-schedule fixed",

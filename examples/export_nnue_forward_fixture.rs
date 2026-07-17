@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use bulletou_lib::value::{
-    FastBatchHost, FastBatchLayout, HalfkpTeacherBatchConfig, NNUE_HALFKP_256X2_32_32,
-    NnueForwardOwnedWeights, NnueForwardShape, load_halfkp_teacher_fast_batch, write_nnue_forward_fixture_file,
+    FastBatchHost, FastBatchLayout, HalfkpTeacherBatchConfig, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights,
+    NnueForwardShape, load_halfkp_teacher_fast_batch, write_nnue_forward_fixture_file,
     write_nnue_train_batch_fixture_file, write_nnue_train_fixture_file,
     yaneuraou_kppt::{extract_component_section, parse_model_weights_bin},
 };
@@ -316,6 +316,7 @@ fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box
         lambda: args.lambda,
         scale: args.scale,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+        ft_factorize: false,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: false,
     })?;

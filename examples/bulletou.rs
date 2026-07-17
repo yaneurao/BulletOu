@@ -57,29 +57,29 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
-    nn::{optimiser, ExecutionContext, ModelNode},
-    teacher_path::{expand_teacher, infer_data_format, DataFormat},
+    nn::{ExecutionContext, ModelNode, optimiser},
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
     trainer::{
         save::SavedFormat,
-        schedule::{wdl, TrainingSchedule, TrainingSteps},
+        schedule::{TrainingSchedule, TrainingSteps, wdl},
         settings::LocalSettings,
     },
-    validate::{compute_sign_accuracy_with_loss, read_random_teacher_positions, ValidationLossKind},
+    validate::{ValidationLossKind, compute_sign_accuracy_with_loss, read_random_teacher_positions},
     value::{
+        ValueTrainer, ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
-            ft_hash_bytes, header_bytes, l1_bias_scale, network_layer_hash_bytes, pad32 as nnue_pad32,
-            pad_weights_for_simd, Activation as NnueActivation, NnueFeatureSet,
+            Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
+            network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
         },
         nnue_save_sfnn1536::{
-            build_sfnn_1536_save_format, Sfnn1536SaveParams, LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION,
+            LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION, Sfnn1536SaveParams, build_sfnn_1536_save_format,
         },
         yaneuraou_kppt::{
-            bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, unbundle_component_state,
-            write_state_backend_marker, KppFormat, STATE_BACKEND_BULLET,
+            KppFormat, STATE_BACKEND_BULLET, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
+            unbundle_component_state, write_state_backend_marker,
         },
-        ValueTrainer, ValueTrainerBuilder,
     },
 };
 use clap::{Parser, ValueEnum};
@@ -1766,17 +1766,13 @@ impl Args {
             }
             (None, true) => {}
             (Some(_), true) => {
-                return Err(
-                    "--backend cuda-oxide accepts either --cuda-oxide-train-steps or --superbatches, not both"
-                        .to_string(),
-                );
+                return Err("--backend cuda-oxide accepts either --cuda-oxide-train-steps or --superbatches, not both"
+                    .to_string());
             }
             (None, false) => {
-                return Err(
-                    "--backend cuda-oxide requires either --cuda-oxide-train-steps N for a direct smoke run \
+                return Err("--backend cuda-oxide requires either --cuda-oxide-train-steps N for a direct smoke run \
                      or --superbatches N --max-epochs N for production schedule mode"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
         if effective_batch_size(self) == 0 {
@@ -1802,19 +1798,15 @@ impl Args {
                 || self.optimizer_beta1.is_some()
                 || self.optimizer_beta2.is_some())
         {
-            return Err(
-                "--backend cuda-oxide direct-step mode does not honor production schedule flags; \
+            return Err("--backend cuda-oxide direct-step mode does not honor production schedule flags; \
                  use --superbatches with --max-epochs instead"
-                    .to_string(),
-            );
+                .to_string());
         }
         if self.lr_schedule == LrScheduleKind::Plateau {
             if !production_schedule {
-                return Err(
-                    "--backend cuda-oxide plateau control requires --superbatches N --max-epochs N; \
+                return Err("--backend cuda-oxide plateau control requires --superbatches N --max-epochs N; \
                      direct-step mode cannot retry validation-bounded superbatches"
-                        .to_string(),
-                );
+                    .to_string());
             }
             if self.test_teacher.is_none() {
                 return Err(
@@ -1837,7 +1829,7 @@ impl Args {
         }
         if self.dump_activation_stats {
             return Err(
-                "--backend cuda-oxide activation metrics are not wired yet; this remains CPU/Bullet-only".to_string(),
+                "--backend cuda-oxide activation metrics are not wired yet; this remains CPU/Bullet-only".to_string()
             );
         }
         if self.no_resume {
@@ -1877,11 +1869,7 @@ fn nnue_pytorch_wrm_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>)
 }
 
 fn value_loss_fn(args: &Args) -> ValueLossFn {
-    if args.nnue_pytorch_wrm_loss {
-        nnue_pytorch_wrm_value_loss
-    } else {
-        sigmoid_mse_value_loss
-    }
+    if args.nnue_pytorch_wrm_loss { nnue_pytorch_wrm_value_loss } else { sigmoid_mse_value_loss }
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
@@ -2245,11 +2233,7 @@ impl NerfRng {
     }
 
     fn gen_delta(&mut self) -> i16 {
-        if self.next_u64() & 1 == 0 {
-            -1
-        } else {
-            1
-        }
+        if self.next_u64() & 1 == 0 { -1 } else { 1 }
     }
 }
 
@@ -2890,17 +2874,8 @@ fn cuda_oxide_cargo_run_args_with_child(args: &Args, child_run: &CudaOxideChildR
     if args.cuda_oxide_release {
         cargo_args.push("--release".to_string());
     }
-    cargo_args.extend(
-        [
-            "-p",
-            "bulletou-cuda-train",
-            "--features",
-            "cuda,root-loader",
-            "--",
-        ]
-        .into_iter()
-        .map(str::to_string),
-    );
+    cargo_args
+        .extend(["-p", "bulletou-cuda-train", "--features", "cuda,root-loader", "--"].into_iter().map(str::to_string));
     cargo_args.push(cuda_oxide_child_trainer_flag(args.eval_type()).to_string());
     if args.eval_type() == EvalType::SfnnHalfka2 && args.sfnn_factorized_l1 {
         cargo_args.push("--sfnn-factorized-l1".to_string());
@@ -3422,11 +3397,7 @@ fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
 }
 
 fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if resume_enabled(args, output_dir) {
-        find_latest_state_bin_raw(output_dir)
-    } else {
-        None
-    }
+    if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
 }
 
 fn prepare_resume_config_or_exit(args: &Args) {
@@ -4889,11 +4860,7 @@ impl RunningActivationStats {
     }
 
     fn mean(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.sum / self.count as f64
-        }
+        if self.count == 0 { 0.0 } else { self.sum / self.count as f64 }
     }
 
     fn variance(&self) -> f64 {
@@ -4910,19 +4877,11 @@ impl RunningActivationStats {
     }
 
     fn zero_ratio(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.zero as f64 / self.count as f64
-        }
+        if self.count == 0 { 0.0 } else { self.zero as f64 / self.count as f64 }
     }
 
     fn max_ratio(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.maxed as f64 / self.count as f64
-        }
+        if self.count == 0 { 0.0 } else { self.maxed as f64 / self.count as f64 }
     }
 }
 

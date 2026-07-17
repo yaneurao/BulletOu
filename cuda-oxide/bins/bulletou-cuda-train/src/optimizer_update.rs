@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
+    CudaModule, CudaStream, DeviceBuffer, Error, LaunchConfig, Result,
     backward::{NnueBackwardWorkspace, SfnnBackwardWorkspace},
     nnue::NnueForwardDeviceWeights,
     optimizer::{
@@ -11,9 +12,13 @@ use bulletou_cuda_oxide_runtime::{
         RangerOptimizerState, RangerUpdateLayout, RangerUpdateParams, SfnnRangerOptimizerStates,
     },
     sfnn::SfnnForwardDeviceWeights,
-    CudaModule, CudaStream, DeviceBuffer, Error, LaunchConfig, Result,
 };
 use cuda_host::cuda_launch;
+
+const NNUE_QUANT_CLAMP_MIN: f32 = -127.0 / 64.0;
+const NNUE_QUANT_CLAMP_MAX: f32 = 127.0 / 64.0;
+const NNUE_NO_CLAMP_MIN: f32 = f32::MIN;
+const NNUE_NO_CLAMP_MAX: f32 = f32::MAX;
 
 #[allow(dead_code)]
 pub(crate) fn launch_adamw_update(
@@ -195,12 +200,14 @@ pub(crate) fn launch_nnue_ranger_update(
 ) -> Result<()> {
     ensure_nnue_update_shapes(weights, gradients, states)?;
     let layout = states.layout;
+    let no_clamp_params = nnue_ranger_params_with_clamp(params, NNUE_NO_CLAMP_MIN, NNUE_NO_CLAMP_MAX);
+    let quant_clamp_params = nnue_ranger_params_with_clamp(params, NNUE_QUANT_CLAMP_MIN, NNUE_QUANT_CLAMP_MAX);
 
     launch_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l0w_state_layout().state_len()),
-        params,
+        no_clamp_params,
         &gradients.l0w_gradients,
         &mut weights.l0w,
         &mut states.l0w,
@@ -209,7 +216,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l0b_state_layout().state_len()),
-        params,
+        no_clamp_params,
         &gradients.l0b_gradients,
         &mut weights.l0b,
         &mut states.l0b,
@@ -218,7 +225,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l1w_state_layout().state_len()),
-        params,
+        quant_clamp_params,
         &gradients.l1w_gradients,
         &mut weights.l1w,
         &mut states.l1w,
@@ -227,7 +234,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l1b_state_layout().state_len()),
-        params,
+        quant_clamp_params,
         &gradients.l1b_gradients,
         &mut weights.l1b,
         &mut states.l1b,
@@ -236,7 +243,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l2w_state_layout().state_len()),
-        params,
+        quant_clamp_params,
         &gradients.l2w_gradients,
         &mut weights.l2w,
         &mut states.l2w,
@@ -245,7 +252,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.l2b_state_layout().state_len()),
-        params,
+        quant_clamp_params,
         &gradients.l2b_gradients,
         &mut weights.l2b,
         &mut states.l2b,
@@ -254,7 +261,7 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.outw_state_layout().state_len()),
-        params,
+        quant_clamp_params,
         &gradients.outw_gradients,
         &mut weights.outw,
         &mut states.outw,
@@ -263,13 +270,23 @@ pub(crate) fn launch_nnue_ranger_update(
         stream,
         module,
         RangerUpdateLayout::new(layout.outb_state_layout().state_len()),
-        params,
+        no_clamp_params,
         &gradients.outb_gradients,
         &mut weights.outb,
         &mut states.outb,
     )?;
 
     Ok(())
+}
+
+fn nnue_ranger_params_with_clamp(
+    mut params: RangerUpdateParams,
+    min_weight: f32,
+    max_weight: f32,
+) -> RangerUpdateParams {
+    params.radam.min_weight = min_weight;
+    params.radam.max_weight = max_weight;
+    params
 }
 
 #[allow(dead_code)]
@@ -334,9 +351,7 @@ pub(crate) fn launch_sfnn_ranger_update(
         }
         (None, None) => {}
         _ => {
-            return Err(Error::Smoke(
-                "SFNN shared L1 weight/state mismatch for l1fw update".to_string(),
-            ));
+            return Err(Error::Smoke("SFNN shared L1 weight/state mismatch for l1fw update".to_string()));
         }
     }
     match (&mut weights.l1fb, &mut states.l1fb) {
@@ -353,9 +368,7 @@ pub(crate) fn launch_sfnn_ranger_update(
         }
         (None, None) => {}
         _ => {
-            return Err(Error::Smoke(
-                "SFNN shared L1 weight/state mismatch for l1fb update".to_string(),
-            ));
+            return Err(Error::Smoke("SFNN shared L1 weight/state mismatch for l1fb update".to_string()));
         }
     }
     launch_ranger_update(
@@ -404,9 +417,7 @@ fn ensure_ranger_state_len(name: &'static str, layout: RangerUpdateLayout, state
     if expected == actual {
         Ok(())
     } else {
-        Err(Error::Smoke(format!(
-            "{name} optimizer state length mismatch: expected {expected}, got {actual}"
-        )))
+        Err(Error::Smoke(format!("{name} optimizer state length mismatch: expected {expected}, got {actual}")))
     }
 }
 

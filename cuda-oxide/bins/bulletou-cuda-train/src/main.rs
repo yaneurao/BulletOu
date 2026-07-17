@@ -1236,7 +1236,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     let initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfkp_weights_as_nnue_case(path)?,
-        None => NnueForwardCase::new(NnueForwardCaseKind::Halfkp),
+        None => NnueForwardCase::tatara_simple_factorized_halfkp_256x2_32_32(),
     };
     let restored_state = match train_state_source {
         Some(NnueTrainStateSource::BoungFixture(path)) => Some(NnueTrainStateCase::read_fixture(path)?),
@@ -1244,7 +1244,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         None => None,
     };
     let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
-    if shape != initial_case.shape {
+    if restored_state.is_none() && shape != initial_case.shape {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "--nnue-teacher-train currently supports only HalfKP shape input={} l1={} l2={} l3={}, but state has input={} l1={} l2={} l3={}",
             initial_case.shape.input_size,
@@ -1317,146 +1317,146 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         lambda: 1.0,
         scale: 400.0,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+        ft_factorize: nnue_halfkp_uses_ft_factorize(shape),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: args.profile_train_step,
     };
-    let mut handle_loaded_batch = |loaded: bulletou_lib::value::HalfkpTeacherBatch| -> bulletou_cuda_oxide_runtime::Result<()> {
-        let source = loaded.source;
-        let dataloader_pos = loaded.dataloader_pos;
-        let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
-        if runner.is_none() {
-            runner = Some(match restored_state.as_ref() {
-                Some(state) => NnueLossRangerStepRunner::with_optimizer_state(
-                    &stream,
-                    &state.host_weights(),
-                    state.host_optimizer_states(),
-                    train_batch.batch_size,
-                    train_batch.max_active,
-                )?,
-                None => {
-                    let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
-                        shape: initial_case.shape,
-                        l0w: &initial_case.l0w,
-                        l0b: &initial_case.l0b,
-                        l1w: &initial_case.l1w,
-                        l1b: &initial_case.l1b,
-                        l2w: &initial_case.l2w,
-                        l2b: &initial_case.l2b,
-                        outw: &initial_case.outw,
-                        outb: &initial_case.outb,
-                    };
-                    NnueLossRangerStepRunner::new(
+    let mut handle_loaded_batch =
+        |loaded: bulletou_lib::value::HalfkpTeacherBatch| -> bulletou_cuda_oxide_runtime::Result<()> {
+            let source = loaded.source;
+            let dataloader_pos = loaded.dataloader_pos;
+            let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
+            if runner.is_none() {
+                runner = Some(match restored_state.as_ref() {
+                    Some(state) => NnueLossRangerStepRunner::with_optimizer_state(
                         &stream,
-                        &host_weights,
+                        &state.host_weights(),
+                        state.host_optimizer_states(),
                         train_batch.batch_size,
                         train_batch.max_active,
-                    )?
-                }
-            });
-        }
-
-        let runner_ref = runner.as_mut().expect("runner is initialized");
-        let step = completed_step_offset + run_steps + 1;
-        let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
-        let params = grouped_ranger_step_params_for_step_with_hyperparams(
-            step,
-            learning_rate,
-            args.optimizer_weight_decay,
-            args.optimizer_beta1,
-            args.optimizer_beta2,
-            args.optimizer_epsilon,
-        );
-        let host_batch = NnueTrainStepHostBatch {
-            stm_indices: &train_batch.stm,
-            nstm_indices: &train_batch.nstm,
-            targets: &train_batch.targets,
-            entry_weights: &train_batch.entry_weights,
-            batch_size: train_batch.batch_size,
-            max_active: train_batch.max_active,
-        };
-        train_timer.get_or_insert_with(std::time::Instant::now);
-        train_positions = train_positions.saturating_add(train_batch.batch_size);
-
-        if use_async_pipeline {
-            let completed_loss = runner_ref.step_pipelined(
-                &stream,
-                &module,
-                params,
-                train_loss_kind,
-                host_batch,
-                args.debug_readback,
-                false,
-                args.profile_train_step,
-            )?;
-            if let Some(loss) = completed_loss {
-                let meta = pending_async_step
-                    .take()
-                    .expect("async NNUE train pipeline returns losses in submission order");
-                let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
-                losses.push(loss_entry);
-                learning_rates.push(meta.learning_rate);
-                sources.push(meta.source);
-                dataloader_positions.push(meta.dataloader_pos);
-                last_batch = Some(meta.train_batch);
+                    )?,
+                    None => {
+                        let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
+                            shape: initial_case.shape,
+                            l0w: &initial_case.l0w,
+                            l0b: &initial_case.l0b,
+                            l1w: &initial_case.l1w,
+                            l1b: &initial_case.l1b,
+                            l2w: &initial_case.l2w,
+                            l2b: &initial_case.l2b,
+                            outw: &initial_case.outw,
+                            outb: &initial_case.outb,
+                        };
+                        NnueLossRangerStepRunner::new(
+                            &stream,
+                            &host_weights,
+                            train_batch.batch_size,
+                            train_batch.max_active,
+                        )?
+                    }
+                });
             }
-            pending_async_step =
-                Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
-            run_steps += 1;
-            return Ok(());
-        }
 
-        runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
-        stream.synchronize()?;
-
-        let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
-        let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
-        losses.push(loss_entry);
-        learning_rates.push(learning_rate);
-        sources.push(source.clone());
-        dataloader_positions.push(dataloader_pos);
-        checkpoint_losses.push(loss_entry);
-        checkpoint_learning_rates.push(learning_rate);
-        checkpoint_sources.push(source);
-        checkpoint_dataloader_positions.push(dataloader_pos);
-        run_steps += 1;
-        if args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false) {
-            let weights = runner_ref.read_weights(&stream)?;
-            let state = runner_ref.read_state(&stream)?;
-            let test_metrics = match &test_cache {
-                Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
-                None => None,
+            let runner_ref = runner.as_mut().expect("runner is initialized");
+            let step = completed_step_offset + run_steps + 1;
+            let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
+            let params = grouped_ranger_step_params_for_step_with_hyperparams(
+                step,
+                learning_rate,
+                args.optimizer_weight_decay,
+                args.optimizer_beta1,
+                args.optimizer_beta2,
+                args.optimizer_epsilon,
+            );
+            let host_batch = NnueTrainStepHostBatch {
+                stm_indices: &train_batch.stm,
+                nstm_indices: &train_batch.nstm,
+                targets: &train_batch.targets,
+                entry_weights: &train_batch.entry_weights,
+                batch_size: train_batch.batch_size,
+                max_active: train_batch.max_active,
             };
-            bridge_checkpoints.push(write_nnue_bridge_checkpoint(
-                args.output.as_ref().expect("checked output exists"),
-                shape,
-                completed_step_offset + run_steps,
-                weights,
-                &state,
-                &train_batch,
-                teacher,
-                &checkpoint_losses,
-                &checkpoint_learning_rates,
-                &checkpoint_sources,
-                &checkpoint_dataloader_positions,
-                test_metrics,
-                log_context,
-            )?);
-            checkpoint_losses.clear();
-            checkpoint_learning_rates.clear();
-            checkpoint_sources.clear();
-            checkpoint_dataloader_positions.clear();
-        }
-        last_batch = Some(train_batch);
-        Ok(())
-    };
+            train_timer.get_or_insert_with(std::time::Instant::now);
+            train_positions = train_positions.saturating_add(train_batch.batch_size);
+
+            if use_async_pipeline {
+                let completed_loss = runner_ref.step_pipelined(
+                    &stream,
+                    &module,
+                    params,
+                    train_loss_kind,
+                    host_batch,
+                    args.debug_readback,
+                    false,
+                    args.profile_train_step,
+                )?;
+                if let Some(loss) = completed_loss {
+                    let meta = pending_async_step
+                        .take()
+                        .expect("async NNUE train pipeline returns losses in submission order");
+                    let loss_entry = (meta.step, loss.weighted_sum[0], loss.mean[0]);
+                    losses.push(loss_entry);
+                    learning_rates.push(meta.learning_rate);
+                    sources.push(meta.source);
+                    dataloader_positions.push(meta.dataloader_pos);
+                    last_batch = Some(meta.train_batch);
+                }
+                pending_async_step =
+                    Some(PendingAsyncTeacherStep { step, learning_rate, source, dataloader_pos, train_batch });
+                run_steps += 1;
+                return Ok(());
+            }
+
+            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
+            stream.synchronize()?;
+
+            let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
+            let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
+            losses.push(loss_entry);
+            learning_rates.push(learning_rate);
+            sources.push(source.clone());
+            dataloader_positions.push(dataloader_pos);
+            checkpoint_losses.push(loss_entry);
+            checkpoint_learning_rates.push(learning_rate);
+            checkpoint_sources.push(source);
+            checkpoint_dataloader_positions.push(dataloader_pos);
+            run_steps += 1;
+            if args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false) {
+                let weights = runner_ref.read_weights(&stream)?;
+                let state = runner_ref.read_state(&stream)?;
+                let test_metrics = match &test_cache {
+                    Some(cache) => Some(run_nnue_bridge_test_pass(shape, &weights, cache, &args)?),
+                    None => None,
+                };
+                bridge_checkpoints.push(write_nnue_bridge_checkpoint(
+                    args.output.as_ref().expect("checked output exists"),
+                    shape,
+                    completed_step_offset + run_steps,
+                    weights,
+                    &state,
+                    &train_batch,
+                    teacher,
+                    &checkpoint_losses,
+                    &checkpoint_learning_rates,
+                    &checkpoint_sources,
+                    &checkpoint_dataloader_positions,
+                    test_metrics,
+                    log_context,
+                )?);
+                checkpoint_losses.clear();
+                checkpoint_learning_rates.clear();
+                checkpoint_sources.clear();
+                checkpoint_dataloader_positions.clear();
+            }
+            last_batch = Some(train_batch);
+            Ok(())
+        };
 
     let train_steps = args.train_steps;
     if args.profile_train_step {
-        bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
-            &teacher_batch_config,
-            train_steps,
-            |loaded| handle_loaded_batch(loaded),
-        )
+        bulletou_lib::value::for_each_halfkp_teacher_fast_batch(&teacher_batch_config, train_steps, |loaded| {
+            handle_loaded_batch(loaded)
+        })
         .map_err(|err| {
             bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                 "failed to stream NNUE teacher batches from {teacher}: {err}"
@@ -1466,14 +1466,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         std::thread::scope(|scope| -> bulletou_cuda_oxide_runtime::Result<()> {
             let (tx, rx) = std::sync::mpsc::sync_channel(2);
             let producer = scope.spawn(move || {
-                bulletou_lib::value::for_each_halfkp_teacher_fast_batch(
-                    &teacher_batch_config,
-                    train_steps,
-                    |loaded| {
-                        tx.send(loaded)
-                            .map_err(|err| format!("teacher batch consumer stopped: {err}"))
-                    },
-                )
+                bulletou_lib::value::for_each_halfkp_teacher_fast_batch(&teacher_batch_config, train_steps, |loaded| {
+                    tx.send(loaded).map_err(|err| format!("teacher batch consumer stopped: {err}"))
+                })
             });
 
             let mut consumer_result: bulletou_cuda_oxide_runtime::Result<()> = Ok(());
@@ -2105,7 +2100,7 @@ fn run_nnue_bridge_test_pass(
     args: &Args,
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeTestMetrics> {
     use bulletou_lib::{
-        game::inputs::ShogiHalfKP,
+        game::inputs::{Factorised, ShogiHalfKP, ShogiHalfKPPieceFactorizer},
         validate::{ValidationLossKind, compute_sign_accuracy_with_loss},
         value::{
             FastBatchHost, NnueForwardWeights, NoOutputBuckets,
@@ -2135,26 +2130,47 @@ fn run_nnue_bridge_test_pass(
     })?;
 
     let empty_files: [&str; 0] = [];
-    let dataloader = DefaultDataLoader::new(
-        ShogiHalfKP,
-        NoOutputBuckets,
-        (|_, blend| blend) as fn(&bulletou_lib::shogi::PackedSfenValue, f32) -> f32,
-        None,
-        matches!(args.loss_kind, LossKind::NnuePytorchWrm),
-        false,
-        400.0,
-        (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        DirectSequentialDataLoader::new(&empty_files),
-    );
-
     let mut outputs = Vec::with_capacity(cache.positions.len());
-    for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
-        let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
-        let batch = FastBatchHost::from(prepared);
-        let mut chunk_outputs = forward_weights
-            .forward_batch(&batch)
-            .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}")))?;
-        outputs.append(&mut chunk_outputs);
+    if nnue_halfkp_uses_ft_factorize(shape) {
+        let dataloader = DefaultDataLoader::new(
+            Factorised::from_parts(ShogiHalfKP, ShogiHalfKPPieceFactorizer),
+            NoOutputBuckets,
+            (|_, blend| blend) as fn(&bulletou_lib::shogi::PackedSfenValue, f32) -> f32,
+            None,
+            matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+            false,
+            400.0,
+            (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+            DirectSequentialDataLoader::new(&empty_files),
+        );
+        for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
+            let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
+            let batch = FastBatchHost::from(prepared);
+            let mut chunk_outputs = forward_weights.forward_batch(&batch).map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}"))
+            })?;
+            outputs.append(&mut chunk_outputs);
+        }
+    } else {
+        let dataloader = DefaultDataLoader::new(
+            ShogiHalfKP,
+            NoOutputBuckets,
+            (|_, blend| blend) as fn(&bulletou_lib::shogi::PackedSfenValue, f32) -> f32,
+            None,
+            matches!(args.loss_kind, LossKind::NnuePytorchWrm),
+            false,
+            400.0,
+            (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+            DirectSequentialDataLoader::new(&empty_files),
+        );
+        for chunk in cache.positions.chunks(args.test_batch_size.max(1)) {
+            let prepared = dataloader.prepare(chunk, args.threads.max(1), 0.0);
+            let batch = FastBatchHost::from(prepared);
+            let mut chunk_outputs = forward_weights.forward_batch(&batch).map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!("validation forward failed: {err}"))
+            })?;
+            outputs.append(&mut chunk_outputs);
+        }
     }
 
     let loss_kind = match args.loss_kind {
@@ -2515,13 +2531,23 @@ fn write_nnue_halfkp_nn_bin(
     use std::io::Write as _;
 
     let feature_set = NnueFeatureSet::HalfKp;
-    if shape.input_size != feature_set.input_size() {
+    let base_input_size = feature_set.input_size();
+    let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+    if shape.input_size != base_input_size && shape.input_size != base_input_size + virtual_rows {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "cannot write HalfKP nn.bin for input_size={}, expected {}",
+            "cannot write HalfKP nn.bin for input_size={}, expected {} or factorized {}",
             shape.input_size,
-            feature_set.input_size()
+            base_input_size,
+            base_input_size + virtual_rows
         )));
     }
+    let folded_l0w;
+    let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
+        &state.l0w.weights
+    } else {
+        folded_l0w = fold_halfkp_piece_factorized_l0w(&state.l0w.weights, base_input_size, virtual_rows, shape.l1)?;
+        &folded_l0w
+    };
 
     let qa: i16 = 127;
     let qb: i16 = 64;
@@ -2542,7 +2568,7 @@ fn write_nnue_halfkp_nn_bin(
             ))
         })?;
     write_quantized_i16(&mut writer, path, "l0b", &state.l0b.weights, qa)?;
-    write_quantized_i16(&mut writer, path, "l0w", &state.l0w.weights, qa)?;
+    write_quantized_i16(&mut writer, path, "l0w", l0w_for_export, qa)?;
     writer.write_all(&network_layer_hash_bytes(shape.l1, shape.l2, shape.l3)).map_err(|err| {
         bulletou_cuda_oxide_runtime::Error::Smoke(format!(
             "failed to write NNUE nn.bin network hash {}: {err}",
@@ -2569,6 +2595,40 @@ fn write_nnue_halfkp_nn_bin(
         bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to flush NNUE nn.bin {}: {err}", path.display()))
     })?;
     Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn fold_halfkp_piece_factorized_l0w(
+    weights: &[f32],
+    base_input_size: usize,
+    virtual_rows: usize,
+    l1: usize,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+    let expected = base_input_size
+        .checked_add(virtual_rows)
+        .and_then(|rows| rows.checked_mul(l1))
+        .ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "factorized HalfKP l0w shape overflow: base_input_size={base_input_size} virtual_rows={virtual_rows} l1={l1}"
+            ))
+        })?;
+    if weights.len() != expected {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "factorized HalfKP l0w length mismatch: expected {expected}, got {}",
+            weights.len()
+        )));
+    }
+    let mut folded = vec![0.0_f32; base_input_size * l1];
+    for row in 0..base_input_size {
+        let piece = row % virtual_rows;
+        let virtual_start = piece * l1;
+        let base_start = (virtual_rows + row) * l1;
+        let dst_start = row * l1;
+        for col in 0..l1 {
+            folded[dst_start + col] = weights[base_start + col] + weights[virtual_start + col];
+        }
+    }
+    Ok(folded)
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -5653,7 +5713,7 @@ fn grouped_ranger_step_params_for_step_with_hyperparams(
 ) -> bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
     bulletou_cuda_oxide_runtime::optimizer::RangerUpdateParams {
         radam: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
-            gradient_factor: 0.25,
+            gradient_factor: 1.0,
             learning_rate,
             step,
             decay,
@@ -5665,8 +5725,22 @@ fn grouped_ranger_step_params_for_step_with_hyperparams(
             max_weight: 1.98,
         },
         lookahead: bulletou_cuda_oxide_runtime::optimizer::RangerLookaheadParams { alpha: 0.5 },
-        k: 1,
+        k: 6,
     }
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_halfkp_factorized_input_size() -> usize {
+    bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.input_size
+        + bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS
+}
+
+#[cfg(feature = "cuda")]
+fn nnue_halfkp_uses_ft_factorize(shape: bulletou_cuda_oxide_runtime::nnue::NnueForwardShape) -> bool {
+    shape.input_size == nnue_halfkp_factorized_input_size()
+        && shape.l1 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l1
+        && shape.l2 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l2
+        && shape.l3 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l3
 }
 
 #[cfg(feature = "cuda")]
@@ -6183,6 +6257,72 @@ impl NnueForwardCase {
             l2b: deterministic_f32_vec(layout.l2b_len(), 0xB2A5_0020, 0.004, 0.02),
             outw: deterministic_f32_vec(layout.outw_len(), 0x0A17_0003, 0.02, 0.0),
             outb: deterministic_f32_vec(layout.outb_len(), 0x0B17_0004, 0.002, 0.01),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn tatara_simple_halfkp_256x2_32_32() -> Self {
+        let shape = bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32;
+        let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+        let batch_size = 2;
+        let max_active = 38;
+        let (stm, nstm) = deterministic_sparse_batch(batch_size, max_active, shape.input_size);
+
+        Self {
+            label: "tatara-simple-halfkp-256x2-32-32",
+            shape,
+            batch_size,
+            max_active,
+            stm,
+            nstm,
+            l0w: tatara_uniform_abs_init(layout.l0w_len(), 0x5071_e001, 0.01),
+            l0b: tatara_uniform_abs_init(layout.l0b_len(), 0x5071_e002, 0.01),
+            l1w: tatara_uniform_abs_init(layout.l1w_len(), 0x5071_e003, 0.01),
+            l1b: tatara_uniform_abs_init(layout.l1b_len(), 0x5071_e004, 0.01),
+            l2w: tatara_uniform_abs_init(layout.l2w_len(), 0x5071_e005, 0.01),
+            l2b: tatara_uniform_abs_init(layout.l2b_len(), 0x5071_e006, 0.01),
+            outw: tatara_uniform_abs_init(layout.outw_len(), 0x5071_e007, 0.01),
+            outb: tatara_uniform_abs_init(layout.outb_len(), 0x5071_e008, 0.01),
+        }
+    }
+
+    fn tatara_simple_factorized_halfkp_256x2_32_32() -> Self {
+        let base_shape = bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32;
+        let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+        let shape = bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
+            input_size: base_shape.input_size + virtual_rows,
+            l1: base_shape.l1,
+            l2: base_shape.l2,
+            l3: base_shape.l3,
+        };
+        let layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(shape);
+        let base_layout = bulletou_cuda_oxide_runtime::nnue::NnueForwardWeightLayout::new(base_shape);
+        let batch_size = 2;
+        let max_active = 76;
+        let (stm, nstm) = deterministic_sparse_batch(batch_size, max_active, shape.input_size);
+        let mut l0w = vec![0.0_f32; layout.l0w_len()];
+        let base_l0w = tatara_uniform_abs_init(base_layout.l0w_len(), 0x5071_e001, 0.01);
+        for row in 0..base_shape.input_size {
+            let src_start = row * shape.l1;
+            let dst_start = (virtual_rows + row) * shape.l1;
+            l0w[dst_start..dst_start + shape.l1].copy_from_slice(&base_l0w[src_start..src_start + shape.l1]);
+        }
+
+        Self {
+            label: "tatara-simple-factorized-halfkp-256x2-32-32",
+            shape,
+            batch_size,
+            max_active,
+            stm,
+            nstm,
+            l0w,
+            l0b: tatara_uniform_abs_init(layout.l0b_len(), 0x5071_e002, 0.01),
+            l1w: tatara_uniform_abs_init(layout.l1w_len(), 0x5071_e003, 0.01),
+            l1b: tatara_uniform_abs_init(layout.l1b_len(), 0x5071_e004, 0.01),
+            l2w: tatara_uniform_abs_init(layout.l2w_len(), 0x5071_e005, 0.01),
+            l2b: tatara_uniform_abs_init(layout.l2b_len(), 0x5071_e006, 0.01),
+            outw: tatara_uniform_abs_init(layout.outw_len(), 0x5071_e007, 0.01),
+            outb: tatara_uniform_abs_init(layout.outb_len(), 0x5071_e008, 0.01),
         }
     }
 
@@ -7696,6 +7836,35 @@ fn deterministic_f32_vec(len: usize, seed: u64, scale: f32, bias: f32) -> Vec<f3
             bias + centered as f32 * (scale / 1000.0)
         })
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> Vec<f32> {
+    let mut rng = TataraXorShift::new(seed);
+    (0..len).map(|_| rng.next_signed_unit() * half_width).collect()
+}
+
+#[cfg(feature = "cuda")]
+struct TataraXorShift {
+    state: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl TataraXorShift {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_unit(&mut self) -> f32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state >> 11) as f32 / ((1u64 << 53) as f32)
+    }
+
+    fn next_signed_unit(&mut self) -> f32 {
+        self.next_unit() * 2.0 - 1.0
+    }
 }
 
 #[cfg(feature = "cuda")]

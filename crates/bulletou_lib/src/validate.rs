@@ -40,8 +40,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
-use crate::teacher_path::{expand_teacher, infer_data_format, DataFormat};
-use crate::value::loader::hcpe::{decode_hcpe_record, HCPE_RECORD_SIZE};
+use crate::teacher_path::{DataFormat, expand_teacher, infer_data_format};
+use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
 
 const PSV_RECORD_SIZE: usize = std::mem::size_of::<PackedSfenValue>();
 
@@ -94,11 +94,7 @@ pub struct AccuracyReport {
 impl AccuracyReport {
     /// `sign_matches / compared`, or `NaN` if no positions were compared.
     pub fn accuracy(&self) -> f32 {
-        if self.compared == 0 {
-            f32::NAN
-        } else {
-            self.sign_matches as f32 / self.compared as f32
-        }
+        if self.compared == 0 { f32::NAN } else { self.sign_matches as f32 / self.compared as f32 }
     }
 }
 
@@ -529,7 +525,7 @@ mod tests {
         // training-loss subset.
         let m = [0.5, -0.1, 0.3, -0.2];
         let t = [200i16, 100, 0, -50]; // teacher scores (unused for
-                                       // accuracy when results given)
+        // accuracy when results given)
         let game = [1i8, 0, 0, -1]; // Win, Draw, Draw, Loss
         let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
         // i=0: Win, pred=true, truth=true → match
@@ -616,7 +612,7 @@ mod tests {
     fn test_loss_pure_wdl_target() {
         // lambda=0.0, blend=1 → target = result/2 mapping (Win=1, Loss=0, Draw=0.5)
         let m = [0.0, 0.0, 0.0]; // sigmoid(0) = 0.5
-                                 // results: +1 (win), -1 (loss), 0 (draw)
+        // results: +1 (win), -1 (loss), 0 (draw)
         let r = compute_sign_accuracy(&m, &[100i16, -100, 100], &[1, -1, 0], None, 0.0, 400.0);
         // draw position has teacher_score=100 (not 0) so accuracy still includes it,
         // but here we just check loss.

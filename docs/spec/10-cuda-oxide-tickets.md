@@ -31,6 +31,8 @@ commit each completed slice.
 | BO-CUDA-023 | done | YaneuraOu quantized eval cross-check | YaneuraOu `test eval_accuracy` on the cuda-oxide checkpoint `nn.bin` matches BulletOu's f32 checkpoint-time validation on the same held-out PSV |
 | BO-CUDA-024 | done | retire stale legacy cuda-oxide TODO rows | synced the older `09-cuda-oxide-todo.md` CO-008..CO-013 summary rows with the completed BO-CUDA implementation slices |
 | BO-CUDA-025 | done | final folder-teacher parity audit | reran the standard-NNUE parity harness using the requested teacher directory and validation HCPE, confirming same-PSV tatara/BulletOu accuracy parity and BulletOu speed parity |
+| BO-CUDA-026 | done | longer standard NNUE speed benchmark | reran the folder-teacher parity harness on 4M positions and exposed that the remaining gap was not the loader, but tatara's default HalfKP FT factorizer path |
+| BO-CUDA-027 | done | tatara-style HalfKP FT factorizer | BulletOu cuda-oxide standard NNUE training now uses tatara's piece-input factorizer for scratch HalfKP runs, folds it when writing `nn.bin`, and matches tatara's 4M same-PSV loss/accuracy/speed envelope |
 
 ## Notes
 
@@ -429,3 +431,30 @@ commit each completed slice.
   - checkpoint-time validation: `accuracy=65.0635% (5330/8192; pred>=0 4139 pred<0 4053 zero 0)`, `loss=0.055417`;
   - `summary-learn.log`: `test_value_accuracy=0.650635`, `test_value_loss=0.055417`, `train_value_loss=0.061433263`;
   - metrics-run throughput (`82659` pos/s) is intentionally not used for speed comparison because it includes checkpoint serialization and validation overhead.
+
+### BO-CUDA-027
+
+- Root cause of the BO-CUDA-026 gap:
+  - tatara's default `simple --feature-set halfkp` trains with the HalfKP FT factorizer enabled;
+  - BulletOu's cuda-oxide scratch path was training the non-factorized HalfKP input, so the comparison was unintentionally "tatara factorized" vs "BulletOu non-factorized".
+- Added a tatara-style `ShogiHalfKPPieceFactorizer`:
+  - virtual factor rows are the 1,548 `bona_piece` rows;
+  - factorized scratch shape is `input=126936` (`125388 + 1548`), `l1=256`, `l2=32`, `l3=32`;
+  - virtual rows are laid out before base HalfKP rows, matching `Factorised::merge_factoriser` folding semantics;
+  - cuda-oxide checkpoint validation uses the factorized input when the train state shape is factorized;
+  - `nn.bin` export folds the virtual piece rows back into ordinary HalfKP rows.
+- Also aligned the standard NNUE Ranger update clamp policy with tatara: the FT layer stays unclamped in fp32 training state, while the later quantized layers use their signed-int8-compatible clamp ranges.
+- Controlled 4M same-PSV comparison on `target\tatara-parity\parity-20260718-073904\teacher-4194304.psv`:
+  - tatara factorized, `threads=1`: superbatch64 train `loss=0.053733`, held-out `test_loss=0.054000`, `test_acc=0.6655`;
+  - tatara non-factorized, `threads=1 --no-ft-factorize`: superbatch64 train `loss=0.056900`, held-out `test_loss=0.055529`, `test_acc=0.6503`;
+  - BulletOu non-factorized control: superbatch64 average train `loss=0.056960131`, matching tatara's non-factorized result;
+  - BulletOu factorized speed run: `4194304` positions in `3.797s`, `1104772` pos/s, superbatch64 average train `loss=0.053683987`, `step512_loss mean=0.053936914`;
+  - BulletOu factorized validation run: `4194304` positions in `3.832s`, `1094486` pos/s, `step512_loss mean=0.053869173`, held-out `test_loss=0.052451`, `test_acc=0.664429`.
+- Result: on the 4M same-PSV benchmark, BulletOu is no longer materially behind tatara in either training loss/accuracy or throughput. The previous "BulletOu is roughly 53% of tatara throughput" note applies to the old non-factorized BulletOu run and should not be used as the current status.
+- Validation:
+  - `cargo fmt -p bulletou_lib`;
+  - `cargo fmt --package bulletou-cuda-train`;
+  - `cargo check -p bulletou_lib`;
+  - `cargo check -p bulletou-cuda-train`;
+  - WSL `cargo check -p bulletou-cuda-train --features cuda,root-loader`;
+  - WSL 4M factorized speed and checkpoint-validation runs listed above.

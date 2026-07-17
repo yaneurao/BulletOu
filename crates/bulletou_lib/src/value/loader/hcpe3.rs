@@ -56,8 +56,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
 
-use super::shogipack::MiniPosition;
 use super::DataLoader;
+use super::shogipack::MiniPosition;
 
 const HEADER_SIZE: usize = 36;
 const MOVE_INFO_SIZE: usize = 6;
@@ -325,8 +325,7 @@ where
         let consumed_offset = self.consumed_offset.clone();
         let consumed_plies = self.consumed_plies.clone();
 
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PackedSfenValue>, u64, usize)>(0);
 
         let producer = std::thread::spawn(move || {
             Self::produce_buffers(
@@ -385,10 +384,7 @@ where
         // 時にこのペアを attach する。初期値は呼び出し時点の resume 位置。
         let mut next_after_push: (u64, usize) = (resume_offset, resume_plies);
 
-        let total_bytes: u64 = file_paths
-            .iter()
-            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
-            .sum();
+        let total_bytes: u64 = file_paths.iter().filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len())).sum();
         if total_bytes == 0 {
             return;
         }
@@ -424,146 +420,128 @@ where
 
             // `current_global_offset` = 連結ファイル列の先頭からの現在の読み込み
             // 累積 byte 数。cyclic mode では sweep ごとに 0 から数え直す。
-            let mut current_global_offset: u64 = if first_sweep && resume_offset > 0 {
-                resume_offset
-            } else {
-                0
-            };
+            let mut current_global_offset: u64 = if first_sweep && resume_offset > 0 { resume_offset } else { 0 };
             let mut first_game_for_this_resume = first_sweep;
             let mut accepted_in_sweep = 0usize;
 
-        'files: for (idx, path) in file_paths.iter().enumerate() {
-            if idx < first_file_idx {
-                continue;
-            }
-            let file = match File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[Hcpe3DataLoader] failed to open {path}: {e}");
+            'files: for (idx, path) in file_paths.iter().enumerate() {
+                if idx < first_file_idx {
                     continue;
                 }
-            };
-            let mut reader = BufReader::with_capacity(1 << 20, file);
-            if idx == first_file_idx && in_file_seek > 0 {
-                if let Err(e) = reader.seek(SeekFrom::Start(in_file_seek)) {
-                    eprintln!("[Hcpe3DataLoader] seek error in {path}: {e}");
-                    continue;
-                }
-            }
-
-            loop {
-                let game_header_offset = current_global_offset;
-
-                // Game header (36 byte) を読む
-                let mut hdr = [0u8; HEADER_SIZE];
-                match read_exact_or_eof(&mut reader, &mut hdr) {
-                    Ok(true) => {}
-                    Ok(false) => break,
+                let file = match File::open(path) {
+                    Ok(f) => f,
                     Err(e) => {
-                        eprintln!("[Hcpe3DataLoader] read error in {path}: {e}");
-                        break;
-                    }
-                }
-                current_global_offset += HEADER_SIZE as u64;
-
-                let mut hcp = [0u8; 32];
-                hcp.copy_from_slice(&hdr[0..32]);
-                let move_num = u16::from_le_bytes([hdr[32], hdr[33]]) as usize;
-                let result_bits = (hdr[34] & 0x3) as i8;
-
-                let mut pos = match MiniPosition::from_hcp(&hcp, 0) {
-                    Some(p) => p,
-                    None => {
-                        // 不正な HCP。残り body を skip して次の game へ
-                        let body_bytes =
-                            match skip_remaining_game_and_count(&mut reader, move_num) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[Hcpe3DataLoader] skip error in {path}: {e}"
-                                    );
-                                    break;
-                                }
-                            };
-                        current_global_offset += body_bytes;
-                        first_game_for_this_resume = false;
+                        eprintln!("[Hcpe3DataLoader] failed to open {path}: {e}");
                         continue;
                     }
                 };
-
-                // resume_plies は最初の game でのみ有効。それ以外の game は 0。
-                let initial_skip = if first_game_for_this_resume {
-                    first_game_for_this_resume = false;
-                    resume_plies
-                } else {
-                    0
-                };
-
-                for i in 0..move_num {
-                    let mut mi = [0u8; MOVE_INFO_SIZE];
-                    match read_exact_or_eof(&mut reader, &mut mi) {
-                        Ok(true) => {}
-                        _ => break 'files, // 途中切れ
+                let mut reader = BufReader::with_capacity(1 << 20, file);
+                if idx == first_file_idx && in_file_seek > 0 {
+                    if let Err(e) = reader.seek(SeekFrom::Start(in_file_seek)) {
+                        eprintln!("[Hcpe3DataLoader] seek error in {path}: {e}");
+                        continue;
                     }
-                    current_global_offset += MOVE_INFO_SIZE as u64;
-                    let selected_move16 = u16::from_le_bytes([mi[0], mi[1]]);
-                    let eval = i16::from_le_bytes([mi[2], mi[3]]);
-                    let cand_num = u16::from_le_bytes([mi[4], mi[5]]) as usize;
+                }
 
-                    let do_push = i >= initial_skip;
-                    if do_push {
-                        let psv =
-                            pos.to_packed_sfen_value(eval, selected_move16, result_bits);
-                        if filter(&psv) {
-                            if legacy_skip_mode && skipped < start_position {
-                                skipped += 1;
-                            } else {
-                                accepted_in_sweep += 1;
-                                buffer.push(psv);
-                                // 次に push する PSV の位置 = (この game,
-                                // ply i+1)。i+1 == move_num の場合は次 game
-                                // の頭にあたるが、Producer 側の resume ロジック
-                                // が plies >= move_num を「この game を完全に
-                                // 飛ばす」と解釈するので問題ない。
-                                next_after_push = (game_header_offset, i + 1);
+                loop {
+                    let game_header_offset = current_global_offset;
 
-                                if buffer.len() >= buffer_size {
-                                    let taken = std::mem::replace(
-                                        &mut buffer,
-                                        Vec::with_capacity(buffer_size),
-                                    );
-                                    if tx
-                                        .send((
-                                            taken,
-                                            next_after_push.0,
-                                            next_after_push.1,
-                                        ))
-                                        .is_err()
-                                    {
-                                        return;
+                    // Game header (36 byte) を読む
+                    let mut hdr = [0u8; HEADER_SIZE];
+                    match read_exact_or_eof(&mut reader, &mut hdr) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("[Hcpe3DataLoader] read error in {path}: {e}");
+                            break;
+                        }
+                    }
+                    current_global_offset += HEADER_SIZE as u64;
+
+                    let mut hcp = [0u8; 32];
+                    hcp.copy_from_slice(&hdr[0..32]);
+                    let move_num = u16::from_le_bytes([hdr[32], hdr[33]]) as usize;
+                    let result_bits = (hdr[34] & 0x3) as i8;
+
+                    let mut pos = match MiniPosition::from_hcp(&hcp, 0) {
+                        Some(p) => p,
+                        None => {
+                            // 不正な HCP。残り body を skip して次の game へ
+                            let body_bytes = match skip_remaining_game_and_count(&mut reader, move_num) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("[Hcpe3DataLoader] skip error in {path}: {e}");
+                                    break;
+                                }
+                            };
+                            current_global_offset += body_bytes;
+                            first_game_for_this_resume = false;
+                            continue;
+                        }
+                    };
+
+                    // resume_plies は最初の game でのみ有効。それ以外の game は 0。
+                    let initial_skip = if first_game_for_this_resume {
+                        first_game_for_this_resume = false;
+                        resume_plies
+                    } else {
+                        0
+                    };
+
+                    for i in 0..move_num {
+                        let mut mi = [0u8; MOVE_INFO_SIZE];
+                        match read_exact_or_eof(&mut reader, &mut mi) {
+                            Ok(true) => {}
+                            _ => break 'files, // 途中切れ
+                        }
+                        current_global_offset += MOVE_INFO_SIZE as u64;
+                        let selected_move16 = u16::from_le_bytes([mi[0], mi[1]]);
+                        let eval = i16::from_le_bytes([mi[2], mi[3]]);
+                        let cand_num = u16::from_le_bytes([mi[4], mi[5]]) as usize;
+
+                        let do_push = i >= initial_skip;
+                        if do_push {
+                            let psv = pos.to_packed_sfen_value(eval, selected_move16, result_bits);
+                            if filter(&psv) {
+                                if legacy_skip_mode && skipped < start_position {
+                                    skipped += 1;
+                                } else {
+                                    accepted_in_sweep += 1;
+                                    buffer.push(psv);
+                                    // 次に push する PSV の位置 = (この game,
+                                    // ply i+1)。i+1 == move_num の場合は次 game
+                                    // の頭にあたるが、Producer 側の resume ロジック
+                                    // が plies >= move_num を「この game を完全に
+                                    // 飛ばす」と解釈するので問題ない。
+                                    next_after_push = (game_header_offset, i + 1);
+
+                                    if buffer.len() >= buffer_size {
+                                        let taken = std::mem::replace(&mut buffer, Vec::with_capacity(buffer_size));
+                                        if tx.send((taken, next_after_push.0, next_after_push.1)).is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // MoveVisits を読み飛ばし (cand_num * 4 byte)
-                    if cand_num > 0 {
-                        let bytes = MOVE_VISITS_SIZE * cand_num;
-                        if let Err(e) = skip_bytes(&mut reader, bytes) {
-                            eprintln!("[Hcpe3DataLoader] skip MoveVisits error in {path}: {e}");
-                            break 'files;
+                        // MoveVisits を読み飛ばし (cand_num * 4 byte)
+                        if cand_num > 0 {
+                            let bytes = MOVE_VISITS_SIZE * cand_num;
+                            if let Err(e) = skip_bytes(&mut reader, bytes) {
+                                eprintln!("[Hcpe3DataLoader] skip MoveVisits error in {path}: {e}");
+                                break 'files;
+                            }
+                            current_global_offset += bytes as u64;
                         }
-                        current_global_offset += bytes as u64;
-                    }
 
-                    // do_move (最後の ply は進めない)
-                    if i + 1 < move_num {
-                        pos.do_move(selected_move16);
+                        // do_move (最後の ply は進めない)
+                        if i + 1 < move_num {
+                            pos.do_move(selected_move16);
+                        }
                     }
                 }
             }
-        }
 
             if accepted_in_sweep == 0 {
                 consecutive_empty_sweeps += 1;
@@ -592,10 +570,7 @@ where
 }
 
 /// `skip_remaining_game` と同じだが、skip した byte 数も返す (resume 用)。
-fn skip_remaining_game_and_count<R: Read>(
-    reader: &mut R,
-    move_num: usize,
-) -> std::io::Result<u64> {
+fn skip_remaining_game_and_count<R: Read>(reader: &mut R, move_num: usize) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     for _ in 0..move_num {
         let mut mi = [0u8; MOVE_INFO_SIZE];
@@ -663,8 +638,7 @@ mod tests {
         }
 
         // 比較件数は XREF_COUNT で上書き可能 (default 10000)
-        let target_count: usize =
-            std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        let target_count: usize = std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
 
         // Rust 側: decode_one_game を順次呼び、最初の target_count ply を集める。
         let file = std::fs::File::open(&hcpe3_path).expect("open hcpe3");
@@ -705,9 +679,7 @@ mod tests {
                     eprintln!("first MISMATCH at record {i}:");
                     eprintln!("  ours (Rust):    {}", hex(ours[i].as_bytes()));
                     eprintln!("  cshogi (psv):   {}", hex(&psv_rec));
-                    let diffs: Vec<usize> = (0..40)
-                        .filter(|&k| ours[i].as_bytes()[k] != psv_rec[k])
-                        .collect();
+                    let diffs: Vec<usize> = (0..40).filter(|&k| ours[i].as_bytes()[k] != psv_rec[k]).collect();
                     eprintln!("  diff offsets:   {diffs:?}");
                 }
             }

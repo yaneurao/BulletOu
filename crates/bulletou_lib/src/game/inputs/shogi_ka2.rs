@@ -66,7 +66,8 @@ impl SparseInputType for ShogiKa2 {
     }
 
     fn description(&self) -> String {
-        "Shogi K+A2: 162 king features + 1629 piece features (kings collapsed onto friend plane) per perspective".to_string()
+        "Shogi K+A2: 162 king features + 1629 piece features (kings collapsed onto friend plane) per perspective"
+            .to_string()
     }
 }
 

@@ -330,12 +330,7 @@ mod tests {
 
     #[test]
     fn workspace_layout_counts_forward_activations() {
-        let shape = NnueForwardShape {
-            input_size: 4,
-            l1: 2,
-            l2: 3,
-            l3: 1,
-        };
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 };
         let layout = NnueForwardWorkspaceLayout::new(shape, 5);
 
         assert_eq!(layout.l0_len(), 10);
@@ -371,12 +366,7 @@ mod tests {
         let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
         let weights = tiny_weights(shape);
         let batch = FastBatchHost {
-            layout: FastBatchLayout {
-                batch_size: 1,
-                max_active: 3,
-                output_size: 1,
-                hand_count_dim: 0,
-            },
+            layout: FastBatchLayout { batch_size: 1, max_active: 3, output_size: 1, hand_count_dim: 0 },
             stm: vec![0, 1, -1],
             nstm: vec![2, -1, -1],
             buckets: vec![0],
@@ -490,10 +480,7 @@ mod tests {
     fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len(), "{name} length mismatch");
         for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-            assert!(
-                (actual - expected).abs() < 1.0e-6,
-                "{name}[{idx}] mismatch: expected {expected}, got {actual}"
-            );
+            assert!((actual - expected).abs() < 1.0e-6, "{name}[{idx}] mismatch: expected {expected}, got {actual}");
         }
     }
 }

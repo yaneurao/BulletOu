@@ -14,7 +14,7 @@ use std::{
 
 use bulletou_lib::{
     shogi::PackedSfenValue,
-    teacher_path::{expand_teacher, infer_data_format, DataFormat},
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     value::loader::{DataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
 };
 use clap::Parser;

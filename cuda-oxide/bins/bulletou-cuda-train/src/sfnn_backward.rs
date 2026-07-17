@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
+    CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
     backward::{
         SfnnL0SparseBackwardLaunchPlan, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLaunchPlan,
         SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan, SfnnPairwiseBackwardLayout,
@@ -10,7 +11,6 @@ use bulletou_cuda_oxide_runtime::{
         SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout,
         SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
     },
-    CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
 };
 use cuda_host::cuda_launch;
 

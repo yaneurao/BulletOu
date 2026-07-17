@@ -1,7 +1,7 @@
 //! Minimal backward kernels for CO-009.
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
-use cuda_device::{kernel, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel, thread};
 
 #[kernel]
 pub fn dense_output_backward(
@@ -667,9 +667,5 @@ fn dense_crelu_pre_gradient(
 
 #[cuda_device::device]
 fn crelu_pre_gradient_from_value(activation: f32, output_gradient: f32) -> f32 {
-    if activation > 0.0_f32 && activation < 1.0_f32 {
-        output_gradient
-    } else {
-        0.0_f32
-    }
+    if activation > 0.0_f32 && activation < 1.0_f32 { output_gradient } else { 0.0_f32 }
 }

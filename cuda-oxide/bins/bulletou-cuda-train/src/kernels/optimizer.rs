@@ -1,6 +1,6 @@
 //! Minimal optimizer kernels for CO-010.
 
-use cuda_device::{device, kernel, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, device, kernel, thread};
 
 #[kernel]
 pub fn adamw_update(
@@ -83,12 +83,7 @@ pub fn radam_update(
 }
 
 #[kernel]
-pub fn ranger_lookahead(
-    mut weights: DisjointSlice<f32>,
-    mut slow_params: DisjointSlice<f32>,
-    len: u32,
-    alpha: f32,
-) {
+pub fn ranger_lookahead(mut weights: DisjointSlice<f32>, mut slow_params: DisjointSlice<f32>, len: u32, alpha: f32) {
     let tid = thread::index_1d();
     let idx = tid.get();
     if idx >= len as usize {

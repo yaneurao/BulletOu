@@ -5,7 +5,7 @@ use std::{error::Error, fmt, sync::atomic::Ordering};
 
 use crate::{
     game::{
-        inputs::{ShogiHalfKa2, ShogiHalfKP},
+        inputs::{Factorised, ShogiHalfKP, ShogiHalfKPPieceFactorizer, ShogiHalfKa2, SparseInputType},
         outputs::ShogiLayerStackBucket9,
     },
     shogi::PackedSfenValue,
@@ -13,8 +13,7 @@ use crate::{
     value::{
         FastBatchHost, NoOutputBuckets,
         loader::{
-            DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader,
+            DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader,
         },
     },
 };
@@ -45,6 +44,8 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub scale: f32,
     /// Use nnue-pytorch WRM target conversion while preparing teacher targets.
     pub nnue_pytorch_wrm_loss: bool,
+    /// Add tatara-style HalfKP piece-input virtual rows to the FT input.
+    pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
     pub score_drop_abs: Option<u16>,
     /// Print CPU batch materialisation timing for profiling runs.
@@ -175,7 +176,9 @@ where
                 config,
                 batch_count,
                 loader_start_batch,
-                move |visited_batches| hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches),
+                move |visited_batches| {
+                    hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches)
+                },
                 visitor,
             )
         }
@@ -191,12 +194,20 @@ where
             } else {
                 config.batch_index
             };
-            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| {
-                Some(TeacherDataloaderPos {
-                    byte_offset: offset_handle.load(Ordering::Acquire),
-                    plies: plies_handle.load(Ordering::Acquire),
-                })
-            }, visitor)
+            visit_halfkp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
         }
         DataFormat::Pack => {
             let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
@@ -210,12 +221,20 @@ where
             } else {
                 config.batch_index
             };
-            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| {
-                Some(TeacherDataloaderPos {
-                    byte_offset: offset_handle.load(Ordering::Acquire),
-                    plies: plies_handle.load(Ordering::Acquire),
-                })
-            }, visitor)
+            visit_halfkp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
@@ -283,7 +302,9 @@ where
                 config,
                 batch_count,
                 loader_start_batch,
-                move |visited_batches| hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches),
+                move |visited_batches| {
+                    hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches)
+                },
                 visitor,
             )
         }
@@ -299,12 +320,20 @@ where
             } else {
                 config.batch_index
             };
-            visit_sfnn_batches(loader, format, config, batch_count, loader_start_batch, |_| {
-                Some(TeacherDataloaderPos {
-                    byte_offset: offset_handle.load(Ordering::Acquire),
-                    plies: plies_handle.load(Ordering::Acquire),
-                })
-            }, visitor)
+            visit_sfnn_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
         }
         DataFormat::Pack => {
             let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
@@ -318,12 +347,20 @@ where
             } else {
                 config.batch_index
             };
-            visit_sfnn_batches(loader, format, config, batch_count, loader_start_batch, |_| {
-                Some(TeacherDataloaderPos {
-                    byte_offset: offset_handle.load(Ordering::Acquire),
-                    plies: plies_handle.load(Ordering::Acquire),
-                })
-            }, visitor)
+            visit_sfnn_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
@@ -375,8 +412,8 @@ fn visit_halfkp_batches<D, P, F, E>(
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
     loader_start_batch: usize,
-    mut dataloader_pos: P,
-    mut visitor: F,
+    dataloader_pos: P,
+    visitor: F,
 ) -> Result<usize, TeacherBatchError>
 where
     D: DataLoader<PackedSfenValue>,
@@ -384,9 +421,51 @@ where
     F: FnMut(HalfkpTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
+    if config.ft_factorize {
+        visit_halfkp_batches_with_input(
+            Factorised::from_parts(ShogiHalfKP, ShogiHalfKPPieceFactorizer),
+            loader,
+            format,
+            config,
+            batch_count,
+            loader_start_batch,
+            dataloader_pos,
+            visitor,
+        )
+    } else {
+        visit_halfkp_batches_with_input(
+            ShogiHalfKP,
+            loader,
+            format,
+            config,
+            batch_count,
+            loader_start_batch,
+            dataloader_pos,
+            visitor,
+        )
+    }
+}
+
+fn visit_halfkp_batches_with_input<I, D, P, F, E>(
+    input_getter: I,
+    loader: D,
+    format: DataFormat,
+    config: &HalfkpTeacherBatchConfig<'_>,
+    batch_count: usize,
+    loader_start_batch: usize,
+    mut dataloader_pos: P,
+    mut visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    I: SparseInputType<RequiredDataType = PackedSfenValue>,
+    D: DataLoader<PackedSfenValue>,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
+    F: FnMut(HalfkpTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
     let threads = config.threads.max(1);
     let dataloader = DefaultDataLoader::new(
-        ShogiHalfKP,
+        input_getter,
         NoOutputBuckets,
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
@@ -547,6 +626,7 @@ mod tests {
             lambda: 1.0,
             scale: 400.0,
             nnue_pytorch_wrm_loss: false,
+            ft_factorize: false,
             score_drop_abs: Some(32_000),
             profile_prepare: false,
         }
@@ -582,8 +662,7 @@ mod tests {
         config.teacher = Box::leak(teacher.into_boxed_str());
         config.dataloader_resume_pos = Some(TeacherDataloaderPos { byte_offset: 0, plies: 1 });
 
-        let err =
-            for_each_halfkp_teacher_fast_batch(&config, 1, |_| Ok::<(), TeacherBatchError>(())).unwrap_err();
+        let err = for_each_halfkp_teacher_fast_batch(&config, 1, |_| Ok::<(), TeacherBatchError>(())).unwrap_err();
         assert!(err.to_string().contains("plies=0"));
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
