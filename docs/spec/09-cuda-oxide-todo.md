@@ -978,6 +978,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `--features cuda,root-loader`, and a two-step direct teacher train all passed.
   The streamed direct final fixture SHA-256 again matched the fixture-backed
   one-shot two-step final exactly.
+- Added `--nnue-train-state-fixture` restore support to
+  `--nnue-teacher-train`. Direct resume reads `BOUNRNG1`, uploads saved weights
+  plus Ranger optimizer state, starts the teacher loader at `completed_steps`,
+  and treats `--train-steps` as the number of additional batches for this run.
+  Validation: direct one-step state -> direct one-step resume produced
+  `nnue-halfkp-direct-resume-final.nnuef`; its SHA-256 matched the fixture-backed
+  one-shot two-step final exactly, with step2 loss matching the one-shot run.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.

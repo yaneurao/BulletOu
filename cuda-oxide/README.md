@@ -117,6 +117,10 @@ cargo run -p bulletou-cuda-train --features cuda,root-loader --release -- \
   --train-steps 2 --batch-size 2 --buffer-mb 1 --loader-threads 1 --threads 1
 ```
 
+Pass `--nnue-train-state-fixture <BOUNRNG1>` to resume direct teacher training.
+In this mode `--train-steps` is the number of additional batches to run, and
+the loader starts at `completed_steps` from the state fixture.
+
 The PowerShell helper can run this extra path with `-RunDirectTeacherTrain`.
 Use `-DirectTrainedForwardFixture <PATH>` or `-DirectTrainStateFixture <PATH>`
 to save its readback fixtures.

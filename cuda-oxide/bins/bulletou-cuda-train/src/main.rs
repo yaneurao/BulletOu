@@ -1020,7 +1020,6 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
 #[cfg(feature = "cuda")]
 #[cfg(feature = "root-loader")]
 fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
-    use bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights;
     use nnue_train_step::{NnueLossRangerStepRunner, NnueTrainLossKind, NnueTrainStepHostBatch};
 
     let teacher = args.teacher.as_deref().ok_or_else(|| {
@@ -1043,17 +1042,25 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     };
 
     let initial_case = NnueForwardCase::new(NnueForwardCaseKind::Halfkp);
-    let host_weights = NnueForwardHostWeights {
-        shape: initial_case.shape,
-        l0w: &initial_case.l0w,
-        l0b: &initial_case.l0b,
-        l1w: &initial_case.l1w,
-        l1b: &initial_case.l1b,
-        l2w: &initial_case.l2w,
-        l2b: &initial_case.l2b,
-        outw: &initial_case.outw,
-        outb: &initial_case.outb,
+    let restored_state = match args.nnue_train_state_fixture.as_deref() {
+        Some(path) => Some(NnueTrainStateCase::read_fixture(path)?),
+        None => None,
     };
+    let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
+    if shape != initial_case.shape {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "--nnue-teacher-train currently supports only HalfKP shape input={} l1={} l2={} l3={}, but state has input={} l1={} l2={} l3={}",
+            initial_case.shape.input_size,
+            initial_case.shape.l1,
+            initial_case.shape.l2,
+            initial_case.shape.l3,
+            shape.input_size,
+            shape.l1,
+            shape.l2,
+            shape.l3
+        )));
+    }
+    let completed_step_offset = restored_state.as_ref().map(|state| state.completed_steps).unwrap_or(0);
 
     let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
     let stream = ctx.default_stream();
@@ -1067,11 +1074,11 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut losses = Vec::with_capacity(args.train_steps);
     let mut sources = Vec::with_capacity(args.train_steps);
     let mut last_batch = None;
-    let mut completed_steps = 0usize;
+    let mut run_steps = 0usize;
     let teacher_batch_config = bulletou_lib::value::HalfkpTeacherBatchConfig {
         teacher,
         batch_size: args.batch_size,
-        batch_index: 0,
+        batch_index: completed_step_offset,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -1085,18 +1092,40 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         args.train_steps,
         |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
             let source = loaded.source;
-            let train_batch = nnue_train_batch_from_root_fast_batch(initial_case.shape.input_size, loaded.batch)?;
+            let train_batch = nnue_train_batch_from_root_fast_batch(shape.input_size, loaded.batch)?;
             if runner.is_none() {
-                runner = Some(NnueLossRangerStepRunner::new(
-                    &stream,
-                    &host_weights,
-                    train_batch.batch_size,
-                    train_batch.max_active,
-                )?);
+                runner = Some(match restored_state.as_ref() {
+                    Some(state) => NnueLossRangerStepRunner::with_optimizer_state(
+                        &stream,
+                        &state.host_weights(),
+                        state.host_optimizer_states(),
+                        train_batch.batch_size,
+                        train_batch.max_active,
+                    )?,
+                    None => {
+                        let host_weights = bulletou_cuda_oxide_runtime::nnue::NnueForwardHostWeights {
+                            shape: initial_case.shape,
+                            l0w: &initial_case.l0w,
+                            l0b: &initial_case.l0b,
+                            l1w: &initial_case.l1w,
+                            l1b: &initial_case.l1b,
+                            l2w: &initial_case.l2w,
+                            l2b: &initial_case.l2b,
+                            outw: &initial_case.outw,
+                            outb: &initial_case.outb,
+                        };
+                        NnueLossRangerStepRunner::new(
+                            &stream,
+                            &host_weights,
+                            train_batch.batch_size,
+                            train_batch.max_active,
+                        )?
+                    }
+                });
             }
 
             let runner_ref = runner.as_mut().expect("runner is initialized");
-            let step = completed_steps + 1;
+            let step = completed_step_offset + run_steps + 1;
             let params = grouped_ranger_step_params_for_step(step);
             let host_batch = NnueTrainStepHostBatch {
                 stm_indices: &train_batch.stm,
@@ -1113,7 +1142,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             losses.push((step, loss.weighted_sum[0], loss.mean[0]));
             sources.push(source);
             last_batch = Some(train_batch);
-            completed_steps += 1;
+            run_steps += 1;
             Ok(())
         },
     )
@@ -1129,7 +1158,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         let weights = runner.read_weights(&stream)?;
         let trained_forward = NnueForwardCase {
             label: "teacher-trained-forward-fixture",
-            shape: initial_case.shape,
+            shape,
             batch_size: last_batch.batch_size,
             max_active: last_batch.max_active,
             stm: last_batch.stm.clone(),
@@ -1147,7 +1176,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     if let Some(path) = &args.write_nnue_train_state_fixture {
         let state = runner.read_state(&stream)?;
-        write_nnue_train_state_fixture(path, initial_case.shape, args.train_steps, &state)?;
+        write_nnue_train_state_fixture(path, shape, completed_step_offset + run_steps, &state)?;
     }
 
     println!("bulletou-cuda-train NNUE teacher train");
@@ -1162,8 +1191,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  batch        : {} samples", last_batch.batch_size);
     println!(
         "  shape        : input={} l1={} l2={} l3={}",
-        initial_case.shape.input_size, initial_case.shape.l1, initial_case.shape.l2, initial_case.shape.l3
+        shape.input_size, shape.l1, shape.l2, shape.l3
     );
+    println!("  start_step   : {}", completed_step_offset + 1);
     println!("  steps        : {}", losses.len());
     for (step, weighted_sum, mean) in losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
