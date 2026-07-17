@@ -539,3 +539,34 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 - Remaining CO-010 work: wire this update into the real trainer parameter
   groups and reconcile the existing optimizer variant naming (Ranger/RAdam vs
   current AdamW baseline).
+
+### 2026-07-17 CO-010 RAdam update smoke
+
+- Added cuda-oxide runtime layout/params for a fused RAdam update:
+  `RAdamUpdateLayout { len }` and `RAdamUpdateParams`.
+- Added host-side RAdam step-size calculation matching the existing
+  `crates/trainer/src/optimiser/radam.rs` formula.
+- Added CUDA kernel `radam_update`:
+  - applies `gradient_factor`;
+  - uses `learning_rate * step_size` as the effective rate, matching existing
+    RAdam weight decay behavior;
+  - updates momentum and velocity buffers;
+  - conditionally divides by `sqrt(velocity) + epsilon` when the rectified
+    branch is active;
+  - clamps the updated weight into `[min_weight, max_weight]`.
+- Added host launcher and CLI:
+  `bulletou-cuda-train --radam-update-smoke`.
+- The smoke runs two 7-parameter cases: `step=1` for the warmup/no-denominator
+  branch and `step=6` for the rectified denominator branch.
+- Validation:
+  - `cargo check -p bulletou-cuda-train` succeeded.
+  - `cargo test -p bulletou-cuda-oxide-runtime optimizer` succeeded.
+  - `cargo check -p bulletou-cuda-train --features cuda` succeeded in WSL2
+    Ubuntu-24.04.
+  - `cargo oxide build --arch sm_89 --features cuda -- --package
+    bulletou-cuda-train --release` succeeded in WSL2 Ubuntu-24.04.
+  - `--radam-update-smoke --debug-readback` succeeded on RTX 4090:
+    warmup/no-denominator and rectified-denominator cases both had max_abs diff
+    `0` for `weights`, `momentum`, and `velocity`.
+- Remaining CO-010 work: add Lookahead/Ranger smoke, then wire optimizer state
+  buffers into the real trainer path.

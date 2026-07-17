@@ -45,6 +45,7 @@ fn run() -> bulletou_cuda_oxide_runtime::Result<()> {
         SmokeMode::NnueDenseBackward => run_nnue_dense_backward_smoke(args),
         SmokeMode::NnueForward => run_nnue_forward_smoke(args),
         SmokeMode::AdamWUpdate => run_adamw_update_smoke(args),
+        SmokeMode::RAdamUpdate => run_radam_update_smoke(args),
         SmokeMode::SfnnOutputBackward => run_sfnn_output_backward_smoke(args),
         SmokeMode::SfnnForward => run_sfnn_forward_smoke(args),
     }
@@ -79,6 +80,7 @@ enum SmokeMode {
     NnueDenseBackward,
     NnueForward,
     AdamWUpdate,
+    RAdamUpdate,
     SfnnOutputBackward,
     SfnnForward,
 }
@@ -140,6 +142,7 @@ impl Args {
                 "--nnue-dense-backward-smoke" => parsed.mode = SmokeMode::NnueDenseBackward,
                 "--nnue-forward-smoke" => parsed.mode = SmokeMode::NnueForward,
                 "--adamw-update-smoke" => parsed.mode = SmokeMode::AdamWUpdate,
+                "--radam-update-smoke" => parsed.mode = SmokeMode::RAdamUpdate,
                 "--sfnn-dense-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-output-backward-smoke" => parsed.mode = SmokeMode::SfnnOutputBackward,
                 "--sfnn-forward-smoke" => parsed.mode = SmokeMode::SfnnForward,
@@ -671,6 +674,89 @@ fn run_adamw_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("  cpu weights  : {:?}", cpu_trace.weights);
         println!("  gpu weights  : {:?}", gpu_weights);
     }
+    println!("  compare      : ok");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_radam_update_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
+    use bulletou_cuda_oxide_runtime::{optimizer::RAdamUpdateLayout, DeviceBuffer};
+
+    let cases = RAdamUpdateCase::cases();
+    let ptx = match args.ptx {
+        Some(ptx) => ptx,
+        None => default_nnue_ptx()?,
+    };
+
+    let ctx = bulletou_cuda_oxide_runtime::CudaContext::new(args.device)?;
+    let stream = ctx.default_stream();
+    let module = bulletou_cuda_oxide_runtime::load_ptx_module(&ctx, &ptx)?;
+
+    println!("bulletou-cuda-train RAdam update smoke");
+    println!("  ptx          : {}", ptx.display());
+    println!("  device       : {}", args.device);
+    println!("  tolerance    : {}", args.tolerance);
+
+    for case in cases {
+        let cpu_trace = case.cpu_update_trace()?;
+        let layout = RAdamUpdateLayout::new(case.weights.len());
+        let gradients = DeviceBuffer::from_host(&stream, &case.gradients)?;
+        let mut weights = DeviceBuffer::from_host(&stream, &case.weights)?;
+        let mut momentum = DeviceBuffer::from_host(&stream, &case.momentum)?;
+        let mut velocity = DeviceBuffer::from_host(&stream, &case.velocity)?;
+
+        optimizer_update::launch_radam_update(
+            &stream,
+            &module,
+            layout,
+            case.params,
+            &gradients,
+            &mut weights,
+            &mut momentum,
+            &mut velocity,
+        )?;
+        stream.synchronize()?;
+
+        let gpu_weights = weights.to_host_vec(&stream)?;
+        let gpu_momentum = momentum.to_host_vec(&stream)?;
+        let gpu_velocity = velocity.to_host_vec(&stream)?;
+        let comparisons = [
+            compare_slices("weights", &cpu_trace.weights, &gpu_weights, args.tolerance)?,
+            compare_slices("momentum", &cpu_trace.momentum, &gpu_momentum, args.tolerance)?,
+            compare_slices("velocity", &cpu_trace.velocity, &gpu_velocity, args.tolerance)?,
+        ];
+
+        println!("  case         : {}", case.label);
+        println!("    len        : {}", case.weights.len());
+        println!(
+            "    params     : step={} lr={} decay={} beta1={} beta2={} eps={} clamp=[{}, {}] grad_factor={}",
+            case.params.step,
+            case.params.learning_rate,
+            case.params.decay,
+            case.params.beta1,
+            case.params.beta2,
+            case.params.epsilon,
+            case.params.min_weight,
+            case.params.max_weight,
+            case.params.gradient_factor
+        );
+        println!(
+            "    step_scale : step_size={} use_denom={}",
+            cpu_trace.step_scale.step_size, cpu_trace.step_scale.use_denom
+        );
+        for cmp in comparisons {
+            println!(
+                "    {:<9}: max_abs={} at {}, mean_abs={}",
+                cmp.name, cmp.max_abs_diff, cmp.max_abs_index, cmp.mean_abs_diff
+            );
+        }
+        if args.debug_readback {
+            println!("    cpu weights: {:?}", cpu_trace.weights);
+            println!("    gpu weights: {:?}", gpu_weights);
+        }
+    }
+
     println!("  compare      : ok");
 
     Ok(())
@@ -1209,6 +1295,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -1236,6 +1323,9 @@ fn usage() -> &'static str {
      CO-010 AdamW update smoke: compare one fused weight/momentum/velocity\n\
      update pass against a CPU scalar golden, including decoupled weight decay\n\
      and weight clamping.\n\
+     CO-010 RAdam update smoke: compare the fused RAdam weight/momentum/\n\
+     velocity update against CPU scalar goldens for both the warmup and\n\
+     rectified denominator branches.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
@@ -1314,6 +1404,81 @@ impl AdamWUpdateCase {
         }
 
         AdamWUpdateTrace { weights, momentum, velocity }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RAdamUpdateCase {
+    label: &'static str,
+    gradients: Vec<f32>,
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    params: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct RAdamUpdateTrace {
+    weights: Vec<f32>,
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    step_scale: bulletou_cuda_oxide_runtime::optimizer::RAdamStepScale,
+}
+
+#[cfg(feature = "cuda")]
+impl RAdamUpdateCase {
+    fn cases() -> [Self; 2] {
+        [
+            Self::new("warmup-no-denom", 1),
+            Self::new("rectified-denom", 6),
+        ]
+    }
+
+    fn new(label: &'static str, step: usize) -> Self {
+        Self {
+            label,
+            gradients: vec![0.1, -0.2, 5.0, -5.0, 0.0, 0.3, -0.4],
+            weights: vec![0.5, -0.25, 1.97, -1.97, 0.0, 1.2, -1.2],
+            momentum: vec![0.0, 0.01, -0.02, 0.03, 0.0, 0.2, -0.1],
+            velocity: vec![0.0, 0.0004, 0.0009, 0.0016, 0.0, 0.04, 0.09],
+            params: bulletou_cuda_oxide_runtime::optimizer::RAdamUpdateParams {
+                gradient_factor: 0.25,
+                learning_rate: 0.01,
+                step,
+                decay: 0.01,
+                beta1: 0.9,
+                beta2: 0.999,
+                n_sma_threshold: 5.0,
+                epsilon: 1.0e-8,
+                min_weight: -1.0,
+                max_weight: 1.0,
+            },
+        }
+    }
+
+    fn cpu_update_trace(&self) -> bulletou_cuda_oxide_runtime::Result<RAdamUpdateTrace> {
+        let step_scale = self.params.step_scale()?;
+        let rate = self.params.learning_rate * step_scale.step_size;
+        let mut weights = self.weights.clone();
+        let mut momentum = self.momentum.clone();
+        let mut velocity = self.velocity.clone();
+
+        for idx in 0..weights.len() {
+            let grad = self.params.gradient_factor * self.gradients[idx];
+            weights[idx] *= 1.0 - self.params.decay * rate;
+            momentum[idx] = self.params.beta1 * momentum[idx] + (1.0 - self.params.beta1) * grad;
+            velocity[idx] = self.params.beta2 * velocity[idx] + (1.0 - self.params.beta2) * grad * grad;
+            let mut value = momentum[idx];
+            if step_scale.use_denom {
+                value /= velocity[idx].sqrt() + self.params.epsilon;
+            }
+            weights[idx] -= rate * value;
+            weights[idx] = weights[idx].clamp(self.params.min_weight, self.params.max_weight);
+        }
+
+        Ok(RAdamUpdateTrace { weights, momentum, velocity, step_scale })
     }
 }
 
