@@ -9,13 +9,15 @@ use crate::{CudaStream, DeviceBuffer, Result};
 pub const SFNN_SPARSE_L0_CRELU_KERNEL: &str = "sfnn_sparse_l0_crelu";
 pub const SFNN_PAIRWISE_CONCAT_KERNEL: &str = "sfnn_pairwise_concat";
 pub const SFNN_STACKED_L1_KERNEL: &str = "sfnn_stacked_l1";
+pub const SFNN_SHARED_L1_ADD_KERNEL: &str = "sfnn_shared_l1_add";
 pub const SFNN_L2_INPUT_KERNEL: &str = "sfnn_l2_input";
 pub const SFNN_STACKED_L2_CRELU_KERNEL: &str = "sfnn_stacked_l2_crelu";
 pub const SFNN_STACKED_L3_OUTPUT_KERNEL: &str = "sfnn_stacked_l3_output";
-pub const SFNN_FORWARD_KERNEL_NAMES: [&str; 6] = [
+pub const SFNN_FORWARD_KERNEL_NAMES: [&str; 7] = [
     SFNN_SPARSE_L0_CRELU_KERNEL,
     SFNN_PAIRWISE_CONCAT_KERNEL,
     SFNN_STACKED_L1_KERNEL,
+    SFNN_SHARED_L1_ADD_KERNEL,
     SFNN_L2_INPUT_KERNEL,
     SFNN_STACKED_L2_CRELU_KERNEL,
     SFNN_STACKED_L3_OUTPUT_KERNEL,
@@ -95,6 +97,14 @@ impl SfnnForwardWeightLayout {
         self.shape.num_stacks.saturating_mul(self.shape.l1_out())
     }
 
+    pub fn l1fw_len(self) -> usize {
+        self.shape.ft_size.saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l1fb_len(self) -> usize {
+        self.shape.l1_out()
+    }
+
     pub fn l2w_len(self) -> usize {
         self.shape.l2_in().saturating_mul(self.shape.num_stacks).saturating_mul(self.shape.l2_size)
     }
@@ -120,6 +130,19 @@ impl SfnnForwardWeightLayout {
         expect_len("l0b", self.l0b_len(), weights.l0b.len())?;
         expect_len("l1w", self.l1w_len(), weights.l1w.len())?;
         expect_len("l1b", self.l1b_len(), weights.l1b.len())?;
+        match (weights.l1fw, weights.l1fb) {
+            (Some(l1fw), Some(l1fb)) => {
+                expect_len("l1fw", self.l1fw_len(), l1fw.len())?;
+                expect_len("l1fb", self.l1fb_len(), l1fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(SfnnLayoutError::Shape { message: "l1fw requires l1fb".to_string() });
+            }
+            (None, Some(_)) => {
+                return Err(SfnnLayoutError::Shape { message: "l1fb requires l1fw".to_string() });
+            }
+        }
         expect_len("l2w", self.l2w_len(), weights.l2w.len())?;
         expect_len("l2b", self.l2b_len(), weights.l2b.len())?;
         expect_len("l3w", self.l3w_len(), weights.l3w.len())?;
@@ -135,6 +158,8 @@ pub struct SfnnForwardHostWeights<'a> {
     pub l0b: &'a [f32],
     pub l1w: &'a [f32],
     pub l1b: &'a [f32],
+    pub l1fw: Option<&'a [f32]>,
+    pub l1fb: Option<&'a [f32]>,
     pub l2w: &'a [f32],
     pub l2b: &'a [f32],
     pub l3w: &'a [f32],
@@ -224,6 +249,8 @@ pub struct SfnnForwardDeviceWeights {
     pub l0b: DeviceBuffer<f32>,
     pub l1w: DeviceBuffer<f32>,
     pub l1b: DeviceBuffer<f32>,
+    pub l1fw: Option<DeviceBuffer<f32>>,
+    pub l1fb: Option<DeviceBuffer<f32>>,
     pub l2w: DeviceBuffer<f32>,
     pub l2b: DeviceBuffer<f32>,
     pub l3w: DeviceBuffer<f32>,
@@ -240,6 +267,14 @@ impl SfnnForwardDeviceWeights {
             l0b: DeviceBuffer::from_host(stream, weights.l0b)?,
             l1w: DeviceBuffer::from_host(stream, weights.l1w)?,
             l1b: DeviceBuffer::from_host(stream, weights.l1b)?,
+            l1fw: match weights.l1fw {
+                Some(values) => Some(DeviceBuffer::from_host(stream, values)?),
+                None => None,
+            },
+            l1fb: match weights.l1fb {
+                Some(values) => Some(DeviceBuffer::from_host(stream, values)?),
+                None => None,
+            },
             l2w: DeviceBuffer::from_host(stream, weights.l2w)?,
             l2b: DeviceBuffer::from_host(stream, weights.l2b)?,
             l3w: DeviceBuffer::from_host(stream, weights.l3w)?,
@@ -259,6 +294,7 @@ pub struct SfnnForwardLaunchPlan {
     pub sparse_l0_threads_per_perspective: usize,
     pub pairwise_concat_threads: usize,
     pub stacked_l1_threads: usize,
+    pub shared_l1_threads: usize,
     pub l2_input_threads: usize,
     pub stacked_l2_threads: usize,
     pub stacked_l3_threads: usize,
@@ -270,6 +306,7 @@ impl SfnnForwardLaunchPlan {
             sparse_l0_threads_per_perspective: layout.l0_len(),
             pairwise_concat_threads: layout.combined_len(),
             stacked_l1_threads: layout.l1_len(),
+            shared_l1_threads: layout.l1_len(),
             l2_input_threads: layout.l2_input_len(),
             stacked_l2_threads: layout.l2_len(),
             stacked_l3_threads: layout.output_len(),
@@ -362,6 +399,8 @@ mod tests {
         assert_eq!(layout.l0b_len(), 1024);
         assert_eq!(layout.l1w_len(), 1024 * 9 * 8);
         assert_eq!(layout.l1b_len(), 9 * 8);
+        assert_eq!(layout.l1fw_len(), 1024 * 8);
+        assert_eq!(layout.l1fb_len(), 8);
         assert_eq!(layout.l2w_len(), 14 * 9 * 64);
         assert_eq!(layout.l2b_len(), 9 * 64);
         assert_eq!(layout.l3w_len(), 64 * 9);
@@ -376,6 +415,7 @@ mod tests {
                 "sfnn_sparse_l0_crelu",
                 "sfnn_pairwise_concat",
                 "sfnn_stacked_l1",
+                "sfnn_shared_l1_add",
                 "sfnn_l2_input",
                 "sfnn_stacked_l2_crelu",
                 "sfnn_stacked_l3_output",
@@ -406,6 +446,7 @@ mod tests {
         assert_eq!(plan.sparse_l0_threads_per_perspective, 20);
         assert_eq!(plan.pairwise_concat_threads, 20);
         assert_eq!(plan.stacked_l1_threads, 15);
+        assert_eq!(plan.shared_l1_threads, 15);
         assert_eq!(plan.l2_input_threads, 20);
         assert_eq!(plan.stacked_l2_threads, 15);
         assert_eq!(plan.stacked_l3_threads, 5);
@@ -420,6 +461,8 @@ mod tests {
             l0b: &[0.0; 4],
             l1w: &[0.0; 24],
             l1b: &[0.0; 6],
+            l1fw: None,
+            l1fb: None,
             l2w: &[0.0; 24],
             l2b: &[0.0; 6],
             l3w: &[0.0; 6],
@@ -438,6 +481,8 @@ mod tests {
             l0b: &[0.0; 4],
             l1w: &[0.0; 24],
             l1b: &[0.0; 6],
+            l1fw: None,
+            l1fb: None,
             l2w: &[0.0; 24],
             l2b: &[0.0; 6],
             l3w: &[0.0; 6],

@@ -106,6 +106,26 @@ pub(crate) fn launch_sfnn_forward(
             ]
         }
     }?;
+    if let (Some(l1fw), Some(l1fb)) = (&weights.l1fw, &weights.l1fb) {
+        unsafe {
+            // SAFETY: shared L1 dimensions are derived from the same validated
+            // shape as stacked L1. The kernel adds into the L1 buffer produced
+            // by the previous launch in the same stream.
+            cuda_launch! {
+                kernel: crate::kernels::sfnn::sfnn_shared_l1_add,
+                stream: stream.clone(),
+                module: module.clone(),
+                config: cfg_1d(plan.shared_l1_threads),
+                args: [
+                    slice(workspace.combined),
+                    slice(l1fw),
+                    slice(l1fb),
+                    slice_mut(workspace.l1),
+                    batch_size, ft_size, l1_out
+                ]
+            }
+        }?;
+    }
     unsafe {
         // SAFETY: l2_input reads L1 output and writes exactly
         // batch * l1_hidden * 2 values.

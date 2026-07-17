@@ -19,6 +19,7 @@ commit each completed slice.
 | BO-CUDA-011 | done | SFNN production schedule / periodic checkpoints | SFNN cuda-oxide child honors `--save-rate` and the BulletOu wrapper accepts bounded `--superbatches` / `--max-epochs` direct production schedule |
 | BO-CUDA-012 | done | SFNN resume from root `state.bin` | `--sfnn-teacher-train` can auto-resume weights, Ranger state, completed step count, and teacher dataloader position from SFNN bridge checkpoints |
 | BO-CUDA-013 | done | SFNN plateau schedule | BulletOu `--backend cuda-oxide --eval-type SFNN_HALFKA2 --lr-schedule plateau` runs through the generic plateau orchestrator using SFNN validation metrics and auto-resume |
+| BO-CUDA-014 | done | SFNN factorized L1 forward foundation | cuda-oxide SFNN forward/runtime/fixture paths can carry optional shared `l1f` weights and match CPU golden output before training-backward integration |
 
 ## Notes
 
@@ -176,3 +177,20 @@ commit each completed slice.
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check --example bulletou`.
   - WSL CUDA plateau smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --lr-schedule plateau --superbatches 1 --max-epochs 1 --positions-per-superbatch 1 --batch-size 1 --save-rate 1 --test-teacher shuffled-001.hcpe --test-positions 4 --test-batch-size 4` launched the nested SFNN child with `--lr-schedule fixed --learning-rate 0.000875`, wrote `0001/dataloader_pos.txt = 38,0`, wrote validation metrics `test_value_accuracy=0.666667` and `test_value_loss=0.138324`, and the plateau orchestrator printed `initial validation metrics = loss=0.138324, accuracy=0.666667`.
+
+### BO-CUDA-014
+
+- Extended SFNN forward weight layout / host-device weight ownership with optional shared factorized L1 weights (`l1fw`, `l1fb`).
+- Added CUDA kernel `sfnn_shared_l1_add`, launched after stacked L1 and before pairwise L2 input assembly when shared L1 weights are present.
+- Added synthetic `factorized-tiny` SFNN forward case and fixture read/write support for optional shared L1 payloads while preserving old fixtures without that trailer.
+- Backward and Ranger smoke paths now reject factorized L1 cases explicitly until training-backward integration is wired.
+- Validation:
+  - `cargo check -p bulletou-cuda-oxide-runtime`.
+  - `cargo check -p bulletou-cuda-train`.
+  - `cargo test -p bulletou-cuda-oxide-runtime sfnn`.
+  - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
+  - WSL: `cargo oxide build --arch sm_89 --features cuda -- --package bulletou-cuda-train --release`.
+  - WSL CUDA smoke used a local cubin produced from `bulletou_cuda_train.ll` via `llvm-link-20` + libdevice, `llc-20`, and `ptxas`, avoiding the known WSL `nvJitLinkCreate` symbol issue on the `.ll` runtime load path.
+  - WSL CUDA `--sfnn-forward-smoke --sfnn-forward-case factorized-tiny --debug-readback` matched CPU golden: output max_abs diff `0.000000029802322`; `l1` max_abs diff `0.000000007450581`; compare `ok`.
+  - WSL CUDA regression `--sfnn-forward-smoke --sfnn-forward-case tiny --debug-readback` matched CPU golden with all reported max_abs diffs `0`.
+  - WSL CUDA fixture round-trip of `factorized-tiny` via `--write-sfnn-forward-fixture` then `--sfnn-forward-fixture` matched CPU golden with output max_abs diff `0.000000029802322`.

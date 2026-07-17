@@ -84,6 +84,35 @@ pub fn sfnn_stacked_l1(
 }
 
 #[kernel]
+pub fn sfnn_shared_l1_add(
+    input: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    output_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (output_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+
+    let out_col = tid.get() % (output_dim as usize);
+    let sample = tid.get() / (output_dim as usize);
+    let input_base = sample * (input_dim as usize);
+    let mut sum = bias[out_col];
+    for in_col in 0..(input_dim as usize) {
+        sum += input[input_base + in_col] * weights[in_col * (output_dim as usize) + out_col];
+    }
+
+    if let Some(out) = output.get_mut(tid) {
+        *out += sum;
+    }
+}
+
+#[kernel]
 pub fn sfnn_l2_input(l1: &[f32], mut output: DisjointSlice<f32>, batch: u32, l1_hidden: u32) {
     let tid = thread::index_1d();
     let l2_input_dim = (l1_hidden as usize) * 2;

@@ -183,6 +183,7 @@ enum NnueForwardCaseKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SfnnForwardCaseKind {
     Tiny,
+    FactorizedTiny,
     Halfka2,
 }
 
@@ -1789,6 +1790,8 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                             l0b: &initial_case.l0b,
                             l1w: &initial_case.l1w,
                             l1b: &initial_case.l1b,
+                            l1fw: initial_case.l1fw.as_deref(),
+                            l1fb: initial_case.l1fb.as_deref(),
                             l2w: &initial_case.l2w,
                             l2b: &initial_case.l2b,
                             l3w: &initial_case.l3w,
@@ -3286,6 +3289,8 @@ fn load_root_halfka2_weights_as_sfnn_case(path: &std::path::Path) -> bulletou_cu
         l0b: root_weights.l0b,
         l1w: root_weights.l1w,
         l1b: root_weights.l1b,
+        l1fw: None,
+        l1fb: None,
         l2w: root_weights.l2w,
         l2b: root_weights.l2b,
         l3w: root_weights.l3w,
@@ -4233,6 +4238,8 @@ fn run_sfnn_forward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         l0b: &case.l0b,
         l1w: &case.l1w,
         l1b: &case.l1b,
+        l1fw: case.l1fw.as_deref(),
+        l1fb: case.l1fb.as_deref(),
         l2w: &case.l2w,
         l2b: &case.l2b,
         l3w: &case.l3w,
@@ -4313,6 +4320,12 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         Some(path) => SfnnForwardCase::read_fixture(path)?,
         None => SfnnForwardCase::new(args.sfnn_case),
     };
+    if case.l1fw.is_some() || case.l1fb.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "SFNN factorized L1 backward smoke is not wired yet; use --sfnn-forward-smoke for factorized cases"
+                .to_string(),
+        ));
+    }
     let cpu_forward_trace = case.cpu_forward_trace();
     let cpu_trace = case.cpu_output_backward_trace(&cpu_forward_trace);
     let ptx = match args.ptx {
@@ -4337,6 +4350,8 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         l0b: &case.l0b,
         l1w: &case.l1w,
         l1b: &case.l1b,
+        l1fw: case.l1fw.as_deref(),
+        l1fb: case.l1fb.as_deref(),
         l2w: &case.l2w,
         l2b: &case.l2b,
         l3w: &case.l3w,
@@ -4518,6 +4533,12 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         Some(path) => SfnnForwardCase::read_fixture(path)?,
         None => SfnnForwardCase::new(args.sfnn_case),
     };
+    if case.l1fw.is_some() || case.l1fb.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "SFNN factorized L1 Ranger-step smoke is not wired yet; use --sfnn-forward-smoke for factorized cases"
+                .to_string(),
+        ));
+    }
     let cpu_forward_trace = case.cpu_forward_trace();
     let cpu_trace = case.cpu_output_backward_trace(&cpu_forward_trace);
     let params = grouped_ranger_step_params();
@@ -4543,6 +4564,8 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         l0b: &case.l0b,
         l1w: &case.l1w,
         l1b: &case.l1b,
+        l1fw: case.l1fw.as_deref(),
+        l1fb: case.l1fb.as_deref(),
         l2w: &case.l2w,
         l2b: &case.l2b,
         l3w: &case.l3w,
@@ -4879,8 +4902,9 @@ fn parse_nnue_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result<SfnnForwardCaseKind> {
     match value.as_str() {
         "tiny" => Ok(SfnnForwardCaseKind::Tiny),
+        "factorized-tiny" | "tiny-factorized" => Ok(SfnnForwardCaseKind::FactorizedTiny),
         "halfka2" | "halfka2-1024-7-64-k3k3" | "SFNN_halfka2_1024_7_64_k3k3" => Ok(SfnnForwardCaseKind::Halfka2),
-        _ => usage_error(format!("--sfnn-forward-case must be one of: tiny, halfka2 (got {value})")),
+        _ => usage_error(format!("--sfnn-forward-case must be one of: tiny, factorized-tiny, halfka2 (got {value})")),
     }
 }
 
@@ -4903,7 +4927,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --ranger-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-dense-backward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
-       bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
@@ -4990,6 +5014,7 @@ fn usage() -> &'static str {
      CO-007 SFNN forward smoke: build a fixed SFNN batch, compare the GPU\n\
      launch_sfnn_forward output against a CPU scalar golden, and fail if any\n\
      output differs by more than --tolerance. The default case is tiny; use\n\
+     --sfnn-forward-case factorized-tiny for the optional shared L1 path or\n\
      --sfnn-forward-case halfka2 for SFNN_halfka2_1024_7_64_k3k3.\n\
      --sfnn-forward-fixture loads the same buffers from a simple binary fixture;\n\
      --write-sfnn-forward-fixture writes the selected/generated case in that format."
@@ -5693,6 +5718,8 @@ struct SfnnForwardCase {
     l0b: Vec<f32>,
     l1w: Vec<f32>,
     l1b: Vec<f32>,
+    l1fw: Option<Vec<f32>>,
+    l1fb: Option<Vec<f32>>,
     l2w: Vec<f32>,
     l2b: Vec<f32>,
     l3w: Vec<f32>,
@@ -6381,6 +6408,8 @@ impl SfnnTrainStateCase {
             l0b: &self.l0b.weights,
             l1w: &self.l1w.weights,
             l1b: &self.l1b.weights,
+            l1fw: None,
+            l1fb: None,
             l2w: &self.l2w.weights,
             l2b: &self.l2b.weights,
             l3w: &self.l3w.weights,
@@ -6874,6 +6903,7 @@ impl SfnnForwardCase {
     fn new(kind: SfnnForwardCaseKind) -> Self {
         match kind {
             SfnnForwardCaseKind::Tiny => Self::tiny(),
+            SfnnForwardCaseKind::FactorizedTiny => Self::factorized_tiny(),
             SfnnForwardCaseKind::Halfka2 => Self::halfka2_1024_7_64_k3k3(),
         }
     }
@@ -6907,6 +6937,8 @@ impl SfnnForwardCase {
                 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, // combined 3
             ],
             l1b: vec![0.0; 6],
+            l1fw: None,
+            l1fb: None,
             l2w: vec![
                 1.0, 0.0, 0.0, 0.0, // l2 input 0
                 0.0, 1.0, 0.0, 0.0, // l2 input 1
@@ -6920,6 +6952,19 @@ impl SfnnForwardCase {
             ],
             l3b: vec![0.1, -0.02],
         }
+    }
+
+    fn factorized_tiny() -> Self {
+        let mut case = Self::tiny();
+        case.label = "factorized-tiny";
+        case.l1fw = Some(vec![
+            0.05, -0.02, 0.01, // combined 0
+            -0.03, 0.04, 0.02, // combined 1
+            0.02, 0.01, -0.04, // combined 2
+            -0.01, 0.03, 0.05, // combined 3
+        ]);
+        case.l1fb = Some(vec![0.01, -0.02, 0.03]);
+        case
     }
 
     fn halfka2_1024_7_64_k3k3() -> Self {
@@ -6941,6 +6986,8 @@ impl SfnnForwardCase {
             l0b: deterministic_f32_vec(layout.l0b_len(), 0x10B1_5F23, 0.02, 0.10),
             l1w: deterministic_f32_vec(layout.l1w_len(), 0xC1A5_5F23, 0.002, 0.0),
             l1b: deterministic_f32_vec(layout.l1b_len(), 0xB1A5_5F23, 0.004, 0.02),
+            l1fw: None,
+            l1fb: None,
             l2w: deterministic_f32_vec(layout.l2w_len(), 0xD2A5_5F23, 0.003, 0.0),
             l2b: deterministic_f32_vec(layout.l2b_len(), 0xB2A5_5F23, 0.004, 0.02),
             l3w: deterministic_f32_vec(layout.l3w_len(), 0xD3A5_5F23, 0.02, 0.0),
@@ -7011,6 +7058,15 @@ impl SfnnForwardCase {
                 stack,
                 &mut trace.l1[l1_start..l1_end],
             );
+            if let (Some(l1fw), Some(l1fb)) = (&self.l1fw, &self.l1fb) {
+                affine_dense_add(
+                    l1fw,
+                    l1fb,
+                    &trace.combined[combined_start..combined_end],
+                    self.shape.l1_out(),
+                    &mut trace.l1[l1_start..l1_end],
+                );
+            }
             fill_sfnn_l2_input(
                 &trace.l1[l1_start..l1_end],
                 self.shape.l1_hidden,
@@ -7158,11 +7214,39 @@ impl SfnnForwardCase {
             l0b: read_f32_vec(&mut reader, layout.l0b_len(), "l0b")?,
             l1w: read_f32_vec(&mut reader, layout.l1w_len(), "l1w")?,
             l1b: read_f32_vec(&mut reader, layout.l1b_len(), "l1b")?,
+            l1fw: None,
+            l1fb: None,
             l2w: read_f32_vec(&mut reader, layout.l2w_len(), "l2w")?,
             l2b: read_f32_vec(&mut reader, layout.l2b_len(), "l2b")?,
             l3w: read_f32_vec(&mut reader, layout.l3w_len(), "l3w")?,
             l3b: read_f32_vec(&mut reader, layout.l3b_len(), "l3b")?,
         };
+
+        let mut case = case;
+        let mut l1f_flag = [0_u8; 1];
+        match std::io::Read::read(&mut reader, &mut l1f_flag) {
+            Ok(0) => return Ok(case),
+            Ok(1) => {
+                match l1f_flag[0] {
+                    0 => {}
+                    1 => {
+                        case.l1fw = Some(read_f32_vec(&mut reader, layout.l1fw_len(), "l1fw")?);
+                        case.l1fb = Some(read_f32_vec(&mut reader, layout.l1fb_len(), "l1fb")?);
+                    }
+                    value => {
+                        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                            "SFNN forward fixture {} has invalid l1f flag {value}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            Ok(_) => unreachable!("single-byte read returned more than one byte"),
+            Err(err) => Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to read SFNN forward fixture {}: {err}",
+                path.display()
+            )))?,
+        }
 
         let mut trailing = [0_u8; 1];
         match std::io::Read::read(&mut reader, &mut trailing) {
@@ -7209,6 +7293,31 @@ impl SfnnForwardCase {
         write_f32_vec(&mut writer, &self.l2b, "l2b")?;
         write_f32_vec(&mut writer, &self.l3w, "l3w")?;
         write_f32_vec(&mut writer, &self.l3b, "l3b")?;
+        match (&self.l1fw, &self.l1fb) {
+            (Some(l1fw), Some(l1fb)) => {
+                std::io::Write::write_all(&mut writer, &[1]).map_err(|err| {
+                    bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                        "failed to write SFNN forward fixture l1f flag {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                write_f32_vec(&mut writer, l1fw, "l1fw")?;
+                write_f32_vec(&mut writer, l1fb, "l1fb")?;
+            }
+            (None, None) => {
+                std::io::Write::write_all(&mut writer, &[0]).map_err(|err| {
+                    bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                        "failed to write SFNN forward fixture l1f flag {}: {err}",
+                        path.display()
+                    ))
+                })?;
+            }
+            _ => {
+                return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+                    "SFNN forward fixture has incomplete l1f weights".to_string(),
+                ));
+            }
+        }
         std::io::Write::flush(&mut writer).map_err(|err| {
             bulletou_cuda_oxide_runtime::Error::Smoke(format!(
                 "failed to flush SFNN forward fixture {}: {err}",
@@ -7377,6 +7486,22 @@ fn affine_sparse_padded(weights: &[f32], bias: &[f32], rows: usize, cols: usize,
 #[cfg(feature = "cuda")]
 fn affine_dense(weights: &[f32], bias: &[f32], input: &[f32], rows: usize, out: &mut [f32]) {
     out.copy_from_slice(&bias[..rows]);
+    for (input_idx, &value) in input.iter().enumerate() {
+        if value == 0.0 {
+            continue;
+        }
+        let base = input_idx * rows;
+        for row in 0..rows {
+            out[row] += weights[base + row] * value;
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn affine_dense_add(weights: &[f32], bias: &[f32], input: &[f32], rows: usize, out: &mut [f32]) {
+    for row in 0..rows {
+        out[row] += bias[row];
+    }
     for (input_idx, &value) in input.iter().enumerate() {
         if value == 0.0 {
             continue;
