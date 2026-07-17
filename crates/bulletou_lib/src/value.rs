@@ -9,6 +9,7 @@ pub mod fast_sfnn_fixture;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
+pub mod teacher_batch;
 mod save;
 pub mod yaneuraou_kppt;
 
@@ -39,6 +40,9 @@ pub use fast_sfnn::{
 pub use fast_sfnn_fixture::{
     SFNN_FORWARD_FIXTURE_MAGIC, SfnnForwardFixtureError, write_sfnn_forward_fixture,
     write_sfnn_forward_fixture_file,
+};
+pub use teacher_batch::{
+    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, TeacherBatchError, load_halfkp_teacher_fast_batch,
 };
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{

@@ -941,6 +941,15 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
   `--nnue-train-state-fixture`. Validation with `-SkipCudaBuild -TrainSteps 2`
   and the one-step state wrote `nnue-halfkp-resume-final-script.nnuef`; its
   SHA-256 matched the one-shot two-step fixture exactly.
+- Moved the root-side real teacher batch materialisation path from the
+  `export_nnue_forward_fixture` example into
+  `bulletou_lib::value::teacher_batch` as
+  `load_halfkp_teacher_fast_batch()`. This keeps the existing fixture exporter
+  on the same code path while exposing the `teacher -> FastBatchHost` bridge
+  needed by a future cuda-oxide trainer binary. Validation:
+  `cargo check -p bulletou_lib --example export_nnue_forward_fixture`,
+  `cargo test -p bulletou_lib teacher_batch`, and a real HCPE
+  `--batch-fixture --batch-index 1` export all passed.
 - Remaining work: turn this fixture/smoke bridge into the actual cuda-oxide
   trainer loop so batches can stream directly from the loader instead of being
   materialised as fixture files first.
