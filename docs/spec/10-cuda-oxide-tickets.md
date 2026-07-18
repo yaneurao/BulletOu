@@ -679,6 +679,10 @@ the tickets in order and commit each completed slice.
   - `NnueTrainStepRunner` owns persistent sparse batch buffers, targets, entry weights, device weights, Ranger optimizer state, forward/loss/backward workspaces, and runs forward -> scalar loss -> backward -> Ranger update;
   - optimizer slow weights initialise from the initial host weights, matching Ranger semantics;
   - the standalone smoke checks one tiny train step by comparing the runner's updated weights against applying the existing host Ranger update to the CPU reference gradients.
+- Connected the runner to the BulletOu root CLI for a Windows-native direct NNUE HalfKP path:
+  - `examples/bulletou --backend cuda-cpp --cuda-cpp-train-steps N --eval-type NNUE_HALFKP` now streams real teacher batches through the shared fixed-layout `HalfkpTeacherBatchConfig`;
+  - the direct path is intentionally limited to Ranger, constant-LR direct steps, and no production checkpoint/resume/validation flags yet;
+  - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's `device-cuda` runtime just to create the model.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -687,10 +691,12 @@ the tickets in order and commit each completed slice.
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_tiny_forward_matches_scalar_reference -- --ignored` passed;
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_scalar_loss_matches_cpu_reference -- --ignored` passed;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou` passed.
+  - `cargo test --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 1024 --buffer-mb 64 --threads 4` passed without WSL and reported two real HCPE train steps;
+  - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 5 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=461695 pos/s` for the short direct-step probe.
 - Remaining BO-CUDA-033 work:
-  - connect the C++/CUDA runtime to the BulletOu `--backend cuda-cpp` training wrapper;
   - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
+  - optimise the correctness-first L0 sparse backward path (currently atomic-scatter) and reintroduce the tatara-style HalfKP FT factorizer/fold path needed for the BO-CUDA-029 recipe;
   - preserve normal checkpoint/log/validation semantics;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
