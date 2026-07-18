@@ -898,10 +898,16 @@ the tickets in order and commit each completed slice.
   - step/geometric/cos LR schedules are applied to the actual C++/CUDA Ranger update per batch using the same positions-based LR formulas as the normal trainer, with epoch-local warm restarts.
 - Current limitations:
   - production mode is intentionally bounded and requires `--max-epochs` to avoid accidental infinite direct runs;
-  - plateau LR orchestration remains on the normal/cuda-oxide paths for now;
-  - production-mode resume now restores weights/optimizer/dataloader through the existing C++ direct resume path, but exact mid-epoch schedule continuation still needs a focused resume audit before BO-CUDA-035 can be marked done.
+  - plateau LR orchestration remains on the normal/cuda-oxide paths for now.
+- Added production-mode resume scheduling:
+  - mid-epoch resume detects the latest saved superbatch and resumes from `last_sb + 1` while keeping the displayed epoch number stable;
+  - cleanly completed epochs continue as additional epochs with `epoch = previous_max_epoch + 1` and `superbatch = 1`;
+  - LR computation now uses `prior_positions + current_run_positions`, so mid-epoch resumes continue inside the same LR cycle and clean epoch continuations warm-restart when the previous epoch size is complete;
+  - the existing direct C++ resume path continues to restore weights, Ranger optimizer state, completed optimizer-step counters, and the teacher dataloader position.
 - Validation:
-  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (31 cuda-cpp tests);
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp_run_schedule_ -- --nocapture` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (33 cuda-cpp tests);
   - HalfKP production smoke on Windows:
     `--backend cuda-cpp --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --superbatches 2 --max-epochs 1 --positions-per-superbatch 64 --batch-size 64 --save-rate 1 --cuda-cpp-loss-readback-interval 0 --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 32 --test-sample sequential`
     wrote `0001` and `0002`, logged `positions=64` then `128`, and wrote `dataloader_pos.txt` as `2432,0` then `4864,0`.
+  - Re-running the same HalfKP production smoke auto-resumed from `0002/state.bin`, restored `optimizer_step=3`, resumed the teacher at `4864,0`, wrote `0003` and `0004` as `epoch=2, superbatch=1..2`, logged `positions=192` then `256`, and advanced `dataloader_pos.txt` to `7296,0` then `9728,0`.

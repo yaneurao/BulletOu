@@ -3219,29 +3219,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
             let step_index = seen_steps.saturating_sub(1);
-            let learning_rate = if schedule.production {
-                let chunk = checkpoint_chunk.unwrap_or_else(|| schedule.chunks.last().expect("non-empty cuda-cpp schedule"));
-                if chunk.steps == 0 {
-                    args.lr
-                } else {
-                    let batch_size = effective_batch_size(args);
-                    let lr_period = (args.superbatches.unwrap_or(1) as u64)
-                        .saturating_mul(schedule.batches_per_superbatch as u64)
-                        .saturating_mul(batch_size as u64);
-                    let (gamma, _) =
-                        effective_lr_step_gamma(args, schedule.batches_per_superbatch).map_err(|e| e.to_string())?;
-                    cuda_cpp_lr_at_step(
-                        args,
-                        step_index,
-                        batch_size,
-                        lr_period,
-                        gamma,
-                        effective_lr_step_positions(args, schedule.batches_per_superbatch),
-                    )
-                }
-            } else {
-                args.lr
-            };
+            let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
@@ -3542,24 +3520,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
             let step_index = seen_steps.saturating_sub(1);
-            let learning_rate = if schedule.production {
-                let batch_size = effective_batch_size(args);
-                let lr_period = (args.superbatches.unwrap_or(1) as u64)
-                    .saturating_mul(schedule.batches_per_superbatch as u64)
-                    .saturating_mul(batch_size as u64);
-                let (gamma, _) =
-                    effective_lr_step_gamma(args, schedule.batches_per_superbatch).map_err(|e| e.to_string())?;
-                cuda_cpp_lr_at_step(
-                    args,
-                    step_index,
-                    batch_size,
-                    lr_period,
-                    gamma,
-                    effective_lr_step_positions(args, schedule.batches_per_superbatch),
-                )
-            } else {
-                args.lr
-            };
+            let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
@@ -5415,18 +5376,46 @@ struct CudaCppRunSchedule {
     production: bool,
     total_steps: usize,
     batches_per_superbatch: usize,
+    prior_positions: usize,
+    lr_period: u64,
+    lr_step_gamma: f32,
+    lr_step_positions: u64,
     chunks: Vec<CudaCppScheduleChunk>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppRunSchedule {
+    fn lr_for_step(&self, args: &Args, step_index: usize, batch_size: usize) -> f32 {
+        if self.production {
+            cuda_cpp_lr_at_step(
+                args,
+                step_index,
+                batch_size,
+                self.prior_positions,
+                self.lr_period,
+                self.lr_step_gamma,
+                self.lr_step_positions,
+            )
+        } else {
+            args.lr
+        }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let batch_size = effective_batch_size(args);
+    let default_lr_step_positions = effective_lr_step_positions(args, 1);
     if let Some(train_steps) = args.cuda_cpp_train_steps {
         let lr = args.lr;
         return Ok(CudaCppRunSchedule {
             production: false,
             total_steps: train_steps,
             batches_per_superbatch: train_steps,
+            prior_positions: 0,
+            lr_period: 0,
+            lr_step_gamma: DEFAULT_LR_STEP_GAMMA,
+            lr_step_positions: default_lr_step_positions,
             chunks: vec![CudaCppScheduleChunk {
                 epoch: 1,
                 superbatch: 1,
@@ -5463,11 +5452,40 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         .checked_mul(batches_per_superbatch as u64)
         .and_then(|v| v.checked_mul(batch_size as u64))
         .ok_or_else(|| "cuda-cpp LR period overflow".to_string())?;
+    let output_dir = args.output_dir();
+    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let resume_enabled = resume_enabled(args, &output_dir);
+    let latest_superbatch = if resume_enabled { read_latest_saved_superbatch(&output_dir) } else { None };
+    let prev_teacher = if resume_enabled { read_latest_saved_teacher(&output_dir) } else { None };
+    let teacher_changed =
+        prev_teacher.as_deref().is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
+    let prev_run_completed_epoch = latest_superbatch.map(|last_sb| last_sb >= superbatches).unwrap_or(false);
+    let max_epoch_in_log =
+        if resume_enabled { read_latest_epoch_in_top_level_log(&top_level_log).unwrap_or(0) } else { 0 };
+    let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_superbatch.is_some();
+    let epoch_offset = if mid_epoch_resume {
+        max_epoch_in_log.saturating_sub(1)
+    } else if resume_enabled {
+        max_epoch_in_log
+    } else {
+        0
+    };
+    let first_epoch_start_superbatch = if teacher_changed || prev_run_completed_epoch {
+        1usize
+    } else {
+        latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1)
+    };
+    let prior_positions = if resume_enabled {
+        read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0)
+    } else {
+        0
+    };
 
     let mut chunks = Vec::new();
     let mut cumulative_steps = 0usize;
-    for epoch in 1..=max_epochs {
-        let mut first_superbatch = 1usize;
+    for local_epoch in 1..=max_epochs {
+        let epoch = epoch_offset + local_epoch;
+        let mut first_superbatch = if local_epoch == 1 { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let last_superbatch =
                 first_superbatch.saturating_add(args.save_rate.max(1)).saturating_sub(1).min(superbatches);
@@ -5480,10 +5498,24 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 format!("cuda-cpp cumulative step overflow at epoch={epoch}, superbatch={last_superbatch}")
             })?;
             let chunk_end_step = cumulative_steps.saturating_sub(1);
-            let lr_start =
-                cuda_cpp_lr_at_step(args, chunk_start_step, batch_size, lr_period, lr_step_gamma, lr_step_positions);
-            let lr_end =
-                cuda_cpp_lr_at_step(args, chunk_end_step, batch_size, lr_period, lr_step_gamma, lr_step_positions);
+            let lr_start = cuda_cpp_lr_at_step(
+                args,
+                chunk_start_step,
+                batch_size,
+                prior_positions,
+                lr_period,
+                lr_step_gamma,
+                lr_step_positions,
+            );
+            let lr_end = cuda_cpp_lr_at_step(
+                args,
+                chunk_end_step,
+                batch_size,
+                prior_positions,
+                lr_period,
+                lr_step_gamma,
+                lr_step_positions,
+            );
             chunks.push(CudaCppScheduleChunk {
                 epoch,
                 superbatch: last_superbatch,
@@ -5495,8 +5527,21 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             first_superbatch = last_superbatch + 1;
         }
     }
+    if chunks.is_empty() {
+        return Err("--backend cuda-cpp production schedule has no remaining chunks to train".to_string());
+    }
 
-    Ok(CudaCppRunSchedule { production: true, total_steps, batches_per_superbatch, chunks })
+    let total_steps = chunks.iter().map(|chunk| chunk.steps).sum();
+    Ok(CudaCppRunSchedule {
+        production: true,
+        total_steps,
+        batches_per_superbatch,
+        prior_positions,
+        lr_period,
+        lr_step_gamma,
+        lr_step_positions,
+        chunks,
+    })
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5504,11 +5549,12 @@ fn cuda_cpp_lr_at_step(
     args: &Args,
     step_index: usize,
     batch_size: usize,
+    prior_positions: usize,
     lr_period: u64,
     lr_step_gamma: f32,
     lr_step_positions: u64,
 ) -> f32 {
-    let positions = (step_index as u64).saturating_mul(batch_size as u64);
+    let positions = (prior_positions as u64).saturating_add((step_index as u64).saturating_mul(batch_size as u64));
     match args.lr_schedule {
         LrScheduleKind::Step => {
             StepLR::lr_at_positions(args.lr, args.lr_min, lr_step_gamma, lr_step_positions, lr_period, positions)
@@ -10296,6 +10342,134 @@ mod tests {
         assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6);
         assert!(schedule.chunks[0].lr_end < schedule.chunks[0].lr_start);
         assert!((schedule.chunks[2].lr_start - 0.1).abs() < 1e-6, "LR should warm-restart at epoch 2");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_resumes_mid_epoch_from_next_superbatch() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-schedule-mid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("0001")).unwrap();
+        let output = tmp.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "teacher.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "1",
+            "--batch-size",
+            "64",
+            "--positions-per-superbatch",
+            "64",
+            "--lr",
+            "0.1",
+            "--lr-min",
+            "0.01",
+            "--output",
+            output,
+        ])
+        .unwrap();
+        write_resume_config(&tmp, &args).unwrap();
+        std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("learn.log"), format!(
+            "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1,-,-,0.1,0.1,0.1,1.000000,64,teacher.hcpe\n"
+        ))
+        .unwrap();
+        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,-,-,0.1,0.1,0.1,1.000000,64,teacher.hcpe\n"
+        ))
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.prior_positions, 64);
+        assert_eq!(schedule.total_steps, 2);
+        assert_eq!(schedule.chunks.len(), 2);
+        assert_eq!(schedule.chunks[0].epoch, 1);
+        assert_eq!(schedule.chunks[0].superbatch, 2);
+        assert_eq!(schedule.chunks[1].epoch, 1);
+        assert_eq!(schedule.chunks[1].superbatch, 3);
+        assert!(schedule.chunks[0].lr_start < 0.1, "mid-epoch resume should continue LR inside the epoch");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_continues_after_completed_epoch() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-schedule-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("0001")).unwrap();
+        let output = tmp.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "teacher.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "1",
+            "--batch-size",
+            "64",
+            "--positions-per-superbatch",
+            "64",
+            "--lr",
+            "0.1",
+            "--lr-min",
+            "0.01",
+            "--output",
+            output,
+        ])
+        .unwrap();
+        write_resume_config(&tmp, &args).unwrap();
+        std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("learn.log"), format!(
+            "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,1,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe\n"
+        ))
+        .unwrap();
+        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe\n"
+        ))
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.prior_positions, 192);
+        assert_eq!(schedule.total_steps, 3);
+        assert_eq!(schedule.chunks.len(), 3);
+        assert_eq!(schedule.chunks[0].epoch, 2);
+        assert_eq!(schedule.chunks[0].superbatch, 1);
+        assert_eq!(schedule.chunks[2].epoch, 2);
+        assert_eq!(schedule.chunks[2].superbatch, 3);
+        assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6, "completed epoch should warm-restart LR");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
