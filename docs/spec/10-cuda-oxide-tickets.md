@@ -904,10 +904,17 @@ the tickets in order and commit each completed slice.
   - cleanly completed epochs continue as additional epochs with `epoch = previous_max_epoch + 1` and `superbatch = 1`;
   - LR computation now uses `prior_positions + current_run_positions`, so mid-epoch resumes continue inside the same LR cycle and clean epoch continuations warm-restart when the previous epoch size is complete;
   - the existing direct C++ resume path continues to restore weights, Ranger optimizer state, completed optimizer-step counters, and the teacher dataloader position.
+- Added C++/CUDA production plateau orchestration:
+  - `--backend cuda-cpp --lr-schedule plateau` is now accepted in bounded production mode for both `NNUE_HALFKP` and `SFNN_HALFKA2`;
+  - plateau still requires `--test-teacher` and `--save-rate 1`, matching the existing per-superbatch validation decision model;
+  - each attempted superbatch snapshots C++/CUDA weights and Ranger optimizer state in memory, trains at the current plateau LR, validates, then either writes an accepted numbered checkpoint or restores the snapshot and retries/rejects according to the shared `PlateauLrState`;
+  - rejected final-min runs do not write a new checkpoint; the latest accepted checkpoint is marked with `plateau_epoch_done.txt`.
 - Validation:
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp_run_schedule_ -- --nocapture` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (33 cuda-cpp tests);
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (37 cuda-cpp tests);
   - HalfKP production smoke on Windows:
     `--backend cuda-cpp --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --superbatches 2 --max-epochs 1 --positions-per-superbatch 64 --batch-size 64 --save-rate 1 --cuda-cpp-loss-readback-interval 0 --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 32 --test-sample sequential`
     wrote `0001` and `0002`, logged `positions=64` then `128`, and wrote `dataloader_pos.txt` as `2432,0` then `4864,0`.
   - Re-running the same HalfKP production smoke auto-resumed from `0002/state.bin`, restored `optimizer_step=3`, resumed the teacher at `4864,0`, wrote `0003` and `0004` as `epoch=2, superbatch=1..2`, logged `positions=192` then `256`, and advanced `dataloader_pos.txt` to `7296,0` then `9728,0`.
+  - HalfKP plateau accept smoke with yamaoka PSV validation wrote `0001`, logged `lr_start=lr_end=0.001000`, and advanced `dataloader_pos.txt` to `2432,0`.
+  - HalfKP plateau reject smoke using `--lr-plateau-monitor accuracy --lr 0.001 --lr-min 0.001` accepted `0001`, rejected the second attempted superbatch, left no `0002`, and wrote `0001/plateau_epoch_done.txt`.

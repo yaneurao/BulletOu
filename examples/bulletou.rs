@@ -1891,10 +1891,15 @@ impl Args {
             );
         }
         if production_schedule && self.lr_schedule == LrScheduleKind::Plateau {
-            return Err(
-                "--backend cuda-cpp production schedule mode supports step/geometric/cos LR for now; plateau remains on the normal backend/cuda-oxide path"
-                    .to_string(),
-            );
+            if self.test_teacher.is_none() {
+                return Err(
+                    "--backend cuda-cpp --lr-schedule plateau requires --test-teacher so validation metrics can be monitored"
+                        .to_string(),
+                );
+            }
+            if self.save_rate != 1 {
+                return Err("--backend cuda-cpp --lr-schedule plateau requires --save-rate 1".to_string());
+            }
         }
 
         Ok(())
@@ -3207,6 +3212,297 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         profile_prepare: false,
     };
 
+    if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
+        let mut current_resume_pos = dataloader_resume_pos;
+        let mut completed_steps = completed_step_offset;
+        let mut accepted_steps_total = 0usize;
+        let mut attempted_steps_total = 0usize;
+        let mut last_checkpoint_metrics = None;
+        let mut previous_epoch_final_metrics = if resume_enabled(args, &args.output_dir()) {
+            read_latest_nnue_test_metrics_in_top_level_log(&args.output_dir().join(SUMMARY_LEARN_LOG_NAME))
+        } else {
+            None
+        };
+        let mut checkpoint_chunk_idx = 0usize;
+        while checkpoint_chunk_idx < schedule.chunks.len() {
+            let epoch = schedule.chunks[checkpoint_chunk_idx].epoch;
+            let display_max_epochs = args.max_epochs.map(|n| n + epoch.saturating_sub(1)).unwrap_or(epoch);
+            print_epoch_banner(epoch, display_max_epochs);
+            let mut plateau_state = PlateauLrState::new(
+                args.lr,
+                args.lr_min,
+                args.lr_plateau_factor,
+                args.lr_plateau_min_delta,
+                args.lr_plateau_monitor,
+            );
+            let mut plateau_epoch_final_metrics = None;
+            while checkpoint_chunk_idx < schedule.chunks.len() && schedule.chunks[checkpoint_chunk_idx].epoch == epoch {
+                let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
+                let snapshot_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let snapshot_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let snapshot_completed_steps = completed_steps;
+                let chunk_resume_pos = current_resume_pos;
+                let mut chunk_seen_steps = 0usize;
+                let mut chunk_last_pos = None;
+                let chunk_config = HalfkpTeacherBatchConfig {
+                    teacher: &args.teacher,
+                    batch_size,
+                    batch_index: 0,
+                    dataloader_resume_pos: chunk_resume_pos,
+                    buffer_mb: args.buffer_mb,
+                    loader_threads: args.loader_threads,
+                    threads: args.threads,
+                    lambda: args.lambda,
+                    scale: args.scale as f32,
+                    nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                    ft_factorize: false,
+                    score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                    profile_prepare: false,
+                };
+                eprintln!(
+                    "  cuda-cpp plateau: epoch={}, superbatch={}, lr {}",
+                    chunk.epoch, chunk.superbatch, plateau_state.current_lr
+                );
+                for_each_halfkp_teacher_fast_batch(&chunk_config, chunk.steps, |teacher_batch| {
+                    chunk_seen_steps += 1;
+                    attempted_steps_total += 1;
+                    chunk_last_pos = teacher_batch.dataloader_pos;
+                    let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
+                    let fast = teacher_batch.batch;
+                    let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+                    let params = RangerUpdateParams {
+                        radam: RAdamUpdateParams {
+                            step: optimizer_step as u64,
+                            learning_rate: plateau_state.current_lr,
+                            decay: ranger.decay,
+                            beta1: ranger.beta1,
+                            beta2: ranger.beta2,
+                            epsilon: ranger.epsilon,
+                            min_weight: ranger.min_weight,
+                            max_weight: ranger.max_weight,
+                            ..RAdamUpdateParams::default()
+                        },
+                        lookahead_alpha: ranger.alpha,
+                        lookahead_period: ranger.k as u64,
+                    };
+                    let batch = NnueTrainStepHostBatch {
+                        stm_indices: &fast.stm,
+                        nstm_indices: &fast.nstm,
+                        targets: &fast.targets,
+                        entry_weights: &fast.weights,
+                        batch_size: fast.layout.batch_size,
+                        max_active: fast.layout.max_active,
+                    };
+                    runner
+                        .step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                })
+                .map_err(|e| e.to_string())?;
+                if chunk_seen_steps != chunk.steps {
+                    return Err(format!(
+                        "cuda-cpp plateau chunk ended early: expected {} steps, saw {chunk_seen_steps}",
+                        chunk.steps
+                    ));
+                }
+                let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
+                last_loss = loss.mean;
+                reported_loss_sum += f64::from(loss.mean);
+                reported_loss_count += 1;
+                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?
+                    .ok_or_else(|| "--backend cuda-cpp plateau requires readable --test-teacher metrics".to_string())?;
+                let action = plateau_state.observe(test_metrics.into());
+                let reject_update = plateau_action_rejects_update(action);
+                let retry_same_chunk = plateau_action_retries_teacher(action);
+                let accepted_dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                    args,
+                    chunk_seen_steps,
+                    batch_size,
+                    chunk_last_pos,
+                    chunk_resume_pos,
+                )?;
+
+                if reject_update {
+                    let snapshot_host_weights = CudaNnueForwardHostWeights {
+                        shape: cuda_shape,
+                        l0w: &snapshot_weights.l0w,
+                        l0b: &snapshot_weights.l0b,
+                        l1w: &snapshot_weights.l1w,
+                        l1b: &snapshot_weights.l1b,
+                        l2w: &snapshot_weights.l2w,
+                        l2b: &snapshot_weights.l2b,
+                        outw: &snapshot_weights.outw,
+                        outb: &snapshot_weights.outb,
+                    };
+                    runner = NnueTrainStepRunner::with_optimizer_states(
+                        &ctx,
+                        snapshot_host_weights,
+                        cuda_cpp_halfkp_optimizer_readback_as_host(&snapshot_optimizer_states),
+                        batch_size,
+                        max_active,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    completed_steps = snapshot_completed_steps;
+                } else {
+                    completed_steps = snapshot_completed_steps + chunk_seen_steps;
+                    accepted_steps_total += chunk_seen_steps;
+                    current_resume_pos = Some(accepted_dataloader_pos);
+                    let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
+                        args,
+                        cuda_shape,
+                        &trained_weights,
+                        &trained_optimizer_states,
+                        completed_steps,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics: Some(test_metrics),
+                            lr_start: plateau_state.current_lr,
+                            lr_end: plateau_state.current_lr,
+                            dataloader_pos: accepted_dataloader_pos,
+                        },
+                    )?;
+                    eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+                    last_checkpoint_metrics = Some(test_metrics);
+                }
+
+                let current_lr = plateau_state.current_lr;
+                let monitor_label = args.lr_plateau_monitor.label();
+                match action {
+                    PlateauAction::First { metrics } => {
+                        eprintln!(
+                            "  plateau: initial validation metrics = {}; lr stays {current_lr}",
+                            plateau_metrics_text(metrics)
+                        );
+                    }
+                    PlateauAction::Improved { old_best, new_best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} improved (best {} -> {}); lr stays {}",
+                            plateau_metrics_text(old_best),
+                            plateau_metrics_text(new_best),
+                            current_lr,
+                        );
+                    }
+                    PlateauAction::Keep { metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); lr stays {}",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                            current_lr,
+                        );
+                    }
+                    PlateauAction::Reduced { old_lr, new_lr, metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); lr {old_lr} -> {new_lr}",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                    }
+                    PlateauAction::ScheduledFinal { old_lr, min_lr, metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); \
+                             next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
+                             (old lr {old_lr})",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                    }
+                    PlateauAction::FinalImproved { old_best, new_best } => {
+                        plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                        mark_latest_checkpoint_epoch_done(&args.output_dir());
+                        eprintln!(
+                            "  plateau: final lr_min superbatch improved {monitor_label} (best {} -> {}); \
+                             accepting it and ending this epoch.",
+                            plateau_metrics_text(old_best),
+                            plateau_metrics_text(new_best),
+                        );
+                        checkpoint_chunk_idx += 1;
+                        break;
+                    }
+                    PlateauAction::FinalRejected { metrics, best } => {
+                        plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                        mark_latest_checkpoint_epoch_done(&args.output_dir());
+                        eprintln!(
+                            "  plateau: final lr_min superbatch did not improve {monitor_label} (current {}, best {}); \
+                             discarding it and ending this epoch.",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                        break;
+                    }
+                }
+
+                if retry_same_chunk {
+                    eprintln!(
+                        "  cuda-cpp plateau: restored model + optimiser, then rewinding teacher to retry superbatch {} at lowered lr {}",
+                        chunk.superbatch, plateau_state.current_lr
+                    );
+                    continue;
+                }
+                checkpoint_chunk_idx += 1;
+            }
+            while checkpoint_chunk_idx < schedule.chunks.len() && schedule.chunks[checkpoint_chunk_idx].epoch == epoch {
+                checkpoint_chunk_idx += 1;
+            }
+
+            if let Some(current_metrics) = plateau_epoch_final_metrics {
+                if epoch_final_should_stop(
+                    previous_epoch_final_metrics,
+                    current_metrics,
+                    PlateauMonitor::LossOrAccuracy,
+                    0.0,
+                ) {
+                    let previous_metrics = previous_epoch_final_metrics.expect("checked by predicate");
+                    eprintln!(
+                        "  plateau: epoch-final validation metrics did not improve from previous epoch \
+                         (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
+                        previous_metrics.loss,
+                        current_metrics.loss,
+                        previous_metrics.accuracy,
+                        current_metrics.accuracy
+                    );
+                    break;
+                }
+                previous_epoch_final_metrics = Some(current_metrics);
+            }
+        }
+
+        ctx.synchronize().map_err(|e| e.to_string())?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let positions = accepted_steps_total.saturating_mul(batch_size);
+        let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+        let reported_avg_loss =
+            if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
+        eprintln!(
+            "  cuda-cpp plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
+             positions={positions}, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
+             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+        );
+        let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+        let final_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+        let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
+        write_cuda_cpp_halfkp_direct_outputs(
+            &direct_output_dir,
+            cuda_shape,
+            &final_weights,
+            &final_optimizer_states,
+            completed_steps,
+        )?;
+        eprintln!("  cuda-cpp direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
+        if let Some(metrics) = last_checkpoint_metrics {
+            eprintln!(
+                "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+                metrics.accuracy, metrics.loss
+            );
+        }
+        return Ok(());
+    }
+
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
     for_each_halfkp_teacher_fast_batch(&config, train_steps, |teacher_batch| {
@@ -3508,6 +3804,296 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         profile_prepare: false,
     };
 
+    if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
+        let mut current_resume_pos = dataloader_resume_pos;
+        let mut completed_steps = completed_step_offset;
+        let mut accepted_steps_total = 0usize;
+        let mut attempted_steps_total = 0usize;
+        let mut last_checkpoint_metrics = None;
+        let mut previous_epoch_final_metrics = if resume_enabled(args, &args.output_dir()) {
+            read_latest_nnue_test_metrics_in_top_level_log(&args.output_dir().join(SUMMARY_LEARN_LOG_NAME))
+        } else {
+            None
+        };
+        let mut checkpoint_chunk_idx = 0usize;
+        while checkpoint_chunk_idx < schedule.chunks.len() {
+            let epoch = schedule.chunks[checkpoint_chunk_idx].epoch;
+            let display_max_epochs = args.max_epochs.map(|n| n + epoch.saturating_sub(1)).unwrap_or(epoch);
+            print_epoch_banner(epoch, display_max_epochs);
+            let mut plateau_state = PlateauLrState::new(
+                args.lr,
+                args.lr_min,
+                args.lr_plateau_factor,
+                args.lr_plateau_min_delta,
+                args.lr_plateau_monitor,
+            );
+            let mut plateau_epoch_final_metrics = None;
+            while checkpoint_chunk_idx < schedule.chunks.len() && schedule.chunks[checkpoint_chunk_idx].epoch == epoch {
+                let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
+                let snapshot_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let snapshot_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let snapshot_completed_steps = completed_steps;
+                let chunk_resume_pos = current_resume_pos;
+                let mut chunk_seen_steps = 0usize;
+                let mut chunk_last_pos = None;
+                let chunk_config = SfnnTeacherBatchConfig {
+                    teacher: &args.teacher,
+                    batch_size,
+                    batch_index: 0,
+                    dataloader_resume_pos: chunk_resume_pos,
+                    buffer_mb: args.buffer_mb,
+                    loader_threads: args.loader_threads,
+                    threads: args.threads,
+                    lambda: args.lambda,
+                    scale: args.scale as f32,
+                    nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                    score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                    profile_prepare: false,
+                };
+                eprintln!(
+                    "  cuda-cpp SFNN plateau: epoch={}, superbatch={}, lr {}",
+                    chunk.epoch, chunk.superbatch, plateau_state.current_lr
+                );
+                for_each_sfnn_halfka2_teacher_fast_batch(&chunk_config, chunk.steps, |teacher_batch| {
+                    chunk_seen_steps += 1;
+                    attempted_steps_total += 1;
+                    chunk_last_pos = teacher_batch.dataloader_pos;
+                    let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
+                    let fast = teacher_batch.batch;
+                    let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+                    let params = RangerUpdateParams {
+                        radam: RAdamUpdateParams {
+                            step: optimizer_step as u64,
+                            learning_rate: plateau_state.current_lr,
+                            decay: ranger.decay,
+                            beta1: ranger.beta1,
+                            beta2: ranger.beta2,
+                            epsilon: ranger.epsilon,
+                            min_weight: ranger.min_weight,
+                            max_weight: ranger.max_weight,
+                            ..RAdamUpdateParams::default()
+                        },
+                        lookahead_alpha: ranger.alpha,
+                        lookahead_period: ranger.k as u64,
+                    };
+                    let batch = SfnnTrainStepHostBatch {
+                        stm_indices: &fast.stm,
+                        nstm_indices: &fast.nstm,
+                        buckets: &fast.buckets,
+                        targets: &fast.targets,
+                        entry_weights: &fast.weights,
+                        batch_size: fast.layout.batch_size,
+                        max_active: fast.layout.max_active,
+                    };
+                    let finalize_loss = chunk_seen_steps == chunk.steps;
+                    runner
+                        .step_no_readback_with_loss_finalize(
+                            &ctx,
+                            params,
+                            loss_kind,
+                            output_inv_scale,
+                            batch,
+                            finalize_loss,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                })
+                .map_err(|e| e.to_string())?;
+                if chunk_seen_steps != chunk.steps {
+                    return Err(format!(
+                        "cuda-cpp SFNN plateau chunk ended early: expected {} steps, saw {chunk_seen_steps}",
+                        chunk.steps
+                    ));
+                }
+                let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
+                last_loss = loss.mean;
+                reported_loss_sum += f64::from(loss.mean);
+                reported_loss_count += 1;
+                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?
+                    .ok_or_else(|| {
+                        "--backend cuda-cpp SFNN plateau requires readable --test-teacher metrics".to_string()
+                    })?;
+                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let action = plateau_state.observe(test_metrics.into());
+                let reject_update = plateau_action_rejects_update(action);
+                let retry_same_chunk = plateau_action_retries_teacher(action);
+                let accepted_dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                    args,
+                    chunk_seen_steps,
+                    batch_size,
+                    chunk_last_pos,
+                    chunk_resume_pos,
+                )?;
+
+                if reject_update {
+                    runner = SfnnTrainStepRunner::with_optimizer_states(
+                        &ctx,
+                        cuda_cpp_sfnn_weights_readback_as_host(cuda_shape, &snapshot_weights),
+                        cuda_cpp_sfnn_optimizer_readback_as_host(&snapshot_optimizer_states),
+                        batch_size,
+                        max_active,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    completed_steps = snapshot_completed_steps;
+                } else {
+                    completed_steps = snapshot_completed_steps + chunk_seen_steps;
+                    accepted_steps_total += chunk_seen_steps;
+                    current_resume_pos = Some(accepted_dataloader_pos);
+                    let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
+                        args,
+                        cuda_shape,
+                        &trained_weights,
+                        &trained_optimizer_states,
+                        completed_steps,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics: Some(test_metrics),
+                            lr_start: plateau_state.current_lr,
+                            lr_end: plateau_state.current_lr,
+                            dataloader_pos: accepted_dataloader_pos,
+                        },
+                    )?;
+                    eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+                    last_checkpoint_metrics = Some(test_metrics);
+                }
+
+                let current_lr = plateau_state.current_lr;
+                let monitor_label = args.lr_plateau_monitor.label();
+                match action {
+                    PlateauAction::First { metrics } => {
+                        eprintln!(
+                            "  plateau: initial validation metrics = {}; lr stays {current_lr}",
+                            plateau_metrics_text(metrics)
+                        );
+                    }
+                    PlateauAction::Improved { old_best, new_best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} improved (best {} -> {}); lr stays {}",
+                            plateau_metrics_text(old_best),
+                            plateau_metrics_text(new_best),
+                            current_lr,
+                        );
+                    }
+                    PlateauAction::Keep { metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); lr stays {}",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                            current_lr,
+                        );
+                    }
+                    PlateauAction::Reduced { old_lr, new_lr, metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); lr {old_lr} -> {new_lr}",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                    }
+                    PlateauAction::ScheduledFinal { old_lr, min_lr, metrics, best } => {
+                        eprintln!(
+                            "  plateau: {monitor_label} did not improve (current {}, best {}); \
+                             next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
+                             (old lr {old_lr})",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                    }
+                    PlateauAction::FinalImproved { old_best, new_best } => {
+                        plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                        mark_latest_checkpoint_epoch_done(&args.output_dir());
+                        eprintln!(
+                            "  plateau: final lr_min superbatch improved {monitor_label} (best {} -> {}); \
+                             accepting it and ending this epoch.",
+                            plateau_metrics_text(old_best),
+                            plateau_metrics_text(new_best),
+                        );
+                        checkpoint_chunk_idx += 1;
+                        break;
+                    }
+                    PlateauAction::FinalRejected { metrics, best } => {
+                        plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
+                        mark_latest_checkpoint_epoch_done(&args.output_dir());
+                        eprintln!(
+                            "  plateau: final lr_min superbatch did not improve {monitor_label} (current {}, best {}); \
+                             discarding it and ending this epoch.",
+                            plateau_metrics_text(metrics),
+                            plateau_metrics_text(best),
+                        );
+                        break;
+                    }
+                }
+
+                if retry_same_chunk {
+                    eprintln!(
+                        "  cuda-cpp SFNN plateau: restored model + optimiser, then rewinding teacher to retry superbatch {} at lowered lr {}",
+                        chunk.superbatch, plateau_state.current_lr
+                    );
+                    continue;
+                }
+                checkpoint_chunk_idx += 1;
+            }
+            while checkpoint_chunk_idx < schedule.chunks.len() && schedule.chunks[checkpoint_chunk_idx].epoch == epoch {
+                checkpoint_chunk_idx += 1;
+            }
+
+            if let Some(current_metrics) = plateau_epoch_final_metrics {
+                if epoch_final_should_stop(
+                    previous_epoch_final_metrics,
+                    current_metrics,
+                    PlateauMonitor::LossOrAccuracy,
+                    0.0,
+                ) {
+                    let previous_metrics = previous_epoch_final_metrics.expect("checked by predicate");
+                    eprintln!(
+                        "  plateau: epoch-final validation metrics did not improve from previous epoch \
+                         (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
+                        previous_metrics.loss,
+                        current_metrics.loss,
+                        previous_metrics.accuracy,
+                        current_metrics.accuracy
+                    );
+                    break;
+                }
+                previous_epoch_final_metrics = Some(current_metrics);
+            }
+        }
+
+        ctx.synchronize().map_err(|e| e.to_string())?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let positions = accepted_steps_total.saturating_mul(batch_size);
+        let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+        let reported_avg_loss =
+            if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
+        eprintln!(
+            "  cuda-cpp SFNN plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
+             positions={positions}, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
+             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+        );
+        let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+        let final_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+        let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
+        write_cuda_cpp_sfnn_halfka2_direct_outputs(
+            &direct_output_dir,
+            cuda_shape,
+            &final_weights,
+            &final_optimizer_states,
+            completed_steps,
+        )?;
+        eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
+        if let Some(metrics) = last_checkpoint_metrics {
+            eprintln!(
+                "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+                metrics.accuracy, metrics.loss
+            );
+        }
+        return Ok(());
+    }
+
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
     for_each_sfnn_halfka2_teacher_fast_batch(&config, train_steps, |teacher_batch| {
@@ -3689,6 +4275,71 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_ranger_readback_as_host(
+    state: &bulletou_cuda_cpp::RangerParamStateReadback,
+) -> bulletou_cuda_cpp::RangerParamHostState<'_> {
+    bulletou_cuda_cpp::RangerParamHostState {
+        momentum: &state.momentum,
+        velocity: &state.velocity,
+        slow_params: &state.slow_params,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_halfkp_optimizer_readback_as_host(
+    states: &bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback,
+) -> bulletou_cuda_cpp::NnueRangerOptimizerHostStates<'_> {
+    bulletou_cuda_cpp::NnueRangerOptimizerHostStates {
+        l0w: cuda_cpp_ranger_readback_as_host(&states.l0w),
+        l0b: cuda_cpp_ranger_readback_as_host(&states.l0b),
+        l1w: cuda_cpp_ranger_readback_as_host(&states.l1w),
+        l1b: cuda_cpp_ranger_readback_as_host(&states.l1b),
+        l2w: cuda_cpp_ranger_readback_as_host(&states.l2w),
+        l2b: cuda_cpp_ranger_readback_as_host(&states.l2b),
+        outw: cuda_cpp_ranger_readback_as_host(&states.outw),
+        outb: cuda_cpp_ranger_readback_as_host(&states.outb),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_weights_readback_as_host(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+) -> bulletou_cuda_cpp::SfnnForwardHostWeights<'_> {
+    bulletou_cuda_cpp::SfnnForwardHostWeights {
+        shape,
+        l0w: &weights.l0w,
+        l0b: &weights.l0b,
+        l1w: &weights.l1w,
+        l1b: &weights.l1b,
+        l1fw: weights.l1fw.as_deref(),
+        l1fb: weights.l1fb.as_deref(),
+        l2w: &weights.l2w,
+        l2b: &weights.l2b,
+        l3w: &weights.l3w,
+        l3b: &weights.l3b,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_optimizer_readback_as_host(
+    states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
+) -> bulletou_cuda_cpp::SfnnRangerOptimizerHostStates<'_> {
+    bulletou_cuda_cpp::SfnnRangerOptimizerHostStates {
+        l0w: cuda_cpp_ranger_readback_as_host(&states.l0w),
+        l0b: cuda_cpp_ranger_readback_as_host(&states.l0b),
+        l1w: cuda_cpp_ranger_readback_as_host(&states.l1w),
+        l1b: cuda_cpp_ranger_readback_as_host(&states.l1b),
+        l1fw: states.l1fw.as_ref().map(cuda_cpp_ranger_readback_as_host),
+        l1fb: states.l1fb.as_ref().map(cuda_cpp_ranger_readback_as_host),
+        l2w: cuda_cpp_ranger_readback_as_host(&states.l2w),
+        l2b: cuda_cpp_ranger_readback_as_host(&states.l2b),
+        l3w: cuda_cpp_ranger_readback_as_host(&states.l3w),
+        l3b: cuda_cpp_ranger_readback_as_host(&states.l3b),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_halfkp_final_validation(
     args: &Args,
     shape: bulletou_cuda_cpp::NnueForwardShape,
@@ -3792,6 +4443,23 @@ fn cuda_cpp_direct_dataloader_pos(
     batch_size: usize,
     last_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
 ) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
+    cuda_cpp_direct_dataloader_pos_from_base(
+        args,
+        seen_steps,
+        batch_size,
+        last_pos,
+        cuda_cpp_auto_resume_dataloader_pos(args),
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_direct_dataloader_pos_from_base(
+    args: &Args,
+    seen_steps: usize,
+    batch_size: usize,
+    last_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+    base_resume_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
     if let Some(pos) = last_pos {
         return Ok(pos);
     }
@@ -3819,7 +4487,7 @@ fn cuda_cpp_direct_dataloader_pos(
     if total_bytes == 0 {
         return Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
     }
-    let base_byte_offset = cuda_cpp_auto_resume_dataloader_pos(args).map(|pos| pos.byte_offset).unwrap_or(0);
+    let base_byte_offset = base_resume_pos.map(|pos| pos.byte_offset).unwrap_or(0);
     let consumed_records = seen_steps
         .checked_mul(batch_size)
         .ok_or_else(|| format!("cuda-cpp dataloader_pos overflow: steps={seen_steps} batch_size={batch_size}"))?;
@@ -10257,6 +10925,95 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_accepts_halfkp_plateau_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "1024",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_plateau_requires_test_teacher() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "1",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "--test-teacher" } else { "cuda-cpp-backend" }));
+    }
+
+    #[test]
+    fn cuda_cpp_backend_plateau_requires_save_rate_one() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+            "--save-rate",
+            "2",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "--save-rate 1" } else { "cuda-cpp-backend" }));
+    }
+
+    #[test]
     fn cuda_cpp_backend_rejects_mixed_direct_and_production_schedule() {
         use clap::Parser as _;
 
@@ -10521,6 +11278,44 @@ mod tests {
             "1024",
             "--positions-per-superbatch",
             "1024",
+            "--sfnn-factorized-l1",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_sfnn_halfka2_plateau_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "1",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "1024",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
             "--sfnn-factorized-l1",
         ])
         .unwrap();
