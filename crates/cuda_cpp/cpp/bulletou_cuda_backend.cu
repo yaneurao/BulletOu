@@ -137,6 +137,37 @@ __global__ void fill_f32_kernel(size_t len, float value, float* out) {
     out[idx] = value;
 }
 
+__device__ __forceinline__ void radam_update_one(
+    float grad,
+    float learning_rate,
+    float step_size,
+    int use_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    float* weight,
+    float* momentum,
+    float* velocity) {
+    float rate = learning_rate * step_size;
+    float w = *weight * (1.0f - decay * rate);
+    float m = beta1 * *momentum + (1.0f - beta1) * grad;
+    float v = beta2 * *velocity + (1.0f - beta2) * grad * grad;
+
+    float update = m;
+    if (use_denom != 0) {
+        update /= sqrtf(v) + epsilon;
+    }
+    w -= rate * update;
+    w = fminf(fmaxf(w, min_weight), max_weight);
+
+    *weight = w;
+    *momentum = m;
+    *velocity = v;
+}
+
 __global__ void radam_update_reset_gradients_kernel(
     float* gradients,
     float* weights,
@@ -159,22 +190,105 @@ __global__ void radam_update_reset_gradients_kernel(
     }
 
     float grad = gradient_factor * gradients[idx];
-    float rate = learning_rate * step_size;
-    float weight = weights[idx] * (1.0f - decay * rate);
-    float m = beta1 * momentum[idx] + (1.0f - beta1) * grad;
-    float v = beta2 * velocity[idx] + (1.0f - beta2) * grad * grad;
-
-    float update = m;
-    if (use_denom != 0) {
-        update /= sqrtf(v) + epsilon;
-    }
-    weight -= rate * update;
-    weight = fminf(fmaxf(weight, min_weight), max_weight);
+    float weight = weights[idx];
+    float m = momentum[idx];
+    float v = velocity[idx];
+    radam_update_one(
+        grad, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight, &m, &v);
 
     gradients[idx] = 0.0f;
     weights[idx] = weight;
     momentum[idx] = m;
     velocity[idx] = v;
+}
+
+__global__ void radam_update_reset_gradients_vec4_kernel(
+    float* gradients,
+    float* weights,
+    float* momentum,
+    float* velocity,
+    size_t len4,
+    float gradient_factor,
+    float learning_rate,
+    float step_size,
+    int use_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len4) {
+        return;
+    }
+
+    const float4 gradient4 = reinterpret_cast<const float4*>(gradients)[idx];
+    float4 weight4 = reinterpret_cast<const float4*>(weights)[idx];
+    float4 momentum4 = reinterpret_cast<const float4*>(momentum)[idx];
+    float4 velocity4 = reinterpret_cast<const float4*>(velocity)[idx];
+
+    radam_update_one(
+        gradient_factor * gradient4.x,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight,
+        &weight4.x,
+        &momentum4.x,
+        &velocity4.x);
+    radam_update_one(
+        gradient_factor * gradient4.y,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight,
+        &weight4.y,
+        &momentum4.y,
+        &velocity4.y);
+    radam_update_one(
+        gradient_factor * gradient4.z,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight,
+        &weight4.z,
+        &momentum4.z,
+        &velocity4.z);
+    radam_update_one(
+        gradient_factor * gradient4.w,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight,
+        &weight4.w,
+        &momentum4.w,
+        &velocity4.w);
+
+    reinterpret_cast<float4*>(gradients)[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    reinterpret_cast<float4*>(weights)[idx] = weight4;
+    reinterpret_cast<float4*>(momentum)[idx] = momentum4;
+    reinterpret_cast<float4*>(velocity)[idx] = velocity4;
 }
 
 __global__ void ranger_lookahead_kernel(float* weights, float* slow_params, size_t len, float alpha) {
@@ -186,6 +300,22 @@ __global__ void ranger_lookahead_kernel(float* weights, float* slow_params, size
     float next = alpha * weights[idx] + (1.0f - alpha) * slow_params[idx];
     weights[idx] = next;
     slow_params[idx] = next;
+}
+
+__global__ void ranger_lookahead_vec4_kernel(float* weights, float* slow_params, size_t len4, float alpha) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len4) {
+        return;
+    }
+
+    float4 weight4 = reinterpret_cast<const float4*>(weights)[idx];
+    const float4 slow4 = reinterpret_cast<const float4*>(slow_params)[idx];
+    weight4.x = alpha * weight4.x + (1.0f - alpha) * slow4.x;
+    weight4.y = alpha * weight4.y + (1.0f - alpha) * slow4.y;
+    weight4.z = alpha * weight4.z + (1.0f - alpha) * slow4.z;
+    weight4.w = alpha * weight4.w + (1.0f - alpha) * slow4.w;
+    reinterpret_cast<float4*>(weights)[idx] = weight4;
+    reinterpret_cast<float4*>(slow_params)[idx] = weight4;
 }
 
 __device__ float crelu(float value) {
@@ -1551,32 +1681,67 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
         return ok();
     }
 
-    int threads = 256;
-    int blocks = static_cast<int>((len + threads - 1) / threads);
-    radam_update_reset_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        gradients->ptr,
-        weights->ptr,
-        momentum->ptr,
-        velocity->ptr,
-        len,
-        gradient_factor,
-        learning_rate,
-        step_size,
-        use_denom,
-        decay,
-        beta1,
-        beta2,
-        epsilon,
-        min_weight,
-        max_weight);
-    if (check_kernel_launch("radam_update_reset_gradients_kernel launch") != 0) {
+    constexpr int threads = 256;
+    const bool use_vec4 = (len % 4) == 0;
+    const size_t update_threads = use_vec4 ? len / 4 : len;
+    int blocks = 0;
+    if (block_count_1d(update_threads, threads, &blocks, "radam_update_reset_gradients_kernel") != 0) {
         return -1;
+    }
+    if (use_vec4) {
+        radam_update_reset_gradients_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            gradients->ptr,
+            weights->ptr,
+            momentum->ptr,
+            velocity->ptr,
+            len / 4,
+            gradient_factor,
+            learning_rate,
+            step_size,
+            use_denom,
+            decay,
+            beta1,
+            beta2,
+            epsilon,
+            min_weight,
+            max_weight);
+        if (check_kernel_launch("radam_update_reset_gradients_vec4_kernel launch") != 0) {
+            return -1;
+        }
+    } else {
+        radam_update_reset_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            gradients->ptr,
+            weights->ptr,
+            momentum->ptr,
+            velocity->ptr,
+            len,
+            gradient_factor,
+            learning_rate,
+            step_size,
+            use_denom,
+            decay,
+            beta1,
+            beta2,
+            epsilon,
+            min_weight,
+            max_weight);
+        if (check_kernel_launch("radam_update_reset_gradients_kernel launch") != 0) {
+            return -1;
+        }
     }
 
     if (do_lookahead != 0) {
-        ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(weights->ptr, slow_params->ptr, len, lookahead_alpha);
-        if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
-            return -1;
+        if (use_vec4) {
+            ranger_lookahead_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                weights->ptr, slow_params->ptr, len / 4, lookahead_alpha);
+            if (check_kernel_launch("ranger_lookahead_vec4_kernel launch") != 0) {
+                return -1;
+            }
+        } else {
+            ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(weights->ptr, slow_params->ptr, len, lookahead_alpha);
+            if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
+                return -1;
+            }
         }
     }
 
