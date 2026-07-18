@@ -683,6 +683,9 @@ the tickets in order and commit each completed slice.
   - `examples/bulletou --backend cuda-cpp --cuda-cpp-train-steps N --eval-type NNUE_HALFKP` now streams real teacher batches through the shared fixed-layout `HalfkpTeacherBatchConfig`;
   - the direct path is intentionally limited to Ranger, constant-LR direct steps, and no production checkpoint/resume/validation flags yet;
   - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's `device-cuda` runtime just to create the model.
+- Reduced direct-step synchronization overhead:
+  - `NnueTrainStepRunner::step_no_readback` runs upload -> forward -> loss -> backward -> Ranger update without downloading the loss every batch;
+  - the compatibility `step` method remains readback-producing, while the direct CLI now samples loss only at step 1, every 10 steps, and the final step.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -693,7 +696,7 @@ the tickets in order and commit each completed slice.
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou` passed;
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 1024 --buffer-mb 64 --threads 4` passed without WSL and reported two real HCPE train steps;
-  - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 5 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=461695 pos/s` for the short direct-step probe.
+  - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=867894 pos/s` for the short direct-step probe after readback sampling.
 - Remaining BO-CUDA-033 work:
   - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;

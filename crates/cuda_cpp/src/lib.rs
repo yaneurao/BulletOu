@@ -14,11 +14,7 @@ impl CudaCppError {
         if status == 0 {
             // SAFETY: the backend always nul-terminates on success.
             let message = unsafe { CStr::from_ptr(bytes.as_ptr()) }.to_string_lossy().into_owned();
-            if message.is_empty() {
-                Self { message: fallback }
-            } else {
-                Self { message }
-            }
+            if message.is_empty() { Self { message: fallback } } else { Self { message } }
         } else {
             Self { message: fallback }
         }
@@ -1307,6 +1303,18 @@ impl NnueTrainStepRunner {
         output_inv_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
     ) -> Result<ScalarLossReadback> {
+        self.step_no_readback(ctx, params, loss_kind, output_inv_scale, batch)?;
+        self.read_loss(ctx)
+    }
+
+    pub fn step_no_readback(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+    ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
@@ -1340,7 +1348,10 @@ impl NnueTrainStepRunner {
             &self.loss_workspace,
             &self.backward_workspace,
         )?;
-        self.update_weights(ctx, params)?;
+        self.update_weights(ctx, params)
+    }
+
+    pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
         self.loss_workspace.download(ctx)
     }
 
@@ -1708,11 +1719,7 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
 }
 
 fn check(code: i32) -> Result<()> {
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(CudaCppError::from_last_error(code))
-    }
+    if code == 0 { Ok(()) } else { Err(CudaCppError::from_last_error(code)) }
 }
 
 mod ffi {

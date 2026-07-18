@@ -3020,7 +3020,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     // `--scale` is used only while preparing the teacher target.
     let output_inv_scale = 1.0_f32;
     let mut seen_steps = 0usize;
-    let mut loss_sum = 0.0_f64;
+    let mut reported_loss_sum = 0.0_f64;
+    let mut reported_loss_count = 0usize;
     let mut last_loss = 0.0_f32;
     let started = std::time::Instant::now();
 
@@ -3061,8 +3062,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                 lookahead_period: ranger.k as u64,
             }
         };
-        let loss = runner
-            .step(
+        runner
+            .step_no_readback(
                 &ctx,
                 params,
                 loss_kind,
@@ -3077,9 +3078,12 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-        last_loss = loss.mean;
-        loss_sum += f64::from(loss.mean);
-        if seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0 {
+        let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
+        if should_report {
+            let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
+            last_loss = loss.mean;
+            reported_loss_sum += f64::from(loss.mean);
+            reported_loss_count += 1;
             eprintln!(
                 "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
                 loss.mean, teacher_batch.source
@@ -3093,10 +3097,10 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
     let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
-    let avg_loss = if seen_steps > 0 { loss_sum / seen_steps as f64 } else { 0.0 };
+    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
         "  cuda-cpp direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
-         throughput={positions_per_sec:.0} pos/s, avg_loss={avg_loss:.8}, last_loss={last_loss:.8}"
+         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
 
     Ok(())
