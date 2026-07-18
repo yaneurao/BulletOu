@@ -2780,6 +2780,9 @@ fn main() {
         std::process::exit(2);
     }
     if args.backend == BackendKind::CudaCpp {
+        if let Err(e) = record_invocation_to_tag_txt(&args) {
+            eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
+        }
         if let Err(e) = run_cuda_cpp_backend(&args) {
             eprintln!("error: {e}");
             std::process::exit(2);
@@ -3139,6 +3142,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let mut profile_total_ms = 0.0_f64;
     let mut profile_count = 0usize;
     let started = std::time::Instant::now();
+    let mut last_dataloader_pos = None;
 
     let config = HalfkpTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3158,6 +3162,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
 
     for_each_halfkp_teacher_fast_batch(&config, train_steps, |teacher_batch| {
         seen_steps += 1;
+        last_dataloader_pos = teacher_batch.dataloader_pos;
         let optimizer_step = completed_step_offset + seen_steps;
         let fast = teacher_batch.batch;
         let params = {
@@ -3268,6 +3273,19 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         completed_steps,
     )?;
     eprintln!("  cuda-cpp direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
+    let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+    let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
+        args,
+        cuda_shape,
+        &trained_weights,
+        &trained_optimizer_states,
+        completed_steps,
+        seen_steps,
+        last_loss,
+        None,
+        dataloader_pos,
+    )?;
+    eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
 
     Ok(())
 }
@@ -3366,6 +3384,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let mut profile_count = 0usize;
     let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
+    let mut last_dataloader_pos = None;
 
     let config = SfnnTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3384,6 +3403,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
 
     for_each_sfnn_halfka2_teacher_fast_batch(&config, train_steps, |teacher_batch| {
         seen_steps += 1;
+        last_dataloader_pos = teacher_batch.dataloader_pos;
         let optimizer_step = completed_step_offset + seen_steps;
         let fast = teacher_batch.batch;
         let params = {
@@ -3505,6 +3525,19 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         completed_steps,
     )?;
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
+    let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+    let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
+        args,
+        cuda_shape,
+        &trained_weights,
+        &trained_optimizer_states,
+        completed_steps,
+        seen_steps,
+        last_loss,
+        final_test_metrics,
+        dataloader_pos,
+    )?;
+    eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
     if let Some(metrics) = final_test_metrics {
         eprintln!(
             "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
@@ -3546,6 +3579,175 @@ fn run_cuda_cpp_sfnn_halfka2_final_validation(
     );
 
     Ok(Some(run_one_test_pass(&cache, args, outputs)))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_direct_dataloader_pos(
+    args: &Args,
+    seen_steps: usize,
+    batch_size: usize,
+    last_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
+    if let Some(pos) = last_pos {
+        return Ok(pos);
+    }
+
+    let paths = expand_teacher(&args.teacher)?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format = infer_data_format(&path_refs)?;
+    let Some(record_size) = (match format {
+        DataFormat::Hcpe => Some(bulletou_lib::value::loader::hcpe::HCPE_RECORD_SIZE),
+        DataFormat::Psv => Some(std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>()),
+        DataFormat::Hcpe3 | DataFormat::Pack => None,
+    }) else {
+        eprintln!(
+            "  WARN: cuda-cpp direct checkpoint could not infer dataloader_pos for variable-length {format:?}; writing 0,0"
+        );
+        return Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
+    };
+
+    let mut total_bytes = 0u64;
+    for path in &paths {
+        let len = std::fs::metadata(path).map_err(|err| format!("failed to stat teacher {path}: {err}"))?.len();
+        total_bytes =
+            total_bytes.checked_add(len).ok_or_else(|| format!("teacher byte size overflow while adding {path}"))?;
+    }
+    if total_bytes == 0 {
+        return Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
+    }
+    let consumed_records = seen_steps
+        .checked_mul(batch_size)
+        .ok_or_else(|| format!("cuda-cpp dataloader_pos overflow: steps={seen_steps} batch_size={batch_size}"))?;
+    let consumed_bytes = (consumed_records as u64)
+        .checked_mul(record_size as u64)
+        .ok_or_else(|| format!("cuda-cpp dataloader_pos byte overflow: records={consumed_records}"))?;
+    Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: consumed_bytes % total_bytes, plies: 0 })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_halfkp_numbered_checkpoint(
+    args: &Args,
+    shape: bulletou_cuda_cpp::NnueForwardShape,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback,
+    completed_steps: usize,
+    train_steps: usize,
+    train_loss: f32,
+    test_metrics: Option<TestMetrics>,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+) -> Result<std::path::PathBuf, String> {
+    let output_dir = args.output_dir();
+    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let idx = count_existing_numbered_dirs(&output_dir) + 1;
+    let dir = output_dir.join(format!("{idx:04}"));
+    if dir.exists() {
+        return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    write_cuda_cpp_halfkp_nn_bin(&dir.join("nn.bin"), shape, weights)?;
+    write_cuda_cpp_halfkp_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
+    write_cuda_cpp_direct_checkpoint_metadata(
+        &output_dir,
+        idx,
+        &dir,
+        args,
+        train_steps,
+        train_loss,
+        test_metrics,
+        dataloader_pos,
+    )?;
+    Ok(dir)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_sfnn_numbered_checkpoint(
+    args: &Args,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
+    completed_steps: usize,
+    train_steps: usize,
+    train_loss: f32,
+    test_metrics: Option<TestMetrics>,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+) -> Result<std::path::PathBuf, String> {
+    let output_dir = args.output_dir();
+    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let idx = count_existing_numbered_dirs(&output_dir) + 1;
+    let dir = output_dir.join(format!("{idx:04}"));
+    if dir.exists() {
+        return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    write_cuda_cpp_sfnn_halfka2_nn_bin(&dir.join("nn.bin"), shape, weights)?;
+    write_cuda_cpp_sfnn_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
+    write_cuda_cpp_direct_checkpoint_metadata(
+        &output_dir,
+        idx,
+        &dir,
+        args,
+        train_steps,
+        train_loss,
+        test_metrics,
+        dataloader_pos,
+    )?;
+    Ok(dir)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_direct_checkpoint_metadata(
+    output_dir: &std::path::Path,
+    idx: usize,
+    dir: &std::path::Path,
+    args: &Args,
+    train_steps: usize,
+    train_loss: f32,
+    test_metrics: Option<TestMetrics>,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+) -> Result<(), String> {
+    std::fs::write(dir.join("teacher.txt"), format!("{}\n", args.teacher))
+        .map_err(|err| format!("failed to write {}: {err}", dir.join("teacher.txt").display()))?;
+    std::fs::write(
+        dir.join("dataloader_pos.txt"),
+        format!("{},{}\n", dataloader_pos.byte_offset, dataloader_pos.plies),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
+
+    let mut learn = String::new();
+    learn.push_str(LEARN_LOG_HEADER);
+    learn.push('\n');
+    learn.push_str(&cuda_cpp_direct_learn_log_row(args, train_steps, train_loss, test_metrics));
+    std::fs::write(dir.join("learn.log"), learn)
+        .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))?;
+    append_to_top_level_log(output_dir, idx)
+        .map_err(|err| format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_direct_learn_log_row(
+    args: &Args,
+    train_steps: usize,
+    train_loss: f32,
+    test_metrics: Option<TestMetrics>,
+) -> String {
+    let eval_field = if args.eval_type().uses_arch() {
+        format!("{}-{}", args.eval_type().cli_name(), args.arch().cli_name())
+    } else {
+        args.eval_type().cli_name().to_string()
+    };
+    let (test_accuracy, test_loss) = match test_metrics {
+        Some(metrics) => (format!("{:.6}", metrics.accuracy), format!("{:.6}", metrics.loss)),
+        None => ("-".to_string(), "-".to_string()),
+    };
+    let positions = train_steps.saturating_mul(effective_batch_size(args));
+    format!(
+        "{eval},1,1,{batch},{test_accuracy},{test_loss},{train_loss:.6},{lr:.6},{lr:.6},{lambda:.6},{positions},{teacher}\n",
+        eval = eval_field,
+        batch = train_steps,
+        lr = args.lr,
+        lambda = args.lambda,
+        teacher = csv_escape(&resolve_teacher_for_log(&args.teacher)),
+    )
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5451,6 +5653,7 @@ fn resume_signature(args: &Args) -> String {
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
+        format!("test_sample={}", args.test_sample.cli_name()),
         format!("test_seed={}", args.test_seed),
     ]
     .join("\n")
@@ -10795,6 +10998,68 @@ mod tests {
         assert_eq!(cols2.len(), 11);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
         assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_direct_checkpoint_metadata_writes_learn_and_summary_logs() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-direct-meta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = tmp.join("0001");
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "teacher.psv",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "3",
+            "--batch-size",
+            "5",
+            "--test-sample",
+            "sequential",
+        ])
+        .unwrap();
+        let metrics = TestMetrics { accuracy: 0.625, loss: 0.125 };
+
+        write_cuda_cpp_direct_checkpoint_metadata(
+            &tmp,
+            1,
+            &dir,
+            &args,
+            3,
+            0.25,
+            Some(metrics),
+            bulletou_lib::value::TeacherDataloaderPos { byte_offset: 600, plies: 0 },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("teacher.txt")).unwrap(), "teacher.psv\n");
+        assert_eq!(std::fs::read_to_string(dir.join("dataloader_pos.txt")).unwrap(), "600,0\n");
+        let learn = std::fs::read_to_string(dir.join("learn.log")).unwrap();
+        let learn_lines = learn.lines().collect::<Vec<_>>();
+        assert_eq!(learn_lines[0], LEARN_LOG_HEADER);
+        assert!(learn_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,3,"));
+        assert!(learn_lines[1].contains(",0.625000,0.125000,0.250000,"));
+        assert!(learn_lines[1].contains(",15,teacher.psv"));
+
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let summary_lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(summary_lines[0], SUMMARY_LEARN_LOG_HEADER);
+        assert_eq!(summary_lines.len(), 2);
+        assert_eq!(summary_lines[1].split(',').count(), 11);
+        assert!(summary_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

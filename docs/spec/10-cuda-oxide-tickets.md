@@ -741,8 +741,10 @@ the tickets in order and commit each completed slice.
   - vectorized update profile smoke reported average profiled GPU time: upload `0.427ms`, forward `0.332ms`, loss `0.143ms`, backward `1.703ms`, Ranger update `1.215ms`, total `3.821ms`.
   - unprofiled 100-step release smoke after vectorized update reported `throughput=897088 pos/s` for `--cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8 --output target\cuda-cpp-vec4-100`.
   - after moving L0 bias backward off atomics, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed, `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed, and the unprofiled 100-step release smoke reported `throughput=910234 pos/s`.
+  - Added direct-mode numbered checkpoint/log emission alongside the temporary `cuda-cpp-direct` folder:
+    `--backend cuda-cpp --eval-type NNUE_HALFKP --cuda-cpp-train-steps 1 --batch-size 64 --output target\cuda-cpp-numbered-halfkp-smoke` wrote `0001/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}`, top-level `summary-learn.log`, and `tag.txt`; `learn.log` / `summary-learn.log` used the production CSV schemas and `dataloader_pos.txt` was `2432,0`.
 - Remaining BO-CUDA-033 work:
-  - wire the direct full-state replay into normal checkpoint/log/validation semantics and `--resume`/`--no-resume` orchestration;
+  - wire direct validation and direct full-state replay into `--resume`/`--no-resume` orchestration;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
   - optimise the correctness-first L0 sparse backward atomic-scatter and Ranger update path, which still dominate the CUDA profile after removing the direct-path zero kernel;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
@@ -803,6 +805,9 @@ the tickets in order and commit each completed slice.
   - added root `--test-sample random|sequential` so the C++ direct path can use the same sequential yamaoka PSV subset as the tatara/cuda-oxide SFNN parity probes;
   - the final C++ direct validation reads the trained weights back, folds optional `l1fw/l1fb` into the stacked L1 weights/biases for the CPU fast SFNN forward, evaluates the cached yamaoka positions, and prints `test_value_accuracy` / `test_value_loss`;
   - root `--backend cuda-oxide` now forwards `--test-sample` to the child trainer so the same CLI spelling works across both experimental backends.
+- Added the same direct-mode numbered checkpoint/log emission to SFNN C++ direct:
+  - after training, the backend still writes the temporary `<output>/cuda-cpp-direct/{nn.bin,weights.bin}` compatibility folder, and now also writes the production-shaped `<output>/<NNNN>/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}` plus top-level `summary-learn.log`;
+  - direct `learn.log` is a one-row production CSV for the completed direct run, with final validation metrics populated when `--test-teacher` is present.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -845,6 +850,6 @@ the tickets in order and commit each completed slice.
   - Full exported-teacher yamaoka comparison on Windows used `target\full-epoch-sfnn-20260718\teacher-all.psv` for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation:
     `--cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-positions 65536 --test-sample sequential --test-batch-size 8192` reported `649199616` positions in `489.182s`, `throughput=1327112 pos/s`, `test_value_loss=0.05579023`, `test_value_accuracy=0.6717072`.
 - Remaining BO-CUDA-034 work:
-  - wire SFNN cuda-cpp direct output and final validation into the normal numbered checkpoint/log semantics and auto-resume orchestration;
+  - wire SFNN cuda-cpp direct full-state replay into auto-resume orchestration (`--resume` / `--no-resume`) instead of requiring explicit `--cuda-cpp-weights-bin`;
   - add deeper backward profiling/optimisation; the large-batch full-teacher C++ direct comparison now clears the tracked tatara speed/quality target, but the backend still has rough direct-mode ergonomics;
   - consider a clean repeat run and/or smaller-batch quality-speed recipe after normal checkpoint/log support lands.
