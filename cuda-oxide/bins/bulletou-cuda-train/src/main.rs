@@ -122,6 +122,7 @@ struct Args {
     optimizer_beta1: f32,
     optimizer_beta2: f32,
     batch_size: usize,
+    teacher_batch_size: Option<usize>,
     buffer_mb: usize,
     loader_threads: usize,
     teacher_queue_depth: usize,
@@ -251,6 +252,7 @@ impl Args {
             optimizer_beta1: 0.99,
             optimizer_beta2: 0.999,
             batch_size: 2,
+            teacher_batch_size: None,
             buffer_mb: 1,
             loader_threads: 1,
             teacher_queue_depth: 8,
@@ -437,6 +439,10 @@ impl Args {
                 }
                 "--batch-size" => {
                     parsed.batch_size = parse_usize_arg(required_arg(&mut args, "--batch-size")?, "--batch-size")?;
+                }
+                "--teacher-batch-size" => {
+                    parsed.teacher_batch_size =
+                        Some(parse_usize_arg(required_arg(&mut args, "--teacher-batch-size")?, "--teacher-batch-size")?);
                 }
                 "--buffer-mb" => {
                     parsed.buffer_mb = parse_usize_arg(required_arg(&mut args, "--buffer-mb")?, "--buffer-mb")?;
@@ -1823,7 +1829,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 .to_string(),
         ));
     }
-    let initial_weights_are_loaded = true;
+    let initial_weights_are_loaded = args.weights_bin.is_some();
     let mut initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfka2_weights_as_sfnn_case(path)?,
         None => SfnnForwardCase::halfka2_1024_7_64_k3k3_ft_factorized(),
@@ -1893,18 +1899,49 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut train_timer: Option<std::time::Instant> = None;
     let mut train_positions = 0usize;
     let mut run_steps = 0usize;
+    let teacher_batch_size = args.teacher_batch_size.unwrap_or(args.batch_size);
+    if teacher_batch_size < args.batch_size {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "--teacher-batch-size ({teacher_batch_size}) must be >= --batch-size ({})",
+            args.batch_size
+        )));
+    }
+    if !teacher_batch_size.is_multiple_of(args.batch_size) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "--teacher-batch-size ({teacher_batch_size}) must be a multiple of --batch-size ({})",
+            args.batch_size
+        )));
+    }
+    if args.teacher_batch_size.is_some() && args.output.is_some() {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--teacher-batch-size is currently for benchmark runs without --output; checkpoint resume needs a stored microbatch offset".to_string(),
+        ));
+    }
+    let teacher_batches_to_load = args
+        .train_steps
+        .checked_add(teacher_batch_size / args.batch_size - 1)
+        .and_then(|value| value.checked_div(teacher_batch_size / args.batch_size))
+        .ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(
+                "--train-steps / --teacher-batch-size calculation overflowed".to_string(),
+            )
+        })?;
     let teacher_batch_index = if dataloader_resume_pos.is_some()
         || resume_teacher_matches
         || legacy_resume_checkpoint
         || output_resume_checkpoint.is_none()
     {
-        completed_step_offset
+        if args.teacher_batch_size.is_some() {
+            completed_step_offset / (teacher_batch_size / args.batch_size)
+        } else {
+            completed_step_offset
+        }
     } else {
         0
     };
     let teacher_batch_config = bulletou_lib::value::teacher_batch::SfnnTeacherBatchConfig {
         teacher,
-        batch_size: args.batch_size,
+        batch_size: teacher_batch_size,
         batch_index: teacher_batch_index,
         dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
@@ -1923,139 +1960,154 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             let dataloader_pos = loaded.dataloader_pos;
             let batch = loaded.batch;
             validate_sfnn_teacher_fast_batch(shape, &batch)?;
-            if runner.is_none() {
-                runner = Some(match restored_state.as_ref() {
-                    Some(state) => SfnnLossRangerStepRunner::with_optimizer_state(
-                        &stream,
-                        &state.host_weights(),
-                        state.host_optimizer_states(),
-                        batch.layout.batch_size,
-                        batch.layout.max_active,
-                    )?,
-                    None => {
-                        let host_weights = SfnnForwardHostWeights {
-                            shape,
-                            l0w: &initial_case.l0w,
-                            l0b: &initial_case.l0b,
-                            l1w: &initial_case.l1w,
-                            l1b: &initial_case.l1b,
-                            l1fw: initial_case.l1fw.as_deref(),
-                            l1fb: initial_case.l1fb.as_deref(),
-                            l2w: &initial_case.l2w,
-                            l2b: &initial_case.l2b,
-                            l3w: &initial_case.l3w,
-                            l3b: &initial_case.l3b,
-                        };
-                        if initial_weights_are_loaded {
-                            SfnnLossRangerStepRunner::new(
-                                &stream,
-                                &host_weights,
-                                batch.layout.batch_size,
-                                batch.layout.max_active,
-                            )?
-                        } else {
-                            SfnnLossRangerStepRunner::new_from_scratch(
-                                &stream,
-                                &host_weights,
-                                batch.layout.batch_size,
-                                batch.layout.max_active,
-                            )?
+            let micro_batches = batch.layout.batch_size / args.batch_size;
+            for micro in 0..micro_batches {
+                if run_steps >= args.train_steps {
+                    break;
+                }
+                if runner.is_none() {
+                    runner = Some(match restored_state.as_ref() {
+                        Some(state) => SfnnLossRangerStepRunner::with_optimizer_state(
+                            &stream,
+                            &state.host_weights(),
+                            state.host_optimizer_states(),
+                            args.batch_size,
+                            batch.layout.max_active,
+                        )?,
+                        None => {
+                            let host_weights = SfnnForwardHostWeights {
+                                shape,
+                                l0w: &initial_case.l0w,
+                                l0b: &initial_case.l0b,
+                                l1w: &initial_case.l1w,
+                                l1b: &initial_case.l1b,
+                                l1fw: initial_case.l1fw.as_deref(),
+                                l1fb: initial_case.l1fb.as_deref(),
+                                l2w: &initial_case.l2w,
+                                l2b: &initial_case.l2b,
+                                l3w: &initial_case.l3w,
+                                l3b: &initial_case.l3b,
+                            };
+                            if initial_weights_are_loaded {
+                                SfnnLossRangerStepRunner::new(
+                                    &stream,
+                                    &host_weights,
+                                    args.batch_size,
+                                    batch.layout.max_active,
+                                )?
+                            } else {
+                                SfnnLossRangerStepRunner::new_from_scratch(
+                                    &stream,
+                                    &host_weights,
+                                    args.batch_size,
+                                    batch.layout.max_active,
+                                )?
+                            }
                         }
-                    }
-                });
-            }
+                    });
+                }
 
-            let step = completed_step_offset + run_steps + 1;
-            let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
-            let params = grouped_ranger_step_params_for_step_with_hyperparams(
-                step,
-                learning_rate,
-                args.optimizer_weight_decay,
-                args.optimizer_beta1,
-                args.optimizer_beta2,
-                args.optimizer_epsilon,
-            );
-            let host_batch = SfnnTrainStepHostBatch {
-                stm_indices: &batch.stm,
-                nstm_indices: &batch.nstm,
-                buckets: &batch.buckets,
-                targets: &batch.targets,
-                entry_weights: &batch.weights,
-                batch_size: batch.layout.batch_size,
-                max_active: batch.layout.max_active,
-            };
-            train_timer.get_or_insert_with(std::time::Instant::now);
-            train_positions = train_positions.saturating_add(batch.layout.batch_size);
-            let runner_ref = runner.as_mut().expect("runner is initialized");
-            runner_ref.step(
-                &stream,
-                &module,
-                params,
-                train_loss_kind,
-                args.sigmoid_output_scale,
-                host_batch,
-                args.profile_train_step,
-            )?;
+                let step = completed_step_offset + run_steps + 1;
+                let learning_rate = nnue_teacher_learning_rate_for_step(&args, step);
+                let params = grouped_ranger_step_params_for_step_with_hyperparams(
+                    step,
+                    learning_rate,
+                    args.optimizer_weight_decay,
+                    args.optimizer_beta1,
+                    args.optimizer_beta2,
+                    args.optimizer_epsilon,
+                );
+                let sparse_start = micro * args.batch_size * batch.layout.max_active;
+                let sparse_end = sparse_start + args.batch_size * batch.layout.max_active;
+                let dense_start = micro * args.batch_size;
+                let dense_end = dense_start + args.batch_size;
+                let host_batch = SfnnTrainStepHostBatch {
+                    stm_indices: &batch.stm[sparse_start..sparse_end],
+                    nstm_indices: &batch.nstm[sparse_start..sparse_end],
+                    buckets: &batch.buckets[dense_start..dense_end],
+                    targets: &batch.targets[dense_start..dense_end],
+                    entry_weights: &batch.weights[dense_start..dense_end],
+                    batch_size: args.batch_size,
+                    max_active: batch.layout.max_active,
+                };
+                train_timer.get_or_insert_with(std::time::Instant::now);
+                train_positions = train_positions.saturating_add(args.batch_size);
+                let runner_ref = runner.as_mut().expect("runner is initialized");
+                runner_ref.step(
+                    &stream,
+                    &module,
+                    params,
+                    train_loss_kind,
+                    args.sigmoid_output_scale,
+                    host_batch,
+                    args.profile_train_step,
+                )?;
 
-            last_batch_size = batch.layout.batch_size;
-            last_max_active = batch.layout.max_active;
-            run_steps += 1;
+                last_batch_size = args.batch_size;
+                last_max_active = batch.layout.max_active;
+                run_steps += 1;
 
-            let periodic_loss_readback = if args.loss_readback_interval > 0 {
-                step % args.loss_readback_interval == 0
-            } else {
-                step % args.batches_per_superbatch == 0
-            };
-            let checkpoint_loss_readback =
-                args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false);
-            let readback_loss = args.profile_train_step
-                || step == completed_step_offset + args.train_steps
-                || periodic_loss_readback
-                || checkpoint_loss_readback;
-            if readback_loss {
-                let loss = runner_ref.read_loss(&stream)?;
-                let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
-                losses.push(loss_entry);
-                learning_rates.push(learning_rate);
-                sources.push(source.clone());
-                dataloader_positions.push(dataloader_pos);
-                checkpoint_losses.push(loss_entry);
-                checkpoint_learning_rates.push(learning_rate);
-                checkpoint_sources.push(source);
-                checkpoint_dataloader_positions.push(dataloader_pos);
-            }
-
-            if let (Some(output_dir), Some(interval)) = (&args.output, save_interval_steps) {
-                if run_steps % interval == 0 {
-                    let state = runner_ref.read_state(&stream)?;
-                    let test_metrics = match &test_cache {
-                        Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
-                        None => None,
+                let periodic_loss_readback = if args.loss_readback_interval > 0 {
+                    step % args.loss_readback_interval == 0
+                } else {
+                    step % args.batches_per_superbatch == 0
+                };
+                let checkpoint_loss_readback = args.output.is_some()
+                    && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false);
+                let readback_loss = args.profile_train_step
+                    || step == completed_step_offset + args.train_steps
+                    || periodic_loss_readback
+                    || checkpoint_loss_readback;
+                if readback_loss {
+                    let loss = runner_ref.read_loss(&stream)?;
+                    let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
+                    let micro_source = if micro_batches > 1 {
+                        format!("{source} micro {}/{}", micro + 1, micro_batches)
+                    } else {
+                        source.clone()
                     };
-                    bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
-                        output_dir,
-                        shape,
-                        completed_step_offset + run_steps,
-                        &state,
-                        teacher,
-                        &checkpoint_losses,
-                        &checkpoint_learning_rates,
-                        &checkpoint_sources,
-                        &checkpoint_dataloader_positions,
-                        test_teacher_spec.as_deref(),
-                        test_metrics,
-                        log_context,
-                    )?);
-                    checkpoint_losses.clear();
-                    checkpoint_learning_rates.clear();
-                    checkpoint_sources.clear();
-                    checkpoint_dataloader_positions.clear();
+                    losses.push(loss_entry);
+                    learning_rates.push(learning_rate);
+                    sources.push(micro_source.clone());
+                    dataloader_positions.push(dataloader_pos);
+                    checkpoint_losses.push(loss_entry);
+                    checkpoint_learning_rates.push(learning_rate);
+                    checkpoint_sources.push(micro_source);
+                    checkpoint_dataloader_positions.push(dataloader_pos);
+                }
+
+                if let (Some(output_dir), Some(interval)) = (&args.output, save_interval_steps) {
+                    if run_steps % interval == 0 {
+                        let state = runner_ref.read_state(&stream)?;
+                        let test_metrics = match &test_cache {
+                            Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
+                            None => None,
+                        };
+                        bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
+                            output_dir,
+                            shape,
+                            completed_step_offset + run_steps,
+                            &state,
+                            teacher,
+                            &checkpoint_losses,
+                            &checkpoint_learning_rates,
+                            &checkpoint_sources,
+                            &checkpoint_dataloader_positions,
+                            test_teacher_spec.as_deref(),
+                            test_metrics,
+                            log_context,
+                        )?);
+                        checkpoint_losses.clear();
+                        checkpoint_learning_rates.clear();
+                        checkpoint_sources.clear();
+                        checkpoint_dataloader_positions.clear();
+                    }
                 }
             }
             Ok(())
         };
 
-    let train_steps = args.train_steps;
+    let train_steps = teacher_batches_to_load;
     if args.profile_train_step {
         bulletou_lib::value::teacher_batch::for_each_sfnn_halfka2_teacher_fast_batch(
             &teacher_batch_config,
@@ -2174,6 +2226,9 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  scale        : {}", args.sigmoid_scale);
     println!("  model_scale  : {}", args.sigmoid_output_scale);
     println!("  batch        : {} samples, max_active={}", last_batch_size, last_max_active);
+    if teacher_batch_size != args.batch_size {
+        println!("  teacher_batch: {} samples", teacher_batch_size);
+    }
     println!(
         "  shape        : input={} ft={} h1={} h2={} stacks={}",
         shape.input_size, shape.ft_size, shape.l1_hidden, shape.l2_size, shape.num_stacks
@@ -5543,7 +5598,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--teacher-batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -5617,8 +5672,9 @@ fn usage() -> &'static str {
      them directly to the SFNN loss/Ranger runner. --output writes numbered\n\
      bridge checkpoints with YaneuraOu-compatible nn.bin, root-format state.bin,\n\
      teacher.txt, dataloader_pos.txt, learn.log, and summary-learn.log.\n\
-     --sfnn-factorized-l1 zero-initializes nnue-pytorch-style shared L1 weights\n\
-     for new runs; resumed state.bin files keep their stored l1fw/l1fb records.\n\
+     HalfKA2 SFNN uses tatara-style shared L1f weights by default for new runs;\n\
+     --sfnn-factorized-l1 also adds zero shared L1f records when resuming a state.bin\n\
+     that was saved without l1fw/l1fb records.\n\
      \n\
      CO-006 NNUE forward smoke: build a fixed NNUE batch, compare the GPU\n\
      launch_nnue_forward output against a CPU scalar golden, and fail if any\n\
