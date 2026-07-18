@@ -694,6 +694,9 @@ the tickets in order and commit each completed slice.
   - after `--cuda-cpp-train-steps`, the runner reads trained weights back and writes `<output>/cuda-cpp-direct/nn.bin` plus `<output>/cuda-cpp-direct/weights.bin`;
   - `nn.bin` folds factorized HalfKP virtual rows back into normal HalfKP L0 rows before quantization;
   - `weights.bin` stores raw f32 `nnue/weights/*` records with a `cuda-cpp` backend marker and per-weight completed-step records, ready for the later resume-state work.
+- Added `--cuda-cpp-weights-bin <PATH>` for direct-trainer initial weights:
+  - it accepts root-format/unprefixed `l0w`..`outb` records or `nnue/weights/*` component records;
+  - it restores weights only for now; Ranger momentum/velocity/slow state still resets and remains part of the later production resume work.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -707,6 +710,7 @@ the tickets in order and commit each completed slice.
   - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=867894 pos/s` for the short direct-step probe after readback sampling.
   - after switching to the factorized FT layout, `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 50 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=802739 pos/s`.
   - direct output smoke with `--output target\cuda-cpp-direct-smoke` wrote `cuda-cpp-direct/nn.bin` (64,217,077 bytes) and `cuda-cpp-direct/weights.bin` (130,054,016 bytes).
+  - direct weights reload smoke with `--cuda-cpp-weights-bin target\cuda-cpp-direct-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-direct-resume-smoke` passed and wrote a fresh `cuda-cpp-direct/{nn.bin,weights.bin}`.
 - Remaining BO-CUDA-033 work:
   - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;

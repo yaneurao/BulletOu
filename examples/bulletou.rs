@@ -1299,6 +1299,11 @@ struct Args {
     #[arg(long)]
     cuda_cpp_smoke: bool,
 
+    /// Optional initial root-format NNUE weights stream for the Windows-native
+    /// C++/CUDA direct trainer. Optimizer state is not restored yet.
+    #[arg(long)]
+    cuda_cpp_weights_bin: Option<PathBuf>,
+
     /// Temporary Windows-native C++/CUDA direct-trainer batch count.
     /// This currently runs NNUE_HALFKP fixed-layout train steps without
     /// production checkpoint/resume orchestration.
@@ -1756,6 +1761,9 @@ impl Args {
         if self.cuda_cpp_smoke {
             if self.cuda_cpp_train_steps.is_some() {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-train-steps cannot be used together".to_string());
+            }
+            if self.cuda_cpp_weights_bin.is_some() {
+                return Err("--cuda-cpp-smoke and --cuda-cpp-weights-bin cannot be used together".to_string());
             }
             return Ok(());
         }
@@ -2983,6 +2991,11 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     let initial_weights = build_halfkp_initial_weights_for_cuda_cpp(args)?;
+    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+        eprintln!("  initial weights = {}", path.display());
+    } else {
+        eprintln!("  initial weights = tatara-simple factorized scratch");
+    }
     let input_size = initial_weights.shape.input_size;
     let max_active = {
         use bulletou_lib::game::inputs::{Factorised, ShogiHalfKPPieceFactorizer};
@@ -3118,6 +3131,10 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
 fn build_halfkp_initial_weights_for_cuda_cpp(
     args: &Args,
 ) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
+    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+        return load_cuda_cpp_halfkp_weights_bin(path, args);
+    }
+
     use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
@@ -3147,6 +3164,31 @@ fn build_halfkp_initial_weights_for_cuda_cpp(
     };
     weights.validate().map_err(|e| e.to_string())?;
     Ok(weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_halfkp_weights_bin(
+    path: &Path,
+    args: &Args,
+) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
+    use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
+
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let records =
+        parse_model_weights_bin(&bytes).map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let component_weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
+    let weights = if component_weights.is_empty() { &records } else { &component_weights };
+
+    let (l1_size, l2_size, l3_size) = args.arch().dims();
+    let input_size = ShogiHalfKP.num_inputs() + bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+    let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
+    NnueForwardOwnedWeights::from_weight_map(shape, weights).map_err(|err| {
+        format!(
+            "failed to load cuda-cpp HalfKP factorized weights from {} for arch {}: {err}",
+            path.display(),
+            args.arch().cli_name()
+        )
+    })
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8006,6 +8048,59 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_initial_weights_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--cuda-cpp-weights-bin",
+            "weights.bin",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_smoke_rejects_initial_weights() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-smoke",
+            "--cuda-cpp-weights-bin",
+            "weights.bin",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--cuda-cpp-weights-bin"
+        } else {
+            "cuda-cpp-backend"
+        }));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
