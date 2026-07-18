@@ -371,6 +371,180 @@ __global__ void loss_finalize_from_per_sample_kernel(
     mean[0] = sum / static_cast<float>(batch);
 }
 
+__device__ float crelu_pre_gradient_from_value(float activation, float output_gradient) {
+    return activation > 0.0f && activation < 1.0f ? output_gradient : 0.0f;
+}
+
+__global__ void dense_output_backward_kernel(
+    const float* inputs,
+    const float* output_gradients,
+    const float* weights,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradient,
+    size_t batch,
+    size_t input_len) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_len;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_len;
+        size_t row = tid - sample * input_len;
+        input_gradients[tid] = output_gradients[sample] * weights[row];
+    }
+
+    if (tid < input_len) {
+        float sum = 0.0f;
+        for (size_t sample = 0; sample < batch; ++sample) {
+            sum += output_gradients[sample] * inputs[sample * input_len + tid];
+        }
+        weight_gradients[tid] = sum;
+    }
+
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (size_t sample = 0; sample < batch; ++sample) {
+            sum += output_gradients[sample];
+        }
+        bias_gradient[0] = sum;
+    }
+}
+
+__global__ void dense_crelu_backward_kernel(
+    const float* inputs,
+    const float* activations,
+    const float* output_gradients,
+    const float* weights,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_dim;
+    size_t weight_len = input_dim * output_dim;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_dim;
+        size_t in_col = tid - sample * input_dim;
+        float sum = 0.0f;
+        for (size_t out_col = 0; out_col < output_dim; ++out_col) {
+            size_t out_idx = sample * output_dim + out_col;
+            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            sum += grad * weights[in_col * output_dim + out_col];
+        }
+        input_gradients[tid] = sum;
+    }
+
+    if (tid < weight_len) {
+        size_t in_col = tid / output_dim;
+        size_t out_col = tid - in_col * output_dim;
+        float sum = 0.0f;
+        for (size_t sample = 0; sample < batch; ++sample) {
+            size_t out_idx = sample * output_dim + out_col;
+            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            sum += grad * inputs[sample * input_dim + in_col];
+        }
+        weight_gradients[tid] = sum;
+    }
+
+    if (tid < output_dim) {
+        float sum = 0.0f;
+        for (size_t sample = 0; sample < batch; ++sample) {
+            size_t out_idx = sample * output_dim + tid;
+            sum += crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+        }
+        bias_gradients[tid] = sum;
+    }
+}
+
+__global__ void nnue_l0_crelu_backward_kernel(
+    const float* combined_gradients,
+    const float* stm_activations,
+    const float* nstm_activations,
+    float* stm_gradients,
+    float* nstm_gradients,
+    size_t batch,
+    size_t l1) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t combined_stride = l1 * 2;
+    size_t combined_len = batch * combined_stride;
+    if (tid >= combined_len) {
+        return;
+    }
+
+    size_t sample = tid / combined_stride;
+    size_t col = tid - sample * combined_stride;
+    if (col < l1) {
+        size_t perspective_idx = sample * l1 + col;
+        stm_gradients[perspective_idx] =
+            crelu_pre_gradient_from_value(stm_activations[perspective_idx], combined_gradients[tid]);
+    } else {
+        size_t row = col - l1;
+        size_t perspective_idx = sample * l1 + row;
+        nstm_gradients[perspective_idx] =
+            crelu_pre_gradient_from_value(nstm_activations[perspective_idx], combined_gradients[tid]);
+    }
+}
+
+__global__ void nnue_l0_sparse_zero_gradients_kernel(
+    float* l0w_gradients,
+    float* l0b_gradients,
+    size_t input_size,
+    size_t l1) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t weight_len = input_size * l1;
+
+    if (tid < weight_len) {
+        l0w_gradients[tid] = 0.0f;
+    }
+    if (tid < l1) {
+        l0b_gradients[tid] = 0.0f;
+    }
+}
+
+__global__ void nnue_l0_sparse_backward_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_gradients,
+    const float* nstm_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t l1) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t scatter_len = batch * max_active * l1;
+
+    if (tid < scatter_len) {
+        size_t row = tid % l1;
+        size_t sparse_entry = tid / l1;
+        size_t sample = sparse_entry / max_active;
+        size_t slot = sparse_entry - sample * max_active;
+        size_t sparse_base = sample * max_active + slot;
+
+        int stm_feature = stm_indices[sparse_base];
+        if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            size_t weight_idx = static_cast<size_t>(stm_feature) * l1 + row;
+            atomicAdd(&l0w_gradients[weight_idx], stm_gradients[sample * l1 + row]);
+        }
+
+        int nstm_feature = nstm_indices[sparse_base];
+        if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            size_t weight_idx = static_cast<size_t>(nstm_feature) * l1 + row;
+            atomicAdd(&l0w_gradients[weight_idx], nstm_gradients[sample * l1 + row]);
+        }
+    }
+
+    if (tid < batch * l1) {
+        size_t row = tid % l1;
+        size_t sample = tid / l1;
+        atomicAdd(&l0b_gradients[row], stm_gradients[sample * l1 + row] + nstm_gradients[sample * l1 + row]);
+    }
+}
+
 int sync_after_kernel(const char* launch_label, const char* sync_label) {
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -694,6 +868,150 @@ int launch_scalar_loss_kernels(
     if (check_kernel_launch("loss_finalize_from_per_sample_kernel launch") != 0) {
         return -1;
     }
+    return 0;
+}
+
+int launch_nnue_backward_kernels(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* combined,
+    const float* hidden1,
+    const float* hidden2,
+    const float* stm_l0,
+    const float* nstm_l0,
+    const float* l1w,
+    const float* l2w,
+    const float* outw,
+    const float* mean_output_gradients,
+    float* hidden2_gradients,
+    float* hidden1_gradients,
+    float* combined_gradients,
+    float* stm_l0_gradients,
+    float* nstm_l0_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    float* l1w_gradients,
+    float* l1b_gradients,
+    float* l2w_gradients,
+    float* l2b_gradients,
+    float* outw_gradients,
+    float* outb_gradients) {
+    if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+
+    size_t out_threads = std::max(batch * l3, std::max(l3, static_cast<size_t>(1)));
+    if (block_count_1d(out_threads, threads, &blocks, "dense_output_backward_kernel") != 0) {
+        return -1;
+    }
+    dense_output_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        hidden2,
+        mean_output_gradients,
+        outw,
+        hidden2_gradients,
+        outw_gradients,
+        outb_gradients,
+        batch,
+        l3);
+    if (check_kernel_launch("dense_output_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l2_threads = std::max(batch * l2, std::max(l2 * l3, l3));
+    if (block_count_1d(l2_threads, threads, &blocks, "dense_l2_crelu_backward_kernel") != 0) {
+        return -1;
+    }
+    dense_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        hidden1,
+        hidden2,
+        hidden2_gradients,
+        l2w,
+        hidden1_gradients,
+        l2w_gradients,
+        l2b_gradients,
+        batch,
+        l2,
+        l3);
+    if (check_kernel_launch("dense_l2_crelu_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l1_input_dim = l1 * 2;
+    size_t l1_threads = std::max(batch * l1_input_dim, std::max(l1_input_dim * l2, l2));
+    if (block_count_1d(l1_threads, threads, &blocks, "dense_l1_crelu_backward_kernel") != 0) {
+        return -1;
+    }
+    dense_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        combined,
+        hidden1,
+        hidden1_gradients,
+        l1w,
+        combined_gradients,
+        l1w_gradients,
+        l1b_gradients,
+        batch,
+        l1_input_dim,
+        l2);
+    if (check_kernel_launch("dense_l1_crelu_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_l0_crelu_backward_kernel") != 0) {
+        return -1;
+    }
+    nnue_l0_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        combined_gradients,
+        stm_l0,
+        nstm_l0,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        batch,
+        l1);
+    if (check_kernel_launch("nnue_l0_crelu_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l0_zero_threads = std::max(input_size * l1, l1);
+    if (block_count_1d(l0_zero_threads, threads, &blocks, "nnue_l0_sparse_zero_gradients_kernel") != 0) {
+        return -1;
+    }
+    nnue_l0_sparse_zero_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w_gradients, l0b_gradients, input_size, l1);
+    if (check_kernel_launch("nnue_l0_sparse_zero_gradients_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l0_scatter_threads = std::max(batch * max_active * l1, batch * l1);
+    if (block_count_1d(l0_scatter_threads, threads, &blocks, "nnue_l0_sparse_backward_kernel") != 0) {
+        return -1;
+    }
+    nnue_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices,
+        nstm_indices,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        l0w_gradients,
+        l0b_gradients,
+        batch,
+        max_active,
+        input_size,
+        l1);
+    if (check_kernel_launch("nnue_l0_sparse_backward_kernel launch") != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1592,6 +1910,104 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
     bulletou_cuda_cpp_context_destroy(ctx);
 
     return rc == 0 ? ok() : rc;
+}
+
+extern "C" int bulletou_cuda_cpp_nnue_backward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* hidden1,
+    const BulletOuCudaCppF32Buffer* hidden2,
+    const BulletOuCudaCppF32Buffer* stm_l0,
+    const BulletOuCudaCppF32Buffer* nstm_l0,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* outw,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* hidden2_gradients,
+    BulletOuCudaCppF32Buffer* hidden1_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_gradients,
+    BulletOuCudaCppF32Buffer* l0w_gradients,
+    BulletOuCudaCppF32Buffer* l0b_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* outw_gradients,
+    BulletOuCudaCppF32Buffer* outb_gradients) {
+    if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "nstm_indices") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(combined), batch * l1 * 2, "combined") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(hidden1), batch * l2, "hidden1") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(hidden2), batch * l3, "hidden2") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(stm_l0), batch * l1, "stm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(nstm_l0), batch * l1, "nstm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), l1 * 2 * l2, "l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), l2 * l3, "l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outw), l3, "outw") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(mean_output_gradients), batch, "mean_output_gradients") != 0 ||
+        validate_buffer(ctx, hidden2_gradients, batch * l3, "hidden2_gradients") != 0 ||
+        validate_buffer(ctx, hidden1_gradients, batch * l2, "hidden1_gradients") != 0 ||
+        validate_buffer(ctx, combined_gradients, batch * l1 * 2, "combined_gradients") != 0 ||
+        validate_buffer(ctx, stm_l0_gradients, batch * l1, "stm_l0_gradients") != 0 ||
+        validate_buffer(ctx, nstm_l0_gradients, batch * l1, "nstm_l0_gradients") != 0 ||
+        validate_buffer(ctx, l0w_gradients, input_size * l1, "l0w_gradients") != 0 ||
+        validate_buffer(ctx, l0b_gradients, l1, "l0b_gradients") != 0 ||
+        validate_buffer(ctx, l1w_gradients, l1 * 2 * l2, "l1w_gradients") != 0 ||
+        validate_buffer(ctx, l1b_gradients, l2, "l1b_gradients") != 0 ||
+        validate_buffer(ctx, l2w_gradients, l2 * l3, "l2w_gradients") != 0 ||
+        validate_buffer(ctx, l2b_gradients, l3, "l2b_gradients") != 0 ||
+        validate_buffer(ctx, outw_gradients, l3, "outw_gradients") != 0 ||
+        validate_buffer(ctx, outb_gradients, 1, "outb_gradients") != 0) {
+        return -1;
+    }
+
+    if (launch_nnue_backward_kernels(
+            ctx,
+            input_size,
+            l1,
+            l2,
+            l3,
+            batch,
+            max_active,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            combined->ptr,
+            hidden1->ptr,
+            hidden2->ptr,
+            stm_l0->ptr,
+            nstm_l0->ptr,
+            l1w->ptr,
+            l2w->ptr,
+            outw->ptr,
+            mean_output_gradients->ptr,
+            hidden2_gradients->ptr,
+            hidden1_gradients->ptr,
+            combined_gradients->ptr,
+            stm_l0_gradients->ptr,
+            nstm_l0_gradients->ptr,
+            l0w_gradients->ptr,
+            l0b_gradients->ptr,
+            l1w_gradients->ptr,
+            l1b_gradients->ptr,
+            l2w_gradients->ptr,
+            l2b_gradients->ptr,
+            outw_gradients->ptr,
+            outb_gradients->ptr) != 0) {
+        return -1;
+    }
+
+    return ok();
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(

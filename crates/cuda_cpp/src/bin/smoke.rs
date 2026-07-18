@@ -99,6 +99,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_close_scalar("loss_d weighted_sum", loss_device.weighted_sum, loss_host.weighted_sum, 1.0e-6);
     assert_close_scalar("loss_d mean", loss_device.mean, loss_host.mean, 1.0e-6);
 
+    let nnue_targets = [0.25, 0.75];
+    let nnue_entry_weights = [1.0, 0.5];
+    let nnue_targets_dev = F32Buffer::from_host(&ctx, &nnue_targets)?;
+    let nnue_entry_weights_dev = F32Buffer::from_host(&ctx, &nnue_entry_weights)?;
+    let nnue_loss_workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size))?;
+    bulletou_cuda_cpp::scalar_loss_device_from_buffers(
+        &ctx,
+        ScalarLossKind::SigmoidMse,
+        1.0,
+        batch.batch_size,
+        &workspace.output,
+        &nnue_targets_dev,
+        &nnue_entry_weights_dev,
+        &nnue_loss_workspace,
+    )?;
+    let backward_workspace = bulletou_cuda_cpp::NnueBackwardWorkspace::new(
+        &ctx,
+        bulletou_cuda_cpp::NnueBackwardWorkspaceLayout::new(shape, batch.batch_size, batch.max_active),
+    )?;
+    bulletou_cuda_cpp::nnue_backward_device(
+        &ctx,
+        &device_batch,
+        &device_weights,
+        &workspace,
+        &nnue_loss_workspace,
+        &backward_workspace,
+    )?;
+    let backward_device = backward_workspace.download(&ctx)?;
+    let backward_expected = cpu_tiny_nnue_backward(batch, weights, &nnue_targets, &nnue_entry_weights);
+    println!("  bwd_d : outb_grad={:?} l0b_grad={:?}", backward_device.outb_gradients, backward_device.l0b_gradients);
+    assert_close_slice("bwd hidden2", &backward_device.hidden2_gradients, &backward_expected.hidden2_gradients, 1.0e-6);
+    assert_close_slice("bwd hidden1", &backward_device.hidden1_gradients, &backward_expected.hidden1_gradients, 1.0e-6);
+    assert_close_slice(
+        "bwd combined",
+        &backward_device.combined_gradients,
+        &backward_expected.combined_gradients,
+        1.0e-6,
+    );
+    assert_close_slice("bwd stm_l0", &backward_device.stm_l0_gradients, &backward_expected.stm_l0_gradients, 1.0e-6);
+    assert_close_slice("bwd nstm_l0", &backward_device.nstm_l0_gradients, &backward_expected.nstm_l0_gradients, 1.0e-6);
+    assert_close_slice("bwd l0w", &backward_device.l0w_gradients, &backward_expected.l0w_gradients, 1.0e-6);
+    assert_close_slice("bwd l0b", &backward_device.l0b_gradients, &backward_expected.l0b_gradients, 1.0e-6);
+    assert_close_slice("bwd l1w", &backward_device.l1w_gradients, &backward_expected.l1w_gradients, 1.0e-6);
+    assert_close_slice("bwd l1b", &backward_device.l1b_gradients, &backward_expected.l1b_gradients, 1.0e-6);
+    assert_close_slice("bwd l2w", &backward_device.l2w_gradients, &backward_expected.l2w_gradients, 1.0e-6);
+    assert_close_slice("bwd l2b", &backward_device.l2b_gradients, &backward_expected.l2b_gradients, 1.0e-6);
+    assert_close_slice("bwd outw", &backward_device.outw_gradients, &backward_expected.outw_gradients, 1.0e-6);
+    assert_close_slice("bwd outb", &backward_device.outb_gradients, &backward_expected.outb_gradients, 1.0e-6);
+
     let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
     let mut weights = vec![0.1, -0.2, 0.3, -0.4];
     let mut momentum = vec![0.0; gradients.len()];
@@ -201,6 +250,255 @@ fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static>
 
 fn tiny_loss_batch() -> ScalarLossHostBatch<'static> {
     ScalarLossHostBatch { outputs: &[-2.0, 0.0, 2.0], targets: &[0.0, 0.5, 1.0], entry_weights: &[1.0, 0.5, 2.0] }
+}
+
+struct CpuBackward {
+    hidden2_gradients: Vec<f32>,
+    hidden1_gradients: Vec<f32>,
+    combined_gradients: Vec<f32>,
+    stm_l0_gradients: Vec<f32>,
+    nstm_l0_gradients: Vec<f32>,
+    l0w_gradients: Vec<f32>,
+    l0b_gradients: Vec<f32>,
+    l1w_gradients: Vec<f32>,
+    l1b_gradients: Vec<f32>,
+    l2w_gradients: Vec<f32>,
+    l2b_gradients: Vec<f32>,
+    outw_gradients: Vec<f32>,
+    outb_gradients: Vec<f32>,
+}
+
+fn cpu_tiny_nnue_backward(
+    batch: NnueForwardHostBatch<'_>,
+    weights: NnueForwardHostWeights<'_>,
+    targets: &[f32],
+    entry_weights: &[f32],
+) -> CpuBackward {
+    let shape = weights.shape;
+    let trace = cpu_forward_trace(batch, weights);
+    let mut output_gradients = vec![0.0; batch.batch_size];
+    for sample in 0..batch.batch_size {
+        let prediction = sigmoid(trace.outputs[sample]);
+        let error = prediction - targets[sample];
+        output_gradients[sample] =
+            entry_weights[sample] * 2.0 * error * prediction * (1.0 - prediction) / batch.batch_size as f32;
+    }
+
+    let mut hidden2_gradients = vec![0.0; batch.batch_size * shape.l3];
+    let mut outw_gradients = vec![0.0; shape.l3];
+    let mut outb_gradients = vec![0.0; 1];
+    for sample in 0..batch.batch_size {
+        outb_gradients[0] += output_gradients[sample];
+        for row in 0..shape.l3 {
+            hidden2_gradients[sample * shape.l3 + row] = output_gradients[sample] * weights.outw[row];
+            outw_gradients[row] += output_gradients[sample] * trace.hidden2[sample * shape.l3 + row];
+        }
+    }
+
+    let (hidden1_gradients, l2w_gradients, l2b_gradients) = dense_crelu_backward_cpu(
+        &trace.hidden1,
+        &trace.hidden2,
+        &hidden2_gradients,
+        weights.l2w,
+        batch.batch_size,
+        shape.l2,
+        shape.l3,
+    );
+    let (combined_gradients, l1w_gradients, l1b_gradients) = dense_crelu_backward_cpu(
+        &trace.combined,
+        &trace.hidden1,
+        &hidden1_gradients,
+        weights.l1w,
+        batch.batch_size,
+        shape.l1 * 2,
+        shape.l2,
+    );
+
+    let mut stm_l0_gradients = vec![0.0; batch.batch_size * shape.l1];
+    let mut nstm_l0_gradients = vec![0.0; batch.batch_size * shape.l1];
+    for sample in 0..batch.batch_size {
+        for row in 0..shape.l1 {
+            let combined_base = sample * shape.l1 * 2;
+            let perspective_idx = sample * shape.l1 + row;
+            stm_l0_gradients[perspective_idx] =
+                crelu_pre_gradient(trace.stm_l0[perspective_idx], combined_gradients[combined_base + row]);
+            nstm_l0_gradients[perspective_idx] =
+                crelu_pre_gradient(trace.nstm_l0[perspective_idx], combined_gradients[combined_base + shape.l1 + row]);
+        }
+    }
+
+    let mut l0w_gradients = vec![0.0; shape.input_size * shape.l1];
+    let mut l0b_gradients = vec![0.0; shape.l1];
+    for sample in 0..batch.batch_size {
+        for row in 0..shape.l1 {
+            let perspective_idx = sample * shape.l1 + row;
+            l0b_gradients[row] += stm_l0_gradients[perspective_idx] + nstm_l0_gradients[perspective_idx];
+        }
+        let sparse_base = sample * batch.max_active;
+        for slot in 0..batch.max_active {
+            let stm_feature = batch.stm_indices[sparse_base + slot];
+            if stm_feature >= 0 && (stm_feature as usize) < shape.input_size {
+                for row in 0..shape.l1 {
+                    l0w_gradients[stm_feature as usize * shape.l1 + row] += stm_l0_gradients[sample * shape.l1 + row];
+                }
+            }
+            let nstm_feature = batch.nstm_indices[sparse_base + slot];
+            if nstm_feature >= 0 && (nstm_feature as usize) < shape.input_size {
+                for row in 0..shape.l1 {
+                    l0w_gradients[nstm_feature as usize * shape.l1 + row] += nstm_l0_gradients[sample * shape.l1 + row];
+                }
+            }
+        }
+    }
+
+    CpuBackward {
+        hidden2_gradients,
+        hidden1_gradients,
+        combined_gradients,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        l0w_gradients,
+        l0b_gradients,
+        l1w_gradients,
+        l1b_gradients,
+        l2w_gradients,
+        l2b_gradients,
+        outw_gradients,
+        outb_gradients,
+    }
+}
+
+struct CpuTrace {
+    stm_l0: Vec<f32>,
+    nstm_l0: Vec<f32>,
+    combined: Vec<f32>,
+    hidden1: Vec<f32>,
+    hidden2: Vec<f32>,
+    outputs: Vec<f32>,
+}
+
+fn cpu_forward_trace(batch: NnueForwardHostBatch<'_>, weights: NnueForwardHostWeights<'_>) -> CpuTrace {
+    let shape = weights.shape;
+    let mut trace = CpuTrace {
+        stm_l0: vec![0.0; batch.batch_size * shape.l1],
+        nstm_l0: vec![0.0; batch.batch_size * shape.l1],
+        combined: vec![0.0; batch.batch_size * shape.l1 * 2],
+        hidden1: vec![0.0; batch.batch_size * shape.l2],
+        hidden2: vec![0.0; batch.batch_size * shape.l3],
+        outputs: vec![0.0; batch.batch_size],
+    };
+    for sample in 0..batch.batch_size {
+        let sparse_base = sample * batch.max_active;
+        let l0_base = sample * shape.l1;
+        sparse_l0_cpu(
+            weights.l0w,
+            weights.l0b,
+            shape.input_size,
+            shape.l1,
+            &batch.stm_indices[sparse_base..sparse_base + batch.max_active],
+            &mut trace.stm_l0[l0_base..l0_base + shape.l1],
+        );
+        sparse_l0_cpu(
+            weights.l0w,
+            weights.l0b,
+            shape.input_size,
+            shape.l1,
+            &batch.nstm_indices[sparse_base..sparse_base + batch.max_active],
+            &mut trace.nstm_l0[l0_base..l0_base + shape.l1],
+        );
+        let combined_base = sample * shape.l1 * 2;
+        trace.combined[combined_base..combined_base + shape.l1]
+            .copy_from_slice(&trace.stm_l0[l0_base..l0_base + shape.l1]);
+        trace.combined[combined_base + shape.l1..combined_base + shape.l1 * 2]
+            .copy_from_slice(&trace.nstm_l0[l0_base..l0_base + shape.l1]);
+        dense_crelu_cpu(
+            weights.l1w,
+            weights.l1b,
+            shape.l1 * 2,
+            shape.l2,
+            &trace.combined[combined_base..combined_base + shape.l1 * 2],
+            &mut trace.hidden1[sample * shape.l2..(sample + 1) * shape.l2],
+        );
+        dense_crelu_cpu(
+            weights.l2w,
+            weights.l2b,
+            shape.l2,
+            shape.l3,
+            &trace.hidden1[sample * shape.l2..(sample + 1) * shape.l2],
+            &mut trace.hidden2[sample * shape.l3..(sample + 1) * shape.l3],
+        );
+        let mut sum = weights.outb[0];
+        for row in 0..shape.l3 {
+            sum += trace.hidden2[sample * shape.l3 + row] * weights.outw[row];
+        }
+        trace.outputs[sample] = sum;
+    }
+    trace
+}
+
+fn sparse_l0_cpu(weights: &[f32], bias: &[f32], input_size: usize, rows: usize, active: &[i32], out: &mut [f32]) {
+    out.copy_from_slice(&bias[..rows]);
+    for &feature in active {
+        if feature >= 0 && (feature as usize) < input_size {
+            let base = feature as usize * rows;
+            for row in 0..rows {
+                out[row] += weights[base + row];
+            }
+        }
+    }
+    for value in out {
+        *value = value.clamp(0.0, 1.0);
+    }
+}
+
+fn dense_crelu_cpu(weights: &[f32], bias: &[f32], input_dim: usize, output_dim: usize, input: &[f32], out: &mut [f32]) {
+    out.copy_from_slice(&bias[..output_dim]);
+    for in_col in 0..input_dim {
+        for out_col in 0..output_dim {
+            out[out_col] += input[in_col] * weights[in_col * output_dim + out_col];
+        }
+    }
+    for value in out {
+        *value = value.clamp(0.0, 1.0);
+    }
+}
+
+fn dense_crelu_backward_cpu(
+    inputs: &[f32],
+    activations: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    batch_size: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut input_gradients = vec![0.0; batch_size * input_dim];
+    let mut weight_gradients = vec![0.0; input_dim * output_dim];
+    let mut bias_gradients = vec![0.0; output_dim];
+    for sample in 0..batch_size {
+        for out_col in 0..output_dim {
+            let out_idx = sample * output_dim + out_col;
+            let grad = crelu_pre_gradient(activations[out_idx], output_gradients[out_idx]);
+            bias_gradients[out_col] += grad;
+            for in_col in 0..input_dim {
+                input_gradients[sample * input_dim + in_col] += grad * weights[in_col * output_dim + out_col];
+                weight_gradients[in_col * output_dim + out_col] += grad * inputs[sample * input_dim + in_col];
+            }
+        }
+    }
+    (input_gradients, weight_gradients, bias_gradients)
+}
+
+fn crelu_pre_gradient(activation: f32, output_gradient: f32) -> f32 {
+    if activation > 0.0 && activation < 1.0 {
+        output_gradient
+    } else {
+        0.0
+    }
+}
+
+fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
 }
 
 fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) {

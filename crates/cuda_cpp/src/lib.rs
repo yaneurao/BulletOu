@@ -849,11 +849,39 @@ pub fn scalar_loss_device(
     workspace: &ScalarLossWorkspace,
 ) -> Result<()> {
     batch.validate()?;
+    scalar_loss_device_from_buffers(
+        ctx,
+        kind,
+        output_inv_scale,
+        batch.batch_size,
+        &batch.outputs,
+        &batch.targets,
+        &batch.entry_weights,
+        workspace,
+    )
+}
+
+pub fn scalar_loss_device_from_buffers(
+    ctx: &Context,
+    kind: ScalarLossKind,
+    output_inv_scale: f32,
+    batch_size: usize,
+    outputs: &F32Buffer,
+    targets: &F32Buffer,
+    entry_weights: &F32Buffer,
+    workspace: &ScalarLossWorkspace,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Err(CudaCppError::message("scalar loss batch must not be empty"));
+    }
+    expect_len("loss device outputs", batch_size, outputs.len())?;
+    expect_len("loss device targets", batch_size, targets.len())?;
+    expect_len("loss device entry_weights", batch_size, entry_weights.len())?;
     workspace.validate()?;
-    if workspace.layout.batch_size != batch.batch_size {
+    if workspace.layout.batch_size != batch_size {
         return Err(CudaCppError::message(format!(
             "scalar loss workspace batch mismatch: workspace={} batch={}",
-            workspace.layout.batch_size, batch.batch_size
+            workspace.layout.batch_size, batch_size
         )));
     }
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
@@ -862,14 +890,252 @@ pub fn scalar_loss_device(
             ctx.as_ptr(),
             kind.as_ffi(),
             output_inv_scale,
-            batch.batch_size,
-            batch.outputs.as_ptr(),
-            batch.targets.as_ptr(),
-            batch.entry_weights.as_ptr(),
+            batch_size,
+            outputs.as_ptr(),
+            targets.as_ptr(),
+            entry_weights.as_ptr(),
             workspace.per_sample.as_ptr(),
             workspace.mean_output_gradients.as_ptr(),
             workspace.weighted_sum.as_ptr(),
             workspace.mean.as_ptr(),
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueBackwardWorkspaceLayout {
+    pub shape: NnueForwardShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl NnueBackwardWorkspaceLayout {
+    pub fn new(shape: NnueForwardShape, batch_size: usize, max_active: usize) -> Self {
+        Self { shape, batch_size, max_active }
+    }
+
+    pub fn hidden2_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l3)
+    }
+
+    pub fn hidden1_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2)
+    }
+
+    pub fn combined_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1).saturating_mul(2)
+    }
+
+    pub fn l0_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1)
+    }
+
+    pub fn l0w_gradients_len(self) -> usize {
+        self.shape.input_size.saturating_mul(self.shape.l1)
+    }
+
+    pub fn l0b_gradients_len(self) -> usize {
+        self.shape.l1
+    }
+
+    pub fn l1w_gradients_len(self) -> usize {
+        self.shape.l1.saturating_mul(2).saturating_mul(self.shape.l2)
+    }
+
+    pub fn l1b_gradients_len(self) -> usize {
+        self.shape.l2
+    }
+
+    pub fn l2w_gradients_len(self) -> usize {
+        self.shape.l2.saturating_mul(self.shape.l3)
+    }
+
+    pub fn l2b_gradients_len(self) -> usize {
+        self.shape.l3
+    }
+
+    pub fn outw_gradients_len(self) -> usize {
+        self.shape.l3
+    }
+
+    pub fn outb_gradients_len(self) -> usize {
+        1
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_nnue_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("NNUE backward batch_size must be greater than zero"))
+        } else if self.max_active == 0 {
+            Err(CudaCppError::message("NNUE backward max_active must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NnueBackwardWorkspace {
+    pub layout: NnueBackwardWorkspaceLayout,
+    pub hidden2_gradients: F32Buffer,
+    pub hidden1_gradients: F32Buffer,
+    pub combined_gradients: F32Buffer,
+    pub stm_l0_gradients: F32Buffer,
+    pub nstm_l0_gradients: F32Buffer,
+    pub l0w_gradients: F32Buffer,
+    pub l0b_gradients: F32Buffer,
+    pub l1w_gradients: F32Buffer,
+    pub l1b_gradients: F32Buffer,
+    pub l2w_gradients: F32Buffer,
+    pub l2b_gradients: F32Buffer,
+    pub outw_gradients: F32Buffer,
+    pub outb_gradients: F32Buffer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NnueBackwardReadback {
+    pub hidden2_gradients: Vec<f32>,
+    pub hidden1_gradients: Vec<f32>,
+    pub combined_gradients: Vec<f32>,
+    pub stm_l0_gradients: Vec<f32>,
+    pub nstm_l0_gradients: Vec<f32>,
+    pub l0w_gradients: Vec<f32>,
+    pub l0b_gradients: Vec<f32>,
+    pub l1w_gradients: Vec<f32>,
+    pub l1b_gradients: Vec<f32>,
+    pub l2w_gradients: Vec<f32>,
+    pub l2b_gradients: Vec<f32>,
+    pub outw_gradients: Vec<f32>,
+    pub outb_gradients: Vec<f32>,
+}
+
+impl NnueBackwardWorkspace {
+    pub fn new(ctx: &Context, layout: NnueBackwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            hidden2_gradients: F32Buffer::new(ctx, layout.hidden2_gradients_len())?,
+            hidden1_gradients: F32Buffer::new(ctx, layout.hidden1_gradients_len())?,
+            combined_gradients: F32Buffer::new(ctx, layout.combined_gradients_len())?,
+            stm_l0_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            nstm_l0_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            l0w_gradients: F32Buffer::new(ctx, layout.l0w_gradients_len())?,
+            l0b_gradients: F32Buffer::new(ctx, layout.l0b_gradients_len())?,
+            l1w_gradients: F32Buffer::new(ctx, layout.l1w_gradients_len())?,
+            l1b_gradients: F32Buffer::new(ctx, layout.l1b_gradients_len())?,
+            l2w_gradients: F32Buffer::new(ctx, layout.l2w_gradients_len())?,
+            l2b_gradients: F32Buffer::new(ctx, layout.l2b_gradients_len())?,
+            outw_gradients: F32Buffer::new(ctx, layout.outw_gradients_len())?,
+            outb_gradients: F32Buffer::new(ctx, layout.outb_gradients_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("backward hidden2_gradients", self.layout.hidden2_gradients_len(), self.hidden2_gradients.len())?;
+        expect_len("backward hidden1_gradients", self.layout.hidden1_gradients_len(), self.hidden1_gradients.len())?;
+        expect_len("backward combined_gradients", self.layout.combined_gradients_len(), self.combined_gradients.len())?;
+        expect_len("backward stm_l0_gradients", self.layout.l0_gradients_len(), self.stm_l0_gradients.len())?;
+        expect_len("backward nstm_l0_gradients", self.layout.l0_gradients_len(), self.nstm_l0_gradients.len())?;
+        expect_len("backward l0w_gradients", self.layout.l0w_gradients_len(), self.l0w_gradients.len())?;
+        expect_len("backward l0b_gradients", self.layout.l0b_gradients_len(), self.l0b_gradients.len())?;
+        expect_len("backward l1w_gradients", self.layout.l1w_gradients_len(), self.l1w_gradients.len())?;
+        expect_len("backward l1b_gradients", self.layout.l1b_gradients_len(), self.l1b_gradients.len())?;
+        expect_len("backward l2w_gradients", self.layout.l2w_gradients_len(), self.l2w_gradients.len())?;
+        expect_len("backward l2b_gradients", self.layout.l2b_gradients_len(), self.l2b_gradients.len())?;
+        expect_len("backward outw_gradients", self.layout.outw_gradients_len(), self.outw_gradients.len())?;
+        expect_len("backward outb_gradients", self.layout.outb_gradients_len(), self.outb_gradients.len())
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<NnueBackwardReadback> {
+        Ok(NnueBackwardReadback {
+            hidden2_gradients: self.hidden2_gradients.download(ctx)?,
+            hidden1_gradients: self.hidden1_gradients.download(ctx)?,
+            combined_gradients: self.combined_gradients.download(ctx)?,
+            stm_l0_gradients: self.stm_l0_gradients.download(ctx)?,
+            nstm_l0_gradients: self.nstm_l0_gradients.download(ctx)?,
+            l0w_gradients: self.l0w_gradients.download(ctx)?,
+            l0b_gradients: self.l0b_gradients.download(ctx)?,
+            l1w_gradients: self.l1w_gradients.download(ctx)?,
+            l1b_gradients: self.l1b_gradients.download(ctx)?,
+            l2w_gradients: self.l2w_gradients.download(ctx)?,
+            l2b_gradients: self.l2b_gradients.download(ctx)?,
+            outw_gradients: self.outw_gradients.download(ctx)?,
+            outb_gradients: self.outb_gradients.download(ctx)?,
+        })
+    }
+}
+
+pub fn nnue_backward_device(
+    ctx: &Context,
+    batch: &NnueForwardDeviceBatch,
+    weights: &NnueForwardDeviceWeights,
+    forward: &NnueForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &NnueBackwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    forward.validate()?;
+    loss.validate()?;
+    backward.validate()?;
+    let shape = weights.shape;
+    if forward.layout.shape != shape || backward.layout.shape != shape {
+        return Err(CudaCppError::message(format!(
+            "NNUE backward shape mismatch: weights={shape:?} forward={:?} backward={:?}",
+            forward.layout.shape, backward.layout.shape
+        )));
+    }
+    if forward.layout.batch_size != batch.batch_size
+        || loss.layout.batch_size != batch.batch_size
+        || backward.layout.batch_size != batch.batch_size
+    {
+        return Err(CudaCppError::message(format!(
+            "NNUE backward batch mismatch: batch={} forward={} loss={} backward={}",
+            batch.batch_size, forward.layout.batch_size, loss.layout.batch_size, backward.layout.batch_size
+        )));
+    }
+    if backward.layout.max_active != batch.max_active {
+        return Err(CudaCppError::message(format!(
+            "NNUE backward max_active mismatch: batch={} backward={}",
+            batch.max_active, backward.layout.max_active
+        )));
+    }
+
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_nnue_backward_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.l1,
+            shape.l2,
+            shape.l3,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            forward.combined.as_ptr(),
+            forward.hidden1.as_ptr(),
+            forward.hidden2.as_ptr(),
+            forward.stm_l0.as_ptr(),
+            forward.nstm_l0.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l2w.as_ptr(),
+            weights.outw.as_ptr(),
+            loss.mean_output_gradients.as_ptr(),
+            backward.hidden2_gradients.as_ptr(),
+            backward.hidden1_gradients.as_ptr(),
+            backward.combined_gradients.as_ptr(),
+            backward.stm_l0_gradients.as_ptr(),
+            backward.nstm_l0_gradients.as_ptr(),
+            backward.l0w_gradients.as_ptr(),
+            backward.l0b_gradients.as_ptr(),
+            backward.l1w_gradients.as_ptr(),
+            backward.l1b_gradients.as_ptr(),
+            backward.l2w_gradients.as_ptr(),
+            backward.l2b_gradients.as_ptr(),
+            backward.outw_gradients.as_ptr(),
+            backward.outb_gradients.as_ptr(),
         )
     })
 }
@@ -1320,6 +1586,39 @@ mod ffi {
             mean_output_gradients: *mut f32,
             weighted_sum: *mut f32,
             mean: *mut f32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_nnue_backward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            l1: usize,
+            l2: usize,
+            l3: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            hidden1: *mut BulletOuCudaCppF32Buffer,
+            hidden2: *mut BulletOuCudaCppF32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            outw: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            hidden2_gradients: *mut BulletOuCudaCppF32Buffer,
+            hidden1_gradients: *mut BulletOuCudaCppF32Buffer,
+            combined_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            outw_gradients: *mut BulletOuCudaCppF32Buffer,
+            outb_gradients: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
