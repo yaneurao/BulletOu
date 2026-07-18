@@ -10,6 +10,17 @@ namespace {
 
 thread_local std::string g_last_error;
 
+struct BulletOuCudaCppContext {
+    int device = 0;
+    cudaStream_t stream = nullptr;
+};
+
+struct BulletOuCudaCppF32Buffer {
+    int device = 0;
+    size_t len = 0;
+    float* ptr = nullptr;
+};
+
 void set_error(const char* context, cudaError_t status) {
     char buffer[512];
     std::snprintf(
@@ -100,6 +111,14 @@ __global__ void axpy_kernel(size_t len, float a, const float* x, const float* y,
     out[idx] = a * x[idx] + y[idx];
 }
 
+__global__ void fill_f32_kernel(size_t len, float value, float* out) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    out[idx] = value;
+}
+
 __global__ void radam_update_reset_gradients_kernel(
     float* gradients,
     float* weights,
@@ -163,11 +182,67 @@ int sync_after_kernel(const char* launch_label, const char* sync_label) {
     return 0;
 }
 
+int check_kernel_launch(const char* launch_label) {
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return fail(launch_label, status);
+    }
+    return 0;
+}
+
 int validate_host_ptr(const void* ptr, size_t len, const char* name) {
     if (len != 0 && ptr == nullptr) {
         char buffer[256];
         std::snprintf(buffer, sizeof(buffer), "%s must not be null when len > 0", name);
         return fail_message(buffer);
+    }
+    return 0;
+}
+
+int validate_context(BulletOuCudaCppContext* ctx) {
+    if (ctx == nullptr) {
+        return fail_message("context must not be null");
+    }
+    if (ctx->stream == nullptr) {
+        return fail_message("context stream must not be null");
+    }
+    return 0;
+}
+
+int validate_buffer(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* buffer, size_t len, const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (buffer == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->ptr == nullptr && buffer->len != 0) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s device pointer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->device != ctx->device) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer belongs to device %d, context is device %d", name, buffer->device, ctx->device);
+        return fail_message(message);
+    }
+    if (buffer->len < len) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer length %zu is smaller than requested length %zu", name, buffer->len, len);
+        return fail_message(message);
+    }
+    return 0;
+}
+
+int set_context_device(BulletOuCudaCppContext* ctx) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaSetDevice(ctx->device);
+    if (status != cudaSuccess) {
+        return fail("cudaSetDevice", status);
     }
     return 0;
 }
@@ -203,6 +278,265 @@ extern "C" int bulletou_cuda_cpp_device_name(int device, char* out, size_t out_l
     size_t n = std::min(out_len - 1, std::strlen(prop.name));
     std::memcpy(out, prop.name, n);
     out[n] = '\0';
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_context_create(int device, BulletOuCudaCppContext** out) {
+    if (out == nullptr) {
+        return fail_message("context_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    cudaError_t status = cudaSetDevice(device);
+    if (status != cudaSuccess) {
+        return fail("cudaSetDevice", status);
+    }
+
+    BulletOuCudaCppContext* ctx = new BulletOuCudaCppContext();
+    ctx->device = device;
+    status = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
+    if (status != cudaSuccess) {
+        delete ctx;
+        return fail("cudaStreamCreateWithFlags", status);
+    }
+
+    *out = ctx;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(ctx->device);
+    if (status != cudaSuccess) {
+        delete ctx;
+        return fail("cudaSetDevice", status);
+    }
+    if (ctx->stream != nullptr) {
+        status = cudaStreamDestroy(ctx->stream);
+        if (status != cudaSuccess) {
+            delete ctx;
+            return fail("cudaStreamDestroy", status);
+        }
+    }
+    delete ctx;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_context_synchronize(BulletOuCudaCppContext* ctx) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamSynchronize", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_buffer_create(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    BulletOuCudaCppF32Buffer** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("f32_buffer_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    BulletOuCudaCppF32Buffer* buffer = new BulletOuCudaCppF32Buffer();
+    buffer->device = ctx->device;
+    buffer->len = len;
+    if (checked_malloc(&buffer->ptr, len, "cudaMalloc f32 buffer") != 0) {
+        delete buffer;
+        return -1;
+    }
+
+    *out = buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_buffer_destroy(BulletOuCudaCppF32Buffer* buffer) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(buffer->device);
+    if (status != cudaSuccess) {
+        delete buffer;
+        return fail("cudaSetDevice", status);
+    }
+    if (buffer->ptr != nullptr) {
+        status = cudaFree(buffer->ptr);
+        if (status != cudaSuccess) {
+            delete buffer;
+            return fail("cudaFree f32 buffer", status);
+        }
+    }
+    delete buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_upload(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* dst,
+    const float* src,
+    size_t len) {
+    if (validate_buffer(ctx, dst, len, "dst") != 0 || validate_host_ptr(src, len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, src, len * sizeof(float), cudaMemcpyHostToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync f32 upload", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_download(
+    BulletOuCudaCppContext* ctx,
+    const BulletOuCudaCppF32Buffer* src,
+    float* dst,
+    size_t len) {
+    if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src), len, "src") != 0 ||
+        validate_host_ptr(dst, len, "dst") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst, src->ptr, len * sizeof(float), cudaMemcpyDeviceToHost, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync f32 download", status);
+    }
+    status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamSynchronize f32 download", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_fill(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* dst,
+    float value,
+    size_t len) {
+    if (validate_buffer(ctx, dst, len, "dst") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    int threads = 256;
+    int blocks = static_cast<int>((len + threads - 1) / threads);
+    fill_f32_kernel<<<blocks, threads, 0, ctx->stream>>>(len, value, dst->ptr);
+    if (check_kernel_launch("fill_f32_kernel launch") != 0) {
+        return -1;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_axpy_device(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    float a,
+    const BulletOuCudaCppF32Buffer* x,
+    const BulletOuCudaCppF32Buffer* y,
+    BulletOuCudaCppF32Buffer* out) {
+    if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(x), len, "x") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(y), len, "y") != 0 ||
+        validate_buffer(ctx, out, len, "out") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    int threads = 256;
+    int blocks = static_cast<int>((len + threads - 1) / threads);
+    axpy_kernel<<<blocks, threads, 0, ctx->stream>>>(len, a, x->ptr, y->ptr, out->ptr);
+    if (check_kernel_launch("axpy_kernel launch") != 0) {
+        return -1;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_ranger_update_device(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    float gradient_factor,
+    float learning_rate,
+    float step_size,
+    int use_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    int do_lookahead,
+    float lookahead_alpha,
+    BulletOuCudaCppF32Buffer* gradients,
+    BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* momentum,
+    BulletOuCudaCppF32Buffer* velocity,
+    BulletOuCudaCppF32Buffer* slow_params) {
+    if (validate_buffer(ctx, gradients, len, "gradients") != 0 || validate_buffer(ctx, weights, len, "weights") != 0 ||
+        validate_buffer(ctx, momentum, len, "momentum") != 0 || validate_buffer(ctx, velocity, len, "velocity") != 0 ||
+        validate_buffer(ctx, slow_params, len, "slow_params") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+
+    int threads = 256;
+    int blocks = static_cast<int>((len + threads - 1) / threads);
+    radam_update_reset_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        gradients->ptr,
+        weights->ptr,
+        momentum->ptr,
+        velocity->ptr,
+        len,
+        gradient_factor,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight);
+    if (check_kernel_launch("radam_update_reset_gradients_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (do_lookahead != 0) {
+        ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(weights->ptr, slow_params->ptr, len, lookahead_alpha);
+        if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
+            return -1;
+        }
+    }
+
     return ok();
 }
 

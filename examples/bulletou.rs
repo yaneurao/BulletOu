@@ -2765,7 +2765,9 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
             return Err("cuda-cpp trainer is not connected yet".to_string());
         }
 
-        use bulletou_cuda_cpp::{RAdamUpdateParams, RangerStateMut, RangerUpdateParams};
+        use bulletou_cuda_cpp::{
+            Context, F32Buffer, RAdamUpdateParams, RangerDeviceStateMut, RangerStateMut, RangerUpdateParams,
+        };
 
         let device = args.cuda_cpp_device;
         eprintln!("  backend = cuda-cpp Windows-native smoke");
@@ -2776,6 +2778,16 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         if axpy != vec![12.0, 24.0, 36.0, 48.0] {
             return Err(format!("cuda-cpp axpy smoke mismatch: {axpy:?}"));
+        }
+
+        let ctx = Context::new(device).map_err(|e| e.to_string())?;
+        let x_dev = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0, 4.0]).map_err(|e| e.to_string())?;
+        let y_dev = F32Buffer::from_host(&ctx, &[10.0, 20.0, 30.0, 40.0]).map_err(|e| e.to_string())?;
+        let out_dev = F32Buffer::new(&ctx, 4).map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, &x_dev, &y_dev, &out_dev).map_err(|e| e.to_string())?;
+        let axpy_device = out_dev.download(&ctx).map_err(|e| e.to_string())?;
+        if axpy_device != vec![12.0, 24.0, 36.0, 48.0] {
+            return Err(format!("cuda-cpp persistent axpy smoke mismatch: {axpy_device:?}"));
         }
 
         let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
@@ -2809,6 +2821,47 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         if !gradients.iter().all(|&g| g == 0.0) {
             return Err(format!("cuda-cpp ranger smoke did not reset gradients: {gradients:?}"));
+        }
+
+        let gradients_dev = F32Buffer::from_host(&ctx, &[0.25, -0.5, 1.0, -1.5]).map_err(|e| e.to_string())?;
+        let weights_dev = F32Buffer::from_host(&ctx, &[0.1, -0.2, 0.3, -0.4]).map_err(|e| e.to_string())?;
+        let momentum_dev = F32Buffer::from_host(&ctx, &[0.0; 4]).map_err(|e| e.to_string())?;
+        let velocity_dev = F32Buffer::from_host(&ctx, &[0.0; 4]).map_err(|e| e.to_string())?;
+        let slow_dev = F32Buffer::from_host(&ctx, &[0.1, -0.2, 0.3, -0.4]).map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::ranger_update_device(
+            &ctx,
+            RangerUpdateParams {
+                radam: RAdamUpdateParams {
+                    step: 1,
+                    learning_rate: 0.01,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    min_weight: -1.98,
+                    max_weight: 1.98,
+                    ..RAdamUpdateParams::default()
+                },
+                lookahead_alpha: 0.5,
+                lookahead_period: 6,
+            },
+            RangerDeviceStateMut {
+                gradients: &gradients_dev,
+                weights: &weights_dev,
+                momentum: &momentum_dev,
+                velocity: &velocity_dev,
+                slow_params: &slow_dev,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.synchronize().map_err(|e| e.to_string())?;
+        let gradients_device = gradients_dev.download(&ctx).map_err(|e| e.to_string())?;
+        let weights_device = weights_dev.download(&ctx).map_err(|e| e.to_string())?;
+        if !gradients_device.iter().all(|&g| g == 0.0) {
+            return Err(format!("cuda-cpp persistent ranger smoke did not reset gradients: {gradients_device:?}"));
+        }
+        if weights_device != weights {
+            return Err(format!(
+                "cuda-cpp persistent ranger smoke mismatch: host={weights:?} device={weights_device:?}"
+            ));
         }
 
         eprintln!("  cuda-cpp smoke = ok");

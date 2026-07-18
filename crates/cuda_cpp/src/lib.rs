@@ -1,4 +1,4 @@
-use std::{error, ffi::CStr, fmt, os::raw::c_char};
+use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CudaCppError {
@@ -35,6 +35,117 @@ impl error::Error for CudaCppError {}
 
 pub type Result<T> = std::result::Result<T, CudaCppError>;
 
+#[derive(Debug)]
+pub struct Context {
+    raw: NonNull<ffi::BulletOuCudaCppContext>,
+}
+
+impl Context {
+    pub fn new(device: i32) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer.
+        check(unsafe { ffi::bulletou_cuda_cpp_context_create(device, &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA context_create returned null"))?;
+        Ok(Self { raw })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        // SAFETY: `self.raw` is owned by this wrapper and valid until Drop.
+        check(unsafe { ffi::bulletou_cuda_cpp_context_synchronize(self.raw.as_ptr()) })
+    }
+
+    fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppContext {
+        self.raw.as_ptr()
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_context_destroy(self.raw.as_ptr()) };
+    }
+}
+
+#[derive(Debug)]
+pub struct F32Buffer {
+    raw: NonNull<ffi::BulletOuCudaCppF32Buffer>,
+    len: usize,
+}
+
+impl F32Buffer {
+    pub fn new(ctx: &Context, len: usize) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `ctx` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_f32_buffer_create(ctx.as_ptr(), len, &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA f32_buffer_create returned null"))?;
+        Ok(Self { raw, len })
+    }
+
+    pub fn from_host(ctx: &Context, values: &[f32]) -> Result<Self> {
+        let buffer = Self::new(ctx, values.len())?;
+        buffer.upload(ctx, values)?;
+        Ok(buffer)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn upload(&self, ctx: &Context, values: &[f32]) -> Result<()> {
+        if values.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "upload length {} exceeds device buffer length {}",
+                values.len(),
+                self.len
+            )));
+        }
+        // SAFETY: host slice is valid for `values.len()`; backend validates device buffer length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_f32_upload(ctx.as_ptr(), self.raw.as_ptr(), values.as_ptr(), values.len())
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<Vec<f32>> {
+        let mut out = vec![0.0; self.len];
+        self.download_prefix(ctx, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn download_prefix(&self, ctx: &Context, out: &mut [f32]) -> Result<()> {
+        if out.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "download length {} exceeds device buffer length {}",
+                out.len(),
+                self.len
+            )));
+        }
+        // SAFETY: host slice is valid for `out.len()`; backend validates device buffer length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_f32_download(ctx.as_ptr(), self.raw.as_ptr(), out.as_mut_ptr(), out.len())
+        })
+    }
+
+    pub fn fill(&self, ctx: &Context, value: f32) -> Result<()> {
+        // SAFETY: backend validates device buffer length.
+        check(unsafe { ffi::bulletou_cuda_cpp_f32_fill(ctx.as_ptr(), self.raw.as_ptr(), value, self.len) })
+    }
+
+    fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppF32Buffer {
+        self.raw.as_ptr()
+    }
+}
+
+impl Drop for F32Buffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_f32_buffer_destroy(self.raw.as_ptr()) };
+    }
+}
+
 pub fn device_name(device: i32) -> Result<String> {
     let mut bytes = vec![0i8; 256];
     // SAFETY: `bytes` is a valid writable C buffer.
@@ -51,6 +162,11 @@ pub fn axpy_host(device: i32, a: f32, x: &[f32], y: &[f32]) -> Result<Vec<f32>> 
     // SAFETY: all slices have identical length and valid pointers for `len` elements.
     check(unsafe { ffi::bulletou_cuda_cpp_axpy_host(device, x.len(), a, x.as_ptr(), y.as_ptr(), out.as_mut_ptr()) })?;
     Ok(out)
+}
+
+pub fn axpy_device(ctx: &Context, len: usize, a: f32, x: &F32Buffer, y: &F32Buffer, out: &F32Buffer) -> Result<()> {
+    // SAFETY: backend validates buffer lengths and device ownership.
+    check(unsafe { ffi::bulletou_cuda_cpp_axpy_device(ctx.as_ptr(), len, a, x.as_ptr(), y.as_ptr(), out.as_ptr()) })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,6 +312,33 @@ impl RangerStateMut<'_> {
     }
 }
 
+pub struct RangerDeviceStateMut<'a> {
+    pub gradients: &'a F32Buffer,
+    pub weights: &'a F32Buffer,
+    pub momentum: &'a F32Buffer,
+    pub velocity: &'a F32Buffer,
+    pub slow_params: &'a F32Buffer,
+}
+
+impl RangerDeviceStateMut<'_> {
+    fn validate(&self) -> Result<usize> {
+        let len = self.gradients.len();
+        for (name, actual) in [
+            ("weights", self.weights.len()),
+            ("momentum", self.momentum.len()),
+            ("velocity", self.velocity.len()),
+            ("slow_params", self.slow_params.len()),
+        ] {
+            if actual != len {
+                return Err(CudaCppError::message(format!(
+                    "Ranger device length mismatch: gradients={len}, {name}={actual}"
+                )));
+            }
+        }
+        Ok(len)
+    }
+}
+
 pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: RangerStateMut<'_>) -> Result<()> {
     params.validate()?;
     let len = state.validate()?;
@@ -228,6 +371,38 @@ pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: Ranger
     })
 }
 
+pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: RangerDeviceStateMut<'_>) -> Result<()> {
+    params.validate()?;
+    let len = state.validate()?;
+    let scale = params.radam.step_scale()?;
+    let do_lookahead = params.should_lookahead()?;
+
+    // SAFETY: backend validates device ownership and lengths.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_ranger_update_device(
+            ctx.as_ptr(),
+            len,
+            params.radam.gradient_factor,
+            params.radam.learning_rate,
+            scale.step_size,
+            i32::from(scale.use_denom),
+            params.radam.decay,
+            params.radam.beta1,
+            params.radam.beta2,
+            params.radam.epsilon,
+            params.radam.min_weight,
+            params.radam.max_weight,
+            i32::from(do_lookahead),
+            params.lookahead_alpha,
+            state.gradients.as_ptr(),
+            state.weights.as_ptr(),
+            state.momentum.as_ptr(),
+            state.velocity.as_ptr(),
+            state.slow_params.as_ptr(),
+        )
+    })
+}
+
 fn check(code: i32) -> Result<()> {
     if code == 0 { Ok(()) } else { Err(CudaCppError::from_last_error(code)) }
 }
@@ -235,9 +410,54 @@ fn check(code: i32) -> Result<()> {
 mod ffi {
     use super::c_char;
 
+    #[repr(C)]
+    pub struct BulletOuCudaCppContext {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct BulletOuCudaCppF32Buffer {
+        _private: [u8; 0],
+    }
+
     unsafe extern "C" {
         pub fn bulletou_cuda_cpp_last_error(out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_device_name(device: i32, out: *mut c_char, out_len: usize) -> i32;
+        pub fn bulletou_cuda_cpp_context_create(device: i32, out: *mut *mut BulletOuCudaCppContext) -> i32;
+        pub fn bulletou_cuda_cpp_context_destroy(ctx: *mut BulletOuCudaCppContext) -> i32;
+        pub fn bulletou_cuda_cpp_context_synchronize(ctx: *mut BulletOuCudaCppContext) -> i32;
+        pub fn bulletou_cuda_cpp_f32_buffer_create(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            out: *mut *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_buffer_destroy(buffer: *mut BulletOuCudaCppF32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_f32_upload(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppF32Buffer,
+            src: *const f32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_download(
+            ctx: *mut BulletOuCudaCppContext,
+            src: *mut BulletOuCudaCppF32Buffer,
+            dst: *mut f32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_fill(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppF32Buffer,
+            value: f32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_axpy_device(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            a: f32,
+            x: *mut BulletOuCudaCppF32Buffer,
+            y: *mut BulletOuCudaCppF32Buffer,
+            out: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
             len: usize,
@@ -267,6 +487,27 @@ mod ffi {
             velocity: *mut f32,
             slow_params: *mut f32,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_ranger_update_device(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            gradient_factor: f32,
+            learning_rate: f32,
+            step_size: f32,
+            use_denom: i32,
+            decay: f32,
+            beta1: f32,
+            beta2: f32,
+            epsilon: f32,
+            min_weight: f32,
+            max_weight: f32,
+            do_lookahead: i32,
+            lookahead_alpha: f32,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            momentum: *mut BulletOuCudaCppF32Buffer,
+            velocity: *mut BulletOuCudaCppF32Buffer,
+            slow_params: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
     }
 }
 
@@ -290,5 +531,16 @@ mod tests {
     fn axpy_gpu_smoke() {
         let out = axpy_host(0, 2.0, &[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0]).unwrap();
         assert_eq!(out, vec![12.0, 24.0, 36.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn persistent_device_api_smoke() {
+        let ctx = Context::new(0).unwrap();
+        let x = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0]).unwrap();
+        let y = F32Buffer::from_host(&ctx, &[10.0, 20.0, 30.0]).unwrap();
+        let out = F32Buffer::new(&ctx, 3).unwrap();
+        axpy_device(&ctx, 3, 2.0, &x, &y, &out).unwrap();
+        assert_eq!(out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
     }
 }
