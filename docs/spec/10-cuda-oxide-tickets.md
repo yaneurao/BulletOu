@@ -779,6 +779,9 @@ the tickets in order and commit each completed slice.
   - the public/debug backward entry remains split so `stm_l0_gradients`, `nstm_l0_gradients`, and pre-gradient buffers stay inspectable for correctness tests;
   - `SfnnTrainStepRunner` now calls a dedicated `bulletou_cuda_cpp_sfnn_backward_train_device` entry that fuses pairwise backward with sparse L0 CReLU backward, avoiding the intermediate pairwise-gradient write/read in the hot train path;
   - the existing ignored SFNN backward smoke still covers the split path, and the train-step runner smoke covers the fused path against the CPU golden.
+- Reduced SFNN backward atomic overhead further:
+  - the fused pairwise/L0 sparse backward kernel now works per pair instead of per row, so each thread handles both halves of a pair and scans the sparse feature list once instead of twice;
+  - stacked L3/L2/L1 backward kernels skip zero-gradient or zero-activation weight/bias `atomicAdd`s, preserving the same gradients while avoiding a large fraction of atomics after CReLU/pairwise sparsification.
 - Added double-buffered SFNN upload pipelining for the root direct trainer:
   - `I32UploadSlot` mirrors the existing `F32UploadSlot`, so sparse feature indices can be uploaded on a separate CUDA stream;
   - `SfnnTrainStepRunner` owns two `SfnnTrainStepUploadSlot`s containing sparse indices, buckets, targets, entry weights, upload-ready events, and compute-done events;
@@ -817,6 +820,8 @@ the tickets in order and commit each completed slice.
     `--cuda-cpp-train-steps 50 --batch-size 65536 --buffer-mb 512 --threads 10 --sfnn-factorized-l1` reported `throughput=1064822 pos/s`;
     a shorter post-display-change bs65k/20-step smoke reported `throughput=1059357 pos/s`.
   - With final-only loss readback, the same bs65k/50-step release smoke plus `--cuda-cpp-loss-readback-interval 0` reported `throughput=1120866 pos/s`.
+  - After pairwise-L0 and zero-atomic skipping, bs65k/50-step final-only release smoke reported `throughput=1190496 pos/s`.
+  - Backward profile moved from the post-fused baseline `38.249ms` through pairwise-L0 `37.705ms` to zero-skip `33.576ms` on the bs65k/3-profile-step probe; the rejected L1-small-output experiment regressed to `35.039ms` and was not kept.
 - Remaining BO-CUDA-034 work:
   - wire SFNN cuda-cpp direct output into the normal numbered checkpoint/log/validation semantics and auto-resume orchestration;
   - add deeper backward profiling/optimisation; current C++ direct speed is improved but still below the tatara target (`~1.29M pos/s`);

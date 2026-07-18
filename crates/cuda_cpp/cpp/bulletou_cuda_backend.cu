@@ -746,7 +746,10 @@ __global__ void sfnn_stacked_l3_backward_kernel(
             size_t stack = static_cast<size_t>(stack_i32);
             float output_gradient = output_gradients[sample];
             value = output_gradient * weights[stack * input_dim + row];
-            atomicAdd(&weight_gradients[stack * input_dim + row], output_gradient * inputs[tid]);
+            float input_value = inputs[tid];
+            if (output_gradient != 0.0f && input_value != 0.0f) {
+                atomicAdd(&weight_gradients[stack * input_dim + row], output_gradient * input_value);
+            }
         }
         input_gradients[tid] = value;
     }
@@ -760,7 +763,10 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     if (tid < batch) {
         int stack_i32 = buckets[tid];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
-            atomicAdd(&bias_gradients[static_cast<size_t>(stack_i32)], output_gradients[tid]);
+            float grad = output_gradients[tid];
+            if (grad != 0.0f) {
+                atomicAdd(&bias_gradients[static_cast<size_t>(stack_i32)], grad);
+            }
         }
     }
 }
@@ -794,7 +800,9 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 size_t out_idx = sample * output_dim + out_col;
                 float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
-                sum += grad * weights[stack_base + out_col * input_dim + in_col];
+                if (grad != 0.0f) {
+                    sum += grad * weights[stack_base + out_col * input_dim + in_col];
+                }
             }
         }
         input_gradients[tid] = sum;
@@ -810,8 +818,11 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             size_t stack = static_cast<size_t>(stack_i32);
             size_t out_idx = sample * output_dim + out_col;
             float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
-            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
-            atomicAdd(&weight_gradients[weight_idx], grad * inputs[sample * input_dim + in_col]);
+            float input_value = inputs[sample * input_dim + in_col];
+            if (grad != 0.0f && input_value != 0.0f) {
+                size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+                atomicAdd(&weight_gradients[weight_idx], grad * input_value);
+            }
         }
     }
 
@@ -823,7 +834,9 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             size_t stack = static_cast<size_t>(stack_i32);
             size_t out_idx = sample * output_dim + out_col;
             float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
-            atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+            if (grad != 0.0f) {
+                atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+            }
         }
     }
 }
@@ -885,8 +898,10 @@ __global__ void sfnn_stacked_affine_backward_kernel(
             size_t stack = static_cast<size_t>(stack_i32);
             size_t stack_base = stack * output_dim * input_dim;
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
-                sum += output_gradients[sample * output_dim + out_col] *
-                    weights[stack_base + out_col * input_dim + in_col];
+                float grad = output_gradients[sample * output_dim + out_col];
+                if (grad != 0.0f) {
+                    sum += grad * weights[stack_base + out_col * input_dim + in_col];
+                }
             }
         }
         input_gradients[tid] = sum;
@@ -900,9 +915,12 @@ __global__ void sfnn_stacked_affine_backward_kernel(
         int stack_i32 = buckets[sample];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
-            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
-            float grad = output_gradients[sample * output_dim + out_col] * inputs[sample * input_dim + in_col];
-            atomicAdd(&weight_gradients[weight_idx], grad);
+            float output_gradient = output_gradients[sample * output_dim + out_col];
+            float input_value = inputs[sample * input_dim + in_col];
+            if (output_gradient != 0.0f && input_value != 0.0f) {
+                size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+                atomicAdd(&weight_gradients[weight_idx], output_gradient * input_value);
+            }
         }
     }
 
@@ -912,7 +930,10 @@ __global__ void sfnn_stacked_affine_backward_kernel(
         int stack_i32 = buckets[sample];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
-            atomicAdd(&bias_gradients[stack * output_dim + out_col], output_gradients[tid]);
+            float grad = output_gradients[tid];
+            if (grad != 0.0f) {
+                atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+            }
         }
     }
 }
@@ -947,9 +968,11 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             size_t stack_base = stack * output_dim * input_dim;
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 float grad = output_gradients[sample * output_dim + out_col];
-                float stacked_weight = weights[stack_base + out_col * input_dim + in_col];
-                float shared_weight = shared_weights[in_col * output_dim + out_col];
-                sum += grad * (stacked_weight + shared_weight);
+                if (grad != 0.0f) {
+                    float stacked_weight = weights[stack_base + out_col * input_dim + in_col];
+                    float shared_weight = shared_weights[in_col * output_dim + out_col];
+                    sum += grad * (stacked_weight + shared_weight);
+                }
             }
         }
         input_gradients[tid] = sum;
@@ -963,14 +986,17 @@ __global__ void sfnn_factorized_l1_backward_kernel(
         int stack_i32 = buckets[sample];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
-            float grad = output_gradients[sample * output_dim + out_col] * inputs[sample * input_dim + in_col];
-            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
-            size_t shared_weight_idx = in_col * output_dim + out_col;
-            atomicAdd(&weight_gradients[weight_idx], grad);
-            atomicAdd(&shared_weight_gradients[shared_weight_idx], grad);
+            float output_gradient = output_gradients[sample * output_dim + out_col];
+            float input_value = inputs[sample * input_dim + in_col];
+            if (output_gradient != 0.0f && input_value != 0.0f) {
+                float grad = output_gradient * input_value;
+                size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+                size_t shared_weight_idx = in_col * output_dim + out_col;
+                atomicAdd(&weight_gradients[weight_idx], grad);
+                atomicAdd(&shared_weight_gradients[shared_weight_idx], grad);
+            }
         }
     }
-
     if (tid < bias_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t sample = tid / output_dim;
@@ -978,8 +1004,10 @@ __global__ void sfnn_factorized_l1_backward_kernel(
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
             float grad = output_gradients[tid];
-            atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
-            atomicAdd(&shared_bias_gradients[out_col], grad);
+            if (grad != 0.0f) {
+                atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+                atomicAdd(&shared_bias_gradients[out_col], grad);
+            }
         }
     }
 }
@@ -1031,42 +1059,63 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     size_t input_size,
     size_t ft_size) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t l0_len = batch * ft_size;
-    if (tid >= l0_len) {
+    size_t pairwise = ft_size / 2;
+    size_t total = batch * pairwise;
+    if (tid >= total) {
         return;
     }
 
-    size_t pairwise = ft_size / 2;
-    size_t row = tid % ft_size;
-    size_t sample = tid / ft_size;
-    size_t pair = row % pairwise;
-    size_t mate_col = row < pairwise ? pairwise + pair : pair;
+    size_t pair = tid % pairwise;
+    size_t sample = tid / pairwise;
+    size_t row0 = pair;
+    size_t row1 = pairwise + pair;
     size_t l0_base = sample * ft_size;
     size_t sparse_base = sample * max_active;
 
-    float stm_output_grad =
-        combined_gradients[l0_base + pair] * stm_activations[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
-    float nstm_output_grad =
-        combined_gradients[l0_base + pairwise + pair] * nstm_activations[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
-    float stm_grad = crelu_pre_gradient_from_value(stm_activations[tid], stm_output_grad);
-    float nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid], nstm_output_grad);
+    float stm0 = stm_activations[l0_base + row0];
+    float stm1 = stm_activations[l0_base + row1];
+    float nstm0 = nstm_activations[l0_base + row0];
+    float nstm1 = nstm_activations[l0_base + row1];
+    float stm_pair_grad = combined_gradients[l0_base + pair] * SFNN_PAIRWISE_SCALE;
+    float nstm_pair_grad = combined_gradients[l0_base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
+    float stm_grad0 = crelu_pre_gradient_from_value(stm0, stm_pair_grad * stm1);
+    float stm_grad1 = crelu_pre_gradient_from_value(stm1, stm_pair_grad * stm0);
+    float nstm_grad0 = crelu_pre_gradient_from_value(nstm0, nstm_pair_grad * nstm1);
+    float nstm_grad1 = crelu_pre_gradient_from_value(nstm1, nstm_pair_grad * nstm0);
+    float bias_grad0 = stm_grad0 + nstm_grad0;
+    float bias_grad1 = stm_grad1 + nstm_grad1;
 
-    if (stm_grad != 0.0f || nstm_grad != 0.0f) {
-        atomicAdd(&l0b_gradients[row], stm_grad + nstm_grad);
-    } else {
+    if (bias_grad0 == 0.0f && bias_grad1 == 0.0f) {
         return;
+    }
+    if (bias_grad0 != 0.0f) {
+        atomicAdd(&l0b_gradients[row0], bias_grad0);
+    }
+    if (bias_grad1 != 0.0f) {
+        atomicAdd(&l0b_gradients[row1], bias_grad1);
     }
 
     for (size_t slot = 0; slot < max_active; ++slot) {
         int stm_feature = stm_indices[sparse_base + slot];
-        if (stm_grad != 0.0f && stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
-            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad);
+        if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            size_t feature = static_cast<size_t>(stm_feature);
+            if (stm_grad0 != 0.0f) {
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, stm_grad0);
+            }
+            if (stm_grad1 != 0.0f) {
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, stm_grad1);
+            }
         }
 
         int nstm_feature = nstm_indices[sparse_base + slot];
-        if (nstm_grad != 0.0f && nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
-            sfnn_atomic_add_l0w_gradient(
-                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad);
+        if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            size_t feature = static_cast<size_t>(nstm_feature);
+            if (nstm_grad0 != 0.0f) {
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, nstm_grad0);
+            }
+            if (nstm_grad1 != 0.0f) {
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, nstm_grad1);
+            }
         }
     }
 }
@@ -1893,12 +1942,12 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
-    l1_threads = std::max(l1_threads, batch * l1_out);
-    if (block_count_1d(l1_threads, threads, &blocks, "sfnn_l1_backward_kernel") != 0) {
-        return -1;
-    }
     if (has_l1f != 0) {
+        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
+        l1_threads = std::max(l1_threads, batch * l1_out);
+        if (block_count_1d(l1_threads, threads, &blocks, "sfnn_factorized_l1_backward_kernel") != 0) {
+            return -1;
+        }
         sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,
@@ -1918,6 +1967,11 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
     } else {
+        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
+        l1_threads = std::max(l1_threads, batch * l1_out);
+        if (block_count_1d(l1_threads, threads, &blocks, "sfnn_stacked_affine_backward_kernel") != 0) {
+            return -1;
+        }
         sfnn_stacked_affine_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,
@@ -1936,7 +1990,7 @@ int launch_sfnn_backward_kernels(
     }
 
     if (fuse_pairwise_l0 != 0) {
-        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_l0_sparse_backward_kernel") != 0) {
+        if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_sparse_backward_kernel") != 0) {
             return -1;
         }
         sfnn_pairwise_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
