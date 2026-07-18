@@ -667,12 +667,17 @@ the tickets in order and commit each completed slice.
 - Added BulletOu root-side correctness coverage:
   - `value::fast_nnue::tests::cuda_cpp_tiny_forward_matches_scalar_reference` compares the C++/CUDA tiny NNUE output against the existing CPU scalar golden behind `--features cuda-cpp-backend`;
   - the test is `#[ignore]` so normal CPU-only test runs do not require an NVIDIA GPU.
+- Added scalar loss kernels and wrappers:
+  - C++/CUDA now implements sigmoid-MSE and nnue-pytorch-WRM per-sample loss, mean output gradients, deterministic weighted-sum finalize, and persistent-device workspace readback;
+  - `bulletou-cuda-cpp-smoke` checks both host convenience and persistent-device scalar-loss paths;
+  - `value::fast_loss::tests::cuda_cpp_scalar_loss_matches_cpu_reference` compares the C++/CUDA loss output against the existing CPU scalar loss golden behind `--features cuda-cpp-backend`.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
-  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `nnue_h: [1.208, 1.1194999]` / `nnue_d: [1.208, 1.1194999]`;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `nnue_h: [1.208, 1.1194999]` / `nnue_d: [1.208, 1.1194999]` plus matching `loss_h` / `loss_d`;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_tiny_forward_matches_scalar_reference -- --ignored` passed;
+  - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_scalar_loss_matches_cpu_reference -- --ignored` passed;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou` passed.
 - Remaining BO-CUDA-033 work:

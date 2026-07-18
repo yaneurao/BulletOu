@@ -653,6 +653,227 @@ pub fn nnue_forward_device(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarLossKind {
+    SigmoidMse,
+    NnuePytorchWrm,
+}
+
+impl ScalarLossKind {
+    fn as_ffi(self) -> i32 {
+        match self {
+            Self::SigmoidMse => 0,
+            Self::NnuePytorchWrm => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScalarLossHostBatch<'a> {
+    pub outputs: &'a [f32],
+    pub targets: &'a [f32],
+    pub entry_weights: &'a [f32],
+}
+
+impl ScalarLossHostBatch<'_> {
+    pub fn batch_size(self) -> usize {
+        self.outputs.len()
+    }
+
+    pub fn validate(self) -> Result<()> {
+        let batch_size = self.batch_size();
+        if batch_size == 0 {
+            return Err(CudaCppError::message("scalar loss batch must not be empty"));
+        }
+        expect_len("loss targets", batch_size, self.targets.len())?;
+        expect_len("loss entry_weights", batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct ScalarLossDeviceBatch {
+    pub batch_size: usize,
+    pub outputs: F32Buffer,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+}
+
+impl ScalarLossDeviceBatch {
+    pub fn from_host(ctx: &Context, batch: ScalarLossHostBatch<'_>) -> Result<Self> {
+        batch.validate()?;
+        Ok(Self {
+            batch_size: batch.batch_size(),
+            outputs: F32Buffer::from_host(ctx, batch.outputs)?,
+            targets: F32Buffer::from_host(ctx, batch.targets)?,
+            entry_weights: F32Buffer::from_host(ctx, batch.entry_weights)?,
+        })
+    }
+
+    pub fn from_device(outputs: F32Buffer, targets: F32Buffer, entry_weights: F32Buffer) -> Result<Self> {
+        let batch_size = outputs.len();
+        if batch_size == 0 {
+            return Err(CudaCppError::message("scalar loss batch must not be empty"));
+        }
+        expect_len("loss device targets", batch_size, targets.len())?;
+        expect_len("loss device entry_weights", batch_size, entry_weights.len())?;
+        Ok(Self { batch_size, outputs, targets, entry_weights })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.batch_size == 0 {
+            return Err(CudaCppError::message("scalar loss batch must not be empty"));
+        }
+        expect_len("loss device outputs", self.batch_size, self.outputs.len())?;
+        expect_len("loss device targets", self.batch_size, self.targets.len())?;
+        expect_len("loss device entry_weights", self.batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarLossWorkspaceLayout {
+    pub batch_size: usize,
+}
+
+impl ScalarLossWorkspaceLayout {
+    pub fn new(batch_size: usize) -> Self {
+        Self { batch_size }
+    }
+
+    pub fn per_sample_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn mean_output_gradients_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn reduced_len(self) -> usize {
+        1
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("scalar loss workspace batch must not be empty"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ScalarLossWorkspace {
+    pub layout: ScalarLossWorkspaceLayout,
+    pub per_sample: F32Buffer,
+    pub mean_output_gradients: F32Buffer,
+    pub weighted_sum: F32Buffer,
+    pub mean: F32Buffer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarLossReadback {
+    pub per_sample: Vec<f32>,
+    pub mean_output_gradients: Vec<f32>,
+    pub weighted_sum: f32,
+    pub mean: f32,
+}
+
+impl ScalarLossWorkspace {
+    pub fn new(ctx: &Context, layout: ScalarLossWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            per_sample: F32Buffer::new(ctx, layout.per_sample_len())?,
+            mean_output_gradients: F32Buffer::new(ctx, layout.mean_output_gradients_len())?,
+            weighted_sum: F32Buffer::new(ctx, layout.reduced_len())?,
+            mean: F32Buffer::new(ctx, layout.reduced_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("loss workspace per_sample", self.layout.per_sample_len(), self.per_sample.len())?;
+        expect_len(
+            "loss workspace mean_output_gradients",
+            self.layout.mean_output_gradients_len(),
+            self.mean_output_gradients.len(),
+        )?;
+        expect_len("loss workspace weighted_sum", self.layout.reduced_len(), self.weighted_sum.len())?;
+        expect_len("loss workspace mean", self.layout.reduced_len(), self.mean.len())
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<ScalarLossReadback> {
+        let per_sample = self.per_sample.download(ctx)?;
+        let mean_output_gradients = self.mean_output_gradients.download(ctx)?;
+        let weighted_sum = self.weighted_sum.download(ctx)?;
+        let mean = self.mean.download(ctx)?;
+        Ok(ScalarLossReadback { per_sample, mean_output_gradients, weighted_sum: weighted_sum[0], mean: mean[0] })
+    }
+}
+
+pub fn scalar_loss_host(
+    device: i32,
+    kind: ScalarLossKind,
+    output_inv_scale: f32,
+    batch: ScalarLossHostBatch<'_>,
+) -> Result<ScalarLossReadback> {
+    batch.validate()?;
+    let batch_size = batch.batch_size();
+    let mut per_sample = vec![0.0; batch_size];
+    let mut mean_output_gradients = vec![0.0; batch_size];
+    let mut weighted_sum = [0.0];
+    let mut mean = [0.0];
+    // SAFETY: all host slices have been length-validated against `batch_size`.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_scalar_loss_host(
+            device,
+            kind.as_ffi(),
+            output_inv_scale,
+            batch_size,
+            batch.outputs.as_ptr(),
+            batch.targets.as_ptr(),
+            batch.entry_weights.as_ptr(),
+            per_sample.as_mut_ptr(),
+            mean_output_gradients.as_mut_ptr(),
+            weighted_sum.as_mut_ptr(),
+            mean.as_mut_ptr(),
+        )
+    })?;
+    Ok(ScalarLossReadback { per_sample, mean_output_gradients, weighted_sum: weighted_sum[0], mean: mean[0] })
+}
+
+pub fn scalar_loss_device(
+    ctx: &Context,
+    kind: ScalarLossKind,
+    output_inv_scale: f32,
+    batch: &ScalarLossDeviceBatch,
+    workspace: &ScalarLossWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    workspace.validate()?;
+    if workspace.layout.batch_size != batch.batch_size {
+        return Err(CudaCppError::message(format!(
+            "scalar loss workspace batch mismatch: workspace={} batch={}",
+            workspace.layout.batch_size, batch.batch_size
+        )));
+    }
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_scalar_loss_device(
+            ctx.as_ptr(),
+            kind.as_ffi(),
+            output_inv_scale,
+            batch.batch_size,
+            batch.outputs.as_ptr(),
+            batch.targets.as_ptr(),
+            batch.entry_weights.as_ptr(),
+            workspace.per_sample.as_ptr(),
+            workspace.mean_output_gradients.as_ptr(),
+            workspace.weighted_sum.as_ptr(),
+            workspace.mean.as_ptr(),
+        )
+    })
+}
+
 fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
     if shape.input_size == 0 || shape.l1 == 0 || shape.l2 == 0 || shape.l3 == 0 {
         Err(CudaCppError::message(format!("NNUE shape dimensions must be non-zero: {shape:?}")))
@@ -1074,6 +1295,32 @@ mod ffi {
             outb: *const f32,
             output: *mut f32,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_scalar_loss_device(
+            ctx: *mut BulletOuCudaCppContext,
+            kind: i32,
+            output_inv_scale: f32,
+            batch: usize,
+            outputs: *mut BulletOuCudaCppF32Buffer,
+            targets: *mut BulletOuCudaCppF32Buffer,
+            entry_weights: *mut BulletOuCudaCppF32Buffer,
+            per_sample: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            weighted_sum: *mut BulletOuCudaCppF32Buffer,
+            mean: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_scalar_loss_host(
+            device: i32,
+            kind: i32,
+            output_inv_scale: f32,
+            batch: usize,
+            outputs: *const f32,
+            targets: *const f32,
+            entry_weights: *const f32,
+            per_sample: *mut f32,
+            mean_output_gradients: *mut f32,
+            weighted_sum: *mut f32,
+            mean: *mut f32,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
             len: usize,
@@ -1175,6 +1422,15 @@ mod tests {
     }
 
     #[test]
+    fn scalar_loss_validation_reports_length_mismatch() {
+        let batch = ScalarLossHostBatch { outputs: &[0.0], targets: &[], entry_weights: &[1.0] };
+
+        let err = batch.validate().unwrap_err();
+
+        assert!(err.to_string().contains("loss targets length mismatch"));
+    }
+
+    #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn axpy_gpu_smoke() {
         let out = axpy_host(0, 2.0, &[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0]).unwrap();
@@ -1196,6 +1452,43 @@ mod tests {
         let out = nnue_forward_host(0, batch, weights).unwrap();
 
         assert_close_slice("nnue", &out, &[1.208, 1.1195], 1.0e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn scalar_loss_gpu_smoke() {
+        let outputs = [-2.0, 0.0, 2.0];
+        let targets = [0.0, 0.5, 1.0];
+        let entry_weights = [1.0, 0.5, 2.0];
+        let batch = ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &entry_weights };
+
+        let host = scalar_loss_host(0, ScalarLossKind::SigmoidMse, 1.0, batch).unwrap();
+
+        assert_close_slice("per_sample", &host.per_sample, &[0.014209336, 0.0, 0.028418668], 1.0e-6);
+        assert_close_slice(
+            "mean_output_gradients",
+            &host.mean_output_gradients,
+            &[0.008343695, 0.0, -0.01668739],
+            1.0e-6,
+        );
+        assert_close("weighted_sum", host.weighted_sum, 0.042628005, 1.0e-6);
+        assert_close("mean", host.mean, 0.014209335, 1.0e-6);
+
+        let ctx = Context::new(0).unwrap();
+        let device_batch = ScalarLossDeviceBatch::from_host(&ctx, batch).unwrap();
+        let workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size())).unwrap();
+        scalar_loss_device(&ctx, ScalarLossKind::SigmoidMse, 1.0, &device_batch, &workspace).unwrap();
+        let device = workspace.download(&ctx).unwrap();
+
+        assert_close_slice("device per_sample", &device.per_sample, &host.per_sample, 1.0e-6);
+        assert_close_slice(
+            "device mean_output_gradients",
+            &device.mean_output_gradients,
+            &host.mean_output_gradients,
+            1.0e-6,
+        );
+        assert_close("device weighted_sum", device.weighted_sum, host.weighted_sum, 1.0e-6);
+        assert_close("device mean", device.mean, host.mean, 1.0e-6);
     }
 
     #[test]
@@ -1272,5 +1565,10 @@ mod tests {
                 "{name}[{idx}] mismatch: expected {expected}, got {actual}, abs_diff={abs_diff}"
             );
         }
+    }
+
+    fn assert_close(name: &str, actual: f32, expected: f32, tolerance: f32) {
+        let abs_diff = (actual - expected).abs();
+        assert!(abs_diff <= tolerance, "{name}: expected {expected}, got {actual}, abs_diff={abs_diff}");
     }
 }

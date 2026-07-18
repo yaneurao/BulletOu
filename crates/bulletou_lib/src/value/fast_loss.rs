@@ -173,6 +173,29 @@ mod tests {
         assert_eq!(err, FastLossError::EmptyBatch);
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn cuda_cpp_scalar_loss_matches_cpu_reference() {
+        let outputs = [-2.0, 0.0, 2.0];
+        let targets = [0.0, 0.5, 1.0];
+        let weights = [1.0, 0.5, 2.0];
+        let cpu = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &outputs, &targets, &weights).unwrap();
+
+        let gpu = bulletou_cuda_cpp::scalar_loss_host(
+            0,
+            bulletou_cuda_cpp::ScalarLossKind::SigmoidMse,
+            1.0,
+            bulletou_cuda_cpp::ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &weights },
+        )
+        .unwrap();
+
+        assert_close_slice("per_sample", &gpu.per_sample, &cpu.per_sample);
+        assert_close_slice("mean_output_gradients", &gpu.mean_output_gradients, &cpu.mean_output_gradients);
+        assert_close("weighted_sum", gpu.weighted_sum, cpu.weighted_sum);
+        assert_close("mean", gpu.mean, cpu.mean);
+    }
+
     fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len(), "{name} length mismatch");
         for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {

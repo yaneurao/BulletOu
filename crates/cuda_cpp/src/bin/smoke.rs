@@ -1,7 +1,8 @@
 use bulletou_cuda_cpp::{
     Context, Event, F32Buffer, F32UploadSlot, NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch,
     NnueForwardHostWeights, NnueForwardShape, NnueForwardWorkspace, NnueForwardWorkspaceLayout, RAdamUpdateParams,
-    RangerDeviceStateMut, RangerStateMut, RangerUpdateParams,
+    RangerDeviceStateMut, RangerStateMut, RangerUpdateParams, ScalarLossDeviceBatch, ScalarLossHostBatch,
+    ScalarLossKind, ScalarLossWorkspace, ScalarLossWorkspaceLayout,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +70,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nnue_device = workspace.download_output(&ctx)?;
     println!("  nnue_d: {nnue_device:?}");
     assert_close_slice("nnue_d", &nnue_device, &[1.208, 1.1195], 1.0e-5);
+
+    let loss_batch = tiny_loss_batch();
+    let loss_host = bulletou_cuda_cpp::scalar_loss_host(device, ScalarLossKind::SigmoidMse, 1.0, loss_batch)?;
+    println!("  loss_h: mean={} weighted_sum={}", loss_host.mean, loss_host.weighted_sum);
+    assert_close_slice("loss_h per_sample", &loss_host.per_sample, &[0.014209336, 0.0, 0.028418668], 1.0e-6);
+    assert_close_slice(
+        "loss_h mean_output_gradients",
+        &loss_host.mean_output_gradients,
+        &[0.008343695, 0.0, -0.01668739],
+        1.0e-6,
+    );
+    assert_close_scalar("loss_h weighted_sum", loss_host.weighted_sum, 0.042628005, 1.0e-6);
+    assert_close_scalar("loss_h mean", loss_host.mean, 0.014209335, 1.0e-6);
+
+    let loss_device_batch = ScalarLossDeviceBatch::from_host(&ctx, loss_batch)?;
+    let loss_workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(loss_batch.batch_size()))?;
+    bulletou_cuda_cpp::scalar_loss_device(&ctx, ScalarLossKind::SigmoidMse, 1.0, &loss_device_batch, &loss_workspace)?;
+    let loss_device = loss_workspace.download(&ctx)?;
+    println!("  loss_d: mean={} weighted_sum={}", loss_device.mean, loss_device.weighted_sum);
+    assert_close_slice("loss_d per_sample", &loss_device.per_sample, &loss_host.per_sample, 1.0e-6);
+    assert_close_slice(
+        "loss_d mean_output_gradients",
+        &loss_device.mean_output_gradients,
+        &loss_host.mean_output_gradients,
+        1.0e-6,
+    );
+    assert_close_scalar("loss_d weighted_sum", loss_device.weighted_sum, loss_host.weighted_sum, 1.0e-6);
+    assert_close_scalar("loss_d mean", loss_device.mean, loss_host.mean, 1.0e-6);
 
     let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
     let mut weights = vec![0.1, -0.2, 0.3, -0.4];
@@ -170,6 +199,10 @@ fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static>
     }
 }
 
+fn tiny_loss_batch() -> ScalarLossHostBatch<'static> {
+    ScalarLossHostBatch { outputs: &[-2.0, 0.0, 2.0], targets: &[0.0, 0.5, 1.0], entry_weights: &[1.0, 0.5, 2.0] }
+}
+
 fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len(), "{name} length mismatch");
     for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -179,4 +212,9 @@ fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], tolerance: f
             "{name}[{idx}] mismatch: expected {expected}, got {actual}, abs_diff={abs_diff}"
         );
     }
+}
+
+fn assert_close_scalar(name: &str, actual: f32, expected: f32, tolerance: f32) {
+    let abs_diff = (actual - expected).abs();
+    assert!(abs_diff <= tolerance, "{name}: expected {expected}, got {actual}, abs_diff={abs_diff}");
 }
