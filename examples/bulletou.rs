@@ -3106,6 +3106,11 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
 
+    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+    let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
+    write_cuda_cpp_halfkp_direct_outputs(&direct_output_dir, cuda_shape, &trained_weights, seen_steps)?;
+    eprintln!("  cuda-cpp direct output = {} (nn.bin, weights.bin)", direct_output_dir.display());
+
     Ok(())
 }
 
@@ -3142,6 +3147,235 @@ fn build_halfkp_initial_weights_for_cuda_cpp(
     };
     weights.validate().map_err(|e| e.to_string())?;
     Ok(weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_halfkp_direct_outputs(
+    dir: &Path,
+    shape: bulletou_cuda_cpp::NnueForwardShape,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+    completed_steps: usize,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    write_cuda_cpp_halfkp_nn_bin(&dir.join("nn.bin"), shape, weights)?;
+    write_cuda_cpp_halfkp_weights_bin(&dir.join("weights.bin"), weights, completed_steps)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_halfkp_weights_bin(
+    path: &Path,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+    completed_steps: usize,
+) -> Result<(), String> {
+    let completed_steps = [completed_steps as f32];
+    let mut bytes = write_state_backend_marker("cuda-cpp");
+    bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin([
+        ("nnue/weights/l0w", weights.l0w.as_slice()),
+        ("nnue/weights/l0b", weights.l0b.as_slice()),
+        ("nnue/weights/l1w", weights.l1w.as_slice()),
+        ("nnue/weights/l1b", weights.l1b.as_slice()),
+        ("nnue/weights/l2w", weights.l2w.as_slice()),
+        ("nnue/weights/l2b", weights.l2b.as_slice()),
+        ("nnue/weights/outw", weights.outw.as_slice()),
+        ("nnue/weights/outb", weights.outb.as_slice()),
+        ("nnue/step_ranger/l0w", completed_steps.as_slice()),
+        ("nnue/step_ranger/l0b", completed_steps.as_slice()),
+        ("nnue/step_ranger/l1w", completed_steps.as_slice()),
+        ("nnue/step_ranger/l1b", completed_steps.as_slice()),
+        ("nnue/step_ranger/l2w", completed_steps.as_slice()),
+        ("nnue/step_ranger/l2b", completed_steps.as_slice()),
+        ("nnue/step_ranger/outw", completed_steps.as_slice()),
+        ("nnue/step_ranger/outb", completed_steps.as_slice()),
+    ]));
+    std::fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_halfkp_nn_bin(
+    path: &Path,
+    shape: bulletou_cuda_cpp::NnueForwardShape,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let feature_set = NnueFeatureSet::HalfKp;
+    let base_input_size = feature_set.input_size();
+    let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+    if shape.input_size != base_input_size && shape.input_size != base_input_size + virtual_rows {
+        return Err(format!(
+            "cannot write HalfKP nn.bin for input_size={}, expected {} or factorized {}",
+            shape.input_size,
+            base_input_size,
+            base_input_size + virtual_rows
+        ));
+    }
+    let folded_l0w;
+    let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
+        &weights.l0w
+    } else {
+        folded_l0w = fold_halfkp_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.l1)?;
+        &folded_l0w
+    };
+
+    let qa: i16 = 127;
+    let qb: i16 = 64;
+    let l1_input_dim = shape.l1 * 2;
+    let l1_bias = l1_bias_scale(NnueActivation::Crelu, false, qa, qb);
+
+    let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer
+        .write_all(&header_bytes(feature_set, shape.l1, shape.l2, shape.l3))
+        .and_then(|_| writer.write_all(&ft_hash_bytes(feature_set, shape.l1)))
+        .map_err(|err| format!("failed to write NNUE nn.bin header {}: {err}", path.display()))?;
+
+    write_quantized_i16(&mut writer, path, "l0b", &weights.l0b, qa)?;
+    write_quantized_i16(&mut writer, path, "l0w", l0w_for_export, qa)?;
+    writer
+        .write_all(&network_layer_hash_bytes(shape.l1, shape.l2, shape.l3))
+        .map_err(|err| format!("failed to write NNUE nn.bin network hash {}: {err}", path.display()))?;
+
+    write_quantized_i32(&mut writer, path, "l1b", &weights.l1b, l1_bias)?;
+    let l1w = transpose_input_major_dense_weights(&weights.l1w, l1_input_dim, shape.l2)?;
+    let l1w = pad_weights_for_simd(&l1w, shape.l2, l1_input_dim);
+    write_quantized_i8(&mut writer, path, "l1w", &l1w, qb)?;
+
+    write_quantized_i32(&mut writer, path, "l2b", &weights.l2b, 127 * i32::from(qb))?;
+    let l2w = transpose_input_major_dense_weights(&weights.l2w, shape.l2, shape.l3)?;
+    let l2w = pad_weights_for_simd(&l2w, shape.l3, shape.l2);
+    write_quantized_i8(&mut writer, path, "l2w", &l2w, qb)?;
+
+    write_quantized_i32(&mut writer, path, "outb", &weights.outb, 127 * i32::from(qb))?;
+    let outw = transpose_input_major_dense_weights(&weights.outw, shape.l3, 1)?;
+    let outw = pad_weights_for_simd(&outw, 1, shape.l3);
+    write_quantized_i8(&mut writer, path, "outw", &outw, qb)?;
+
+    writer.flush().map_err(|err| format!("failed to flush NNUE nn.bin {}: {err}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_halfkp_piece_factorized_l0w(
+    weights: &[f32],
+    base_input_size: usize,
+    virtual_rows: usize,
+    l1: usize,
+) -> Result<Vec<f32>, String> {
+    let expected = base_input_size
+        .checked_add(virtual_rows)
+        .and_then(|rows| rows.checked_mul(l1))
+        .ok_or_else(|| {
+            format!("factorized HalfKP l0w shape overflow: base_input_size={base_input_size} virtual_rows={virtual_rows} l1={l1}")
+        })?;
+    if weights.len() != expected {
+        return Err(format!("factorized HalfKP l0w length mismatch: expected {expected}, got {}", weights.len()));
+    }
+    let mut folded = vec![0.0_f32; base_input_size * l1];
+    for row in 0..base_input_size {
+        let piece = row % virtual_rows;
+        let virtual_start = piece * l1;
+        let base_start = (virtual_rows + row) * l1;
+        let dst_start = row * l1;
+        for col in 0..l1 {
+            folded[dst_start + col] = weights[base_start + col] + weights[virtual_start + col];
+        }
+    }
+    Ok(folded)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn transpose_input_major_dense_weights(
+    weights: &[f32],
+    input_dim: usize,
+    output_dim: usize,
+) -> Result<Vec<f32>, String> {
+    let expected = input_dim
+        .checked_mul(output_dim)
+        .ok_or_else(|| format!("dense weight shape overflow: input_dim={input_dim} output_dim={output_dim}"))?;
+    if weights.len() != expected {
+        return Err(format!(
+            "dense weight length mismatch: got {}, expected input_dim({input_dim}) * output_dim({output_dim}) = {expected}",
+            weights.len()
+        ));
+    }
+    let mut transposed = vec![0.0_f32; weights.len()];
+    for input in 0..input_dim {
+        for output in 0..output_dim {
+            transposed[output * input_dim + input] = weights[input * output_dim + output];
+        }
+    }
+    Ok(transposed)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_quantized_i8(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i16,
+) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(values.len());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        if qf < f64::from(i8::MIN) || qf > f64::from(i8::MAX) {
+            return Err(quantization_error(path, name, "i8", value, qf));
+        }
+        bytes.extend_from_slice(&(qf as i8).to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_quantized_i16(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i16,
+) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i16>());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        if qf < f64::from(i16::MIN) || qf > f64::from(i16::MAX) {
+            return Err(quantization_error(path, name, "i16", value, qf));
+        }
+        bytes.extend_from_slice(&(qf as i16).to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_quantized_i32(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    name: &'static str,
+    values: &[f32],
+    scale: i32,
+) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i32>());
+    for &value in values {
+        let qf = (f64::from(scale) * f64::from(value)).round();
+        if qf < f64::from(i32::MIN) || qf > f64::from(i32::MAX) {
+            return Err(quantization_error(path, name, "i32", value, qf));
+        }
+        bytes.extend_from_slice(&(qf as i32).to_le_bytes());
+    }
+    write_nnue_bin_chunk(writer, path, name, &bytes)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_nnue_bin_chunk(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    name: &'static str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    writer.write_all(bytes).map_err(|err| format!("failed to write NNUE nn.bin {name} chunk {}: {err}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantization_error(path: &Path, name: &'static str, target: &'static str, value: f32, quantized: f64) -> String {
+    format!("failed to quantize NNUE nn.bin {name} value {value} -> {quantized} as {target} for {}", path.display())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7799,6 +8033,34 @@ mod tests {
         assert!(weights.l0w[..virtual_rows * weights.shape.l1].iter().all(|&v| v == 0.0));
         assert!(weights.l0w[virtual_rows * weights.shape.l1..].iter().any(|&v| v != 0.0));
         assert!(weights.l0b.iter().any(|&v| v != 0.0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_halfkp_factorized_l0w_fold_adds_virtual_piece_rows() {
+        let base_input_size = 4;
+        let virtual_rows = 2;
+        let l1 = 3;
+        let weights = vec![
+            10.0, 11.0, 12.0, // virtual piece 0
+            20.0, 21.0, 22.0, // virtual piece 1
+            1.0, 2.0, 3.0, // base row 0 -> piece 0
+            4.0, 5.0, 6.0, // base row 1 -> piece 1
+            7.0, 8.0, 9.0, // base row 2 -> piece 0
+            30.0, 31.0, 32.0, // base row 3 -> piece 1
+        ];
+
+        let folded = fold_halfkp_piece_factorized_l0w(&weights, base_input_size, virtual_rows, l1).unwrap();
+
+        assert_eq!(
+            folded,
+            vec![
+                11.0, 13.0, 15.0, //
+                24.0, 26.0, 28.0, //
+                17.0, 19.0, 21.0, //
+                50.0, 52.0, 54.0,
+            ]
+        );
     }
 
     #[test]

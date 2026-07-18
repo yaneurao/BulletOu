@@ -690,6 +690,10 @@ the tickets in order and commit each completed slice.
   - the input shape is now `HALFKP_PIECE_INPUTS + ShogiHalfKP` (virtual piece rows first, normal HalfKP rows offset by 1548);
   - `HalfkpTeacherBatchConfig::ft_factorize = true`, so each normal active HalfKP feature also emits its piece-input virtual row;
   - initial weights match the cuda-oxide tatara-simple recipe: virtual L0 rows zero, base L0/bias/dense/output tensors initialized by deterministic `TataraXorShift` uniform values in `[-0.01, 0.01]`.
+- Added minimal direct-output writing:
+  - after `--cuda-cpp-train-steps`, the runner reads trained weights back and writes `<output>/cuda-cpp-direct/nn.bin` plus `<output>/cuda-cpp-direct/weights.bin`;
+  - `nn.bin` folds factorized HalfKP virtual rows back into normal HalfKP L0 rows before quantization;
+  - `weights.bin` stores raw f32 `nnue/weights/*` records with a `cuda-cpp` backend marker and per-weight completed-step records, ready for the later resume-state work.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -702,6 +706,7 @@ the tickets in order and commit each completed slice.
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 1024 --buffer-mb 64 --threads 4` passed without WSL and reported two real HCPE train steps;
   - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=867894 pos/s` for the short direct-step probe after readback sampling.
   - after switching to the factorized FT layout, `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 50 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=802739 pos/s`.
+  - direct output smoke with `--output target\cuda-cpp-direct-smoke` wrote `cuda-cpp-direct/nn.bin` (64,217,077 bytes) and `cuda-cpp-direct/weights.bin` (130,054,016 bytes).
 - Remaining BO-CUDA-033 work:
   - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
