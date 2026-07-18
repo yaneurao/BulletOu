@@ -741,3 +741,26 @@ the tickets in order and commit each completed slice.
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
   - optimise the correctness-first L0 sparse backward atomic-scatter and Ranger update path, which still dominate the CUDA profile after removing the direct-path zero kernel;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
+
+### BO-CUDA-034
+
+- Started the Windows-native SFNN port by adding a fixed-layout SFNN forward path to `crates/cuda_cpp`:
+  - Rust now exposes `SfnnForwardShape`, host/device batch wrappers, host/device weight wrappers, `SfnnForwardWorkspace`, and `sfnn_forward_device`;
+  - the current layout supports stacked `l1/l2/l3` weights, per-sample bucket selection, PSQT shortcut output, and optional shared/factorized L1 weights;
+  - C++/CUDA now runs sparse L0 + CReLU, pairwise concat, stacked L1, L2 input transform, stacked L2 + CReLU, and stacked L3 output kernels;
+  - the sparse L0 kernel also supports HalfKA2-style virtual piece rows when `input_size == 131949 + 1629`, so normal features can add their factorized piece row without expanding teacher indices on the host.
+- Added correctness smoke coverage:
+  - `tests::sfnn_workspace_layout_counts_forward_activations` verifies the Rust workspace sizing;
+  - ignored GPU test `tests::sfnn_tiny_forward_gpu_smoke` compares the C++/CUDA SFNN forward result against an in-test CPU scalar reference;
+  - standalone `bulletou-cuda-cpp-smoke` now includes the same SFNN tiny forward check alongside NNUE/loss/backward/Ranger smokes.
+- Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
+  - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_forward_gpu_smoke -- --ignored --nocapture` passed;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `sfnn_d: [0.06838137, 0.0869026]`;
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed.
+- Remaining BO-CUDA-034 work:
+  - add SFNN scalar loss/backward kernels and persistent train-step runner;
+  - wire SFNN `--backend cuda-cpp` training through the root CLI;
+  - add SFNN direct output/checkpoint/resume support after the runner exists;
+  - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.

@@ -2,7 +2,8 @@ use bulletou_cuda_cpp::{
     Context, Event, F32Buffer, F32UploadSlot, NnueForwardDeviceBatch, NnueForwardDeviceWeights, NnueForwardHostBatch,
     NnueForwardHostWeights, NnueForwardShape, NnueForwardWorkspace, NnueForwardWorkspaceLayout, RAdamUpdateParams,
     RangerDeviceStateMut, RangerStateMut, RangerUpdateParams, ScalarLossDeviceBatch, ScalarLossHostBatch,
-    ScalarLossKind, ScalarLossWorkspace, ScalarLossWorkspaceLayout,
+    ScalarLossKind, ScalarLossWorkspace, ScalarLossWorkspaceLayout, SfnnForwardDeviceBatch, SfnnForwardDeviceWeights,
+    SfnnForwardHostBatch, SfnnForwardHostWeights, SfnnForwardShape, SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,6 +71,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nnue_device = workspace.download_output(&ctx)?;
     println!("  nnue_d: {nnue_device:?}");
     assert_close_slice("nnue_d", &nnue_device, &[1.208, 1.1195], 1.0e-5);
+
+    let sfnn_shape = tiny_sfnn_shape();
+    let sfnn_batch = tiny_sfnn_batch();
+    let sfnn_weights = tiny_sfnn_weights(sfnn_shape);
+    let sfnn_expected = cpu_tiny_sfnn_forward(sfnn_batch, sfnn_weights);
+    let sfnn_device_batch = SfnnForwardDeviceBatch::from_host(&ctx, sfnn_batch)?;
+    let sfnn_device_weights = SfnnForwardDeviceWeights::from_host(&ctx, sfnn_weights)?;
+    let sfnn_workspace =
+        SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(sfnn_shape, sfnn_batch.batch_size))?;
+    bulletou_cuda_cpp::sfnn_forward_device(&ctx, &sfnn_device_batch, &sfnn_device_weights, &sfnn_workspace)?;
+    let sfnn_device = sfnn_workspace.download_output(&ctx)?;
+    println!("  sfnn_d: {sfnn_device:?}");
+    assert_close_slice("sfnn_d", &sfnn_device, &sfnn_expected, 1.0e-5);
 
     let loss_batch = tiny_loss_batch();
     let loss_host = bulletou_cuda_cpp::scalar_loss_host(device, ScalarLossKind::SigmoidMse, 1.0, loss_batch)?;
@@ -290,6 +304,154 @@ fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static>
         outw: &[1.5],
         outb: &[0.05],
     }
+}
+
+fn tiny_sfnn_shape() -> SfnnForwardShape {
+    SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2 }
+}
+
+fn tiny_sfnn_batch() -> SfnnForwardHostBatch<'static> {
+    SfnnForwardHostBatch {
+        stm_indices: &[0, 1, -1, 2, -1, -1],
+        nstm_indices: &[2, -1, -1, 0, 3, -1],
+        buckets: &[0, 1],
+        batch_size: 2,
+        max_active: 3,
+    }
+}
+
+fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {
+    assert_eq!(shape, tiny_sfnn_shape());
+    SfnnForwardHostWeights {
+        shape,
+        l0w: &[
+            0.2, 0.3, 0.4, 0.5, // feature 0
+            0.1, -0.2, 0.3, -0.4, // feature 1
+            -0.3, 0.2, 0.6, 0.1, // feature 2
+            0.7, 0.4, -0.5, 0.2, // feature 3
+        ],
+        l0b: &[0.05, 0.1, 0.15, 0.2],
+        l1w: &[
+            0.4, -0.1, 0.2, 0.3, // stack 0, row 0
+            0.1, 0.5, -0.2, 0.4, // stack 0, row 1
+            -0.3, 0.2, 0.6, -0.1, // stack 0, row 2 (PSQT)
+            0.2, 0.3, -0.4, 0.1, // stack 1, row 0
+            -0.2, 0.4, 0.1, 0.5, // stack 1, row 1
+            0.3, -0.5, 0.2, 0.1, // stack 1, row 2 (PSQT)
+        ],
+        l1b: &[0.01, 0.02, 0.03, -0.01, 0.04, -0.02],
+        l1fw: Some(&[
+            0.01, -0.02, 0.03, // input 0
+            -0.01, 0.02, -0.03, // input 1
+            0.04, 0.01, -0.02, // input 2
+            0.02, -0.04, 0.01, // input 3
+        ]),
+        l1fb: Some(&[0.005, -0.006, 0.007]),
+        l2w: &[
+            0.3, -0.1, 0.2, 0.4, // stack 0, row 0
+            -0.2, 0.5, 0.1, -0.3, // stack 0, row 1
+            0.1, 0.2, -0.4, 0.3, // stack 1, row 0
+            0.4, -0.2, 0.3, 0.1, // stack 1, row 1
+        ],
+        l2b: &[0.02, -0.03, 0.01, 0.04],
+        l3w: &[0.6, -0.4, 0.5, 0.2],
+        l3b: &[0.05, -0.02],
+    }
+}
+
+fn cpu_tiny_sfnn_forward(batch: SfnnForwardHostBatch<'_>, weights: SfnnForwardHostWeights<'_>) -> Vec<f32> {
+    let shape = weights.shape;
+    let mut out = vec![0.0; batch.batch_size];
+    for (sample, out_sample) in out.iter_mut().enumerate() {
+        let stack = batch.buckets[sample] as usize;
+        let sparse_base = sample * batch.max_active;
+        let mut stm_l0 = weights.l0b.to_vec();
+        let mut nstm_l0 = weights.l0b.to_vec();
+        add_sparse_l0_sfnn(
+            &mut stm_l0,
+            weights.l0w,
+            shape.ft_size,
+            shape.input_size,
+            &batch.stm_indices[sparse_base..sparse_base + batch.max_active],
+        );
+        add_sparse_l0_sfnn(
+            &mut nstm_l0,
+            weights.l0w,
+            shape.ft_size,
+            shape.input_size,
+            &batch.nstm_indices[sparse_base..sparse_base + batch.max_active],
+        );
+        stm_l0.iter_mut().for_each(|value| *value = value.clamp(0.0, 1.0));
+        nstm_l0.iter_mut().for_each(|value| *value = value.clamp(0.0, 1.0));
+
+        let mut combined = vec![0.0; shape.ft_size];
+        for pair in 0..shape.pairwise_size() {
+            combined[pair] = stm_l0[pair] * stm_l0[shape.pairwise_size() + pair] * (127.0 / 128.0);
+            combined[shape.pairwise_size() + pair] =
+                nstm_l0[pair] * nstm_l0[shape.pairwise_size() + pair] * (127.0 / 128.0);
+        }
+
+        let mut l1 = stacked_affine_sfnn_cpu(&combined, weights.l1w, weights.l1b, shape.ft_size, shape.l1_out(), stack);
+        if let (Some(l1fw), Some(l1fb)) = (weights.l1fw, weights.l1fb) {
+            for row in 0..shape.l1_out() {
+                l1[row] += l1fb[row];
+                for input in 0..shape.ft_size {
+                    l1[row] += combined[input] * l1fw[input * shape.l1_out() + row];
+                }
+            }
+        }
+
+        let psqt = l1[shape.l1_hidden];
+        let mut l2_input = vec![0.0; shape.l2_in()];
+        for col in 0..shape.l2_in() {
+            let value = l1[col % shape.l1_hidden];
+            l2_input[col] = if col < shape.l1_hidden {
+                (value.abs() * value.abs() * (127.0 / 128.0)).clamp(0.0, 1.0)
+            } else {
+                value.clamp(0.0, 1.0)
+            };
+        }
+
+        let mut l2 = stacked_affine_sfnn_cpu(&l2_input, weights.l2w, weights.l2b, shape.l2_in(), shape.l2_size, stack);
+        l2.iter_mut().for_each(|value| *value = value.clamp(0.0, 1.0));
+
+        let mut value = weights.l3b[stack] + psqt;
+        for input in 0..shape.l2_size {
+            value += l2[input] * weights.l3w[stack * shape.l2_size + input];
+        }
+        *out_sample = value;
+    }
+    out
+}
+
+fn add_sparse_l0_sfnn(out: &mut [f32], weights: &[f32], rows: usize, input_size: usize, indices: &[i32]) {
+    for &feature in indices {
+        if feature >= 0 && (feature as usize) < input_size {
+            let base = feature as usize * rows;
+            for row in 0..rows {
+                out[row] += weights[base + row];
+            }
+        }
+    }
+}
+
+fn stacked_affine_sfnn_cpu(
+    input: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    input_dim: usize,
+    output_dim: usize,
+    stack: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0; output_dim];
+    let stack_base = stack * output_dim * input_dim;
+    for row in 0..output_dim {
+        out[row] = bias[stack * output_dim + row];
+        for col in 0..input_dim {
+            out[row] += input[col] * weights[stack_base + row * input_dim + col];
+        }
+    }
+    out
 }
 
 fn tiny_loss_batch() -> ScalarLossHostBatch<'static> {
@@ -596,11 +758,7 @@ fn dense_crelu_backward_cpu(
 }
 
 fn crelu_pre_gradient(activation: f32, output_gradient: f32) -> f32 {
-    if activation > 0.0 && activation < 1.0 {
-        output_gradient
-    } else {
-        0.0
-    }
+    if activation > 0.0 && activation < 1.0 { output_gradient } else { 0.0 }
 }
 
 fn sigmoid(value: f32) -> f32 {

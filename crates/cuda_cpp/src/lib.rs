@@ -650,6 +650,370 @@ pub fn nnue_forward_device(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnForwardShape {
+    pub input_size: usize,
+    pub ft_size: usize,
+    pub l1_hidden: usize,
+    pub l2_size: usize,
+    pub num_stacks: usize,
+}
+
+impl SfnnForwardShape {
+    pub fn l1_out(self) -> usize {
+        self.l1_hidden + 1
+    }
+
+    pub fn l2_in(self) -> usize {
+        self.l1_hidden * 2
+    }
+
+    pub fn pairwise_size(self) -> usize {
+        self.ft_size / 2
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnForwardHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub buckets: &'a [i32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl SfnnForwardHostBatch<'_> {
+    pub fn validate(self) -> Result<()> {
+        if self.batch_size == 0 {
+            return Err(CudaCppError::message("SFNN batch_size must be greater than zero"));
+        }
+        if self.max_active == 0 {
+            return Err(CudaCppError::message("SFNN max_active must be greater than zero"));
+        }
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("SFNN sparse batch length overflow"))?;
+        expect_len("sfnn stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("sfnn nstm_indices", sparse_len, self.nstm_indices.len())?;
+        expect_len("sfnn buckets", self.batch_size, self.buckets.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnForwardHostWeights<'a> {
+    pub shape: SfnnForwardShape,
+    pub l0w: &'a [f32],
+    pub l0b: &'a [f32],
+    pub l1w: &'a [f32],
+    pub l1b: &'a [f32],
+    pub l1fw: Option<&'a [f32]>,
+    pub l1fb: Option<&'a [f32]>,
+    pub l2w: &'a [f32],
+    pub l2b: &'a [f32],
+    pub l3w: &'a [f32],
+    pub l3b: &'a [f32],
+}
+
+impl SfnnForwardHostWeights<'_> {
+    pub fn validate(self) -> Result<()> {
+        let shape = self.shape;
+        validate_sfnn_shape(shape)?;
+        expect_len("sfnn l0w", checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, self.l0w.len())?;
+        expect_len("sfnn l0b", shape.ft_size, self.l0b.len())?;
+        expect_len(
+            "sfnn l1w",
+            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
+            self.l1w.len(),
+        )?;
+        expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
+        match (self.l1fw, self.l1fb) {
+            (Some(l1fw), Some(l1fb)) => {
+                expect_len("sfnn l1fw", checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, l1fw.len())?;
+                expect_len("sfnn l1fb", shape.l1_out(), l1fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l1fw requires l1fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l1fb requires l1fw")),
+        }
+        expect_len(
+            "sfnn l2w",
+            checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
+            self.l2w.len(),
+        )?;
+        expect_len("sfnn l2b", checked_product("sfnn l2b", &[shape.num_stacks, shape.l2_size])?, self.l2b.len())?;
+        expect_len("sfnn l3w", checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, self.l3w.len())?;
+        expect_len("sfnn l3b", shape.num_stacks, self.l3b.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct SfnnForwardDeviceBatch {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub stm_indices: I32Buffer,
+    pub nstm_indices: I32Buffer,
+    pub buckets: I32Buffer,
+}
+
+impl SfnnForwardDeviceBatch {
+    pub fn from_host(ctx: &Context, batch: SfnnForwardHostBatch<'_>) -> Result<Self> {
+        batch.validate()?;
+        Ok(Self {
+            batch_size: batch.batch_size,
+            max_active: batch.max_active,
+            stm_indices: I32Buffer::from_host(ctx, batch.stm_indices)?,
+            nstm_indices: I32Buffer::from_host(ctx, batch.nstm_indices)?,
+            buckets: I32Buffer::from_host(ctx, batch.buckets)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("SFNN sparse batch length overflow"))?;
+        expect_len("device sfnn stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("device sfnn nstm_indices", sparse_len, self.nstm_indices.len())?;
+        expect_len("device sfnn buckets", self.batch_size, self.buckets.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct SfnnForwardDeviceWeights {
+    pub shape: SfnnForwardShape,
+    pub l0w: F32Buffer,
+    pub l0b: F32Buffer,
+    pub l1w: F32Buffer,
+    pub l1b: F32Buffer,
+    pub l1fw: Option<F32Buffer>,
+    pub l1fb: Option<F32Buffer>,
+    pub l2w: F32Buffer,
+    pub l2b: F32Buffer,
+    pub l3w: F32Buffer,
+    pub l3b: F32Buffer,
+}
+
+impl SfnnForwardDeviceWeights {
+    pub fn from_host(ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            shape: weights.shape,
+            l0w: F32Buffer::from_host(ctx, weights.l0w)?,
+            l0b: F32Buffer::from_host(ctx, weights.l0b)?,
+            l1w: F32Buffer::from_host(ctx, weights.l1w)?,
+            l1b: F32Buffer::from_host(ctx, weights.l1b)?,
+            l1fw: weights.l1fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l1fb: weights.l1fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l2w: F32Buffer::from_host(ctx, weights.l2w)?,
+            l2b: F32Buffer::from_host(ctx, weights.l2b)?,
+            l3w: F32Buffer::from_host(ctx, weights.l3w)?,
+            l3b: F32Buffer::from_host(ctx, weights.l3b)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let shape = self.shape;
+        validate_sfnn_shape(shape)?;
+        expect_len(
+            "device sfnn l0w",
+            checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?,
+            self.l0w.len(),
+        )?;
+        expect_len("device sfnn l0b", shape.ft_size, self.l0b.len())?;
+        expect_len(
+            "device sfnn l1w",
+            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
+            self.l1w.len(),
+        )?;
+        expect_len(
+            "device sfnn l1b",
+            checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?,
+            self.l1b.len(),
+        )?;
+        match (&self.l1fw, &self.l1fb) {
+            (Some(l1fw), Some(l1fb)) => {
+                expect_len(
+                    "device sfnn l1fw",
+                    checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
+                    l1fw.len(),
+                )?;
+                expect_len("device sfnn l1fb", shape.l1_out(), l1fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l1fw requires l1fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l1fb requires l1fw")),
+        }
+        expect_len(
+            "device sfnn l2w",
+            checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
+            self.l2w.len(),
+        )?;
+        expect_len(
+            "device sfnn l2b",
+            checked_product("sfnn l2b", &[shape.num_stacks, shape.l2_size])?,
+            self.l2b.len(),
+        )?;
+        expect_len(
+            "device sfnn l3w",
+            checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?,
+            self.l3w.len(),
+        )?;
+        expect_len("device sfnn l3b", shape.num_stacks, self.l3b.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnForwardWorkspaceLayout {
+    pub shape: SfnnForwardShape,
+    pub batch_size: usize,
+}
+
+impl SfnnForwardWorkspaceLayout {
+    pub fn new(shape: SfnnForwardShape, batch_size: usize) -> Self {
+        Self { shape, batch_size }
+    }
+
+    pub fn l0_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn combined_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn l1_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l2_input_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2_in())
+    }
+
+    pub fn l2_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2_size)
+    }
+
+    pub fn output_len(self) -> usize {
+        self.batch_size
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_sfnn_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("SFNN workspace batch_size must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SfnnForwardWorkspace {
+    pub layout: SfnnForwardWorkspaceLayout,
+    pub stm_l0: F32Buffer,
+    pub nstm_l0: F32Buffer,
+    pub combined: F32Buffer,
+    pub l1: F32Buffer,
+    pub l2_input: F32Buffer,
+    pub l2: F32Buffer,
+    pub output: F32Buffer,
+}
+
+impl SfnnForwardWorkspace {
+    pub fn new(ctx: &Context, layout: SfnnForwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            stm_l0: F32Buffer::new(ctx, layout.l0_len())?,
+            nstm_l0: F32Buffer::new(ctx, layout.l0_len())?,
+            combined: F32Buffer::new(ctx, layout.combined_len())?,
+            l1: F32Buffer::new(ctx, layout.l1_len())?,
+            l2_input: F32Buffer::new(ctx, layout.l2_input_len())?,
+            l2: F32Buffer::new(ctx, layout.l2_len())?,
+            output: F32Buffer::new(ctx, layout.output_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("sfnn workspace stm_l0", self.layout.l0_len(), self.stm_l0.len())?;
+        expect_len("sfnn workspace nstm_l0", self.layout.l0_len(), self.nstm_l0.len())?;
+        expect_len("sfnn workspace combined", self.layout.combined_len(), self.combined.len())?;
+        expect_len("sfnn workspace l1", self.layout.l1_len(), self.l1.len())?;
+        expect_len("sfnn workspace l2_input", self.layout.l2_input_len(), self.l2_input.len())?;
+        expect_len("sfnn workspace l2", self.layout.l2_len(), self.l2.len())?;
+        expect_len("sfnn workspace output", self.layout.output_len(), self.output.len())
+    }
+
+    pub fn download_output(&self, ctx: &Context) -> Result<Vec<f32>> {
+        self.output.download(ctx)
+    }
+}
+
+pub fn sfnn_forward_device(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &SfnnForwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    workspace.validate()?;
+    if workspace.layout.batch_size != batch.batch_size {
+        return Err(CudaCppError::message(format!(
+            "SFNN workspace batch mismatch: workspace={} batch={}",
+            workspace.layout.batch_size, batch.batch_size
+        )));
+    }
+    if workspace.layout.shape != weights.shape {
+        return Err(CudaCppError::message(format!(
+            "SFNN workspace shape mismatch: workspace={:?} weights={:?}",
+            workspace.layout.shape, weights.shape
+        )));
+    }
+    let shape = weights.shape;
+    let (l1fw, l1fb, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
+        (Some(l1fw), Some(l1fb)) => (l1fw.as_ptr(), l1fb.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
+    };
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_forward_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.ft_size,
+            shape.l1_hidden,
+            shape.l2_size,
+            shape.num_stacks,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            batch.buckets.as_ptr(),
+            weights.l0w.as_ptr(),
+            weights.l0b.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l1b.as_ptr(),
+            l1fw,
+            l1fb,
+            has_l1f,
+            weights.l2w.as_ptr(),
+            weights.l2b.as_ptr(),
+            weights.l3w.as_ptr(),
+            weights.l3b.as_ptr(),
+            workspace.stm_l0.as_ptr(),
+            workspace.nstm_l0.as_ptr(),
+            workspace.combined.as_ptr(),
+            workspace.l1.as_ptr(),
+            workspace.l2_input.as_ptr(),
+            workspace.l2.as_ptr(),
+            workspace.output.as_ptr(),
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarLossKind {
     SigmoidMse,
     NnuePytorchWrm,
@@ -1696,6 +2060,20 @@ fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
     }
 }
 
+fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
+    if shape.input_size == 0
+        || shape.ft_size == 0
+        || shape.l1_hidden == 0
+        || shape.l2_size == 0
+        || shape.num_stacks == 0
+        || shape.ft_size % 2 != 0
+    {
+        Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
+    } else {
+        Ok(())
+    }
+}
+
 fn checked_product(name: &'static str, values: &[usize]) -> Result<usize> {
     let mut out = 1usize;
     for &value in values {
@@ -2165,6 +2543,37 @@ mod ffi {
             outb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_l0_gradients: i32,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_forward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            ft_size: usize,
+            l1_hidden: usize,
+            l2_size: usize,
+            num_stacks: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer,
+            l0w: *mut BulletOuCudaCppF32Buffer,
+            l0b: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l1b: *mut BulletOuCudaCppF32Buffer,
+            l1fw: *mut BulletOuCudaCppF32Buffer,
+            l1fb: *mut BulletOuCudaCppF32Buffer,
+            has_l1f: i32,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            l2b: *mut BulletOuCudaCppF32Buffer,
+            l3w: *mut BulletOuCudaCppF32Buffer,
+            l3b: *mut BulletOuCudaCppF32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            l1: *mut BulletOuCudaCppF32Buffer,
+            l2_input: *mut BulletOuCudaCppF32Buffer,
+            l2: *mut BulletOuCudaCppF32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
             len: usize,
@@ -2266,6 +2675,21 @@ mod tests {
     }
 
     #[test]
+    fn sfnn_workspace_layout_counts_forward_activations() {
+        let shape = SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2 };
+        let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
+
+        assert_eq!(shape.l1_out(), 3);
+        assert_eq!(shape.l2_in(), 4);
+        assert_eq!(layout.l0_len(), 20);
+        assert_eq!(layout.combined_len(), 20);
+        assert_eq!(layout.l1_len(), 15);
+        assert_eq!(layout.l2_input_len(), 20);
+        assert_eq!(layout.l2_len(), 15);
+        assert_eq!(layout.output_len(), 5);
+    }
+
+    #[test]
     fn scalar_loss_validation_reports_length_mismatch() {
         let batch = ScalarLossHostBatch { outputs: &[0.0], targets: &[], entry_weights: &[1.0] };
 
@@ -2337,6 +2761,31 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_tiny_forward_gpu_smoke() {
+        let shape = tiny_sfnn_shape();
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let weights = tiny_sfnn_weights(shape);
+        let expected = tiny_sfnn_forward_cpu(batch, weights);
+
+        let ctx = Context::new(0).unwrap();
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let workspace =
+            SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, batch.batch_size)).unwrap();
+        sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace).unwrap();
+        let actual = workspace.download_output(&ctx).unwrap();
+
+        assert_close_slice("sfnn", &actual, &expected, 1.0e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn persistent_device_api_smoke() {
         let ctx = Context::new(0).unwrap();
         let x = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0]).unwrap();
@@ -2398,6 +2847,158 @@ mod tests {
             outw: &[1.5],
             outb: &[0.05],
         }
+    }
+
+    fn tiny_sfnn_shape() -> SfnnForwardShape {
+        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2 }
+    }
+
+    fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {
+        assert_eq!(shape, tiny_sfnn_shape());
+        SfnnForwardHostWeights {
+            shape,
+            l0w: &[
+                0.2, 0.3, 0.4, 0.5, // feature 0
+                0.1, -0.2, 0.3, -0.4, // feature 1
+                -0.3, 0.2, 0.6, 0.1, // feature 2
+                0.7, 0.4, -0.5, 0.2, // feature 3
+            ],
+            l0b: &[0.05, 0.1, 0.15, 0.2],
+            l1w: &[
+                0.4, -0.1, 0.2, 0.3, // stack 0, row 0
+                0.1, 0.5, -0.2, 0.4, // stack 0, row 1
+                -0.3, 0.2, 0.6, -0.1, // stack 0, row 2 (PSQT)
+                0.2, 0.3, -0.4, 0.1, // stack 1, row 0
+                -0.2, 0.4, 0.1, 0.5, // stack 1, row 1
+                0.3, -0.5, 0.2, 0.1, // stack 1, row 2 (PSQT)
+            ],
+            l1b: &[0.01, 0.02, 0.03, -0.01, 0.04, -0.02],
+            l1fw: Some(&[
+                0.01, -0.02, 0.03, // input 0
+                -0.01, 0.02, -0.03, // input 1
+                0.04, 0.01, -0.02, // input 2
+                0.02, -0.04, 0.01, // input 3
+            ]),
+            l1fb: Some(&[0.005, -0.006, 0.007]),
+            l2w: &[
+                0.3, -0.1, 0.2, 0.4, // stack 0, row 0
+                -0.2, 0.5, 0.1, -0.3, // stack 0, row 1
+                0.1, 0.2, -0.4, 0.3, // stack 1, row 0
+                0.4, -0.2, 0.3, 0.1, // stack 1, row 1
+            ],
+            l2b: &[0.02, -0.03, 0.01, 0.04],
+            l3w: &[0.6, -0.4, 0.5, 0.2],
+            l3b: &[0.05, -0.02],
+        }
+    }
+
+    fn tiny_sfnn_forward_cpu(batch: SfnnForwardHostBatch<'_>, weights: SfnnForwardHostWeights<'_>) -> Vec<f32> {
+        let shape = weights.shape;
+        let mut out = vec![0.0; batch.batch_size];
+        for (sample, out_sample) in out.iter_mut().enumerate() {
+            let stack = batch.buckets[sample] as usize;
+            let mut stm_l0 = weights.l0b.to_vec();
+            let mut nstm_l0 = weights.l0b.to_vec();
+            add_sparse_l0(
+                &mut stm_l0,
+                weights.l0w,
+                shape.ft_size,
+                shape.input_size,
+                &batch.stm_indices[sample * batch.max_active..(sample + 1) * batch.max_active],
+            );
+            add_sparse_l0(
+                &mut nstm_l0,
+                weights.l0w,
+                shape.ft_size,
+                shape.input_size,
+                &batch.nstm_indices[sample * batch.max_active..(sample + 1) * batch.max_active],
+            );
+            stm_l0.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+            nstm_l0.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+
+            let mut combined = vec![0.0; shape.ft_size];
+            for pair in 0..shape.pairwise_size() {
+                combined[pair] = stm_l0[pair] * stm_l0[shape.pairwise_size() + pair] * (127.0 / 128.0);
+                combined[shape.pairwise_size() + pair] =
+                    nstm_l0[pair] * nstm_l0[shape.pairwise_size() + pair] * (127.0 / 128.0);
+            }
+
+            let mut l1 = stacked_affine_cpu(
+                &combined,
+                weights.l1w,
+                weights.l1b,
+                shape.ft_size,
+                shape.l1_out(),
+                shape.num_stacks,
+                stack,
+            );
+            if let (Some(l1fw), Some(l1fb)) = (weights.l1fw, weights.l1fb) {
+                for row in 0..shape.l1_out() {
+                    l1[row] += l1fb[row];
+                    for input in 0..shape.ft_size {
+                        l1[row] += combined[input] * l1fw[input * shape.l1_out() + row];
+                    }
+                }
+            }
+            let psqt = l1[shape.l1_hidden];
+            let mut l2_input = vec![0.0; shape.l2_in()];
+            for col in 0..shape.l2_in() {
+                let value = l1[col % shape.l1_hidden];
+                l2_input[col] = if col < shape.l1_hidden {
+                    (value.abs() * value.abs() * (127.0 / 128.0)).clamp(0.0, 1.0)
+                } else {
+                    value.clamp(0.0, 1.0)
+                };
+            }
+
+            let mut l2 = stacked_affine_cpu(
+                &l2_input,
+                weights.l2w,
+                weights.l2b,
+                shape.l2_in(),
+                shape.l2_size,
+                shape.num_stacks,
+                stack,
+            );
+            l2.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+            let mut value = weights.l3b[stack] + psqt;
+            for input in 0..shape.l2_size {
+                value += l2[input] * weights.l3w[stack * shape.l2_size + input];
+            }
+            *out_sample = value;
+        }
+        out
+    }
+
+    fn add_sparse_l0(out: &mut [f32], weights: &[f32], rows: usize, input_size: usize, indices: &[i32]) {
+        for &feature in indices {
+            if feature >= 0 && (feature as usize) < input_size {
+                let base = feature as usize * rows;
+                for row in 0..rows {
+                    out[row] += weights[base + row];
+                }
+            }
+        }
+    }
+
+    fn stacked_affine_cpu(
+        input: &[f32],
+        weights: &[f32],
+        bias: &[f32],
+        input_dim: usize,
+        output_dim: usize,
+        _num_stacks: usize,
+        stack: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; output_dim];
+        let stack_base = stack * output_dim * input_dim;
+        for row in 0..output_dim {
+            out[row] = bias[stack * output_dim + row];
+            for col in 0..input_dim {
+                out[row] += input[col] * weights[stack_base + row * input_dim + col];
+            }
+        }
+        out
     }
 
     fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) {

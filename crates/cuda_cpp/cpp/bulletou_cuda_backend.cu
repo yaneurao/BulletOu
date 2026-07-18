@@ -414,6 +414,221 @@ __global__ void nnue_dense_output_kernel(
     output[sample] = sum;
 }
 
+constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
+constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
+constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
+constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
+
+__device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_size, size_t* out_feature) {
+    if (input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
+        *out_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
+        return true;
+    }
+    return false;
+}
+
+__global__ void sfnn_sparse_l0_pairwise_concat_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* weights,
+    const float* bias,
+    float* stm_l0,
+    float* nstm_l0,
+    float* combined,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t ft_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t pairwise = ft_size / 2;
+    size_t total = batch * pairwise;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t pair = tid % pairwise;
+    size_t sample = tid / pairwise;
+    size_t row0 = pair;
+    size_t row1 = pairwise + pair;
+    size_t l0_base = sample * ft_size;
+    size_t sparse_base = sample * max_active;
+    float stm_sum0 = bias[row0];
+    float stm_sum1 = bias[row1];
+    float nstm_sum0 = bias[row0];
+    float nstm_sum1 = bias[row1];
+
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int stm_feature_i32 = stm_indices[sparse_base + slot];
+        if (stm_feature_i32 >= 0 && static_cast<size_t>(stm_feature_i32) < input_size) {
+            size_t feature = static_cast<size_t>(stm_feature_i32);
+            size_t weight_base = feature * ft_size;
+            stm_sum0 += weights[weight_base + row0];
+            stm_sum1 += weights[weight_base + row1];
+            size_t virtual_feature = 0;
+            if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
+                size_t virtual_weight_base = virtual_feature * ft_size;
+                stm_sum0 += weights[virtual_weight_base + row0];
+                stm_sum1 += weights[virtual_weight_base + row1];
+            }
+        }
+
+        int nstm_feature_i32 = nstm_indices[sparse_base + slot];
+        if (nstm_feature_i32 >= 0 && static_cast<size_t>(nstm_feature_i32) < input_size) {
+            size_t feature = static_cast<size_t>(nstm_feature_i32);
+            size_t weight_base = feature * ft_size;
+            nstm_sum0 += weights[weight_base + row0];
+            nstm_sum1 += weights[weight_base + row1];
+            size_t virtual_feature = 0;
+            if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
+                size_t virtual_weight_base = virtual_feature * ft_size;
+                nstm_sum0 += weights[virtual_weight_base + row0];
+                nstm_sum1 += weights[virtual_weight_base + row1];
+            }
+        }
+    }
+
+    float stm0 = crelu(stm_sum0);
+    float stm1 = crelu(stm_sum1);
+    float nstm0 = crelu(nstm_sum0);
+    float nstm1 = crelu(nstm_sum1);
+    stm_l0[l0_base + row0] = stm0;
+    stm_l0[l0_base + row1] = stm1;
+    nstm_l0[l0_base + row0] = nstm0;
+    nstm_l0[l0_base + row1] = nstm1;
+    combined[l0_base + pair] = stm0 * stm1 * SFNN_PAIRWISE_SCALE;
+    combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
+}
+
+__global__ void sfnn_stacked_l1_kernel(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    const float* shared_weights,
+    const float* shared_bias,
+    const int* buckets,
+    float* output,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    int has_shared) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * output_dim;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t out_col = tid % output_dim;
+    size_t sample = tid / output_dim;
+    int stack_i32 = buckets[sample];
+    if (stack_i32 < 0 || static_cast<size_t>(stack_i32) >= num_stacks) {
+        output[tid] = 0.0f;
+        return;
+    }
+
+    size_t stack = static_cast<size_t>(stack_i32);
+    size_t input_base = sample * input_dim;
+    size_t stack_base = stack * output_dim * input_dim;
+    float sum = bias[stack * output_dim + out_col];
+    if (has_shared != 0) {
+        sum += shared_bias[out_col];
+    }
+    for (size_t in_col = 0; in_col < input_dim; ++in_col) {
+        float input_value = input[input_base + in_col];
+        sum += input_value * weights[stack_base + out_col * input_dim + in_col];
+        if (has_shared != 0) {
+            sum += input_value * shared_weights[in_col * output_dim + out_col];
+        }
+    }
+    output[tid] = sum;
+}
+
+__global__ void sfnn_l2_input_kernel(const float* l1, float* output, size_t batch, size_t l1_hidden) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t l2_input_dim = l1_hidden * 2;
+    size_t total = batch * l2_input_dim;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t col = tid % l2_input_dim;
+    size_t sample = tid / l2_input_dim;
+    size_t source_col = col % l1_hidden;
+    size_t l1_out = l1_hidden + 1;
+    float value = l1[sample * l1_out + source_col];
+    if (col < l1_hidden) {
+        float abs_value = fabsf(value);
+        output[tid] = crelu(abs_value * abs_value * SFNN_PAIRWISE_SCALE);
+    } else {
+        output[tid] = crelu(value);
+    }
+}
+
+__global__ void sfnn_stacked_l2_crelu_kernel(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    const int* buckets,
+    float* output,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * output_dim;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t out_col = tid % output_dim;
+    size_t sample = tid / output_dim;
+    int stack_i32 = buckets[sample];
+    if (stack_i32 < 0 || static_cast<size_t>(stack_i32) >= num_stacks) {
+        output[tid] = 0.0f;
+        return;
+    }
+
+    size_t stack = static_cast<size_t>(stack_i32);
+    size_t input_base = sample * input_dim;
+    size_t stack_base = stack * output_dim * input_dim;
+    float sum = bias[stack * output_dim + out_col];
+    for (size_t in_col = 0; in_col < input_dim; ++in_col) {
+        sum += input[input_base + in_col] * weights[stack_base + out_col * input_dim + in_col];
+    }
+    output[tid] = crelu(sum);
+}
+
+__global__ void sfnn_stacked_l3_output_kernel(
+    const float* input,
+    const float* l1,
+    const float* weights,
+    const float* bias,
+    const int* buckets,
+    float* output,
+    size_t batch,
+    size_t input_dim,
+    size_t l1_hidden,
+    size_t num_stacks) {
+    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= batch) {
+        return;
+    }
+
+    int stack_i32 = buckets[sample];
+    if (stack_i32 < 0 || static_cast<size_t>(stack_i32) >= num_stacks) {
+        output[sample] = 0.0f;
+        return;
+    }
+
+    size_t stack = static_cast<size_t>(stack_i32);
+    size_t input_base = sample * input_dim;
+    float sum = bias[stack];
+    for (size_t in_col = 0; in_col < input_dim; ++in_col) {
+        sum += input[input_base + in_col] * weights[stack * input_dim + in_col];
+    }
+    output[sample] = sum + l1[sample * (l1_hidden + 1) + l1_hidden];
+}
+
 __device__ float loss_sigmoid(float value) {
     float exp_neg = expf(-value);
     return 1.0f / (1.0f + exp_neg);
@@ -874,6 +1089,29 @@ int validate_nnue_shape(size_t input_size, size_t l1, size_t l2, size_t l3, size
     return 0;
 }
 
+int validate_sfnn_shape(
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active) {
+    if (input_size == 0 || ft_size == 0 || l1_hidden == 0 || l2_size == 0 || num_stacks == 0) {
+        return fail_message("SFNN shape dimensions must be greater than zero");
+    }
+    if ((ft_size % 2) != 0) {
+        return fail_message("SFNN ft_size must be even");
+    }
+    if (batch == 0) {
+        return fail_message("SFNN batch size must be greater than zero");
+    }
+    if (max_active == 0) {
+        return fail_message("SFNN max_active must be greater than zero");
+    }
+    return 0;
+}
+
 int launch_nnue_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -951,6 +1189,117 @@ int launch_nnue_forward_kernels(
     }
     nnue_dense_output_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden2, outw, outb, output, batch, l3);
     if (check_kernel_launch("nnue_dense_output_kernel launch") != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int launch_sfnn_forward_kernels(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const int* buckets,
+    const float* l0w,
+    const float* l0b,
+    const float* l1w,
+    const float* l1b,
+    const float* l1fw,
+    const float* l1fb,
+    int has_l1f,
+    const float* l2w,
+    const float* l2b,
+    const float* l3w,
+    const float* l3b,
+    float* stm_l0,
+    float* nstm_l0,
+    float* combined,
+    float* l1,
+    float* l2_input,
+    float* l2,
+    float* output) {
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+    const size_t pairwise = ft_size / 2;
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+
+    if (block_count_1d(batch * pairwise, threads, &blocks, "sfnn_sparse_l0_pairwise_concat_kernel") != 0) {
+        return -1;
+    }
+    sfnn_sparse_l0_pairwise_concat_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices,
+        nstm_indices,
+        l0w,
+        l0b,
+        stm_l0,
+        nstm_l0,
+        combined,
+        batch,
+        max_active,
+        input_size,
+        ft_size);
+    if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_stacked_l1_kernel") != 0) {
+        return -1;
+    }
+    sfnn_stacked_l1_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        combined,
+        l1w,
+        l1b,
+        l1fw,
+        l1fb,
+        buckets,
+        l1,
+        batch,
+        ft_size,
+        l1_out,
+        num_stacks,
+        has_l1f);
+    if (check_kernel_launch("sfnn_stacked_l1_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l2_in, threads, &blocks, "sfnn_l2_input_kernel") != 0) {
+        return -1;
+    }
+    sfnn_l2_input_kernel<<<blocks, threads, 0, ctx->stream>>>(l1, l2_input, batch, l1_hidden);
+    if (check_kernel_launch("sfnn_l2_input_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l2_size, threads, &blocks, "sfnn_stacked_l2_crelu_kernel") != 0) {
+        return -1;
+    }
+    sfnn_stacked_l2_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        l2_input, l2w, l2b, buckets, l2, batch, l2_in, l2_size, num_stacks);
+    if (check_kernel_launch("sfnn_stacked_l2_crelu_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch, threads, &blocks, "sfnn_stacked_l3_output_kernel") != 0) {
+        return -1;
+    }
+    sfnn_stacked_l3_output_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        l2, l1, l3w, l3b, buckets, output, batch, l2_size, l1_hidden, num_stacks);
+    if (check_kernel_launch("sfnn_stacked_l3_output_kernel launch") != 0) {
         return -1;
     }
 
@@ -1842,6 +2191,104 @@ extern "C" int bulletou_cuda_cpp_nnue_forward_device(
             combined->ptr,
             hidden1->ptr,
             hidden2->ptr,
+            output->ptr) != 0) {
+        return -1;
+    }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppI32Buffer* buckets,
+    const BulletOuCudaCppF32Buffer* l0w,
+    const BulletOuCudaCppF32Buffer* l0b,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1b,
+    const BulletOuCudaCppF32Buffer* l1fw,
+    const BulletOuCudaCppF32Buffer* l1fb,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l2b,
+    const BulletOuCudaCppF32Buffer* l3w,
+    const BulletOuCudaCppF32Buffer* l3b,
+    BulletOuCudaCppF32Buffer* stm_l0,
+    BulletOuCudaCppF32Buffer* nstm_l0,
+    BulletOuCudaCppF32Buffer* combined,
+    BulletOuCudaCppF32Buffer* l1,
+    BulletOuCudaCppF32Buffer* l2_input,
+    BulletOuCudaCppF32Buffer* l2,
+    BulletOuCudaCppF32Buffer* output) {
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0w), input_size * ft_size, "sfnn l0w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0b), ft_size, "sfnn l0b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), num_stacks * l1_out * ft_size, "sfnn l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1b), num_stacks * l1_out, "sfnn l1b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), num_stacks * l2_size * l2_in, "sfnn l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2b), num_stacks * l2_size, "sfnn l2b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l3w), num_stacks * l2_size, "sfnn l3w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l3b), num_stacks, "sfnn l3b") != 0 ||
+        validate_buffer(ctx, stm_l0, batch * ft_size, "sfnn stm_l0") != 0 ||
+        validate_buffer(ctx, nstm_l0, batch * ft_size, "sfnn nstm_l0") != 0 ||
+        validate_buffer(ctx, combined, batch * ft_size, "sfnn combined") != 0 ||
+        validate_buffer(ctx, l1, batch * l1_out, "sfnn l1") != 0 ||
+        validate_buffer(ctx, l2_input, batch * l2_in, "sfnn l2_input") != 0 ||
+        validate_buffer(ctx, l2, batch * l2_size, "sfnn l2") != 0 ||
+        validate_buffer(ctx, output, batch, "sfnn output") != 0) {
+        return -1;
+    }
+    if (has_l1f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fb), l1_out, "sfnn l1fb") != 0) {
+            return -1;
+        }
+    } else if (l1fw != nullptr || l1fb != nullptr) {
+        return fail_message("sfnn l1fw/l1fb must be null when has_l1f is false");
+    }
+
+    if (launch_sfnn_forward_kernels(
+            ctx,
+            input_size,
+            ft_size,
+            l1_hidden,
+            l2_size,
+            num_stacks,
+            batch,
+            max_active,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            buckets->ptr,
+            l0w->ptr,
+            l0b->ptr,
+            l1w->ptr,
+            l1b->ptr,
+            has_l1f != 0 ? l1fw->ptr : nullptr,
+            has_l1f != 0 ? l1fb->ptr : nullptr,
+            has_l1f,
+            l2w->ptr,
+            l2b->ptr,
+            l3w->ptr,
+            l3b->ptr,
+            stm_l0->ptr,
+            nstm_l0->ptr,
+            combined->ptr,
+            l1->ptr,
+            l2_input->ptr,
+            l2->ptr,
             output->ptr) != 0) {
         return -1;
     }
