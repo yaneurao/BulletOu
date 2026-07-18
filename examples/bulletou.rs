@@ -3384,6 +3384,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if seen_steps <= profile_steps {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
@@ -3407,10 +3408,17 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             );
         } else {
             runner
-                .step_pipelined_no_readback(&ctx, &upload_ctx, params, loss_kind, output_inv_scale, batch)
+                .step_pipelined_no_readback_with_loss_finalize(
+                    &ctx,
+                    &upload_ctx,
+                    params,
+                    loss_kind,
+                    output_inv_scale,
+                    batch,
+                    should_report,
+                )
                 .map_err(|e| e.to_string())?;
         }
-        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;

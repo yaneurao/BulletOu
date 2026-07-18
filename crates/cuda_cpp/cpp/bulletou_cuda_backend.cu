@@ -1856,6 +1856,7 @@ int launch_sfnn_backward_kernels(
     float* l2b_gradients,
     float* l3w_gradients,
     float* l3b_gradients,
+    int zero_parameter_gradients,
     int fuse_pairwise_l0) {
     if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
         return -1;
@@ -1869,24 +1870,26 @@ int launch_sfnn_backward_kernels(
     constexpr int threads = 256;
     int blocks = 0;
 
-    if (launch_zero_sfnn_backward_parameter_gradients(
-            ctx,
-            input_size,
-            ft_size,
-            l1_hidden,
-            l2_size,
-            num_stacks,
-            l0w_gradients,
-            l0b_gradients,
-            l1w_gradients,
-            l1b_gradients,
-            l1fw_gradients,
-            l1fb_gradients,
-            l2w_gradients,
-            l2b_gradients,
-            l3w_gradients,
-            l3b_gradients) != 0) {
-        return -1;
+    if (zero_parameter_gradients != 0) {
+        if (launch_zero_sfnn_backward_parameter_gradients(
+                ctx,
+                input_size,
+                ft_size,
+                l1_hidden,
+                l2_size,
+                num_stacks,
+                l0w_gradients,
+                l0b_gradients,
+                l1w_gradients,
+                l1b_gradients,
+                l1fw_gradients,
+                l1fb_gradients,
+                l2w_gradients,
+                l2b_gradients,
+                l3w_gradients,
+                l3b_gradients) != 0) {
+            return -1;
+        }
     }
 
     size_t l3_threads = std::max(batch * l2_size, batch * l1_out);
@@ -2065,7 +2068,8 @@ int launch_scalar_loss_kernels(
     float* per_sample,
     float* mean_output_gradients,
     float* weighted_sum,
-    float* mean) {
+    float* mean,
+    int finalize_loss) {
     if (validate_scalar_loss(batch, kind) != 0) {
         return -1;
     }
@@ -2104,9 +2108,11 @@ int launch_scalar_loss_kernels(
         }
     }
 
-    loss_finalize_from_per_sample_kernel<<<1, 1, 0, ctx->stream>>>(per_sample, weighted_sum, mean, batch);
-    if (check_kernel_launch("loss_finalize_from_per_sample_kernel launch") != 0) {
-        return -1;
+    if (finalize_loss != 0) {
+        loss_finalize_from_per_sample_kernel<<<1, 1, 0, ctx->stream>>>(per_sample, weighted_sum, mean, batch);
+        if (check_kernel_launch("loss_finalize_from_per_sample_kernel launch") != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -3172,7 +3178,7 @@ extern "C" int bulletou_cuda_cpp_nnue_forward_host(
     return rc == 0 ? ok() : rc;
 }
 
-extern "C" int bulletou_cuda_cpp_scalar_loss_device(
+extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
@@ -3183,7 +3189,8 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
     BulletOuCudaCppF32Buffer* per_sample,
     BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* weighted_sum,
-    BulletOuCudaCppF32Buffer* mean) {
+    BulletOuCudaCppF32Buffer* mean,
+    int finalize_loss) {
     if (validate_scalar_loss(batch, kind) != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outputs), batch, "outputs") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(targets), batch, "targets") != 0 ||
@@ -3206,11 +3213,39 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
             per_sample->ptr,
             mean_output_gradients->ptr,
             weighted_sum->ptr,
-            mean->ptr) != 0) {
+            mean->ptr,
+            finalize_loss) != 0) {
         return -1;
     }
 
     return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_scalar_loss_device(
+    BulletOuCudaCppContext* ctx,
+    int kind,
+    float output_inv_scale,
+    size_t batch,
+    const BulletOuCudaCppF32Buffer* outputs,
+    const BulletOuCudaCppF32Buffer* targets,
+    const BulletOuCudaCppF32Buffer* entry_weights,
+    BulletOuCudaCppF32Buffer* per_sample,
+    BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* weighted_sum,
+    BulletOuCudaCppF32Buffer* mean) {
+    return bulletou_cuda_cpp_scalar_loss_device_with_finalize(
+        ctx,
+        kind,
+        output_inv_scale,
+        batch,
+        outputs,
+        targets,
+        entry_weights,
+        per_sample,
+        mean_output_gradients,
+        weighted_sum,
+        mean,
+        1);
 }
 
 extern "C" int bulletou_cuda_cpp_scalar_loss_host(
@@ -3522,6 +3557,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l2b_gradients->ptr,
             l3w_gradients->ptr,
             l3b_gradients->ptr,
+            1,
             0) != 0) {
         return -1;
     }
@@ -3570,7 +3606,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     BulletOuCudaCppF32Buffer* l2w_gradients,
     BulletOuCudaCppF32Buffer* l2b_gradients,
     BulletOuCudaCppF32Buffer* l3w_gradients,
-    BulletOuCudaCppF32Buffer* l3b_gradients) {
+    BulletOuCudaCppF32Buffer* l3b_gradients,
+    int zero_parameter_gradients) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
     if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
@@ -3657,6 +3694,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
             l2b_gradients->ptr,
             l3w_gradients->ptr,
             l3b_gradients->ptr,
+            zero_parameter_gradients,
             1) != 0) {
         return -1;
     }

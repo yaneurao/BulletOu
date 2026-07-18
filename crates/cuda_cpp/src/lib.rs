@@ -1257,6 +1257,30 @@ pub fn scalar_loss_device_from_buffers(
     entry_weights: &F32Buffer,
     workspace: &ScalarLossWorkspace,
 ) -> Result<()> {
+    scalar_loss_device_from_buffers_with_finalize(
+        ctx,
+        kind,
+        output_inv_scale,
+        batch_size,
+        outputs,
+        targets,
+        entry_weights,
+        workspace,
+        true,
+    )
+}
+
+fn scalar_loss_device_from_buffers_with_finalize(
+    ctx: &Context,
+    kind: ScalarLossKind,
+    output_inv_scale: f32,
+    batch_size: usize,
+    outputs: &F32Buffer,
+    targets: &F32Buffer,
+    entry_weights: &F32Buffer,
+    workspace: &ScalarLossWorkspace,
+    finalize_loss: bool,
+) -> Result<()> {
     if batch_size == 0 {
         return Err(CudaCppError::message("scalar loss batch must not be empty"));
     }
@@ -1272,7 +1296,7 @@ pub fn scalar_loss_device_from_buffers(
     }
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
-        ffi::bulletou_cuda_cpp_scalar_loss_device(
+        ffi::bulletou_cuda_cpp_scalar_loss_device_with_finalize(
             ctx.as_ptr(),
             kind.as_ffi(),
             output_inv_scale,
@@ -1284,6 +1308,7 @@ pub fn scalar_loss_device_from_buffers(
             workspace.mean_output_gradients.as_ptr(),
             workspace.weighted_sum.as_ptr(),
             workspace.mean.as_ptr(),
+            i32::from(finalize_loss),
         )
     })
 }
@@ -1768,6 +1793,19 @@ impl SfnnBackwardWorkspace {
             l3b_gradients: self.l3b_gradients.download(ctx)?,
         })
     }
+
+    fn zero_parameter_gradients(&self, ctx: &Context) -> Result<()> {
+        self.l0w_gradients.fill(ctx, 0.0)?;
+        self.l0b_gradients.fill(ctx, 0.0)?;
+        self.l1w_gradients.fill(ctx, 0.0)?;
+        self.l1b_gradients.fill(ctx, 0.0)?;
+        self.l1fw_gradients.fill(ctx, 0.0)?;
+        self.l1fb_gradients.fill(ctx, 0.0)?;
+        self.l2w_gradients.fill(ctx, 0.0)?;
+        self.l2b_gradients.fill(ctx, 0.0)?;
+        self.l3w_gradients.fill(ctx, 0.0)?;
+        self.l3b_gradients.fill(ctx, 0.0)
+    }
 }
 
 pub fn sfnn_backward_device(
@@ -1879,6 +1917,7 @@ fn sfnn_backward_device_impl(
                 backward.l2b_gradients.as_ptr(),
                 backward.l3w_gradients.as_ptr(),
                 backward.l3b_gradients.as_ptr(),
+                0,
             )
         } else {
             ffi::bulletou_cuda_cpp_sfnn_backward_device(
@@ -2757,6 +2796,9 @@ impl SfnnTrainStepRunner {
         for _ in 0..2 {
             upload_slots.push(SfnnTrainStepUploadSlot::new(ctx, batch_size, max_active)?);
         }
+        let backward_workspace =
+            SfnnBackwardWorkspace::new(ctx, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
+        backward_workspace.zero_parameter_gradients(ctx)?;
         Ok(Self {
             shape,
             batch_size,
@@ -2774,10 +2816,7 @@ impl SfnnTrainStepRunner {
             optimizer_states,
             forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
             loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
-            backward_workspace: SfnnBackwardWorkspace::new(
-                ctx,
-                SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active),
-            )?,
+            backward_workspace,
             upload_slots,
             next_upload_slot: 0,
         })
@@ -2803,6 +2842,18 @@ impl SfnnTrainStepRunner {
         output_inv_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
     ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize(ctx, params, loss_kind, output_inv_scale, batch, true)
+    }
+
+    pub fn step_no_readback_with_loss_finalize(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+    ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
@@ -2819,7 +2870,7 @@ impl SfnnTrainStepRunner {
         self.entry_weights.upload(ctx, batch.entry_weights)?;
 
         sfnn_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
-        scalar_loss_device_from_buffers(
+        scalar_loss_device_from_buffers_with_finalize(
             ctx,
             loss_kind,
             output_inv_scale,
@@ -2828,6 +2879,7 @@ impl SfnnTrainStepRunner {
             &self.targets,
             &self.entry_weights,
             &self.loss_workspace,
+            finalize_loss,
         )?;
         sfnn_backward_train_device(
             ctx,
@@ -2848,6 +2900,27 @@ impl SfnnTrainStepRunner {
         loss_kind: ScalarLossKind,
         output_inv_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.step_pipelined_no_readback_with_loss_finalize(
+            ctx,
+            upload_ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            true,
+        )
+    }
+
+    pub fn step_pipelined_no_readback_with_loss_finalize(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
     ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
@@ -2871,7 +2944,7 @@ impl SfnnTrainStepRunner {
             let slot = &self.upload_slots[slot_idx];
             slot.wait_upload_on(ctx)?;
             sfnn_forward_device(ctx, &slot.device_batch, &self.weights, &self.forward_workspace)?;
-            scalar_loss_device_from_buffers(
+            scalar_loss_device_from_buffers_with_finalize(
                 ctx,
                 loss_kind,
                 output_inv_scale,
@@ -2880,6 +2953,7 @@ impl SfnnTrainStepRunner {
                 &slot.targets,
                 &slot.entry_weights,
                 &self.loss_workspace,
+                finalize_loss,
             )?;
             sfnn_backward_train_device(
                 ctx,
@@ -3540,7 +3614,7 @@ mod ffi {
             outb: *const f32,
             output: *mut f32,
         ) -> i32;
-        pub fn bulletou_cuda_cpp_scalar_loss_device(
+        pub fn bulletou_cuda_cpp_scalar_loss_device_with_finalize(
             ctx: *mut BulletOuCudaCppContext,
             kind: i32,
             output_inv_scale: f32,
@@ -3552,6 +3626,7 @@ mod ffi {
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             weighted_sum: *mut BulletOuCudaCppF32Buffer,
             mean: *mut BulletOuCudaCppF32Buffer,
+            finalize_loss: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_scalar_loss_host(
             device: i32,
@@ -3716,6 +3791,7 @@ mod ffi {
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+            zero_parameter_gradients: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,

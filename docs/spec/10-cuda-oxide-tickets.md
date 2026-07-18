@@ -790,6 +790,9 @@ the tickets in order and commit each completed slice.
 - Reduced direct-loop loss readback synchronization:
   - `--cuda-cpp-loss-readback-interval N` controls how often the direct C++/CUDA trainer synchronizes the compute stream to read/report loss;
   - the default `10` preserves the previous step1/every10/final reporting cadence, while `0` keeps only the final readback for throughput probes.
+- Reduced no-readback SFNN train-step work:
+  - `SfnnTrainStepRunner` now clears parameter-gradient buffers once when the runner is created, then the hot train-only backward entry skips the per-step parameter-gradient zero because the Ranger update path consumes and resets those buffers;
+  - scalar loss now has an internal `finalize_loss=false` path so SFNN direct steps that will not read/report loss still compute output gradients but skip the final weighted-sum/mean reduction kernel.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -822,7 +825,9 @@ the tickets in order and commit each completed slice.
   - With final-only loss readback, the same bs65k/50-step release smoke plus `--cuda-cpp-loss-readback-interval 0` reported `throughput=1120866 pos/s`.
   - After pairwise-L0 and zero-atomic skipping, bs65k/50-step final-only release smoke reported `throughput=1190496 pos/s`.
   - Backward profile moved from the post-fused baseline `38.249ms` through pairwise-L0 `37.705ms` to zero-skip `33.576ms` on the bs65k/3-profile-step probe; the rejected L1-small-output experiment regressed to `35.039ms` and was not kept.
+  - After one-time SFNN gradient zeroing, bs65k/50-step final-only release smoke reported `throughput=1205993 pos/s`.
+  - After skipping scalar-loss finalization on non-reported SFNN steps, bs131k/50-step final-only release smoke reported `throughput=1301058 pos/s`, and bs262k/20-step final-only release smoke reported `throughput=1320817 pos/s`.
 - Remaining BO-CUDA-034 work:
   - wire SFNN cuda-cpp direct output into the normal numbered checkpoint/log/validation semantics and auto-resume orchestration;
-  - add deeper backward profiling/optimisation; current C++ direct speed is improved but still below the tatara target (`~1.29M pos/s`);
+  - add deeper backward profiling/optimisation; large-batch C++ direct smokes now clear the tracked tatara speed target (`~1.29M pos/s`), but the full-teacher comparison still needs to prove this under the real validation recipe;
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.
