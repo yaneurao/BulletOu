@@ -793,6 +793,11 @@ the tickets in order and commit each completed slice.
 - Reduced no-readback SFNN train-step work:
   - `SfnnTrainStepRunner` now clears parameter-gradient buffers once when the runner is created, then the hot train-only backward entry skips the per-step parameter-gradient zero because the Ranger update path consumes and resets those buffers;
   - scalar loss now has an internal `finalize_loss=false` path so SFNN direct steps that will not read/report loss still compute output gradients but skip the final weighted-sum/mean reduction kernel.
+- Added final held-out validation for the SFNN C++ direct path:
+  - root `bulletou` now accepts `--test-teacher` for `--backend cuda-cpp --eval-type SFNN_HALFKA2` and keeps rejecting it for the unsupported C++ direct HalfKP validation path;
+  - added root `--test-sample random|sequential` so the C++ direct path can use the same sequential yamaoka PSV subset as the tatara/cuda-oxide SFNN parity probes;
+  - the final C++ direct validation reads the trained weights back, folds optional `l1fw/l1fb` into the stacked L1 weights/biases for the CPU fast SFNN forward, evaluates the cached yamaoka positions, and prints `test_value_accuracy` / `test_value_loss`;
+  - root `--backend cuda-oxide` now forwards `--test-sample` to the child trainer so the same CLI spelling works across both experimental backends.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -827,7 +832,12 @@ the tickets in order and commit each completed slice.
   - Backward profile moved from the post-fused baseline `38.249ms` through pairwise-L0 `37.705ms` to zero-skip `33.576ms` on the bs65k/3-profile-step probe; the rejected L1-small-output experiment regressed to `35.039ms` and was not kept.
   - After one-time SFNN gradient zeroing, bs65k/50-step final-only release smoke reported `throughput=1205993 pos/s`.
   - After skipping scalar-loss finalization on non-reported SFNN steps, bs131k/50-step final-only release smoke reported `throughput=1301058 pos/s`, and bs262k/20-step final-only release smoke reported `throughput=1320817 pos/s`.
+  - Final-validation wiring checks passed:
+    `cargo check --features cuda-cpp-backend --example bulletou`,
+    `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` (22 cuda-cpp tests), and
+    `cargo test --example bulletou cuda_oxide_backend_accepts_sfnn_halfka2_direct_steps -- --nocapture`.
+  - Real-data validation smoke on Windows used training `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` and held-out `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 128 --test-sample sequential`; it printed `test_value_accuracy=0.5000000`, `test_value_loss=0.17757529`.
 - Remaining BO-CUDA-034 work:
-  - wire SFNN cuda-cpp direct output into the normal numbered checkpoint/log/validation semantics and auto-resume orchestration;
+  - wire SFNN cuda-cpp direct output and final validation into the normal numbered checkpoint/log semantics and auto-resume orchestration;
   - add deeper backward profiling/optimisation; large-batch C++ direct smokes now clear the tracked tatara speed target (`~1.29M pos/s`), but the full-teacher comparison still needs to prove this under the real validation recipe;
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.

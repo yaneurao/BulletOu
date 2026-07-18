@@ -71,7 +71,10 @@ use bulletou_lib::{
         schedule::{TrainingSchedule, TrainingSteps, wdl},
         settings::LocalSettings,
     },
-    validate::{ValidationLossKind, compute_sign_accuracy_with_loss, read_random_teacher_positions},
+    validate::{
+        ValidationLossKind, compute_sign_accuracy_with_loss, read_random_teacher_positions,
+        read_teacher_positions_prefix,
+    },
     value::{
         ValueTrainer, ValueTrainerBuilder,
         loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
@@ -1031,6 +1034,22 @@ impl PlateauMonitor {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "lowercase")]
+enum TestSampleMode {
+    Random,
+    Sequential,
+}
+
+impl TestSampleMode {
+    fn cli_name(self) -> &'static str {
+        match self {
+            TestSampleMode::Random => "random",
+            TestSampleMode::Sequential => "sequential",
+        }
+    }
+}
+
 fn plateau_action_retries_teacher(action: PlateauAction) -> bool {
     matches!(action, PlateauAction::Reduced { .. } | PlateauAction::ScheduledFinal { .. })
 }
@@ -1639,10 +1658,10 @@ struct Args {
     #[arg(long, default_value = "1024")]
     activation_stats_positions: usize,
 
-    /// Held-out test set (.hcpe only) for sign-agreement validation
+    /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
-    /// each save event (= every `--save-rate` superbatches): random-
-    /// picks `--test-positions` positions from this file, runs them
+    /// each save event (= every `--save-rate` superbatches): samples
+    /// `--test-positions` positions from this file, runs them
     /// through the model, and emits per-superbatch
     /// `test_value_accuracy` and `test_value_loss` columns into
     /// `learn.log`. Positions whose teacher score is 0 (draw stamp)
@@ -1658,6 +1677,12 @@ struct Args {
     /// event.
     #[arg(long, default_value = "100000")]
     test_positions: usize,
+
+    /// How to choose validation positions from `--test-teacher`.
+    /// `sequential` reads the first `--test-positions` fixed records and
+    /// is useful for byte-for-byte parity against tatara / cuda-oxide.
+    #[arg(long, value_enum, default_value = "random")]
+    test_sample: TestSampleMode,
 
     /// GPU batch size for the validation forward pass. Larger is faster
     /// but uses more VRAM. Independent of `--batch-size` (which
@@ -1829,17 +1854,21 @@ impl Args {
                 "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
             );
         }
+        if self.test_teacher.is_some() && eval_type != EvalType::SfnnHalfka2 {
+            return Err(
+                "--backend cuda-cpp direct final validation is currently wired only for SFNN_HALFKA2".to_string()
+            );
+        }
         if self.superbatches.is_some()
             || self.max_epochs.is_some()
             || self.lr_schedule != LrScheduleKind::Step
             || self.lr_step_gamma.is_some()
             || self.lr_step_positions.is_some()
             || self.save_rate != 1
-            || self.test_teacher.is_some()
             || self.resume
             || self.no_resume
         {
-            return Err("--backend cuda-cpp direct trainer does not yet honor production schedule, validation, or resume flags; \
+            return Err("--backend cuda-cpp direct trainer does not yet honor production schedule or resume flags; \
                  use --cuda-cpp-train-steps only"
                 .to_string());
         }
@@ -3465,6 +3494,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     }
     let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+    let final_test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
     let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
     write_cuda_cpp_sfnn_halfka2_direct_outputs(
@@ -3475,8 +3505,205 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         completed_steps,
     )?;
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
+    if let Some(metrics) = final_test_metrics {
+        eprintln!(
+            "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+            metrics.accuracy, metrics.loss
+        );
+    }
 
     Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_halfka2_final_validation(
+    args: &Args,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+) -> Result<Option<TestMetrics>, String> {
+    let Some(cache) = TestPositionsCache::try_load(args) else {
+        return Ok(None);
+    };
+    if cache.positions.is_empty() {
+        eprintln!("  WARN: --test-teacher yielded no positions; cuda-cpp SFNN final validation skipped");
+        return Ok(None);
+    }
+
+    let validation_weights = cuda_cpp_sfnn_weights_for_cpu_validation(shape, weights)?;
+    let batch_size = args.test_batch_size.max(1);
+    let mut outputs = Vec::with_capacity(cache.positions.len());
+    let started = std::time::Instant::now();
+    for positions in cache.positions.chunks(batch_size) {
+        let batch = build_sfnn_halfka2_validation_fast_batch(positions)?;
+        let mut chunk_outputs = validation_weights.forward_batch(&batch).map_err(|e| e.to_string())?;
+        outputs.append(&mut chunk_outputs);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    eprintln!(
+        "  cuda-cpp SFNN final validation forward = ok: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        outputs.len(),
+        batch_size
+    );
+
+    Ok(Some(run_one_test_pass(&cache, args, outputs)))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_weights_for_cpu_validation(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+) -> Result<bulletou_lib::value::SfnnForwardOwnedWeights, String> {
+    use bulletou_lib::value::{
+        SfnnForwardOwnedWeights as CpuSfnnForwardOwnedWeights, SfnnForwardShape as CpuSfnnForwardShape,
+    };
+
+    let cpu_shape = CpuSfnnForwardShape {
+        input_size: shape.input_size,
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+    };
+    let mut l1w = weights.l1w.clone();
+    let mut l1b = weights.l1b.clone();
+    fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+        shape,
+        &mut l1w,
+        &mut l1b,
+        weights.l1fw.as_deref(),
+        weights.l1fb.as_deref(),
+    )?;
+
+    let cpu_weights = CpuSfnnForwardOwnedWeights {
+        shape: cpu_shape,
+        l0w: weights.l0w.clone(),
+        l0b: weights.l0b.clone(),
+        l1w,
+        l1b,
+        l2w: weights.l2w.clone(),
+        l2b: weights.l2b.clone(),
+        l3w: weights.l3w.clone(),
+        l3b: weights.l3b.clone(),
+    };
+    cpu_weights.validate().map_err(|e| e.to_string())?;
+    Ok(cpu_weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l1w: &mut [f32],
+    l1b: &mut [f32],
+    l1fw: Option<&[f32]>,
+    l1fb: Option<&[f32]>,
+) -> Result<(), String> {
+    let l1_out = shape.l1_out();
+    let expected_l1w = shape.num_stacks * l1_out * shape.ft_size;
+    let expected_l1b = shape.num_stacks * l1_out;
+    if l1w.len() != expected_l1w {
+        return Err(format!("SFNN l1w length mismatch: got {}, expected {expected_l1w}", l1w.len()));
+    }
+    if l1b.len() != expected_l1b {
+        return Err(format!("SFNN l1b length mismatch: got {}, expected {expected_l1b}", l1b.len()));
+    }
+    match (l1fw, l1fb) {
+        (Some(shared_w), Some(shared_b)) => {
+            let expected_l1fw = shape.ft_size * l1_out;
+            if shared_w.len() != expected_l1fw {
+                return Err(format!("SFNN l1fw length mismatch: got {}, expected {expected_l1fw}", shared_w.len()));
+            }
+            if shared_b.len() != l1_out {
+                return Err(format!("SFNN l1fb length mismatch: got {}, expected {l1_out}", shared_b.len()));
+            }
+            let stack_stride = l1_out * shape.ft_size;
+            for stack in 0..shape.num_stacks {
+                let bias_base = stack * l1_out;
+                for out_col in 0..l1_out {
+                    l1b[bias_base + out_col] += shared_b[out_col];
+                }
+
+                let weight_base = stack * stack_stride;
+                for out_col in 0..l1_out {
+                    let row_base = weight_base + out_col * shape.ft_size;
+                    for in_col in 0..shape.ft_size {
+                        l1w[row_base + in_col] += shared_w[in_col * l1_out + out_col];
+                    }
+                }
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("cuda-cpp SFNN weights have partial l1f state".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_sfnn_halfka2_validation_fast_batch(
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+) -> Result<bulletou_lib::value::FastBatchHost, String> {
+    use bulletou_lib::value::{FastBatchHost, FastBatchLayout};
+
+    let batch_size = positions.len();
+    if batch_size == 0 {
+        return Err("SFNN validation batch must not be empty".to_string());
+    }
+    let max_active = ShogiHalfKa2.max_active();
+    let input_size = ShogiHalfKa2.num_inputs();
+    let sparse_len =
+        batch_size.checked_mul(max_active).ok_or_else(|| "SFNN validation sparse batch length overflow".to_string())?;
+    let mut stm = vec![-1_i32; sparse_len];
+    let mut nstm = vec![-1_i32; sparse_len];
+    let mut buckets = vec![0_i32; batch_size];
+    for (sample, pos) in positions.iter().enumerate() {
+        let mut j_stm = 0usize;
+        let mut j_nstm = 0usize;
+        let sparse_offset = sample * max_active;
+        let mut error = None;
+        ShogiHalfKa2.map_features_split(pos, |our_opt, opp_opt| {
+            if let Some(our) = our_opt {
+                if our >= input_size {
+                    error = Some(format!("STM feature index {our} exceeded input size {input_size}"));
+                    return;
+                }
+                if j_stm >= max_active {
+                    error = Some(format!("STM active feature count exceeded max_active {max_active}"));
+                    return;
+                }
+                stm[sparse_offset + j_stm] = our as i32;
+                j_stm += 1;
+            }
+            if let Some(opp) = opp_opt {
+                if opp >= input_size {
+                    error = Some(format!("NSTM feature index {opp} exceeded input size {input_size}"));
+                    return;
+                }
+                if j_nstm >= max_active {
+                    error = Some(format!("NSTM active feature count exceeded max_active {max_active}"));
+                    return;
+                }
+                nstm[sparse_offset + j_nstm] = opp as i32;
+                j_nstm += 1;
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        buckets[sample] = i32::from(ShogiLayerStackBucket9::KingRank9.bucket(pos));
+    }
+
+    let batch = FastBatchHost {
+        layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
+        stm,
+        nstm,
+        buckets,
+        targets: vec![0.0; batch_size],
+        weights: vec![1.0; batch_size],
+        hand_count: None,
+    };
+    batch.validate()?;
+    Ok(batch)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4862,6 +5089,8 @@ fn cuda_oxide_cargo_run_args_with_child(args: &Args, child_run: &CudaOxideChildR
         cargo_args.push(args.test_batch_size.to_string());
         cargo_args.push("--test-seed".to_string());
         cargo_args.push(args.test_seed.to_string());
+        cargo_args.push("--test-sample".to_string());
+        cargo_args.push(args.test_sample.cli_name().to_string());
     }
 
     if let Some(lr) = child_run.lr {
@@ -6731,10 +6960,21 @@ impl TestPositionsCache {
             }
         };
         eprintln!(
-            "  loading {} test positions from {} (seed={}) for per-superbatch validation...",
-            args.test_positions, path, args.test_seed
+            "  loading {} test positions from {} (sample={}, seed={}) for validation...",
+            args.test_positions,
+            path,
+            args.test_sample.cli_name(),
+            if args.test_sample == TestSampleMode::Random {
+                args.test_seed.to_string()
+            } else {
+                "-".to_string()
+            }
         );
-        match read_random_teacher_positions(&path, args.test_positions, args.test_seed) {
+        let loaded = match args.test_sample {
+            TestSampleMode::Random => read_random_teacher_positions(&path, args.test_positions, args.test_seed),
+            TestSampleMode::Sequential => read_teacher_positions_prefix(&path, args.test_positions),
+        };
+        match loaded {
             Ok(positions) => {
                 let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
                 let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
@@ -9286,6 +9526,63 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_accepts_sfnn_final_validation_teacher() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+            "--test-positions",
+            "65536",
+            "--test-sample",
+            "sequential",
+        ])
+        .unwrap();
+
+        assert_eq!(args.test_sample, TestSampleMode::Sequential);
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_halfkp_final_validation_teacher() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "SFNN_HALFKA2" } else { "cuda-cpp-backend" }));
+    }
+
+    #[test]
     fn cuda_cpp_backend_rejects_sfnn_default_arch() {
         use clap::Parser as _;
 
@@ -9768,6 +10065,38 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_validation_l1f_fold_adds_shared_l1_to_each_stack() {
+        let shape =
+            bulletou_cuda_cpp::SfnnForwardShape { input_size: 4, ft_size: 3, l1_hidden: 1, l2_size: 2, num_stacks: 2 };
+        let l1_out = shape.l1_out();
+        let mut l1w = vec![
+            1.0, 2.0, 3.0, // stack0 out0
+            4.0, 5.0, 6.0, // stack0 out1
+            7.0, 8.0, 9.0, // stack1 out0
+            10.0, 11.0, 12.0, // stack1 out1
+        ];
+        let mut l1b = vec![0.5, 1.5, 2.5, 3.5];
+        // Layout: shared_w[in_col * l1_out + out_col].
+        let l1fw = vec![0.1, 0.2, 1.0, 2.0, 10.0, 20.0];
+        let l1fb = vec![100.0, 200.0];
+
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(shape, &mut l1w, &mut l1b, Some(&l1fw), Some(&l1fb)).unwrap();
+
+        assert_eq!(l1_out, 2);
+        assert_eq!(l1b, vec![100.5, 201.5, 102.5, 203.5]);
+        assert_eq!(
+            l1w,
+            vec![
+                1.1, 3.0, 13.0, // stack0 out0
+                4.2, 7.0, 26.0, // stack0 out1
+                7.1, 9.0, 19.0, // stack1 out0
+                10.2, 13.0, 32.0, // stack1 out1
+            ]
+        );
+    }
+
     #[test]
     fn cuda_oxide_backend_accepts_explicit_halfkp_direct_steps() {
         use clap::Parser as _;
@@ -9826,6 +10155,8 @@ mod tests {
             "1",
             "--test-teacher",
             "/dev/null",
+            "--test-sample",
+            "sequential",
         ])
         .unwrap();
 
@@ -9834,6 +10165,8 @@ mod tests {
         let cargo_args = cuda_oxide_cargo_run_args_with_child(&args, &child_run).unwrap();
         assert!(cargo_args.iter().any(|arg| arg == "--sfnn-teacher-train"));
         assert!(cargo_args.iter().any(|arg| arg == "--test-teacher"));
+        let test_sample_idx = cargo_args.iter().position(|arg| arg == "--test-sample").unwrap();
+        assert_eq!(cargo_args.get(test_sample_idx + 1).map(String::as_str), Some("sequential"));
         let save_rate_idx = cargo_args.iter().position(|arg| arg == "--save-rate").unwrap();
         assert_eq!(cargo_args.get(save_rate_idx + 1).map(String::as_str), Some("1"));
     }
