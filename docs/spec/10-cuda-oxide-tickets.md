@@ -709,6 +709,9 @@ the tickets in order and commit each completed slice.
 - Reduced Ranger update overhead:
   - C++/CUDA RAdam/Ranger update now uses a `float4` kernel whenever the parameter group length is divisible by four;
   - scalar update remains as the fallback for groups such as `outb`.
+- Reduced L0 bias backward contention:
+  - L0 weight gradients still use the correctness-first sparse `atomicAdd` scatter;
+  - L0 bias gradients now use a row-wise reduction kernel instead of contended atomics into 256 bias entries.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -732,6 +735,7 @@ the tickets in order and commit each completed slice.
   - after vectorising the C++/CUDA Ranger update, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed.
   - vectorized update profile smoke reported average profiled GPU time: upload `0.427ms`, forward `0.332ms`, loss `0.143ms`, backward `1.703ms`, Ranger update `1.215ms`, total `3.821ms`.
   - unprofiled 100-step release smoke after vectorized update reported `throughput=897088 pos/s` for `--cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8 --output target\cuda-cpp-vec4-100`.
+  - after moving L0 bias backward off atomics, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed, `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed, and the unprofiled 100-step release smoke reported `throughput=910234 pos/s`.
 - Remaining BO-CUDA-033 work:
   - wire the direct full-state replay into normal checkpoint/log/validation semantics and `--resume`/`--no-resume` orchestration;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;

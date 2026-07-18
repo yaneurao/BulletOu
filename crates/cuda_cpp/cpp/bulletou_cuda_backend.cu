@@ -640,38 +640,61 @@ __global__ void nnue_l0_sparse_backward_kernel(
     const float* stm_gradients,
     const float* nstm_gradients,
     float* l0w_gradients,
-    float* l0b_gradients,
     size_t batch,
     size_t max_active,
     size_t input_size,
     size_t l1) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t scatter_len = batch * max_active * l1;
-
-    if (tid < scatter_len) {
-        size_t row = tid % l1;
-        size_t sparse_entry = tid / l1;
-        size_t sample = sparse_entry / max_active;
-        size_t slot = sparse_entry - sample * max_active;
-        size_t sparse_base = sample * max_active + slot;
-
-        int stm_feature = stm_indices[sparse_base];
-        if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
-            size_t weight_idx = static_cast<size_t>(stm_feature) * l1 + row;
-            atomicAdd(&l0w_gradients[weight_idx], stm_gradients[sample * l1 + row]);
-        }
-
-        int nstm_feature = nstm_indices[sparse_base];
-        if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
-            size_t weight_idx = static_cast<size_t>(nstm_feature) * l1 + row;
-            atomicAdd(&l0w_gradients[weight_idx], nstm_gradients[sample * l1 + row]);
-        }
+    if (tid >= scatter_len) {
+        return;
     }
 
-    if (tid < batch * l1) {
-        size_t row = tid % l1;
-        size_t sample = tid / l1;
-        atomicAdd(&l0b_gradients[row], stm_gradients[sample * l1 + row] + nstm_gradients[sample * l1 + row]);
+    size_t row = tid % l1;
+    size_t sparse_entry = tid / l1;
+    size_t sample = sparse_entry / max_active;
+    size_t slot = sparse_entry - sample * max_active;
+    size_t sparse_base = sample * max_active + slot;
+
+    int stm_feature = stm_indices[sparse_base];
+    if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+        size_t weight_idx = static_cast<size_t>(stm_feature) * l1 + row;
+        atomicAdd(&l0w_gradients[weight_idx], stm_gradients[sample * l1 + row]);
+    }
+
+    int nstm_feature = nstm_indices[sparse_base];
+    if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+        size_t weight_idx = static_cast<size_t>(nstm_feature) * l1 + row;
+        atomicAdd(&l0w_gradients[weight_idx], nstm_gradients[sample * l1 + row]);
+    }
+}
+
+__global__ void nnue_l0_bias_backward_kernel(
+    const float* stm_gradients,
+    const float* nstm_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t l1) {
+    constexpr int threads = 256;
+    __shared__ float partial[threads];
+
+    size_t row = blockIdx.x;
+    size_t tid = threadIdx.x;
+    float sum = 0.0f;
+    for (size_t sample = tid; sample < batch; sample += threads) {
+        sum += stm_gradients[sample * l1 + row] + nstm_gradients[sample * l1 + row];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+
+    for (int stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < static_cast<size_t>(stride)) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        l0b_gradients[row] = partial[0];
     }
 }
 
@@ -1127,7 +1150,7 @@ int launch_nnue_backward_kernels(
         }
     }
 
-    size_t l0_scatter_threads = std::max(batch * max_active * l1, batch * l1);
+    size_t l0_scatter_threads = batch * max_active * l1;
     if (block_count_1d(l0_scatter_threads, threads, &blocks, "nnue_l0_sparse_backward_kernel") != 0) {
         return -1;
     }
@@ -1137,12 +1160,17 @@ int launch_nnue_backward_kernels(
         stm_l0_gradients,
         nstm_l0_gradients,
         l0w_gradients,
-        l0b_gradients,
         batch,
         max_active,
         input_size,
         l1);
     if (check_kernel_launch("nnue_l0_sparse_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    nnue_l0_bias_backward_kernel<<<static_cast<int>(l1), threads, 0, ctx->stream>>>(
+        stm_l0_gradients, nstm_l0_gradients, l0b_gradients, batch, l1);
+    if (check_kernel_launch("nnue_l0_bias_backward_kernel launch") != 0) {
         return -1;
     }
 
