@@ -40,9 +40,10 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-030 | done | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, the Windows-native C++/CUDA direct path now exceeds tatara in train throughput, held-out loss, and held-out accuracy |
 | BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
-| BO-CUDA-033 | doing | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
+| BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | todo | cuda-cpp production schedule parity | teach the Windows-native direct backend to honor normal production `--superbatches` / `--max-epochs` / `--save-rate` / LR schedule semantics instead of requiring manual `--cuda-cpp-train-steps` sizing |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | optimise the remaining HalfKP sparse L0 backward/update hot spots and first-step library warmup so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
 
 ## Notes
 
@@ -687,14 +688,15 @@ the tickets in order and commit each completed slice.
   - the standalone smoke checks one tiny train step by comparing the runner's updated weights against applying the existing host Ranger update to the CPU reference gradients.
 - Connected the runner to the BulletOu root CLI for a Windows-native direct NNUE HalfKP path:
   - `examples/bulletou --backend cuda-cpp --cuda-cpp-train-steps N --eval-type NNUE_HALFKP` now streams real teacher batches through the shared fixed-layout `HalfkpTeacherBatchConfig`;
-  - the direct path is intentionally limited to Ranger and constant-LR direct steps; production schedule flags and HalfKP final validation remain follow-up work;
+  - the direct path is intentionally limited to Ranger and constant-LR direct steps; production schedule flags remain follow-up work under BO-CUDA-035;
   - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's `device-cuda` runtime just to create the model.
 - Reduced direct-step synchronization overhead:
   - `NnueTrainStepRunner::step_no_readback` runs upload -> forward -> loss -> backward -> Ranger update without downloading the loss every batch;
   - the compatibility `step` method remains readback-producing, while the direct CLI now samples loss only at step 1, every 10 steps, and the final step.
 - Moved the direct C++/CUDA HalfKP scratch path onto the tatara/cuda-oxide factorized FT layout:
   - the input shape is now `HALFKP_PIECE_INPUTS + ShogiHalfKP` (virtual piece rows first, normal HalfKP rows offset by 1548);
-  - `HalfkpTeacherBatchConfig::ft_factorize = true`, so each normal active HalfKP feature also emits its piece-input virtual row;
+  - C++/CUDA sparse L0 forward/backward now expands each normal HalfKP feature into both its offset base row and its virtual piece row when the factorized input size is selected;
+  - `HalfkpTeacherBatchConfig::ft_factorize = false` and `max_active = ShogiHalfKP.max_active()`, so the host streams normal HalfKP indices and avoids duplicating factorized rows in the teacher batch;
   - initial weights match the cuda-oxide tatara-simple recipe: virtual L0 rows zero, base L0/bias/dense/output tensors initialized by deterministic `TataraXorShift` uniform values in `[-0.01, 0.01]`.
 - Added direct-output writing:
   - after `--cuda-cpp-train-steps`, the runner reads trained weights and Ranger optimizer buffers back and writes `<output>/cuda-cpp-direct/nn.bin` plus `<output>/cuda-cpp-direct/weights.bin`;
@@ -718,6 +720,10 @@ the tickets in order and commit each completed slice.
 - Reduced L0 bias backward contention:
   - L0 weight gradients still use the correctness-first sparse `atomicAdd` scatter;
   - L0 bias gradients now use a row-wise reduction kernel instead of contended atomics into 256 bias entries.
+- Moved dense hidden-layer CReLU backward onto cuBLAS:
+  - the C++/CUDA context owns a cuBLAS handle on the same stream and links `cublas` from the CUDA toolkit;
+  - L1/L2 dense input-gradient and weight-gradient phases now use `cublasSgemm`, with small custom kernels only for CReLU pre-gradient and bias-gradient reduction;
+  - this cuts the profiled HalfKP backward hot section roughly in half on RTX 4090 after the one-time cuBLAS warmup.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -750,16 +756,30 @@ the tickets in order and commit each completed slice.
   - if `--resume` is forced while the teacher spec differs from the latest checkpoint, weights/optimizer state still resume but the dataloader starts from the new teacher's beginning, matching the normal BulletOu resume rule;
   - fixed-record PSV teacher batches now map `TeacherDataloaderPos.byte_offset` back to a batch index for both HalfKP and SFNN, while rejecting nonzero plies, record-misaligned offsets, and batch-misaligned offsets;
   - direct `learn.log` / `summary-learn.log` rows now keep `positions` cumulative across resumed direct runs.
+- Added HalfKP final validation for the Windows-native direct path:
+  - root `bulletou` now accepts `--test-teacher` for `--backend cuda-cpp --eval-type NNUE_HALFKP`;
+  - validation folds factorized L0 virtual rows into normal HalfKP rows, runs the existing CPU fast NNUE validator, and writes `test_value_accuracy` / `test_value_loss` into numbered `learn.log` and `summary-learn.log`;
+  - benchmark and smoke validation use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` as the held-out set.
 - Validation for direct auto-resume:
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test -p bulletou_lib psv_resume_offset_maps_to_batch_index -- --nocapture` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (26 cuda-cpp tests);
   - HalfKP auto-resume smoke on `target\cuda-cpp-numbered-halfkp-smoke` loaded `0002/state.bin`, printed `initial completed optimizer steps = 2`, ran `optimizer_step=3`, wrote `0003/dataloader_pos.txt = 7296,0`, and the corrected `0003/learn.log` row used cumulative `positions=128`.
-- Remaining BO-CUDA-033 work:
-  - wire HalfKP direct validation into the C++/CUDA path if it is still needed for standard-NNUE comparisons;
-  - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
-  - optimise the correctness-first L0 sparse backward atomic-scatter and Ranger update path, which still dominate the CUDA profile after removing the direct-path zero kernel;
-  - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
+- Validation after the final HalfKP C++/CUDA rewrite:
+  - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (27 cuda-cpp tests);
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and reported `result : ok` on `NVIDIA GeForce RTX 4090`;
+  - one-step HalfKP validation smoke using `--test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 128` wrote held-out metrics (`test_value_accuracy=0.5000000`, `test_value_loss=0.17730953`) to the numbered logs;
+  - profiled HalfKP bs16k after implicit factorized rows and cuBLAS: post-warmup steps reported upload `0.682-0.987ms`, forward `0.720-0.742ms`, loss `0.306-0.309ms`, backward `3.098-3.108ms`, update `1.146-1.155ms`, total `5.955-6.299ms`; the first measured step includes one-time cuBLAS warmup and is not representative of steady state.
+- BO-CUDA-033 4M comparison result:
+  - command shape: `--backend cuda-cpp --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --cuda-cpp-train-steps 256 --batch-size 16384 --threads 10 --cuda-cpp-loss-readback-interval 0 --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --test-batch-size 8192`;
+  - three clean bs16k/lr0.024 runs reported `2,651,604`, `2,645,789`, and `2,664,118` positions/sec, with held-out accuracy/loss `0.6733398/0.05194952`, `0.6632080/0.05239367`, and `0.6640625/0.05355105`;
+  - mean result: `2,653,837` positions/sec, `test_value_accuracy=0.6668701`, `test_value_loss=0.0526314`;
+  - BO-CUDA-029 tatara idle reference mean was `2,495,146` positions/sec, `test_value_accuracy=0.663567`, `test_value_loss=0.053232`, so the Windows-native C++/CUDA HalfKP path clears the tracked tatara speed/quality target without WSL.
+- Result:
+  - BO-CUDA-033 is complete for the requested Windows-native HalfKP C++/CUDA direct trainer and tatara-beating 4M comparison.
+  - Remaining ergonomics belong to BO-CUDA-035, and deeper HalfKP micro-optimisation against the previous cuda-oxide throughput ceiling belongs to BO-CUDA-036.
 
 ### BO-CUDA-034
 
@@ -813,7 +833,7 @@ the tickets in order and commit each completed slice.
   - `SfnnTrainStepRunner` now clears parameter-gradient buffers once when the runner is created, then the hot train-only backward entry skips the per-step parameter-gradient zero because the Ranger update path consumes and resets those buffers;
   - scalar loss now has an internal `finalize_loss=false` path so SFNN direct steps that will not read/report loss still compute output gradients but skip the final weighted-sum/mean reduction kernel.
 - Added final held-out validation for the SFNN C++ direct path:
-  - root `bulletou` now accepts `--test-teacher` for `--backend cuda-cpp --eval-type SFNN_HALFKA2` and keeps rejecting it for the unsupported C++ direct HalfKP validation path;
+  - root `bulletou` now accepts `--test-teacher` for `--backend cuda-cpp --eval-type SFNN_HALFKA2`; HalfKP validation support is covered by BO-CUDA-033;
   - added root `--test-sample random|sequential` so the C++ direct path can use the same sequential yamaoka PSV subset as the tatara/cuda-oxide SFNN parity probes;
   - the final C++ direct validation reads the trained weights back, folds optional `l1fw/l1fb` into the stacked L1 weights/biases for the CPU fast SFNN forward, evaluates the cached yamaoka positions, and prints `test_value_accuracy` / `test_value_loss`;
   - root `--backend cuda-oxide` now forwards `--test-sample` to the child trainer so the same CLI spelling works across both experimental backends.

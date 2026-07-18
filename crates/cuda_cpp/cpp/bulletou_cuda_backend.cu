@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,7 @@ thread_local std::string g_last_error;
 struct BulletOuCudaCppContext {
     int device = 0;
     cudaStream_t stream = nullptr;
+    cublasHandle_t blas = nullptr;
 };
 
 struct BulletOuCudaCppF32Buffer {
@@ -65,10 +67,47 @@ int fail(const char* context, cudaError_t status) {
     return static_cast<int>(status) == 0 ? -1 : static_cast<int>(status);
 }
 
+const char* cublas_status_string(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS:
+            return "success";
+        case CUBLAS_STATUS_NOT_INITIALIZED:
+            return "not initialized";
+        case CUBLAS_STATUS_ALLOC_FAILED:
+            return "alloc failed";
+        case CUBLAS_STATUS_INVALID_VALUE:
+            return "invalid value";
+        case CUBLAS_STATUS_ARCH_MISMATCH:
+            return "arch mismatch";
+        case CUBLAS_STATUS_MAPPING_ERROR:
+            return "mapping error";
+        case CUBLAS_STATUS_EXECUTION_FAILED:
+            return "execution failed";
+        case CUBLAS_STATUS_INTERNAL_ERROR:
+            return "internal error";
+        case CUBLAS_STATUS_NOT_SUPPORTED:
+            return "not supported";
+        case CUBLAS_STATUS_LICENSE_ERROR:
+            return "license error";
+        default:
+            return "unknown";
+    }
+}
+
+int fail_blas(const char* context, cublasStatus_t status) {
+    char buffer[512];
+    std::snprintf(buffer, sizeof(buffer), "%s: cuBLAS %s (%d)", context, cublas_status_string(status), static_cast<int>(status));
+    set_error_message(buffer);
+    return static_cast<int>(status) == 0 ? -1 : static_cast<int>(status);
+}
+
 int fail_message(const char* message) {
     set_error_message(message);
     return -1;
 }
+
+int check_kernel_launch(const char* launch_label);
+int block_count_1d(size_t len, int threads, int* blocks, const char* label);
 
 template <typename T>
 int checked_malloc(T** ptr, size_t len, const char* label) {
@@ -322,6 +361,19 @@ __device__ float crelu(float value) {
     return fminf(fmaxf(value, 0.0f), 1.0f);
 }
 
+constexpr size_t NNUE_HALFKP_BASE_INPUT_SIZE = 125388;
+constexpr size_t NNUE_HALFKP_PIECE_INPUTS = 1548;
+constexpr size_t NNUE_HALFKP_FACTORIZED_INPUT_SIZE = NNUE_HALFKP_BASE_INPUT_SIZE + NNUE_HALFKP_PIECE_INPUTS;
+
+__device__ bool nnue_halfkp_factorized_feature(size_t feature, size_t input_size, size_t* out_base_feature, size_t* out_virtual_feature) {
+    if (input_size == NNUE_HALFKP_FACTORIZED_INPUT_SIZE && feature < NNUE_HALFKP_BASE_INPUT_SIZE) {
+        *out_base_feature = NNUE_HALFKP_PIECE_INPUTS + feature;
+        *out_virtual_feature = feature % NNUE_HALFKP_PIECE_INPUTS;
+        return true;
+    }
+    return false;
+}
+
 __global__ void nnue_sparse_l0_crelu_kernel(
     const int* indices,
     const float* weights,
@@ -344,8 +396,14 @@ __global__ void nnue_sparse_l0_crelu_kernel(
     for (size_t slot = 0; slot < max_active; ++slot) {
         int feature = indices[sparse_base + slot];
         if (feature >= 0 && static_cast<size_t>(feature) < input_size) {
-            size_t weight_base = static_cast<size_t>(feature) * rows;
-            sum += weights[weight_base + row];
+            size_t base_feature = 0;
+            size_t virtual_feature = 0;
+            if (nnue_halfkp_factorized_feature(static_cast<size_t>(feature), input_size, &base_feature, &virtual_feature)) {
+                sum += weights[base_feature * rows + row] + weights[virtual_feature * rows + row];
+            } else {
+                size_t weight_base = static_cast<size_t>(feature) * rows;
+                sum += weights[weight_base + row];
+            }
         }
     }
     output[tid] = crelu(sum);
@@ -1262,6 +1320,121 @@ __global__ void dense_crelu_backward_kernel(
     }
 }
 
+__global__ void dense_crelu_pre_gradient_kernel(
+    const float* activations,
+    float* gradients,
+    size_t batch,
+    size_t output_dim) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t len = batch * output_dim;
+    if (tid >= len) {
+        return;
+    }
+    gradients[tid] = crelu_pre_gradient_from_value(activations[tid], gradients[tid]);
+}
+
+__global__ void dense_bias_sum_kernel(
+    const float* gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t output_dim) {
+    constexpr int threads = 256;
+    __shared__ float partial[threads];
+
+    size_t out_col = blockIdx.x;
+    size_t tid = threadIdx.x;
+    float sum = 0.0f;
+    for (size_t sample = tid; sample < batch; sample += threads) {
+        sum += gradients[sample * output_dim + out_col];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+
+    for (int stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < static_cast<size_t>(stride)) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        bias_gradients[out_col] = partial[0];
+    }
+}
+
+int launch_dense_crelu_backward_gemm(
+    BulletOuCudaCppContext* ctx,
+    const char* label,
+    const float* inputs,
+    const float* activations,
+    float* output_gradients,
+    const float* weights,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim) {
+    constexpr int threads = 256;
+    int blocks = 0;
+
+    if (block_count_1d(batch * output_dim, threads, &blocks, "dense_crelu_pre_gradient_kernel") != 0) {
+        return -1;
+    }
+    dense_crelu_pre_gradient_kernel<<<blocks, threads, 0, ctx->stream>>>(activations, output_gradients, batch, output_dim);
+    if (check_kernel_launch("dense_crelu_pre_gradient_kernel launch") != 0) {
+        return -1;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasStatus_t status = cublasSgemm(
+        ctx->blas,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        static_cast<int>(input_dim),
+        static_cast<int>(batch),
+        static_cast<int>(output_dim),
+        &alpha,
+        weights,
+        static_cast<int>(output_dim),
+        output_gradients,
+        static_cast<int>(output_dim),
+        &beta,
+        input_gradients,
+        static_cast<int>(input_dim));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return fail_blas(label, status);
+    }
+
+    status = cublasSgemm(
+        ctx->blas,
+        CUBLAS_OP_N,
+        CUBLAS_OP_T,
+        static_cast<int>(output_dim),
+        static_cast<int>(input_dim),
+        static_cast<int>(batch),
+        &alpha,
+        output_gradients,
+        static_cast<int>(output_dim),
+        inputs,
+        static_cast<int>(input_dim),
+        &beta,
+        weight_gradients,
+        static_cast<int>(output_dim));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return fail_blas(label, status);
+    }
+
+    dense_bias_sum_kernel<<<static_cast<int>(output_dim), threads, 0, ctx->stream>>>(
+        output_gradients, bias_gradients, batch, output_dim);
+    if (check_kernel_launch("dense_bias_sum_kernel launch") != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 __global__ void nnue_l0_crelu_backward_kernel(
     const float* combined_gradients,
     const float* stm_activations,
@@ -1331,14 +1504,28 @@ __global__ void nnue_l0_sparse_backward_kernel(
 
     int stm_feature = stm_indices[sparse_base];
     if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
-        size_t weight_idx = static_cast<size_t>(stm_feature) * l1 + row;
-        atomicAdd(&l0w_gradients[weight_idx], stm_gradients[sample * l1 + row]);
+        size_t base_feature = 0;
+        size_t virtual_feature = 0;
+        float value = stm_gradients[sample * l1 + row];
+        if (nnue_halfkp_factorized_feature(static_cast<size_t>(stm_feature), input_size, &base_feature, &virtual_feature)) {
+            atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
+            atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
+        } else {
+            atomicAdd(&l0w_gradients[static_cast<size_t>(stm_feature) * l1 + row], value);
+        }
     }
 
     int nstm_feature = nstm_indices[sparse_base];
     if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
-        size_t weight_idx = static_cast<size_t>(nstm_feature) * l1 + row;
-        atomicAdd(&l0w_gradients[weight_idx], nstm_gradients[sample * l1 + row]);
+        size_t base_feature = 0;
+        size_t virtual_feature = 0;
+        float value = nstm_gradients[sample * l1 + row];
+        if (nnue_halfkp_factorized_feature(static_cast<size_t>(nstm_feature), input_size, &base_feature, &virtual_feature)) {
+            atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
+            atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
+        } else {
+            atomicAdd(&l0w_gradients[static_cast<size_t>(nstm_feature) * l1 + row], value);
+        }
     }
 }
 
@@ -2177,11 +2364,9 @@ int launch_nnue_backward_kernels(
         return -1;
     }
 
-    size_t l2_threads = std::max(batch * l2, std::max(l2 * l3, l3));
-    if (block_count_1d(l2_threads, threads, &blocks, "dense_l2_crelu_backward_kernel") != 0) {
-        return -1;
-    }
-    dense_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+    if (launch_dense_crelu_backward_gemm(
+            ctx,
+            "dense_l2_crelu_backward_gemm",
         hidden1,
         hidden2,
         hidden2_gradients,
@@ -2191,17 +2376,14 @@ int launch_nnue_backward_kernels(
         l2b_gradients,
         batch,
         l2,
-        l3);
-    if (check_kernel_launch("dense_l2_crelu_backward_kernel launch") != 0) {
+            l3) != 0) {
         return -1;
     }
 
     size_t l1_input_dim = l1 * 2;
-    size_t l1_threads = std::max(batch * l1_input_dim, std::max(l1_input_dim * l2, l2));
-    if (block_count_1d(l1_threads, threads, &blocks, "dense_l1_crelu_backward_kernel") != 0) {
-        return -1;
-    }
-    dense_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+    if (launch_dense_crelu_backward_gemm(
+            ctx,
+            "dense_l1_crelu_backward_gemm",
         combined,
         hidden1,
         hidden1_gradients,
@@ -2211,8 +2393,7 @@ int launch_nnue_backward_kernels(
         l1b_gradients,
         batch,
         l1_input_dim,
-        l2);
-    if (check_kernel_launch("dense_l1_crelu_backward_kernel launch") != 0) {
+            l2) != 0) {
         return -1;
     }
 
@@ -2322,6 +2503,19 @@ extern "C" int bulletou_cuda_cpp_context_create(int device, BulletOuCudaCppConte
         delete ctx;
         return fail("cudaStreamCreateWithFlags", status);
     }
+    cublasStatus_t blas_status = cublasCreate(&ctx->blas);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        cudaStreamDestroy(ctx->stream);
+        delete ctx;
+        return fail_blas("cublasCreate", blas_status);
+    }
+    blas_status = cublasSetStream(ctx->blas, ctx->stream);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(ctx->blas);
+        cudaStreamDestroy(ctx->stream);
+        delete ctx;
+        return fail_blas("cublasSetStream", blas_status);
+    }
 
     *out = ctx;
     return ok();
@@ -2335,6 +2529,13 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (status != cudaSuccess) {
         delete ctx;
         return fail("cudaSetDevice", status);
+    }
+    if (ctx->blas != nullptr) {
+        cublasStatus_t blas_status = cublasDestroy(ctx->blas);
+        if (blas_status != CUBLAS_STATUS_SUCCESS) {
+            delete ctx;
+            return fail_blas("cublasDestroy", blas_status);
+        }
     }
     if (ctx->stream != nullptr) {
         status = cudaStreamDestroy(ctx->stream);

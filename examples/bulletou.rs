@@ -1860,9 +1860,10 @@ impl Args {
                 "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
             );
         }
-        if self.test_teacher.is_some() && eval_type != EvalType::SfnnHalfka2 {
+        if self.test_teacher.is_some() && !matches!(eval_type, EvalType::NnueHalfkp | EvalType::SfnnHalfka2) {
             return Err(
-                "--backend cuda-cpp direct final validation is currently wired only for SFNN_HALFKA2".to_string()
+                "--backend cuda-cpp direct final validation is currently wired only for NNUE_HALFKP and SFNN_HALFKA2"
+                    .to_string(),
             );
         }
         if self.superbatches.is_some()
@@ -3084,12 +3085,12 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         eprintln!("  initial completed optimizer steps = {}", initial_state.completed_steps);
     }
     let input_size = initial_weights.shape.input_size;
-    let max_active = {
-        use bulletou_lib::game::inputs::{Factorised, ShogiHalfKPPieceFactorizer};
-        Factorised::from_parts(ShogiHalfKP, ShogiHalfKPPieceFactorizer).max_active()
-    };
+    let max_active = ShogiHalfKP.max_active();
     eprintln!("  batch size = {batch_size}");
-    eprintln!("  arch = {} (factorized input {input_size}, {l1_size}x2-{l2_size}-{l3_size})", args.arch().cli_name());
+    eprintln!(
+        "  arch = {} (factorized input {input_size}, implicit HalfKP piece rows, {l1_size}x2-{l2_size}-{l3_size})",
+        args.arch().cli_name()
+    );
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
@@ -3169,7 +3170,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
-        ft_factorize: true,
+        ft_factorize: false,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: false,
     };
@@ -3278,6 +3279,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+    let final_test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
     let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
     write_cuda_cpp_halfkp_direct_outputs(
         &direct_output_dir,
@@ -3296,10 +3298,16 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         completed_steps,
         seen_steps,
         last_loss,
-        None,
+        final_test_metrics,
         dataloader_pos,
     )?;
     eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+    if let Some(metrics) = final_test_metrics {
+        eprintln!(
+            "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+            metrics.accuracy, metrics.loss
+        );
+    }
 
     Ok(())
 }
@@ -3570,6 +3578,39 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_halfkp_final_validation(
+    args: &Args,
+    shape: bulletou_cuda_cpp::NnueForwardShape,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+) -> Result<Option<TestMetrics>, String> {
+    let Some(cache) = TestPositionsCache::try_load(args) else {
+        return Ok(None);
+    };
+    if cache.positions.is_empty() {
+        eprintln!("  WARN: --test-teacher yielded no positions; cuda-cpp final validation skipped");
+        return Ok(None);
+    }
+
+    let validation_weights = cuda_cpp_halfkp_weights_for_cpu_validation(shape, weights)?;
+    let batch_size = args.test_batch_size.max(1);
+    let mut outputs = Vec::with_capacity(cache.positions.len());
+    let started = std::time::Instant::now();
+    for positions in cache.positions.chunks(batch_size) {
+        let batch = build_halfkp_validation_fast_batch(positions)?;
+        let mut chunk_outputs = validation_weights.forward_batch(&batch).map_err(|e| e.to_string())?;
+        outputs.append(&mut chunk_outputs);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    eprintln!(
+        "  cuda-cpp final validation forward = ok: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        outputs.len(),
+        batch_size
+    );
+
+    Ok(Some(run_one_test_pass(&cache, args, outputs)))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_halfka2_final_validation(
     args: &Args,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
@@ -3769,10 +3810,8 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     )
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
 
-    let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME))
-        .get("nnue")
-        .copied()
-        .unwrap_or(0);
+    let prior_positions =
+        read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME)).get("nnue").copied().unwrap_or(0);
     let mut learn = String::new();
     learn.push_str(LEARN_LOG_HEADER);
     learn.push('\n');
@@ -3809,6 +3848,45 @@ fn cuda_cpp_direct_learn_log_row(
         lambda = args.lambda,
         teacher = csv_escape(&resolve_teacher_for_log(&args.teacher)),
     )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_halfkp_weights_for_cpu_validation(
+    shape: bulletou_cuda_cpp::NnueForwardShape,
+    weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
+    use bulletou_lib::value::{
+        NnueForwardOwnedWeights as CpuNnueForwardOwnedWeights, NnueForwardShape as CpuNnueForwardShape,
+    };
+
+    let base_input_size = ShogiHalfKP.num_inputs();
+    let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+    let l0w = if shape.input_size == base_input_size {
+        weights.l0w.clone()
+    } else if shape.input_size == base_input_size + virtual_rows {
+        fold_halfkp_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.l1)?
+    } else {
+        return Err(format!(
+            "cannot validate HalfKP cuda-cpp weights with input_size={}, expected {} or factorized {}",
+            shape.input_size,
+            base_input_size,
+            base_input_size + virtual_rows
+        ));
+    };
+    let cpu_shape = CpuNnueForwardShape { input_size: base_input_size, l1: shape.l1, l2: shape.l2, l3: shape.l3 };
+    let validation_weights = CpuNnueForwardOwnedWeights {
+        shape: cpu_shape,
+        l0w,
+        l0b: weights.l0b.clone(),
+        l1w: weights.l1w.clone(),
+        l1b: weights.l1b.clone(),
+        l2w: weights.l2w.clone(),
+        l2b: weights.l2b.clone(),
+        outw: weights.outw.clone(),
+        outb: weights.outb.clone(),
+    };
+    validation_weights.validate().map_err(|e| e.to_string())?;
+    Ok(validation_weights)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3900,6 +3978,72 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_halfkp_validation_fast_batch(
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+) -> Result<bulletou_lib::value::FastBatchHost, String> {
+    use bulletou_lib::value::{FastBatchHost, FastBatchLayout};
+
+    let batch_size = positions.len();
+    if batch_size == 0 {
+        return Err("HalfKP validation batch must not be empty".to_string());
+    }
+    let max_active = ShogiHalfKP.max_active();
+    let input_size = ShogiHalfKP.num_inputs();
+    let sparse_len = batch_size
+        .checked_mul(max_active)
+        .ok_or_else(|| "HalfKP validation sparse batch length overflow".to_string())?;
+    let mut stm = vec![-1_i32; sparse_len];
+    let mut nstm = vec![-1_i32; sparse_len];
+    for (sample, pos) in positions.iter().enumerate() {
+        let mut j_stm = 0usize;
+        let mut j_nstm = 0usize;
+        let sparse_offset = sample * max_active;
+        let mut error = None;
+        ShogiHalfKP.map_features_split(pos, |our_opt, opp_opt| {
+            if let Some(our) = our_opt {
+                if our >= input_size {
+                    error = Some(format!("STM feature index {our} exceeded input size {input_size}"));
+                    return;
+                }
+                if j_stm >= max_active {
+                    error = Some(format!("STM active feature count exceeded max_active {max_active}"));
+                    return;
+                }
+                stm[sparse_offset + j_stm] = our as i32;
+                j_stm += 1;
+            }
+            if let Some(opp) = opp_opt {
+                if opp >= input_size {
+                    error = Some(format!("NSTM feature index {opp} exceeded input size {input_size}"));
+                    return;
+                }
+                if j_nstm >= max_active {
+                    error = Some(format!("NSTM active feature count exceeded max_active {max_active}"));
+                    return;
+                }
+                nstm[sparse_offset + j_nstm] = opp as i32;
+                j_nstm += 1;
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+
+    let batch = FastBatchHost {
+        layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
+        stm,
+        nstm,
+        buckets: vec![0_i32; batch_size],
+        targets: vec![0.0; batch_size],
+        weights: vec![1.0; batch_size],
+        hand_count: None,
+    };
+    batch.validate()?;
+    Ok(batch)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9949,7 +10093,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_cpp_backend_rejects_halfkp_final_validation_teacher() {
+    fn cuda_cpp_backend_accepts_halfkp_final_validation_teacher() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -9967,8 +10111,12 @@ mod tests {
         ])
         .unwrap();
 
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "SFNN_HALFKA2" } else { "cuda-cpp-backend" }));
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
     }
 
     #[test]
@@ -10424,6 +10572,33 @@ mod tests {
                 50.0, 52.0, 54.0,
             ]
         );
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_halfkp_validation_weights_fold_factorized_l0w() {
+        let base_input_size = ShogiHalfKP.num_inputs();
+        let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+        let shape =
+            bulletou_cuda_cpp::NnueForwardShape { input_size: base_input_size + virtual_rows, l1: 1, l2: 1, l3: 1 };
+        let mut l0w = vec![0.0; shape.input_size * shape.l1];
+        l0w[0] = 10.0;
+        l0w[virtual_rows] = 1.0;
+        let weights = bulletou_cuda_cpp::NnueTrainWeightsReadback {
+            l0w,
+            l0b: vec![0.0],
+            l1w: vec![1.0, 1.0],
+            l1b: vec![0.0],
+            l2w: vec![1.0],
+            l2b: vec![0.0],
+            outw: vec![1.0],
+            outb: vec![0.0],
+        };
+
+        let validation_weights = cuda_cpp_halfkp_weights_for_cpu_validation(shape, &weights).unwrap();
+
+        assert_eq!(validation_weights.shape.input_size, base_input_size);
+        assert_eq!(validation_weights.l0w[0], 11.0);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
