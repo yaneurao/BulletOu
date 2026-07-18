@@ -766,8 +766,12 @@ the tickets in order and commit each completed slice.
   - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --cuda-cpp-train-steps N` now streams real `SfnnTeacherBatchConfig` batches through `SfnnTrainStepRunner`;
   - `crates/bulletou_lib::value` now publicly re-exports the SFNN fixed-layout teacher batch helpers needed by the root CLI;
   - SFNN cuda-cpp direct mode accepts optional `--sfnn-factorized-l1`, with `l1fw/l1fb` zero-initialised to match the existing Bullet CLI semantics;
-  - unsupported SFNN direct resume/input-state (`--cuda-cpp-weights-bin`) fails fast until dedicated C++/CUDA state loading exists;
   - SFNN initial weights use a deterministic nnue-pytorch-style scratch layout: HalfKA2 base rows plus zero virtual piece rows for the factorized FT, and bucket0-copied stacked L1/L2/L3 weights.
+- Added SFNN direct output and explicit resume support:
+  - after direct training, the runner reads trained SFNN weights and Ranger optimizer buffers back and writes `<output>/cuda-cpp-direct/nn.bin` plus full-state `<output>/cuda-cpp-direct/weights.bin`;
+  - `nn.bin` is written in YaneuraOu SFNN HalfKA2 format, folds the HalfKA2 FT virtual piece rows into base feature rows, and folds optional `l1fw/l1fb` into each stack's fc0 weights/biases;
+  - `weights.bin` uses the root `nnue/{weights,momentum,velocity,slow,step_ranger}/*` namespace with a `cuda-cpp` backend marker, including optional `l1fw/l1fb` records when factorized L1 is enabled;
+  - `--cuda-cpp-weights-bin <PATH>` can now restore SFNN direct weights, Ranger state, optional factorized L1 state, and the completed optimizer-step counter.
 - Added SFNN per-stage direct-step profiling:
   - `SfnnTrainStepRunner::step_profiled_no_readback` mirrors the NNUE profiled runner and measures upload, forward, scalar loss, backward, Ranger update, and total CUDA time with events;
   - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2 --cuda-cpp-profile-steps N` now prints per-step and average SFNN profile lines.
@@ -791,8 +795,10 @@ the tickets in order and commit each completed slice.
   - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `sfnn_d: [0.06838137, 0.0869026]`;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (19 cuda-cpp tests);
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 256 --buffer-mb 64 --threads 4 --sfnn-factorized-l1` passed on Windows and ran two real HCPE SFNN train steps.
+  - Direct output smoke with `--output target\cuda-cpp-sfnn-output-smoke --cuda-cpp-train-steps 1 --batch-size 256 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0` wrote `cuda-cpp-direct/nn.bin` (135,212,356 bytes) and full-state `weights.bin` (2,190,019,306 bytes).
+  - Direct resume smoke with `--cuda-cpp-weights-bin target\cuda-cpp-sfnn-output-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-sfnn-resume-smoke --cuda-cpp-train-steps 1 --batch-size 256 --cuda-cpp-loss-readback-interval 0` restored `weights + Ranger optimizer state`, printed `initial completed optimizer steps = 1`, and ran the next update with `optimizer_step=2`.
   - Profile smoke with `--cuda-cpp-train-steps 3 --cuda-cpp-profile-steps 2 --batch-size 256 --buffer-mb 64 --threads 4 --sfnn-factorized-l1` passed and reported average profiled GPU time: upload `0.193ms`, forward `2.232ms`, loss `0.176ms`, backward `4.283ms`, Ranger update `5.870ms`, total `12.753ms`.
   - Training-only fused pairwise/L0 backward smokes passed:
     `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_backward_gpu_smoke -- --ignored --nocapture`,
@@ -812,6 +818,6 @@ the tickets in order and commit each completed slice.
     a shorter post-display-change bs65k/20-step smoke reported `throughput=1059357 pos/s`.
   - With final-only loss readback, the same bs65k/50-step release smoke plus `--cuda-cpp-loss-readback-interval 0` reported `throughput=1120866 pos/s`.
 - Remaining BO-CUDA-034 work:
-  - add SFNN direct output/checkpoint/resume support after the runner exists;
+  - wire SFNN cuda-cpp direct output into the normal numbered checkpoint/log/validation semantics and auto-resume orchestration;
   - add deeper backward profiling/optimisation; current C++ direct speed is improved but still below the tatara target (`~1.29M pos/s`);
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.
