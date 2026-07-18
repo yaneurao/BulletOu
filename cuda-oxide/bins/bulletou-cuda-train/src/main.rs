@@ -90,6 +90,8 @@ struct Args {
     loss_kind: LossKind,
     sigmoid_scale: f32,
     sigmoid_output_scale: f32,
+    wdl: f32,
+    test_wdl: Option<f32>,
     loss_case: LossCaseKind,
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
@@ -222,6 +224,8 @@ impl Args {
             loss_kind: LossKind::SigmoidMse,
             sigmoid_scale: 400.0,
             sigmoid_output_scale: 1.0,
+            wdl: 0.0,
+            test_wdl: None,
             loss_case: LossCaseKind::Tiny,
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
@@ -322,6 +326,12 @@ impl Args {
                 "--model-output-scale" | "--sigmoid-output-scale" => {
                     parsed.sigmoid_output_scale =
                         parse_f32_arg(required_arg(&mut args, "--model-output-scale")?, "--model-output-scale")?;
+                }
+                "--wdl" => {
+                    parsed.wdl = parse_f32_arg(required_arg(&mut args, "--wdl")?, "--wdl")?;
+                }
+                "--test-wdl" => {
+                    parsed.test_wdl = Some(parse_f32_arg(required_arg(&mut args, "--test-wdl")?, "--test-wdl")?);
                 }
                 "--loss-case" => {
                     parsed.loss_case = parse_loss_case(required_arg(&mut args, "--loss-case")?)?;
@@ -443,8 +453,10 @@ impl Args {
                     parsed.batch_size = parse_usize_arg(required_arg(&mut args, "--batch-size")?, "--batch-size")?;
                 }
                 "--teacher-batch-size" => {
-                    parsed.teacher_batch_size =
-                        Some(parse_usize_arg(required_arg(&mut args, "--teacher-batch-size")?, "--teacher-batch-size")?);
+                    parsed.teacher_batch_size = Some(parse_usize_arg(
+                        required_arg(&mut args, "--teacher-batch-size")?,
+                        "--teacher-batch-size",
+                    )?);
                 }
                 "--buffer-mb" => {
                     parsed.buffer_mb = parse_usize_arg(required_arg(&mut args, "--buffer-mb")?, "--buffer-mb")?;
@@ -492,6 +504,14 @@ impl Args {
 
         if !(parsed.tolerance.is_finite() && parsed.tolerance >= 0.0) {
             return usage_error("--tolerance must be a finite non-negative number");
+        }
+        if !(parsed.wdl.is_finite() && (0.0..=1.0).contains(&parsed.wdl)) {
+            return usage_error("--wdl must be finite and in [0, 1]");
+        }
+        if let Some(test_wdl) = parsed.test_wdl {
+            if !(test_wdl.is_finite() && (0.0..=1.0).contains(&test_wdl)) {
+                return usage_error("--test-wdl must be finite and in [0, 1]");
+            }
         }
 
         Ok(parsed)
@@ -1150,15 +1170,7 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(
-            &stream,
-            &module,
-            params,
-            train_loss_kind,
-            args.sigmoid_output_scale,
-            host_batch,
-            false,
-        )?;
+        runner.step(&stream, &module, params, train_loss_kind, args.sigmoid_output_scale, host_batch, false)?;
         stream.synchronize()?;
 
         let loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -1325,13 +1337,14 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         LossKind::SigmoidMse => NnueTrainLossKind::SigmoidMse,
         LossKind::NnuePytorchWrm => NnueTrainLossKind::NnuePytorchWrm,
     };
+    let score_lambda = score_lambda_from_wdl(args.wdl);
     let test_cache = load_nnue_bridge_test_cache(&args)?;
     let test_teacher_spec = bridge_test_teacher_spec(&args);
     let log_context = NnueBridgeLogContext {
         batch_size: args.batch_size,
         batches_per_superbatch: args.batches_per_superbatch,
         superbatches_per_epoch: args.superbatches_per_epoch,
-        lambda: 1.0,
+        lambda: score_lambda,
     };
 
     let mut runner = None;
@@ -1374,7 +1387,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
-        lambda: 1.0,
+        lambda: score_lambda,
         scale: args.sigmoid_scale,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         ft_factorize: nnue_halfkp_uses_ft_factorize(shape),
@@ -1697,6 +1710,8 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
     println!("  scale        : {}", args.sigmoid_scale);
     println!("  model_scale  : {}", args.sigmoid_output_scale);
+    println!("  wdl_lambda   : {}", args.wdl);
+    println!("  test_wdl     : {}", validation_wdl(&args));
     println!("  batch        : {} samples", last_batch.batch_size);
     println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  start_step   : {}", completed_step_offset + 1);
@@ -1876,11 +1891,12 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         LossKind::SigmoidMse => SfnnTrainLossKind::SigmoidMse,
         LossKind::NnuePytorchWrm => SfnnTrainLossKind::NnuePytorchWrm,
     };
+    let score_lambda = score_lambda_from_wdl(args.wdl);
     let log_context = NnueBridgeLogContext {
         batch_size: args.batch_size,
         batches_per_superbatch: args.batches_per_superbatch,
         superbatches_per_epoch: args.superbatches_per_epoch,
-        lambda: 1.0,
+        lambda: score_lambda,
     };
     let test_cache = load_nnue_bridge_test_cache(&args)?;
     let test_teacher_spec = bridge_test_teacher_spec(&args);
@@ -1949,7 +1965,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
-        lambda: 1.0,
+        lambda: score_lambda,
         scale: args.sigmoid_scale,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -2227,6 +2243,8 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
     println!("  scale        : {}", args.sigmoid_scale);
     println!("  model_scale  : {}", args.sigmoid_output_scale);
+    println!("  wdl_lambda   : {}", args.wdl);
+    println!("  test_wdl     : {}", validation_wdl(&args));
     println!("  batch        : {} samples, max_active={}", last_batch_size, last_max_active);
     if teacher_batch_size != args.batch_size {
         println!("  teacher_batch: {} samples", teacher_batch_size);
@@ -2353,6 +2371,16 @@ struct NnueBridgeLogContext {
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn score_lambda_from_wdl(wdl_lambda: f32) -> f32 {
+    1.0 - wdl_lambda
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn validation_wdl(args: &Args) -> f32 {
+    args.test_wdl.unwrap_or(args.wdl)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn bridge_test_teacher_spec(args: &Args) -> Option<String> {
     let path = args.test_teacher.as_ref()?;
     let sample = match args.test_sample {
@@ -2360,8 +2388,13 @@ fn bridge_test_teacher_spec(args: &Args) -> Option<String> {
         TestSampleMode::Sequential => "sequential",
     };
     let mut spec = format!(
-        "{}\npositions={}\nsample={sample}\nscale={}\nmodel_output_scale={}\n",
-        path, args.test_positions, args.sigmoid_scale, args.sigmoid_output_scale
+        "{}\npositions={}\nsample={sample}\nscale={}\nmodel_output_scale={}\nwdl={}\ntest_wdl={}\n",
+        path,
+        args.test_positions,
+        args.sigmoid_scale,
+        args.sigmoid_output_scale,
+        args.wdl,
+        validation_wdl(args)
     );
     if matches!(args.test_sample, TestSampleMode::Random) {
         spec.push_str(&format!("seed={}\n", args.test_seed));
@@ -2481,7 +2514,7 @@ fn run_nnue_bridge_test_pass(
         &cache.teacher_scores,
         &cache.teacher_results,
         (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        1.0,
+        score_lambda_from_wdl(validation_wdl(args)),
         args.sigmoid_scale,
         args.sigmoid_output_scale,
         loss_kind,
@@ -2595,7 +2628,7 @@ fn run_sfnn_bridge_test_pass(
         &cache.teacher_scores,
         &cache.teacher_results,
         (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        1.0,
+        score_lambda_from_wdl(validation_wdl(args)),
         args.sigmoid_scale,
         args.sigmoid_output_scale,
         loss_kind,
@@ -4210,15 +4243,7 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(
-            &stream,
-            &module,
-            params,
-            train_loss_kind,
-            args.sigmoid_output_scale,
-            host_batch,
-            false,
-        )?;
+        runner.step(&stream, &module, params, train_loss_kind, args.sigmoid_output_scale, host_batch, false)?;
         stream.synchronize()?;
 
         let gpu_loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -5604,7 +5629,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--model-output-scale <F32>] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--wdl <F32>] [--test-wdl <F32>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--model-output-scale <F32>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -5616,7 +5641,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--teacher-batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--teacher-batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--wdl <F32>] [--test-wdl <F32>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
