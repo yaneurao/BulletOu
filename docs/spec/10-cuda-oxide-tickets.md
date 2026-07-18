@@ -758,16 +758,20 @@ the tickets in order and commit each completed slice.
   - C++/CUDA now runs stacked L3 backward, stacked L2 CReLU backward, L2-input transform backward, stacked/factorized L1 backward, pairwise backward, and sparse L0 CReLU backward;
   - parameter-gradient buffers are zeroed at the start of each public backward call because the stacked SFNN gradients are accumulated with atomics;
   - the L0 sparse backward also adds gradients to HalfKA2 virtual piece rows when the factorized input shape is used.
+- Added the first persistent SFNN train-step runner:
+  - `SfnnTrainStepRunner` owns reusable sparse batches, buckets, targets, entry weights, SFNN weights, optional L1f optimizer state, forward/loss/backward workspaces, and Ranger optimizer buffers;
+  - `SfnnRangerOptimizerStates` mirrors the NNUE optimizer bundle and keeps `l1fw/l1fb` optional as a matched pair;
+  - one runner step now executes upload -> SFNN forward -> existing scalar loss -> SFNN backward -> Ranger update without leaving the C++/CUDA backend.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_forward_gpu_smoke -- --ignored --nocapture` passed;
   - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_backward_gpu_smoke -- --ignored --nocapture` passed;
+  - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `sfnn_d: [0.06838137, 0.0869026]`;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed.
 - Remaining BO-CUDA-034 work:
-  - add a persistent SFNN train-step runner using the existing scalar loss kernels and the new SFNN backward path;
   - wire SFNN `--backend cuda-cpp` training through the root CLI;
   - add SFNN direct output/checkpoint/resume support after the runner exists;
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.

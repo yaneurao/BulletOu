@@ -1993,6 +1993,144 @@ impl NnueRangerOptimizerStates {
     }
 }
 
+#[derive(Debug)]
+pub struct SfnnRangerOptimizerStates {
+    pub l0w: RangerParamState,
+    pub l0b: RangerParamState,
+    pub l1w: RangerParamState,
+    pub l1b: RangerParamState,
+    pub l1fw: Option<RangerParamState>,
+    pub l1fb: Option<RangerParamState>,
+    pub l2w: RangerParamState,
+    pub l2b: RangerParamState,
+    pub l3w: RangerParamState,
+    pub l3b: RangerParamState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnRangerOptimizerHostStates<'a> {
+    pub l0w: RangerParamHostState<'a>,
+    pub l0b: RangerParamHostState<'a>,
+    pub l1w: RangerParamHostState<'a>,
+    pub l1b: RangerParamHostState<'a>,
+    pub l1fw: Option<RangerParamHostState<'a>>,
+    pub l1fb: Option<RangerParamHostState<'a>>,
+    pub l2w: RangerParamHostState<'a>,
+    pub l2b: RangerParamHostState<'a>,
+    pub l3w: RangerParamHostState<'a>,
+    pub l3b: RangerParamHostState<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SfnnRangerOptimizerStatesReadback {
+    pub l0w: RangerParamStateReadback,
+    pub l0b: RangerParamStateReadback,
+    pub l1w: RangerParamStateReadback,
+    pub l1b: RangerParamStateReadback,
+    pub l1fw: Option<RangerParamStateReadback>,
+    pub l1fb: Option<RangerParamStateReadback>,
+    pub l2w: RangerParamStateReadback,
+    pub l2b: RangerParamStateReadback,
+    pub l3w: RangerParamStateReadback,
+    pub l3b: RangerParamStateReadback,
+}
+
+impl SfnnRangerOptimizerStates {
+    pub fn from_host_weights(ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            l0w: RangerParamState::from_host_weights(ctx, weights.l0w)?,
+            l0b: RangerParamState::from_host_weights(ctx, weights.l0b)?,
+            l1w: RangerParamState::from_host_weights(ctx, weights.l1w)?,
+            l1b: RangerParamState::from_host_weights(ctx, weights.l1b)?,
+            l1fw: weights.l1fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l1fb: weights.l1fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l2w: RangerParamState::from_host_weights(ctx, weights.l2w)?,
+            l2b: RangerParamState::from_host_weights(ctx, weights.l2b)?,
+            l3w: RangerParamState::from_host_weights(ctx, weights.l3w)?,
+            l3b: RangerParamState::from_host_weights(ctx, weights.l3b)?,
+        })
+    }
+
+    pub fn from_host_states(
+        ctx: &Context,
+        shape: SfnnForwardShape,
+        states: SfnnRangerOptimizerHostStates<'_>,
+    ) -> Result<Self> {
+        validate_sfnn_shape(shape)?;
+        let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?;
+        let l1w_len = checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?;
+        let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
+        let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
+        let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
+            (Some(l1fw), Some(l1fb)) => (
+                Some(RangerParamState::from_host_state(
+                    ctx,
+                    checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
+                    l1fw,
+                )?),
+                Some(RangerParamState::from_host_state(ctx, shape.l1_out(), l1fb)?),
+            ),
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1fw requires l1fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1fb requires l1fw")),
+        };
+        Ok(Self {
+            l0w: RangerParamState::from_host_state(ctx, l0w_len, states.l0w)?,
+            l0b: RangerParamState::from_host_state(ctx, shape.ft_size, states.l0b)?,
+            l1w: RangerParamState::from_host_state(ctx, l1w_len, states.l1w)?,
+            l1b: RangerParamState::from_host_state(ctx, shape.num_stacks * shape.l1_out(), states.l1b)?,
+            l1fw,
+            l1fb,
+            l2w: RangerParamState::from_host_state(ctx, l2w_len, states.l2w)?,
+            l2b: RangerParamState::from_host_state(ctx, shape.num_stacks * shape.l2_size, states.l2b)?,
+            l3w: RangerParamState::from_host_state(ctx, l3w_len, states.l3w)?,
+            l3b: RangerParamState::from_host_state(ctx, shape.num_stacks, states.l3b)?,
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<SfnnRangerOptimizerStatesReadback> {
+        Ok(SfnnRangerOptimizerStatesReadback {
+            l0w: self.l0w.download(ctx)?,
+            l0b: self.l0b.download(ctx)?,
+            l1w: self.l1w.download(ctx)?,
+            l1b: self.l1b.download(ctx)?,
+            l1fw: self.l1fw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l1fb: self.l1fb.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l2w: self.l2w.download(ctx)?,
+            l2b: self.l2b.download(ctx)?,
+            l3w: self.l3w.download(ctx)?,
+            l3b: self.l3b.download(ctx)?,
+        })
+    }
+
+    fn validate(&self, shape: SfnnForwardShape) -> Result<()> {
+        self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, "optimizer sfnn l0w")?;
+        self.l0b.validate(shape.ft_size, "optimizer sfnn l0b")?;
+        self.l1w.validate(
+            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
+            "optimizer sfnn l1w",
+        )?;
+        self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
+        match (&self.l1fw, &self.l1fb) {
+            (Some(l1fw), Some(l1fb)) => {
+                l1fw.validate(checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, "optimizer sfnn l1fw")?;
+                l1fb.validate(shape.l1_out(), "optimizer sfnn l1fb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1fw requires l1fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1fb requires l1fw")),
+        }
+        self.l2w.validate(
+            checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
+            "optimizer sfnn l2w",
+        )?;
+        self.l2b.validate(shape.num_stacks * shape.l2_size, "optimizer sfnn l2b")?;
+        self.l3w.validate(checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, "optimizer sfnn l3w")?;
+        self.l3b.validate(shape.num_stacks, "optimizer sfnn l3b")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NnueTrainStepHostBatch<'a> {
     pub stm_indices: &'a [i32],
@@ -2334,6 +2472,303 @@ impl NnueTrainStepRunner {
             &self.backward_workspace.outb_gradients,
             &self.weights.outb,
             &self.optimizer_states.outb,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnTrainStepHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub buckets: &'a [i32],
+    pub targets: &'a [f32],
+    pub entry_weights: &'a [f32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl<'a> SfnnTrainStepHostBatch<'a> {
+    fn forward_batch(self) -> SfnnForwardHostBatch<'a> {
+        SfnnForwardHostBatch {
+            stm_indices: self.stm_indices,
+            nstm_indices: self.nstm_indices,
+            buckets: self.buckets,
+            batch_size: self.batch_size,
+            max_active: self.max_active,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        self.forward_batch().validate()?;
+        expect_len("sfnn train targets", self.batch_size, self.targets.len())?;
+        expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SfnnTrainWeightsReadback {
+    pub l0w: Vec<f32>,
+    pub l0b: Vec<f32>,
+    pub l1w: Vec<f32>,
+    pub l1b: Vec<f32>,
+    pub l1fw: Option<Vec<f32>>,
+    pub l1fb: Option<Vec<f32>>,
+    pub l2w: Vec<f32>,
+    pub l2b: Vec<f32>,
+    pub l3w: Vec<f32>,
+    pub l3b: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct SfnnTrainStepRunner {
+    pub shape: SfnnForwardShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub device_batch: SfnnForwardDeviceBatch,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+    pub weights: SfnnForwardDeviceWeights,
+    pub optimizer_states: SfnnRangerOptimizerStates,
+    pub forward_workspace: SfnnForwardWorkspace,
+    pub loss_workspace: ScalarLossWorkspace,
+    pub backward_workspace: SfnnBackwardWorkspace,
+}
+
+impl SfnnTrainStepRunner {
+    pub fn new(
+        ctx: &Context,
+        initial_weights: SfnnForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        let optimizer_states = SfnnRangerOptimizerStates::from_host_weights(ctx, initial_weights)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    pub fn with_optimizer_states(
+        ctx: &Context,
+        initial_weights: SfnnForwardHostWeights<'_>,
+        optimizer_states: SfnnRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        let optimizer_states =
+            SfnnRangerOptimizerStates::from_host_states(ctx, initial_weights.shape, optimizer_states)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    fn with_device_optimizer_states(
+        ctx: &Context,
+        initial_weights: SfnnForwardHostWeights<'_>,
+        optimizer_states: SfnnRangerOptimizerStates,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        initial_weights.validate()?;
+        if batch_size == 0 {
+            return Err(CudaCppError::message("SFNN train-step batch_size must be greater than zero"));
+        }
+        if max_active == 0 {
+            return Err(CudaCppError::message("SFNN train-step max_active must be greater than zero"));
+        }
+
+        let shape = initial_weights.shape;
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("SFNN train-step sparse length overflow"))?;
+        Ok(Self {
+            shape,
+            batch_size,
+            max_active,
+            device_batch: SfnnForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+                buckets: I32Buffer::new(ctx, batch_size)?,
+            },
+            targets: F32Buffer::new(ctx, batch_size)?,
+            entry_weights: F32Buffer::new(ctx, batch_size)?,
+            weights: SfnnForwardDeviceWeights::from_host(ctx, initial_weights)?,
+            optimizer_states,
+            forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
+            loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
+            backward_workspace: SfnnBackwardWorkspace::new(
+                ctx,
+                SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active),
+            )?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+    ) -> Result<ScalarLossReadback> {
+        self.step_no_readback(ctx, params, loss_kind, output_inv_scale, batch)?;
+        self.read_loss(ctx)
+    }
+
+    pub fn step_no_readback(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "SFNN train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+
+        self.device_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+        self.device_batch.buckets.upload(ctx, batch.buckets)?;
+        self.targets.upload(ctx, batch.targets)?;
+        self.entry_weights.upload(ctx, batch.entry_weights)?;
+
+        sfnn_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        scalar_loss_device_from_buffers(
+            ctx,
+            loss_kind,
+            output_inv_scale,
+            self.batch_size,
+            &self.forward_workspace.output,
+            &self.targets,
+            &self.entry_weights,
+            &self.loss_workspace,
+        )?;
+        sfnn_backward_device(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+        )?;
+        self.update_weights(ctx, params)
+    }
+
+    pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
+        self.loss_workspace.download(ctx)
+    }
+
+    pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
+        Ok(SfnnTrainWeightsReadback {
+            l0w: self.weights.l0w.download(ctx)?,
+            l0b: self.weights.l0b.download(ctx)?,
+            l1w: self.weights.l1w.download(ctx)?,
+            l1b: self.weights.l1b.download(ctx)?,
+            l1fw: self.weights.l1fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l1fb: self.weights.l1fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l2w: self.weights.l2w.download(ctx)?,
+            l2b: self.weights.l2b.download(ctx)?,
+            l3w: self.weights.l3w.download(ctx)?,
+            l3b: self.weights.l3b.download(ctx)?,
+        })
+    }
+
+    pub fn read_optimizer_states(&self, ctx: &Context) -> Result<SfnnRangerOptimizerStatesReadback> {
+        self.optimizer_states.download(ctx)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_sfnn_shape(self.shape)?;
+        self.device_batch.validate()?;
+        self.weights.validate()?;
+        self.optimizer_states.validate(self.shape)?;
+        self.validate_optional_l1f_state_matches_weights()?;
+        self.forward_workspace.validate()?;
+        self.loss_workspace.validate()?;
+        self.backward_workspace.validate()?;
+        expect_len("sfnn train targets", self.batch_size, self.targets.len())?;
+        expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+
+    fn validate_optional_l1f_state_matches_weights(&self) -> Result<()> {
+        match (
+            self.weights.l1fw.is_some(),
+            self.weights.l1fb.is_some(),
+            self.optimizer_states.l1fw.is_some(),
+            self.optimizer_states.l1fb.is_some(),
+        ) {
+            (true, true, true, true) | (false, false, false, false) => Ok(()),
+            _ => Err(CudaCppError::message("SFNN weight/state l1fw/l1fb optional groups mismatch")),
+        }
+    }
+
+    fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l0w_gradients,
+            &self.weights.l0w,
+            &self.optimizer_states.l0w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l0b_gradients,
+            &self.weights.l0b,
+            &self.optimizer_states.l0b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l1w_gradients,
+            &self.weights.l1w,
+            &self.optimizer_states.l1w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l1b_gradients,
+            &self.weights.l1b,
+            &self.optimizer_states.l1b,
+        )?;
+        match (&self.weights.l1fw, &self.weights.l1fb, &self.optimizer_states.l1fw, &self.optimizer_states.l1fb) {
+            (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) => {
+                update_param_group(ctx, params, &self.backward_workspace.l1fw_gradients, l1fw, l1fw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l1fb_gradients, l1fb, l1fb_state)?;
+            }
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l1fw/l1fb optional groups mismatch")),
+        }
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l2w_gradients,
+            &self.weights.l2w,
+            &self.optimizer_states.l2w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l2b_gradients,
+            &self.weights.l2b,
+            &self.optimizer_states.l2b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l3w_gradients,
+            &self.weights.l3w,
+            &self.optimizer_states.l3w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l3b_gradients,
+            &self.weights.l3b,
+            &self.optimizer_states.l3b,
         )
     }
 }
@@ -3233,6 +3668,80 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_tiny_train_step_runner_smoke() {
+        let shape = tiny_sfnn_shape();
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let weights = tiny_sfnn_weights(shape);
+        let targets = [0.25, 0.75];
+        let entry_weights = [1.0, 0.5];
+        let params = RangerUpdateParams {
+            radam: RAdamUpdateParams {
+                step: 1,
+                learning_rate: 0.01,
+                beta1: 0.9,
+                beta2: 0.999,
+                min_weight: -1.98,
+                max_weight: 1.98,
+                ..RAdamUpdateParams::default()
+            },
+            lookahead_alpha: 0.5,
+            lookahead_period: 6,
+        };
+        let expected_gradients = tiny_sfnn_backward_cpu(batch, weights, &targets, &entry_weights);
+        let expected = host_ranger_updated_tiny_sfnn_weights(0, weights, &expected_gradients, params);
+
+        let ctx = Context::new(0).unwrap();
+        let mut runner = SfnnTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active).unwrap();
+        let loss = runner
+            .step(
+                &ctx,
+                params,
+                ScalarLossKind::SigmoidMse,
+                1.0,
+                SfnnTrainStepHostBatch {
+                    stm_indices: batch.stm_indices,
+                    nstm_indices: batch.nstm_indices,
+                    buckets: batch.buckets,
+                    targets: &targets,
+                    entry_weights: &entry_weights,
+                    batch_size: batch.batch_size,
+                    max_active: batch.max_active,
+                },
+            )
+            .unwrap();
+        assert!(loss.mean.is_finite());
+        let actual = runner.read_weights(&ctx).unwrap();
+
+        assert_close_slice("train sfnn l0w", &actual.l0w, &expected.l0w, 1.0e-6);
+        assert_close_slice("train sfnn l0b", &actual.l0b, &expected.l0b, 1.0e-6);
+        assert_close_slice("train sfnn l1w", &actual.l1w, &expected.l1w, 1.0e-6);
+        assert_close_slice("train sfnn l1b", &actual.l1b, &expected.l1b, 1.0e-6);
+        assert_close_slice(
+            "train sfnn l1fw",
+            actual.l1fw.as_deref().unwrap(),
+            expected.l1fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "train sfnn l1fb",
+            actual.l1fb.as_deref().unwrap(),
+            expected.l1fb.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice("train sfnn l2w", &actual.l2w, &expected.l2w, 1.0e-6);
+        assert_close_slice("train sfnn l2b", &actual.l2b, &expected.l2b, 1.0e-6);
+        assert_close_slice("train sfnn l3w", &actual.l3w, &expected.l3w, 1.0e-6);
+        assert_close_slice("train sfnn l3b", &actual.l3b, &expected.l3b, 1.0e-6);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn persistent_device_api_smoke() {
         let ctx = Context::new(0).unwrap();
         let x = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0]).unwrap();
@@ -3446,6 +3955,19 @@ mod tests {
         l2b_gradients: Vec<f32>,
         l3w_gradients: Vec<f32>,
         l3b_gradients: Vec<f32>,
+    }
+
+    struct SfnnTinyWeightsOwned {
+        l0w: Vec<f32>,
+        l0b: Vec<f32>,
+        l1w: Vec<f32>,
+        l1b: Vec<f32>,
+        l1fw: Option<Vec<f32>>,
+        l1fb: Option<Vec<f32>>,
+        l2w: Vec<f32>,
+        l2b: Vec<f32>,
+        l3w: Vec<f32>,
+        l3b: Vec<f32>,
     }
 
     fn tiny_sfnn_forward_trace_cpu(
@@ -3716,6 +4238,60 @@ mod tests {
             l3w_gradients,
             l3b_gradients,
         }
+    }
+
+    fn host_ranger_updated_tiny_sfnn_weights(
+        device: i32,
+        weights: SfnnForwardHostWeights<'_>,
+        gradients: &SfnnCpuBackward,
+        params: RangerUpdateParams,
+    ) -> SfnnTinyWeightsOwned {
+        let mut out = SfnnTinyWeightsOwned {
+            l0w: weights.l0w.to_vec(),
+            l0b: weights.l0b.to_vec(),
+            l1w: weights.l1w.to_vec(),
+            l1b: weights.l1b.to_vec(),
+            l1fw: weights.l1fw.map(|values| values.to_vec()),
+            l1fb: weights.l1fb.map(|values| values.to_vec()),
+            l2w: weights.l2w.to_vec(),
+            l2b: weights.l2b.to_vec(),
+            l3w: weights.l3w.to_vec(),
+            l3b: weights.l3b.to_vec(),
+        };
+        apply_host_ranger_to_group(device, params, &gradients.l0w_gradients, &mut out.l0w);
+        apply_host_ranger_to_group(device, params, &gradients.l0b_gradients, &mut out.l0b);
+        apply_host_ranger_to_group(device, params, &gradients.l1w_gradients, &mut out.l1w);
+        apply_host_ranger_to_group(device, params, &gradients.l1b_gradients, &mut out.l1b);
+        if let Some(l1fw) = &mut out.l1fw {
+            apply_host_ranger_to_group(device, params, &gradients.l1fw_gradients, l1fw);
+        }
+        if let Some(l1fb) = &mut out.l1fb {
+            apply_host_ranger_to_group(device, params, &gradients.l1fb_gradients, l1fb);
+        }
+        apply_host_ranger_to_group(device, params, &gradients.l2w_gradients, &mut out.l2w);
+        apply_host_ranger_to_group(device, params, &gradients.l2b_gradients, &mut out.l2b);
+        apply_host_ranger_to_group(device, params, &gradients.l3w_gradients, &mut out.l3w);
+        apply_host_ranger_to_group(device, params, &gradients.l3b_gradients, &mut out.l3b);
+        out
+    }
+
+    fn apply_host_ranger_to_group(device: i32, params: RangerUpdateParams, gradients: &[f32], weights: &mut [f32]) {
+        let mut gradients = gradients.to_vec();
+        let mut momentum = vec![0.0; gradients.len()];
+        let mut velocity = vec![0.0; gradients.len()];
+        let mut slow_params = weights.to_vec();
+        ranger_update_host(
+            device,
+            params,
+            RangerStateMut {
+                gradients: &mut gradients,
+                weights,
+                momentum: &mut momentum,
+                velocity: &mut velocity,
+                slow_params: &mut slow_params,
+            },
+        )
+        .unwrap();
     }
 
     fn add_sfnn_l0w_gradient(
