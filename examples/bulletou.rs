@@ -2766,7 +2766,8 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         }
 
         use bulletou_cuda_cpp::{
-            Context, F32Buffer, RAdamUpdateParams, RangerDeviceStateMut, RangerStateMut, RangerUpdateParams,
+            Context, Event, F32Buffer, F32UploadSlot, RAdamUpdateParams, RangerDeviceStateMut, RangerStateMut,
+            RangerUpdateParams,
         };
 
         let device = args.cuda_cpp_device;
@@ -2784,10 +2785,43 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         let x_dev = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0, 4.0]).map_err(|e| e.to_string())?;
         let y_dev = F32Buffer::from_host(&ctx, &[10.0, 20.0, 30.0, 40.0]).map_err(|e| e.to_string())?;
         let out_dev = F32Buffer::new(&ctx, 4).map_err(|e| e.to_string())?;
+        let start = Event::new(&ctx).map_err(|e| e.to_string())?;
+        let stop = Event::new(&ctx).map_err(|e| e.to_string())?;
+        start.record(&ctx).map_err(|e| e.to_string())?;
         bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, &x_dev, &y_dev, &out_dev).map_err(|e| e.to_string())?;
+        stop.record(&ctx).map_err(|e| e.to_string())?;
+        stop.synchronize().map_err(|e| e.to_string())?;
+        let _axpy_ms = stop.elapsed_ms_since(&start).map_err(|e| e.to_string())?;
         let axpy_device = out_dev.download(&ctx).map_err(|e| e.to_string())?;
         if axpy_device != vec![12.0, 24.0, 36.0, 48.0] {
             return Err(format!("cuda-cpp persistent axpy smoke mismatch: {axpy_device:?}"));
+        }
+
+        let graph_out = F32Buffer::new(&ctx, 4).map_err(|e| e.to_string())?;
+        ctx.begin_capture().map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, &x_dev, &y_dev, &graph_out).map_err(|e| e.to_string())?;
+        let graph = ctx.end_capture().map_err(|e| e.to_string())?;
+        graph_out.fill(&ctx, 0.0).map_err(|e| e.to_string())?;
+        graph.launch(&ctx).map_err(|e| e.to_string())?;
+        graph.launch(&ctx).map_err(|e| e.to_string())?;
+        ctx.synchronize().map_err(|e| e.to_string())?;
+        let graph_axpy = graph_out.download(&ctx).map_err(|e| e.to_string())?;
+        if graph_axpy != vec![12.0, 24.0, 36.0, 48.0] {
+            return Err(format!("cuda-cpp graph axpy smoke mismatch: {graph_axpy:?}"));
+        }
+
+        let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
+        let upload_x = F32UploadSlot::new(&upload_ctx, 4).map_err(|e| e.to_string())?;
+        let upload_y = F32UploadSlot::new(&upload_ctx, 4).map_err(|e| e.to_string())?;
+        upload_x.upload(&upload_ctx, &[1.0, 2.0, 3.0, 4.0]).map_err(|e| e.to_string())?;
+        upload_y.upload(&upload_ctx, &[10.0, 20.0, 30.0, 40.0]).map_err(|e| e.to_string())?;
+        let upload_out = F32Buffer::new(&ctx, 4).map_err(|e| e.to_string())?;
+        let ready_x = upload_x.wait_on(&ctx).map_err(|e| e.to_string())?;
+        let ready_y = upload_y.wait_on(&ctx).map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, ready_x, ready_y, &upload_out).map_err(|e| e.to_string())?;
+        let upload_axpy = upload_out.download(&ctx).map_err(|e| e.to_string())?;
+        if upload_axpy != vec![12.0, 24.0, 36.0, 48.0] {
+            return Err(format!("cuda-cpp upload-slot axpy smoke mismatch: {upload_axpy:?}"));
         }
 
         let mut gradients = vec![0.25, -0.5, 1.0, -1.5];

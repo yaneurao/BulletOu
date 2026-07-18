@@ -54,6 +54,19 @@ impl Context {
         check(unsafe { ffi::bulletou_cuda_cpp_context_synchronize(self.raw.as_ptr()) })
     }
 
+    pub fn begin_capture(&self) -> Result<()> {
+        // SAFETY: `self.raw` is owned by this wrapper and valid until Drop.
+        check(unsafe { ffi::bulletou_cuda_cpp_graph_begin_capture(self.raw.as_ptr()) })
+    }
+
+    pub fn end_capture(&self) -> Result<GraphExec> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `self.raw` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_graph_end_capture(self.raw.as_ptr(), &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA graph_end_capture returned null"))?;
+        Ok(GraphExec { raw })
+    }
+
     fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppContext {
         self.raw.as_ptr()
     }
@@ -67,9 +80,98 @@ impl Drop for Context {
 }
 
 #[derive(Debug)]
+pub struct Event {
+    raw: NonNull<ffi::BulletOuCudaCppEvent>,
+}
+
+impl Event {
+    pub fn new(ctx: &Context) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `ctx` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_create(ctx.as_ptr(), &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA event_create returned null"))?;
+        Ok(Self { raw })
+    }
+
+    pub fn record(&self, ctx: &Context) -> Result<()> {
+        // SAFETY: `self.raw` and `ctx` are valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_record(ctx.as_ptr(), self.raw.as_ptr()) })
+    }
+
+    pub fn wait(&self, ctx: &Context) -> Result<()> {
+        // SAFETY: `self.raw` and `ctx` are valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_wait(ctx.as_ptr(), self.raw.as_ptr()) })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        // SAFETY: `self.raw` is valid until Drop.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_synchronize(self.raw.as_ptr()) })
+    }
+
+    pub fn elapsed_ms_since(&self, start: &Event) -> Result<f32> {
+        let mut out = 0.0;
+        // SAFETY: both events are valid and `out` is a valid out pointer.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_elapsed_ms(start.raw.as_ptr(), self.raw.as_ptr(), &mut out) })?;
+        Ok(out)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_event_destroy(self.raw.as_ptr()) };
+    }
+}
+
+#[derive(Debug)]
+pub struct GraphExec {
+    raw: NonNull<ffi::BulletOuCudaCppGraphExec>,
+}
+
+impl GraphExec {
+    pub fn launch(&self, ctx: &Context) -> Result<()> {
+        // SAFETY: `self.raw` and `ctx` are valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_graph_launch(ctx.as_ptr(), self.raw.as_ptr()) })
+    }
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_graph_destroy(self.raw.as_ptr()) };
+    }
+}
+
+#[derive(Debug)]
 pub struct F32Buffer {
     raw: NonNull<ffi::BulletOuCudaCppF32Buffer>,
     len: usize,
+}
+
+#[derive(Debug)]
+pub struct F32UploadSlot {
+    buffer: F32Buffer,
+    ready: Event,
+}
+
+impl F32UploadSlot {
+    pub fn new(upload_ctx: &Context, len: usize) -> Result<Self> {
+        Ok(Self { buffer: F32Buffer::new(upload_ctx, len)?, ready: Event::new(upload_ctx)? })
+    }
+
+    pub fn upload(&self, upload_ctx: &Context, values: &[f32]) -> Result<()> {
+        self.buffer.upload(upload_ctx, values)?;
+        self.ready.record(upload_ctx)
+    }
+
+    pub fn wait_on<'a>(&'a self, compute_ctx: &Context) -> Result<&'a F32Buffer> {
+        self.ready.wait(compute_ctx)?;
+        Ok(&self.buffer)
+    }
+
+    pub fn buffer(&self) -> &F32Buffer {
+        &self.buffer
+    }
 }
 
 impl F32Buffer {
@@ -420,12 +522,48 @@ mod ffi {
         _private: [u8; 0],
     }
 
+    #[repr(C)]
+    pub struct BulletOuCudaCppEvent {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct BulletOuCudaCppGraphExec {
+        _private: [u8; 0],
+    }
+
     unsafe extern "C" {
         pub fn bulletou_cuda_cpp_last_error(out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_device_name(device: i32, out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_context_create(device: i32, out: *mut *mut BulletOuCudaCppContext) -> i32;
         pub fn bulletou_cuda_cpp_context_destroy(ctx: *mut BulletOuCudaCppContext) -> i32;
         pub fn bulletou_cuda_cpp_context_synchronize(ctx: *mut BulletOuCudaCppContext) -> i32;
+        pub fn bulletou_cuda_cpp_event_create(
+            ctx: *mut BulletOuCudaCppContext,
+            out: *mut *mut BulletOuCudaCppEvent,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_event_destroy(event: *mut BulletOuCudaCppEvent) -> i32;
+        pub fn bulletou_cuda_cpp_event_record(
+            ctx: *mut BulletOuCudaCppContext,
+            event: *mut BulletOuCudaCppEvent,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_event_wait(ctx: *mut BulletOuCudaCppContext, event: *mut BulletOuCudaCppEvent) -> i32;
+        pub fn bulletou_cuda_cpp_event_synchronize(event: *mut BulletOuCudaCppEvent) -> i32;
+        pub fn bulletou_cuda_cpp_event_elapsed_ms(
+            start: *mut BulletOuCudaCppEvent,
+            stop: *mut BulletOuCudaCppEvent,
+            out_ms: *mut f32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_graph_begin_capture(ctx: *mut BulletOuCudaCppContext) -> i32;
+        pub fn bulletou_cuda_cpp_graph_end_capture(
+            ctx: *mut BulletOuCudaCppContext,
+            out: *mut *mut BulletOuCudaCppGraphExec,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_graph_destroy(graph: *mut BulletOuCudaCppGraphExec) -> i32;
+        pub fn bulletou_cuda_cpp_graph_launch(
+            ctx: *mut BulletOuCudaCppContext,
+            graph: *mut BulletOuCudaCppGraphExec,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_f32_buffer_create(
             ctx: *mut BulletOuCudaCppContext,
             len: usize,
@@ -540,7 +678,33 @@ mod tests {
         let x = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0]).unwrap();
         let y = F32Buffer::from_host(&ctx, &[10.0, 20.0, 30.0]).unwrap();
         let out = F32Buffer::new(&ctx, 3).unwrap();
+        let start = Event::new(&ctx).unwrap();
+        let stop = Event::new(&ctx).unwrap();
+        start.record(&ctx).unwrap();
         axpy_device(&ctx, 3, 2.0, &x, &y, &out).unwrap();
+        stop.record(&ctx).unwrap();
+        stop.synchronize().unwrap();
+        assert!(stop.elapsed_ms_since(&start).unwrap() >= 0.0);
         assert_eq!(out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
+
+        let graph_out = F32Buffer::new(&ctx, 3).unwrap();
+        ctx.begin_capture().unwrap();
+        axpy_device(&ctx, 3, 2.0, &x, &y, &graph_out).unwrap();
+        let graph = ctx.end_capture().unwrap();
+        graph_out.fill(&ctx, 0.0).unwrap();
+        graph.launch(&ctx).unwrap();
+        graph.launch(&ctx).unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(graph_out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
+
+        let upload_ctx = Context::new(0).unwrap();
+        let upload_x = F32UploadSlot::new(&upload_ctx, 3).unwrap();
+        let upload_y = F32UploadSlot::new(&upload_ctx, 3).unwrap();
+        upload_x.upload(&upload_ctx, &[1.0, 2.0, 3.0]).unwrap();
+        upload_y.upload(&upload_ctx, &[10.0, 20.0, 30.0]).unwrap();
+        let upload_out = F32Buffer::new(&ctx, 3).unwrap();
+        axpy_device(&ctx, 3, 2.0, upload_x.wait_on(&ctx).unwrap(), upload_y.wait_on(&ctx).unwrap(), &upload_out)
+            .unwrap();
+        assert_eq!(upload_out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
     }
 }

@@ -39,7 +39,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-029 | done | NNUE idle recompare after external GPU load stopped | remeasure tatara/BulletOu on the same 4M PSV slice with the GPU idle and record a BulletOu recipe that exceeds tatara in speed and accuracy |
 | BO-CUDA-030 | doing | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, improve `SFNN_halfka2_1024_7_64_k3k3` until BulletOu exceeds tatara in train throughput, held-out loss, and held-out accuracy |
 | BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
-| BO-CUDA-032 | doing | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
+| BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
 | BO-CUDA-033 | todo | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
 | BO-CUDA-034 | todo | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 
@@ -630,26 +630,29 @@ the tickets in order and commit each completed slice.
 
 - Added persistent C++/CUDA runtime primitives on top of the BO-CUDA-031 smoke:
   - `bulletou_cuda_cpp_context_create/destroy/synchronize` owns a Windows-native CUDA stream per context;
+  - `bulletou_cuda_cpp_event_create/destroy/record/wait/synchronize/elapsed_ms` exposes cross-stream dependency points and timing;
   - `bulletou_cuda_cpp_f32_buffer_create/destroy/upload/download/fill` owns reusable device allocations;
   - `bulletou_cuda_cpp_axpy_device` launches on persistent buffers rather than doing a host-copy one-shot;
-  - `bulletou_cuda_cpp_ranger_update_device` runs the RAdam reset-gradient phase plus optional Ranger lookahead on persistent device buffers.
+  - `bulletou_cuda_cpp_ranger_update_device` runs the RAdam reset-gradient phase plus optional Ranger lookahead on persistent device buffers;
+  - `bulletou_cuda_cpp_graph_begin_capture/end_capture/launch/destroy` provides generic CUDA Graph capture/replay hooks for fixed train-step launch sequences.
 - Added Rust RAII wrappers:
   - `Context`;
+  - `Event`;
+  - `GraphExec`;
   - `F32Buffer`;
+  - `F32UploadSlot`;
   - `axpy_device`;
   - `ranger_update_device`;
   - `RangerDeviceStateMut`.
 - Updated both C++/CUDA smokes to verify the persistent path:
-  - standalone `bulletou-cuda-cpp-smoke` now checks both host-copy and persistent-device AXPY/Ranger paths;
-  - BulletOu CLI `--backend cuda-cpp --cuda-cpp-smoke` also checks both paths.
+  - standalone `bulletou-cuda-cpp-smoke` now checks host-copy AXPY/Ranger, persistent-device AXPY/Ranger, CUDA event timing, CUDA Graph AXPY replay, and upload-context-to-compute-context event handoff;
+  - BulletOu CLI `--backend cuda-cpp --cuda-cpp-smoke` also checks the persistent, event, graph, and upload-slot paths.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
-  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed matching `axpy_d` / `ranger_d` results;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed matching `axpy_d`, `graph`, `upload`, and `ranger_d` results;
   - `cargo run --features cuda-cpp-backend --example bulletou -- --backend cuda-cpp --cuda-cpp-smoke --eval-type NNUE_HALFKP --teacher dummy --cuda-cpp-device 0` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou` passed.
-- Remaining BO-CUDA-032 work before marking done:
-  - add event wrappers and explicit async upload/download dependency points;
-  - add double-buffer upload slot abstractions for teacher batches;
-  - add CUDA Graph capture/replay hooks for fixed train-step launch sequences.
+- Result:
+  - BO-CUDA-032 is complete as a backend-runtime foundation. BO-CUDA-033 can now allocate persistent NNUE train state, upload teacher batches through `F32UploadSlot` rings, and graph-capture fixed kernel sequences without depending on WSL or cuda-oxide.

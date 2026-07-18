@@ -21,6 +21,17 @@ struct BulletOuCudaCppF32Buffer {
     float* ptr = nullptr;
 };
 
+struct BulletOuCudaCppEvent {
+    int device = 0;
+    cudaEvent_t event = nullptr;
+};
+
+struct BulletOuCudaCppGraphExec {
+    int device = 0;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+};
+
 void set_error(const char* context, cudaError_t status) {
     char buffer[512];
     std::snprintf(
@@ -247,6 +258,50 @@ int set_context_device(BulletOuCudaCppContext* ctx) {
     return 0;
 }
 
+int validate_event(BulletOuCudaCppContext* ctx, BulletOuCudaCppEvent* event, const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (event == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s event must not be null", name);
+        return fail_message(message);
+    }
+    if (event->event == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s event handle must not be null", name);
+        return fail_message(message);
+    }
+    if (event->device != ctx->device) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s event belongs to device %d, context is device %d", name, event->device, ctx->device);
+        return fail_message(message);
+    }
+    return 0;
+}
+
+int validate_graph(BulletOuCudaCppContext* ctx, BulletOuCudaCppGraphExec* graph, const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (graph == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s graph must not be null", name);
+        return fail_message(message);
+    }
+    if (graph->exec == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s graph exec handle must not be null", name);
+        return fail_message(message);
+    }
+    if (graph->device != ctx->device) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s graph belongs to device %d, context is device %d", name, graph->device, ctx->device);
+        return fail_message(message);
+    }
+    return 0;
+}
+
 } // namespace
 
 extern "C" int bulletou_cuda_cpp_last_error(char* out, size_t out_len) {
@@ -331,6 +386,186 @@ extern "C" int bulletou_cuda_cpp_context_synchronize(BulletOuCudaCppContext* ctx
     cudaError_t status = cudaStreamSynchronize(ctx->stream);
     if (status != cudaSuccess) {
         return fail("cudaStreamSynchronize", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_create(BulletOuCudaCppContext* ctx, BulletOuCudaCppEvent** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("event_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    BulletOuCudaCppEvent* event = new BulletOuCudaCppEvent();
+    event->device = ctx->device;
+    cudaError_t status = cudaEventCreateWithFlags(&event->event, cudaEventDefault);
+    if (status != cudaSuccess) {
+        delete event;
+        return fail("cudaEventCreateWithFlags", status);
+    }
+
+    *out = event;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_destroy(BulletOuCudaCppEvent* event) {
+    if (event == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(event->device);
+    if (status != cudaSuccess) {
+        delete event;
+        return fail("cudaSetDevice", status);
+    }
+    if (event->event != nullptr) {
+        status = cudaEventDestroy(event->event);
+        if (status != cudaSuccess) {
+            delete event;
+            return fail("cudaEventDestroy", status);
+        }
+    }
+    delete event;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_record(BulletOuCudaCppContext* ctx, BulletOuCudaCppEvent* event) {
+    if (validate_event(ctx, event, "record") != 0 || set_context_device(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaEventRecord(event->event, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaEventRecord", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_wait(BulletOuCudaCppContext* ctx, BulletOuCudaCppEvent* event) {
+    if (validate_event(ctx, event, "wait") != 0 || set_context_device(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaStreamWaitEvent(ctx->stream, event->event, 0);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamWaitEvent", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_synchronize(BulletOuCudaCppEvent* event) {
+    if (event == nullptr || event->event == nullptr) {
+        return fail_message("event_synchronize event must not be null");
+    }
+    cudaError_t status = cudaSetDevice(event->device);
+    if (status != cudaSuccess) {
+        return fail("cudaSetDevice", status);
+    }
+    status = cudaEventSynchronize(event->event);
+    if (status != cudaSuccess) {
+        return fail("cudaEventSynchronize", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_event_elapsed_ms(
+    BulletOuCudaCppEvent* start,
+    BulletOuCudaCppEvent* stop,
+    float* out_ms) {
+    if (start == nullptr || start->event == nullptr || stop == nullptr || stop->event == nullptr || out_ms == nullptr) {
+        return fail_message("event_elapsed_ms arguments must not be null");
+    }
+    if (start->device != stop->device) {
+        return fail_message("event_elapsed_ms events belong to different devices");
+    }
+    cudaError_t status = cudaSetDevice(start->device);
+    if (status != cudaSuccess) {
+        return fail("cudaSetDevice", status);
+    }
+    status = cudaEventElapsedTime(out_ms, start->event, stop->event);
+    if (status != cudaSuccess) {
+        return fail("cudaEventElapsedTime", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_graph_begin_capture(BulletOuCudaCppContext* ctx) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamBeginCapture", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_graph_end_capture(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppGraphExec** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("graph_end_capture output pointer must not be null");
+    }
+    *out = nullptr;
+
+    cudaGraph_t graph = nullptr;
+    cudaError_t status = cudaStreamEndCapture(ctx->stream, &graph);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamEndCapture", status);
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    status = cudaGraphInstantiate(&exec, graph, 0);
+    if (status != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return fail("cudaGraphInstantiate", status);
+    }
+
+    BulletOuCudaCppGraphExec* graph_exec = new BulletOuCudaCppGraphExec();
+    graph_exec->device = ctx->device;
+    graph_exec->graph = graph;
+    graph_exec->exec = exec;
+    *out = graph_exec;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_graph_destroy(BulletOuCudaCppGraphExec* graph) {
+    if (graph == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(graph->device);
+    if (status != cudaSuccess) {
+        delete graph;
+        return fail("cudaSetDevice", status);
+    }
+    if (graph->exec != nullptr) {
+        status = cudaGraphExecDestroy(graph->exec);
+        if (status != cudaSuccess) {
+            delete graph;
+            return fail("cudaGraphExecDestroy", status);
+        }
+    }
+    if (graph->graph != nullptr) {
+        status = cudaGraphDestroy(graph->graph);
+        if (status != cudaSuccess) {
+            delete graph;
+            return fail("cudaGraphDestroy", status);
+        }
+    }
+    delete graph;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_graph_launch(BulletOuCudaCppContext* ctx, BulletOuCudaCppGraphExec* graph) {
+    if (validate_graph(ctx, graph, "launch") != 0 || set_context_device(ctx) != 0) {
+        return -1;
+    }
+    cudaError_t status = cudaGraphLaunch(graph->exec, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaGraphLaunch", status);
     }
     return ok();
 }

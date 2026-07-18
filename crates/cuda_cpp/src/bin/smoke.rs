@@ -1,5 +1,6 @@
 use bulletou_cuda_cpp::{
-    Context, F32Buffer, RAdamUpdateParams, RangerDeviceStateMut, RangerStateMut, RangerUpdateParams,
+    Context, Event, F32Buffer, F32UploadSlot, RAdamUpdateParams, RangerDeviceStateMut, RangerStateMut,
+    RangerUpdateParams,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,10 +18,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let x_dev = F32Buffer::from_host(&ctx, &[1.0, 2.0, 3.0, 4.0])?;
     let y_dev = F32Buffer::from_host(&ctx, &[10.0, 20.0, 30.0, 40.0])?;
     let out_dev = F32Buffer::new(&ctx, 4)?;
+    let start = Event::new(&ctx)?;
+    let stop = Event::new(&ctx)?;
+    start.record(&ctx)?;
     bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, &x_dev, &y_dev, &out_dev)?;
+    stop.record(&ctx)?;
+    stop.synchronize()?;
+    let axpy_ms = stop.elapsed_ms_since(&start)?;
     let axpy_device = out_dev.download(&ctx)?;
-    println!("  axpy_d : {axpy_device:?}");
+    println!("  axpy_d : {axpy_device:?} ({axpy_ms:.3} ms)");
     assert_eq!(axpy_device, vec![12.0, 24.0, 36.0, 48.0]);
+
+    let graph_out = F32Buffer::new(&ctx, 4)?;
+    ctx.begin_capture()?;
+    bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, &x_dev, &y_dev, &graph_out)?;
+    let graph = ctx.end_capture()?;
+    graph_out.fill(&ctx, 0.0)?;
+    graph.launch(&ctx)?;
+    graph.launch(&ctx)?;
+    ctx.synchronize()?;
+    let graph_axpy = graph_out.download(&ctx)?;
+    println!("  graph  : {graph_axpy:?}");
+    assert_eq!(graph_axpy, vec![12.0, 24.0, 36.0, 48.0]);
+
+    let upload_ctx = Context::new(device)?;
+    let upload_x = F32UploadSlot::new(&upload_ctx, 4)?;
+    let upload_y = F32UploadSlot::new(&upload_ctx, 4)?;
+    upload_x.upload(&upload_ctx, &[1.0, 2.0, 3.0, 4.0])?;
+    upload_y.upload(&upload_ctx, &[10.0, 20.0, 30.0, 40.0])?;
+    let upload_out = F32Buffer::new(&ctx, 4)?;
+    let ready_x = upload_x.wait_on(&ctx)?;
+    let ready_y = upload_y.wait_on(&ctx)?;
+    bulletou_cuda_cpp::axpy_device(&ctx, 4, 2.0, ready_x, ready_y, &upload_out)?;
+    let upload_axpy = upload_out.download(&ctx)?;
+    println!("  upload : {upload_axpy:?}");
+    assert_eq!(upload_axpy, vec![12.0, 24.0, 36.0, 48.0]);
 
     let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
     let mut weights = vec![0.1, -0.2, 0.3, -0.4];
