@@ -775,6 +775,11 @@ the tickets in order and commit each completed slice.
   - the public/debug backward entry remains split so `stm_l0_gradients`, `nstm_l0_gradients`, and pre-gradient buffers stay inspectable for correctness tests;
   - `SfnnTrainStepRunner` now calls a dedicated `bulletou_cuda_cpp_sfnn_backward_train_device` entry that fuses pairwise backward with sparse L0 CReLU backward, avoiding the intermediate pairwise-gradient write/read in the hot train path;
   - the existing ignored SFNN backward smoke still covers the split path, and the train-step runner smoke covers the fused path against the CPU golden.
+- Added double-buffered SFNN upload pipelining for the root direct trainer:
+  - `I32UploadSlot` mirrors the existing `F32UploadSlot`, so sparse feature indices can be uploaded on a separate CUDA stream;
+  - `SfnnTrainStepRunner` owns two `SfnnTrainStepUploadSlot`s containing sparse indices, buckets, targets, entry weights, upload-ready events, and compute-done events;
+  - `step_pipelined_no_readback` uploads the next batch on `upload_ctx`, makes the compute stream wait on the upload-ready event, then records compute-done after Ranger update so slot reuse cannot overwrite buffers still read by kernels;
+  - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2` uses the pipeline for non-profiled direct steps while keeping profiled steps serial for clean stage timings.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -794,7 +799,15 @@ the tickets in order and commit each completed slice.
   - Release bs16k profile before fused backward: `throughput=719579 pos/s`, profile avg upload `0.773ms`, forward `2.887ms`, loss `0.394ms`, backward `11.336ms`, update `4.901ms`, total `20.291ms`.
   - Release bs16k profile after fused backward: `throughput=760770 pos/s`, profile avg upload `0.664ms`, forward `2.820ms`, loss `0.353ms`, backward `10.036ms`, update `4.903ms`, total `18.776ms`.
   - Release bs65k short probe after fused backward: `throughput=921239 pos/s`, profile avg upload `3.091ms`, forward `10.234ms`, loss `1.167ms`, backward `38.634ms`, update `4.919ms`, total `58.045ms`.
+  - Upload-pipelined smokes passed:
+    `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` (including `I32UploadSlot`),
+    `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture`,
+    `cargo check --features cuda-cpp-backend --example bulletou`, and
+    `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture`.
+  - Release bs65k no-profile direct smoke after upload pipelining:
+    `--cuda-cpp-train-steps 50 --batch-size 65536 --buffer-mb 512 --threads 10 --sfnn-factorized-l1` reported `throughput=1064822 pos/s`;
+    a shorter post-display-change bs65k/20-step smoke reported `throughput=1059357 pos/s`.
 - Remaining BO-CUDA-034 work:
   - add SFNN direct output/checkpoint/resume support after the runner exists;
-  - add upload/compute pipelining and deeper backward profiling/optimisation; current C++ direct speed is still below the tatara target (`~1.29M pos/s`);
+  - add deeper backward profiling/optimisation; current C++ direct speed is improved but still below the tatara target (`~1.29M pos/s`);
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.

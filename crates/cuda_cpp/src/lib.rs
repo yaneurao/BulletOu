@@ -160,6 +160,12 @@ pub struct F32UploadSlot {
     ready: Event,
 }
 
+#[derive(Debug)]
+pub struct I32UploadSlot {
+    buffer: I32Buffer,
+    ready: Event,
+}
+
 impl F32UploadSlot {
     pub fn new(upload_ctx: &Context, len: usize) -> Result<Self> {
         Ok(Self { buffer: F32Buffer::new(upload_ctx, len)?, ready: Event::new(upload_ctx)? })
@@ -176,6 +182,26 @@ impl F32UploadSlot {
     }
 
     pub fn buffer(&self) -> &F32Buffer {
+        &self.buffer
+    }
+}
+
+impl I32UploadSlot {
+    pub fn new(upload_ctx: &Context, len: usize) -> Result<Self> {
+        Ok(Self { buffer: I32Buffer::new(upload_ctx, len)?, ready: Event::new(upload_ctx)? })
+    }
+
+    pub fn upload(&self, upload_ctx: &Context, values: &[i32]) -> Result<()> {
+        self.buffer.upload(upload_ctx, values)?;
+        self.ready.record(upload_ctx)
+    }
+
+    pub fn wait_on<'a>(&'a self, compute_ctx: &Context) -> Result<&'a I32Buffer> {
+        self.ready.wait(compute_ctx)?;
+        Ok(&self.buffer)
+    }
+
+    pub fn buffer(&self) -> &I32Buffer {
         &self.buffer
     }
 }
@@ -2590,6 +2616,85 @@ pub struct SfnnTrainWeightsReadback {
 }
 
 #[derive(Debug)]
+pub struct SfnnTrainStepUploadSlot {
+    pub device_batch: SfnnForwardDeviceBatch,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+    upload_ready: Event,
+    compute_done: Event,
+    in_use: bool,
+}
+
+impl SfnnTrainStepUploadSlot {
+    pub fn new(ctx: &Context, batch_size: usize, max_active: usize) -> Result<Self> {
+        if batch_size == 0 {
+            return Err(CudaCppError::message("SFNN upload slot batch_size must be greater than zero"));
+        }
+        if max_active == 0 {
+            return Err(CudaCppError::message("SFNN upload slot max_active must be greater than zero"));
+        }
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("SFNN upload slot sparse length overflow"))?;
+        Ok(Self {
+            device_batch: SfnnForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+                buckets: I32Buffer::new(ctx, batch_size)?,
+            },
+            targets: F32Buffer::new(ctx, batch_size)?,
+            entry_weights: F32Buffer::new(ctx, batch_size)?,
+            upload_ready: Event::new(ctx)?,
+            compute_done: Event::new(ctx)?,
+            in_use: false,
+        })
+    }
+
+    fn upload(&mut self, upload_ctx: &Context, batch: SfnnTrainStepHostBatch<'_>) -> Result<()> {
+        batch.validate()?;
+        if batch.batch_size != self.device_batch.batch_size || batch.max_active != self.device_batch.max_active {
+            return Err(CudaCppError::message(format!(
+                "SFNN upload slot batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.device_batch.batch_size, self.device_batch.max_active
+            )));
+        }
+        if self.in_use {
+            self.compute_done.wait(upload_ctx)?;
+        }
+        self.device_batch.stm_indices.upload(upload_ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(upload_ctx, batch.nstm_indices)?;
+        self.device_batch.buckets.upload(upload_ctx, batch.buckets)?;
+        self.targets.upload(upload_ctx, batch.targets)?;
+        self.entry_weights.upload(upload_ctx, batch.entry_weights)?;
+        self.upload_ready.record(upload_ctx)?;
+        self.in_use = true;
+        Ok(())
+    }
+
+    fn wait_upload_on(&self, compute_ctx: &Context) -> Result<()> {
+        self.upload_ready.wait(compute_ctx)
+    }
+
+    fn record_compute_done(&self, compute_ctx: &Context) -> Result<()> {
+        self.compute_done.record(compute_ctx)
+    }
+
+    fn validate(&self, batch_size: usize, max_active: usize) -> Result<()> {
+        if self.device_batch.batch_size != batch_size || self.device_batch.max_active != max_active {
+            return Err(CudaCppError::message(format!(
+                "SFNN upload slot layout mismatch: slot batch_size={} max_active={}, expected batch_size={} max_active={}",
+                self.device_batch.batch_size, self.device_batch.max_active, batch_size, max_active
+            )));
+        }
+        self.device_batch.validate()?;
+        expect_len("sfnn upload slot targets", batch_size, self.targets.len())?;
+        expect_len("sfnn upload slot entry_weights", batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug)]
 pub struct SfnnTrainStepRunner {
     pub shape: SfnnForwardShape,
     pub batch_size: usize,
@@ -2602,6 +2707,8 @@ pub struct SfnnTrainStepRunner {
     pub forward_workspace: SfnnForwardWorkspace,
     pub loss_workspace: ScalarLossWorkspace,
     pub backward_workspace: SfnnBackwardWorkspace,
+    pub upload_slots: Vec<SfnnTrainStepUploadSlot>,
+    pub next_upload_slot: usize,
 }
 
 impl SfnnTrainStepRunner {
@@ -2646,6 +2753,10 @@ impl SfnnTrainStepRunner {
         let sparse_len = batch_size
             .checked_mul(max_active)
             .ok_or_else(|| CudaCppError::message("SFNN train-step sparse length overflow"))?;
+        let mut upload_slots = Vec::with_capacity(2);
+        for _ in 0..2 {
+            upload_slots.push(SfnnTrainStepUploadSlot::new(ctx, batch_size, max_active)?);
+        }
         Ok(Self {
             shape,
             batch_size,
@@ -2667,6 +2778,8 @@ impl SfnnTrainStepRunner {
                 ctx,
                 SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active),
             )?,
+            upload_slots,
+            next_upload_slot: 0,
         })
     }
 
@@ -2725,6 +2838,60 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace,
         )?;
         self.update_weights(ctx, params)
+    }
+
+    pub fn step_pipelined_no_readback(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "SFNN train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+        if self.upload_slots.is_empty() {
+            return Err(CudaCppError::message("SFNN train-step runner has no upload slots"));
+        }
+
+        let slot_idx = self.next_upload_slot;
+        self.next_upload_slot = (self.next_upload_slot + 1) % self.upload_slots.len();
+        {
+            let slot = &mut self.upload_slots[slot_idx];
+            slot.upload(upload_ctx, batch)?;
+        }
+        {
+            let slot = &self.upload_slots[slot_idx];
+            slot.wait_upload_on(ctx)?;
+            sfnn_forward_device(ctx, &slot.device_batch, &self.weights, &self.forward_workspace)?;
+            scalar_loss_device_from_buffers(
+                ctx,
+                loss_kind,
+                output_inv_scale,
+                self.batch_size,
+                &self.forward_workspace.output,
+                &slot.targets,
+                &slot.entry_weights,
+                &self.loss_workspace,
+            )?;
+            sfnn_backward_train_device(
+                ctx,
+                &slot.device_batch,
+                &self.weights,
+                &self.forward_workspace,
+                &self.loss_workspace,
+                &self.backward_workspace,
+            )?;
+        }
+        self.update_weights(ctx, params)?;
+        self.upload_slots[slot_idx].record_compute_done(ctx)
     }
 
     pub fn step_profiled_no_readback(
@@ -2828,7 +2995,18 @@ impl SfnnTrainStepRunner {
         self.loss_workspace.validate()?;
         self.backward_workspace.validate()?;
         expect_len("sfnn train targets", self.batch_size, self.targets.len())?;
-        expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())
+        expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())?;
+        if self.next_upload_slot >= self.upload_slots.len() {
+            return Err(CudaCppError::message(format!(
+                "SFNN next upload slot {} is out of range for {} slots",
+                self.next_upload_slot,
+                self.upload_slots.len()
+            )));
+        }
+        for slot in &self.upload_slots {
+            slot.validate(self.batch_size, self.max_active)?;
+        }
+        Ok(())
     }
 
     fn validate_optional_l1f_state_matches_weights(&self) -> Result<()> {
@@ -3919,6 +4097,50 @@ mod tests {
         assert_close_slice("train sfnn l2b", &actual.l2b, &expected.l2b, 1.0e-6);
         assert_close_slice("train sfnn l3w", &actual.l3w, &expected.l3w, 1.0e-6);
         assert_close_slice("train sfnn l3b", &actual.l3b, &expected.l3b, 1.0e-6);
+
+        let upload_ctx = Context::new(0).unwrap();
+        let mut pipelined_runner = SfnnTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active).unwrap();
+        pipelined_runner
+            .step_pipelined_no_readback(
+                &ctx,
+                &upload_ctx,
+                params,
+                ScalarLossKind::SigmoidMse,
+                1.0,
+                SfnnTrainStepHostBatch {
+                    stm_indices: batch.stm_indices,
+                    nstm_indices: batch.nstm_indices,
+                    buckets: batch.buckets,
+                    targets: &targets,
+                    entry_weights: &entry_weights,
+                    batch_size: batch.batch_size,
+                    max_active: batch.max_active,
+                },
+            )
+            .unwrap();
+        let pipelined_loss = pipelined_runner.read_loss(&ctx).unwrap();
+        assert!(pipelined_loss.mean.is_finite());
+        let pipelined = pipelined_runner.read_weights(&ctx).unwrap();
+        assert_close_slice("pipelined train sfnn l0w", &pipelined.l0w, &expected.l0w, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l0b", &pipelined.l0b, &expected.l0b, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l1w", &pipelined.l1w, &expected.l1w, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l1b", &pipelined.l1b, &expected.l1b, 1.0e-6);
+        assert_close_slice(
+            "pipelined train sfnn l1fw",
+            pipelined.l1fw.as_deref().unwrap(),
+            expected.l1fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "pipelined train sfnn l1fb",
+            pipelined.l1fb.as_deref().unwrap(),
+            expected.l1fb.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice("pipelined train sfnn l2w", &pipelined.l2w, &expected.l2w, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l2b", &pipelined.l2b, &expected.l2b, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l3w", &pipelined.l3w, &expected.l3w, 1.0e-6);
+        assert_close_slice("pipelined train sfnn l3b", &pipelined.l3b, &expected.l3b, 1.0e-6);
     }
 
     #[test]
@@ -3956,6 +4178,10 @@ mod tests {
         axpy_device(&ctx, 3, 2.0, upload_x.wait_on(&ctx).unwrap(), upload_y.wait_on(&ctx).unwrap(), &upload_out)
             .unwrap();
         assert_eq!(upload_out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
+
+        let upload_i = I32UploadSlot::new(&upload_ctx, 3).unwrap();
+        upload_i.upload(&upload_ctx, &[7, 8, 9]).unwrap();
+        assert_eq!(upload_i.wait_on(&ctx).unwrap().download(&ctx).unwrap(), vec![7, 8, 9]);
     }
 
     fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {

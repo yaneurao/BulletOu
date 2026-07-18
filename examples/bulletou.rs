@@ -3264,6 +3264,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     if profile_steps > 0 {
         eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
     }
+    eprintln!("  cuda-cpp SFNN upload pipeline = enabled (2 slots; non-profiled steps)");
 
     let initial_weights = build_sfnn_halfka2_initial_weights_for_cuda_cpp(args)?;
     let cuda_shape = initial_weights.shape;
@@ -3284,6 +3285,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let max_active = ShogiHalfKa2.max_active();
     let mut runner =
         SfnnTrainStepRunner::new(&ctx, initial_host_weights, batch_size, max_active).map_err(|e| e.to_string())?;
+    let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind =
         if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
@@ -3370,7 +3372,9 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
                 profile.total_ms
             );
         } else {
-            runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+            runner
+                .step_pipelined_no_readback(&ctx, &upload_ctx, params, loss_kind, output_inv_scale, batch)
+                .map_err(|e| e.to_string())?;
         }
         let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
         if should_report {
