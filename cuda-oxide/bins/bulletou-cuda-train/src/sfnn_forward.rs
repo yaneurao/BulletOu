@@ -50,54 +50,26 @@ pub(crate) fn launch_sfnn_forward_with_l0(
     let l2_size = shape.l2_size as u32;
     let num_stacks = shape.num_stacks as u32;
 
+    let sparse_l0_pairwise_threads = layout.batch_size.saturating_mul(shape.ft_size / 2);
     unsafe {
-        // SAFETY: kernel ABI matches `sfnn_sparse_l0_crelu`; all buffers are
-        // device allocations owned by the same CUDA context and live until the
-        // caller synchronizes or launches subsequent same-stream work.
+        // SAFETY: kernel ABI matches `sfnn_sparse_l0_pairwise_concat`; all
+        // buffers are device allocations owned by the same CUDA context. The
+        // SFNN pairwise layer requires an even FT size and validated layouts
+        // ensure all written activation/combined indices are in range.
         cuda_launch! {
-            kernel: crate::kernels::sfnn::sfnn_sparse_l0_crelu,
+            kernel: crate::kernels::sfnn::sfnn_sparse_l0_pairwise_concat,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.sparse_l0_threads_per_perspective),
+            config: cfg_1d(sparse_l0_pairwise_threads),
             args: [
                 slice(batch.stm_indices),
-                slice(l0w),
-                slice(weights.l0b),
-                slice_mut(workspace.stm_l0),
-                batch_size, max_active, input_size, ft_size
-            ]
-        }
-    }?;
-    unsafe {
-        // SAFETY: same ABI and lifetime guarantees as the stm L0 launch, using
-        // the opponent-perspective sparse input and output buffer.
-        cuda_launch! {
-            kernel: crate::kernels::sfnn::sfnn_sparse_l0_crelu,
-            stream: stream.clone(),
-            module: module.clone(),
-            config: cfg_1d(plan.sparse_l0_threads_per_perspective),
-            args: [
                 slice(batch.nstm_indices),
                 slice(l0w),
                 slice(weights.l0b),
+                slice_mut(workspace.stm_l0),
                 slice_mut(workspace.nstm_l0),
-                batch_size, max_active, input_size, ft_size
-            ]
-        }
-    }?;
-    unsafe {
-        // SAFETY: pairwise concat reads the two L0 buffers written earlier in
-        // the same stream and writes the combined buffer once.
-        cuda_launch! {
-            kernel: crate::kernels::sfnn::sfnn_pairwise_concat,
-            stream: stream.clone(),
-            module: module.clone(),
-            config: cfg_1d(plan.pairwise_concat_threads),
-            args: [
-                slice(workspace.stm_l0),
-                slice(workspace.nstm_l0),
                 slice_mut(workspace.combined),
-                batch_size, ft_size
+                batch_size, max_active, input_size, ft_size
             ]
         }
     }?;

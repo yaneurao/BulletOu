@@ -555,3 +555,11 @@ commit each completed slice.
   - command shape: `--sfnn-teacher-train --sfnn-factorized-l1 --teacher teacher-all.psv --test-teacher /mnt/c/shogi/teacher/test/yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --score-drop-abs 0 --batch-size 16384 --teacher-batch-size 131072 --train-steps 3072 --batches-per-superbatch 3072 --optimizer-weight-decay 0 --learning-rate 0.000875 --lr-schedule step`;
   - result: `50331648` positions in `53.940s`, `933104` pos/s, `test_loss=0.073467635`, `test_acc=0.62983704`;
   - this is a modest speed improvement over the earlier bs16k full-superbatch speed line, but still far below the tatara full-epoch speed target; next bottlenecks are the dense RAdam update, sparse L0 backward atomics, and upload/compute pipeline overlap.
+- Added a fused SFNN forward L0/pairwise path:
+  - the new kernel computes both perspective L0 CReLU row-pairs and writes the pairwise-concat buffer in one launch, replacing the former `stm_l0`, `nstm_l0`, and `pairwise_concat` launches;
+  - `--sfnn-forward-smoke --sfnn-forward-case halfka2-factorized-nonzero-virtual` and `--sfnn-ranger-step-smoke --sfnn-forward-case factorized-tiny` passed against CPU goldens with `bulletou_cuda_train_bo042.cubin`;
+  - bo042 bs65k/50M yamaoka probe with `beta1=0.9`, `wd=0`, LR `0.014`: `50331648` positions in `35.046s`, `1436154` pos/s, `test_loss=0.07165658`, `test_acc=0.63778687`.
+- Full-epoch bs65k yamaoka probes:
+  - bo039, `wd=0`, `beta1=0.99`, LR `0.014`: `649265152` positions in `447.735s`, `1450109` pos/s, `test_loss=0.067095526`, `test_acc=0.652298`;
+  - bo039, `wd=0`, `beta1=0.9`, LR `0.014`: `649265152` positions in `451.525s`, `1437937` pos/s, `test_loss=0.06694752`, `test_acc=0.6571045`;
+  - speed now clears the tatara target, but held-out loss/accuracy are still short of tatara's `0.064964` / `0.663361`; a bs49k full-epoch quality/speed probe is in progress.

@@ -75,6 +75,84 @@ pub fn sfnn_sparse_l0_crelu(
     }
 }
 
+#[kernel]
+pub fn sfnn_sparse_l0_pairwise_concat(
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    weights: &[f32],
+    bias: &[f32],
+    mut stm_output: DisjointSlice<f32>,
+    mut nstm_output: DisjointSlice<f32>,
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    max_active: u32,
+    input_size: u32,
+    rows: u32,
+) {
+    let tid = thread::index_1d();
+    let row_pairs = (rows as usize) / 2;
+    let total = (batch as usize) * row_pairs;
+    if tid.get() >= total {
+        return;
+    }
+
+    let pair = tid.get() % row_pairs;
+    let sample = tid.get() / row_pairs;
+    let rows = rows as usize;
+    let row0 = pair;
+    let row1 = row_pairs + pair;
+    let l0_base = sample * rows;
+    let sparse_base = sample * (max_active as usize);
+    let mut stm_sum0 = bias[row0];
+    let mut stm_sum1 = bias[row1];
+    let mut nstm_sum0 = bias[row0];
+    let mut nstm_sum1 = bias[row1];
+
+    for slot in 0..(max_active as usize) {
+        let stm_feature = stm_indices[sparse_base + slot];
+        if stm_feature >= 0 && (stm_feature as u32) < input_size {
+            let feature = stm_feature as u32;
+            let weight_base = (feature as usize) * rows;
+            stm_sum0 += weights[weight_base + row0];
+            stm_sum1 += weights[weight_base + row1];
+            if let Some(virtual_feature) = sfnn_forward_halfka2_ft_factorized_virtual_feature(feature, input_size) {
+                let virtual_weight_base = (virtual_feature as usize) * rows;
+                stm_sum0 += weights[virtual_weight_base + row0];
+                stm_sum1 += weights[virtual_weight_base + row1];
+            }
+        }
+
+        let nstm_feature = nstm_indices[sparse_base + slot];
+        if nstm_feature >= 0 && (nstm_feature as u32) < input_size {
+            let feature = nstm_feature as u32;
+            let weight_base = (feature as usize) * rows;
+            nstm_sum0 += weights[weight_base + row0];
+            nstm_sum1 += weights[weight_base + row1];
+            if let Some(virtual_feature) = sfnn_forward_halfka2_ft_factorized_virtual_feature(feature, input_size) {
+                let virtual_weight_base = (virtual_feature as usize) * rows;
+                nstm_sum0 += weights[virtual_weight_base + row0];
+                nstm_sum1 += weights[virtual_weight_base + row1];
+            }
+        }
+    }
+
+    let stm0 = sfnn_crelu(stm_sum0);
+    let stm1 = sfnn_crelu(stm_sum1);
+    let nstm0 = sfnn_crelu(nstm_sum0);
+    let nstm1 = sfnn_crelu(nstm_sum1);
+    let idx0 = l0_base + row0;
+    let idx1 = l0_base + row1;
+    let combined_base = sample * rows;
+    unsafe {
+        *stm_output.get_unchecked_mut(idx0) = stm0;
+        *stm_output.get_unchecked_mut(idx1) = stm1;
+        *nstm_output.get_unchecked_mut(idx0) = nstm0;
+        *nstm_output.get_unchecked_mut(idx1) = nstm1;
+        *combined.get_unchecked_mut(combined_base + pair) = stm0 * stm1 * (127.0_f32 / 128.0_f32);
+        *combined.get_unchecked_mut(combined_base + row_pairs + pair) = nstm0 * nstm1 * (127.0_f32 / 128.0_f32);
+    }
+}
+
 #[device]
 fn sfnn_forward_halfka2_ft_factorized_virtual_feature(feature: u32, input_size: u32) -> Option<u32> {
     if input_size == SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE {
