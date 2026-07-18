@@ -720,6 +720,354 @@ __device__ float crelu_pre_gradient_from_value(float activation, float output_gr
     return activation > 0.0f && activation < 1.0f ? output_gradient : 0.0f;
 }
 
+__global__ void sfnn_stacked_l3_backward_kernel(
+    const float* inputs,
+    const float* output_gradients,
+    const float* weights,
+    const int* buckets,
+    float* input_gradients,
+    float* l1_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t l1_out,
+    size_t num_stacks) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_dim;
+    size_t l1_gradient_len = batch * l1_out;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_dim;
+        size_t row = tid - sample * input_dim;
+        int stack_i32 = buckets[sample];
+        float value = 0.0f;
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            float output_gradient = output_gradients[sample];
+            value = output_gradient * weights[stack * input_dim + row];
+            atomicAdd(&weight_gradients[stack * input_dim + row], output_gradient * inputs[tid]);
+        }
+        input_gradients[tid] = value;
+    }
+
+    if (tid < l1_gradient_len) {
+        size_t sample = tid / l1_out;
+        size_t col = tid - sample * l1_out;
+        l1_gradients[tid] = (col + 1 == l1_out) ? output_gradients[sample] : 0.0f;
+    }
+
+    if (tid < batch) {
+        int stack_i32 = buckets[tid];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            atomicAdd(&bias_gradients[static_cast<size_t>(stack_i32)], output_gradients[tid]);
+        }
+    }
+}
+
+__global__ void sfnn_stacked_crelu_backward_kernel(
+    const float* inputs,
+    const float* activations,
+    const float* output_gradients,
+    const float* weights,
+    const int* buckets,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_dim;
+    size_t weight_scatter_len = batch * input_dim * output_dim;
+    size_t bias_scatter_len = batch * output_dim;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_dim;
+        size_t in_col = tid - sample * input_dim;
+        int stack_i32 = buckets[sample];
+        float sum = 0.0f;
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t stack_base = stack * output_dim * input_dim;
+            for (size_t out_col = 0; out_col < output_dim; ++out_col) {
+                size_t out_idx = sample * output_dim + out_col;
+                float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+                sum += grad * weights[stack_base + out_col * input_dim + in_col];
+            }
+        }
+        input_gradients[tid] = sum;
+    }
+
+    if (tid < weight_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t input_entry = tid / output_dim;
+        size_t in_col = input_entry % input_dim;
+        size_t sample = input_entry / input_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t out_idx = sample * output_dim + out_col;
+            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+            atomicAdd(&weight_gradients[weight_idx], grad * inputs[sample * input_dim + in_col]);
+        }
+    }
+
+    if (tid < bias_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t sample = tid / output_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t out_idx = sample * output_dim + out_col;
+            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+        }
+    }
+}
+
+__global__ void sfnn_l2_input_backward_kernel(
+    const float* l1,
+    const float* l2_input,
+    const float* l2_input_gradients,
+    float* l1_gradients,
+    size_t batch,
+    size_t l1_hidden) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t l1_out = l1_hidden + 1;
+    size_t total = batch * l1_out;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t sample = tid / l1_out;
+    size_t col = tid - sample * l1_out;
+    if (col >= l1_hidden) {
+        return;
+    }
+
+    size_t l2_input_dim = l1_hidden * 2;
+    size_t l2_base = sample * l2_input_dim;
+    size_t square_idx = l2_base + col;
+    size_t linear_idx = l2_base + l1_hidden + col;
+    float value = l1[tid];
+    float square_grad = crelu_pre_gradient_from_value(l2_input[square_idx], l2_input_gradients[square_idx]) *
+        (2.0f * value * SFNN_PAIRWISE_SCALE);
+    float linear_grad = crelu_pre_gradient_from_value(l2_input[linear_idx], l2_input_gradients[linear_idx]);
+    l1_gradients[tid] += square_grad + linear_grad;
+}
+
+__global__ void sfnn_stacked_affine_backward_kernel(
+    const float* inputs,
+    const float* output_gradients,
+    const float* weights,
+    const int* buckets,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_dim;
+    size_t weight_scatter_len = batch * input_dim * output_dim;
+    size_t bias_scatter_len = batch * output_dim;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_dim;
+        size_t in_col = tid - sample * input_dim;
+        int stack_i32 = buckets[sample];
+        float sum = 0.0f;
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t stack_base = stack * output_dim * input_dim;
+            for (size_t out_col = 0; out_col < output_dim; ++out_col) {
+                sum += output_gradients[sample * output_dim + out_col] *
+                    weights[stack_base + out_col * input_dim + in_col];
+            }
+        }
+        input_gradients[tid] = sum;
+    }
+
+    if (tid < weight_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t input_entry = tid / output_dim;
+        size_t in_col = input_entry % input_dim;
+        size_t sample = input_entry / input_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+            float grad = output_gradients[sample * output_dim + out_col] * inputs[sample * input_dim + in_col];
+            atomicAdd(&weight_gradients[weight_idx], grad);
+        }
+    }
+
+    if (tid < bias_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t sample = tid / output_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            atomicAdd(&bias_gradients[stack * output_dim + out_col], output_gradients[tid]);
+        }
+    }
+}
+
+__global__ void sfnn_factorized_l1_backward_kernel(
+    const float* inputs,
+    const float* output_gradients,
+    const float* weights,
+    const float* shared_weights,
+    const int* buckets,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    float* shared_weight_gradients,
+    float* shared_bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t input_gradient_len = batch * input_dim;
+    size_t weight_scatter_len = batch * input_dim * output_dim;
+    size_t bias_scatter_len = batch * output_dim;
+
+    if (tid < input_gradient_len) {
+        size_t sample = tid / input_dim;
+        size_t in_col = tid - sample * input_dim;
+        int stack_i32 = buckets[sample];
+        float sum = 0.0f;
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            size_t stack_base = stack * output_dim * input_dim;
+            for (size_t out_col = 0; out_col < output_dim; ++out_col) {
+                float grad = output_gradients[sample * output_dim + out_col];
+                float stacked_weight = weights[stack_base + out_col * input_dim + in_col];
+                float shared_weight = shared_weights[in_col * output_dim + out_col];
+                sum += grad * (stacked_weight + shared_weight);
+            }
+        }
+        input_gradients[tid] = sum;
+    }
+
+    if (tid < weight_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t input_entry = tid / output_dim;
+        size_t in_col = input_entry % input_dim;
+        size_t sample = input_entry / input_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            float grad = output_gradients[sample * output_dim + out_col] * inputs[sample * input_dim + in_col];
+            size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+            size_t shared_weight_idx = in_col * output_dim + out_col;
+            atomicAdd(&weight_gradients[weight_idx], grad);
+            atomicAdd(&shared_weight_gradients[shared_weight_idx], grad);
+        }
+    }
+
+    if (tid < bias_scatter_len) {
+        size_t out_col = tid % output_dim;
+        size_t sample = tid / output_dim;
+        int stack_i32 = buckets[sample];
+        if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
+            size_t stack = static_cast<size_t>(stack_i32);
+            float grad = output_gradients[tid];
+            atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
+            atomicAdd(&shared_bias_gradients[out_col], grad);
+        }
+    }
+}
+
+__global__ void sfnn_pairwise_backward_kernel(
+    const float* stm_l0,
+    const float* nstm_l0,
+    const float* combined_gradients,
+    float* stm_gradients,
+    float* nstm_gradients,
+    size_t batch,
+    size_t ft_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * ft_size;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t pairwise = ft_size / 2;
+    size_t sample = tid / ft_size;
+    size_t col = tid - sample * ft_size;
+    size_t pair = col % pairwise;
+    size_t mate_col = col < pairwise ? pairwise + pair : pair;
+    size_t l0_base = sample * ft_size;
+    size_t combined_base = sample * ft_size;
+    stm_gradients[tid] = combined_gradients[combined_base + pair] * stm_l0[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
+    nstm_gradients[tid] =
+        combined_gradients[combined_base + pairwise + pair] * nstm_l0[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
+}
+
+__device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value) {
+    size_t weight_idx = feature * rows + row;
+    atomicAdd(&gradients[weight_idx], value);
+    size_t virtual_feature = 0;
+    if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
+        atomicAdd(&gradients[virtual_feature * rows + row], value);
+    }
+}
+
+__global__ void sfnn_l0_sparse_backward_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_activations,
+    const float* nstm_activations,
+    const float* stm_output_gradients,
+    const float* nstm_output_gradients,
+    float* stm_pre_gradients,
+    float* nstm_pre_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t ft_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t l0_len = batch * ft_size;
+    if (tid >= l0_len) {
+        return;
+    }
+
+    size_t row = tid % ft_size;
+    size_t sample = tid / ft_size;
+    size_t sparse_base = sample * max_active;
+    float stm_grad = crelu_pre_gradient_from_value(stm_activations[tid], stm_output_gradients[tid]);
+    float nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid], nstm_output_gradients[tid]);
+    stm_pre_gradients[tid] = stm_grad;
+    nstm_pre_gradients[tid] = nstm_grad;
+
+    if (stm_grad != 0.0f || nstm_grad != 0.0f) {
+        atomicAdd(&l0b_gradients[row], stm_grad + nstm_grad);
+    } else {
+        return;
+    }
+
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int stm_feature = stm_indices[sparse_base + slot];
+        if (stm_grad != 0.0f && stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad);
+        }
+
+        int nstm_feature = nstm_indices[sparse_base + slot];
+        if (nstm_grad != 0.0f && nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            sfnn_atomic_add_l0w_gradient(
+                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad);
+        }
+    }
+}
+
 __global__ void dense_output_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -1300,6 +1648,259 @@ int launch_sfnn_forward_kernels(
     sfnn_stacked_l3_output_kernel<<<blocks, threads, 0, ctx->stream>>>(
         l2, l1, l3w, l3b, buckets, output, batch, l2_size, l1_hidden, num_stacks);
     if (check_kernel_launch("sfnn_stacked_l3_output_kernel launch") != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int launch_fill_f32_raw(BulletOuCudaCppContext* ctx, float* ptr, size_t len, float value, const char* label) {
+    if (len == 0) {
+        return 0;
+    }
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (block_count_1d(len, threads, &blocks, label) != 0) {
+        return -1;
+    }
+    fill_f32_kernel<<<blocks, threads, 0, ctx->stream>>>(len, value, ptr);
+    if (check_kernel_launch(label) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_zero_sfnn_backward_parameter_gradients(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    float* l1w_gradients,
+    float* l1b_gradients,
+    float* l1fw_gradients,
+    float* l1fb_gradients,
+    float* l2w_gradients,
+    float* l2b_gradients,
+    float* l3w_gradients,
+    float* l3b_gradients) {
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+    if (launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l0b_gradients, ft_size, 0.0f, "sfnn zero l0b_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l1w_gradients, num_stacks * l1_out * ft_size, 0.0f, "sfnn zero l1w_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l1b_gradients, num_stacks * l1_out, 0.0f, "sfnn zero l1b_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l1fw_gradients, ft_size * l1_out, 0.0f, "sfnn zero l1fw_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l1fb_gradients, l1_out, 0.0f, "sfnn zero l1fb_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l2w_gradients, num_stacks * l2_size * l2_in, 0.0f, "sfnn zero l2w_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l2b_gradients, num_stacks * l2_size, 0.0f, "sfnn zero l2b_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l3w_gradients, num_stacks * l2_size, 0.0f, "sfnn zero l3w_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, l3b_gradients, num_stacks, 0.0f, "sfnn zero l3b_gradients") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_sfnn_backward_kernels(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const int* buckets,
+    const float* stm_l0,
+    const float* nstm_l0,
+    const float* combined,
+    const float* l1,
+    const float* l2_input,
+    const float* l2,
+    const float* l1w,
+    const float* l1fw,
+    int has_l1f,
+    const float* l2w,
+    const float* l3w,
+    const float* mean_output_gradients,
+    float* l2_gradients,
+    float* l1_gradients,
+    float* l2_input_gradients,
+    float* combined_gradients,
+    float* stm_l0_gradients,
+    float* nstm_l0_gradients,
+    float* stm_l0_pre_gradients,
+    float* nstm_l0_pre_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    float* l1w_gradients,
+    float* l1b_gradients,
+    float* l1fw_gradients,
+    float* l1fb_gradients,
+    float* l2w_gradients,
+    float* l2b_gradients,
+    float* l3w_gradients,
+    float* l3b_gradients) {
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+    constexpr int threads = 256;
+    int blocks = 0;
+
+    if (launch_zero_sfnn_backward_parameter_gradients(
+            ctx,
+            input_size,
+            ft_size,
+            l1_hidden,
+            l2_size,
+            num_stacks,
+            l0w_gradients,
+            l0b_gradients,
+            l1w_gradients,
+            l1b_gradients,
+            l1fw_gradients,
+            l1fb_gradients,
+            l2w_gradients,
+            l2b_gradients,
+            l3w_gradients,
+            l3b_gradients) != 0) {
+        return -1;
+    }
+
+    size_t l3_threads = std::max(batch * l2_size, batch * l1_out);
+    l3_threads = std::max(l3_threads, batch);
+    if (block_count_1d(l3_threads, threads, &blocks, "sfnn_stacked_l3_backward_kernel") != 0) {
+        return -1;
+    }
+    sfnn_stacked_l3_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        l2,
+        mean_output_gradients,
+        l3w,
+        buckets,
+        l2_gradients,
+        l1_gradients,
+        l3w_gradients,
+        l3b_gradients,
+        batch,
+        l2_size,
+        l1_out,
+        num_stacks);
+    if (check_kernel_launch("sfnn_stacked_l3_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l2_threads = std::max(batch * l2_in, batch * l2_in * l2_size);
+    l2_threads = std::max(l2_threads, batch * l2_size);
+    if (block_count_1d(l2_threads, threads, &blocks, "sfnn_stacked_crelu_backward_kernel") != 0) {
+        return -1;
+    }
+    sfnn_stacked_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        l2_input,
+        l2,
+        l2_gradients,
+        l2w,
+        buckets,
+        l2_input_gradients,
+        l2w_gradients,
+        l2b_gradients,
+        batch,
+        l2_in,
+        l2_size,
+        num_stacks);
+    if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_l2_input_backward_kernel") != 0) {
+        return -1;
+    }
+    sfnn_l2_input_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden);
+    if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
+    l1_threads = std::max(l1_threads, batch * l1_out);
+    if (block_count_1d(l1_threads, threads, &blocks, "sfnn_l1_backward_kernel") != 0) {
+        return -1;
+    }
+    if (has_l1f != 0) {
+        sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            combined,
+            l1_gradients,
+            l1w,
+            l1fw,
+            buckets,
+            combined_gradients,
+            l1w_gradients,
+            l1b_gradients,
+            l1fw_gradients,
+            l1fb_gradients,
+            batch,
+            ft_size,
+            l1_out,
+            num_stacks);
+        if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
+            return -1;
+        }
+    } else {
+        sfnn_stacked_affine_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            combined,
+            l1_gradients,
+            l1w,
+            buckets,
+            combined_gradients,
+            l1w_gradients,
+            l1b_gradients,
+            batch,
+            ft_size,
+            l1_out,
+            num_stacks);
+        if (check_kernel_launch("sfnn_stacked_affine_backward_kernel launch") != 0) {
+            return -1;
+        }
+    }
+
+    if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_backward_kernel") != 0) {
+        return -1;
+    }
+    sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
+    if (check_kernel_launch("sfnn_pairwise_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_l0_sparse_backward_kernel") != 0) {
+        return -1;
+    }
+    sfnn_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices,
+        nstm_indices,
+        stm_l0,
+        nstm_l0,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        stm_l0_pre_gradients,
+        nstm_l0_pre_gradients,
+        l0w_gradients,
+        l0b_gradients,
+        batch,
+        max_active,
+        input_size,
+        ft_size);
+    if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
         return -1;
     }
 
@@ -2650,6 +3251,140 @@ extern "C" int bulletou_cuda_cpp_nnue_backward_device(
             outw_gradients->ptr,
             outb_gradients->ptr,
             zero_l0_gradients) != 0) {
+        return -1;
+    }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppI32Buffer* buckets,
+    const BulletOuCudaCppF32Buffer* stm_l0,
+    const BulletOuCudaCppF32Buffer* nstm_l0,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* l1,
+    const BulletOuCudaCppF32Buffer* l2_input,
+    const BulletOuCudaCppF32Buffer* l2,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1fw,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l3w,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* l2_gradients,
+    BulletOuCudaCppF32Buffer* l1_gradients,
+    BulletOuCudaCppF32Buffer* l2_input_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* l0w_gradients,
+    BulletOuCudaCppF32Buffer* l0b_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l1fw_gradients,
+    BulletOuCudaCppF32Buffer* l1fb_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* l3w_gradients,
+    BulletOuCudaCppF32Buffer* l3b_gradients) {
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(stm_l0), batch * ft_size, "sfnn stm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(nstm_l0), batch * ft_size, "sfnn nstm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(combined), batch * ft_size, "sfnn combined") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1), batch * l1_out, "sfnn l1") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2_input), batch * l2_in, "sfnn l2_input") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2), batch * l2_size, "sfnn l2") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), num_stacks * l1_out * ft_size, "sfnn l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), num_stacks * l2_size * l2_in, "sfnn l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l3w), num_stacks * l2_size, "sfnn l3w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(mean_output_gradients), batch, "sfnn mean_output_gradients") != 0 ||
+        validate_buffer(ctx, l2_gradients, batch * l2_size, "sfnn l2_gradients") != 0 ||
+        validate_buffer(ctx, l1_gradients, batch * l1_out, "sfnn l1_gradients") != 0 ||
+        validate_buffer(ctx, l2_input_gradients, batch * l2_in, "sfnn l2_input_gradients") != 0 ||
+        validate_buffer(ctx, combined_gradients, batch * ft_size, "sfnn combined_gradients") != 0 ||
+        validate_buffer(ctx, stm_l0_gradients, batch * ft_size, "sfnn stm_l0_gradients") != 0 ||
+        validate_buffer(ctx, nstm_l0_gradients, batch * ft_size, "sfnn nstm_l0_gradients") != 0 ||
+        validate_buffer(ctx, stm_l0_pre_gradients, batch * ft_size, "sfnn stm_l0_pre_gradients") != 0 ||
+        validate_buffer(ctx, nstm_l0_pre_gradients, batch * ft_size, "sfnn nstm_l0_pre_gradients") != 0 ||
+        validate_buffer(ctx, l0w_gradients, input_size * ft_size, "sfnn l0w_gradients") != 0 ||
+        validate_buffer(ctx, l0b_gradients, ft_size, "sfnn l0b_gradients") != 0 ||
+        validate_buffer(ctx, l1w_gradients, num_stacks * l1_out * ft_size, "sfnn l1w_gradients") != 0 ||
+        validate_buffer(ctx, l1b_gradients, num_stacks * l1_out, "sfnn l1b_gradients") != 0 ||
+        validate_buffer(ctx, l1fw_gradients, ft_size * l1_out, "sfnn l1fw_gradients") != 0 ||
+        validate_buffer(ctx, l1fb_gradients, l1_out, "sfnn l1fb_gradients") != 0 ||
+        validate_buffer(ctx, l2w_gradients, num_stacks * l2_size * l2_in, "sfnn l2w_gradients") != 0 ||
+        validate_buffer(ctx, l2b_gradients, num_stacks * l2_size, "sfnn l2b_gradients") != 0 ||
+        validate_buffer(ctx, l3w_gradients, num_stacks * l2_size, "sfnn l3w_gradients") != 0 ||
+        validate_buffer(ctx, l3b_gradients, num_stacks, "sfnn l3b_gradients") != 0) {
+        return -1;
+    }
+    if (has_l1f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0) {
+            return -1;
+        }
+    } else if (l1fw != nullptr) {
+        return fail_message("sfnn l1fw must be null when has_l1f is false");
+    }
+
+    if (launch_sfnn_backward_kernels(
+            ctx,
+            input_size,
+            ft_size,
+            l1_hidden,
+            l2_size,
+            num_stacks,
+            batch,
+            max_active,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            buckets->ptr,
+            stm_l0->ptr,
+            nstm_l0->ptr,
+            combined->ptr,
+            l1->ptr,
+            l2_input->ptr,
+            l2->ptr,
+            l1w->ptr,
+            has_l1f != 0 ? l1fw->ptr : nullptr,
+            has_l1f,
+            l2w->ptr,
+            l3w->ptr,
+            mean_output_gradients->ptr,
+            l2_gradients->ptr,
+            l1_gradients->ptr,
+            l2_input_gradients->ptr,
+            combined_gradients->ptr,
+            stm_l0_gradients->ptr,
+            nstm_l0_gradients->ptr,
+            stm_l0_pre_gradients->ptr,
+            nstm_l0_pre_gradients->ptr,
+            l0w_gradients->ptr,
+            l0b_gradients->ptr,
+            l1w_gradients->ptr,
+            l1b_gradients->ptr,
+            l1fw_gradients->ptr,
+            l1fb_gradients->ptr,
+            l2w_gradients->ptr,
+            l2b_gradients->ptr,
+            l3w_gradients->ptr,
+            l3b_gradients->ptr) != 0) {
         return -1;
     }
 

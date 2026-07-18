@@ -1527,6 +1527,312 @@ fn nnue_backward_device_with_l0_zero(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnBackwardWorkspaceLayout {
+    pub shape: SfnnForwardShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl SfnnBackwardWorkspaceLayout {
+    pub fn new(shape: SfnnForwardShape, batch_size: usize, max_active: usize) -> Self {
+        Self { shape, batch_size, max_active }
+    }
+
+    pub fn l2_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2_size)
+    }
+
+    pub fn l1_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l2_input_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2_in())
+    }
+
+    pub fn combined_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn l0_gradients_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn l0w_gradients_len(self) -> usize {
+        self.shape.input_size.saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn l0b_gradients_len(self) -> usize {
+        self.shape.ft_size
+    }
+
+    pub fn l1w_gradients_len(self) -> usize {
+        self.shape.num_stacks.saturating_mul(self.shape.l1_out()).saturating_mul(self.shape.ft_size)
+    }
+
+    pub fn l1b_gradients_len(self) -> usize {
+        self.shape.num_stacks.saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l1fw_gradients_len(self) -> usize {
+        self.shape.ft_size.saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l1fb_gradients_len(self) -> usize {
+        self.shape.l1_out()
+    }
+
+    pub fn l2w_gradients_len(self) -> usize {
+        self.shape.num_stacks.saturating_mul(self.shape.l2_size).saturating_mul(self.shape.l2_in())
+    }
+
+    pub fn l2b_gradients_len(self) -> usize {
+        self.shape.num_stacks.saturating_mul(self.shape.l2_size)
+    }
+
+    pub fn l3w_gradients_len(self) -> usize {
+        self.shape.num_stacks.saturating_mul(self.shape.l2_size)
+    }
+
+    pub fn l3b_gradients_len(self) -> usize {
+        self.shape.num_stacks
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_sfnn_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("SFNN backward batch_size must be greater than zero"))
+        } else if self.max_active == 0 {
+            Err(CudaCppError::message("SFNN backward max_active must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SfnnBackwardWorkspace {
+    pub layout: SfnnBackwardWorkspaceLayout,
+    pub l2_gradients: F32Buffer,
+    pub l1_gradients: F32Buffer,
+    pub l2_input_gradients: F32Buffer,
+    pub combined_gradients: F32Buffer,
+    pub stm_l0_gradients: F32Buffer,
+    pub nstm_l0_gradients: F32Buffer,
+    pub stm_l0_pre_gradients: F32Buffer,
+    pub nstm_l0_pre_gradients: F32Buffer,
+    pub l0w_gradients: F32Buffer,
+    pub l0b_gradients: F32Buffer,
+    pub l1w_gradients: F32Buffer,
+    pub l1b_gradients: F32Buffer,
+    pub l1fw_gradients: F32Buffer,
+    pub l1fb_gradients: F32Buffer,
+    pub l2w_gradients: F32Buffer,
+    pub l2b_gradients: F32Buffer,
+    pub l3w_gradients: F32Buffer,
+    pub l3b_gradients: F32Buffer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SfnnBackwardReadback {
+    pub l2_gradients: Vec<f32>,
+    pub l1_gradients: Vec<f32>,
+    pub l2_input_gradients: Vec<f32>,
+    pub combined_gradients: Vec<f32>,
+    pub stm_l0_gradients: Vec<f32>,
+    pub nstm_l0_gradients: Vec<f32>,
+    pub stm_l0_pre_gradients: Vec<f32>,
+    pub nstm_l0_pre_gradients: Vec<f32>,
+    pub l0w_gradients: Vec<f32>,
+    pub l0b_gradients: Vec<f32>,
+    pub l1w_gradients: Vec<f32>,
+    pub l1b_gradients: Vec<f32>,
+    pub l1fw_gradients: Vec<f32>,
+    pub l1fb_gradients: Vec<f32>,
+    pub l2w_gradients: Vec<f32>,
+    pub l2b_gradients: Vec<f32>,
+    pub l3w_gradients: Vec<f32>,
+    pub l3b_gradients: Vec<f32>,
+}
+
+impl SfnnBackwardWorkspace {
+    pub fn new(ctx: &Context, layout: SfnnBackwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            l2_gradients: F32Buffer::new(ctx, layout.l2_gradients_len())?,
+            l1_gradients: F32Buffer::new(ctx, layout.l1_gradients_len())?,
+            l2_input_gradients: F32Buffer::new(ctx, layout.l2_input_gradients_len())?,
+            combined_gradients: F32Buffer::new(ctx, layout.combined_gradients_len())?,
+            stm_l0_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            nstm_l0_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            stm_l0_pre_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            nstm_l0_pre_gradients: F32Buffer::new(ctx, layout.l0_gradients_len())?,
+            l0w_gradients: F32Buffer::new(ctx, layout.l0w_gradients_len())?,
+            l0b_gradients: F32Buffer::new(ctx, layout.l0b_gradients_len())?,
+            l1w_gradients: F32Buffer::new(ctx, layout.l1w_gradients_len())?,
+            l1b_gradients: F32Buffer::new(ctx, layout.l1b_gradients_len())?,
+            l1fw_gradients: F32Buffer::new(ctx, layout.l1fw_gradients_len())?,
+            l1fb_gradients: F32Buffer::new(ctx, layout.l1fb_gradients_len())?,
+            l2w_gradients: F32Buffer::new(ctx, layout.l2w_gradients_len())?,
+            l2b_gradients: F32Buffer::new(ctx, layout.l2b_gradients_len())?,
+            l3w_gradients: F32Buffer::new(ctx, layout.l3w_gradients_len())?,
+            l3b_gradients: F32Buffer::new(ctx, layout.l3b_gradients_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("sfnn backward l2_gradients", self.layout.l2_gradients_len(), self.l2_gradients.len())?;
+        expect_len("sfnn backward l1_gradients", self.layout.l1_gradients_len(), self.l1_gradients.len())?;
+        expect_len(
+            "sfnn backward l2_input_gradients",
+            self.layout.l2_input_gradients_len(),
+            self.l2_input_gradients.len(),
+        )?;
+        expect_len(
+            "sfnn backward combined_gradients",
+            self.layout.combined_gradients_len(),
+            self.combined_gradients.len(),
+        )?;
+        expect_len("sfnn backward stm_l0_gradients", self.layout.l0_gradients_len(), self.stm_l0_gradients.len())?;
+        expect_len("sfnn backward nstm_l0_gradients", self.layout.l0_gradients_len(), self.nstm_l0_gradients.len())?;
+        expect_len(
+            "sfnn backward stm_l0_pre_gradients",
+            self.layout.l0_gradients_len(),
+            self.stm_l0_pre_gradients.len(),
+        )?;
+        expect_len(
+            "sfnn backward nstm_l0_pre_gradients",
+            self.layout.l0_gradients_len(),
+            self.nstm_l0_pre_gradients.len(),
+        )?;
+        expect_len("sfnn backward l0w_gradients", self.layout.l0w_gradients_len(), self.l0w_gradients.len())?;
+        expect_len("sfnn backward l0b_gradients", self.layout.l0b_gradients_len(), self.l0b_gradients.len())?;
+        expect_len("sfnn backward l1w_gradients", self.layout.l1w_gradients_len(), self.l1w_gradients.len())?;
+        expect_len("sfnn backward l1b_gradients", self.layout.l1b_gradients_len(), self.l1b_gradients.len())?;
+        expect_len("sfnn backward l1fw_gradients", self.layout.l1fw_gradients_len(), self.l1fw_gradients.len())?;
+        expect_len("sfnn backward l1fb_gradients", self.layout.l1fb_gradients_len(), self.l1fb_gradients.len())?;
+        expect_len("sfnn backward l2w_gradients", self.layout.l2w_gradients_len(), self.l2w_gradients.len())?;
+        expect_len("sfnn backward l2b_gradients", self.layout.l2b_gradients_len(), self.l2b_gradients.len())?;
+        expect_len("sfnn backward l3w_gradients", self.layout.l3w_gradients_len(), self.l3w_gradients.len())?;
+        expect_len("sfnn backward l3b_gradients", self.layout.l3b_gradients_len(), self.l3b_gradients.len())
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<SfnnBackwardReadback> {
+        Ok(SfnnBackwardReadback {
+            l2_gradients: self.l2_gradients.download(ctx)?,
+            l1_gradients: self.l1_gradients.download(ctx)?,
+            l2_input_gradients: self.l2_input_gradients.download(ctx)?,
+            combined_gradients: self.combined_gradients.download(ctx)?,
+            stm_l0_gradients: self.stm_l0_gradients.download(ctx)?,
+            nstm_l0_gradients: self.nstm_l0_gradients.download(ctx)?,
+            stm_l0_pre_gradients: self.stm_l0_pre_gradients.download(ctx)?,
+            nstm_l0_pre_gradients: self.nstm_l0_pre_gradients.download(ctx)?,
+            l0w_gradients: self.l0w_gradients.download(ctx)?,
+            l0b_gradients: self.l0b_gradients.download(ctx)?,
+            l1w_gradients: self.l1w_gradients.download(ctx)?,
+            l1b_gradients: self.l1b_gradients.download(ctx)?,
+            l1fw_gradients: self.l1fw_gradients.download(ctx)?,
+            l1fb_gradients: self.l1fb_gradients.download(ctx)?,
+            l2w_gradients: self.l2w_gradients.download(ctx)?,
+            l2b_gradients: self.l2b_gradients.download(ctx)?,
+            l3w_gradients: self.l3w_gradients.download(ctx)?,
+            l3b_gradients: self.l3b_gradients.download(ctx)?,
+        })
+    }
+}
+
+pub fn sfnn_backward_device(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    forward.validate()?;
+    loss.validate()?;
+    backward.validate()?;
+    let shape = weights.shape;
+    if forward.layout.shape != shape || backward.layout.shape != shape {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward shape mismatch: weights={shape:?} forward={:?} backward={:?}",
+            forward.layout.shape, backward.layout.shape
+        )));
+    }
+    if forward.layout.batch_size != batch.batch_size
+        || loss.layout.batch_size != batch.batch_size
+        || backward.layout.batch_size != batch.batch_size
+    {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward batch mismatch: batch={} forward={} loss={} backward={}",
+            batch.batch_size, forward.layout.batch_size, loss.layout.batch_size, backward.layout.batch_size
+        )));
+    }
+    if backward.layout.max_active != batch.max_active {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward max_active mismatch: batch={} backward={}",
+            batch.max_active, backward.layout.max_active
+        )));
+    }
+    let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
+        (Some(l1fw), Some(_)) => (l1fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
+    };
+
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_backward_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.ft_size,
+            shape.l1_hidden,
+            shape.l2_size,
+            shape.num_stacks,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            batch.buckets.as_ptr(),
+            forward.stm_l0.as_ptr(),
+            forward.nstm_l0.as_ptr(),
+            forward.combined.as_ptr(),
+            forward.l1.as_ptr(),
+            forward.l2_input.as_ptr(),
+            forward.l2.as_ptr(),
+            weights.l1w.as_ptr(),
+            l1fw,
+            has_l1f,
+            weights.l2w.as_ptr(),
+            weights.l3w.as_ptr(),
+            loss.mean_output_gradients.as_ptr(),
+            backward.l2_gradients.as_ptr(),
+            backward.l1_gradients.as_ptr(),
+            backward.l2_input_gradients.as_ptr(),
+            backward.combined_gradients.as_ptr(),
+            backward.stm_l0_gradients.as_ptr(),
+            backward.nstm_l0_gradients.as_ptr(),
+            backward.stm_l0_pre_gradients.as_ptr(),
+            backward.nstm_l0_pre_gradients.as_ptr(),
+            backward.l0w_gradients.as_ptr(),
+            backward.l0b_gradients.as_ptr(),
+            backward.l1w_gradients.as_ptr(),
+            backward.l1b_gradients.as_ptr(),
+            backward.l1fw_gradients.as_ptr(),
+            backward.l1fb_gradients.as_ptr(),
+            backward.l2w_gradients.as_ptr(),
+            backward.l2b_gradients.as_ptr(),
+            backward.l3w_gradients.as_ptr(),
+            backward.l3b_gradients.as_ptr(),
+        )
+    })
+}
+
 #[derive(Debug)]
 pub struct RangerParamState {
     pub momentum: F32Buffer,
@@ -2574,6 +2880,49 @@ mod ffi {
             l2: *mut BulletOuCudaCppF32Buffer,
             output: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_backward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            ft_size: usize,
+            l1_hidden: usize,
+            l2_size: usize,
+            num_stacks: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            l1: *mut BulletOuCudaCppF32Buffer,
+            l2_input: *mut BulletOuCudaCppF32Buffer,
+            l2: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l1fw: *mut BulletOuCudaCppF32Buffer,
+            has_l1f: i32,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            l3w: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_input_gradients: *mut BulletOuCudaCppF32Buffer,
+            combined_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
             len: usize,
@@ -2690,6 +3039,28 @@ mod tests {
     }
 
     #[test]
+    fn sfnn_backward_workspace_layout_counts_gradients() {
+        let shape = SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2 };
+        let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
+
+        assert_eq!(layout.l2_gradients_len(), 15);
+        assert_eq!(layout.l1_gradients_len(), 15);
+        assert_eq!(layout.l2_input_gradients_len(), 20);
+        assert_eq!(layout.combined_gradients_len(), 20);
+        assert_eq!(layout.l0_gradients_len(), 20);
+        assert_eq!(layout.l0w_gradients_len(), 16);
+        assert_eq!(layout.l0b_gradients_len(), 4);
+        assert_eq!(layout.l1w_gradients_len(), 24);
+        assert_eq!(layout.l1b_gradients_len(), 6);
+        assert_eq!(layout.l1fw_gradients_len(), 12);
+        assert_eq!(layout.l1fb_gradients_len(), 3);
+        assert_eq!(layout.l2w_gradients_len(), 24);
+        assert_eq!(layout.l2b_gradients_len(), 6);
+        assert_eq!(layout.l3w_gradients_len(), 6);
+        assert_eq!(layout.l3b_gradients_len(), 2);
+    }
+
+    #[test]
     fn scalar_loss_validation_reports_length_mismatch() {
         let batch = ScalarLossHostBatch { outputs: &[0.0], targets: &[], entry_weights: &[1.0] };
 
@@ -2782,6 +3153,82 @@ mod tests {
         let actual = workspace.download_output(&ctx).unwrap();
 
         assert_close_slice("sfnn", &actual, &expected, 1.0e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_tiny_backward_gpu_smoke() {
+        let shape = tiny_sfnn_shape();
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let weights = tiny_sfnn_weights(shape);
+        let targets = [0.25, 0.75];
+        let entry_weights = [1.0, 0.5];
+        let expected = tiny_sfnn_backward_cpu(batch, weights, &targets, &entry_weights);
+
+        let ctx = Context::new(0).unwrap();
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let forward =
+            SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, batch.batch_size)).unwrap();
+        sfnn_forward_device(&ctx, &device_batch, &device_weights, &forward).unwrap();
+
+        let targets_dev = F32Buffer::from_host(&ctx, &targets).unwrap();
+        let entry_weights_dev = F32Buffer::from_host(&ctx, &entry_weights).unwrap();
+        let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size)).unwrap();
+        scalar_loss_device_from_buffers(
+            &ctx,
+            ScalarLossKind::SigmoidMse,
+            1.0,
+            batch.batch_size,
+            &forward.output,
+            &targets_dev,
+            &entry_weights_dev,
+            &loss,
+        )
+        .unwrap();
+
+        let backward = SfnnBackwardWorkspace::new(
+            &ctx,
+            SfnnBackwardWorkspaceLayout::new(shape, batch.batch_size, batch.max_active),
+        )
+        .unwrap();
+        sfnn_backward_device(&ctx, &device_batch, &device_weights, &forward, &loss, &backward).unwrap();
+        let actual = backward.download(&ctx).unwrap();
+
+        assert_close_slice("sfnn l2_grad", &actual.l2_gradients, &expected.l2_gradients, 1.0e-6);
+        assert_close_slice("sfnn l1_grad", &actual.l1_gradients, &expected.l1_gradients, 1.0e-6);
+        assert_close_slice("sfnn l2_input_grad", &actual.l2_input_gradients, &expected.l2_input_gradients, 1.0e-6);
+        assert_close_slice("sfnn combined_grad", &actual.combined_gradients, &expected.combined_gradients, 1.0e-6);
+        assert_close_slice("sfnn stm_l0_grad", &actual.stm_l0_gradients, &expected.stm_l0_gradients, 1.0e-6);
+        assert_close_slice("sfnn nstm_l0_grad", &actual.nstm_l0_gradients, &expected.nstm_l0_gradients, 1.0e-6);
+        assert_close_slice(
+            "sfnn stm_l0_pre_grad",
+            &actual.stm_l0_pre_gradients,
+            &expected.stm_l0_pre_gradients,
+            1.0e-6,
+        );
+        assert_close_slice(
+            "sfnn nstm_l0_pre_grad",
+            &actual.nstm_l0_pre_gradients,
+            &expected.nstm_l0_pre_gradients,
+            1.0e-6,
+        );
+        assert_close_slice("sfnn l0w_grad", &actual.l0w_gradients, &expected.l0w_gradients, 1.0e-6);
+        assert_close_slice("sfnn l0b_grad", &actual.l0b_gradients, &expected.l0b_gradients, 1.0e-6);
+        assert_close_slice("sfnn l1w_grad", &actual.l1w_gradients, &expected.l1w_gradients, 1.0e-6);
+        assert_close_slice("sfnn l1b_grad", &actual.l1b_gradients, &expected.l1b_gradients, 1.0e-6);
+        assert_close_slice("sfnn l1fw_grad", &actual.l1fw_gradients, &expected.l1fw_gradients, 1.0e-6);
+        assert_close_slice("sfnn l1fb_grad", &actual.l1fb_gradients, &expected.l1fb_gradients, 1.0e-6);
+        assert_close_slice("sfnn l2w_grad", &actual.l2w_gradients, &expected.l2w_gradients, 1.0e-6);
+        assert_close_slice("sfnn l2b_grad", &actual.l2b_gradients, &expected.l2b_gradients, 1.0e-6);
+        assert_close_slice("sfnn l3w_grad", &actual.l3w_gradients, &expected.l3w_gradients, 1.0e-6);
+        assert_close_slice("sfnn l3b_grad", &actual.l3b_gradients, &expected.l3b_gradients, 1.0e-6);
     }
 
     #[test]
@@ -2968,6 +3415,339 @@ mod tests {
             *out_sample = value;
         }
         out
+    }
+
+    struct SfnnCpuTrace {
+        stm_l0: Vec<f32>,
+        nstm_l0: Vec<f32>,
+        combined: Vec<f32>,
+        l1: Vec<f32>,
+        l2_input: Vec<f32>,
+        l2: Vec<f32>,
+        outputs: Vec<f32>,
+    }
+
+    struct SfnnCpuBackward {
+        l2_gradients: Vec<f32>,
+        l1_gradients: Vec<f32>,
+        l2_input_gradients: Vec<f32>,
+        combined_gradients: Vec<f32>,
+        stm_l0_gradients: Vec<f32>,
+        nstm_l0_gradients: Vec<f32>,
+        stm_l0_pre_gradients: Vec<f32>,
+        nstm_l0_pre_gradients: Vec<f32>,
+        l0w_gradients: Vec<f32>,
+        l0b_gradients: Vec<f32>,
+        l1w_gradients: Vec<f32>,
+        l1b_gradients: Vec<f32>,
+        l1fw_gradients: Vec<f32>,
+        l1fb_gradients: Vec<f32>,
+        l2w_gradients: Vec<f32>,
+        l2b_gradients: Vec<f32>,
+        l3w_gradients: Vec<f32>,
+        l3b_gradients: Vec<f32>,
+    }
+
+    fn tiny_sfnn_forward_trace_cpu(
+        batch: SfnnForwardHostBatch<'_>,
+        weights: SfnnForwardHostWeights<'_>,
+    ) -> SfnnCpuTrace {
+        let shape = weights.shape;
+        let mut trace = SfnnCpuTrace {
+            stm_l0: vec![0.0; batch.batch_size * shape.ft_size],
+            nstm_l0: vec![0.0; batch.batch_size * shape.ft_size],
+            combined: vec![0.0; batch.batch_size * shape.ft_size],
+            l1: vec![0.0; batch.batch_size * shape.l1_out()],
+            l2_input: vec![0.0; batch.batch_size * shape.l2_in()],
+            l2: vec![0.0; batch.batch_size * shape.l2_size],
+            outputs: vec![0.0; batch.batch_size],
+        };
+
+        for sample in 0..batch.batch_size {
+            let stack = batch.buckets[sample] as usize;
+            let sparse_base = sample * batch.max_active;
+            let l0_base = sample * shape.ft_size;
+            trace.stm_l0[l0_base..l0_base + shape.ft_size].copy_from_slice(weights.l0b);
+            trace.nstm_l0[l0_base..l0_base + shape.ft_size].copy_from_slice(weights.l0b);
+            add_sparse_l0(
+                &mut trace.stm_l0[l0_base..l0_base + shape.ft_size],
+                weights.l0w,
+                shape.ft_size,
+                shape.input_size,
+                &batch.stm_indices[sparse_base..sparse_base + batch.max_active],
+            );
+            add_sparse_l0(
+                &mut trace.nstm_l0[l0_base..l0_base + shape.ft_size],
+                weights.l0w,
+                shape.ft_size,
+                shape.input_size,
+                &batch.nstm_indices[sparse_base..sparse_base + batch.max_active],
+            );
+            trace.stm_l0[l0_base..l0_base + shape.ft_size].iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+            trace.nstm_l0[l0_base..l0_base + shape.ft_size].iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+
+            let combined_base = sample * shape.ft_size;
+            for pair in 0..shape.pairwise_size() {
+                trace.combined[combined_base + pair] = trace.stm_l0[l0_base + pair]
+                    * trace.stm_l0[l0_base + shape.pairwise_size() + pair]
+                    * (127.0 / 128.0);
+                trace.combined[combined_base + shape.pairwise_size() + pair] = trace.nstm_l0[l0_base + pair]
+                    * trace.nstm_l0[l0_base + shape.pairwise_size() + pair]
+                    * (127.0 / 128.0);
+            }
+
+            let l1 = stacked_affine_cpu(
+                &trace.combined[combined_base..combined_base + shape.ft_size],
+                weights.l1w,
+                weights.l1b,
+                shape.ft_size,
+                shape.l1_out(),
+                shape.num_stacks,
+                stack,
+            );
+            let l1_base = sample * shape.l1_out();
+            trace.l1[l1_base..l1_base + shape.l1_out()].copy_from_slice(&l1);
+            if let (Some(l1fw), Some(l1fb)) = (weights.l1fw, weights.l1fb) {
+                for row in 0..shape.l1_out() {
+                    trace.l1[l1_base + row] += l1fb[row];
+                    for input in 0..shape.ft_size {
+                        trace.l1[l1_base + row] +=
+                            trace.combined[combined_base + input] * l1fw[input * shape.l1_out() + row];
+                    }
+                }
+            }
+
+            let l2_input_base = sample * shape.l2_in();
+            for col in 0..shape.l2_in() {
+                let value = trace.l1[l1_base + col % shape.l1_hidden];
+                trace.l2_input[l2_input_base + col] = if col < shape.l1_hidden {
+                    (value.abs() * value.abs() * (127.0 / 128.0)).clamp(0.0, 1.0)
+                } else {
+                    value.clamp(0.0, 1.0)
+                };
+            }
+
+            let mut l2 = stacked_affine_cpu(
+                &trace.l2_input[l2_input_base..l2_input_base + shape.l2_in()],
+                weights.l2w,
+                weights.l2b,
+                shape.l2_in(),
+                shape.l2_size,
+                shape.num_stacks,
+                stack,
+            );
+            l2.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+            let l2_base = sample * shape.l2_size;
+            trace.l2[l2_base..l2_base + shape.l2_size].copy_from_slice(&l2);
+            let mut value = weights.l3b[stack] + trace.l1[l1_base + shape.l1_hidden];
+            for input in 0..shape.l2_size {
+                value += trace.l2[l2_base + input] * weights.l3w[stack * shape.l2_size + input];
+            }
+            trace.outputs[sample] = value;
+        }
+
+        trace
+    }
+
+    fn tiny_sfnn_backward_cpu(
+        batch: SfnnForwardHostBatch<'_>,
+        weights: SfnnForwardHostWeights<'_>,
+        targets: &[f32],
+        entry_weights: &[f32],
+    ) -> SfnnCpuBackward {
+        let shape = weights.shape;
+        let trace = tiny_sfnn_forward_trace_cpu(batch, weights);
+        let mut output_gradients = vec![0.0; batch.batch_size];
+        for sample in 0..batch.batch_size {
+            let prediction = sigmoid_cpu(trace.outputs[sample]);
+            let error = prediction - targets[sample];
+            output_gradients[sample] =
+                entry_weights[sample] * 2.0 * error * prediction * (1.0 - prediction) / batch.batch_size as f32;
+        }
+
+        let mut l2_gradients = vec![0.0; batch.batch_size * shape.l2_size];
+        let mut l1_gradients = vec![0.0; batch.batch_size * shape.l1_out()];
+        let mut l3w_gradients = vec![0.0; shape.num_stacks * shape.l2_size];
+        let mut l3b_gradients = vec![0.0; shape.num_stacks];
+        for sample in 0..batch.batch_size {
+            let stack = batch.buckets[sample] as usize;
+            let output_gradient = output_gradients[sample];
+            l3b_gradients[stack] += output_gradient;
+            l1_gradients[sample * shape.l1_out() + shape.l1_hidden] = output_gradient;
+            for row in 0..shape.l2_size {
+                l2_gradients[sample * shape.l2_size + row] = output_gradient * weights.l3w[stack * shape.l2_size + row];
+                l3w_gradients[stack * shape.l2_size + row] += output_gradient * trace.l2[sample * shape.l2_size + row];
+            }
+        }
+
+        let mut l2_input_gradients = vec![0.0; batch.batch_size * shape.l2_in()];
+        let mut l2w_gradients = vec![0.0; shape.num_stacks * shape.l2_size * shape.l2_in()];
+        let mut l2b_gradients = vec![0.0; shape.num_stacks * shape.l2_size];
+        for sample in 0..batch.batch_size {
+            let stack = batch.buckets[sample] as usize;
+            for out_col in 0..shape.l2_size {
+                let out_idx = sample * shape.l2_size + out_col;
+                let grad = crelu_pre_gradient_cpu(trace.l2[out_idx], l2_gradients[out_idx]);
+                l2b_gradients[stack * shape.l2_size + out_col] += grad;
+                for in_col in 0..shape.l2_in() {
+                    let input_idx = sample * shape.l2_in() + in_col;
+                    let weight_idx = stack * shape.l2_size * shape.l2_in() + out_col * shape.l2_in() + in_col;
+                    l2_input_gradients[input_idx] += grad * weights.l2w[weight_idx];
+                    l2w_gradients[weight_idx] += grad * trace.l2_input[input_idx];
+                }
+            }
+        }
+
+        for sample in 0..batch.batch_size {
+            for col in 0..shape.l1_hidden {
+                let l1_idx = sample * shape.l1_out() + col;
+                let l2_input_base = sample * shape.l2_in();
+                let square_idx = l2_input_base + col;
+                let linear_idx = l2_input_base + shape.l1_hidden + col;
+                let value = trace.l1[l1_idx];
+                let square_grad = crelu_pre_gradient_cpu(trace.l2_input[square_idx], l2_input_gradients[square_idx])
+                    * (2.0 * value * (127.0 / 128.0));
+                let linear_grad = crelu_pre_gradient_cpu(trace.l2_input[linear_idx], l2_input_gradients[linear_idx]);
+                l1_gradients[l1_idx] += square_grad + linear_grad;
+            }
+        }
+
+        let mut combined_gradients = vec![0.0; batch.batch_size * shape.ft_size];
+        let mut l1w_gradients = vec![0.0; shape.num_stacks * shape.l1_out() * shape.ft_size];
+        let mut l1b_gradients = vec![0.0; shape.num_stacks * shape.l1_out()];
+        let mut l1fw_gradients = vec![0.0; shape.ft_size * shape.l1_out()];
+        let mut l1fb_gradients = vec![0.0; shape.l1_out()];
+        for sample in 0..batch.batch_size {
+            let stack = batch.buckets[sample] as usize;
+            for out_col in 0..shape.l1_out() {
+                let grad = l1_gradients[sample * shape.l1_out() + out_col];
+                l1b_gradients[stack * shape.l1_out() + out_col] += grad;
+                if weights.l1fb.is_some() {
+                    l1fb_gradients[out_col] += grad;
+                }
+                for in_col in 0..shape.ft_size {
+                    let input_idx = sample * shape.ft_size + in_col;
+                    let weight_idx = stack * shape.l1_out() * shape.ft_size + out_col * shape.ft_size + in_col;
+                    let input = trace.combined[input_idx];
+                    let mut weight = weights.l1w[weight_idx];
+                    l1w_gradients[weight_idx] += grad * input;
+                    if let Some(l1fw) = weights.l1fw {
+                        let shared_idx = in_col * shape.l1_out() + out_col;
+                        weight += l1fw[shared_idx];
+                        l1fw_gradients[shared_idx] += grad * input;
+                    }
+                    combined_gradients[input_idx] += grad * weight;
+                }
+            }
+        }
+
+        let mut stm_l0_gradients = vec![0.0; batch.batch_size * shape.ft_size];
+        let mut nstm_l0_gradients = vec![0.0; batch.batch_size * shape.ft_size];
+        for sample in 0..batch.batch_size {
+            let l0_base = sample * shape.ft_size;
+            for col in 0..shape.ft_size {
+                let pair = col % shape.pairwise_size();
+                let mate_col = if col < shape.pairwise_size() { shape.pairwise_size() + pair } else { pair };
+                stm_l0_gradients[l0_base + col] =
+                    combined_gradients[l0_base + pair] * trace.stm_l0[l0_base + mate_col] * (127.0 / 128.0);
+                nstm_l0_gradients[l0_base + col] = combined_gradients[l0_base + shape.pairwise_size() + pair]
+                    * trace.nstm_l0[l0_base + mate_col]
+                    * (127.0 / 128.0);
+            }
+        }
+
+        let mut stm_l0_pre_gradients = vec![0.0; batch.batch_size * shape.ft_size];
+        let mut nstm_l0_pre_gradients = vec![0.0; batch.batch_size * shape.ft_size];
+        let mut l0w_gradients = vec![0.0; shape.input_size * shape.ft_size];
+        let mut l0b_gradients = vec![0.0; shape.ft_size];
+        for sample in 0..batch.batch_size {
+            let sparse_base = sample * batch.max_active;
+            for row in 0..shape.ft_size {
+                let idx = sample * shape.ft_size + row;
+                let stm_grad = crelu_pre_gradient_cpu(trace.stm_l0[idx], stm_l0_gradients[idx]);
+                let nstm_grad = crelu_pre_gradient_cpu(trace.nstm_l0[idx], nstm_l0_gradients[idx]);
+                stm_l0_pre_gradients[idx] = stm_grad;
+                nstm_l0_pre_gradients[idx] = nstm_grad;
+                l0b_gradients[row] += stm_grad + nstm_grad;
+                for slot in 0..batch.max_active {
+                    let stm_feature = batch.stm_indices[sparse_base + slot];
+                    if stm_feature >= 0 && (stm_feature as usize) < shape.input_size {
+                        add_sfnn_l0w_gradient(
+                            &mut l0w_gradients,
+                            stm_feature as usize,
+                            shape.input_size,
+                            shape.ft_size,
+                            row,
+                            stm_grad,
+                        );
+                    }
+                    let nstm_feature = batch.nstm_indices[sparse_base + slot];
+                    if nstm_feature >= 0 && (nstm_feature as usize) < shape.input_size {
+                        add_sfnn_l0w_gradient(
+                            &mut l0w_gradients,
+                            nstm_feature as usize,
+                            shape.input_size,
+                            shape.ft_size,
+                            row,
+                            nstm_grad,
+                        );
+                    }
+                }
+            }
+        }
+
+        SfnnCpuBackward {
+            l2_gradients,
+            l1_gradients,
+            l2_input_gradients,
+            combined_gradients,
+            stm_l0_gradients,
+            nstm_l0_gradients,
+            stm_l0_pre_gradients,
+            nstm_l0_pre_gradients,
+            l0w_gradients,
+            l0b_gradients,
+            l1w_gradients,
+            l1b_gradients,
+            l1fw_gradients,
+            l1fb_gradients,
+            l2w_gradients,
+            l2b_gradients,
+            l3w_gradients,
+            l3b_gradients,
+        }
+    }
+
+    fn add_sfnn_l0w_gradient(
+        gradients: &mut [f32],
+        feature: usize,
+        input_size: usize,
+        rows: usize,
+        row: usize,
+        value: f32,
+    ) {
+        gradients[feature * rows + row] += value;
+        if let Some(virtual_feature) = sfnn_factorized_virtual_feature_cpu(feature, input_size) {
+            gradients[virtual_feature * rows + row] += value;
+        }
+    }
+
+    fn sfnn_factorized_virtual_feature_cpu(feature: usize, input_size: usize) -> Option<usize> {
+        const BASE_INPUT_SIZE: usize = 131_949;
+        const PIECE_INPUTS: usize = 1_629;
+        if input_size == BASE_INPUT_SIZE + PIECE_INPUTS && feature < BASE_INPUT_SIZE {
+            Some(BASE_INPUT_SIZE + feature % PIECE_INPUTS)
+        } else {
+            None
+        }
+    }
+
+    fn crelu_pre_gradient_cpu(activation: f32, output_gradient: f32) -> f32 {
+        if activation > 0.0 && activation < 1.0 { output_gradient } else { 0.0 }
+    }
+
+    fn sigmoid_cpu(value: f32) -> f32 {
+        1.0 / (1.0 + (-value).exp())
     }
 
     fn add_sparse_l0(out: &mut [f32], weights: &[f32], rows: usize, input_size: usize, indices: &[i32]) {
