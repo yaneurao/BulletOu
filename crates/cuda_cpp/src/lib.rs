@@ -1143,6 +1143,28 @@ pub struct RangerParamState {
     pub slow_params: F32Buffer,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RangerParamHostState<'a> {
+    pub momentum: &'a [f32],
+    pub velocity: &'a [f32],
+    pub slow_params: &'a [f32],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangerParamStateReadback {
+    pub momentum: Vec<f32>,
+    pub velocity: Vec<f32>,
+    pub slow_params: Vec<f32>,
+}
+
+impl RangerParamHostState<'_> {
+    fn validate(self, len: usize, name: &'static str) -> Result<()> {
+        expect_len(name, len, self.momentum.len())?;
+        expect_len(name, len, self.velocity.len())?;
+        expect_len(name, len, self.slow_params.len())
+    }
+}
+
 impl RangerParamState {
     pub fn from_host_weights(ctx: &Context, weights: &[f32]) -> Result<Self> {
         let momentum = F32Buffer::new(ctx, weights.len())?;
@@ -1151,6 +1173,23 @@ impl RangerParamState {
         velocity.fill(ctx, 0.0)?;
         let slow_params = F32Buffer::from_host(ctx, weights)?;
         Ok(Self { momentum, velocity, slow_params })
+    }
+
+    pub fn from_host_state(ctx: &Context, len: usize, state: RangerParamHostState<'_>) -> Result<Self> {
+        state.validate(len, "optimizer state")?;
+        Ok(Self {
+            momentum: F32Buffer::from_host(ctx, state.momentum)?,
+            velocity: F32Buffer::from_host(ctx, state.velocity)?,
+            slow_params: F32Buffer::from_host(ctx, state.slow_params)?,
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<RangerParamStateReadback> {
+        Ok(RangerParamStateReadback {
+            momentum: self.momentum.download(ctx)?,
+            velocity: self.velocity.download(ctx)?,
+            slow_params: self.slow_params.download(ctx)?,
+        })
     }
 
     fn validate(&self, len: usize, name: &'static str) -> Result<()> {
@@ -1172,6 +1211,30 @@ pub struct NnueRangerOptimizerStates {
     pub outb: RangerParamState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NnueRangerOptimizerHostStates<'a> {
+    pub l0w: RangerParamHostState<'a>,
+    pub l0b: RangerParamHostState<'a>,
+    pub l1w: RangerParamHostState<'a>,
+    pub l1b: RangerParamHostState<'a>,
+    pub l2w: RangerParamHostState<'a>,
+    pub l2b: RangerParamHostState<'a>,
+    pub outw: RangerParamHostState<'a>,
+    pub outb: RangerParamHostState<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NnueRangerOptimizerStatesReadback {
+    pub l0w: RangerParamStateReadback,
+    pub l0b: RangerParamStateReadback,
+    pub l1w: RangerParamStateReadback,
+    pub l1b: RangerParamStateReadback,
+    pub l2w: RangerParamStateReadback,
+    pub l2b: RangerParamStateReadback,
+    pub outw: RangerParamStateReadback,
+    pub outb: RangerParamStateReadback,
+}
+
 impl NnueRangerOptimizerStates {
     pub fn from_host_weights(ctx: &Context, weights: NnueForwardHostWeights<'_>) -> Result<Self> {
         weights.validate()?;
@@ -1184,6 +1247,40 @@ impl NnueRangerOptimizerStates {
             l2b: RangerParamState::from_host_weights(ctx, weights.l2b)?,
             outw: RangerParamState::from_host_weights(ctx, weights.outw)?,
             outb: RangerParamState::from_host_weights(ctx, weights.outb)?,
+        })
+    }
+
+    pub fn from_host_states(
+        ctx: &Context,
+        shape: NnueForwardShape,
+        states: NnueRangerOptimizerHostStates<'_>,
+    ) -> Result<Self> {
+        validate_nnue_shape(shape)?;
+        let l0w_len = checked_product("l0w", &[shape.input_size, shape.l1])?;
+        let l1w_len = checked_product("l1w", &[shape.l1, 2, shape.l2])?;
+        let l2w_len = checked_product("l2w", &[shape.l2, shape.l3])?;
+        Ok(Self {
+            l0w: RangerParamState::from_host_state(ctx, l0w_len, states.l0w)?,
+            l0b: RangerParamState::from_host_state(ctx, shape.l1, states.l0b)?,
+            l1w: RangerParamState::from_host_state(ctx, l1w_len, states.l1w)?,
+            l1b: RangerParamState::from_host_state(ctx, shape.l2, states.l1b)?,
+            l2w: RangerParamState::from_host_state(ctx, l2w_len, states.l2w)?,
+            l2b: RangerParamState::from_host_state(ctx, shape.l3, states.l2b)?,
+            outw: RangerParamState::from_host_state(ctx, shape.l3, states.outw)?,
+            outb: RangerParamState::from_host_state(ctx, 1, states.outb)?,
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<NnueRangerOptimizerStatesReadback> {
+        Ok(NnueRangerOptimizerStatesReadback {
+            l0w: self.l0w.download(ctx)?,
+            l0b: self.l0b.download(ctx)?,
+            l1w: self.l1w.download(ctx)?,
+            l1b: self.l1b.download(ctx)?,
+            l2w: self.l2w.download(ctx)?,
+            l2b: self.l2b.download(ctx)?,
+            outw: self.outw.download(ctx)?,
+            outb: self.outb.download(ctx)?,
         })
     }
 
@@ -1260,6 +1357,29 @@ impl NnueTrainStepRunner {
         batch_size: usize,
         max_active: usize,
     ) -> Result<Self> {
+        let optimizer_states = NnueRangerOptimizerStates::from_host_weights(ctx, initial_weights)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    pub fn with_optimizer_states(
+        ctx: &Context,
+        initial_weights: NnueForwardHostWeights<'_>,
+        optimizer_states: NnueRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        let optimizer_states =
+            NnueRangerOptimizerStates::from_host_states(ctx, initial_weights.shape, optimizer_states)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    fn with_device_optimizer_states(
+        ctx: &Context,
+        initial_weights: NnueForwardHostWeights<'_>,
+        optimizer_states: NnueRangerOptimizerStates,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
         initial_weights.validate()?;
         if batch_size == 0 {
             return Err(CudaCppError::message("NNUE train-step batch_size must be greater than zero"));
@@ -1285,7 +1405,7 @@ impl NnueTrainStepRunner {
             targets: F32Buffer::new(ctx, batch_size)?,
             entry_weights: F32Buffer::new(ctx, batch_size)?,
             weights: NnueForwardDeviceWeights::from_host(ctx, initial_weights)?,
-            optimizer_states: NnueRangerOptimizerStates::from_host_weights(ctx, initial_weights)?,
+            optimizer_states,
             forward_workspace: NnueForwardWorkspace::new(ctx, NnueForwardWorkspaceLayout::new(shape, batch_size))?,
             loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
             backward_workspace: NnueBackwardWorkspace::new(
@@ -1366,6 +1486,10 @@ impl NnueTrainStepRunner {
             outw: self.weights.outw.download(ctx)?,
             outb: self.weights.outb.download(ctx)?,
         })
+    }
+
+    pub fn read_optimizer_states(&self, ctx: &Context) -> Result<NnueRangerOptimizerStatesReadback> {
+        self.optimizer_states.download(ctx)
     }
 
     fn validate(&self) -> Result<()> {

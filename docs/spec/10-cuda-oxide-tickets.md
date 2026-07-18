@@ -690,13 +690,16 @@ the tickets in order and commit each completed slice.
   - the input shape is now `HALFKP_PIECE_INPUTS + ShogiHalfKP` (virtual piece rows first, normal HalfKP rows offset by 1548);
   - `HalfkpTeacherBatchConfig::ft_factorize = true`, so each normal active HalfKP feature also emits its piece-input virtual row;
   - initial weights match the cuda-oxide tatara-simple recipe: virtual L0 rows zero, base L0/bias/dense/output tensors initialized by deterministic `TataraXorShift` uniform values in `[-0.01, 0.01]`.
-- Added minimal direct-output writing:
-  - after `--cuda-cpp-train-steps`, the runner reads trained weights back and writes `<output>/cuda-cpp-direct/nn.bin` plus `<output>/cuda-cpp-direct/weights.bin`;
+- Added direct-output writing:
+  - after `--cuda-cpp-train-steps`, the runner reads trained weights and Ranger optimizer buffers back and writes `<output>/cuda-cpp-direct/nn.bin` plus `<output>/cuda-cpp-direct/weights.bin`;
   - `nn.bin` folds factorized HalfKP virtual rows back into normal HalfKP L0 rows before quantization;
-  - `weights.bin` stores raw f32 `nnue/weights/*` records with a `cuda-cpp` backend marker and per-weight completed-step records, ready for the later resume-state work.
-- Added `--cuda-cpp-weights-bin <PATH>` for direct-trainer initial weights:
+  - `weights.bin` stores raw f32 `nnue/weights/*`, `nnue/momentum/*`, `nnue/velocity/*`, `nnue/slow/*`, and `nnue/step_ranger/*` records with a `cuda-cpp` backend marker, matching the root state.bin component namespace.
+- Added `--cuda-cpp-weights-bin <PATH>` for direct-trainer initial weights/state:
   - it accepts root-format/unprefixed `l0w`..`outb` records or `nnue/weights/*` component records;
-  - it restores weights only for now; Ranger momentum/velocity/slow state still resets and remains part of the later production resume work.
+  - if `nnue/{momentum,velocity,slow}/*` records are present, it restores Ranger optimizer buffers too;
+  - if `nnue/step_ranger/*` records are present, the direct trainer continues RAdam's step counter from that value;
+  - older weights-only files still load, but their optimizer buffers are reinitialized.
+  - this is direct-mode state replay only: teacher dataloader position, production checkpoint numbering, validation logs, and `--resume` orchestration are still separate remaining work.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -705,15 +708,17 @@ the tickets in order and commit each completed slice.
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_tiny_forward_matches_scalar_reference -- --ignored` passed;
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_scalar_loss_matches_cpu_reference -- --ignored` passed;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo check --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed, including direct full-state writer/loader tests;
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 1024 --buffer-mb 64 --threads 4` passed without WSL and reported two real HCPE train steps;
   - `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=867894 pos/s` for the short direct-step probe after readback sampling.
   - after switching to the factorized FT layout, `cargo run --release --features cuda-cpp-backend --example bulletou -- --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 50 --batch-size 4096 --buffer-mb 128 --threads 8` passed and reported `throughput=802739 pos/s`.
   - direct output smoke with `--output target\cuda-cpp-direct-smoke` wrote `cuda-cpp-direct/nn.bin` (64,217,077 bytes) and `cuda-cpp-direct/weights.bin` (130,054,016 bytes).
   - direct weights reload smoke with `--cuda-cpp-weights-bin target\cuda-cpp-direct-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-direct-resume-smoke` passed and wrote a fresh `cuda-cpp-direct/{nn.bin,weights.bin}`.
+  - full-state direct output smoke with `--output target\cuda-cpp-fullstate-smoke --cuda-cpp-train-steps 1 --batch-size 256` wrote `cuda-cpp-direct/nn.bin` (64,217,077 bytes) and full-state `cuda-cpp-direct/weights.bin` (520,215,138 bytes).
+  - full-state reload smoke with `--cuda-cpp-weights-bin target\cuda-cpp-fullstate-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-fullstate-resume-smoke --cuda-cpp-train-steps 1 --batch-size 256` restored `weights + Ranger optimizer state`, printed `initial completed optimizer steps = 1`, and ran the next update with `optimizer_step=2`.
 - Remaining BO-CUDA-033 work:
-  - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
+  - wire the direct full-state replay into normal checkpoint/log/validation semantics and `--resume`/`--no-resume` orchestration;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
   - optimise the correctness-first L0 sparse backward path (currently atomic-scatter) and reintroduce the tatara-style HalfKP FT factorizer/fold path needed for the BO-CUDA-029 recipe;
-  - preserve normal checkpoint/log/validation semantics;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.

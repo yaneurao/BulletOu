@@ -48,6 +48,8 @@ Usage:
         --superbatches 20
 */
 
+#[cfg(feature = "cuda-cpp-backend")]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bullet_compiler::tensor::TValue;
@@ -1299,8 +1301,9 @@ struct Args {
     #[arg(long)]
     cuda_cpp_smoke: bool,
 
-    /// Optional initial root-format NNUE weights stream for the Windows-native
-    /// C++/CUDA direct trainer. Optimizer state is not restored yet.
+    /// Optional initial root-format NNUE weights/state stream for the Windows-native
+    /// C++/CUDA direct trainer. If Ranger optimizer records are present, they
+    /// are restored together with the weights.
     #[arg(long)]
     cuda_cpp_weights_bin: Option<PathBuf>,
 
@@ -2990,11 +2993,22 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     );
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
-    let initial_weights = build_halfkp_initial_weights_for_cuda_cpp(args)?;
+    let initial_state = build_halfkp_initial_state_for_cuda_cpp(args)?;
+    let initial_weights = &initial_state.weights;
     if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
-        eprintln!("  initial weights = {}", path.display());
+        let state_kind = if initial_state.optimizer_states.is_some() {
+            "weights + Ranger optimizer state"
+        } else if initial_state.completed_steps > 0 {
+            "weights + step counters"
+        } else {
+            "weights only"
+        };
+        eprintln!("  initial state = {} ({state_kind})", path.display());
     } else {
         eprintln!("  initial weights = tatara-simple factorized scratch");
+    }
+    if initial_state.completed_steps > 0 {
+        eprintln!("  initial completed optimizer steps = {}", initial_state.completed_steps);
     }
     let input_size = initial_weights.shape.input_size;
     let max_active = {
@@ -3012,22 +3026,27 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         l3: initial_weights.shape.l3,
     };
     let ctx = Context::new(device).map_err(|e| e.to_string())?;
-    let mut runner = NnueTrainStepRunner::new(
-        &ctx,
-        CudaNnueForwardHostWeights {
-            shape: cuda_shape,
-            l0w: &initial_weights.l0w,
-            l0b: &initial_weights.l0b,
-            l1w: &initial_weights.l1w,
-            l1b: &initial_weights.l1b,
-            l2w: &initial_weights.l2w,
-            l2b: &initial_weights.l2b,
-            outw: &initial_weights.outw,
-            outb: &initial_weights.outb,
-        },
-        batch_size,
-        max_active,
-    )
+    let initial_host_weights = CudaNnueForwardHostWeights {
+        shape: cuda_shape,
+        l0w: &initial_weights.l0w,
+        l0b: &initial_weights.l0b,
+        l1w: &initial_weights.l1w,
+        l1b: &initial_weights.l1b,
+        l2w: &initial_weights.l2w,
+        l2b: &initial_weights.l2b,
+        outw: &initial_weights.outw,
+        outb: &initial_weights.outb,
+    };
+    let mut runner = match initial_state.optimizer_states.as_ref() {
+        Some(optimizer_states) => NnueTrainStepRunner::with_optimizer_states(
+            &ctx,
+            initial_host_weights,
+            optimizer_states.as_host(),
+            batch_size,
+            max_active,
+        ),
+        None => NnueTrainStepRunner::new(&ctx, initial_host_weights, batch_size, max_active),
+    }
     .map_err(|e| e.to_string())?;
 
     let loss_kind =
@@ -3039,6 +3058,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let mut reported_loss_sum = 0.0_f64;
     let mut reported_loss_count = 0usize;
     let mut last_loss = 0.0_f32;
+    let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
 
     let config = HalfkpTeacherBatchConfig {
@@ -3059,12 +3079,13 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
 
     for_each_halfkp_teacher_fast_batch(&config, train_steps, |teacher_batch| {
         seen_steps += 1;
+        let optimizer_step = completed_step_offset + seen_steps;
         let fast = teacher_batch.batch;
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
             RangerUpdateParams {
                 radam: RAdamUpdateParams {
-                    step: seen_steps as u64,
+                    step: optimizer_step as u64,
                     learning_rate: args.lr,
                     decay: ranger.decay,
                     beta1: ranger.beta1,
@@ -3100,10 +3121,18 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
-            eprintln!(
-                "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
-                loss.mean, teacher_batch.source
-            );
+            if completed_step_offset > 0 {
+                eprintln!(
+                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} optimizer_step={optimizer_step} \
+                     loss_mean={:.8} source={}",
+                    loss.mean, teacher_batch.source
+                );
+            } else {
+                eprintln!(
+                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                    loss.mean, teacher_batch.source
+                );
+            }
         }
         Ok::<(), String>(())
     })
@@ -3119,22 +3148,95 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
 
+    let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+    let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
     let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
-    write_cuda_cpp_halfkp_direct_outputs(&direct_output_dir, cuda_shape, &trained_weights, seen_steps)?;
-    eprintln!("  cuda-cpp direct output = {} (nn.bin, weights.bin)", direct_output_dir.display());
+    write_cuda_cpp_halfkp_direct_outputs(
+        &direct_output_dir,
+        cuda_shape,
+        &trained_weights,
+        &trained_optimizer_states,
+        completed_steps,
+    )?;
+    eprintln!("  cuda-cpp direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
 
     Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppHalfkpInitialState {
+    weights: bulletou_lib::value::NnueForwardOwnedWeights,
+    optimizer_states: Option<CudaCppHalfkpOptimizerState>,
+    completed_steps: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppHalfkpOptimizerState {
+    l0w: CudaCppRangerGroupState,
+    l0b: CudaCppRangerGroupState,
+    l1w: CudaCppRangerGroupState,
+    l1b: CudaCppRangerGroupState,
+    l2w: CudaCppRangerGroupState,
+    l2b: CudaCppRangerGroupState,
+    outw: CudaCppRangerGroupState,
+    outb: CudaCppRangerGroupState,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppHalfkpOptimizerState {
+    fn as_host(&self) -> bulletou_cuda_cpp::NnueRangerOptimizerHostStates<'_> {
+        bulletou_cuda_cpp::NnueRangerOptimizerHostStates {
+            l0w: self.l0w.as_host(),
+            l0b: self.l0b.as_host(),
+            l1w: self.l1w.as_host(),
+            l1b: self.l1b.as_host(),
+            l2w: self.l2w.as_host(),
+            l2b: self.l2b.as_host(),
+            outw: self.outw.as_host(),
+            outb: self.outb.as_host(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppRangerGroupState {
+    momentum: Vec<f32>,
+    velocity: Vec<f32>,
+    slow_params: Vec<f32>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppRangerGroupState {
+    fn as_host(&self) -> bulletou_cuda_cpp::RangerParamHostState<'_> {
+        bulletou_cuda_cpp::RangerParamHostState {
+            momentum: &self.momentum,
+            velocity: &self.velocity,
+            slow_params: &self.slow_params,
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_halfkp_initial_state_for_cuda_cpp(args: &Args) -> Result<CudaCppHalfkpInitialState, String> {
+    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+        return load_cuda_cpp_halfkp_initial_state(path, args);
+    }
+
+    Ok(CudaCppHalfkpInitialState {
+        weights: build_halfkp_initial_weights_for_cuda_cpp(args)?,
+        optimizer_states: None,
+        completed_steps: 0,
+    })
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn build_halfkp_initial_weights_for_cuda_cpp(
     args: &Args,
 ) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
-        return load_cuda_cpp_halfkp_weights_bin(path, args);
-    }
-
     use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
@@ -3167,10 +3269,7 @@ fn build_halfkp_initial_weights_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn load_cuda_cpp_halfkp_weights_bin(
-    path: &Path,
-    args: &Args,
-) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
+fn load_cuda_cpp_halfkp_initial_state(path: &Path, args: &Args) -> Result<CudaCppHalfkpInitialState, String> {
     use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
 
     let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -3182,13 +3281,111 @@ fn load_cuda_cpp_halfkp_weights_bin(
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = ShogiHalfKP.num_inputs() + bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
-    NnueForwardOwnedWeights::from_weight_map(shape, weights).map_err(|err| {
+    let weights = NnueForwardOwnedWeights::from_weight_map(shape, weights).map_err(|err| {
         format!(
             "failed to load cuda-cpp HalfKP factorized weights from {} for arch {}: {err}",
             path.display(),
             args.arch().cli_name()
         )
+    })?;
+    let optimizer_states = load_cuda_cpp_halfkp_optimizer_state(&records, &weights)?;
+    let completed_steps = load_cuda_cpp_halfkp_completed_steps(&records)?;
+
+    Ok(CudaCppHalfkpInitialState { weights, optimizer_states, completed_steps })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_halfkp_optimizer_state(
+    records: &BTreeMap<String, Vec<f32>>,
+    weights: &bulletou_lib::value::NnueForwardOwnedWeights,
+) -> Result<Option<CudaCppHalfkpOptimizerState>, String> {
+    let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "momentum");
+    let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "velocity");
+    let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "slow");
+    let has_any = !momentum.is_empty() || !velocity.is_empty() || !slow.is_empty();
+    if !has_any {
+        return Ok(None);
+    }
+    if momentum.is_empty() || velocity.is_empty() || slow.is_empty() {
+        return Err(
+            "cuda-cpp HalfKP optimizer state is partial: expected nnue/{momentum,velocity,slow}/* records".to_string()
+        );
+    }
+
+    Ok(Some(CudaCppHalfkpOptimizerState {
+        l0w: load_cuda_cpp_ranger_group_state("l0w", weights.l0w.len(), &momentum, &velocity, &slow)?,
+        l0b: load_cuda_cpp_ranger_group_state("l0b", weights.l0b.len(), &momentum, &velocity, &slow)?,
+        l1w: load_cuda_cpp_ranger_group_state("l1w", weights.l1w.len(), &momentum, &velocity, &slow)?,
+        l1b: load_cuda_cpp_ranger_group_state("l1b", weights.l1b.len(), &momentum, &velocity, &slow)?,
+        l2w: load_cuda_cpp_ranger_group_state("l2w", weights.l2w.len(), &momentum, &velocity, &slow)?,
+        l2b: load_cuda_cpp_ranger_group_state("l2b", weights.l2b.len(), &momentum, &velocity, &slow)?,
+        outw: load_cuda_cpp_ranger_group_state("outw", weights.outw.len(), &momentum, &velocity, &slow)?,
+        outb: load_cuda_cpp_ranger_group_state("outb", weights.outb.len(), &momentum, &velocity, &slow)?,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_ranger_group_state(
+    id: &'static str,
+    expected_len: usize,
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
+) -> Result<CudaCppRangerGroupState, String> {
+    Ok(CudaCppRangerGroupState {
+        momentum: load_cuda_cpp_optimizer_record("momentum", momentum, id, expected_len)?,
+        velocity: load_cuda_cpp_optimizer_record("velocity", velocity, id, expected_len)?,
+        slow_params: load_cuda_cpp_optimizer_record("slow", slow, id, expected_len)?,
     })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_optimizer_record(
+    section: &'static str,
+    records: &BTreeMap<String, Vec<f32>>,
+    id: &'static str,
+    expected_len: usize,
+) -> Result<Vec<f32>, String> {
+    let values =
+        records.get(id).ok_or_else(|| format!("cuda-cpp HalfKP optimizer state missing nnue/{section}/{id}"))?;
+    if values.len() != expected_len {
+        return Err(format!(
+            "cuda-cpp HalfKP optimizer state nnue/{section}/{id} has length {}, expected {}",
+            values.len(),
+            expected_len
+        ));
+    }
+    Ok(values.clone())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_halfkp_completed_steps(records: &BTreeMap<String, Vec<f32>>) -> Result<usize, String> {
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
+    if steps.is_empty() {
+        return Ok(0);
+    }
+
+    let mut completed_steps: Option<usize> = None;
+    for id in ["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "outw", "outb"] {
+        let values = steps.get(id).ok_or_else(|| format!("cuda-cpp HalfKP state missing nnue/step_ranger/{id}"))?;
+        let value =
+            values.first().copied().ok_or_else(|| format!("cuda-cpp HalfKP state nnue/step_ranger/{id} is empty"))?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("cuda-cpp HalfKP state nnue/step_ranger/{id} is invalid: {value}"));
+        }
+        let step = value.round() as usize;
+        if let Some(prev) = completed_steps {
+            if prev != step {
+                return Err(format!(
+                    "cuda-cpp HalfKP state has inconsistent step_ranger counters: first={prev}, {id}={step}"
+                ));
+            }
+        } else {
+            completed_steps = Some(step);
+        }
+    }
+
+    Ok(completed_steps.unwrap_or(0))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3196,22 +3393,24 @@ fn write_cuda_cpp_halfkp_direct_outputs(
     dir: &Path,
     shape: bulletou_cuda_cpp::NnueForwardShape,
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback,
     completed_steps: usize,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     write_cuda_cpp_halfkp_nn_bin(&dir.join("nn.bin"), shape, weights)?;
-    write_cuda_cpp_halfkp_weights_bin(&dir.join("weights.bin"), weights, completed_steps)
+    write_cuda_cpp_halfkp_weights_bin(&dir.join("weights.bin"), weights, optimizer_states, completed_steps)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn write_cuda_cpp_halfkp_weights_bin(
     path: &Path,
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback,
     completed_steps: usize,
 ) -> Result<(), String> {
     let completed_steps = [completed_steps as f32];
     let mut bytes = write_state_backend_marker("cuda-cpp");
-    bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin([
+    let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/weights/l0w", weights.l0w.as_slice()),
         ("nnue/weights/l0b", weights.l0b.as_slice()),
         ("nnue/weights/l1w", weights.l1w.as_slice()),
@@ -3220,6 +3419,24 @@ fn write_cuda_cpp_halfkp_weights_bin(
         ("nnue/weights/l2b", weights.l2b.as_slice()),
         ("nnue/weights/outw", weights.outw.as_slice()),
         ("nnue/weights/outb", weights.outb.as_slice()),
+    ];
+    macro_rules! push_group_state {
+        ($id:literal, $state:expr) => {{
+            let state = $state;
+            records.push((concat!("nnue/momentum/", $id), state.momentum.as_slice()));
+            records.push((concat!("nnue/velocity/", $id), state.velocity.as_slice()));
+            records.push((concat!("nnue/slow/", $id), state.slow_params.as_slice()));
+        }};
+    }
+    push_group_state!("l0w", &optimizer_states.l0w);
+    push_group_state!("l0b", &optimizer_states.l0b);
+    push_group_state!("l1w", &optimizer_states.l1w);
+    push_group_state!("l1b", &optimizer_states.l1b);
+    push_group_state!("l2w", &optimizer_states.l2w);
+    push_group_state!("l2b", &optimizer_states.l2b);
+    push_group_state!("outw", &optimizer_states.outw);
+    push_group_state!("outb", &optimizer_states.outb);
+    records.extend([
         ("nnue/step_ranger/l0w", completed_steps.as_slice()),
         ("nnue/step_ranger/l0b", completed_steps.as_slice()),
         ("nnue/step_ranger/l1w", completed_steps.as_slice()),
@@ -3228,7 +3445,8 @@ fn write_cuda_cpp_halfkp_weights_bin(
         ("nnue/step_ranger/l2b", completed_steps.as_slice()),
         ("nnue/step_ranger/outw", completed_steps.as_slice()),
         ("nnue/step_ranger/outb", completed_steps.as_slice()),
-    ]));
+    ]);
+    bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(records));
     std::fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
@@ -8128,6 +8346,95 @@ mod tests {
         assert!(weights.l0w[..virtual_rows * weights.shape.l1].iter().all(|&v| v == 0.0));
         assert!(weights.l0w[virtual_rows * weights.shape.l1..].iter().any(|&v| v != 0.0));
         assert!(weights.l0b.iter().any(|&v| v != 0.0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_halfkp_loads_ranger_optimizer_state_records() {
+        use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
+
+        let weights = NnueForwardOwnedWeights {
+            shape: FastNnueForwardShape { input_size: 2, l1: 2, l2: 2, l3: 1 },
+            l0w: vec![0.0; 4],
+            l0b: vec![0.0; 2],
+            l1w: vec![0.0; 8],
+            l1b: vec![0.0; 2],
+            l2w: vec![0.0; 2],
+            l2b: vec![0.0; 1],
+            outw: vec![0.0; 1],
+            outb: vec![0.0; 1],
+        };
+        let mut records: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+        for (id, len) in [
+            ("l0w", weights.l0w.len()),
+            ("l0b", weights.l0b.len()),
+            ("l1w", weights.l1w.len()),
+            ("l1b", weights.l1b.len()),
+            ("l2w", weights.l2w.len()),
+            ("l2b", weights.l2b.len()),
+            ("outw", weights.outw.len()),
+            ("outb", weights.outb.len()),
+        ] {
+            records.insert(format!("nnue/momentum/{id}"), vec![1.0; len]);
+            records.insert(format!("nnue/velocity/{id}"), vec![2.0; len]);
+            records.insert(format!("nnue/slow/{id}"), vec![3.0; len]);
+            records.insert(format!("nnue/step_ranger/{id}"), vec![42.0]);
+        }
+
+        let state = load_cuda_cpp_halfkp_optimizer_state(&records, &weights).unwrap().unwrap();
+        assert_eq!(state.l0w.momentum, vec![1.0; 4]);
+        assert_eq!(state.l1w.velocity, vec![2.0; 8]);
+        assert_eq!(state.outb.slow_params, vec![3.0]);
+        assert_eq!(load_cuda_cpp_halfkp_completed_steps(&records).unwrap(), 42);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_halfkp_weights_bin_writes_full_ranger_state() {
+        fn group_state(base: f32) -> bulletou_cuda_cpp::RangerParamStateReadback {
+            bulletou_cuda_cpp::RangerParamStateReadback {
+                momentum: vec![base],
+                velocity: vec![base + 0.25],
+                slow_params: vec![base + 0.5],
+            }
+        }
+
+        let weights = bulletou_cuda_cpp::NnueTrainWeightsReadback {
+            l0w: vec![10.0],
+            l0b: vec![11.0],
+            l1w: vec![12.0],
+            l1b: vec![13.0],
+            l2w: vec![14.0],
+            l2b: vec![15.0],
+            outw: vec![16.0],
+            outb: vec![17.0],
+        };
+        let optimizer = bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback {
+            l0w: group_state(1.0),
+            l0b: group_state(2.0),
+            l1w: group_state(3.0),
+            l1b: group_state(4.0),
+            l2w: group_state(5.0),
+            l2b: group_state(6.0),
+            outw: group_state(7.0),
+            outb: group_state(8.0),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-state-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        write_cuda_cpp_halfkp_weights_bin(&path, &weights, &optimizer, 7).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let records = parse_model_weights_bin(&bytes).unwrap();
+
+        assert_eq!(records["nnue/weights/l0w"], vec![10.0]);
+        assert_eq!(records["nnue/momentum/l0w"], vec![1.0]);
+        assert_eq!(records["nnue/velocity/outb"], vec![8.25]);
+        assert_eq!(records["nnue/slow/l2b"], vec![6.5]);
+        assert_eq!(records["nnue/step_ranger/outw"], vec![7.0]);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
