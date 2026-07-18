@@ -11,7 +11,7 @@ use super::{Factorises, SparseInputType};
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::FE_OLD_END,
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece},
+    types::{Color, HAND_PIECE_TYPES, PieceType, Square},
 };
 
 // =============================================================================
@@ -150,26 +150,26 @@ fn map_halfkp_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 
     let nstm_ksq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
 
-    // 盤上の駒（王以外）
-    for &pt in &BOARD_PIECE_TYPES {
-        for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
-                let piece = Piece::new(color, pt);
-
-                // STM 視点での BonaPiece
-                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
-                if stm_bp == BonaPiece::ZERO {
-                    continue;
-                }
-                let stm_idx = halfkp_index(stm_ksq, stm_bp.value() as usize);
-
-                // NSTM 視点での BonaPiece
-                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
-                let nstm_idx = halfkp_index(nstm_ksq, nstm_bp.value() as usize);
-
-                f(stm_idx, nstm_idx);
-            }
+    // 盤上の駒（王以外）。従来は駒種×色ごとに81マスを何度も走査していたが、
+    // HalfKP では各非玉駒を1回だけ列挙すれば十分。
+    for (sq_idx, &piece) in board.board.iter().enumerate() {
+        if piece.is_none() || piece.piece_type == PieceType::King {
+            continue;
         }
+        let sq = Square::from_index(sq_idx);
+
+        // STM 視点での BonaPiece
+        let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+        if stm_bp == BonaPiece::ZERO {
+            continue;
+        }
+        let stm_idx = halfkp_index(stm_ksq, stm_bp.value() as usize);
+
+        // NSTM 視点での BonaPiece
+        let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+        let nstm_idx = halfkp_index(nstm_ksq, nstm_bp.value() as usize);
+
+        f(stm_idx, nstm_idx);
     }
 
     // 注意: HalfKP では王は特徴量に含めない（HalfKA_hm との違い）
@@ -216,7 +216,7 @@ fn halfkp_index(king_sq: usize, bonapiece: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::game::inputs::Factorised;
-    use crate::shogi::{PieceType, Square};
+    use crate::shogi::{Piece, PieceType, Square};
 
     use super::*;
 

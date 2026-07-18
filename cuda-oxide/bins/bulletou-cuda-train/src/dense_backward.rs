@@ -12,6 +12,8 @@ use bulletou_cuda_oxide_runtime::{
 };
 use cuda_host::cuda_launch;
 
+use crate::cublas::CublasHandle;
+
 #[allow(dead_code)]
 pub(crate) fn launch_dense_output_backward(
     stream: &Arc<CudaStream>,
@@ -92,6 +94,194 @@ pub(crate) fn launch_dense_crelu_backward(
                 slice_mut(bias_gradients),
                 batch,
                 input_dim,
+                output_dim
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_dense_crelu_backward_cublas(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    cublas: &CublasHandle,
+    layout: DenseCReluBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    activations: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+    mut pre_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    launch_dense_crelu_pre_gradients(stream, module, layout, activations, output_gradients, &mut pre_gradients)?;
+
+    cublas.sgemm_x_yt_rowmajor(
+        layout.batch_size,
+        layout.input_dim,
+        layout.output_dim,
+        pre_gradients,
+        weights,
+        &mut input_gradients,
+    )?;
+    cublas.sgemm_xt_y_rowmajor(
+        layout.input_dim,
+        layout.output_dim,
+        layout.batch_size,
+        inputs,
+        pre_gradients,
+        &mut weight_gradients,
+    )?;
+
+    launch_dense_bias_gradients(stream, module, layout, pre_gradients, &mut bias_gradients)
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_dense_crelu_backward_split(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: DenseCReluBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    activations: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+    mut pre_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    launch_dense_crelu_pre_gradients(stream, module, layout, activations, output_gradients, &mut pre_gradients)?;
+    launch_dense_pre_input_gradients(stream, module, layout, pre_gradients, weights, &mut input_gradients)?;
+    launch_dense_pre_weight_gradients(stream, module, layout, inputs, pre_gradients, &mut weight_gradients)?;
+    launch_dense_bias_gradients(stream, module, layout, pre_gradients, &mut bias_gradients)
+}
+
+fn launch_dense_crelu_pre_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: DenseCReluBackwardLayout,
+    activations: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    mut pre_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let threads = layout.output_gradients_len();
+    let batch = layout.batch_size as u32;
+    let output_dim = layout.output_dim as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `dense_crelu_pre_gradients`; all buffers
+        // are same-context device allocations and the output has B*out_dim elements.
+        cuda_launch! {
+            kernel: crate::kernels::backward::dense_crelu_pre_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(threads),
+            args: [
+                slice(activations),
+                slice(output_gradients),
+                slice_mut(pre_gradients),
+                batch,
+                output_dim
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+fn launch_dense_pre_input_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: DenseCReluBackwardLayout,
+    pre_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `dense_pre_input_gradients`.
+        cuda_launch! {
+            kernel: crate::kernels::backward::dense_pre_input_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(layout.input_gradients_len()),
+            args: [
+                slice(pre_gradients),
+                slice(weights),
+                slice_mut(input_gradients),
+                batch,
+                input_dim,
+                output_dim
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+fn launch_dense_pre_weight_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: DenseCReluBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    pre_gradients: &DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `dense_pre_weight_gradients`.
+        cuda_launch! {
+            kernel: crate::kernels::backward::dense_pre_weight_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(layout.weight_len()),
+            args: [
+                slice(inputs),
+                slice(pre_gradients),
+                slice_mut(weight_gradients),
+                batch,
+                input_dim,
+                output_dim
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+fn launch_dense_bias_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: DenseCReluBackwardLayout,
+    pre_gradients: &DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let batch = layout.batch_size as u32;
+    let output_dim = layout.output_dim as u32;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `dense_bias_gradients`; one thread owns
+        // each bias output element and scans the batch dimension.
+        cuda_launch! {
+            kernel: crate::kernels::backward::dense_bias_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(layout.bias_len()),
+            args: [
+                slice(pre_gradients),
+                slice_mut(bias_gradients),
+                batch,
                 output_dim
             ]
         }

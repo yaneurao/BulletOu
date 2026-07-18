@@ -108,6 +108,111 @@ pub fn dense_crelu_backward(
 }
 
 #[kernel]
+pub fn dense_crelu_pre_gradients(
+    activations: &[f32],
+    output_gradients: &[f32],
+    mut pre_gradients: DisjointSlice<f32>,
+    batch: u32,
+    output_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (output_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+
+    let value = crelu_pre_gradient_from_value(activations[tid.get()], output_gradients[tid.get()]);
+    if let Some(out) = pre_gradients.get_mut(tid) {
+        *out = value;
+    }
+}
+
+#[kernel]
+pub fn dense_pre_input_gradients(
+    pre_gradients: &[f32],
+    weights: &[f32],
+    mut input_gradients: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    output_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let input_rows = input_dim as usize;
+    let output_rows = output_dim as usize;
+    let input_gradient_len = batch_size * input_rows;
+
+    if tid_value >= input_gradient_len {
+        return;
+    }
+
+    let sample = tid_value / input_rows;
+    let in_col = tid_value - sample * input_rows;
+    let mut sum = 0.0_f32;
+    for out_col in 0..output_rows {
+        sum += pre_gradients[sample * output_rows + out_col] * weights[in_col * output_rows + out_col];
+    }
+    if let Some(out) = input_gradients.get_mut(tid) {
+        *out = sum;
+    }
+}
+
+#[kernel]
+pub fn dense_pre_weight_gradients(
+    inputs: &[f32],
+    pre_gradients: &[f32],
+    mut weight_gradients: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    output_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let input_rows = input_dim as usize;
+    let output_rows = output_dim as usize;
+    let weight_len = input_rows * output_rows;
+
+    if tid_value >= weight_len {
+        return;
+    }
+
+    let in_col = tid_value / output_rows;
+    let out_col = tid_value - in_col * output_rows;
+    let mut sum = 0.0_f32;
+    for sample in 0..batch_size {
+        sum += pre_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
+    }
+    if let Some(out) = weight_gradients.get_mut(tid) {
+        *out = sum;
+    }
+}
+
+#[kernel]
+pub fn dense_bias_gradients(
+    pre_gradients: &[f32],
+    mut bias_gradients: DisjointSlice<f32>,
+    batch: u32,
+    output_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let out_col = tid.get();
+    let rows = output_dim as usize;
+    if out_col >= rows {
+        return;
+    }
+
+    let mut sum = 0.0_f32;
+    for sample in 0..(batch as usize) {
+        sum += pre_gradients[sample * rows + out_col];
+    }
+    if let Some(out) = bias_gradients.get_mut(tid) {
+        *out = sum;
+    }
+}
+
+#[kernel]
 pub fn nnue_l0_crelu_backward(
     combined_gradients: &[f32],
     stm_activations: &[f32],

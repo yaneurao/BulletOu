@@ -7,6 +7,10 @@ use crate::{CudaStream, DeviceBuffer, Result};
 
 pub const DENSE_OUTPUT_BACKWARD_KERNEL: &str = "dense_output_backward";
 pub const DENSE_CRELU_BACKWARD_KERNEL: &str = "dense_crelu_backward";
+pub const DENSE_CRELU_PRE_GRADIENTS_KERNEL: &str = "dense_crelu_pre_gradients";
+pub const DENSE_PRE_INPUT_GRADIENTS_KERNEL: &str = "dense_pre_input_gradients";
+pub const DENSE_PRE_WEIGHT_GRADIENTS_KERNEL: &str = "dense_pre_weight_gradients";
+pub const DENSE_BIAS_GRADIENTS_KERNEL: &str = "dense_bias_gradients";
 pub const NNUE_L0_CRELU_BACKWARD_KERNEL: &str = "nnue_l0_crelu_backward";
 pub const NNUE_L0_SPARSE_BACKWARD_KERNEL: &str = "nnue_l0_sparse_backward";
 pub const SFNN_STACKED_L3_BACKWARD_KERNEL: &str = "sfnn_stacked_l3_backward";
@@ -16,9 +20,13 @@ pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backw
 pub const SFNN_SHARED_L1_BACKWARD_KERNEL: &str = "sfnn_shared_l1_backward";
 pub const SFNN_PAIRWISE_BACKWARD_KERNEL: &str = "sfnn_pairwise_backward";
 pub const SFNN_L0_SPARSE_BACKWARD_KERNEL: &str = "sfnn_l0_sparse_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 11] = [
+pub const BACKWARD_KERNEL_NAMES: [&str; 15] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
+    DENSE_CRELU_PRE_GRADIENTS_KERNEL,
+    DENSE_PRE_INPUT_GRADIENTS_KERNEL,
+    DENSE_PRE_WEIGHT_GRADIENTS_KERNEL,
+    DENSE_BIAS_GRADIENTS_KERNEL,
     NNUE_L0_CRELU_BACKWARD_KERNEL,
     NNUE_L0_SPARSE_BACKWARD_KERNEL,
     SFNN_STACKED_L3_BACKWARD_KERNEL,
@@ -554,6 +562,14 @@ impl NnueBackwardWorkspaceLayout {
         self.batch_size * self.shape.l2
     }
 
+    pub fn hidden2_pre_gradients_len(self) -> usize {
+        self.hidden2_gradients_len()
+    }
+
+    pub fn hidden1_pre_gradients_len(self) -> usize {
+        self.hidden1_gradients_len()
+    }
+
     pub fn combined_gradients_len(self) -> usize {
         self.batch_size * self.shape.l1 * 2
     }
@@ -597,6 +613,8 @@ impl NnueBackwardWorkspaceLayout {
     pub fn total_gradient_f32_len(self) -> usize {
         self.hidden2_gradients_len()
             .saturating_add(self.hidden1_gradients_len())
+            .saturating_add(self.hidden2_pre_gradients_len())
+            .saturating_add(self.hidden1_pre_gradients_len())
             .saturating_add(self.combined_gradients_len())
             .saturating_add(self.l0_gradients_len().saturating_mul(2))
             .saturating_add(self.l0w_gradients_len())
@@ -615,6 +633,8 @@ pub struct NnueBackwardWorkspace {
     pub layout: NnueBackwardWorkspaceLayout,
     pub hidden2_gradients: DeviceBuffer<f32>,
     pub hidden1_gradients: DeviceBuffer<f32>,
+    pub hidden2_pre_gradients: DeviceBuffer<f32>,
+    pub hidden1_pre_gradients: DeviceBuffer<f32>,
     pub combined_gradients: DeviceBuffer<f32>,
     pub stm_l0_gradients: DeviceBuffer<f32>,
     pub nstm_l0_gradients: DeviceBuffer<f32>,
@@ -636,6 +656,8 @@ impl NnueBackwardWorkspace {
             layout,
             hidden2_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden2_gradients_len())?,
             hidden1_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden1_gradients_len())?,
+            hidden2_pre_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden2_pre_gradients_len())?,
+            hidden1_pre_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.hidden1_pre_gradients_len())?,
             combined_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.combined_gradients_len())?,
             stm_l0_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0_gradients_len())?,
             nstm_l0_gradients: DeviceBuffer::<f32>::zeroed(stream, layout.l0_gradients_len())?,
@@ -959,6 +981,10 @@ mod tests {
             [
                 "dense_output_backward",
                 "dense_crelu_backward",
+                "dense_crelu_pre_gradients",
+                "dense_pre_input_gradients",
+                "dense_pre_weight_gradients",
+                "dense_bias_gradients",
                 "nnue_l0_crelu_backward",
                 "nnue_l0_sparse_backward",
                 "sfnn_stacked_l3_backward",
@@ -1064,6 +1090,8 @@ mod tests {
 
         assert_eq!(layout.hidden2_gradients_len(), 6);
         assert_eq!(layout.hidden1_gradients_len(), 9);
+        assert_eq!(layout.hidden2_pre_gradients_len(), 6);
+        assert_eq!(layout.hidden1_pre_gradients_len(), 9);
         assert_eq!(layout.combined_gradients_len(), 24);
         assert_eq!(layout.l0_gradients_len(), 12);
         assert_eq!(layout.l0w_gradients_len(), 28);
@@ -1074,7 +1102,7 @@ mod tests {
         assert_eq!(layout.l2b_gradients_len(), 2);
         assert_eq!(layout.outw_gradients_len(), 2);
         assert_eq!(layout.outb_gradients_len(), 1);
-        assert_eq!(layout.total_gradient_f32_len(), 133);
+        assert_eq!(layout.total_gradient_f32_len(), 148);
     }
 
     #[test]
@@ -1090,15 +1118,11 @@ mod tests {
             BackwardLayoutError::EmptySparse
         );
         assert_eq!(
-            NnueBackwardWorkspaceLayout::new(NnueForwardShape { input_size: 0, ..shape }, 3, 5)
-                .validate()
-                .unwrap_err(),
+            NnueBackwardWorkspaceLayout::new(NnueForwardShape { input_size: 0, ..shape }, 3, 5).validate().unwrap_err(),
             BackwardLayoutError::EmptyInput
         );
         assert_eq!(
-            NnueBackwardWorkspaceLayout::new(NnueForwardShape { l2: 0, ..shape }, 3, 5)
-                .validate()
-                .unwrap_err(),
+            NnueBackwardWorkspaceLayout::new(NnueForwardShape { l2: 0, ..shape }, 3, 5).validate().unwrap_err(),
             BackwardLayoutError::EmptyOutput
         );
     }
@@ -1233,18 +1257,9 @@ mod tests {
 
     #[test]
     fn sfnn_shared_l1_layout_rejects_empty_values() {
-        assert_eq!(
-            SfnnSharedL1BackwardLayout::new(0, 4, 5).validate().unwrap_err(),
-            BackwardLayoutError::EmptyBatch
-        );
-        assert_eq!(
-            SfnnSharedL1BackwardLayout::new(3, 0, 5).validate().unwrap_err(),
-            BackwardLayoutError::EmptyInput
-        );
-        assert_eq!(
-            SfnnSharedL1BackwardLayout::new(3, 4, 0).validate().unwrap_err(),
-            BackwardLayoutError::EmptyOutput
-        );
+        assert_eq!(SfnnSharedL1BackwardLayout::new(0, 4, 5).validate().unwrap_err(), BackwardLayoutError::EmptyBatch);
+        assert_eq!(SfnnSharedL1BackwardLayout::new(3, 0, 5).validate().unwrap_err(), BackwardLayoutError::EmptyInput);
+        assert_eq!(SfnnSharedL1BackwardLayout::new(3, 4, 0).validate().unwrap_err(), BackwardLayoutError::EmptyOutput);
     }
 
     #[test]

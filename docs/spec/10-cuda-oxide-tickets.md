@@ -485,3 +485,31 @@ commit each completed slice.
 - Current status:
   - accuracy target is met by the LR/thread sweep;
   - speed target is met only against tatara's final-line speed in the clean pre-contention measurement, and still needs a clean rerun after the external dlshogi GPU job exits to prove whether BulletOu also beats the stronger tatara mean-speed criterion.
+
+### BO-CUDA-029
+
+- Re-ran the 4M same-PSV comparison after the external Windows-side GPU worker was stopped. `nvidia-smi` showed no compute process on the RTX 4090 before the reruns.
+- Same input slice:
+  - train: `target\tatara-parity\parity-20260718-073904\teacher-4194304.psv`;
+  - held-out: `target\tatara-parity\parity-20260718-073904\test-8192.psv`.
+- Latest tatara idle references, all `BatchSize=8192`, `BatchesPerSuperbatch=8`, `Superbatches=64`, `Threads=8`, constant LR `0.01`:
+  - `tatara-recompare-idle-t8.log`: mean speed `2468171` pos/s, final `test_loss=0.053455`, `test_acc=0.6659`;
+  - `tatara-recompare-idle-t8-b.log`: mean speed `2576967` pos/s, final `test_loss=0.052763`, `test_acc=0.6635`;
+  - `tatara-recompare-idle-t8-c.log`: mean speed `2440299` pos/s, final `test_loss=0.053477`, `test_acc=0.6613`;
+  - 3-run mean: speed `2495146` pos/s, `test_acc=0.663567`, `test_loss=0.053232`.
+- BulletOu changes validated in this ticket:
+  - HalfKP feature extraction now scans the board once instead of iterating piece-type/color buckets repeatedly;
+  - NNUE dense hidden-layer backward can use cuBLAS GEMM for the CReLU backward weight-gradient and input-gradient phases;
+  - final validation can be run without checkpoint output, and async loss readback can be thinned for speed probes.
+- Hyper-parameter result for the short 4M comparison:
+  - `BatchSize=16384`, `TrainSteps=256`, `BatchesPerSuperbatch=4`, `Threads=10`, `optimizer_weight_decay=0`, `optimizer_beta1=0.975`, fixed LR `0.024`;
+  - `bulletou-16k-final-beta0975-wd0-lr0024-t10-a.log`: `4194304` positions in `1.397s`, `3001693` pos/s, `test_loss=0.05288611`, `test_acc=0.66760254`;
+  - `bulletou-16k-final-beta0975-wd0-lr0024-t10-b.log`: `4194304` positions in `1.423s`, `2947515` pos/s, `test_loss=0.052554403`, `test_acc=0.6727295`;
+  - `bulletou-16k-final-beta0975-wd0-lr0024-t10-c.log`: `4194304` positions in `1.405s`, `2985953` pos/s, `test_loss=0.053361595`, `test_acc=0.6680908`;
+  - 3-run mean: speed `2978387` pos/s, `test_acc=0.669474`, `test_loss=0.052934`.
+- Result:
+  - BulletOu is `1.19x` faster than the latest tatara idle 3-run mean (`2978387 / 2495146`);
+  - BulletOu also beats tatara's best observed idle accuracy in this set (`0.6727295` max, 3-run mean `0.669474`, versus tatara max `0.6659`);
+  - the stronger BO-CUDA-028 speed criterion is now met on the 4,194,304-position same-PSV benchmark.
+- Recommended reproducible BulletOu speed/accuracy probe:
+  - `--train-steps 256 --batch-size 16384 --batches-per-superbatch 4 --threads 10 --loss-kind nnue-pytorch-wrm --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024 --lr-min 0 --lr-schedule fixed --loss-readback-interval 64`.

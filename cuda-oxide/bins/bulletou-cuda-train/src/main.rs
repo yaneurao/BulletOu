@@ -2,6 +2,9 @@
 #![cfg_attr(feature = "cuda", feature(core_intrinsics))]
 
 #[cfg(feature = "cuda")]
+mod cublas;
+
+#[cfg(feature = "cuda")]
 mod dense_backward;
 
 #[cfg(feature = "cuda")]
@@ -1399,10 +1402,12 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 } else {
                     step % args.batches_per_superbatch == 0
                 };
-                let readback_loss = args.output.is_some()
-                    || args.debug_readback
+                let checkpoint_loss_readback = args.output.is_some()
+                    && save_interval_steps.map(|interval| run_steps.saturating_add(1) % interval == 0).unwrap_or(false);
+                let readback_loss = args.debug_readback
                     || step == completed_step_offset + args.train_steps
-                    || periodic_loss_readback;
+                    || periodic_loss_readback
+                    || checkpoint_loss_readback;
                 let completed_loss = runner_ref.step_pipelined(
                     &stream,
                     &module,
@@ -1423,6 +1428,14 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     learning_rates.push(meta.learning_rate);
                     sources.push(meta.source);
                     dataloader_positions.push(meta.dataloader_pos);
+                    if args.output.is_some()
+                        && save_interval_steps.map(|interval| meta.step % interval == 0).unwrap_or(false)
+                    {
+                        checkpoint_losses.push(loss_entry);
+                        checkpoint_learning_rates.push(meta.learning_rate);
+                        checkpoint_sources.push(sources.last().expect("async NNUE source was just pushed").clone());
+                        checkpoint_dataloader_positions.push(meta.dataloader_pos);
+                    }
                     last_batch = Some(meta.train_batch);
                 }
                 if readback_loss {

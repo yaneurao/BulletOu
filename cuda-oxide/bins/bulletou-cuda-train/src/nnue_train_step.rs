@@ -24,9 +24,23 @@ use bulletou_cuda_oxide_runtime::{
 };
 use cuda_core::{CudaEvent, PinnedHostBuffer};
 
-use crate::{dense_backward, loss_forward, nnue_forward, optimizer_update};
+use crate::{cublas::CublasHandle, dense_backward, loss_forward, nnue_forward, optimizer_update};
 
 const NNUE_TRAIN_PIPELINE_SLOTS: usize = 2;
+
+fn cublas_dense_backward_enabled() -> bool {
+    match std::env::var("BULLETOU_CUBLAS_DENSE_BACKWARD") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"),
+        Err(_) => true,
+    }
+}
+
+fn cublas_tf32_enabled() -> bool {
+    match std::env::var("BULLETOU_CUBLAS_TF32") {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"),
+        Err(_) => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NnueTrainLossKind {
@@ -148,6 +162,8 @@ pub(crate) struct NnueLossRangerStepRunner {
     slots: Vec<NnueTrainStepSlot>,
     upload_stream: Arc<CudaStream>,
     readback_stream: Arc<CudaStream>,
+    cublas: CublasHandle,
+    use_cublas_dense_backward: bool,
     next_slot: usize,
     last_step_slot: Option<usize>,
     pending_loss: Option<PendingLossReadback>,
@@ -206,6 +222,8 @@ impl NnueLossRangerStepRunner {
     ) -> Result<Self> {
         let upload_stream = stream.fork()?;
         let readback_stream = stream.fork()?;
+        let cublas = CublasHandle::new(stream, cublas_tf32_enabled())?;
+        let use_cublas_dense_backward = cublas_dense_backward_enabled();
         let mut slots = Vec::with_capacity(NNUE_TRAIN_PIPELINE_SLOTS);
         for _ in 0..NNUE_TRAIN_PIPELINE_SLOTS {
             slots.push(NnueTrainStepSlot::new(stream, shape, batch_size, max_active)?);
@@ -220,6 +238,8 @@ impl NnueLossRangerStepRunner {
             slots,
             upload_stream,
             readback_stream,
+            cublas,
+            use_cublas_dense_backward,
             next_slot: 0,
             last_step_slot: None,
             pending_loss: None,
@@ -464,34 +484,70 @@ impl NnueLossRangerStepRunner {
             profile_stage(stream, &mut profile_mark, "out_bwd")?;
         }
 
-        dense_backward::launch_dense_crelu_backward(
-            stream,
-            module,
-            DenseCReluBackwardLayout::new(self.batch_size, self.shape.l2, self.shape.l3),
-            &slot_ref.forward_workspace.hidden1,
-            &slot_ref.forward_workspace.hidden2,
-            &slot_ref.backward_workspace.hidden2_gradients,
-            &self.device_weights.l2w,
-            &mut slot_ref.backward_workspace.hidden1_gradients,
-            &mut slot_ref.backward_workspace.l2w_gradients,
-            &mut slot_ref.backward_workspace.l2b_gradients,
-        )?;
+        let l2_layout = DenseCReluBackwardLayout::new(self.batch_size, self.shape.l2, self.shape.l3);
+        if self.use_cublas_dense_backward {
+            dense_backward::launch_dense_crelu_backward_cublas(
+                stream,
+                module,
+                &self.cublas,
+                l2_layout,
+                &slot_ref.forward_workspace.hidden1,
+                &slot_ref.forward_workspace.hidden2,
+                &slot_ref.backward_workspace.hidden2_gradients,
+                &self.device_weights.l2w,
+                &mut slot_ref.backward_workspace.hidden1_gradients,
+                &mut slot_ref.backward_workspace.l2w_gradients,
+                &mut slot_ref.backward_workspace.l2b_gradients,
+                &mut slot_ref.backward_workspace.hidden2_pre_gradients,
+            )?;
+        } else {
+            dense_backward::launch_dense_crelu_backward(
+                stream,
+                module,
+                l2_layout,
+                &slot_ref.forward_workspace.hidden1,
+                &slot_ref.forward_workspace.hidden2,
+                &slot_ref.backward_workspace.hidden2_gradients,
+                &self.device_weights.l2w,
+                &mut slot_ref.backward_workspace.hidden1_gradients,
+                &mut slot_ref.backward_workspace.l2w_gradients,
+                &mut slot_ref.backward_workspace.l2b_gradients,
+            )?;
+        }
         if profile {
             profile_stage(stream, &mut profile_mark, "l2_bwd")?;
         }
 
-        dense_backward::launch_dense_crelu_backward(
-            stream,
-            module,
-            DenseCReluBackwardLayout::new(self.batch_size, self.shape.l1 * 2, self.shape.l2),
-            &slot_ref.forward_workspace.combined,
-            &slot_ref.forward_workspace.hidden1,
-            &slot_ref.backward_workspace.hidden1_gradients,
-            &self.device_weights.l1w,
-            &mut slot_ref.backward_workspace.combined_gradients,
-            &mut slot_ref.backward_workspace.l1w_gradients,
-            &mut slot_ref.backward_workspace.l1b_gradients,
-        )?;
+        let l1_layout = DenseCReluBackwardLayout::new(self.batch_size, self.shape.l1 * 2, self.shape.l2);
+        if self.use_cublas_dense_backward {
+            dense_backward::launch_dense_crelu_backward_cublas(
+                stream,
+                module,
+                &self.cublas,
+                l1_layout,
+                &slot_ref.forward_workspace.combined,
+                &slot_ref.forward_workspace.hidden1,
+                &slot_ref.backward_workspace.hidden1_gradients,
+                &self.device_weights.l1w,
+                &mut slot_ref.backward_workspace.combined_gradients,
+                &mut slot_ref.backward_workspace.l1w_gradients,
+                &mut slot_ref.backward_workspace.l1b_gradients,
+                &mut slot_ref.backward_workspace.hidden1_pre_gradients,
+            )?;
+        } else {
+            dense_backward::launch_dense_crelu_backward(
+                stream,
+                module,
+                l1_layout,
+                &slot_ref.forward_workspace.combined,
+                &slot_ref.forward_workspace.hidden1,
+                &slot_ref.backward_workspace.hidden1_gradients,
+                &self.device_weights.l1w,
+                &mut slot_ref.backward_workspace.combined_gradients,
+                &mut slot_ref.backward_workspace.l1w_gradients,
+                &mut slot_ref.backward_workspace.l1b_gradients,
+            )?;
+        }
         if profile {
             profile_stage(stream, &mut profile_mark, "l1_bwd")?;
         }
