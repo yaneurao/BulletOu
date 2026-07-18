@@ -1008,7 +1008,7 @@ pub struct NnueBackwardReadback {
 impl NnueBackwardWorkspace {
     pub fn new(ctx: &Context, layout: NnueBackwardWorkspaceLayout) -> Result<Self> {
         layout.validate()?;
-        Ok(Self {
+        let workspace = Self {
             layout,
             hidden2_gradients: F32Buffer::new(ctx, layout.hidden2_gradients_len())?,
             hidden1_gradients: F32Buffer::new(ctx, layout.hidden1_gradients_len())?,
@@ -1023,7 +1023,10 @@ impl NnueBackwardWorkspace {
             l2b_gradients: F32Buffer::new(ctx, layout.l2b_gradients_len())?,
             outw_gradients: F32Buffer::new(ctx, layout.outw_gradients_len())?,
             outb_gradients: F32Buffer::new(ctx, layout.outb_gradients_len())?,
-        })
+        };
+        workspace.l0w_gradients.fill(ctx, 0.0)?;
+        workspace.l0b_gradients.fill(ctx, 0.0)?;
+        Ok(workspace)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1069,6 +1072,29 @@ pub fn nnue_backward_device(
     forward: &NnueForwardWorkspace,
     loss: &ScalarLossWorkspace,
     backward: &NnueBackwardWorkspace,
+) -> Result<()> {
+    nnue_backward_device_with_l0_zero(ctx, batch, weights, forward, loss, backward, true)
+}
+
+fn nnue_backward_device_reusing_zeroed_l0_gradients(
+    ctx: &Context,
+    batch: &NnueForwardDeviceBatch,
+    weights: &NnueForwardDeviceWeights,
+    forward: &NnueForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &NnueBackwardWorkspace,
+) -> Result<()> {
+    nnue_backward_device_with_l0_zero(ctx, batch, weights, forward, loss, backward, false)
+}
+
+fn nnue_backward_device_with_l0_zero(
+    ctx: &Context,
+    batch: &NnueForwardDeviceBatch,
+    weights: &NnueForwardDeviceWeights,
+    forward: &NnueForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &NnueBackwardWorkspace,
+    zero_l0_gradients: bool,
 ) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
@@ -1132,6 +1158,7 @@ pub fn nnue_backward_device(
             backward.l2b_gradients.as_ptr(),
             backward.outw_gradients.as_ptr(),
             backward.outb_gradients.as_ptr(),
+            i32::from(zero_l0_gradients),
         )
     })
 }
@@ -1470,7 +1497,7 @@ impl NnueTrainStepRunner {
             &self.entry_weights,
             &self.loss_workspace,
         )?;
-        nnue_backward_device(
+        nnue_backward_device_reusing_zeroed_l0_gradients(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -1525,7 +1552,7 @@ impl NnueTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
-        nnue_backward_device(
+        nnue_backward_device_reusing_zeroed_l0_gradients(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -2136,6 +2163,7 @@ mod ffi {
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
             outw_gradients: *mut BulletOuCudaCppF32Buffer,
             outb_gradients: *mut BulletOuCudaCppF32Buffer,
+            zero_l0_gradients: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,

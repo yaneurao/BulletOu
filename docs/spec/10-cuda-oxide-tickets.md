@@ -703,6 +703,9 @@ the tickets in order and commit each completed slice.
 - Added direct-step CUDA event profiling:
   - `--cuda-cpp-profile-steps N` profiles only the first N direct train steps, leaving normal unprofiled throughput unaffected afterward;
   - each profiled step prints upload / forward / loss / backward / Ranger update / total GPU time.
+- Reduced train-step L0 backward overhead:
+  - the public `nnue_backward_device` path keeps the previous fresh-gradient semantics and zeroes L0 gradients every call;
+  - `NnueTrainStepRunner` now initialises L0 gradient buffers once and then reuses Ranger's per-step gradient reset, skipping the large per-step L0 zero kernel in the direct training path.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
@@ -721,8 +724,10 @@ the tickets in order and commit each completed slice.
   - full-state direct output smoke with `--output target\cuda-cpp-fullstate-smoke --cuda-cpp-train-steps 1 --batch-size 256` wrote `cuda-cpp-direct/nn.bin` (64,217,077 bytes) and full-state `cuda-cpp-direct/weights.bin` (520,215,138 bytes).
   - full-state reload smoke with `--cuda-cpp-weights-bin target\cuda-cpp-fullstate-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-fullstate-resume-smoke --cuda-cpp-train-steps 1 --batch-size 256` restored `weights + Ranger optimizer state`, printed `initial completed optimizer steps = 1`, and ran the next update with `optimizer_step=2`.
   - profile smoke with `--cuda-cpp-train-steps 20 --cuda-cpp-profile-steps 3 --batch-size 4096 --buffer-mb 128 --threads 8 --output target\cuda-cpp-profile-smoke` passed and reported average profiled GPU time: upload `0.455ms`, forward `0.377ms`, loss `0.165ms`, backward `1.862ms`, Ranger update `1.379ms`, total `4.237ms`.
+  - after skipping the direct-path L0 zero kernel, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed, `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed, and the same 20-step profile reported backward `1.758ms`, total `4.117ms`.
+  - unprofiled 100-step release smoke after the skip-zero change reported `throughput=868393 pos/s` for `--cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8 --output target\cuda-cpp-skipzero-100`.
 - Remaining BO-CUDA-033 work:
   - wire the direct full-state replay into normal checkpoint/log/validation semantics and `--resume`/`--no-resume` orchestration;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
-  - optimise the correctness-first L0 sparse backward path (currently atomic-scatter) and Ranger update path, which dominate the first CUDA profile;
+  - optimise the correctness-first L0 sparse backward atomic-scatter and Ranger update path, which still dominate the CUDA profile after removing the direct-path zero kernel;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.

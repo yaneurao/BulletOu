@@ -902,7 +902,8 @@ int launch_nnue_backward_kernels(
     float* l2w_gradients,
     float* l2b_gradients,
     float* outw_gradients,
-    float* outb_gradients) {
+    float* outb_gradients,
+    int zero_l0_gradients) {
     if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0) {
         return -1;
     }
@@ -984,13 +985,16 @@ int launch_nnue_backward_kernels(
         return -1;
     }
 
-    size_t l0_zero_threads = std::max(input_size * l1, l1);
-    if (block_count_1d(l0_zero_threads, threads, &blocks, "nnue_l0_sparse_zero_gradients_kernel") != 0) {
-        return -1;
-    }
-    nnue_l0_sparse_zero_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w_gradients, l0b_gradients, input_size, l1);
-    if (check_kernel_launch("nnue_l0_sparse_zero_gradients_kernel launch") != 0) {
-        return -1;
+    if (zero_l0_gradients != 0) {
+        size_t l0_zero_threads = std::max(input_size * l1, l1);
+        if (block_count_1d(l0_zero_threads, threads, &blocks, "nnue_l0_sparse_zero_gradients_kernel") != 0) {
+            return -1;
+        }
+        nnue_l0_sparse_zero_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            l0w_gradients, l0b_gradients, input_size, l1);
+        if (check_kernel_launch("nnue_l0_sparse_zero_gradients_kernel launch") != 0) {
+            return -1;
+        }
     }
 
     size_t l0_scatter_threads = std::max(batch * max_active * l1, batch * l1);
@@ -1943,7 +1947,8 @@ extern "C" int bulletou_cuda_cpp_nnue_backward_device(
     BulletOuCudaCppF32Buffer* l2w_gradients,
     BulletOuCudaCppF32Buffer* l2b_gradients,
     BulletOuCudaCppF32Buffer* outw_gradients,
-    BulletOuCudaCppF32Buffer* outb_gradients) {
+    BulletOuCudaCppF32Buffer* outb_gradients,
+    int zero_l0_gradients) {
     if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "stm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "nstm_indices") != 0 ||
@@ -2003,7 +2008,8 @@ extern "C" int bulletou_cuda_cpp_nnue_backward_device(
             l2w_gradients->ptr,
             l2b_gradients->ptr,
             outw_gradients->ptr,
-            outb_gradients->ptr) != 0) {
+            outb_gradients->ptr,
+            zero_l0_gradients) != 0) {
         return -1;
     }
 
