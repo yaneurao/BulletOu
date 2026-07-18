@@ -26,3 +26,4 @@
 - [07-nnue-pytorch-compatibility.md](07-nnue-pytorch-compatibility.md) — nodchip 版 nnue-pytorch 将棋 branch との学習条件差分と互換化の実装順
 - [08-cuda-oxide-speedup-plan.md](08-cuda-oxide-speedup-plan.md) — tatara / cuda-oxide を参考にした BulletOu 高速化調査と段階移植方針
 - [09-cuda-oxide-todo.md](09-cuda-oxide-todo.md) — tatara 同等速度へ向けた cuda-oxide 高速化 TODO
+- [10-cuda-oxide-handoff.md](10-cuda-oxide-handoff.md) — CUDA 環境へ作業を引き継ぐための現状・手順・注意点
