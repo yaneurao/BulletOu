@@ -42,7 +42,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
-| BO-CUDA-035 | todo | cuda-cpp production schedule parity | teach the Windows-native direct backend to honor normal production `--superbatches` / `--max-epochs` / `--save-rate` / LR schedule semantics instead of requiring manual `--cuda-cpp-train-steps` sizing |
+| BO-CUDA-035 | doing | cuda-cpp production schedule parity | teach the Windows-native direct backend to honor normal production `--superbatches` / `--max-epochs` / `--save-rate` / LR schedule semantics instead of requiring manual `--cuda-cpp-train-steps` sizing |
 | BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | optimise the remaining HalfKP sparse L0 backward/update hot spots and first-step library warmup so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
 
 ## Notes
@@ -886,3 +886,22 @@ the tickets in order and commit each completed slice.
     `--cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-positions 65536 --test-sample sequential --test-batch-size 8192` reported `649199616` positions in `489.182s`, `throughput=1327112 pos/s`, `test_value_loss=0.05579023`, `test_value_accuracy=0.6717072`.
   - Auto-resume smoke for SFNN direct wrote `target\cuda-cpp-sfnn-numbered-resume-smoke\0001`, resumed from `0001/state.bin` with `dataloader resume = byte_offset 608, plies 0`, then wrote `0002`; a follow-up resume from `0002/state.bin` printed `initial completed optimizer steps = 2`, ran `optimizer_step=3`, wrote `0003/dataloader_pos.txt = 1824,0`, and the corrected `0003/learn.log` row used cumulative `positions=32`.
 - BO-CUDA-034 is complete for the tracked tatara speed/quality target and Windows-native auto-resume. Follow-up optimisation and production-schedule ergonomics continue under BO-CUDA-033/035.
+
+### BO-CUDA-035
+
+- Started production-schedule parity for the Windows-native C++/CUDA direct backend:
+  - `--backend cuda-cpp` still accepts explicit `--cuda-cpp-train-steps N` for short direct-step smoke/profiling runs;
+  - it now also accepts bounded production mode with `--superbatches N --max-epochs N` for both `NNUE_HALFKP` and `SFNN_HALFKA2`;
+  - direct-step mode and production mode are mutually exclusive, so `--cuda-cpp-train-steps` cannot be mixed with `--superbatches`;
+  - bounded production mode expands `superbatches * max_epochs * effective_batches_per_superbatch` into direct C++/CUDA train steps and chunks checkpoint saves by `--save-rate`;
+  - each save chunk writes a normal numbered checkpoint and summary row, so `--save-rate 1` produces one checkpoint per superbatch and larger values save at the end of each save-rate chunk;
+  - step/geometric/cos LR schedules are applied to the actual C++/CUDA Ranger update per batch using the same positions-based LR formulas as the normal trainer, with epoch-local warm restarts.
+- Current limitations:
+  - production mode is intentionally bounded and requires `--max-epochs` to avoid accidental infinite direct runs;
+  - plateau LR orchestration remains on the normal/cuda-oxide paths for now;
+  - production-mode resume now restores weights/optimizer/dataloader through the existing C++ direct resume path, but exact mid-epoch schedule continuation still needs a focused resume audit before BO-CUDA-035 can be marked done.
+- Validation:
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (31 cuda-cpp tests);
+  - HalfKP production smoke on Windows:
+    `--backend cuda-cpp --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --superbatches 2 --max-epochs 1 --positions-per-superbatch 64 --batch-size 64 --save-rate 1 --cuda-cpp-loss-readback-interval 0 --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 32 --test-sample sequential`
+    wrote `0001` and `0002`, logged `positions=64` then `128`, and wrote `dataloader_pos.txt` as `2432,0` then `4864,0`.
