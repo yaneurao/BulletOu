@@ -7,11 +7,11 @@
 //! - 入力次元: 125,388 (81 × 1548)
 //! - 最大アクティブ特徴: 38 (王2枚を除く)
 
-use super::SparseInputType;
+use super::{Factorises, SparseInputType};
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::FE_OLD_END,
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece},
+    types::{Color, HAND_PIECE_TYPES, PieceType, Square},
 };
 
 // =============================================================================
@@ -26,6 +26,9 @@ pub const NUM_KING_SQ: usize = 81;
 
 /// 駒入力数 (fe_end = 1548、王を除く)
 pub const FE_END: usize = FE_OLD_END; // 1548
+
+/// HalfKP piece-input virtual rows used by the FT factorizer.
+pub const HALFKP_PIECE_INPUTS: usize = FE_END;
 
 /// HalfKP の総入力次元
 pub const HALFKP_DIMENSIONS: usize = NUM_KING_SQ * FE_END; // 125,388
@@ -81,6 +84,46 @@ impl SparseInputType for ShogiHalfKP {
     }
 }
 
+/// Piece-input factorizer for [`ShogiHalfKP`].
+///
+/// A normal HalfKP feature is laid out as `king_square * FE_END + bona_piece`.
+/// The factorized virtual row keeps only the `bona_piece` part, matching tatara's
+/// default Simple FT factorizer in `Base` mode.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiHalfKPPieceFactorizer;
+
+impl SparseInputType for ShogiHalfKPPieceFactorizer {
+    type RequiredDataType = PackedSfenValue;
+
+    fn num_inputs(&self) -> usize {
+        HALFKP_PIECE_INPUTS
+    }
+
+    fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES
+    }
+
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+        ShogiHalfKP.map_features(pos, |stm, nstm| {
+            f(stm % HALFKP_PIECE_INPUTS, nstm % HALFKP_PIECE_INPUTS);
+        });
+    }
+
+    fn shorthand(&self) -> String {
+        "shogi-halfkp-piece-factorizer".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Shogi HalfKP piece-input factorizer".to_string()
+    }
+}
+
+impl Factorises<ShogiHalfKP> for ShogiHalfKPPieceFactorizer {
+    fn derive_feature(&self, _input: &ShogiHalfKP, feat: usize) -> Option<usize> {
+        (feat < HALFKP_DIMENSIONS).then_some(feat % HALFKP_PIECE_INPUTS)
+    }
+}
+
 // =============================================================================
 // HalfKP 特徴量計算
 // =============================================================================
@@ -107,26 +150,26 @@ fn map_halfkp_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 
     let nstm_ksq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
 
-    // 盤上の駒（王以外）
-    for &pt in &BOARD_PIECE_TYPES {
-        for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
-                let piece = Piece::new(color, pt);
-
-                // STM 視点での BonaPiece
-                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
-                if stm_bp == BonaPiece::ZERO {
-                    continue;
-                }
-                let stm_idx = halfkp_index(stm_ksq, stm_bp.value() as usize);
-
-                // NSTM 視点での BonaPiece
-                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
-                let nstm_idx = halfkp_index(nstm_ksq, nstm_bp.value() as usize);
-
-                f(stm_idx, nstm_idx);
-            }
+    // 盤上の駒（王以外）。従来は駒種×色ごとに81マスを何度も走査していたが、
+    // HalfKP では各非玉駒を1回だけ列挙すれば十分。
+    for (sq_idx, &piece) in board.board.iter().enumerate() {
+        if piece.is_none() || piece.piece_type == PieceType::King {
+            continue;
         }
+        let sq = Square::from_index(sq_idx);
+
+        // STM 視点での BonaPiece
+        let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+        if stm_bp == BonaPiece::ZERO {
+            continue;
+        }
+        let stm_idx = halfkp_index(stm_ksq, stm_bp.value() as usize);
+
+        // NSTM 視点での BonaPiece
+        let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+        let nstm_idx = halfkp_index(nstm_ksq, nstm_bp.value() as usize);
+
+        f(stm_idx, nstm_idx);
     }
 
     // 注意: HalfKP では王は特徴量に含めない（HalfKA_hm との違い）
@@ -172,7 +215,8 @@ fn halfkp_index(king_sq: usize, bonapiece: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::shogi::{PieceType, Square};
+    use crate::game::inputs::Factorised;
+    use crate::shogi::{Piece, PieceType, Square};
 
     use super::*;
 
@@ -199,6 +243,43 @@ mod tests {
 
         // king_sq=80, bp=1547 → 80*1548 + 1547 = 125,387
         assert_eq!(halfkp_index(80, 1547), 125_387);
+    }
+
+    #[test]
+    fn test_piece_factorizer_dimensions_and_derivation() {
+        let factorizer = ShogiHalfKPPieceFactorizer;
+
+        assert_eq!(factorizer.num_inputs(), HALFKP_PIECE_INPUTS);
+        assert_eq!(factorizer.max_active(), MAX_ACTIVE_FEATURES);
+        assert_eq!(factorizer.derive_feature(&ShogiHalfKP, halfkp_index(17, 123)), Some(123));
+        assert_eq!(factorizer.derive_feature(&ShogiHalfKP, HALFKP_DIMENSIONS), None);
+    }
+
+    #[test]
+    fn test_piece_factorizer_merge_folds_virtual_rows() {
+        let input = Factorised::from_parts(ShogiHalfKP, ShogiHalfKPPieceFactorizer);
+        let layer_size = 2;
+        let mut unmerged = vec![0.0; input.num_inputs() * layer_size];
+
+        let piece = 10;
+        let normal_feat = halfkp_index(3, piece);
+        let normal_start = (HALFKP_PIECE_INPUTS + normal_feat) * layer_size;
+        unmerged[normal_start] = 1.25;
+        unmerged[normal_start + 1] = -2.5;
+
+        let factor_start = piece * layer_size;
+        unmerged[factor_start] = 0.75;
+        unmerged[factor_start + 1] = 0.5;
+
+        let merged = input.merge_factoriser(unmerged);
+        let merged_start = normal_feat * layer_size;
+        assert_eq!(merged[merged_start], 2.0);
+        assert_eq!(merged[merged_start + 1], -2.0);
+
+        let same_piece_other_king = halfkp_index(5, piece);
+        let other_start = same_piece_other_king * layer_size;
+        assert_eq!(merged[other_start], 0.75);
+        assert_eq!(merged[other_start + 1], 0.5);
     }
 
     #[test]

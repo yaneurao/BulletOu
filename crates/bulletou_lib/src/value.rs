@@ -1,30 +1,50 @@
 pub(crate) mod builder;
 mod dataloader;
 pub mod fast_batch;
+pub mod fast_loss;
 pub mod fast_nnue;
+pub mod fast_nnue_fixture;
+pub mod fast_sfnn;
+pub mod fast_sfnn_fixture;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
 mod save;
+pub mod teacher_batch;
 pub mod yaneuraou_kppt;
 
 use std::cell::RefCell;
 
 pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
-pub use dataloader::FastValueDataLoader;
-pub use fast_batch::{
-    FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs,
-};
-pub use fast_nnue::{
-    FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardWeights,
-    NnueForwardTrace, NnueForwardWorkspaceLayout,
-};
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
     Trainer,
     model::save::SavedFormat,
     optimiser::OptimiserState,
     run::{self, dataloader::PreparedBatchHost, logger},
+};
+pub use dataloader::FastValueDataLoader;
+pub use fast_batch::{FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs};
+pub use fast_loss::{FastLossError, ScalarValueLossKind, ScalarValueLossTrace, scalar_value_loss_trace};
+pub use fast_nnue::{
+    FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardTrace,
+    NnueForwardWeights, NnueForwardWorkspaceLayout,
+};
+pub use fast_nnue_fixture::{
+    NNUE_FORWARD_FIXTURE_MAGIC, NNUE_TRAIN_BATCH_FIXTURE_MAGIC, NNUE_TRAIN_FIXTURE_MAGIC, NnueForwardFixtureError,
+    write_nnue_forward_fixture, write_nnue_forward_fixture_file, write_nnue_train_batch_fixture,
+    write_nnue_train_batch_fixture_file, write_nnue_train_fixture, write_nnue_train_fixture_file,
+};
+pub use fast_sfnn::{
+    FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape, SfnnForwardTrace,
+    SfnnForwardWeights, SfnnForwardWorkspaceLayout,
+};
+pub use fast_sfnn_fixture::{
+    SFNN_FORWARD_FIXTURE_MAGIC, SfnnForwardFixtureError, write_sfnn_forward_fixture, write_sfnn_forward_fixture_file,
+};
+pub use teacher_batch::{
+    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, TeacherBatchError, TeacherDataloaderPos,
+    for_each_halfkp_teacher_fast_batch, load_halfkp_teacher_fast_batch,
 };
 
 use crate::{
@@ -271,11 +291,7 @@ where
     /// Use this for offline validation against a held-out test set: skipping
     /// the `FromStr` step in [`eval_raw_output`] avoids per-position FEN
     /// round-tripping and the larger batch fully utilises the GPU.
-    pub fn eval_packed_batch(
-        &mut self,
-        positions: &[Inp::RequiredDataType],
-        batch_size: usize,
-    ) -> Vec<f32>
+    pub fn eval_packed_batch(&mut self, positions: &[Inp::RequiredDataType], batch_size: usize) -> Vec<f32>
     where
         Inp::RequiredDataType: LoadableDataType,
     {

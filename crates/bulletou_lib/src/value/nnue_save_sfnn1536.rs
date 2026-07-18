@@ -326,9 +326,7 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
                     let bias_scale = (QA as i32 * QB as i32) as f32;
                     let mut bytes = Vec::with_capacity(l2_size * 4);
                     for o in 0..l2_size {
-                        bytes.extend_from_slice(
-                            &quantise_i32(l2b[stack * l2_size + o], bias_scale).to_le_bytes(),
-                        );
+                        bytes.extend_from_slice(&quantise_i32(l2b[stack * l2_size + o], bias_scale).to_le_bytes());
                     }
                     bytes_to_f32_passthrough(&bytes)
                 })
@@ -377,11 +375,7 @@ pub fn build_sfnn_1536_save_format(params: Sfnn1536SaveParams) -> Vec<SavedForma
                     let w_scale = QB as f32;
                     let mut bytes = Vec::with_capacity(pad_in);
                     for in_ in 0..pad_in {
-                        let q = if in_ < l2_size {
-                            quantise_i8(l3w[in_ * num_stacks + stack], w_scale)
-                        } else {
-                            0
-                        };
+                        let q = if in_ < l2_size { quantise_i8(l3w[in_ * num_stacks + stack], w_scale) } else { 0 };
                         bytes.push(q as u8);
                     }
                     bytes_to_f32_passthrough(&bytes)

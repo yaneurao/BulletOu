@@ -216,11 +216,7 @@ fn main() {
         if max_epochs > 1 {
             eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
         }
-        let net_id_for_epoch = if max_epochs > 1 {
-            format!("{}-e{epoch}", args.net_id)
-        } else {
-            args.net_id.clone()
-        };
+        let net_id_for_epoch = if max_epochs > 1 { format!("{}-e{epoch}", args.net_id) } else { args.net_id.clone() };
         let net_id_for_cb = net_id_for_epoch.clone();
         let output_dir_for_cb = args.output.clone();
         let on_checkpoint_saved = move |superbatch: usize| {
@@ -259,13 +255,11 @@ fn main() {
 
         match format {
             DataFormat::Hcpe => {
-                let loader =
-                    HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                let loader = HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
                 trainer.run(&schedule, &settings, &loader);
             }
             DataFormat::Hcpe3 => {
-                let loader =
-                    Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
+                let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true);
                 trainer.run(&schedule, &settings, &loader);
             }
             DataFormat::Pack => {

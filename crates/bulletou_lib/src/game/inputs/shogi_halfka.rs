@@ -20,9 +20,9 @@
 
 use super::SparseInputType;
 use crate::shogi::{
-    bona_piece::{E_KING, FE_HAND_END, F_KING},
-    types::{Color, Piece, Square, BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
     BonaPiece, PackedSfenValue, ShogiBoard,
+    bona_piece::{E_KING, F_KING, FE_HAND_END},
+    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square},
 };
 
 // =============================================================================
@@ -496,11 +496,7 @@ fn map_halfka_nonmirror_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut
 /// キングインデックス（Non-Mirror, 81マス直指定）
 #[inline]
 fn king_index_nonmirror(ksq: Square, perspective: Color) -> usize {
-    if perspective == Color::Black {
-        ksq.index()
-    } else {
-        ksq.inverse().index()
-    }
+    if perspective == Color::Black { ksq.index() } else { ksq.inverse().index() }
 }
 
 /// 王の BonaPiece インデックス（Non-Mirror）
@@ -600,11 +596,7 @@ fn map_halfka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 /// HalfKA2 の BonaPiece pack。敵玉 plane (E_KING) を自玉 plane (F_KING) に畳む。
 #[inline]
 fn pack_bonapiece_halfka2(bp: usize) -> usize {
-    if bp >= E_KING as usize {
-        bp - 81
-    } else {
-        bp
-    }
+    if bp >= E_KING as usize { bp - 81 } else { bp }
 }
 
 /// HalfKA2 の特徴インデックスを計算。

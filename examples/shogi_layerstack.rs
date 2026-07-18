@@ -40,6 +40,7 @@ Options:
 use std::{path::PathBuf, sync::OnceLock};
 
 use bullet_compiler::tensor::TValue;
+use bullet_trainer::model::save::ModelWeights;
 use bulletou_lib::{
     game::inputs::{
         ShogiHalfKA_hm, ShogiHalfKaHmHandCount, ShogiHalfKaHmHandThreat, ShogiHalfKaHmHandThreatDefensive,
@@ -61,7 +62,6 @@ use bulletou_lib::{
     },
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
-use bullet_trainer::model::save::ModelWeights;
 
 /// `ModelWeights::get` が返す `ShapedTValue` から f32 配列と shape を取り出して保持する
 /// ヘルパ。量子化保存の `transform` クロージャで重みを flat に走査するために使う。
@@ -1890,7 +1890,8 @@ fn main() {
     };
 
     // L1 層の入力次元は FT 出力 + （HandCount 有効時は +14）
-    let hand_count_dense_dims: usize = if use_hand_count_dense { bulletou_lib::game::inputs::HAND_COUNT_DIMS } else { 0 };
+    let hand_count_dense_dims: usize =
+        if use_hand_count_dense { bulletou_lib::game::inputs::HAND_COUNT_DIMS } else { 0 };
     let l1_input_dim = ft_out + hand_count_dense_dims;
 
     let optimizer_name = match args.optimizer {

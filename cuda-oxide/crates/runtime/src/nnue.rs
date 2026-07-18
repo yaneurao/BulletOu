@@ -28,12 +28,7 @@ pub struct NnueForwardShape {
     pub l3: usize,
 }
 
-pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape {
-    input_size: 125_388,
-    l1: 256,
-    l2: 32,
-    l3: 32,
-};
+pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape { input_size: 125_388, l1: 256, l2: 32, l3: 32 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardWeightLayout {
@@ -77,7 +72,10 @@ impl NnueForwardWeightLayout {
         1
     }
 
-    pub fn validate_host_weights(self, weights: &NnueForwardHostWeights<'_>) -> std::result::Result<(), NnueLayoutError> {
+    pub fn validate_host_weights(
+        self,
+        weights: &NnueForwardHostWeights<'_>,
+    ) -> std::result::Result<(), NnueLayoutError> {
         expect_len("l0w", self.l0w_len(), weights.l0w.len())?;
         expect_len("l0b", self.l0b_len(), weights.l0b.len())?;
         expect_len("l1w", self.l1w_len(), weights.l1w.len())?;
@@ -112,23 +110,11 @@ impl<'a> NnueForwardHostWeights<'a> {
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum NnueLayoutError {
     #[error("weight length mismatch for {name}: expected {expected}, got {actual}")]
-    WeightLength {
-        name: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    WeightLength { name: &'static str, expected: usize, actual: usize },
     #[error("batch length mismatch for {name}: expected {expected}, got {actual}")]
-    BatchLength {
-        name: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    BatchLength { name: &'static str, expected: usize, actual: usize },
     #[error("layout value mismatch for {name}: expected {expected}, got {actual}")]
-    LayoutValue {
-        name: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    LayoutValue { name: &'static str, expected: usize, actual: usize },
 }
 
 fn expect_len(name: &'static str, expected: usize, actual: usize) -> std::result::Result<(), NnueLayoutError> {
@@ -309,12 +295,7 @@ mod tests {
     use super::*;
 
     fn tiny_shape() -> NnueForwardShape {
-        NnueForwardShape {
-            input_size: 4,
-            l1: 2,
-            l2: 3,
-            l3: 1,
-        }
+        NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 }
     }
 
     #[test]
@@ -406,14 +387,7 @@ mod tests {
 
         let err = weights.validate().unwrap_err();
 
-        assert_eq!(
-            err,
-            NnueLayoutError::WeightLength {
-                name: "l0w",
-                expected: 8,
-                actual: 7,
-            }
-        );
+        assert_eq!(err, NnueLayoutError::WeightLength { name: "l0w", expected: 8, actual: 7 });
     }
 
     #[test]
@@ -439,13 +413,6 @@ mod tests {
 
         let err = batch.validate().unwrap_err();
 
-        assert_eq!(
-            err,
-            NnueLayoutError::BatchLength {
-                name: "stm_indices",
-                expected: 6,
-                actual: 3,
-            }
-        );
+        assert_eq!(err, NnueLayoutError::BatchLength { name: "stm_indices", expected: 6, actual: 3 });
     }
 }

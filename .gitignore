@@ -1,5 +1,12 @@
 /target
 /cuda-oxide/target
+/cuda-oxide/*.cubin
+/cuda-oxide/*.ll
+/cuda-oxide/*.ltoir
+/cuda-oxide/*.options
+/cuda-oxide/*.ptx
+/cuda-oxide/*.target
+/cuda-oxide/*.nnuef
 /nets
 /checkpoints
 /.cargo
@@ -21,6 +28,10 @@ docs/experiments
 yaneuraou/
 __pycache__
 scripts/
+!scripts/
+!scripts/cuda_oxide_nnue_teacher_smoke.ps1
 
 docs/images/bulletou-logo-mascot.png
 /tools
+
+pull.bat

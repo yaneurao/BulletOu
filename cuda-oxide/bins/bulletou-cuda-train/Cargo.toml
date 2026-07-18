@@ -18,6 +18,7 @@ cuda = [
     "dep:cuda-device",
     "dep:cuda-host",
 ]
+root-loader = ["dep:bulletou_lib"]
 
 [[bin]]
 name = "bulletou-cuda-train"
@@ -25,6 +26,7 @@ path = "src/main.rs"
 
 [dependencies]
 bulletou-cuda-oxide-runtime = { path = "../../crates/runtime" }
+bulletou_lib = { path = "../../../crates/bulletou_lib", optional = true }
 cuda-core = { workspace = true, optional = true }
 cuda-device = { workspace = true, optional = true }
 cuda-host = { workspace = true, optional = true }

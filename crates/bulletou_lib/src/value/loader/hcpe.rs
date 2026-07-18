@@ -42,8 +42,8 @@ use std::time::Instant;
 
 use crate::shogi::PackedSfenValue;
 
-use super::shogipack::{convert_game_result, MiniPosition};
 use super::DataLoader;
+use super::shogipack::{MiniPosition, convert_game_result};
 
 /// HCPE 1 レコードのバイト数
 pub const HCPE_RECORD_SIZE: usize = 38;
@@ -291,11 +291,7 @@ where
                         tx,
                     );
                 });
-                *guard = Some(HcpeLoaderInner {
-                    rx: Some(rx),
-                    stop_flag,
-                    producer: Some(producer),
-                });
+                *guard = Some(HcpeLoaderInner { rx: Some(rx), stop_flag, producer: Some(producer) });
             }
         }
 
@@ -306,8 +302,8 @@ where
         let rx = inner.rx.as_ref().expect("rx held until drop");
 
         while let Ok((buf, offset_at_send)) = rx.recv() {
-            let stop = f(&buf);
             consumed_offset.store(offset_at_send, Ordering::Release);
+            let stop = f(&buf);
             if stop {
                 break;
             }
@@ -342,11 +338,8 @@ where
         let mut last_report_at = fill_started_at;
         let target_records = buffer_size;
 
-        let n_workers = loader_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        }).max(1);
+        let n_workers =
+            loader_threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
 
         let mut chunk_buf = vec![0u8; HCPE_RECORD_SIZE * CHUNK_RECORDS];
 
@@ -358,10 +351,7 @@ where
             );
         }
 
-        let total_bytes: u64 = file_paths
-            .iter()
-            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
-            .sum();
+        let total_bytes: u64 = file_paths.iter().filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len())).sum();
         if total_bytes == 0 {
             return;
         }
@@ -392,93 +382,88 @@ where
             let mut bytes_read_total: u64 = bytes_to_skip;
             let mut accepted_in_sweep = 0usize;
 
-        for path in &file_paths {
-            // この path の全体サイズ。`bytes_to_skip` がこれより大きければ
-            // ファイル全体をスキップ (open しない)。スキップした分も
-            // `bytes_read_total` に含めることで、ストリーム上の絶対 offset を
-            // 維持する。
-            let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let in_file_skip = if bytes_to_skip >= file_size {
-                bytes_to_skip -= file_size;
-                continue;
-            } else {
-                let off = bytes_to_skip;
-                bytes_to_skip = 0;
-                off
-            };
-
-            let file = match File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[HcpeDataLoader] failed to open {path}: {e}");
+            for path in &file_paths {
+                // この path の全体サイズ。`bytes_to_skip` がこれより大きければ
+                // ファイル全体をスキップ (open しない)。スキップした分も
+                // `bytes_read_total` に含めることで、ストリーム上の絶対 offset を
+                // 維持する。
+                let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let in_file_skip = if bytes_to_skip >= file_size {
+                    bytes_to_skip -= file_size;
                     continue;
-                }
-            };
-            let mut reader = BufReader::new(file);
-            if in_file_skip > 0 {
-                if let Err(e) = reader.seek(SeekFrom::Start(in_file_skip)) {
-                    eprintln!("[HcpeDataLoader] seek error in {path}: {e}");
-                    continue;
-                }
-            }
+                } else {
+                    let off = bytes_to_skip;
+                    bytes_to_skip = 0;
+                    off
+                };
 
-            loop {
-                // Loader が drop されると stop_flag が立つ → producer は即終了。
-                if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                // 完全レコード境界で読み出すため `read` を繰り返して埋める。
-                let mut filled = 0usize;
-                while filled < chunk_buf.len() {
-                    match reader.read(&mut chunk_buf[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) => {
-                            eprintln!("[HcpeDataLoader] read error in {path}: {e}");
-                            filled = (filled / HCPE_RECORD_SIZE) * HCPE_RECORD_SIZE;
-                            break;
-                        }
+                let file = match File::open(path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[HcpeDataLoader] failed to open {path}: {e}");
+                        continue;
+                    }
+                };
+                let mut reader = BufReader::new(file);
+                if in_file_skip > 0 {
+                    if let Err(e) = reader.seek(SeekFrom::Start(in_file_skip)) {
+                        eprintln!("[HcpeDataLoader] seek error in {path}: {e}");
+                        continue;
                     }
                 }
-                if filled == 0 {
-                    break;
-                }
-                let records_in_chunk = filled / HCPE_RECORD_SIZE;
-                // ストリーム上の絶対 byte offset を進める。次の send 時に
-                // この時点の `bytes_read_total` を attach することで、
-                // Consumer 側が「この buffer まで処理完了 = ここまで読まれた」
-                // を知れる。
-                bytes_read_total += (records_in_chunk * HCPE_RECORD_SIZE) as u64;
-                latest_offset_for_flush = bytes_read_total;
 
-                // この chunk を n_workers で均等に分割して並列デコード。
-                // 各 worker は自分のスライスをデコード → 返す Vec<PSV> を
-                // 元の順番で連結することで、resume の start_position
-                // セマンティクスを壊さない。
-                let per_worker = records_in_chunk.div_ceil(n_workers);
-                let chunk_slice = &chunk_buf[..records_in_chunk * HCPE_RECORD_SIZE];
-                let filter_ref = &filter;
-                let decoded: Vec<Vec<PackedSfenValue>> =
-                    std::thread::scope(|s| {
+                loop {
+                    // Loader が drop されると stop_flag が立つ → producer は即終了。
+                    if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    // 完全レコード境界で読み出すため `read` を繰り返して埋める。
+                    let mut filled = 0usize;
+                    while filled < chunk_buf.len() {
+                        match reader.read(&mut chunk_buf[filled..]) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) => {
+                                eprintln!("[HcpeDataLoader] read error in {path}: {e}");
+                                filled = (filled / HCPE_RECORD_SIZE) * HCPE_RECORD_SIZE;
+                                break;
+                            }
+                        }
+                    }
+                    if filled == 0 {
+                        break;
+                    }
+                    let records_in_chunk = filled / HCPE_RECORD_SIZE;
+                    // ストリーム上の絶対 byte offset を進める。次の send 時に
+                    // この時点の `bytes_read_total` を attach することで、
+                    // Consumer 側が「この buffer まで処理完了 = ここまで読まれた」
+                    // を知れる。
+                    bytes_read_total += (records_in_chunk * HCPE_RECORD_SIZE) as u64;
+                    latest_offset_for_flush = bytes_read_total;
+
+                    // この chunk を n_workers で均等に分割して並列デコード。
+                    // 各 worker は自分のスライスをデコード → 返す Vec<PSV> を
+                    // 元の順番で連結することで、resume の start_position
+                    // セマンティクスを壊さない。
+                    let per_worker = records_in_chunk.div_ceil(n_workers);
+                    let chunk_slice = &chunk_buf[..records_in_chunk * HCPE_RECORD_SIZE];
+                    let filter_ref = &filter;
+                    let decoded: Vec<Vec<PackedSfenValue>> = std::thread::scope(|s| {
                         let mut handles = Vec::with_capacity(n_workers);
                         for tid in 0..n_workers {
                             let start = tid * per_worker;
                             if start >= records_in_chunk {
                                 break;
                             }
-                            let end =
-                                ((tid + 1) * per_worker).min(records_in_chunk);
-                            let part = &chunk_slice[start * HCPE_RECORD_SIZE
-                                ..end * HCPE_RECORD_SIZE];
+                            let end = ((tid + 1) * per_worker).min(records_in_chunk);
+                            let part = &chunk_slice[start * HCPE_RECORD_SIZE..end * HCPE_RECORD_SIZE];
                             handles.push(s.spawn(move || {
                                 let n = end - start;
                                 let mut out = Vec::with_capacity(n);
                                 for i in 0..n {
                                     let off = i * HCPE_RECORD_SIZE;
-                                    let rec_bytes =
-                                        &part[off..off + HCPE_RECORD_SIZE];
-                                    let rec: &[u8; HCPE_RECORD_SIZE] =
-                                        rec_bytes.try_into().unwrap();
+                                    let rec_bytes = &part[off..off + HCPE_RECORD_SIZE];
+                                    let rec: &[u8; HCPE_RECORD_SIZE] = rec_bytes.try_into().unwrap();
                                     if let Some(psv) = decode_hcpe_record(rec) {
                                         if filter_ref(&psv) {
                                             out.push(psv);
@@ -488,67 +473,58 @@ where
                                 out
                             }));
                         }
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap())
-                            .collect()
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
                     });
 
-                // 順序を保ったまま read buffer に追加。`start_position` の
-                // skip はファイル冒頭の byte-seek で済んでいるので、ここでは
-                // skip 判定不要。
-                for partial in decoded {
-                    for psv in partial {
-                        accepted_in_sweep += 1;
-                        buffer.push(psv);
+                    // 順序を保ったまま read buffer に追加。`start_position` の
+                    // skip はファイル冒頭の byte-seek で済んでいるので、ここでは
+                    // skip 判定不要。
+                    for partial in decoded {
+                        for psv in partial {
+                            accepted_in_sweep += 1;
+                            buffer.push(psv);
 
-                        if first_fill_in_progress {
-                            let now = Instant::now();
-                            if now.duration_since(last_report_at).as_millis()
-                                >= 500
-                            {
-                                let pct = 100.0 * buffer.len() as f64
-                                    / target_records.max(1) as f64;
-                                let _ = write!(
-                                    std::io::stderr(),
-                                    "\r  filling read buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
-                                    buffer.len() as f64 / 1.0e6,
-                                    target_records as f64 / 1.0e6,
-                                );
-                                let _ = std::io::stderr().flush();
-                                last_report_at = now;
-                            }
-                        }
-
-                        if buffer.len() >= buffer_size {
                             if first_fill_in_progress {
-                                let elapsed = fill_started_at.elapsed();
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "\r  read buffer ready: {:.1}M records in {:.1}s ({} decode threads)   ",
-                                    buffer.len() as f64 / 1.0e6,
-                                    elapsed.as_secs_f64(),
-                                    n_workers,
-                                );
-                                first_fill_in_progress = false;
+                                let now = Instant::now();
+                                if now.duration_since(last_report_at).as_millis() >= 500 {
+                                    let pct = 100.0 * buffer.len() as f64 / target_records.max(1) as f64;
+                                    let _ = write!(
+                                        std::io::stderr(),
+                                        "\r  filling read buffer: {:.1}M / {:.1}M records ({pct:.1}%)   ",
+                                        buffer.len() as f64 / 1.0e6,
+                                        target_records as f64 / 1.0e6,
+                                    );
+                                    let _ = std::io::stderr().flush();
+                                    last_report_at = now;
+                                }
                             }
-                            let taken = std::mem::replace(
-                                &mut buffer,
-                                Vec::with_capacity(buffer_size),
-                            );
-                            if tx.send((taken, bytes_read_total)).is_err() {
-                                // コンシューマが drop した → 終了
-                                return;
+
+                            if buffer.len() >= buffer_size {
+                                if first_fill_in_progress {
+                                    let elapsed = fill_started_at.elapsed();
+                                    let _ = writeln!(
+                                        std::io::stderr(),
+                                        "\r  read buffer ready: {:.1}M records in {:.1}s ({} decode threads)   ",
+                                        buffer.len() as f64 / 1.0e6,
+                                        elapsed.as_secs_f64(),
+                                        n_workers,
+                                    );
+                                    first_fill_in_progress = false;
+                                }
+                                let taken = std::mem::replace(&mut buffer, Vec::with_capacity(buffer_size));
+                                if tx.send((taken, bytes_read_total)).is_err() {
+                                    // コンシューマが drop した → 終了
+                                    return;
+                                }
                             }
                         }
                     }
-                }
 
-                if filled < chunk_buf.len() {
-                    break;
+                    if filled < chunk_buf.len() {
+                        break;
+                    }
                 }
             }
-        }
 
             if accepted_in_sweep == 0 {
                 consecutive_empty_sweeps += 1;
@@ -602,8 +578,8 @@ mod tests {
     /// 後手番で BlackWin の局面が「STM の勝ち」扱いになるバグがあった。
     #[test]
     fn decode_converts_game_result_to_stm_perspective() {
-        use crate::shogi::Color;
         use super::super::shogipack::MiniPosition;
+        use crate::shogi::Color;
 
         // hirate (STM = Black) で BlackWin → STM win → +1
         let pos = MiniPosition::hirate_for_tests();
@@ -697,12 +673,9 @@ mod tests {
 
         let n_hcpe = hcpe_bytes.len() / HCPE_RECORD_SIZE;
         let n_psv = psv_bytes.len() / 40;
-        let cap: usize =
-            std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        let cap: usize = std::env::var("XREF_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
         let n = n_hcpe.min(n_psv).min(cap);
-        eprintln!(
-            "comparing {n} records (hcpe total = {n_hcpe}, psv total = {n_psv}, cap = {cap})"
-        );
+        eprintln!("comparing {n} records (hcpe total = {n_hcpe}, psv total = {n_psv}, cap = {cap})");
         assert!(n > 0, "need at least 1 record to compare");
 
         let mut mismatches = 0usize;
@@ -733,9 +706,8 @@ mod tests {
                     eprintln!("  hcpe input:     {}", hex(&hcpe_rec));
                     eprintln!("  ours (Rust):    {}", hex(decoded.as_bytes()));
                     eprintln!("  cshogi (psv):   {}", hex(expected.as_bytes()));
-                    let diffs: Vec<usize> = (0..40)
-                        .filter(|&k| decoded.as_bytes()[k] != expected.as_bytes()[k])
-                        .collect();
+                    let diffs: Vec<usize> =
+                        (0..40).filter(|&k| decoded.as_bytes()[k] != expected.as_bytes()[k]).collect();
                     eprintln!("  diff offsets:   {diffs:?}");
                 }
             }
@@ -854,9 +826,6 @@ mod tests {
             got >= expected.saturating_sub(8),
             "loader returned {got} records, but expected ~{expected} (= file_size / 38)"
         );
-        assert!(
-            flushes >= 2,
-            "expected multiple buffer flushes for a 1.61 GB file with a 16 MB buffer, got {flushes}"
-        );
+        assert!(flushes >= 2, "expected multiple buffer flushes for a 1.61 GB file with a 16 MB buffer, got {flushes}");
     }
 }

@@ -18,6 +18,7 @@ pub use text::InMemoryTextLoader;
 pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
 use bulletformat::BulletFormat;
+use rayon::prelude::*;
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 
@@ -177,6 +178,29 @@ where
             self.score_drop_abs,
         )
     }
+
+    pub fn prepare_with_pool(
+        &self,
+        data: &[I::RequiredDataType],
+        pool: &rayon::ThreadPool,
+        threads: usize,
+        blend: f32,
+    ) -> PreparedData<I, O> {
+        PreparedData::new_with_pool(
+            self.input_getter.clone(),
+            self.output_getter,
+            self.blend_getter,
+            self.weight_getter,
+            self.use_win_rate_model,
+            self.wdl,
+            data,
+            threads,
+            blend,
+            self.scale,
+            self.score_drop_abs,
+            Some(pool),
+        )
+    }
 }
 
 /// A batch of data, in the correct format for the GPU.
@@ -216,6 +240,37 @@ where
         scale: f32,
         score_drop_abs: Option<u16>,
     ) -> Self {
+        Self::new_with_pool(
+            input_getter,
+            output_getter,
+            blend_getter,
+            weight_getter,
+            use_win_rate_model,
+            wdl,
+            data,
+            threads,
+            blend,
+            scale,
+            score_drop_abs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_pool(
+        input_getter: I,
+        output_getter: O,
+        blend_getter: B<I>,
+        weight_getter: Option<Wgt<I>>,
+        use_win_rate_model: bool,
+        wdl: bool,
+        data: &[I::RequiredDataType],
+        threads: usize,
+        blend: f32,
+        scale: f32,
+        score_drop_abs: Option<u16>,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Self {
         let rscale = 1.0 / scale;
         let batch_size = data.len();
         let max_active = input_getter.max_active();
@@ -241,6 +296,87 @@ where
         };
 
         let sparse_chunk_size = max_active * chunk_size;
+
+        if hand_count_dim == 0
+            && let Some(pool) = pool
+            && threads > 1
+            && batch_size > 1
+        {
+            pool.install(|| {
+                data.par_chunks(chunk_size)
+                    .zip(prep.stm.par_chunks_mut(sparse_chunk_size))
+                    .zip(prep.nstm.par_chunks_mut(sparse_chunk_size))
+                    .zip(prep.buckets.par_chunks_mut(chunk_size))
+                    .zip(prep.targets.par_chunks_mut(output_size * chunk_size))
+                    .zip(prep.weights.par_chunks_mut(chunk_size))
+                    .for_each(
+                        |(((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk)| {
+                            let inp = &prep.input_getter;
+                            let out = &prep.output_getter;
+
+                            for i in 0..data_chunk.len() {
+                                let pos = &data_chunk[i];
+                                let mut j_stm: usize = 0;
+                                let mut j_nstm: usize = 0;
+                                let sparse_offset = max_active * i;
+
+                                inp.map_features_split(pos, |our_opt, opp_opt| {
+                                    if let Some(our) = our_opt {
+                                        assert!(our < input_size, "STM feature index exceeded input size!");
+                                        stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        j_stm += 1;
+                                    }
+                                    if let Some(opp) = opp_opt {
+                                        assert!(opp < input_size, "NSTM feature index exceeded input size!");
+                                        nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        j_nstm += 1;
+                                    }
+                                });
+
+                                for j in j_stm..max_active {
+                                    stm_chunk[sparse_offset + j] = -1;
+                                }
+                                for j in j_nstm..max_active {
+                                    nstm_chunk[sparse_offset + j] = -1;
+                                }
+
+                                assert!(
+                                    j_stm <= max_active && j_nstm <= max_active,
+                                    "More inputs provided than the specified maximum!"
+                                );
+
+                                buckets_chunk[i] = i32::from(out.bucket(pos));
+                                let mut weight = weight_getter.map_or(1.0, |w| w(pos));
+                                if let Some(cap) = score_drop_abs {
+                                    if pos.score().unsigned_abs() >= cap {
+                                        weight = 0.0;
+                                    }
+                                }
+                                weights_chunk[i] = weight;
+
+                                if wdl {
+                                    results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
+                                } else {
+                                    let score = f32::from(pos.score());
+                                    let score = if use_win_rate_model {
+                                        let p = (score - 270.0) / 380.0;
+                                        let pm = (-score - 270.0) / 380.0;
+                                        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+                                    } else {
+                                        sigmoid(rscale * score)
+                                    };
+                                    let result = f32::from(pos.result() as u8) / 2.0;
+                                    let blend = blend_getter(pos, blend);
+                                    assert!((0.0..=1.0).contains(&blend), "WDL proportion must be in [0, 1]");
+                                    results_chunk[i] = blend * result + (1. - blend) * score;
+                                }
+                            }
+                        },
+                    );
+            });
+
+            return prep;
+        }
 
         // HandCount 用の並列チャンクを事前に materialise。Option は並列ループ内で扱う。
         let hand_count_chunk_size = hand_count_dim * chunk_size;
@@ -352,4 +488,117 @@ where
 
 fn sigmoid(x: f32) -> f32 {
     1. / (1. + (-x).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        game::{inputs::SparseInputType, outputs::OutputBuckets},
+        value::loader::{GameResult, LoadableDataType, PreparedData},
+    };
+
+    #[derive(Clone, Copy)]
+    struct TinyPos {
+        a: usize,
+        b: usize,
+        score: i16,
+        result: GameResult,
+    }
+
+    impl LoadableDataType for TinyPos {
+        fn score(&self) -> i16 {
+            self.score
+        }
+
+        fn result(&self) -> GameResult {
+            self.result
+        }
+    }
+
+    #[derive(Clone)]
+    struct TinyInput;
+
+    impl SparseInputType for TinyInput {
+        type RequiredDataType = TinyPos;
+
+        fn num_inputs(&self) -> usize {
+            8
+        }
+
+        fn max_active(&self) -> usize {
+            2
+        }
+
+        fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+            f(pos.a, pos.b);
+            f((pos.a + 1) % 8, (pos.b + 1) % 8);
+        }
+
+        fn shorthand(&self) -> String {
+            "tiny".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Tiny test input".to_string()
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct TinyBuckets;
+
+    impl OutputBuckets<TinyPos> for TinyBuckets {
+        const BUCKETS: usize = 3;
+
+        fn bucket(&self, pos: &TinyPos) -> u8 {
+            (pos.a % 3) as u8
+        }
+    }
+
+    #[test]
+    fn prepare_with_pool_matches_scoped_prepare() {
+        let data: Vec<_> = (0..16)
+            .map(|i| TinyPos {
+                a: i % 7,
+                b: (i * 3) % 7,
+                score: (i as i16) * 10 - 80,
+                result: [GameResult::Loss, GameResult::Draw, GameResult::Win][i % 3],
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+
+        let baseline = PreparedData::new(
+            TinyInput,
+            TinyBuckets,
+            (|_, blend| blend) as fn(&TinyPos, f32) -> f32,
+            None,
+            true,
+            false,
+            &data,
+            4,
+            0.0,
+            400.0,
+            None,
+        );
+        let pooled = PreparedData::new_with_pool(
+            TinyInput,
+            TinyBuckets,
+            (|_, blend| blend) as fn(&TinyPos, f32) -> f32,
+            None,
+            true,
+            false,
+            &data,
+            4,
+            0.0,
+            400.0,
+            None,
+            Some(&pool),
+        );
+
+        assert_eq!(baseline.stm, pooled.stm);
+        assert_eq!(baseline.nstm, pooled.nstm);
+        assert_eq!(baseline.buckets, pooled.buckets);
+        assert_eq!(baseline.targets, pooled.targets);
+        assert_eq!(baseline.weights, pooled.weights);
+        assert_eq!(baseline.hand_count, pooled.hand_count);
+    }
 }

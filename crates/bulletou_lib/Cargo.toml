@@ -15,6 +15,7 @@ bullet-gpu = { workspace = true }
 bullet-trainer = { workspace = true }
 bulletformat = "1.8.0"
 montyformat = "0.9.2"
+rayon = "1.10"
 sfbinpack = "0.6.0"
 viriformat = "2.0.1"
 
@@ -88,6 +89,14 @@ name = "bulletou"
 path = "../../examples/bulletou.rs"
 
 [[example]]
+name = "export_nnue_forward_fixture"
+path = "../../examples/export_nnue_forward_fixture.rs"
+
+[[example]]
+name = "export_sfnn_forward_fixture"
+path = "../../examples/export_sfnn_forward_fixture.rs"
+
+[[example]]
 name = "shogi_layerstack"
 path = "../../examples/shogi_layerstack.rs"
 
@@ -119,6 +128,10 @@ path = "../../examples/scan_entering_king.rs"
 [[example]]
 name = "merge_scores"
 path = "../../examples/merge_scores.rs"
+
+[[example]]
+name = "export_teacher_psv"
+path = "../../examples/export_teacher_psv.rs"
 
 [[example]]
 name = "scan_bad_records"

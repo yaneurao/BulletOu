@@ -163,9 +163,7 @@ pub fn parse_model_weights_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<
 /// Serialise an iterator of `(id, weights)` pairs into the same
 /// "id\n<usize LE><f32 LE × N>" record stream that
 /// [`parse_model_weights_bin`] reads. Returns the in-memory byte buffer.
-pub fn write_model_weights_bin<'a>(
-    records: impl IntoIterator<Item = (&'a str, &'a [f32])>,
-) -> Vec<u8> {
+pub fn write_model_weights_bin<'a>(records: impl IntoIterator<Item = (&'a str, &'a [f32])>) -> Vec<u8> {
     let mut buf = Vec::new();
     for (id, values) in records {
         buf.extend_from_slice(id.as_bytes());
@@ -178,6 +176,30 @@ pub fn write_model_weights_bin<'a>(
     buf
 }
 
+pub const STATE_BACKEND_RECORD_PREFIX: &str = "meta/state_backend/";
+pub const STATE_BACKEND_MARKER_VALUE: f32 = 1.0;
+pub const STATE_BACKEND_BULLET: &str = "bullet";
+pub const STATE_BACKEND_CUDA_OXIDE: &str = "cuda-oxide";
+
+pub fn state_backend_record_id(backend: &str) -> String {
+    format!("{STATE_BACKEND_RECORD_PREFIX}{backend}")
+}
+
+pub fn write_state_backend_marker(backend: &str) -> Vec<u8> {
+    let id = state_backend_record_id(backend);
+    let value = [STATE_BACKEND_MARKER_VALUE];
+    write_model_weights_bin([(id.as_str(), value.as_slice())])
+}
+
+pub fn detect_state_backend(records: &BTreeMap<String, Vec<f32>>) -> Option<String> {
+    records.iter().find_map(|(id, values)| {
+        if values.as_slice() != [STATE_BACKEND_MARKER_VALUE] {
+            return None;
+        }
+        id.strip_prefix(STATE_BACKEND_RECORD_PREFIX).filter(|backend| !backend.is_empty()).map(ToOwned::to_owned)
+    })
+}
+
 /// Bundle one component's `optimiser_state/` files into the running combined-state buffer
 /// `out`, with every record's ID prefixed by
 /// `<component>/<section>/` so the three components do not clash on shared
@@ -186,18 +208,13 @@ pub fn write_model_weights_bin<'a>(
 /// `component` is `"kk"` / `"kkp"` / `"kpp"` / `"nnue"`. Required sections
 /// are `"weights"`, `"momentum"`, and `"velocity"`. Ranger additionally writes
 /// `"slow"` and a text `"step_ranger"` file; these are bundled when present.
-pub fn bundle_component_state(
-    out: &mut Vec<u8>,
-    component: &str,
-    optimiser_state_dir: &Path,
-) -> io::Result<()> {
+pub fn bundle_component_state(out: &mut Vec<u8>, component: &str, optimiser_state_dir: &Path) -> io::Result<()> {
     for section in ["weights", "momentum", "velocity"] {
         let path = optimiser_state_dir.join(format!("{section}.bin"));
         let bytes = std::fs::read(&path)?;
         let parsed = parse_model_weights_bin(&bytes)?;
-        let mut records: Vec<(String, &[f32])> = parsed.iter().map(|(k, v)| {
-            (format!("{component}/{section}/{k}"), v.as_slice())
-        }).collect();
+        let mut records: Vec<(String, &[f32])> =
+            parsed.iter().map(|(k, v)| (format!("{component}/{section}/{k}"), v.as_slice())).collect();
         records.sort_by(|a, b| a.0.cmp(&b.0));
         let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), *v)));
         out.extend_from_slice(&chunk);
@@ -209,10 +226,8 @@ pub fn bundle_component_state(
         }
         let bytes = std::fs::read(&path)?;
         let parsed = parse_model_weights_bin(&bytes)?;
-        let mut records: Vec<(String, &[f32])> = parsed
-            .iter()
-            .map(|(k, v)| (format!("{component}/{section}/{k}"), v.as_slice()))
-            .collect();
+        let mut records: Vec<(String, &[f32])> =
+            parsed.iter().map(|(k, v)| (format!("{component}/{section}/{k}"), v.as_slice())).collect();
         records.sort_by(|a, b| a.0.cmp(&b.0));
         let chunk = write_model_weights_bin(records.iter().map(|(k, v)| (k.as_str(), *v)));
         out.extend_from_slice(&chunk);
@@ -316,11 +331,7 @@ pub fn save_yaneuraou_kppt(checkpoint_dir: &Path, eval_scale: f32) -> io::Result
 /// Variant of [`save_yaneuraou_kppt`] that selects the on-disk KPP layout
 /// (`KppFormat::Kppt` for standard KPPT, `KppFormat::KppKkpt` for the
 /// factorised KPP_KKPT). KK and KKP outputs are identical in either case.
-pub fn save_yaneuraou_eval(
-    checkpoint_dir: &Path,
-    eval_scale: f32,
-    kpp_format: KppFormat,
-) -> io::Result<()> {
+pub fn save_yaneuraou_eval(checkpoint_dir: &Path, eval_scale: f32, kpp_format: KppFormat) -> io::Result<()> {
     let weights_path = checkpoint_dir.join("optimiser_state").join("weights.bin");
     let bytes = std::fs::read(&weights_path)?;
     let weights = parse_model_weights_bin(&bytes)?;
@@ -514,6 +525,22 @@ mod tests {
     }
 
     #[test]
+    fn state_backend_marker_round_trip_and_component_extract_ignores_meta() {
+        let mut buf = write_state_backend_marker(STATE_BACKEND_CUDA_OXIDE);
+        let records = [("nnue/weights/l0w", [1.0f32, 2.0].as_slice()), ("nnue/weights/l0b", [3.0f32].as_slice())];
+        buf.extend_from_slice(&write_model_weights_bin(records));
+
+        let map = parse_model_weights_bin(&buf).unwrap();
+        assert_eq!(detect_state_backend(&map).as_deref(), Some(STATE_BACKEND_CUDA_OXIDE));
+
+        let nnue_weights = extract_component_section(&map, "nnue", "weights");
+        assert_eq!(nnue_weights.len(), 2);
+        assert_eq!(nnue_weights["l0w"], vec![1.0, 2.0]);
+        assert_eq!(nnue_weights["l0b"], vec![3.0]);
+        assert!(!nnue_weights.contains_key(&state_backend_record_id(STATE_BACKEND_CUDA_OXIDE)));
+    }
+
+    #[test]
     fn quantise_saturates() {
         assert_eq!(quantise_to_i32(f32::NAN, 1.0), 0);
         assert_eq!(quantise_to_i32(1e30, 1.0), i32::MAX);
@@ -592,22 +619,15 @@ mod tests {
                 let id_a = format!("{comp}_idA");
                 let id_b = format!("{comp}_idB");
                 let bytes = write_model_weights_bin(
-                    [
-                        (id_a.as_str(), [1.0f32, 2.0, 3.0].as_slice()),
-                        (id_b.as_str(), [4.0f32, 5.0].as_slice()),
-                    ]
-                    .into_iter()
-                    .map(|(k, v)| (k, v)),
+                    [(id_a.as_str(), [1.0f32, 2.0, 3.0].as_slice()), (id_b.as_str(), [4.0f32, 5.0].as_slice())]
+                        .into_iter()
+                        .map(|(k, v)| (k, v)),
                 );
                 fs::write(dir.join(format!("{section}.bin")), bytes).unwrap();
             }
             if comp == "kkp" {
                 let slow_bytes = write_model_weights_bin(
-                    [
-                        ("kkp_idA", [7.0f32, 8.0, 9.0].as_slice()),
-                        ("kkp_idB", [10.0f32, 11.0].as_slice()),
-                    ]
-                    .into_iter(),
+                    [("kkp_idA", [7.0f32, 8.0, 9.0].as_slice()), ("kkp_idB", [10.0f32, 11.0].as_slice())].into_iter(),
                 );
                 fs::write(dir.join("slow.bin"), slow_bytes).unwrap();
                 fs::write(dir.join("step_ranger.txt"), "kkp_idA,12\nkkp_idB,18\n").unwrap();
@@ -617,8 +637,7 @@ mod tests {
         // Bundle
         let mut bundled: Vec<u8> = Vec::new();
         for comp in ["kk", "kkp", "kpp"] {
-            bundle_component_state(&mut bundled, comp, &tmp.join(format!("{comp}_orig/optimiser_state")))
-                .unwrap();
+            bundle_component_state(&mut bundled, comp, &tmp.join(format!("{comp}_orig/optimiser_state"))).unwrap();
         }
 
         // Re-parse and unbundle each component back to its own dir
@@ -627,8 +646,7 @@ mod tests {
             let dst = tmp.join(format!("{comp}_restored")).join("optimiser_state");
             unbundle_component_state(&parsed, comp, &dst).unwrap();
             for section in ["weights", "momentum", "velocity"] {
-                let orig =
-                    fs::read(tmp.join(format!("{comp}_orig/optimiser_state/{section}.bin"))).unwrap();
+                let orig = fs::read(tmp.join(format!("{comp}_orig/optimiser_state/{section}.bin"))).unwrap();
                 let restored = fs::read(dst.join(format!("{section}.bin"))).unwrap();
                 assert_eq!(orig, restored, "{comp}/{section}: round-trip mismatch");
             }

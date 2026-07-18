@@ -30,16 +30,16 @@ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{
-    FEATURE_HASH_HALFKA2, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA2_DIMENSIONS, HALFKA_HM_DIMENSIONS,
+    FEATURE_HASH_HALFKA2, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA_HM_DIMENSIONS, HALFKA2_DIMENSIONS,
     NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKa2,
 };
-pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
-pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
 pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;
 pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
-pub use shogi_halfkp::{FEATURE_HASH, ShogiHalfKP};
+pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
+pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
+pub use shogi_halfkp::{FEATURE_HASH, HALFKP_DIMENSIONS, HALFKP_PIECE_INPUTS, ShogiHalfKP, ShogiHalfKPPieceFactorizer};
 pub use shogi_halfkpe9::{FEATURE_HASH_HALFKPE9, HALFKPE9_DIMENSIONS, ShogiHalfKpe9};
 pub use shogi_halfkpvm::{FEATURE_HASH_HALFKPVM, HALFKPVM_DIMENSIONS, ShogiHalfKPvm};
 pub use shogi_ka2::{FEATURE_HASH_KA2, KA2_DIMENSIONS, KA2_MAX_ACTIVE, ShogiKa2};

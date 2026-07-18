@@ -104,25 +104,15 @@ impl FastBatchHost {
     pub fn validate(&self) -> Result<(), String> {
         let layout = self.layout;
         if self.stm.len() != layout.sparse_len() {
-            return Err(format!(
-                "stm length mismatch: got {}, expected {}",
-                self.stm.len(),
-                layout.sparse_len(),
-            ));
+            return Err(format!("stm length mismatch: got {}, expected {}", self.stm.len(), layout.sparse_len(),));
         }
         if self.nstm.len() != layout.sparse_len() {
-            return Err(format!(
-                "nstm length mismatch: got {}, expected {}",
-                self.nstm.len(),
-                layout.sparse_len(),
-            ));
+            return Err(format!("nstm length mismatch: got {}, expected {}", self.nstm.len(), layout.sparse_len(),));
         }
         if self.buckets.len() != layout.batch_size {
-            return Err(format!(
-                "buckets length mismatch: got {}, expected {}",
-                self.buckets.len(),
-                layout.batch_size,
-            ));
+            return Err(
+                format!("buckets length mismatch: got {}, expected {}", self.buckets.len(), layout.batch_size,),
+            );
         }
         if self.targets.len() != layout.target_len() {
             return Err(format!(
@@ -132,11 +122,9 @@ impl FastBatchHost {
             ));
         }
         if self.weights.len() != layout.batch_size {
-            return Err(format!(
-                "weights length mismatch: got {}, expected {}",
-                self.weights.len(),
-                layout.batch_size,
-            ));
+            return Err(
+                format!("weights length mismatch: got {}, expected {}", self.weights.len(), layout.batch_size,),
+            );
         }
         match (&self.hand_count, layout.hand_count_dim) {
             (Some(hand_count), dim) if dim > 0 && hand_count.len() != layout.hand_count_len() => Err(format!(
@@ -229,11 +217,7 @@ impl FastBatchHost {
 
 pub fn active_feature_indices(active: &[i32], feature_count: usize) -> impl Iterator<Item = usize> + '_ {
     active.iter().filter_map(move |&feature| {
-        if feature < 0 || feature as usize >= feature_count {
-            None
-        } else {
-            Some(feature as usize)
-        }
+        if feature < 0 || feature as usize >= feature_count { None } else { Some(feature as usize) }
     })
 }
 

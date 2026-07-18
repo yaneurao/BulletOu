@@ -127,10 +127,8 @@ fn map_halfkpe9_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
         return;
     }
 
-    let stm_ksq =
-        if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
-    let nstm_ksq =
-        if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+    let stm_ksq = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+    let nstm_ksq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
 
     let effect_counts = compute_effect_counts(board);
     let cnt_stm = &effect_counts[stm as usize];

@@ -30,6 +30,7 @@ use std::{
 };
 
 use bullet_compiler::tensor::TValue;
+use bullet_trainer::model::save::ModelWeights;
 use bulletou_lib::{
     game::{
         inputs::{
@@ -45,7 +46,6 @@ use bulletou_lib::{
     nn::{Affine, InitSettings, Shape, optimiser},
     value::ValueTrainerBuilder,
 };
-use bullet_trainer::model::save::ModelWeights;
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 

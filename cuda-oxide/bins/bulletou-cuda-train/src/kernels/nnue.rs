@@ -3,7 +3,7 @@
 //! These kernels are intentionally simple. They are the correctness baseline
 //! for CO-006; later passes can fuse or tile them after CPU/GPU traces match.
 
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, device, kernel, thread};
 
 #[kernel]
 pub fn nnue_sparse_l0_crelu(
@@ -42,13 +42,7 @@ pub fn nnue_sparse_l0_crelu(
 }
 
 #[kernel]
-pub fn nnue_concat_l0(
-    stm_l0: &[f32],
-    nstm_l0: &[f32],
-    mut combined: DisjointSlice<f32>,
-    batch: u32,
-    rows: u32,
-) {
+pub fn nnue_concat_l0(stm_l0: &[f32], nstm_l0: &[f32], mut combined: DisjointSlice<f32>, batch: u32, rows: u32) {
     let tid = thread::index_1d();
     let combined_rows = (rows as usize) * 2;
     let total = (batch as usize) * combined_rows;
@@ -59,11 +53,7 @@ pub fn nnue_concat_l0(
     let col = tid.get() % combined_rows;
     let sample = tid.get() / combined_rows;
     let src = sample * (rows as usize) + (col % (rows as usize));
-    let value = if col < rows as usize {
-        stm_l0[src]
-    } else {
-        nstm_l0[src]
-    };
+    let value = if col < rows as usize { stm_l0[src] } else { nstm_l0[src] };
 
     if let Some(out) = combined.get_mut(tid) {
         *out = value;
@@ -75,7 +65,7 @@ pub fn nnue_dense_l1_crelu(
     input: &[f32],
     weights: &[f32],
     bias: &[f32],
-    mut output: DisjointSlice<f32>,
+    output: DisjointSlice<f32>,
     batch: u32,
     input_dim: u32,
     output_dim: u32,
@@ -88,7 +78,7 @@ pub fn nnue_dense_l2_crelu(
     input: &[f32],
     weights: &[f32],
     bias: &[f32],
-    mut output: DisjointSlice<f32>,
+    output: DisjointSlice<f32>,
     batch: u32,
     input_dim: u32,
     output_dim: u32,
@@ -122,6 +112,7 @@ pub fn nnue_dense_output(
     }
 }
 
+#[device]
 fn dense_crelu(
     input: &[f32],
     weights: &[f32],
@@ -152,6 +143,7 @@ fn dense_crelu(
     }
 }
 
+#[device]
 fn crelu(value: f32) -> f32 {
     if value < 0.0_f32 {
         0.0_f32

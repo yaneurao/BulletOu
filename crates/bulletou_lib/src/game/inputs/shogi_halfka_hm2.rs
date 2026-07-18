@@ -76,7 +76,8 @@ impl SparseInputType for ShogiHalfKaHm2 {
     }
 
     fn description(&self) -> String {
-        "Shogi HalfKA_hm2: 45 king buckets (file-mirror), 1629 piece inputs (enemy king collapsed onto friend plane)".to_string()
+        "Shogi HalfKA_hm2: 45 king buckets (file-mirror), 1629 piece inputs (enemy king collapsed onto friend plane)"
+            .to_string()
     }
 }
 
@@ -178,7 +179,8 @@ fn map_halfka_hm2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F)
         let stm_enemy_bp = (E_KING as usize) + stm_enemy_king_sq;
         let stm_enemy_idx = halfka_hm2_index(stm_ksq, stm_enemy_bp);
 
-        let nstm_friend_king_sq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+        let nstm_friend_king_sq =
+            if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
         let nstm_friend_bp = (F_KING as usize) + nstm_friend_king_sq;
         let nstm_friend_idx = halfka_hm2_index(nstm_ksq, nstm_friend_bp);
 

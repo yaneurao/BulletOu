@@ -29,7 +29,6 @@ pub enum DataFormat {
     Psv,
 }
 
-
 /// Resolve a `--teacher` argument into a concrete list of file paths.
 ///
 /// See the module-level docs for the resolution rules. Returns an `Err` with
@@ -45,8 +44,7 @@ pub fn expand_teacher(teacher: &str) -> Result<Vec<String>, String> {
         let path = Path::new(part);
         if path.is_dir() {
             let mut found: Vec<String> = Vec::new();
-            let entries =
-                std::fs::read_dir(path).map_err(|e| format!("failed to read directory {part}: {e}"))?;
+            let entries = std::fs::read_dir(path).map_err(|e| format!("failed to read directory {part}: {e}"))?;
             for entry in entries {
                 let entry = entry.map_err(|e| format!("failed to enumerate directory {part}: {e}"))?;
                 let p = entry.path();

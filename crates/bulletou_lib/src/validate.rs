@@ -1,8 +1,8 @@
-//! Held-out validation against an hcpe test set.
+//! Held-out validation against a fixed-record teacher test set.
 //!
 //! Used by the `bulletou` example to compute "value-sign agreement"
 //! accuracy after training: random-pick N positions from a test
-//! `.hcpe`, run them through the trained model, then for each one
+//! `.hcpe` / `.psv`, run them through the trained model, then for each one
 //! check whether the network's raw output and the actual **game
 //! result** (win/loss for the side to move) have the same sign.
 //!
@@ -37,10 +37,13 @@
 //! `ValueTrainer::eval_packed_batch`).
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
+use crate::teacher_path::{DataFormat, expand_teacher, infer_data_format};
 use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
+
+const PSV_RECORD_SIZE: usize = std::mem::size_of::<PackedSfenValue>();
 
 /// Outcome of a sign-agreement validation pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -55,6 +58,19 @@ pub struct AccuracyReport {
     /// `(model_out >= 0) == (game_result > 0)` (= sign of the model's
     /// output matches the actual winner).
     pub sign_matches: usize,
+    /// Number of decisive positions whose model output was non-negative
+    /// (`model_output >= 0`). This is diagnostic only; it helps detect
+    /// short validation runs where the network is still effectively a
+    /// majority-class predictor.
+    pub predicted_nonnegative: usize,
+    /// Number of decisive positions whose model output was negative
+    /// (`model_output < 0`). Diagnostic counterpart to
+    /// [`predicted_nonnegative`](Self::predicted_nonnegative).
+    pub predicted_negative: usize,
+    /// Number of decisive positions whose model output was exactly zero.
+    /// These are included in `predicted_nonnegative` because the
+    /// BulletOu/YaneuraOu metric uses `model_output >= 0`.
+    pub predicted_zero: usize,
     /// Number of sampled positions whose game ended in a draw
     /// (`game_result == 0`). Excluded from BOTH `compared` and
     /// `sign_matches` (= excluded from accuracy entirely). Still
@@ -182,18 +198,10 @@ pub fn compute_sign_accuracy_with_loss(
     eval_scale: f32,
     loss_kind: ValidationLossKind,
 ) -> AccuracyReport {
-    assert_eq!(
-        model_outputs.len(),
-        teacher_scores.len(),
-        "model_outputs and teacher_scores length mismatch"
-    );
+    assert_eq!(model_outputs.len(), teacher_scores.len(), "model_outputs and teacher_scores length mismatch");
     let have_results = !teacher_results.is_empty();
     if have_results {
-        assert_eq!(
-            model_outputs.len(),
-            teacher_results.len(),
-            "model_outputs and teacher_results length mismatch"
-        );
+        assert_eq!(model_outputs.len(), teacher_results.len(), "model_outputs and teacher_results length mismatch");
     }
     let mut report = AccuracyReport::default();
     let blend = 1.0 - lambda;
@@ -222,6 +230,14 @@ pub fn compute_sign_accuracy_with_loss(
                 // training-loss subset includes it).
             } else {
                 report.compared += 1;
+                if pred {
+                    report.predicted_nonnegative += 1;
+                } else {
+                    report.predicted_negative += 1;
+                }
+                if *m == 0.0 {
+                    report.predicted_zero += 1;
+                }
                 let truth = r > 0;
                 if pred == truth {
                     report.sign_matches += 1;
@@ -231,6 +247,14 @@ pub fn compute_sign_accuracy_with_loss(
             report.drawn_games += 1;
         } else {
             report.compared += 1;
+            if pred {
+                report.predicted_nonnegative += 1;
+            } else {
+                report.predicted_negative += 1;
+            }
+            if *m == 0.0 {
+                report.predicted_zero += 1;
+            }
             if pred == (s > 0) {
                 report.sign_matches += 1;
             }
@@ -267,44 +291,107 @@ pub fn compute_sign_accuracy_with_loss(
     report
 }
 
-/// Reservoir-sample `n` positions uniformly from the hcpe file at
-/// `path`, decoding each into `PackedSfenValue`. Returns `Err` on I/O
-/// failure or non-hcpe sized files.
+/// Reservoir-sample `n` positions uniformly from a fixed-record teacher
+/// spec, decoding each into `PackedSfenValue`.
 ///
 /// `seed = 0` selects a time-based seed (= non-reproducible);
 /// any other value uses that seed verbatim (= reproducible).
 ///
-/// The file must be a flat `.hcpe` (38-byte fixed records). hcpe3 /
-/// pack / psv are not supported here yet — for those, transcode to
-/// hcpe first.
+/// The teacher may be any path accepted by [`expand_teacher`], but the
+/// format must be fixed-record `.hcpe` or `.psv`. Variable-length
+/// `.hcpe3` / `.pack` teachers are intentionally rejected here; export
+/// them to `.psv` first when a held-out validation sample is needed.
 ///
 /// On disk-too-small (= file has fewer than `n` valid records), all
 /// available records are returned and the caller can decide whether to
 /// proceed.
-pub fn read_random_hcpe_positions(
-    path: &str,
+pub fn read_random_teacher_positions(teacher: &str, n: usize, seed: u64) -> std::io::Result<Vec<PackedSfenValue>> {
+    let paths = expand_teacher(teacher).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format =
+        infer_data_format(&path_refs).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    match format {
+        DataFormat::Hcpe | DataFormat::Psv => read_random_fixed_teacher_positions(&paths, format, n, seed),
+        DataFormat::Hcpe3 | DataFormat::Pack => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "--test-teacher format {format:?} is variable-length; export it to .psv with export_teacher_psv first"
+            ),
+        )),
+    }
+}
+
+/// Backwards-compatible HCPE-only entry point.
+pub fn read_random_hcpe_positions(path: &str, n: usize, seed: u64) -> std::io::Result<Vec<PackedSfenValue>> {
+    read_random_fixed_teacher_positions(&[path.to_string()], DataFormat::Hcpe, n, seed)
+}
+
+#[derive(Debug, Clone)]
+struct FixedTeacherFile {
+    path: String,
+    start_record: usize,
+    records: usize,
+}
+
+fn read_random_fixed_teacher_positions(
+    paths: &[String],
+    format: DataFormat,
     n: usize,
     seed: u64,
 ) -> std::io::Result<Vec<PackedSfenValue>> {
-    let meta = std::fs::metadata(path)?;
-    let file_size = meta.len() as usize;
-    if file_size % HCPE_RECORD_SIZE != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{path}: size {file_size} is not a multiple of HCPE_RECORD_SIZE ({HCPE_RECORD_SIZE}) — \
-                 not a valid hcpe file?"
-            ),
-        ));
+    let record_size = fixed_record_size(format).expect("caller validated fixed-record format");
+    let mut files = Vec::with_capacity(paths.len());
+    let mut total_records = 0usize;
+    for path in paths {
+        let file_size = usize::try_from(std::fs::metadata(path)?.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path}: file is too large to index on this platform"),
+            )
+        })?;
+        if file_size % record_size != 0 {
+            let name = fixed_record_size_name(format);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{path}: size {file_size} is not a multiple of {name} ({record_size}) — \
+                     not a valid {format:?} file?"
+                ),
+            ));
+        }
+        let records = file_size / record_size;
+        files.push(FixedTeacherFile { path: path.clone(), start_record: total_records, records });
+        total_records = total_records
+            .checked_add(records)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "teacher record count overflow"))?;
     }
-    let total_records = file_size / HCPE_RECORD_SIZE;
     if total_records == 0 {
         return Ok(Vec::new());
     }
 
-    // Pick `n` distinct record indices (or all of them if total <= n).
+    let indices = sample_record_indices(total_records, n, seed);
+    read_fixed_teacher_indices(&files, format, record_size, &indices)
+}
+
+fn fixed_record_size(format: DataFormat) -> Option<usize> {
+    match format {
+        DataFormat::Hcpe => Some(HCPE_RECORD_SIZE),
+        DataFormat::Psv => Some(PSV_RECORD_SIZE),
+        DataFormat::Hcpe3 | DataFormat::Pack => None,
+    }
+}
+
+fn fixed_record_size_name(format: DataFormat) -> &'static str {
+    match format {
+        DataFormat::Hcpe => "HCPE_RECORD_SIZE",
+        DataFormat::Psv => "PSV_RECORD_SIZE",
+        DataFormat::Hcpe3 | DataFormat::Pack => "record size",
+    }
+}
+
+fn sample_record_indices(total_records: usize, n: usize, seed: u64) -> Vec<usize> {
     let mut rng = SeededXorShift::from_seed(seed);
-    let indices: Vec<usize> = if total_records <= n {
+    if total_records <= n {
         (0..total_records).collect()
     } else {
         // Floyd's algorithm for sampling without replacement, O(n).
@@ -316,24 +403,61 @@ pub fn read_random_hcpe_positions(
             }
         }
         chosen.into_iter().collect()
-    };
+    }
+}
 
-    // Read selected records. Sorting indices lets us do a single
-    // sequential pass through the file (one seek + one read per record
-    // group is good enough at this scale; reading a 35MB file fully into
-    // memory is also fine but we avoid the alloc).
-    let mut file = File::open(path)?;
+fn read_fixed_teacher_indices(
+    files: &[FixedTeacherFile],
+    format: DataFormat,
+    record_size: usize,
+    indices: &[usize],
+) -> std::io::Result<Vec<PackedSfenValue>> {
     let mut out: Vec<PackedSfenValue> = Vec::with_capacity(indices.len());
-    let mut rec = [0u8; HCPE_RECORD_SIZE];
-    for idx in indices {
-        let off = idx * HCPE_RECORD_SIZE;
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(off as u64))?;
-        file.read_exact(&mut rec)?;
-        if let Some(psv) = decode_hcpe_record(&rec) {
-            out.push(psv);
+    let mut current_file_index = usize::MAX;
+    let mut current_file: Option<File> = None;
+    let mut file_index = 0usize;
+
+    for &global_idx in indices {
+        while file_index + 1 < files.len()
+            && global_idx >= files[file_index].start_record.saturating_add(files[file_index].records)
+        {
+            file_index += 1;
         }
-        // silently skip records whose HCP failed to decode (= corrupted)
+        let info = &files[file_index];
+        if current_file_index != file_index {
+            current_file = Some(File::open(&info.path)?);
+            current_file_index = file_index;
+        }
+        let local_idx = global_idx.checked_sub(info.start_record).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("internal validation sampler index underflow for {}", info.path),
+            )
+        })?;
+        let offset = (local_idx as u64)
+            .checked_mul(record_size as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "record offset overflow"))?;
+        let file = current_file.as_mut().expect("file opened above");
+        file.seek(SeekFrom::Start(offset))?;
+
+        match format {
+            DataFormat::Hcpe => {
+                let mut rec = [0u8; HCPE_RECORD_SIZE];
+                file.read_exact(&mut rec)?;
+                if let Some(psv) = decode_hcpe_record(&rec) {
+                    out.push(psv);
+                }
+                // silently skip records whose HCP failed to decode (= corrupted)
+            }
+            DataFormat::Psv => {
+                let mut rec = [0u8; PSV_RECORD_SIZE];
+                file.read_exact(&mut rec)?;
+                let mut psv = PackedSfenValue::default();
+                psv.as_bytes_mut().copy_from_slice(&rec);
+                out.push(psv);
+            }
+            DataFormat::Hcpe3 | DataFormat::Pack => unreachable!("caller validated fixed-record format"),
+        }
     }
     Ok(out)
 }
@@ -401,7 +525,7 @@ mod tests {
         // training-loss subset.
         let m = [0.5, -0.1, 0.3, -0.2];
         let t = [200i16, 100, 0, -50]; // teacher scores (unused for
-                                       // accuracy when results given)
+        // accuracy when results given)
         let game = [1i8, 0, 0, -1]; // Win, Draw, Draw, Loss
         let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
         // i=0: Win, pred=true, truth=true → match
@@ -413,6 +537,18 @@ mod tests {
         assert_eq!(r.drawn_games, 2);
         assert_eq!(r.loss_sampled, 4, "loss subset still includes draws");
         assert!(r.test_loss.is_some());
+    }
+
+    #[test]
+    fn accuracy_reports_decisive_prediction_sign_distribution() {
+        let m = [0.0, 0.2, -0.1, -0.3, 0.4];
+        let t = [1i16, 2, 3, 4, 5];
+        let game = [1i8, -1, -1, 0, 1];
+        let r = compute_sign_accuracy(&m, &t, &game, None, 1.0, 400.0);
+        assert_eq!(r.compared, 4, "draw is excluded from decisive sign diagnostics");
+        assert_eq!(r.predicted_nonnegative, 3, "zero is counted on the >=0 side");
+        assert_eq!(r.predicted_negative, 1);
+        assert_eq!(r.predicted_zero, 1);
     }
 
     #[test]
@@ -464,8 +600,7 @@ mod tests {
     fn test_loss_can_use_nnue_pytorch_wrm() {
         let m = [0.0, 0.0];
         let t = [400i16, -400];
-        let r =
-            compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, ValidationLossKind::NnuePytorchWrm);
+        let r = compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, ValidationLossKind::NnuePytorchWrm);
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");
         assert!(loss.is_finite());
@@ -502,10 +637,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "bulletou-validate-test-bad-size-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::write(&tmp, vec![0u8; 37]).unwrap(); // not a multiple of 38
         let path = tmp.to_str().unwrap();
@@ -515,6 +647,36 @@ mod tests {
             Ok(_) => panic!("expected InvalidData error, got Ok"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
         }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_random_teacher_positions_supports_psv() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-validate-test-fixed-psv-{}-{}.psv",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        fn psv_with(score: i16, result: i8) -> PackedSfenValue {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut()[32..34].copy_from_slice(&score.to_le_bytes());
+            psv.as_bytes_mut()[38] = result as u8;
+            psv
+        }
+
+        let records = [psv_with(123, 1), psv_with(-45, -1), psv_with(0, 0)];
+        let mut bytes = Vec::new();
+        for psv in &records {
+            bytes.extend_from_slice(psv.as_bytes());
+        }
+        std::fs::write(&tmp, bytes).unwrap();
+
+        let got = read_random_teacher_positions(tmp.to_str().unwrap(), 10, 1).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.iter().map(PackedSfenValue::score).collect::<Vec<_>>(), vec![123, -45, 0]);
+        assert_eq!(got.iter().map(PackedSfenValue::game_result).collect::<Vec<_>>(), vec![1, -1, 0]);
+
         let _ = std::fs::remove_file(&tmp);
     }
 }
