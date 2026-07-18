@@ -37,7 +37,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-027 | done | tatara-style HalfKP FT factorizer | BulletOu cuda-oxide standard NNUE training now uses tatara's piece-input factorizer for scratch HalfKP runs, folds it when writing `nn.bin`, and matches tatara's 4M same-PSV loss/accuracy/speed envelope |
 | BO-CUDA-028 | done | beat tatara on 4M speed and accuracy | reduce cuda-oxide host readback overhead and tune the 4M same-PSV recipe until BulletOu exceeds the latest tatara 4M reference in both held-out accuracy and train throughput |
 | BO-CUDA-029 | done | NNUE idle recompare after external GPU load stopped | remeasure tatara/BulletOu on the same 4M PSV slice with the GPU idle and record a BulletOu recipe that exceeds tatara in speed and accuracy |
-| BO-CUDA-030 | doing | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, improve `SFNN_halfka2_1024_7_64_k3k3` until BulletOu exceeds tatara in train throughput, held-out loss, and held-out accuracy |
+| BO-CUDA-030 | done | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, the Windows-native C++/CUDA direct path now exceeds tatara in train throughput, held-out loss, and held-out accuracy |
 | BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
 | BO-CUDA-033 | doing | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
@@ -590,7 +590,12 @@ the tickets in order and commit each completed slice.
 - Later full-epoch yamaoka probes before the C++/CUDA pivot:
   - bs28k, `teacher_batch=458752`, `wd=0`, `beta1=0.975`, LR `0.0020`, `wdl=0.01`, `test_wdl=0`: `649277440` positions in `499.748s`, `1299210` pos/s, `test_loss=0.06488502`, `test_acc=0.6633301`;
   - this beat tatara on loss and speed and missed tatara accuracy by only 2 decisive positions on the 65,536-position yamaoka validation set;
-  - nearby WDL/LR/beta probes did not reliably recover the remaining accuracy while keeping loss/speed, so BO-CUDA-030 remains open.
+  - nearby WDL/LR/beta probes did not reliably recover the remaining accuracy while keeping loss/speed, so BO-CUDA-030 stayed open at the cuda-oxide stage.
+- C++/CUDA full-epoch yamaoka result after the BO-CUDA-034 final-validation wiring:
+  - command shape: `--backend cuda-cpp --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --teacher target\full-epoch-sfnn-20260718\teacher-all.psv --cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --test-batch-size 8192`;
+  - result: `649199616` positions in `489.182s`, `1327112` pos/s, final train loss `0.05046421`, yamaoka `test_loss=0.05579023`, `test_acc=0.6717072`;
+  - this beats the tracked tatara reference on all three target metrics: speed (`1327112` > `~1290000` pos/s), held-out loss (`0.05579023` < `0.064964`), and held-out accuracy (`0.6717072` > `0.663361`).
+  - The quality target is therefore met by the Windows-native C++/CUDA direct path; BO-CUDA-034 still tracks production checkpoint/log/resume integration for this backend.
 - Important validation rule:
   - validation for this target is fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`;
   - if that PSV is missing, convert `C:\shogi\teacher\test\yamaoka-floodgate.hcpe` to PSV in the same folder;
@@ -837,7 +842,9 @@ the tickets in order and commit each completed slice.
     `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` (22 cuda-cpp tests), and
     `cargo test --example bulletou cuda_oxide_backend_accepts_sfnn_halfka2_direct_steps -- --nocapture`.
   - Real-data validation smoke on Windows used training `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` and held-out `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 128 --test-sample sequential`; it printed `test_value_accuracy=0.5000000`, `test_value_loss=0.17757529`.
+  - Full exported-teacher yamaoka comparison on Windows used `target\full-epoch-sfnn-20260718\teacher-all.psv` for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation:
+    `--cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-positions 65536 --test-sample sequential --test-batch-size 8192` reported `649199616` positions in `489.182s`, `throughput=1327112 pos/s`, `test_value_loss=0.05579023`, `test_value_accuracy=0.6717072`.
 - Remaining BO-CUDA-034 work:
   - wire SFNN cuda-cpp direct output and final validation into the normal numbered checkpoint/log semantics and auto-resume orchestration;
-  - add deeper backward profiling/optimisation; large-batch C++ direct smokes now clear the tracked tatara speed target (`~1.29M pos/s`), but the full-teacher comparison still needs to prove this under the real validation recipe;
-  - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.
+  - add deeper backward profiling/optimisation; the large-batch full-teacher C++ direct comparison now clears the tracked tatara speed/quality target, but the backend still has rough direct-mode ergonomics;
+  - consider a clean repeat run and/or smaller-batch quality-speed recipe after normal checkpoint/log support lands.
