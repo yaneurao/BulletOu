@@ -203,6 +203,8 @@ enum SfnnForwardCaseKind {
     Tiny,
     FactorizedTiny,
     Halfka2,
+    Halfka2Factorized,
+    Halfka2FactorizedNonzeroVirtual,
 }
 
 #[cfg(feature = "cuda")]
@@ -5573,7 +5575,15 @@ fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
         "tiny" => Ok(SfnnForwardCaseKind::Tiny),
         "factorized-tiny" | "tiny-factorized" => Ok(SfnnForwardCaseKind::FactorizedTiny),
         "halfka2" | "halfka2-1024-7-64-k3k3" | "SFNN_halfka2_1024_7_64_k3k3" => Ok(SfnnForwardCaseKind::Halfka2),
-        _ => usage_error(format!("--sfnn-forward-case must be one of: tiny, factorized-tiny, halfka2 (got {value})")),
+        "halfka2-factorized" | "halfka2-ft-factorized" | "SFNN_halfka2_1024_7_64_k3k3_ft_factorized" => {
+            Ok(SfnnForwardCaseKind::Halfka2Factorized)
+        }
+        "halfka2-factorized-nonzero-virtual" | "halfka2-ft-factorized-nonzero-virtual" => {
+            Ok(SfnnForwardCaseKind::Halfka2FactorizedNonzeroVirtual)
+        }
+        _ => usage_error(format!(
+            "--sfnn-forward-case must be one of: tiny, factorized-tiny, halfka2, halfka2-factorized, halfka2-factorized-nonzero-virtual (got {value})"
+        )),
     }
 }
 
@@ -7741,6 +7751,10 @@ impl SfnnForwardCase {
             SfnnForwardCaseKind::Tiny => Self::tiny(),
             SfnnForwardCaseKind::FactorizedTiny => Self::factorized_tiny(),
             SfnnForwardCaseKind::Halfka2 => Self::halfka2_1024_7_64_k3k3(),
+            SfnnForwardCaseKind::Halfka2Factorized => Self::halfka2_1024_7_64_k3k3_ft_factorized(),
+            SfnnForwardCaseKind::Halfka2FactorizedNonzeroVirtual => {
+                Self::halfka2_1024_7_64_k3k3_ft_factorized_nonzero_virtual()
+            }
         }
     }
 
@@ -7871,6 +7885,17 @@ impl SfnnForwardCase {
             l3w: tatara_uniform_abs_init(layout.l3w_len(), 0x104, 0.01),
             l3b: vec![0.0; layout.l3b_len()],
         }
+    }
+
+    fn halfka2_1024_7_64_k3k3_ft_factorized_nonzero_virtual() -> Self {
+        let mut case = Self::halfka2_1024_7_64_k3k3_ft_factorized();
+        let base_shape = bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3;
+        let virtual_start = base_shape.input_size * base_shape.ft_size;
+        let virtual_len = case.l0w.len().saturating_sub(virtual_start);
+        let virtual_rows = tatara_uniform_abs_init(virtual_len, 0x105, 0.01);
+        case.l0w[virtual_start..].copy_from_slice(&virtual_rows);
+        case.label = "halfka2-1024-7-64-k3k3-ft-factorized-nonzero-virtual";
+        case
     }
 
     fn cpu_forward_trace(&self) -> SfnnForwardTrace {
