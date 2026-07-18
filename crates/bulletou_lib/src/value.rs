@@ -43,8 +43,9 @@ pub use fast_sfnn_fixture::{
     SFNN_FORWARD_FIXTURE_MAGIC, SfnnForwardFixtureError, write_sfnn_forward_fixture, write_sfnn_forward_fixture_file,
 };
 pub use teacher_batch::{
-    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, TeacherBatchError, TeacherDataloaderPos,
-    for_each_halfkp_teacher_fast_batch, load_halfkp_teacher_fast_batch,
+    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError,
+    TeacherDataloaderPos, for_each_halfkp_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch,
+    load_halfkp_teacher_fast_batch,
 };
 
 use crate::{

@@ -1780,11 +1780,30 @@ impl Args {
         }
 
         let eval_type = self.eval_type();
-        if eval_type != EvalType::NnueHalfkp {
+        if !matches!(eval_type, EvalType::NnueHalfkp | EvalType::SfnnHalfka2) {
             return Err(format!(
-                "--backend cuda-cpp currently supports direct NNUE_HALFKP train steps only; {} is tracked by later tickets",
+                "--backend cuda-cpp currently supports direct NNUE_HALFKP or SFNN_HALFKA2 train steps only; {} is tracked by later tickets",
                 eval_type.cli_name()
             ));
+        }
+        let supported_arch = cuda_cpp_supported_arch(eval_type);
+        if self.arch() != supported_arch {
+            return Err(format!(
+                "--backend cuda-cpp currently supports only --arch {} for {}; got {}",
+                supported_arch.cli_name(),
+                eval_type.cli_name(),
+                self.arch().cli_name()
+            ));
+        }
+        if eval_type == EvalType::SfnnHalfka2 {
+            if self.cuda_cpp_weights_bin.is_some() {
+                return Err("--cuda-cpp-weights-bin is not yet supported for cuda-cpp SFNN direct trainer".to_string());
+            }
+            if self.cuda_cpp_profile_steps != 0 {
+                return Err(
+                    "--cuda-cpp-profile-steps is not yet supported for cuda-cpp SFNN direct trainer".to_string()
+                );
+            }
         }
 
         match self.cuda_cpp_train_steps {
@@ -2835,7 +2854,11 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
     #[cfg(feature = "cuda-cpp-backend")]
     {
         if !args.cuda_cpp_smoke {
-            return run_cuda_cpp_halfkp_direct_steps(args);
+            return match args.eval_type() {
+                EvalType::NnueHalfkp => run_cuda_cpp_halfkp_direct_steps(args),
+                EvalType::SfnnHalfka2 => run_cuda_cpp_sfnn_halfka2_direct_steps(args),
+                other => unreachable!("validated cuda-cpp direct trainer eval type reached dispatch: {other:?}"),
+            };
         }
 
         use bulletou_cuda_cpp::{
@@ -3140,7 +3163,11 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             eprintln!(
                 "  profile_cuda_cpp step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
                  backward={:.3}ms update={:.3}ms total={:.3}ms",
-                profile.upload_ms, profile.forward_ms, profile.loss_ms, profile.backward_ms, profile.update_ms,
+                profile.upload_ms,
+                profile.forward_ms,
+                profile.loss_ms,
+                profile.backward_ms,
+                profile.update_ms,
                 profile.total_ms
             );
         } else {
@@ -3206,6 +3233,253 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     eprintln!("  cuda-cpp direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
 
     Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
+    use bulletou_cuda_cpp::{
+        Context, RAdamUpdateParams, RangerUpdateParams, ScalarLossKind,
+        SfnnForwardHostWeights as CudaSfnnForwardHostWeights, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
+    };
+    use bulletou_lib::value::{SfnnTeacherBatchConfig, for_each_sfnn_halfka2_teacher_fast_batch};
+
+    let train_steps = args.cuda_cpp_train_steps.expect("validated cuda-cpp train steps");
+    let batch_size = effective_batch_size(args);
+    let (ft_size, l1_hidden, l2_size) = args.arch().dims();
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    let num_stacks = layerstack.num_stacks();
+    let device = args.cuda_cpp_device;
+
+    eprintln!(
+        "  backend = cuda-cpp Windows-native direct SFNN_HALFKA2 trainer ({train_steps} batch step{})",
+        if train_steps == 1 { "" } else { "s" }
+    );
+    let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
+    eprintln!("  cuda-cpp device {device}: {name}");
+    eprintln!("  initial weights = deterministic nnue-pytorch-style scratch");
+    eprintln!("  batch size = {batch_size}");
+    eprintln!(
+        "  arch = {} (factorized HalfKA2 input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={num_stacks})",
+        args.arch().cli_name(),
+        ShogiHalfKa2.num_inputs() + bulletou_lib::game::inputs::PIECE_INPUTS
+    );
+    eprintln!("  l1 factorized shared term = {}", if args.sfnn_factorized_l1 { "enabled" } else { "disabled" });
+    eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+
+    let initial_weights = build_sfnn_halfka2_initial_weights_for_cuda_cpp(args)?;
+    let cuda_shape = initial_weights.shape;
+    let ctx = Context::new(device).map_err(|e| e.to_string())?;
+    let initial_host_weights = CudaSfnnForwardHostWeights {
+        shape: cuda_shape,
+        l0w: &initial_weights.l0w,
+        l0b: &initial_weights.l0b,
+        l1w: &initial_weights.l1w,
+        l1b: &initial_weights.l1b,
+        l1fw: initial_weights.l1fw.as_deref(),
+        l1fb: initial_weights.l1fb.as_deref(),
+        l2w: &initial_weights.l2w,
+        l2b: &initial_weights.l2b,
+        l3w: &initial_weights.l3w,
+        l3b: &initial_weights.l3b,
+    };
+    let max_active = ShogiHalfKa2.max_active();
+    let mut runner =
+        SfnnTrainStepRunner::new(&ctx, initial_host_weights, batch_size, max_active).map_err(|e| e.to_string())?;
+
+    let loss_kind =
+        if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
+    // Bullet's scalar value loss applies sigmoid directly to the model output;
+    // `--scale` is used only while preparing the teacher target.
+    let output_inv_scale = 1.0_f32;
+    let mut seen_steps = 0usize;
+    let mut reported_loss_sum = 0.0_f64;
+    let mut reported_loss_count = 0usize;
+    let mut last_loss = 0.0_f32;
+    let started = std::time::Instant::now();
+
+    let config = SfnnTeacherBatchConfig {
+        teacher: &args.teacher,
+        batch_size,
+        batch_index: 0,
+        dataloader_resume_pos: None,
+        buffer_mb: args.buffer_mb,
+        loader_threads: args.loader_threads,
+        threads: args.threads,
+        lambda: args.lambda,
+        scale: args.scale as f32,
+        nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        profile_prepare: false,
+    };
+
+    for_each_sfnn_halfka2_teacher_fast_batch(&config, train_steps, |teacher_batch| {
+        seen_steps += 1;
+        let fast = teacher_batch.batch;
+        let params = {
+            let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+            RangerUpdateParams {
+                radam: RAdamUpdateParams {
+                    step: seen_steps as u64,
+                    learning_rate: args.lr,
+                    decay: ranger.decay,
+                    beta1: ranger.beta1,
+                    beta2: ranger.beta2,
+                    epsilon: ranger.epsilon,
+                    min_weight: ranger.min_weight,
+                    max_weight: ranger.max_weight,
+                    ..RAdamUpdateParams::default()
+                },
+                lookahead_alpha: ranger.alpha,
+                lookahead_period: ranger.k as u64,
+            }
+        };
+        let batch = SfnnTrainStepHostBatch {
+            stm_indices: &fast.stm,
+            nstm_indices: &fast.nstm,
+            buckets: &fast.buckets,
+            targets: &fast.targets,
+            entry_weights: &fast.weights,
+            batch_size: fast.layout.batch_size,
+            max_active: fast.layout.max_active,
+        };
+        runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+        let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
+        if should_report {
+            let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
+            last_loss = loss.mean;
+            reported_loss_sum += f64::from(loss.mean);
+            reported_loss_count += 1;
+            eprintln!(
+                "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                loss.mean, teacher_batch.source
+            );
+        }
+        Ok::<(), String>(())
+    })
+    .map_err(|e| e.to_string())?;
+
+    ctx.synchronize().map_err(|e| e.to_string())?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let positions = seen_steps.saturating_mul(batch_size);
+    let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
+    eprintln!(
+        "  cuda-cpp SFNN direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
+         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+    );
+    eprintln!("  cuda-cpp SFNN direct output = pending (nn.bin/state.bin writer/resume not wired yet)");
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppSfnnInitialWeights {
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l0w: Vec<f32>,
+    l0b: Vec<f32>,
+    l1w: Vec<f32>,
+    l1b: Vec<f32>,
+    l1fw: Option<Vec<f32>>,
+    l1fb: Option<Vec<f32>>,
+    l2w: Vec<f32>,
+    l2b: Vec<f32>,
+    l3w: Vec<f32>,
+    l3b: Vec<f32>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppSfnnInitialWeights {
+    fn validate(&self) -> Result<(), String> {
+        let weights = bulletou_cuda_cpp::SfnnForwardHostWeights {
+            shape: self.shape,
+            l0w: &self.l0w,
+            l0b: &self.l0b,
+            l1w: &self.l1w,
+            l1b: &self.l1b,
+            l1fw: self.l1fw.as_deref(),
+            l1fb: self.l1fb.as_deref(),
+            l2w: &self.l2w,
+            l2b: &self.l2b,
+            l3w: &self.l3w,
+            l3b: &self.l3b,
+        };
+        weights.validate().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_sfnn_halfka2_initial_weights_for_cuda_cpp(args: &Args) -> Result<CudaCppSfnnInitialWeights, String> {
+    let (ft_size, l1_hidden, l2_size) = args.arch().dims();
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    let num_stacks = layerstack.num_stacks();
+    let base_input_size = ShogiHalfKa2.num_inputs();
+    let input_size = base_input_size + bulletou_lib::game::inputs::PIECE_INPUTS;
+    let init_scale = args.nnue_pytorch_init_scale;
+    let shape = bulletou_cuda_cpp::SfnnForwardShape { input_size, ft_size, l1_hidden, l2_size, num_stacks };
+    let l1_out = shape.l1_out();
+    let l2_in = shape.l2_in();
+
+    let mut l0w =
+        cuda_cpp_tatara_uniform_fan_in_init(base_input_size * ft_size, 0x5f11_e001, base_input_size, init_scale);
+    l0w.resize(input_size * ft_size, 0.0);
+    let l0b = cuda_cpp_tatara_uniform_fan_in_init(ft_size, 0x5f11_e002, base_input_size, init_scale);
+
+    let l1_bound = init_scale * (1.0 / ft_size.max(1) as f32).sqrt();
+    let l2_bound = init_scale * (1.0 / l2_in.max(1) as f32).sqrt();
+    let l3_bound = init_scale * (1.0 / l2_size.max(1) as f32).sqrt();
+    let l1w = cuda_cpp_tatara_stacked_row_major_bucket0_init(ft_size, l1_out, num_stacks, 0x5f11_e003, l1_bound);
+    let l1b = cuda_cpp_tatara_stacked_bias_bucket0_init(l1_out, num_stacks, 0x5f11_e004, l1_bound);
+    let l2w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_in, l2_size, num_stacks, 0x5f11_e005, l2_bound);
+    let l2b = cuda_cpp_tatara_stacked_bias_bucket0_init(l2_size, num_stacks, 0x5f11_e006, l2_bound);
+    let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
+    let l3b = vec![0.0; num_stacks];
+    let (l1fw, l1fb) = if args.sfnn_factorized_l1 {
+        (Some(vec![0.0; ft_size * l1_out]), Some(vec![0.0; l1_out]))
+    } else {
+        (None, None)
+    };
+
+    let weights = CudaCppSfnnInitialWeights { shape, l0w, l0b, l1w, l1b, l1fw, l1fb, l2w, l2b, l3w, l3b };
+    weights.validate()?;
+    Ok(weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_tatara_stacked_row_major_bucket0_init(
+    input_dim: usize,
+    output_dim: usize,
+    num_stacks: usize,
+    seed: u64,
+    half_width: f32,
+) -> Vec<f32> {
+    let bucket0 = cuda_cpp_tatara_uniform_abs_init(input_dim * output_dim, seed, half_width);
+    let mut weights = vec![0.0; num_stacks * output_dim * input_dim];
+    for stack in 0..num_stacks {
+        let stack_base = stack * output_dim * input_dim;
+        for out_col in 0..output_dim {
+            let src_base = out_col * input_dim;
+            let dst_base = stack_base + out_col * input_dim;
+            weights[dst_base..dst_base + input_dim].copy_from_slice(&bucket0[src_base..src_base + input_dim]);
+        }
+    }
+    weights
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_tatara_stacked_bias_bucket0_init(
+    output_dim: usize,
+    num_stacks: usize,
+    seed: u64,
+    half_width: f32,
+) -> Vec<f32> {
+    let bucket0 = cuda_cpp_tatara_uniform_abs_init(output_dim, seed, half_width);
+    let mut bias = vec![0.0; num_stacks * output_dim];
+    for stack in 0..num_stacks {
+        let base = stack * output_dim;
+        bias[base..base + output_dim].copy_from_slice(&bucket0);
+    }
+    bias
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3689,6 +3963,13 @@ fn cuda_cpp_tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> V
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_tatara_uniform_fan_in_init(len: usize, seed: u64, fan_in: usize, init_scale: f32) -> Vec<f32> {
+    let fan_in = fan_in.max(1) as f32;
+    let half_width = init_scale * (1.0 / fan_in).sqrt();
+    cuda_cpp_tatara_uniform_abs_init(len, seed, half_width)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Debug)]
 struct CudaCppTataraXorShift {
     state: u64,
@@ -3747,6 +4028,21 @@ fn cuda_oxide_supported_arch(eval_type: EvalType) -> NnueArch {
             Some(LayerStackMode::Kingrank3by3),
         ),
         other => unreachable!("cuda-oxide unsupported eval type reached arch selection: {other:?}"),
+    }
+}
+
+fn cuda_cpp_supported_arch(eval_type: EvalType) -> NnueArch {
+    match eval_type {
+        EvalType::NnueHalfkp => NnueArch::default_for_eval_type(EvalType::NnueHalfkp),
+        EvalType::SfnnHalfka2 => NnueArch::new(
+            NnueArchFamily::Sfnn,
+            NnueArchFeature::Halfka2,
+            1024,
+            7,
+            64,
+            Some(LayerStackMode::Kingrank3by3),
+        ),
+        other => unreachable!("cuda-cpp unsupported eval type reached arch selection: {other:?}"),
     }
 }
 
@@ -8313,6 +8609,87 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_accepts_sfnn_halfka2_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_sfnn_default_arch() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "SFNN_halfka2_1024_7_64_k3k3"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_sfnn_initial_weights_for_now() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--cuda-cpp-weights-bin",
+            "weights.bin",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--cuda-cpp-weights-bin"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
     fn cuda_cpp_backend_accepts_profile_steps_for_direct_steps() {
         use clap::Parser as _;
 
@@ -8418,6 +8795,42 @@ mod tests {
         assert!(weights.l0w[..virtual_rows * weights.shape.l1].iter().all(|&v| v == 0.0));
         assert!(weights.l0w[virtual_rows * weights.shape.l1..].iter().any(|&v| v != 0.0));
         assert!(weights.l0b.iter().any(|&v| v != 0.0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_initial_weights_use_halfka2_factorized_shape() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorized-l1",
+        ])
+        .unwrap();
+
+        let weights = build_sfnn_halfka2_initial_weights_for_cuda_cpp(&args).unwrap();
+        let base_input_size = ShogiHalfKa2.num_inputs();
+        let virtual_rows = bulletou_lib::game::inputs::PIECE_INPUTS;
+        let l1_out = weights.shape.l1_out();
+        assert_eq!(weights.shape.input_size, base_input_size + virtual_rows);
+        assert!(weights.l0w[..base_input_size * weights.shape.ft_size].iter().any(|&v| v != 0.0));
+        assert!(weights.l0w[base_input_size * weights.shape.ft_size..].iter().all(|&v| v == 0.0));
+        assert!(weights.l1fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l1fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
+
+        let stack_stride = l1_out * weights.shape.ft_size;
+        assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
+        assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
