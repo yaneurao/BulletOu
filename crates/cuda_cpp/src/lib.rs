@@ -14,7 +14,11 @@ impl CudaCppError {
         if status == 0 {
             // SAFETY: the backend always nul-terminates on success.
             let message = unsafe { CStr::from_ptr(bytes.as_ptr()) }.to_string_lossy().into_owned();
-            if message.is_empty() { Self { message: fallback } } else { Self { message } }
+            if message.is_empty() {
+                Self { message: fallback }
+            } else {
+                Self { message }
+            }
         } else {
             Self { message: fallback }
         }
@@ -149,6 +153,12 @@ pub struct F32Buffer {
 }
 
 #[derive(Debug)]
+pub struct I32Buffer {
+    raw: NonNull<ffi::BulletOuCudaCppI32Buffer>,
+    len: usize,
+}
+
+#[derive(Debug)]
 pub struct F32UploadSlot {
     buffer: F32Buffer,
     ready: Event,
@@ -248,6 +258,75 @@ impl Drop for F32Buffer {
     }
 }
 
+impl I32Buffer {
+    pub fn new(ctx: &Context, len: usize) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `ctx` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_i32_buffer_create(ctx.as_ptr(), len, &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA i32_buffer_create returned null"))?;
+        Ok(Self { raw, len })
+    }
+
+    pub fn from_host(ctx: &Context, values: &[i32]) -> Result<Self> {
+        let buffer = Self::new(ctx, values.len())?;
+        buffer.upload(ctx, values)?;
+        Ok(buffer)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn upload(&self, ctx: &Context, values: &[i32]) -> Result<()> {
+        if values.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "i32 upload length {} exceeds device buffer length {}",
+                values.len(),
+                self.len
+            )));
+        }
+        // SAFETY: host slice is valid for `values.len()`; backend validates device buffer length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_i32_upload(ctx.as_ptr(), self.raw.as_ptr(), values.as_ptr(), values.len())
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<Vec<i32>> {
+        let mut out = vec![0; self.len];
+        self.download_prefix(ctx, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn download_prefix(&self, ctx: &Context, out: &mut [i32]) -> Result<()> {
+        if out.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "i32 download length {} exceeds device buffer length {}",
+                out.len(),
+                self.len
+            )));
+        }
+        // SAFETY: host slice is valid for `out.len()`; backend validates device buffer length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_i32_download(ctx.as_ptr(), self.raw.as_ptr(), out.as_mut_ptr(), out.len())
+        })
+    }
+
+    fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppI32Buffer {
+        self.raw.as_ptr()
+    }
+}
+
+impl Drop for I32Buffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_i32_buffer_destroy(self.raw.as_ptr()) };
+    }
+}
+
 pub fn device_name(device: i32) -> Result<String> {
     let mut bytes = vec![0i8; 256];
     // SAFETY: `bytes` is a valid writable C buffer.
@@ -269,6 +348,333 @@ pub fn axpy_host(device: i32, a: f32, x: &[f32], y: &[f32]) -> Result<Vec<f32>> 
 pub fn axpy_device(ctx: &Context, len: usize, a: f32, x: &F32Buffer, y: &F32Buffer, out: &F32Buffer) -> Result<()> {
     // SAFETY: backend validates buffer lengths and device ownership.
     check(unsafe { ffi::bulletou_cuda_cpp_axpy_device(ctx.as_ptr(), len, a, x.as_ptr(), y.as_ptr(), out.as_ptr()) })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueForwardShape {
+    pub input_size: usize,
+    pub l1: usize,
+    pub l2: usize,
+    pub l3: usize,
+}
+
+pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape { input_size: 125_388, l1: 256, l2: 32, l3: 32 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct NnueForwardHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl NnueForwardHostBatch<'_> {
+    pub fn validate(self) -> Result<()> {
+        if self.batch_size == 0 {
+            return Err(CudaCppError::message("NNUE batch_size must be greater than zero"));
+        }
+        if self.max_active == 0 {
+            return Err(CudaCppError::message("NNUE max_active must be greater than zero"));
+        }
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("NNUE sparse batch length overflow"))?;
+        expect_len("stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("nstm_indices", sparse_len, self.nstm_indices.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NnueForwardHostWeights<'a> {
+    pub shape: NnueForwardShape,
+    pub l0w: &'a [f32],
+    pub l0b: &'a [f32],
+    pub l1w: &'a [f32],
+    pub l1b: &'a [f32],
+    pub l2w: &'a [f32],
+    pub l2b: &'a [f32],
+    pub outw: &'a [f32],
+    pub outb: &'a [f32],
+}
+
+impl NnueForwardHostWeights<'_> {
+    pub fn validate(self) -> Result<()> {
+        let shape = self.shape;
+        validate_nnue_shape(shape)?;
+        expect_len("l0w", checked_product("l0w", &[shape.input_size, shape.l1])?, self.l0w.len())?;
+        expect_len("l0b", shape.l1, self.l0b.len())?;
+        expect_len("l1w", checked_product("l1w", &[shape.l1, 2, shape.l2])?, self.l1w.len())?;
+        expect_len("l1b", shape.l2, self.l1b.len())?;
+        expect_len("l2w", checked_product("l2w", &[shape.l2, shape.l3])?, self.l2w.len())?;
+        expect_len("l2b", shape.l3, self.l2b.len())?;
+        expect_len("outw", shape.l3, self.outw.len())?;
+        expect_len("outb", 1, self.outb.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct NnueForwardDeviceBatch {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub stm_indices: I32Buffer,
+    pub nstm_indices: I32Buffer,
+}
+
+impl NnueForwardDeviceBatch {
+    pub fn from_host(ctx: &Context, batch: NnueForwardHostBatch<'_>) -> Result<Self> {
+        batch.validate()?;
+        Ok(Self {
+            batch_size: batch.batch_size,
+            max_active: batch.max_active,
+            stm_indices: I32Buffer::from_host(ctx, batch.stm_indices)?,
+            nstm_indices: I32Buffer::from_host(ctx, batch.nstm_indices)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("NNUE sparse batch length overflow"))?;
+        expect_len("device stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("device nstm_indices", sparse_len, self.nstm_indices.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct NnueForwardDeviceWeights {
+    pub shape: NnueForwardShape,
+    pub l0w: F32Buffer,
+    pub l0b: F32Buffer,
+    pub l1w: F32Buffer,
+    pub l1b: F32Buffer,
+    pub l2w: F32Buffer,
+    pub l2b: F32Buffer,
+    pub outw: F32Buffer,
+    pub outb: F32Buffer,
+}
+
+impl NnueForwardDeviceWeights {
+    pub fn from_host(ctx: &Context, weights: NnueForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            shape: weights.shape,
+            l0w: F32Buffer::from_host(ctx, weights.l0w)?,
+            l0b: F32Buffer::from_host(ctx, weights.l0b)?,
+            l1w: F32Buffer::from_host(ctx, weights.l1w)?,
+            l1b: F32Buffer::from_host(ctx, weights.l1b)?,
+            l2w: F32Buffer::from_host(ctx, weights.l2w)?,
+            l2b: F32Buffer::from_host(ctx, weights.l2b)?,
+            outw: F32Buffer::from_host(ctx, weights.outw)?,
+            outb: F32Buffer::from_host(ctx, weights.outb)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let shape = self.shape;
+        validate_nnue_shape(shape)?;
+        expect_len("device l0w", checked_product("l0w", &[shape.input_size, shape.l1])?, self.l0w.len())?;
+        expect_len("device l0b", shape.l1, self.l0b.len())?;
+        expect_len("device l1w", checked_product("l1w", &[shape.l1, 2, shape.l2])?, self.l1w.len())?;
+        expect_len("device l1b", shape.l2, self.l1b.len())?;
+        expect_len("device l2w", checked_product("l2w", &[shape.l2, shape.l3])?, self.l2w.len())?;
+        expect_len("device l2b", shape.l3, self.l2b.len())?;
+        expect_len("device outw", shape.l3, self.outw.len())?;
+        expect_len("device outb", 1, self.outb.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NnueForwardWorkspaceLayout {
+    pub shape: NnueForwardShape,
+    pub batch_size: usize,
+}
+
+impl NnueForwardWorkspaceLayout {
+    pub fn new(shape: NnueForwardShape, batch_size: usize) -> Self {
+        Self { shape, batch_size }
+    }
+
+    pub fn l0_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1)
+    }
+
+    pub fn combined_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l1).saturating_mul(2)
+    }
+
+    pub fn hidden1_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l2)
+    }
+
+    pub fn hidden2_len(self) -> usize {
+        self.batch_size.saturating_mul(self.shape.l3)
+    }
+
+    pub fn output_len(self) -> usize {
+        self.batch_size
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_nnue_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("NNUE workspace batch_size must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NnueForwardWorkspace {
+    pub layout: NnueForwardWorkspaceLayout,
+    pub stm_l0: F32Buffer,
+    pub nstm_l0: F32Buffer,
+    pub combined: F32Buffer,
+    pub hidden1: F32Buffer,
+    pub hidden2: F32Buffer,
+    pub output: F32Buffer,
+}
+
+impl NnueForwardWorkspace {
+    pub fn new(ctx: &Context, layout: NnueForwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            stm_l0: F32Buffer::new(ctx, layout.l0_len())?,
+            nstm_l0: F32Buffer::new(ctx, layout.l0_len())?,
+            combined: F32Buffer::new(ctx, layout.combined_len())?,
+            hidden1: F32Buffer::new(ctx, layout.hidden1_len())?,
+            hidden2: F32Buffer::new(ctx, layout.hidden2_len())?,
+            output: F32Buffer::new(ctx, layout.output_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("workspace stm_l0", self.layout.l0_len(), self.stm_l0.len())?;
+        expect_len("workspace nstm_l0", self.layout.l0_len(), self.nstm_l0.len())?;
+        expect_len("workspace combined", self.layout.combined_len(), self.combined.len())?;
+        expect_len("workspace hidden1", self.layout.hidden1_len(), self.hidden1.len())?;
+        expect_len("workspace hidden2", self.layout.hidden2_len(), self.hidden2.len())?;
+        expect_len("workspace output", self.layout.output_len(), self.output.len())
+    }
+
+    pub fn download_output(&self, ctx: &Context) -> Result<Vec<f32>> {
+        self.output.download(ctx)
+    }
+}
+
+pub fn nnue_forward_host(
+    device: i32,
+    batch: NnueForwardHostBatch<'_>,
+    weights: NnueForwardHostWeights<'_>,
+) -> Result<Vec<f32>> {
+    batch.validate()?;
+    weights.validate()?;
+    let mut out = vec![0.0; batch.batch_size];
+    let shape = weights.shape;
+    // SAFETY: all slices have been length-validated against the shape and batch layout.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_nnue_forward_host(
+            device,
+            shape.input_size,
+            shape.l1,
+            shape.l2,
+            shape.l3,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            weights.l0w.as_ptr(),
+            weights.l0b.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l1b.as_ptr(),
+            weights.l2w.as_ptr(),
+            weights.l2b.as_ptr(),
+            weights.outw.as_ptr(),
+            weights.outb.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    })?;
+    Ok(out)
+}
+
+pub fn nnue_forward_device(
+    ctx: &Context,
+    batch: &NnueForwardDeviceBatch,
+    weights: &NnueForwardDeviceWeights,
+    workspace: &NnueForwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    workspace.validate()?;
+    if workspace.layout.batch_size != batch.batch_size {
+        return Err(CudaCppError::message(format!(
+            "NNUE workspace batch mismatch: workspace={} batch={}",
+            workspace.layout.batch_size, batch.batch_size
+        )));
+    }
+    if workspace.layout.shape != weights.shape {
+        return Err(CudaCppError::message(format!(
+            "NNUE workspace shape mismatch: workspace={:?} weights={:?}",
+            workspace.layout.shape, weights.shape
+        )));
+    }
+    let shape = weights.shape;
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_nnue_forward_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.l1,
+            shape.l2,
+            shape.l3,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            weights.l0w.as_ptr(),
+            weights.l0b.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l1b.as_ptr(),
+            weights.l2w.as_ptr(),
+            weights.l2b.as_ptr(),
+            weights.outw.as_ptr(),
+            weights.outb.as_ptr(),
+            workspace.stm_l0.as_ptr(),
+            workspace.nstm_l0.as_ptr(),
+            workspace.combined.as_ptr(),
+            workspace.hidden1.as_ptr(),
+            workspace.hidden2.as_ptr(),
+            workspace.output.as_ptr(),
+        )
+    })
+}
+
+fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
+    if shape.input_size == 0 || shape.l1 == 0 || shape.l2 == 0 || shape.l3 == 0 {
+        Err(CudaCppError::message(format!("NNUE shape dimensions must be non-zero: {shape:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_product(name: &'static str, values: &[usize]) -> Result<usize> {
+    let mut out = 1usize;
+    for &value in values {
+        out = out.checked_mul(value).ok_or_else(|| CudaCppError::message(format!("NNUE {name} length overflow")))?;
+    }
+    Ok(out)
+}
+
+fn expect_len(name: &'static str, expected: usize, actual: usize) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(CudaCppError::message(format!("{name} length mismatch: expected {expected}, got {actual}")))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -506,7 +912,11 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
 }
 
 fn check(code: i32) -> Result<()> {
-    if code == 0 { Ok(()) } else { Err(CudaCppError::from_last_error(code)) }
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CudaCppError::from_last_error(code))
+    }
 }
 
 mod ffi {
@@ -519,6 +929,11 @@ mod ffi {
 
     #[repr(C)]
     pub struct BulletOuCudaCppF32Buffer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct BulletOuCudaCppI32Buffer {
         _private: [u8; 0],
     }
 
@@ -570,6 +985,24 @@ mod ffi {
             out: *mut *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_f32_buffer_destroy(buffer: *mut BulletOuCudaCppF32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_i32_buffer_create(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            out: *mut *mut BulletOuCudaCppI32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_i32_buffer_destroy(buffer: *mut BulletOuCudaCppI32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_i32_upload(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppI32Buffer,
+            src: *const i32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_i32_download(
+            ctx: *mut BulletOuCudaCppContext,
+            src: *mut BulletOuCudaCppI32Buffer,
+            dst: *mut i32,
+            len: usize,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_f32_upload(
             ctx: *mut BulletOuCudaCppContext,
             dst: *mut BulletOuCudaCppF32Buffer,
@@ -595,6 +1028,51 @@ mod ffi {
             x: *mut BulletOuCudaCppF32Buffer,
             y: *mut BulletOuCudaCppF32Buffer,
             out: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_nnue_forward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            l1: usize,
+            l2: usize,
+            l3: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            l0w: *mut BulletOuCudaCppF32Buffer,
+            l0b: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l1b: *mut BulletOuCudaCppF32Buffer,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            l2b: *mut BulletOuCudaCppF32Buffer,
+            outw: *mut BulletOuCudaCppF32Buffer,
+            outb: *mut BulletOuCudaCppF32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            hidden1: *mut BulletOuCudaCppF32Buffer,
+            hidden2: *mut BulletOuCudaCppF32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_nnue_forward_host(
+            device: i32,
+            input_size: usize,
+            l1: usize,
+            l2: usize,
+            l3: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *const i32,
+            nstm_indices: *const i32,
+            l0w: *const f32,
+            l0b: *const f32,
+            l1w: *const f32,
+            l1b: *const f32,
+            l2w: *const f32,
+            l2b: *const f32,
+            outw: *const f32,
+            outb: *const f32,
+            output: *mut f32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,
@@ -665,10 +1143,59 @@ mod tests {
     }
 
     #[test]
+    fn nnue_shape_validation_reports_weight_mismatch() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let weights = NnueForwardHostWeights {
+            shape,
+            l0w: &[0.0; 7],
+            l0b: &[0.0; 2],
+            l1w: &[0.0; 8],
+            l1b: &[0.0; 2],
+            l2w: &[0.0; 2],
+            l2b: &[0.0; 1],
+            outw: &[0.0; 1],
+            outb: &[0.0; 1],
+        };
+
+        let err = weights.validate().unwrap_err();
+
+        assert!(err.to_string().contains("l0w length mismatch"));
+    }
+
+    #[test]
+    fn nnue_workspace_layout_counts_forward_activations() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 };
+        let layout = NnueForwardWorkspaceLayout::new(shape, 5);
+
+        assert_eq!(layout.l0_len(), 10);
+        assert_eq!(layout.combined_len(), 20);
+        assert_eq!(layout.hidden1_len(), 15);
+        assert_eq!(layout.hidden2_len(), 5);
+        assert_eq!(layout.output_len(), 5);
+    }
+
+    #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn axpy_gpu_smoke() {
         let out = axpy_host(0, 2.0, &[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0]).unwrap();
         assert_eq!(out, vec![12.0, 24.0, 36.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn nnue_tiny_forward_gpu_smoke() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let batch = NnueForwardHostBatch {
+            stm_indices: &[0, 1, -1, 3, -1, -1],
+            nstm_indices: &[2, -1, -1, 1, 2, -1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let weights = tiny_nnue_weights(shape);
+
+        let out = nnue_forward_host(0, batch, weights).unwrap();
+
+        assert_close_slice("nnue", &out, &[1.208, 1.1195], 1.0e-5);
     }
 
     #[test]
@@ -706,5 +1233,44 @@ mod tests {
         axpy_device(&ctx, 3, 2.0, upload_x.wait_on(&ctx).unwrap(), upload_y.wait_on(&ctx).unwrap(), &upload_out)
             .unwrap();
         assert_eq!(upload_out.download(&ctx).unwrap(), vec![12.0, 24.0, 36.0]);
+    }
+
+    fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
+        assert_eq!(shape, NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 });
+        NnueForwardHostWeights {
+            shape,
+            l0w: &[
+                0.2, 0.3, // feature 0
+                0.4, -0.1, // feature 1
+                -0.3, 0.5, // feature 2
+                0.7, 0.9, // feature 3
+            ],
+            l0b: &[0.1, 0.2],
+            l1w: &[
+                0.5, -0.2, // combined 0
+                0.1, 0.3, // combined 1
+                -0.4, 0.2, // combined 2
+                0.6, 0.1, // combined 3
+            ],
+            l1b: &[0.05, 0.1],
+            l2w: &[
+                0.7,  // hidden1 0
+                -0.2, // hidden1 1
+            ],
+            l2b: &[0.2],
+            outw: &[1.5],
+            outb: &[0.05],
+        }
+    }
+
+    fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len(), "{name} length mismatch");
+        for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let abs_diff = (actual - expected).abs();
+            assert!(
+                abs_diff <= tolerance,
+                "{name}[{idx}] mismatch: expected {expected}, got {actual}, abs_diff={abs_diff}"
+            );
+        }
     }
 }

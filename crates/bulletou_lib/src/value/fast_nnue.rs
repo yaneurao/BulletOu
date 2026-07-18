@@ -10,7 +10,7 @@ use bullet_compiler::tensor::TValue;
 use bullet_gpu::runtime::Gpu;
 use bullet_trainer::model::Model;
 
-use crate::value::{FastBatchHost, fast_batch::active_feature_indices};
+use crate::value::{fast_batch::active_feature_indices, FastBatchHost};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {
@@ -444,6 +444,54 @@ mod tests {
         let err = NnueForwardOwnedWeights::from_weight_map(shape, &map).unwrap_err();
 
         assert_eq!(err, FastNnueError::MissingWeight { name: "l0w" });
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn cuda_cpp_tiny_forward_matches_scalar_reference() {
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let weights = tiny_weights(shape);
+        let batch = FastBatchHost {
+            layout: FastBatchLayout { batch_size: 2, max_active: 3, output_size: 1, hand_count_dim: 0 },
+            stm: vec![0, 1, -1, 3, -1, -1],
+            nstm: vec![2, -1, -1, 1, 2, -1],
+            buckets: vec![0, 0],
+            targets: vec![0.0, 0.0],
+            weights: vec![1.0, 1.0],
+            hand_count: None,
+        };
+        let cpu = weights.forward_batch(&batch).unwrap();
+
+        let cuda_shape = bulletou_cuda_cpp::NnueForwardShape {
+            input_size: shape.input_size,
+            l1: shape.l1,
+            l2: shape.l2,
+            l3: shape.l3,
+        };
+        let gpu = bulletou_cuda_cpp::nnue_forward_host(
+            0,
+            bulletou_cuda_cpp::NnueForwardHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            },
+            bulletou_cuda_cpp::NnueForwardHostWeights {
+                shape: cuda_shape,
+                l0w: weights.l0w,
+                l0b: weights.l0b,
+                l1w: weights.l1w,
+                l1b: weights.l1b,
+                l2w: weights.l2w,
+                l2b: weights.l2b,
+                outw: weights.outw,
+                outb: weights.outb,
+            },
+        )
+        .unwrap();
+
+        crate::value::compare_forward_outputs(&cpu, &gpu, 1.0e-5).unwrap();
     }
 
     fn tiny_weights(shape: NnueForwardShape) -> NnueForwardWeights<'static> {

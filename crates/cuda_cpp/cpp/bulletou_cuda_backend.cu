@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -19,6 +20,12 @@ struct BulletOuCudaCppF32Buffer {
     int device = 0;
     size_t len = 0;
     float* ptr = nullptr;
+};
+
+struct BulletOuCudaCppI32Buffer {
+    int device = 0;
+    size_t len = 0;
+    int* ptr = nullptr;
 };
 
 struct BulletOuCudaCppEvent {
@@ -181,6 +188,102 @@ __global__ void ranger_lookahead_kernel(float* weights, float* slow_params, size
     slow_params[idx] = next;
 }
 
+__device__ float crelu(float value) {
+    return fminf(fmaxf(value, 0.0f), 1.0f);
+}
+
+__global__ void nnue_sparse_l0_crelu_kernel(
+    const int* indices,
+    const float* weights,
+    const float* bias,
+    float* output,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t rows) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * rows;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t row = tid % rows;
+    size_t sample = tid / rows;
+    float sum = bias[row];
+    size_t sparse_base = sample * max_active;
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int feature = indices[sparse_base + slot];
+        if (feature >= 0 && static_cast<size_t>(feature) < input_size) {
+            size_t weight_base = static_cast<size_t>(feature) * rows;
+            sum += weights[weight_base + row];
+        }
+    }
+    output[tid] = crelu(sum);
+}
+
+__global__ void nnue_concat_l0_kernel(
+    const float* stm_l0,
+    const float* nstm_l0,
+    float* combined,
+    size_t batch,
+    size_t rows) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t combined_rows = rows * 2;
+    size_t total = batch * combined_rows;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t col = tid % combined_rows;
+    size_t sample = tid / combined_rows;
+    size_t src = sample * rows + (col % rows);
+    combined[tid] = col < rows ? stm_l0[src] : nstm_l0[src];
+}
+
+__global__ void nnue_dense_crelu_kernel(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    float* output,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch * output_dim;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t out_col = tid % output_dim;
+    size_t sample = tid / output_dim;
+    size_t input_base = sample * input_dim;
+    float sum = bias[out_col];
+    for (size_t in_col = 0; in_col < input_dim; ++in_col) {
+        sum += input[input_base + in_col] * weights[in_col * output_dim + out_col];
+    }
+    output[tid] = crelu(sum);
+}
+
+__global__ void nnue_dense_output_kernel(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    float* output,
+    size_t batch,
+    size_t input_dim) {
+    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= batch) {
+        return;
+    }
+
+    size_t input_base = sample * input_dim;
+    float sum = bias[0];
+    for (size_t idx = 0; idx < input_dim; ++idx) {
+        sum += input[input_base + idx] * weights[idx];
+    }
+    output[sample] = sum;
+}
+
 int sync_after_kernel(const char* launch_label, const char* sync_label) {
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -221,6 +324,33 @@ int validate_context(BulletOuCudaCppContext* ctx) {
 }
 
 int validate_buffer(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* buffer, size_t len, const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (buffer == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->ptr == nullptr && buffer->len != 0) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s device pointer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->device != ctx->device) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer belongs to device %d, context is device %d", name, buffer->device, ctx->device);
+        return fail_message(message);
+    }
+    if (buffer->len < len) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s buffer length %zu is smaller than requested length %zu", name, buffer->len, len);
+        return fail_message(message);
+    }
+    return 0;
+}
+
+int validate_i32_buffer(BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* buffer, size_t len, const char* name) {
     if (validate_context(ctx) != 0) {
         return -1;
     }
@@ -299,6 +429,117 @@ int validate_graph(BulletOuCudaCppContext* ctx, BulletOuCudaCppGraphExec* graph,
         std::snprintf(message, sizeof(message), "%s graph belongs to device %d, context is device %d", name, graph->device, ctx->device);
         return fail_message(message);
     }
+    return 0;
+}
+
+int block_count_1d(size_t len, int threads, int* blocks, const char* label) {
+    if (len == 0) {
+        *blocks = 0;
+        return 0;
+    }
+    size_t computed = (len + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads);
+    if (computed > static_cast<size_t>(INT_MAX)) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s launch grid too large: %zu blocks", label, computed);
+        return fail_message(message);
+    }
+    *blocks = static_cast<int>(computed);
+    return 0;
+}
+
+int validate_nnue_shape(size_t input_size, size_t l1, size_t l2, size_t l3, size_t batch, size_t max_active) {
+    if (input_size == 0 || l1 == 0 || l2 == 0 || l3 == 0) {
+        return fail_message("NNUE shape dimensions must be greater than zero");
+    }
+    if (batch == 0) {
+        return fail_message("NNUE batch size must be greater than zero");
+    }
+    if (max_active == 0) {
+        return fail_message("NNUE max_active must be greater than zero");
+    }
+    return 0;
+}
+
+int launch_nnue_forward_kernels(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* l0w,
+    const float* l0b,
+    const float* l1w,
+    const float* l1b,
+    const float* l2w,
+    const float* l2b,
+    const float* outw,
+    const float* outb,
+    float* stm_l0,
+    float* nstm_l0,
+    float* combined,
+    float* hidden1,
+    float* hidden2,
+    float* output) {
+    if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+
+    if (block_count_1d(batch * l1, threads, &blocks, "nnue_sparse_l0_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices, l0w, l0b, stm_l0, batch, max_active, input_size, l1);
+    if (check_kernel_launch("nnue_sparse_l0_crelu_kernel stm launch") != 0) {
+        return -1;
+    }
+    nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        nstm_indices, l0w, l0b, nstm_l0, batch, max_active, input_size, l1);
+    if (check_kernel_launch("nnue_sparse_l0_crelu_kernel nstm launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_concat_l0_kernel") != 0) {
+        return -1;
+    }
+    nnue_concat_l0_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, nstm_l0, combined, batch, l1);
+    if (check_kernel_launch("nnue_concat_l0_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l2, threads, &blocks, "nnue_dense_l1_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(combined, l1w, l1b, hidden1, batch, l1 * 2, l2);
+    if (check_kernel_launch("nnue_dense_l1_crelu_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch * l3, threads, &blocks, "nnue_dense_l2_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l2w, l2b, hidden2, batch, l2, l3);
+    if (check_kernel_launch("nnue_dense_l2_crelu_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (block_count_1d(batch, threads, &blocks, "nnue_dense_output_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_output_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden2, outw, outb, output, batch, l3);
+    if (check_kernel_launch("nnue_dense_output_kernel launch") != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -614,6 +855,97 @@ extern "C" int bulletou_cuda_cpp_f32_buffer_destroy(BulletOuCudaCppF32Buffer* bu
     return ok();
 }
 
+extern "C" int bulletou_cuda_cpp_i32_buffer_create(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    BulletOuCudaCppI32Buffer** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("i32_buffer_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    BulletOuCudaCppI32Buffer* buffer = new BulletOuCudaCppI32Buffer();
+    buffer->device = ctx->device;
+    buffer->len = len;
+    if (checked_malloc(&buffer->ptr, len, "cudaMalloc i32 buffer") != 0) {
+        delete buffer;
+        return -1;
+    }
+
+    *out = buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_i32_buffer_destroy(BulletOuCudaCppI32Buffer* buffer) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(buffer->device);
+    if (status != cudaSuccess) {
+        delete buffer;
+        return fail("cudaSetDevice", status);
+    }
+    if (buffer->ptr != nullptr) {
+        status = cudaFree(buffer->ptr);
+        if (status != cudaSuccess) {
+            delete buffer;
+            return fail("cudaFree i32 buffer", status);
+        }
+    }
+    delete buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_i32_upload(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppI32Buffer* dst,
+    const int* src,
+    size_t len) {
+    if (validate_i32_buffer(ctx, dst, len, "dst") != 0 || validate_host_ptr(src, len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, src, len * sizeof(int), cudaMemcpyHostToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync i32 upload", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_i32_download(
+    BulletOuCudaCppContext* ctx,
+    const BulletOuCudaCppI32Buffer* src,
+    int* dst,
+    size_t len) {
+    if (validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(src), len, "src") != 0 ||
+        validate_host_ptr(dst, len, "dst") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst, src->ptr, len * sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync i32 download", status);
+    }
+    status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamSynchronize i32 download", status);
+    }
+    return ok();
+}
+
 extern "C" int bulletou_cuda_cpp_f32_upload(
     BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* dst,
@@ -773,6 +1105,217 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     }
 
     return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_nnue_forward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppF32Buffer* l0w,
+    const BulletOuCudaCppF32Buffer* l0b,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1b,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l2b,
+    const BulletOuCudaCppF32Buffer* outw,
+    const BulletOuCudaCppF32Buffer* outb,
+    BulletOuCudaCppF32Buffer* stm_l0,
+    BulletOuCudaCppF32Buffer* nstm_l0,
+    BulletOuCudaCppF32Buffer* combined,
+    BulletOuCudaCppF32Buffer* hidden1,
+    BulletOuCudaCppF32Buffer* hidden2,
+    BulletOuCudaCppF32Buffer* output) {
+    if (validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "nstm_indices") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0w), input_size * l1, "l0w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0b), l1, "l0b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), l1 * 2 * l2, "l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1b), l2, "l1b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), l2 * l3, "l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2b), l3, "l2b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outw), l3, "outw") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outb), 1, "outb") != 0 ||
+        validate_buffer(ctx, stm_l0, batch * l1, "stm_l0") != 0 ||
+        validate_buffer(ctx, nstm_l0, batch * l1, "nstm_l0") != 0 ||
+        validate_buffer(ctx, combined, batch * l1 * 2, "combined") != 0 ||
+        validate_buffer(ctx, hidden1, batch * l2, "hidden1") != 0 ||
+        validate_buffer(ctx, hidden2, batch * l3, "hidden2") != 0 ||
+        validate_buffer(ctx, output, batch, "output") != 0) {
+        return -1;
+    }
+
+    if (launch_nnue_forward_kernels(
+            ctx,
+            input_size,
+            l1,
+            l2,
+            l3,
+            batch,
+            max_active,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            l0w->ptr,
+            l0b->ptr,
+            l1w->ptr,
+            l1b->ptr,
+            l2w->ptr,
+            l2b->ptr,
+            outw->ptr,
+            outb->ptr,
+            stm_l0->ptr,
+            nstm_l0->ptr,
+            combined->ptr,
+            hidden1->ptr,
+            hidden2->ptr,
+            output->ptr) != 0) {
+        return -1;
+    }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_nnue_forward_host(
+    int device,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* l0w,
+    const float* l0b,
+    const float* l1w,
+    const float* l1b,
+    const float* l2w,
+    const float* l2b,
+    const float* outw,
+    const float* outb,
+    float* output) {
+    if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0 ||
+        validate_host_ptr(stm_indices, batch * max_active, "stm_indices") != 0 ||
+        validate_host_ptr(nstm_indices, batch * max_active, "nstm_indices") != 0 ||
+        validate_host_ptr(l0w, input_size * l1, "l0w") != 0 ||
+        validate_host_ptr(l0b, l1, "l0b") != 0 ||
+        validate_host_ptr(l1w, l1 * 2 * l2, "l1w") != 0 ||
+        validate_host_ptr(l1b, l2, "l1b") != 0 ||
+        validate_host_ptr(l2w, l2 * l3, "l2w") != 0 ||
+        validate_host_ptr(l2b, l3, "l2b") != 0 ||
+        validate_host_ptr(outw, l3, "outw") != 0 ||
+        validate_host_ptr(outb, 1, "outb") != 0 ||
+        validate_host_ptr(output, batch, "output") != 0) {
+        return -1;
+    }
+
+    BulletOuCudaCppContext* ctx = nullptr;
+    if (bulletou_cuda_cpp_context_create(device, &ctx) != 0) {
+        return -1;
+    }
+
+    BulletOuCudaCppI32Buffer* d_stm = nullptr;
+    BulletOuCudaCppI32Buffer* d_nstm = nullptr;
+    BulletOuCudaCppF32Buffer* d_l0w = nullptr;
+    BulletOuCudaCppF32Buffer* d_l0b = nullptr;
+    BulletOuCudaCppF32Buffer* d_l1w = nullptr;
+    BulletOuCudaCppF32Buffer* d_l1b = nullptr;
+    BulletOuCudaCppF32Buffer* d_l2w = nullptr;
+    BulletOuCudaCppF32Buffer* d_l2b = nullptr;
+    BulletOuCudaCppF32Buffer* d_outw = nullptr;
+    BulletOuCudaCppF32Buffer* d_outb = nullptr;
+    BulletOuCudaCppF32Buffer* d_stm_l0 = nullptr;
+    BulletOuCudaCppF32Buffer* d_nstm_l0 = nullptr;
+    BulletOuCudaCppF32Buffer* d_combined = nullptr;
+    BulletOuCudaCppF32Buffer* d_hidden1 = nullptr;
+    BulletOuCudaCppF32Buffer* d_hidden2 = nullptr;
+    BulletOuCudaCppF32Buffer* d_output = nullptr;
+
+    int rc = 0;
+    if (rc == 0) rc = bulletou_cuda_cpp_i32_buffer_create(ctx, batch * max_active, &d_stm);
+    if (rc == 0) rc = bulletou_cuda_cpp_i32_buffer_create(ctx, batch * max_active, &d_nstm);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, input_size * l1, &d_l0w);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l1, &d_l0b);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l1 * 2 * l2, &d_l1w);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l2, &d_l1b);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l2 * l3, &d_l2w);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l3, &d_l2b);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, l3, &d_outw);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, 1, &d_outb);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch * l1, &d_stm_l0);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch * l1, &d_nstm_l0);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch * l1 * 2, &d_combined);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch * l2, &d_hidden1);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch * l3, &d_hidden2);
+    if (rc == 0) rc = bulletou_cuda_cpp_f32_buffer_create(ctx, batch, &d_output);
+
+    if (rc == 0) {
+        if (rc == 0) rc = bulletou_cuda_cpp_i32_upload(ctx, d_stm, stm_indices, batch * max_active);
+        if (rc == 0) rc = bulletou_cuda_cpp_i32_upload(ctx, d_nstm, nstm_indices, batch * max_active);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l0w, l0w, input_size * l1);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l0b, l0b, l1);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l1w, l1w, l1 * 2 * l2);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l1b, l1b, l2);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l2w, l2w, l2 * l3);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_l2b, l2b, l3);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_outw, outw, l3);
+        if (rc == 0) rc = bulletou_cuda_cpp_f32_upload(ctx, d_outb, outb, 1);
+    }
+
+    if (rc == 0) {
+        rc = bulletou_cuda_cpp_nnue_forward_device(
+            ctx,
+            input_size,
+            l1,
+            l2,
+            l3,
+            batch,
+            max_active,
+            d_stm,
+            d_nstm,
+            d_l0w,
+            d_l0b,
+            d_l1w,
+            d_l1b,
+            d_l2w,
+            d_l2b,
+            d_outw,
+            d_outb,
+            d_stm_l0,
+            d_nstm_l0,
+            d_combined,
+            d_hidden1,
+            d_hidden2,
+            d_output);
+    }
+    if (rc == 0) {
+        rc = bulletou_cuda_cpp_f32_download(ctx, d_output, output, batch);
+    }
+
+    bulletou_cuda_cpp_i32_buffer_destroy(d_stm);
+    bulletou_cuda_cpp_i32_buffer_destroy(d_nstm);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l0w);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l0b);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l1w);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l1b);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l2w);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_l2b);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_outw);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_outb);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_stm_l0);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_nstm_l0);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_combined);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_hidden1);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_hidden2);
+    bulletou_cuda_cpp_f32_buffer_destroy(d_output);
+    bulletou_cuda_cpp_context_destroy(ctx);
+
+    return rc == 0 ? ok() : rc;
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(

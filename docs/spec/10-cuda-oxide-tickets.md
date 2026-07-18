@@ -40,7 +40,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-030 | doing | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, improve `SFNN_halfka2_1024_7_64_k3k3` until BulletOu exceeds tatara in train throughput, held-out loss, and held-out accuracy |
 | BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
-| BO-CUDA-033 | todo | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
+| BO-CUDA-033 | doing | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
 | BO-CUDA-034 | todo | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 
 ## Notes
@@ -656,3 +656,27 @@ the tickets in order and commit each completed slice.
   - `cargo test --features cuda-cpp-backend --example bulletou` passed.
 - Result:
   - BO-CUDA-032 is complete as a backend-runtime foundation. BO-CUDA-033 can now allocate persistent NNUE train state, upload teacher batches through `F32UploadSlot` rings, and graph-capture fixed kernel sequences without depending on WSL or cuda-oxide.
+
+### BO-CUDA-033
+
+- Started the Windows-native NNUE port by moving the fixed-layout NNUE forward sequence into `crates/cuda_cpp`:
+  - added reusable `I32Buffer` device allocations for sparse feature indices;
+  - added C++/CUDA kernels for sparse L0 + CReLU, perspective concat, dense L1 + CReLU, dense L2 + CReLU, and scalar output;
+  - added Rust-side `NnueForwardShape`, host/device batch and weight wrappers, `NnueForwardWorkspace`, `nnue_forward_host`, and `nnue_forward_device`;
+  - extended `bulletou-cuda-cpp-smoke` to run a two-position tiny NNUE through both one-shot host and persistent-device paths.
+- Added BulletOu root-side correctness coverage:
+  - `value::fast_nnue::tests::cuda_cpp_tiny_forward_matches_scalar_reference` compares the C++/CUDA tiny NNUE output against the existing CPU scalar golden behind `--features cuda-cpp-backend`;
+  - the test is `#[ignore]` so normal CPU-only test runs do not require an NVIDIA GPU.
+- Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
+  - `cargo check -p bulletou-cuda-cpp` passed;
+  - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `nnue_h: [1.208, 1.1194999]` / `nnue_d: [1.208, 1.1194999]`;
+  - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_tiny_forward_matches_scalar_reference -- --ignored` passed;
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou` passed.
+- Remaining BO-CUDA-033 work:
+  - port NNUE loss/backward/gradient kernels from the mature cuda-oxide path;
+  - connect the C++/CUDA runtime to the BulletOu `--backend cuda-cpp` training wrapper;
+  - preserve normal checkpoint/log/validation semantics;
+  - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
