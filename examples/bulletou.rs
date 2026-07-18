@@ -1313,6 +1313,11 @@ struct Args {
     #[arg(long)]
     cuda_cpp_train_steps: Option<usize>,
 
+    /// Profile the first N C++/CUDA direct-trainer steps with CUDA events.
+    /// Prints upload/forward/loss/backward/update GPU time per profiled step.
+    #[arg(long, default_value = "0")]
+    cuda_cpp_profile_steps: usize,
+
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
     /// concatenated), or a comma-separated list of either. Format is
@@ -1767,6 +1772,9 @@ impl Args {
             }
             if self.cuda_cpp_weights_bin.is_some() {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-weights-bin cannot be used together".to_string());
+            }
+            if self.cuda_cpp_profile_steps != 0 {
+                return Err("--cuda-cpp-smoke and --cuda-cpp-profile-steps cannot be used together".to_string());
             }
             return Ok(());
         }
@@ -3018,6 +3026,10 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     eprintln!("  batch size = {batch_size}");
     eprintln!("  arch = {} (factorized input {input_size}, {l1_size}x2-{l2_size}-{l3_size})", args.arch().cli_name());
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
+    if profile_steps > 0 {
+        eprintln!("  cuda-cpp profile steps = {profile_steps}");
+    }
 
     let cuda_shape = CudaNnueForwardShape {
         input_size: initial_weights.shape.input_size,
@@ -3059,6 +3071,13 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let mut reported_loss_count = 0usize;
     let mut last_loss = 0.0_f32;
     let completed_step_offset = initial_state.completed_steps;
+    let mut profile_upload_ms = 0.0_f64;
+    let mut profile_forward_ms = 0.0_f64;
+    let mut profile_loss_ms = 0.0_f64;
+    let mut profile_backward_ms = 0.0_f64;
+    let mut profile_update_ms = 0.0_f64;
+    let mut profile_total_ms = 0.0_f64;
+    let mut profile_count = 0usize;
     let started = std::time::Instant::now();
 
     let config = HalfkpTeacherBatchConfig {
@@ -3099,22 +3118,34 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                 lookahead_period: ranger.k as u64,
             }
         };
-        runner
-            .step_no_readback(
-                &ctx,
-                params,
-                loss_kind,
-                output_inv_scale,
-                NnueTrainStepHostBatch {
-                    stm_indices: &fast.stm,
-                    nstm_indices: &fast.nstm,
-                    targets: &fast.targets,
-                    entry_weights: &fast.weights,
-                    batch_size: fast.layout.batch_size,
-                    max_active: fast.layout.max_active,
-                },
-            )
-            .map_err(|e| e.to_string())?;
+        let batch = NnueTrainStepHostBatch {
+            stm_indices: &fast.stm,
+            nstm_indices: &fast.nstm,
+            targets: &fast.targets,
+            entry_weights: &fast.weights,
+            batch_size: fast.layout.batch_size,
+            max_active: fast.layout.max_active,
+        };
+        if seen_steps <= profile_steps {
+            let profile = runner
+                .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
+                .map_err(|e| e.to_string())?;
+            profile_upload_ms += f64::from(profile.upload_ms);
+            profile_forward_ms += f64::from(profile.forward_ms);
+            profile_loss_ms += f64::from(profile.loss_ms);
+            profile_backward_ms += f64::from(profile.backward_ms);
+            profile_update_ms += f64::from(profile.update_ms);
+            profile_total_ms += f64::from(profile.total_ms);
+            profile_count += 1;
+            eprintln!(
+                "  profile_cuda_cpp step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
+                 backward={:.3}ms update={:.3}ms total={:.3}ms",
+                profile.upload_ms, profile.forward_ms, profile.loss_ms, profile.backward_ms, profile.update_ms,
+                profile.total_ms
+            );
+        } else {
+            runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+        }
         let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
@@ -3147,6 +3178,19 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         "  cuda-cpp direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
+    if profile_count > 0 {
+        let denom = profile_count as f64;
+        eprintln!(
+            "  cuda-cpp profile avg: steps={profile_count}, upload={:.3}ms forward={:.3}ms loss={:.3}ms \
+             backward={:.3}ms update={:.3}ms total={:.3}ms",
+            profile_upload_ms / denom,
+            profile_forward_ms / denom,
+            profile_loss_ms / denom,
+            profile_backward_ms / denom,
+            profile_update_ms / denom,
+            profile_total_ms / denom
+        );
+    }
 
     let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
@@ -8263,6 +8307,34 @@ mod tests {
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_profile_steps_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "3",
+            "--cuda-cpp-profile-steps",
+            "2",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+            assert_eq!(args.cuda_cpp_profile_steps, 2);
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }

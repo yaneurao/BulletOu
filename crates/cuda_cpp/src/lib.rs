@@ -1335,6 +1335,16 @@ pub struct NnueTrainWeightsReadback {
     pub outb: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NnueTrainStepProfile {
+    pub upload_ms: f32,
+    pub forward_ms: f32,
+    pub loss_ms: f32,
+    pub backward_ms: f32,
+    pub update_ms: f32,
+    pub total_ms: f32,
+}
+
 #[derive(Debug)]
 pub struct NnueTrainStepRunner {
     pub shape: NnueForwardShape,
@@ -1469,6 +1479,73 @@ impl NnueTrainStepRunner {
             &self.backward_workspace,
         )?;
         self.update_weights(ctx, params)
+    }
+
+    pub fn step_profiled_no_readback(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+    ) -> Result<NnueTrainStepProfile> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "NNUE train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+
+        let start = Event::new(ctx)?;
+        let after_upload = Event::new(ctx)?;
+        let after_forward = Event::new(ctx)?;
+        let after_loss = Event::new(ctx)?;
+        let after_backward = Event::new(ctx)?;
+        let stop = Event::new(ctx)?;
+
+        start.record(ctx)?;
+        self.device_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+        self.targets.upload(ctx, batch.targets)?;
+        self.entry_weights.upload(ctx, batch.entry_weights)?;
+        after_upload.record(ctx)?;
+
+        nnue_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        after_forward.record(ctx)?;
+        scalar_loss_device_from_buffers(
+            ctx,
+            loss_kind,
+            output_inv_scale,
+            self.batch_size,
+            &self.forward_workspace.output,
+            &self.targets,
+            &self.entry_weights,
+            &self.loss_workspace,
+        )?;
+        after_loss.record(ctx)?;
+        nnue_backward_device(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+        )?;
+        after_backward.record(ctx)?;
+        self.update_weights(ctx, params)?;
+        stop.record(ctx)?;
+        stop.synchronize()?;
+
+        Ok(NnueTrainStepProfile {
+            upload_ms: after_upload.elapsed_ms_since(&start)?,
+            forward_ms: after_forward.elapsed_ms_since(&after_upload)?,
+            loss_ms: after_loss.elapsed_ms_since(&after_forward)?,
+            backward_ms: after_backward.elapsed_ms_since(&after_loss)?,
+            update_ms: stop.elapsed_ms_since(&after_backward)?,
+            total_ms: stop.elapsed_ms_since(&start)?,
+        })
     }
 
     pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
