@@ -1752,6 +1752,29 @@ pub fn sfnn_backward_device(
     loss: &ScalarLossWorkspace,
     backward: &SfnnBackwardWorkspace,
 ) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false)
+}
+
+pub fn sfnn_backward_train_device(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true)
+}
+
+fn sfnn_backward_device_impl(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    use_train_entry: bool,
+) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
     forward.validate()?;
@@ -1786,51 +1809,98 @@ pub fn sfnn_backward_device(
     };
 
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
-    check(unsafe {
-        ffi::bulletou_cuda_cpp_sfnn_backward_device(
-            ctx.as_ptr(),
-            shape.input_size,
-            shape.ft_size,
-            shape.l1_hidden,
-            shape.l2_size,
-            shape.num_stacks,
-            batch.batch_size,
-            batch.max_active,
-            batch.stm_indices.as_ptr(),
-            batch.nstm_indices.as_ptr(),
-            batch.buckets.as_ptr(),
-            forward.stm_l0.as_ptr(),
-            forward.nstm_l0.as_ptr(),
-            forward.combined.as_ptr(),
-            forward.l1.as_ptr(),
-            forward.l2_input.as_ptr(),
-            forward.l2.as_ptr(),
-            weights.l1w.as_ptr(),
-            l1fw,
-            has_l1f,
-            weights.l2w.as_ptr(),
-            weights.l3w.as_ptr(),
-            loss.mean_output_gradients.as_ptr(),
-            backward.l2_gradients.as_ptr(),
-            backward.l1_gradients.as_ptr(),
-            backward.l2_input_gradients.as_ptr(),
-            backward.combined_gradients.as_ptr(),
-            backward.stm_l0_gradients.as_ptr(),
-            backward.nstm_l0_gradients.as_ptr(),
-            backward.stm_l0_pre_gradients.as_ptr(),
-            backward.nstm_l0_pre_gradients.as_ptr(),
-            backward.l0w_gradients.as_ptr(),
-            backward.l0b_gradients.as_ptr(),
-            backward.l1w_gradients.as_ptr(),
-            backward.l1b_gradients.as_ptr(),
-            backward.l1fw_gradients.as_ptr(),
-            backward.l1fb_gradients.as_ptr(),
-            backward.l2w_gradients.as_ptr(),
-            backward.l2b_gradients.as_ptr(),
-            backward.l3w_gradients.as_ptr(),
-            backward.l3b_gradients.as_ptr(),
-        )
-    })
+    let rc = unsafe {
+        if use_train_entry {
+            ffi::bulletou_cuda_cpp_sfnn_backward_train_device(
+                ctx.as_ptr(),
+                shape.input_size,
+                shape.ft_size,
+                shape.l1_hidden,
+                shape.l2_size,
+                shape.num_stacks,
+                batch.batch_size,
+                batch.max_active,
+                batch.stm_indices.as_ptr(),
+                batch.nstm_indices.as_ptr(),
+                batch.buckets.as_ptr(),
+                forward.stm_l0.as_ptr(),
+                forward.nstm_l0.as_ptr(),
+                forward.combined.as_ptr(),
+                forward.l1.as_ptr(),
+                forward.l2_input.as_ptr(),
+                forward.l2.as_ptr(),
+                weights.l1w.as_ptr(),
+                l1fw,
+                has_l1f,
+                weights.l2w.as_ptr(),
+                weights.l3w.as_ptr(),
+                loss.mean_output_gradients.as_ptr(),
+                backward.l2_gradients.as_ptr(),
+                backward.l1_gradients.as_ptr(),
+                backward.l2_input_gradients.as_ptr(),
+                backward.combined_gradients.as_ptr(),
+                backward.stm_l0_gradients.as_ptr(),
+                backward.nstm_l0_gradients.as_ptr(),
+                backward.stm_l0_pre_gradients.as_ptr(),
+                backward.nstm_l0_pre_gradients.as_ptr(),
+                backward.l0w_gradients.as_ptr(),
+                backward.l0b_gradients.as_ptr(),
+                backward.l1w_gradients.as_ptr(),
+                backward.l1b_gradients.as_ptr(),
+                backward.l1fw_gradients.as_ptr(),
+                backward.l1fb_gradients.as_ptr(),
+                backward.l2w_gradients.as_ptr(),
+                backward.l2b_gradients.as_ptr(),
+                backward.l3w_gradients.as_ptr(),
+                backward.l3b_gradients.as_ptr(),
+            )
+        } else {
+            ffi::bulletou_cuda_cpp_sfnn_backward_device(
+                ctx.as_ptr(),
+                shape.input_size,
+                shape.ft_size,
+                shape.l1_hidden,
+                shape.l2_size,
+                shape.num_stacks,
+                batch.batch_size,
+                batch.max_active,
+                batch.stm_indices.as_ptr(),
+                batch.nstm_indices.as_ptr(),
+                batch.buckets.as_ptr(),
+                forward.stm_l0.as_ptr(),
+                forward.nstm_l0.as_ptr(),
+                forward.combined.as_ptr(),
+                forward.l1.as_ptr(),
+                forward.l2_input.as_ptr(),
+                forward.l2.as_ptr(),
+                weights.l1w.as_ptr(),
+                l1fw,
+                has_l1f,
+                weights.l2w.as_ptr(),
+                weights.l3w.as_ptr(),
+                loss.mean_output_gradients.as_ptr(),
+                backward.l2_gradients.as_ptr(),
+                backward.l1_gradients.as_ptr(),
+                backward.l2_input_gradients.as_ptr(),
+                backward.combined_gradients.as_ptr(),
+                backward.stm_l0_gradients.as_ptr(),
+                backward.nstm_l0_gradients.as_ptr(),
+                backward.stm_l0_pre_gradients.as_ptr(),
+                backward.nstm_l0_pre_gradients.as_ptr(),
+                backward.l0w_gradients.as_ptr(),
+                backward.l0b_gradients.as_ptr(),
+                backward.l1w_gradients.as_ptr(),
+                backward.l1b_gradients.as_ptr(),
+                backward.l1fw_gradients.as_ptr(),
+                backward.l1fb_gradients.as_ptr(),
+                backward.l2w_gradients.as_ptr(),
+                backward.l2b_gradients.as_ptr(),
+                backward.l3w_gradients.as_ptr(),
+                backward.l3b_gradients.as_ptr(),
+            )
+        }
+    };
+    check(rc)
 }
 
 #[derive(Debug)]
@@ -2646,7 +2716,7 @@ impl SfnnTrainStepRunner {
             &self.entry_weights,
             &self.loss_workspace,
         )?;
-        sfnn_backward_device(
+        sfnn_backward_train_device(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -2702,7 +2772,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
-        sfnn_backward_device(
+        sfnn_backward_train_device(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -3384,6 +3454,49 @@ mod ffi {
             output: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            ft_size: usize,
+            l1_hidden: usize,
+            l2_size: usize,
+            num_stacks: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            l1: *mut BulletOuCudaCppF32Buffer,
+            l2_input: *mut BulletOuCudaCppF32Buffer,
+            l2: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l1fw: *mut BulletOuCudaCppF32Buffer,
+            has_l1f: i32,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            l3w: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_input_gradients: *mut BulletOuCudaCppF32Buffer,
+            combined_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_backward_train_device(
             ctx: *mut BulletOuCudaCppContext,
             input_size: usize,
             ft_size: usize,

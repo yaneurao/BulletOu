@@ -1010,6 +1010,67 @@ __global__ void sfnn_pairwise_backward_kernel(
         combined_gradients[combined_base + pairwise + pair] * nstm_l0[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
 }
 
+__device__ void sfnn_atomic_add_l0w_gradient(
+    float* gradients,
+    size_t feature,
+    size_t input_size,
+    size_t rows,
+    size_t row,
+    float value);
+
+__global__ void sfnn_pairwise_l0_sparse_backward_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_activations,
+    const float* nstm_activations,
+    const float* combined_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t ft_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t l0_len = batch * ft_size;
+    if (tid >= l0_len) {
+        return;
+    }
+
+    size_t pairwise = ft_size / 2;
+    size_t row = tid % ft_size;
+    size_t sample = tid / ft_size;
+    size_t pair = row % pairwise;
+    size_t mate_col = row < pairwise ? pairwise + pair : pair;
+    size_t l0_base = sample * ft_size;
+    size_t sparse_base = sample * max_active;
+
+    float stm_output_grad =
+        combined_gradients[l0_base + pair] * stm_activations[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
+    float nstm_output_grad =
+        combined_gradients[l0_base + pairwise + pair] * nstm_activations[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
+    float stm_grad = crelu_pre_gradient_from_value(stm_activations[tid], stm_output_grad);
+    float nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid], nstm_output_grad);
+
+    if (stm_grad != 0.0f || nstm_grad != 0.0f) {
+        atomicAdd(&l0b_gradients[row], stm_grad + nstm_grad);
+    } else {
+        return;
+    }
+
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int stm_feature = stm_indices[sparse_base + slot];
+        if (stm_grad != 0.0f && stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad);
+        }
+
+        int nstm_feature = nstm_indices[sparse_base + slot];
+        if (nstm_grad != 0.0f && nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            sfnn_atomic_add_l0w_gradient(
+                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad);
+        }
+    }
+}
+
 __device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value) {
     size_t weight_idx = feature * rows + row;
     atomicAdd(&gradients[weight_idx], value);
@@ -1745,7 +1806,8 @@ int launch_sfnn_backward_kernels(
     float* l2w_gradients,
     float* l2b_gradients,
     float* l3w_gradients,
-    float* l3b_gradients) {
+    float* l3b_gradients,
+    int fuse_pairwise_l0) {
     if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
         return -1;
     }
@@ -1873,35 +1935,56 @@ int launch_sfnn_backward_kernels(
         }
     }
 
-    if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_backward_kernel") != 0) {
-        return -1;
-    }
-    sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
-    if (check_kernel_launch("sfnn_pairwise_backward_kernel launch") != 0) {
-        return -1;
-    }
+    if (fuse_pairwise_l0 != 0) {
+        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_l0_sparse_backward_kernel") != 0) {
+            return -1;
+        }
+        sfnn_pairwise_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            stm_indices,
+            nstm_indices,
+            stm_l0,
+            nstm_l0,
+            combined_gradients,
+            l0w_gradients,
+            l0b_gradients,
+            batch,
+            max_active,
+            input_size,
+            ft_size);
+        if (check_kernel_launch("sfnn_pairwise_l0_sparse_backward_kernel launch") != 0) {
+            return -1;
+        }
+    } else {
+        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_backward_kernel") != 0) {
+            return -1;
+        }
+        sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
+        if (check_kernel_launch("sfnn_pairwise_backward_kernel launch") != 0) {
+            return -1;
+        }
 
-    if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_l0_sparse_backward_kernel") != 0) {
-        return -1;
-    }
-    sfnn_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        stm_indices,
-        nstm_indices,
-        stm_l0,
-        nstm_l0,
-        stm_l0_gradients,
-        nstm_l0_gradients,
-        stm_l0_pre_gradients,
-        nstm_l0_pre_gradients,
-        l0w_gradients,
-        l0b_gradients,
-        batch,
-        max_active,
-        input_size,
-        ft_size);
-    if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
-        return -1;
+        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_l0_sparse_backward_kernel") != 0) {
+            return -1;
+        }
+        sfnn_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            stm_indices,
+            nstm_indices,
+            stm_l0,
+            nstm_l0,
+            stm_l0_gradients,
+            nstm_l0_gradients,
+            stm_l0_pre_gradients,
+            nstm_l0_pre_gradients,
+            l0w_gradients,
+            l0b_gradients,
+            batch,
+            max_active,
+            input_size,
+            ft_size);
+        if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
+            return -1;
+        }
     }
 
     return 0;
@@ -3384,7 +3467,143 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l2w_gradients->ptr,
             l2b_gradients->ptr,
             l3w_gradients->ptr,
-            l3b_gradients->ptr) != 0) {
+            l3b_gradients->ptr,
+            0) != 0) {
+        return -1;
+    }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppI32Buffer* buckets,
+    const BulletOuCudaCppF32Buffer* stm_l0,
+    const BulletOuCudaCppF32Buffer* nstm_l0,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* l1,
+    const BulletOuCudaCppF32Buffer* l2_input,
+    const BulletOuCudaCppF32Buffer* l2,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1fw,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l3w,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* l2_gradients,
+    BulletOuCudaCppF32Buffer* l1_gradients,
+    BulletOuCudaCppF32Buffer* l2_input_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* l0w_gradients,
+    BulletOuCudaCppF32Buffer* l0b_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l1fw_gradients,
+    BulletOuCudaCppF32Buffer* l1fb_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* l3w_gradients,
+    BulletOuCudaCppF32Buffer* l3b_gradients) {
+    const size_t l1_out = l1_hidden + 1;
+    const size_t l2_in = l1_hidden * 2;
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(stm_l0), batch * ft_size, "sfnn stm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(nstm_l0), batch * ft_size, "sfnn nstm_l0") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(combined), batch * ft_size, "sfnn combined") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1), batch * l1_out, "sfnn l1") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2_input), batch * l2_in, "sfnn l2_input") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2), batch * l2_size, "sfnn l2") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), num_stacks * l1_out * ft_size, "sfnn l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), num_stacks * l2_size * l2_in, "sfnn l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l3w), num_stacks * l2_size, "sfnn l3w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(mean_output_gradients), batch, "sfnn mean_output_gradients") != 0 ||
+        validate_buffer(ctx, l2_gradients, batch * l2_size, "sfnn l2_gradients") != 0 ||
+        validate_buffer(ctx, l1_gradients, batch * l1_out, "sfnn l1_gradients") != 0 ||
+        validate_buffer(ctx, l2_input_gradients, batch * l2_in, "sfnn l2_input_gradients") != 0 ||
+        validate_buffer(ctx, combined_gradients, batch * ft_size, "sfnn combined_gradients") != 0 ||
+        validate_buffer(ctx, stm_l0_gradients, batch * ft_size, "sfnn stm_l0_gradients") != 0 ||
+        validate_buffer(ctx, nstm_l0_gradients, batch * ft_size, "sfnn nstm_l0_gradients") != 0 ||
+        validate_buffer(ctx, stm_l0_pre_gradients, batch * ft_size, "sfnn stm_l0_pre_gradients") != 0 ||
+        validate_buffer(ctx, nstm_l0_pre_gradients, batch * ft_size, "sfnn nstm_l0_pre_gradients") != 0 ||
+        validate_buffer(ctx, l0w_gradients, input_size * ft_size, "sfnn l0w_gradients") != 0 ||
+        validate_buffer(ctx, l0b_gradients, ft_size, "sfnn l0b_gradients") != 0 ||
+        validate_buffer(ctx, l1w_gradients, num_stacks * l1_out * ft_size, "sfnn l1w_gradients") != 0 ||
+        validate_buffer(ctx, l1b_gradients, num_stacks * l1_out, "sfnn l1b_gradients") != 0 ||
+        validate_buffer(ctx, l1fw_gradients, ft_size * l1_out, "sfnn l1fw_gradients") != 0 ||
+        validate_buffer(ctx, l1fb_gradients, l1_out, "sfnn l1fb_gradients") != 0 ||
+        validate_buffer(ctx, l2w_gradients, num_stacks * l2_size * l2_in, "sfnn l2w_gradients") != 0 ||
+        validate_buffer(ctx, l2b_gradients, num_stacks * l2_size, "sfnn l2b_gradients") != 0 ||
+        validate_buffer(ctx, l3w_gradients, num_stacks * l2_size, "sfnn l3w_gradients") != 0 ||
+        validate_buffer(ctx, l3b_gradients, num_stacks, "sfnn l3b_gradients") != 0) {
+        return -1;
+    }
+    if (has_l1f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0) {
+            return -1;
+        }
+    } else if (l1fw != nullptr) {
+        return fail_message("sfnn l1fw must be null when has_l1f is false");
+    }
+
+    if (launch_sfnn_backward_kernels(
+            ctx,
+            input_size,
+            ft_size,
+            l1_hidden,
+            l2_size,
+            num_stacks,
+            batch,
+            max_active,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            buckets->ptr,
+            stm_l0->ptr,
+            nstm_l0->ptr,
+            combined->ptr,
+            l1->ptr,
+            l2_input->ptr,
+            l2->ptr,
+            l1w->ptr,
+            has_l1f != 0 ? l1fw->ptr : nullptr,
+            has_l1f,
+            l2w->ptr,
+            l3w->ptr,
+            mean_output_gradients->ptr,
+            l2_gradients->ptr,
+            l1_gradients->ptr,
+            l2_input_gradients->ptr,
+            combined_gradients->ptr,
+            stm_l0_gradients->ptr,
+            nstm_l0_gradients->ptr,
+            stm_l0_pre_gradients->ptr,
+            nstm_l0_pre_gradients->ptr,
+            l0w_gradients->ptr,
+            l0b_gradients->ptr,
+            l1w_gradients->ptr,
+            l1b_gradients->ptr,
+            l1fw_gradients->ptr,
+            l1fb_gradients->ptr,
+            l2w_gradients->ptr,
+            l2b_gradients->ptr,
+            l3w_gradients->ptr,
+            l3b_gradients->ptr,
+            1) != 0) {
         return -1;
     }
 
