@@ -675,17 +675,22 @@ the tickets in order and commit each completed slice.
   - C++/CUDA now implements dense output backward, dense CReLU backward, L0 CReLU split backward, L0 gradient zeroing, and sparse L0 gradient scatter with `atomicAdd`;
   - Rust now exposes `NnueBackwardWorkspaceLayout`, `NnueBackwardWorkspace`, gradient readback, and `nnue_backward_device`;
   - `bulletou-cuda-cpp-smoke` runs tiny NNUE forward -> sigmoid loss -> backward and compares every gradient buffer against an in-smoke CPU backprop reference.
+- Added a first Rust-side C++/CUDA NNUE train-step runner:
+  - `NnueTrainStepRunner` owns persistent sparse batch buffers, targets, entry weights, device weights, Ranger optimizer state, forward/loss/backward workspaces, and runs forward -> scalar loss -> backward -> Ranger update;
+  - optimizer slow weights initialise from the initial host weights, matching Ranger semantics;
+  - the standalone smoke checks one tiny train step by comparing the runner's updated weights against applying the existing host Ranger update to the CPU reference gradients.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo check -p bulletou_lib --features cuda-cpp-backend` passed;
-  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `nnue_h: [1.208, 1.1194999]` / `nnue_d: [1.208, 1.1194999]`, matching `loss_h` / `loss_d`, and `bwd_d : outb_grad=[0.09245913] l0b_grad=[0.05391511, 0.05685694]`;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `nnue_h: [1.208, 1.1194999]` / `nnue_d: [1.208, 1.1194999]`, matching `loss_h` / `loss_d`, `bwd_d : outb_grad=[0.09245913] l0b_grad=[0.05391511, 0.05685694]`, and `train : loss_mean=0.13517515 outb=[0.04907541]`;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_tiny_forward_matches_scalar_reference -- --ignored` passed;
   - `cargo test -p bulletou_lib --features cuda-cpp-backend cuda_cpp_scalar_loss_matches_cpu_reference -- --ignored` passed;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou` passed.
 - Remaining BO-CUDA-033 work:
-  - port NNUE loss/backward/gradient kernels from the mature cuda-oxide path;
   - connect the C++/CUDA runtime to the BulletOu `--backend cuda-cpp` training wrapper;
+  - add checkpoint/resume state import/export for C++/CUDA weights and Ranger optimizer buffers;
+  - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
   - preserve normal checkpoint/log/validation semantics;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.

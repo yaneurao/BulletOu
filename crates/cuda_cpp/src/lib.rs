@@ -1140,6 +1140,315 @@ pub fn nnue_backward_device(
     })
 }
 
+#[derive(Debug)]
+pub struct RangerParamState {
+    pub momentum: F32Buffer,
+    pub velocity: F32Buffer,
+    pub slow_params: F32Buffer,
+}
+
+impl RangerParamState {
+    pub fn from_host_weights(ctx: &Context, weights: &[f32]) -> Result<Self> {
+        let momentum = F32Buffer::new(ctx, weights.len())?;
+        momentum.fill(ctx, 0.0)?;
+        let velocity = F32Buffer::new(ctx, weights.len())?;
+        velocity.fill(ctx, 0.0)?;
+        let slow_params = F32Buffer::from_host(ctx, weights)?;
+        Ok(Self { momentum, velocity, slow_params })
+    }
+
+    fn validate(&self, len: usize, name: &'static str) -> Result<()> {
+        expect_len(name, len, self.momentum.len())?;
+        expect_len(name, len, self.velocity.len())?;
+        expect_len(name, len, self.slow_params.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct NnueRangerOptimizerStates {
+    pub l0w: RangerParamState,
+    pub l0b: RangerParamState,
+    pub l1w: RangerParamState,
+    pub l1b: RangerParamState,
+    pub l2w: RangerParamState,
+    pub l2b: RangerParamState,
+    pub outw: RangerParamState,
+    pub outb: RangerParamState,
+}
+
+impl NnueRangerOptimizerStates {
+    pub fn from_host_weights(ctx: &Context, weights: NnueForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            l0w: RangerParamState::from_host_weights(ctx, weights.l0w)?,
+            l0b: RangerParamState::from_host_weights(ctx, weights.l0b)?,
+            l1w: RangerParamState::from_host_weights(ctx, weights.l1w)?,
+            l1b: RangerParamState::from_host_weights(ctx, weights.l1b)?,
+            l2w: RangerParamState::from_host_weights(ctx, weights.l2w)?,
+            l2b: RangerParamState::from_host_weights(ctx, weights.l2b)?,
+            outw: RangerParamState::from_host_weights(ctx, weights.outw)?,
+            outb: RangerParamState::from_host_weights(ctx, weights.outb)?,
+        })
+    }
+
+    fn validate(&self, shape: NnueForwardShape) -> Result<()> {
+        self.l0w.validate(checked_product("l0w", &[shape.input_size, shape.l1])?, "optimizer l0w")?;
+        self.l0b.validate(shape.l1, "optimizer l0b")?;
+        self.l1w.validate(checked_product("l1w", &[shape.l1, 2, shape.l2])?, "optimizer l1w")?;
+        self.l1b.validate(shape.l2, "optimizer l1b")?;
+        self.l2w.validate(checked_product("l2w", &[shape.l2, shape.l3])?, "optimizer l2w")?;
+        self.l2b.validate(shape.l3, "optimizer l2b")?;
+        self.outw.validate(shape.l3, "optimizer outw")?;
+        self.outb.validate(1, "optimizer outb")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NnueTrainStepHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub targets: &'a [f32],
+    pub entry_weights: &'a [f32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl<'a> NnueTrainStepHostBatch<'a> {
+    fn forward_batch(self) -> NnueForwardHostBatch<'a> {
+        NnueForwardHostBatch {
+            stm_indices: self.stm_indices,
+            nstm_indices: self.nstm_indices,
+            batch_size: self.batch_size,
+            max_active: self.max_active,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        self.forward_batch().validate()?;
+        expect_len("train targets", self.batch_size, self.targets.len())?;
+        expect_len("train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NnueTrainWeightsReadback {
+    pub l0w: Vec<f32>,
+    pub l0b: Vec<f32>,
+    pub l1w: Vec<f32>,
+    pub l1b: Vec<f32>,
+    pub l2w: Vec<f32>,
+    pub l2b: Vec<f32>,
+    pub outw: Vec<f32>,
+    pub outb: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct NnueTrainStepRunner {
+    pub shape: NnueForwardShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub device_batch: NnueForwardDeviceBatch,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+    pub weights: NnueForwardDeviceWeights,
+    pub optimizer_states: NnueRangerOptimizerStates,
+    pub forward_workspace: NnueForwardWorkspace,
+    pub loss_workspace: ScalarLossWorkspace,
+    pub backward_workspace: NnueBackwardWorkspace,
+}
+
+impl NnueTrainStepRunner {
+    pub fn new(
+        ctx: &Context,
+        initial_weights: NnueForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        initial_weights.validate()?;
+        if batch_size == 0 {
+            return Err(CudaCppError::message("NNUE train-step batch_size must be greater than zero"));
+        }
+        if max_active == 0 {
+            return Err(CudaCppError::message("NNUE train-step max_active must be greater than zero"));
+        }
+
+        let shape = initial_weights.shape;
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("NNUE train-step sparse length overflow"))?;
+        Ok(Self {
+            shape,
+            batch_size,
+            max_active,
+            device_batch: NnueForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+            },
+            targets: F32Buffer::new(ctx, batch_size)?,
+            entry_weights: F32Buffer::new(ctx, batch_size)?,
+            weights: NnueForwardDeviceWeights::from_host(ctx, initial_weights)?,
+            optimizer_states: NnueRangerOptimizerStates::from_host_weights(ctx, initial_weights)?,
+            forward_workspace: NnueForwardWorkspace::new(ctx, NnueForwardWorkspaceLayout::new(shape, batch_size))?,
+            loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
+            backward_workspace: NnueBackwardWorkspace::new(
+                ctx,
+                NnueBackwardWorkspaceLayout::new(shape, batch_size, max_active),
+            )?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+    ) -> Result<ScalarLossReadback> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "NNUE train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+
+        self.device_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+        self.targets.upload(ctx, batch.targets)?;
+        self.entry_weights.upload(ctx, batch.entry_weights)?;
+
+        nnue_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        scalar_loss_device_from_buffers(
+            ctx,
+            loss_kind,
+            output_inv_scale,
+            self.batch_size,
+            &self.forward_workspace.output,
+            &self.targets,
+            &self.entry_weights,
+            &self.loss_workspace,
+        )?;
+        nnue_backward_device(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+        )?;
+        self.update_weights(ctx, params)?;
+        self.loss_workspace.download(ctx)
+    }
+
+    pub fn read_weights(&self, ctx: &Context) -> Result<NnueTrainWeightsReadback> {
+        Ok(NnueTrainWeightsReadback {
+            l0w: self.weights.l0w.download(ctx)?,
+            l0b: self.weights.l0b.download(ctx)?,
+            l1w: self.weights.l1w.download(ctx)?,
+            l1b: self.weights.l1b.download(ctx)?,
+            l2w: self.weights.l2w.download(ctx)?,
+            l2b: self.weights.l2b.download(ctx)?,
+            outw: self.weights.outw.download(ctx)?,
+            outb: self.weights.outb.download(ctx)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_nnue_shape(self.shape)?;
+        self.device_batch.validate()?;
+        self.weights.validate()?;
+        self.optimizer_states.validate(self.shape)?;
+        self.forward_workspace.validate()?;
+        self.loss_workspace.validate()?;
+        self.backward_workspace.validate()?;
+        expect_len("train targets", self.batch_size, self.targets.len())?;
+        expect_len("train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+
+    fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l0w_gradients,
+            &self.weights.l0w,
+            &self.optimizer_states.l0w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l0b_gradients,
+            &self.weights.l0b,
+            &self.optimizer_states.l0b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l1w_gradients,
+            &self.weights.l1w,
+            &self.optimizer_states.l1w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l1b_gradients,
+            &self.weights.l1b,
+            &self.optimizer_states.l1b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l2w_gradients,
+            &self.weights.l2w,
+            &self.optimizer_states.l2w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.l2b_gradients,
+            &self.weights.l2b,
+            &self.optimizer_states.l2b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.outw_gradients,
+            &self.weights.outw,
+            &self.optimizer_states.outw,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.outb_gradients,
+            &self.weights.outb,
+            &self.optimizer_states.outb,
+        )
+    }
+}
+
+fn update_param_group(
+    ctx: &Context,
+    params: RangerUpdateParams,
+    gradients: &F32Buffer,
+    weights: &F32Buffer,
+    state: &RangerParamState,
+) -> Result<()> {
+    ranger_update_device(
+        ctx,
+        params,
+        RangerDeviceStateMut {
+            gradients,
+            weights,
+            momentum: &state.momentum,
+            velocity: &state.velocity,
+            slow_params: &state.slow_params,
+        },
+    )
+}
+
 fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
     if shape.input_size == 0 || shape.l1 == 0 || shape.l2 == 0 || shape.l3 == 0 {
         Err(CudaCppError::message(format!("NNUE shape dimensions must be non-zero: {shape:?}")))

@@ -148,6 +148,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_close_slice("bwd outw", &backward_device.outw_gradients, &backward_expected.outw_gradients, 1.0e-6);
     assert_close_slice("bwd outb", &backward_device.outb_gradients, &backward_expected.outb_gradients, 1.0e-6);
 
+    let train_params = RangerUpdateParams {
+        radam: RAdamUpdateParams {
+            step: 1,
+            learning_rate: 0.01,
+            beta1: 0.9,
+            beta2: 0.999,
+            min_weight: -1.98,
+            max_weight: 1.98,
+            ..RAdamUpdateParams::default()
+        },
+        lookahead_alpha: 0.5,
+        lookahead_period: 6,
+    };
+    let mut train_runner =
+        bulletou_cuda_cpp::NnueTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active)?;
+    let train_loss = train_runner.step(
+        &ctx,
+        train_params,
+        ScalarLossKind::SigmoidMse,
+        1.0,
+        bulletou_cuda_cpp::NnueTrainStepHostBatch {
+            stm_indices: batch.stm_indices,
+            nstm_indices: batch.nstm_indices,
+            targets: &nnue_targets,
+            entry_weights: &nnue_entry_weights,
+            batch_size: batch.batch_size,
+            max_active: batch.max_active,
+        },
+    )?;
+    let nnue_loss = nnue_loss_workspace.download(&ctx)?;
+    assert_close_scalar("train loss mean", train_loss.mean, nnue_loss.mean, 1.0e-6);
+    assert_close_scalar("train loss weighted_sum", train_loss.weighted_sum, nnue_loss.weighted_sum, 1.0e-6);
+    let trained_weights = train_runner.read_weights(&ctx)?;
+    let expected_trained_weights = host_ranger_updated_tiny_weights(device, weights, &backward_expected, train_params)?;
+    println!("  train : loss_mean={} outb={:?}", train_loss.mean, trained_weights.outb);
+    assert_close_slice("train l0w", &trained_weights.l0w, &expected_trained_weights.l0w, 1.0e-6);
+    assert_close_slice("train l0b", &trained_weights.l0b, &expected_trained_weights.l0b, 1.0e-6);
+    assert_close_slice("train l1w", &trained_weights.l1w, &expected_trained_weights.l1w, 1.0e-6);
+    assert_close_slice("train l1b", &trained_weights.l1b, &expected_trained_weights.l1b, 1.0e-6);
+    assert_close_slice("train l2w", &trained_weights.l2w, &expected_trained_weights.l2w, 1.0e-6);
+    assert_close_slice("train l2b", &trained_weights.l2b, &expected_trained_weights.l2b, 1.0e-6);
+    assert_close_slice("train outw", &trained_weights.outw, &expected_trained_weights.outw, 1.0e-6);
+    assert_close_slice("train outb", &trained_weights.outb, &expected_trained_weights.outb, 1.0e-6);
+
     let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
     let mut weights = vec![0.1, -0.2, 0.3, -0.4];
     let mut momentum = vec![0.0; gradients.len()];
@@ -266,6 +310,68 @@ struct CpuBackward {
     l2b_gradients: Vec<f32>,
     outw_gradients: Vec<f32>,
     outb_gradients: Vec<f32>,
+}
+
+struct TinyWeightsOwned {
+    l0w: Vec<f32>,
+    l0b: Vec<f32>,
+    l1w: Vec<f32>,
+    l1b: Vec<f32>,
+    l2w: Vec<f32>,
+    l2b: Vec<f32>,
+    outw: Vec<f32>,
+    outb: Vec<f32>,
+}
+
+fn host_ranger_updated_tiny_weights(
+    device: i32,
+    weights: NnueForwardHostWeights<'_>,
+    gradients: &CpuBackward,
+    params: RangerUpdateParams,
+) -> Result<TinyWeightsOwned, Box<dyn std::error::Error>> {
+    let mut out = TinyWeightsOwned {
+        l0w: weights.l0w.to_vec(),
+        l0b: weights.l0b.to_vec(),
+        l1w: weights.l1w.to_vec(),
+        l1b: weights.l1b.to_vec(),
+        l2w: weights.l2w.to_vec(),
+        l2b: weights.l2b.to_vec(),
+        outw: weights.outw.to_vec(),
+        outb: weights.outb.to_vec(),
+    };
+    apply_host_ranger(device, params, &gradients.l0w_gradients, &mut out.l0w)?;
+    apply_host_ranger(device, params, &gradients.l0b_gradients, &mut out.l0b)?;
+    apply_host_ranger(device, params, &gradients.l1w_gradients, &mut out.l1w)?;
+    apply_host_ranger(device, params, &gradients.l1b_gradients, &mut out.l1b)?;
+    apply_host_ranger(device, params, &gradients.l2w_gradients, &mut out.l2w)?;
+    apply_host_ranger(device, params, &gradients.l2b_gradients, &mut out.l2b)?;
+    apply_host_ranger(device, params, &gradients.outw_gradients, &mut out.outw)?;
+    apply_host_ranger(device, params, &gradients.outb_gradients, &mut out.outb)?;
+    Ok(out)
+}
+
+fn apply_host_ranger(
+    device: i32,
+    params: RangerUpdateParams,
+    gradients: &[f32],
+    weights: &mut [f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut gradients = gradients.to_vec();
+    let mut momentum = vec![0.0; gradients.len()];
+    let mut velocity = vec![0.0; gradients.len()];
+    let mut slow_params = weights.to_vec();
+    bulletou_cuda_cpp::ranger_update_host(
+        device,
+        params,
+        RangerStateMut {
+            gradients: &mut gradients,
+            weights,
+            momentum: &mut momentum,
+            velocity: &mut velocity,
+            slow_params: &mut slow_params,
+        },
+    )?;
+    Ok(())
 }
 
 fn cpu_tiny_nnue_backward(
