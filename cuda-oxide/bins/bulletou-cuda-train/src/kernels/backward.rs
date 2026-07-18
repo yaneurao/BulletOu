@@ -690,6 +690,67 @@ pub fn sfnn_pairwise_backward(
 }
 
 #[kernel]
+pub fn sfnn_pairwise_l0_sparse_backward_train(
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    stm_activations: &[f32],
+    nstm_activations: &[f32],
+    combined_gradients: &[f32],
+    mut l0w_gradients: DisjointSlice<f32>,
+    mut l0b_gradients: DisjointSlice<f32>,
+    batch: u32,
+    max_active: u32,
+    input_size: u32,
+    ft_size: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let slots = max_active as usize;
+    let rows = ft_size as usize;
+    let features = input_size as usize;
+    let l0_len = batch_size * rows;
+
+    if tid_value >= l0_len {
+        return;
+    }
+
+    let row = tid_value % rows;
+    let sample = tid_value / rows;
+    let sparse_base = sample * slots;
+    let pairwise = rows / 2;
+    let pair = row % pairwise;
+    let mate_col = if row < pairwise { pairwise + pair } else { pair };
+    let l0_base = sample * rows;
+    let combined_base = sample * rows;
+    let scale = 127.0_f32 / 128.0_f32;
+    let stm_output_grad = combined_gradients[combined_base + pair] * stm_activations[l0_base + mate_col] * scale;
+    let nstm_output_grad =
+        combined_gradients[combined_base + pairwise + pair] * nstm_activations[l0_base + mate_col] * scale;
+    let stm_grad = crelu_pre_gradient_from_value(stm_activations[tid_value], stm_output_grad);
+    let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid_value], nstm_output_grad);
+
+    let bias_cell = unsafe { &*(l0b_gradients.as_mut_ptr().add(row) as *const DeviceAtomicF32) };
+    bias_cell.fetch_add(stm_grad + nstm_grad, AtomicOrdering::Relaxed);
+
+    for slot in 0..slots {
+        let stm_feature = stm_indices[sparse_base + slot];
+        if stm_feature >= 0 && (stm_feature as usize) < features {
+            let weight_idx = (stm_feature as usize) * rows + row;
+            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(stm_grad, AtomicOrdering::Relaxed);
+        }
+
+        let nstm_feature = nstm_indices[sparse_base + slot];
+        if nstm_feature >= 0 && (nstm_feature as usize) < features {
+            let weight_idx = (nstm_feature as usize) * rows + row;
+            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(nstm_grad, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+#[kernel]
 pub fn sfnn_l0_sparse_zero_gradients(
     mut l0w_gradients: DisjointSlice<f32>,
     mut l0b_gradients: DisjointSlice<f32>,

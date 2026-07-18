@@ -537,3 +537,13 @@ commit each completed slice.
   - command shape: `--sfnn-teacher-train --sfnn-factorized-l1 --teacher teacher-all.psv --test-teacher /mnt/c/shogi/teacher/test/yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --score-drop-abs 0 --train-steps 192 --batch-size 262144 --teacher-batch-size 262144 --lr 0.056 --lr-schedule fixed`;
   - result: `50331648` positions in `35.303s`, `1425699` pos/s, `test_loss=0.073977835`, `test_acc=0.63442993`;
   - this improves the speed side but quality still needs LR/schedule/batch-size work before the full-epoch tatara target is met.
+- Added a training-only fused pairwise/L0 sparse backward path:
+  - the smoke/debug path still keeps the separate `sfnn_pairwise_backward` and `sfnn_l0_sparse_backward` kernels so internal `stm_l0_pre`/`nstm_l0_pre` buffers remain testable;
+  - real SFNN training now computes pairwise gradients and sparse L0 gradient accumulation in one kernel and skips unused pre-gradient writes;
+  - WSL train-step smoke with nonzero virtual rows passed against the CPU golden;
+  - bs65k profile: separate pairwise+L0 was about `19.1ms`; fused pairwise/L0 is about `16.4ms`;
+  - bs65k/lr0.014 50M yamaoka probe improved throughput from about `1.23M` to `1.31M` pos/s, with `test_loss=0.07200843`, `test_acc=0.6422272`.
+- Full-epoch bs65k/lr0.014 before the fused pairwise/L0 change:
+  - `649265152` positions in `520.834s`, `1246587` pos/s;
+  - yamaoka validation `test_loss=0.072359465`, `test_acc=0.6563568`;
+  - quality remained well behind the tatara full-epoch target even though accuracy improved with more data.

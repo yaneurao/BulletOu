@@ -6,8 +6,8 @@ use bulletou_cuda_oxide_runtime::{
     CudaModule, CudaStream, DeviceBuffer, Error, Result,
     backward::{
         SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-        SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
-        SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
+        SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
+        SfnnStackedL3BackwardLayout,
     },
     loss::{ScalarLossLayout, ScalarLossWorkspace},
     optimizer::{RangerUpdateParams, SfnnRangerOptimizerHostStates, SfnnRangerOptimizerStates},
@@ -404,26 +404,13 @@ impl SfnnLossRangerStepRunner {
             profile_stage(stream, &mut profile_last, "backward_l1_shared")?;
         }
 
-        let pairwise_layout = SfnnPairwiseBackwardLayout::new(self.batch_size, self.shape.ft_size);
-        sfnn_backward::launch_sfnn_pairwise_backward(
-            stream,
-            module,
-            pairwise_layout,
-            &self.forward_workspace.stm_l0,
-            &self.forward_workspace.nstm_l0,
-            &self.backward_workspace.combined_gradients,
-            &mut self.backward_workspace.stm_l0_gradients,
-            &mut self.backward_workspace.nstm_l0_gradients,
-        )?;
-        profile_stage(stream, &mut profile_last, "backward_pairwise")?;
-
         let l0_layout = SfnnL0SparseBackwardLayout::new(
             self.batch_size,
             self.max_active,
             self.shape.input_size,
             self.shape.ft_size,
         );
-        sfnn_backward::launch_sfnn_l0_sparse_backward(
+        sfnn_backward::launch_sfnn_pairwise_l0_sparse_backward_train(
             stream,
             module,
             l0_layout,
@@ -431,10 +418,7 @@ impl SfnnLossRangerStepRunner {
             &self.device_batch.nstm_indices,
             &self.forward_workspace.stm_l0,
             &self.forward_workspace.nstm_l0,
-            &self.backward_workspace.stm_l0_gradients,
-            &self.backward_workspace.nstm_l0_gradients,
-            &mut self.backward_workspace.stm_l0_pre_gradients,
-            &mut self.backward_workspace.nstm_l0_pre_gradients,
+            &self.backward_workspace.combined_gradients,
             &mut self.backward_workspace.l0w_gradients,
             &mut self.backward_workspace.l0b_gradients,
         )?;
@@ -446,7 +430,7 @@ impl SfnnLossRangerStepRunner {
                 &mut self.backward_workspace.l0w_gradients,
             )?;
         }
-        profile_stage(stream, &mut profile_last, "backward_l0_sparse")?;
+        profile_stage(stream, &mut profile_last, "backward_pairwise_l0")?;
 
         optimizer_update::launch_sfnn_ranger_update(
             stream,

@@ -344,6 +344,54 @@ pub(crate) fn launch_sfnn_l0_sparse_backward(
 }
 
 #[allow(dead_code)]
+pub(crate) fn launch_sfnn_pairwise_l0_sparse_backward_train(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnL0SparseBackwardLayout,
+    stm_indices: &DeviceBuffer<i32>,
+    nstm_indices: &DeviceBuffer<i32>,
+    stm_activations: &DeviceBuffer<f32>,
+    nstm_activations: &DeviceBuffer<f32>,
+    combined_gradients: &DeviceBuffer<f32>,
+    mut l0w_gradients: &mut DeviceBuffer<f32>,
+    mut l0b_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let batch = layout.batch_size as u32;
+    let max_active = layout.max_active as u32;
+    let input_size = layout.input_size as u32;
+    let ft_size = layout.ft_size as u32;
+    let threads = layout.l0_len();
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_pairwise_l0_sparse_backward_train`.
+        // Each thread owns one sample/FT row. Weight and bias gradients are
+        // accumulated through device atomics.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_pairwise_l0_sparse_backward_train,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(threads),
+            args: [
+                slice(stm_indices),
+                slice(nstm_indices),
+                slice(stm_activations),
+                slice(nstm_activations),
+                slice(combined_gradients),
+                slice_mut(l0w_gradients),
+                slice_mut(l0b_gradients),
+                batch,
+                max_active,
+                input_size,
+                ft_size
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn launch_sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
