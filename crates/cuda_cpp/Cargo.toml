@@ -1,0 +1,18 @@
+[package]
+name = "bulletou-cuda-cpp"
+version = "0.1.0"
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+readme = { workspace = true }
+rust-version = { workspace = true }
+edition = { workspace = true }
+description = "Windows-native C++/CUDA fixed-layout backend for BulletOu"
+links = "bulletou_cuda_cpp"
+
+[build-dependencies]
+cc = "1.2"
+
+[[bin]]
+name = "bulletou-cuda-cpp-smoke"
+path = "src/bin/smoke.rs"

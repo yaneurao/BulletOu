@@ -11,6 +11,7 @@ resolver = "2"
 members = [
     "crates/bulletou_lib",
     "crates/compiler",
+    "crates/cuda_cpp",
     "crates/gpu",
     "crates/trainer",
     "crates/utils",

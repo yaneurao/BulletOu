@@ -1,8 +1,10 @@
 # 10. cuda-oxide implementation tickets
 
-This is the active ticket queue for turning the current cuda-oxide smoke/bridge
-work into a production BulletOu training backend. Work the tickets in order and
-commit each completed slice.
+This started as the active ticket queue for turning the cuda-oxide smoke/bridge
+work into a production BulletOu training backend. As of BO-CUDA-031 the production
+fast-backend direction is pivoting to a Windows-native C++/CUDA backend while
+keeping cuda-oxide available as a reference/experimental implementation. Work
+the tickets in order and commit each completed slice.
 
 | ticket | status | scope | exit criteria |
 |---|---|---|---|
@@ -36,6 +38,10 @@ commit each completed slice.
 | BO-CUDA-028 | done | beat tatara on 4M speed and accuracy | reduce cuda-oxide host readback overhead and tune the 4M same-PSV recipe until BulletOu exceeds the latest tatara 4M reference in both held-out accuracy and train throughput |
 | BO-CUDA-029 | done | NNUE idle recompare after external GPU load stopped | remeasure tatara/BulletOu on the same 4M PSV slice with the GPU idle and record a BulletOu recipe that exceeds tatara in speed and accuracy |
 | BO-CUDA-030 | doing | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, improve `SFNN_halfka2_1024_7_64_k3k3` until BulletOu exceeds tatara in train throughput, held-out loss, and held-out accuracy |
+| BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
+| BO-CUDA-032 | todo | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
+| BO-CUDA-033 | todo | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
+| BO-CUDA-034 | todo | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 
 ## Notes
 
@@ -581,3 +587,41 @@ commit each completed slice.
   - bs32k/50M, `teacher_batch=262144`, `wd=0`, `beta1=0.9`, LR `0.020`: `50331648` positions in `38.581s`, `1304582` pos/s, `test_loss=0.07097649`, `test_acc=0.6410217`;
   - bs16k/50M, `teacher_batch=131072`, `wd=0`, `beta1=0.99`, LR `0.000875`: `50331648` positions in `50.208s`, `1002472` pos/s, `test_loss=0.07336029`, `test_acc=0.6298981`;
   - the pipelined bs40k line now has ample speed headroom over tatara, but quality is still short; bs32k is the current boundary candidate for recovering quality while keeping speed close to the tatara line.
+- Later full-epoch yamaoka probes before the C++/CUDA pivot:
+  - bs28k, `teacher_batch=458752`, `wd=0`, `beta1=0.975`, LR `0.0020`, `wdl=0.01`, `test_wdl=0`: `649277440` positions in `499.748s`, `1299210` pos/s, `test_loss=0.06488502`, `test_acc=0.6633301`;
+  - this beat tatara on loss and speed and missed tatara accuracy by only 2 decisive positions on the 65,536-position yamaoka validation set;
+  - nearby WDL/LR/beta probes did not reliably recover the remaining accuracy while keeping loss/speed, so BO-CUDA-030 remains open.
+- Important validation rule:
+  - validation for this target is fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`;
+  - if that PSV is missing, convert `C:\shogi\teacher\test\yamaoka-floodgate.hcpe` to PSV in the same folder;
+  - do not use the training teacher folder or `teacher-all.psv` as validation data.
+- Decision:
+  - cuda-oxide remains a useful correctness/reference implementation, but it is experimental and Linux-only;
+  - production fast-backend work moves to a Windows-native C++/CUDA backend starting with BO-CUDA-031.
+
+### BO-CUDA-031
+
+- Added a new workspace crate `crates/cuda_cpp` (`bulletou-cuda-cpp`):
+  - builds `cpp/bulletou_cuda_backend.cu` with `nvcc` through Cargo on Windows;
+  - links against the CUDA Toolkit from `CUDA_PATH`;
+  - exposes a small safe Rust wrapper around C ABI entry points.
+- Added Windows-native CUDA smoke coverage:
+  - `bulletou-cuda-cpp-smoke` queries device 0, runs an AXPY kernel, and runs a host-copy Ranger/RAdam update kernel smoke;
+  - this validates the native Windows CUDA toolchain without WSL/Ubuntu.
+- Added the first C++/CUDA training-relevant kernel:
+  - `radam_update_reset_gradients_kernel` mirrors the cuda-oxide RAdam update/reset kernel;
+  - `ranger_lookahead_kernel` mirrors the cuda-oxide lookahead phase;
+  - the current wrapper copies host arrays in/out for smoke correctness only. BO-CUDA-032 must replace this with persistent device state for training throughput.
+- Added BulletOu CLI plumbing:
+  - `--backend cuda-cpp` is recognized;
+  - `--cuda-cpp-device <N>` selects the CUDA device;
+  - `--cuda-cpp-smoke` runs the C++/CUDA backend smoke through `examples/bulletou`;
+  - actual NNUE/SFNN training intentionally fails fast until BO-CUDA-033/034 connect the trainer.
+- Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
+  - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and reported `NVIDIA GeForce RTX 4090`;
+  - `cargo check --example bulletou` passed;
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo run --features cuda-cpp-backend --example bulletou -- --backend cuda-cpp --cuda-cpp-smoke --eval-type NNUE_HALFKP --teacher dummy --cuda-cpp-device 0` passed;
+  - `cargo test --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou` passed.

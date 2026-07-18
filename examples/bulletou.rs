@@ -167,6 +167,8 @@ enum BackendKind {
     Bullet,
     /// Experimental cuda-oxide fast path for fixed NNUE/SFNN layouts.
     CudaOxide,
+    /// Windows-native C++/CUDA fixed-layout backend bring-up path.
+    CudaCpp,
 }
 
 impl BackendKind {
@@ -174,6 +176,7 @@ impl BackendKind {
         match self {
             BackendKind::Bullet => "bullet",
             BackendKind::CudaOxide => "cuda-oxide",
+            BackendKind::CudaCpp => "cuda-cpp",
         }
     }
 }
@@ -1246,8 +1249,8 @@ struct Args {
     eval_type: Option<EvalType>,
 
     /// Training backend. `bullet` is the existing generic backend.
-    /// `cuda-oxide` is an experimental fixed-layout NNUE/SFNN fast path and
-    /// either requires `--cuda-oxide-train-steps` or a bounded production schedule.
+    /// `cuda-oxide` is the experimental Linux-only Rust/CUDA fixed-layout path.
+    /// `cuda-cpp` is the Windows-native C++/CUDA fixed-layout backend being brought up.
     #[arg(long, value_enum, default_value = "bullet")]
     backend: BackendKind,
 
@@ -1287,6 +1290,14 @@ struct Args {
     /// Pass cuda-oxide's debug readback flag through to the nested trainer.
     #[arg(long)]
     cuda_oxide_debug_readback: bool,
+
+    /// CUDA device index for the Windows-native C++/CUDA backend.
+    #[arg(long, default_value = "0")]
+    cuda_cpp_device: i32,
+
+    /// Run the C++/CUDA backend bring-up smoke and exit.
+    #[arg(long)]
+    cuda_cpp_smoke: bool,
 
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
@@ -1728,7 +1739,20 @@ impl Args {
         match self.backend {
             BackendKind::Bullet => Ok(()),
             BackendKind::CudaOxide => self.validate_cuda_oxide_backend_options(),
+            BackendKind::CudaCpp => self.validate_cuda_cpp_backend_options(),
         }
+    }
+
+    fn validate_cuda_cpp_backend_options(&self) -> Result<(), String> {
+        if !cfg!(feature = "cuda-cpp-backend") {
+            return Err("--backend cuda-cpp requires building with --features cuda-cpp-backend".to_string());
+        }
+        if self.cuda_cpp_smoke {
+            return Ok(());
+        }
+        Err("--backend cuda-cpp is wired for Windows-native CUDA smoke only so far; \
+             use --cuda-cpp-smoke while the NNUE/SFNN trainer kernels are being ported"
+            .to_string())
     }
 
     fn validate_cuda_oxide_backend_options(&self) -> Result<(), String> {
@@ -2634,6 +2658,13 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    if args.backend == BackendKind::CudaCpp {
+        if let Err(e) = run_cuda_cpp_backend(&args) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.backend == BackendKind::CudaOxide {
         if args.batch_size.is_none() {
             eprintln!("  batch size = {} (auto for {})", effective_batch_size(&args), args.eval_type().cli_name());
@@ -2722,6 +2753,72 @@ fn main() {
         EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
         EvalType::SfnnHalfka2 => run_sfnn_1536(&args, ShogiHalfKa2, NnueFeatureSet::HalfKa2),
         EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
+    }
+}
+
+fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
+    args.validate_cuda_cpp_backend_options()?;
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    {
+        if !args.cuda_cpp_smoke {
+            return Err("cuda-cpp trainer is not connected yet".to_string());
+        }
+
+        use bulletou_cuda_cpp::{RAdamUpdateParams, RangerStateMut, RangerUpdateParams};
+
+        let device = args.cuda_cpp_device;
+        eprintln!("  backend = cuda-cpp Windows-native smoke");
+        let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
+        eprintln!("  cuda-cpp device {device}: {name}");
+
+        let axpy = bulletou_cuda_cpp::axpy_host(device, 2.0, &[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])
+            .map_err(|e| e.to_string())?;
+        if axpy != vec![12.0, 24.0, 36.0, 48.0] {
+            return Err(format!("cuda-cpp axpy smoke mismatch: {axpy:?}"));
+        }
+
+        let mut gradients = vec![0.25, -0.5, 1.0, -1.5];
+        let mut weights = vec![0.1, -0.2, 0.3, -0.4];
+        let mut momentum = vec![0.0; gradients.len()];
+        let mut velocity = vec![0.0; gradients.len()];
+        let mut slow_params = weights.clone();
+        bulletou_cuda_cpp::ranger_update_host(
+            device,
+            RangerUpdateParams {
+                radam: RAdamUpdateParams {
+                    step: 1,
+                    learning_rate: 0.01,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    min_weight: -1.98,
+                    max_weight: 1.98,
+                    ..RAdamUpdateParams::default()
+                },
+                lookahead_alpha: 0.5,
+                lookahead_period: 6,
+            },
+            RangerStateMut {
+                gradients: &mut gradients,
+                weights: &mut weights,
+                momentum: &mut momentum,
+                velocity: &mut velocity,
+                slow_params: &mut slow_params,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if !gradients.iter().all(|&g| g == 0.0) {
+            return Err(format!("cuda-cpp ranger smoke did not reset gradients: {gradients:?}"));
+        }
+
+        eprintln!("  cuda-cpp smoke = ok");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda-cpp-backend"))]
+    {
+        let _ = args;
+        Err("--backend cuda-cpp requires building with --features cuda-cpp-backend".to_string())
     }
 }
 
@@ -7249,6 +7346,51 @@ mod tests {
 
         assert_eq!(args.backend, BackendKind::Bullet);
         assert!(args.validate_backend_flags().is_ok());
+    }
+
+    #[test]
+    fn cuda_cpp_backend_smoke_is_feature_gated() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-smoke",
+        ])
+        .unwrap();
+
+        assert_eq!(args.backend, BackendKind::CudaCpp);
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_training_until_connected() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "smoke only" } else { "cuda-cpp-backend" }));
     }
 
     #[test]
