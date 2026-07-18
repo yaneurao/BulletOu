@@ -5109,6 +5109,7 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: V
         cap,
         args.lambda,
         args.scale as f32,
+        1.0,
         validation_loss_kind(args),
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };

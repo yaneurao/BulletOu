@@ -146,16 +146,19 @@ where
             )
             .with_buffer_records(config.batch_size)
             .with_loader_threads(config.loader_threads)
-            .with_single_epoch(true);
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            .with_single_epoch(false);
+            if let Some(pos) = config.dataloader_resume_pos {
                 if pos.plies != 0 {
                     return Err(TeacherBatchError::invalid_input(format!(
                         "HCPE dataloader resume position must have plies=0, got {}",
                         pos.plies
                     )));
                 }
+            }
+            let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
+            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset)
+                (0, pos.byte_offset % total_bytes)
             } else {
                 let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
                     TeacherBatchError::invalid_input(format!(
@@ -170,7 +173,7 @@ where
                             "HCPE dataloader resume byte offset overflow: consumed_records={consumed_records}"
                         ))
                     })?;
-                (config.batch_index, base_byte_offset)
+                (config.batch_index, base_byte_offset % total_bytes)
             };
             visit_halfkp_batches(
                 loader,
@@ -179,7 +182,12 @@ where
                 batch_count,
                 loader_start_batch,
                 move |visited_batches| {
-                    hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches)
+                    hcpe_dataloader_pos_after_batch(
+                        base_byte_offset,
+                        total_bytes,
+                        config.batch_size,
+                        visited_batches,
+                    )
                 },
                 visitor,
             )
@@ -187,7 +195,7 @@ where
         DataFormat::Hcpe3 => {
             let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(true);
+                .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
@@ -214,7 +222,7 @@ where
         DataFormat::Pack => {
             let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(true);
+                .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
@@ -239,7 +247,7 @@ where
             )
         }
         DataFormat::Psv => {
-            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
             visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
         }
     }
@@ -272,16 +280,19 @@ where
             )
             .with_buffer_records(config.batch_size)
             .with_loader_threads(config.loader_threads)
-            .with_single_epoch(true);
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            .with_single_epoch(false);
+            if let Some(pos) = config.dataloader_resume_pos {
                 if pos.plies != 0 {
                     return Err(TeacherBatchError::invalid_input(format!(
                         "HCPE dataloader resume position must have plies=0, got {}",
                         pos.plies
                     )));
                 }
+            }
+            let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
+            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset)
+                (0, pos.byte_offset % total_bytes)
             } else {
                 let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
                     TeacherBatchError::invalid_input(format!(
@@ -296,7 +307,7 @@ where
                             "HCPE dataloader resume byte offset overflow: consumed_records={consumed_records}"
                         ))
                     })?;
-                (config.batch_index, base_byte_offset)
+                (config.batch_index, base_byte_offset % total_bytes)
             };
             visit_sfnn_batches(
                 loader,
@@ -305,7 +316,12 @@ where
                 batch_count,
                 loader_start_batch,
                 move |visited_batches| {
-                    hcpe_dataloader_pos_after_batch(base_byte_offset, config.batch_size, visited_batches)
+                    hcpe_dataloader_pos_after_batch(
+                        base_byte_offset,
+                        total_bytes,
+                        config.batch_size,
+                        visited_batches,
+                    )
                 },
                 visitor,
             )
@@ -313,7 +329,7 @@ where
         DataFormat::Hcpe3 => {
             let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(true);
+                .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
@@ -340,7 +356,7 @@ where
         DataFormat::Pack => {
             let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(true);
+                .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
@@ -365,21 +381,39 @@ where
             )
         }
         DataFormat::Psv => {
-            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
             visit_sfnn_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
         }
     }
 }
 
+fn total_hcpe_teacher_bytes(paths: &[String]) -> Result<u64, TeacherBatchError> {
+    let mut total = 0u64;
+    for path in paths {
+        let len = std::fs::metadata(path)
+            .map_err(|err| TeacherBatchError::invalid_input(format!("failed to stat HCPE teacher {path}: {err}")))?
+            .len();
+        total = total.checked_add(len).ok_or_else(|| {
+            TeacherBatchError::invalid_input(format!("HCPE teacher byte size overflow while adding {path}"))
+        })?;
+    }
+    if total == 0 {
+        return Err(TeacherBatchError::invalid_input("HCPE teacher contains no bytes"));
+    }
+    Ok(total)
+}
+
 fn hcpe_dataloader_pos_after_batch(
     base_byte_offset: u64,
+    total_bytes: u64,
     batch_size: usize,
     visited_batches: usize,
 ) -> Option<TeacherDataloaderPos> {
     let completed_batches = visited_batches.checked_add(1)?;
     let consumed_records = completed_batches.checked_mul(batch_size)?;
     let consumed_bytes = (consumed_records as u64).checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)?;
-    Some(TeacherDataloaderPos { byte_offset: base_byte_offset.checked_add(consumed_bytes)?, plies: 0 })
+    let raw_offset = base_byte_offset.checked_add(consumed_bytes)?;
+    Some(TeacherDataloaderPos { byte_offset: raw_offset % total_bytes, plies: 0 })
 }
 
 fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
@@ -555,6 +589,21 @@ where
     E: fmt::Display,
 {
     let threads = config.threads.max(1);
+    let rayon_pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("bulletou-sfnn-prepare-{index}"))
+                .build()
+                .map_err(|err| {
+                    TeacherBatchError::invalid_input(format!(
+                        "failed to create SFNN teacher prepare thread pool with {threads} threads: {err}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let dataloader = DefaultDataLoader::new(
         ShogiHalfKa2,
         ShogiLayerStackBucket9::KingRank9,
@@ -571,7 +620,10 @@ where
     dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
-        let prepared = dataloader.prepare(batch, threads, 1.0 - config.lambda);
+        let prepared = match rayon_pool.as_ref() {
+            Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+            None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+        };
         if let Some(started) = prepare_started {
             println!(
                 "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
@@ -693,6 +745,14 @@ mod tests {
         assert!(err.to_string().contains("plies=0"));
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hcpe_dataloader_pos_wraps_at_teacher_end() {
+        let total_bytes = 10 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64;
+        let pos = hcpe_dataloader_pos_after_batch(8 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, total_bytes, 4, 0)
+            .unwrap();
+        assert_eq!(pos, TeacherDataloaderPos { byte_offset: 2 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, plies: 0 });
     }
 
     #[test]

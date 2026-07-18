@@ -15,17 +15,25 @@ pub fn loss_sigmoid_mse_reduce(
     entry_weights: &[f32],
     mut per_sample: DisjointSlice<f32>,
     mut mean_output_gradients: DisjointSlice<f32>,
+    output_inv_scale: f32,
     batch: u32,
 ) {
     let tid = thread::index_1d();
     let tid_value = tid.get();
     if tid_value < batch as usize {
-        let weighted = sigmoid_mse_weighted(outputs[tid_value], targets[tid_value], entry_weights[tid_value]);
+        let weighted =
+            sigmoid_mse_weighted(outputs[tid_value], targets[tid_value], entry_weights[tid_value], output_inv_scale);
         if let Some(out) = per_sample.get_mut(tid) {
             *out = weighted;
         }
         if let Some(out) = mean_output_gradients.get_mut(thread::index_1d()) {
-            *out = sigmoid_mse_mean_gradient(outputs[tid_value], targets[tid_value], entry_weights[tid_value], batch);
+            *out = sigmoid_mse_mean_gradient(
+                outputs[tid_value],
+                targets[tid_value],
+                entry_weights[tid_value],
+                output_inv_scale,
+                batch,
+            );
         }
     }
 }
@@ -78,17 +86,23 @@ pub fn loss_finalize_from_per_sample(
 }
 
 #[device]
-fn sigmoid_mse_weighted(output: f32, target: f32, entry_weight: f32) -> f32 {
-    let prediction = loss_sigmoid(output);
+fn sigmoid_mse_weighted(output: f32, target: f32, entry_weight: f32, output_inv_scale: f32) -> f32 {
+    let prediction = loss_sigmoid(output * output_inv_scale);
     let error = prediction - target;
     entry_weight * error * error
 }
 
 #[device]
-fn sigmoid_mse_mean_gradient(output: f32, target: f32, entry_weight: f32, batch: u32) -> f32 {
-    let prediction = loss_sigmoid(output);
+fn sigmoid_mse_mean_gradient(
+    output: f32,
+    target: f32,
+    entry_weight: f32,
+    output_inv_scale: f32,
+    batch: u32,
+) -> f32 {
+    let prediction = loss_sigmoid(output * output_inv_scale);
     let error = prediction - target;
-    let gradient = 2.0_f32 * error * prediction * (1.0_f32 - prediction);
+    let gradient = 2.0_f32 * error * prediction * (1.0_f32 - prediction) * output_inv_scale;
     entry_weight * gradient / (batch as f32)
 }
 

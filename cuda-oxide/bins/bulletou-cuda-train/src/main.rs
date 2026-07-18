@@ -88,6 +88,8 @@ struct Args {
     debug_readback: bool,
     profile_train_step: bool,
     loss_kind: LossKind,
+    sigmoid_scale: f32,
+    sigmoid_output_scale: f32,
     loss_case: LossCaseKind,
     nnue_case: NnueForwardCaseKind,
     sfnn_case: SfnnForwardCaseKind,
@@ -215,6 +217,8 @@ impl Args {
             debug_readback: false,
             profile_train_step: false,
             loss_kind: LossKind::SigmoidMse,
+            sigmoid_scale: 400.0,
+            sigmoid_output_scale: 1.0,
             loss_case: LossCaseKind::Tiny,
             nnue_case: NnueForwardCaseKind::Tiny,
             sfnn_case: SfnnForwardCaseKind::Tiny,
@@ -307,6 +311,13 @@ impl Args {
                 }
                 "--loss-kind" => {
                     parsed.loss_kind = parse_loss_kind(required_arg(&mut args, "--loss-kind")?)?;
+                }
+                "--scale" | "--sigmoid-scale" => {
+                    parsed.sigmoid_scale = parse_f32_arg(required_arg(&mut args, "--scale")?, "--scale")?;
+                }
+                "--model-output-scale" | "--sigmoid-output-scale" => {
+                    parsed.sigmoid_output_scale =
+                        parse_f32_arg(required_arg(&mut args, "--model-output-scale")?, "--model-output-scale")?;
                 }
                 "--loss-case" => {
                     parsed.loss_case = parse_loss_case(required_arg(&mut args, "--loss-case")?)?;
@@ -1131,7 +1142,15 @@ fn run_nnue_fixture_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(&stream, &module, params, train_loss_kind, host_batch, false)?;
+        runner.step(
+            &stream,
+            &module,
+            params,
+            train_loss_kind,
+            args.sigmoid_output_scale,
+            host_batch,
+            false,
+        )?;
         stream.synchronize()?;
 
         let loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -1348,7 +1367,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         loader_threads: args.loader_threads,
         threads: args.threads,
         lambda: 1.0,
-        scale: 400.0,
+        scale: args.sigmoid_scale,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         ft_factorize: nnue_halfkp_uses_ft_factorize(shape),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -1429,6 +1448,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     &module,
                     params,
                     train_loss_kind,
+                    args.sigmoid_output_scale,
                     host_batch,
                     args.debug_readback,
                     readback_loss,
@@ -1462,7 +1482,15 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 return Ok(());
             }
 
-            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
+            runner_ref.step(
+                &stream,
+                &module,
+                params,
+                train_loss_kind,
+                args.sigmoid_output_scale,
+                host_batch,
+                args.profile_train_step,
+            )?;
             stream.synchronize()?;
 
             let loss = runner_ref.read_loss(&stream, args.debug_readback)?;
@@ -1659,6 +1687,8 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    [{}] {}", idx + 1, source);
     }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
+    println!("  scale        : {}", args.sigmoid_scale);
+    println!("  model_scale  : {}", args.sigmoid_output_scale);
     println!("  batch        : {} samples", last_batch.batch_size);
     println!("  shape        : input={} l1={} l2={} l3={}", shape.input_size, shape.l1, shape.l2, shape.l3);
     println!("  start_step   : {}", completed_step_offset + 1);
@@ -1881,7 +1911,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         loader_threads: args.loader_threads,
         threads: args.threads,
         lambda: 1.0,
-        scale: 400.0,
+        scale: args.sigmoid_scale,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: args.profile_train_step,
@@ -1957,7 +1987,15 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             train_timer.get_or_insert_with(std::time::Instant::now);
             train_positions = train_positions.saturating_add(batch.layout.batch_size);
             let runner_ref = runner.as_mut().expect("runner is initialized");
-            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
+            runner_ref.step(
+                &stream,
+                &module,
+                params,
+                train_loss_kind,
+                args.sigmoid_output_scale,
+                host_batch,
+                args.profile_train_step,
+            )?;
 
             last_batch_size = batch.layout.batch_size;
             last_max_active = batch.layout.max_active;
@@ -2133,6 +2171,8 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    [{}] {}", idx + 1, source);
     }
     println!("  loss_kind    : {}", loss_kind_label(args.loss_kind));
+    println!("  scale        : {}", args.sigmoid_scale);
+    println!("  model_scale  : {}", args.sigmoid_output_scale);
     println!("  batch        : {} samples, max_active={}", last_batch_size, last_max_active);
     println!(
         "  shape        : input={} ft={} h1={} h2={} stacks={}",
@@ -2262,7 +2302,10 @@ fn bridge_test_teacher_spec(args: &Args) -> Option<String> {
         TestSampleMode::Random => "random",
         TestSampleMode::Sequential => "sequential",
     };
-    let mut spec = format!("{}\npositions={}\nsample={sample}\n", path, args.test_positions);
+    let mut spec = format!(
+        "{}\npositions={}\nsample={sample}\nscale={}\nmodel_output_scale={}\n",
+        path, args.test_positions, args.sigmoid_scale, args.sigmoid_output_scale
+    );
     if matches!(args.test_sample, TestSampleMode::Random) {
         spec.push_str(&format!("seed={}\n", args.test_seed));
     }
@@ -2338,7 +2381,7 @@ fn run_nnue_bridge_test_pass(
             None,
             matches!(args.loss_kind, LossKind::NnuePytorchWrm),
             false,
-            400.0,
+            args.sigmoid_scale,
             (args.score_drop_abs > 0).then_some(args.score_drop_abs),
             DirectSequentialDataLoader::new(&empty_files),
         );
@@ -2358,7 +2401,7 @@ fn run_nnue_bridge_test_pass(
             None,
             matches!(args.loss_kind, LossKind::NnuePytorchWrm),
             false,
-            400.0,
+            args.sigmoid_scale,
             (args.score_drop_abs > 0).then_some(args.score_drop_abs),
             DirectSequentialDataLoader::new(&empty_files),
         );
@@ -2382,7 +2425,8 @@ fn run_nnue_bridge_test_pass(
         &cache.teacher_results,
         (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         1.0,
-        400.0,
+        args.sigmoid_scale,
+        args.sigmoid_output_scale,
         loss_kind,
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
@@ -2470,7 +2514,7 @@ fn run_sfnn_bridge_test_pass(
         None,
         matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         false,
-        400.0,
+        args.sigmoid_scale,
         (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         DirectSequentialDataLoader::new(&empty_files),
     );
@@ -2495,7 +2539,8 @@ fn run_sfnn_bridge_test_pass(
         &cache.teacher_results,
         (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         1.0,
-        400.0,
+        args.sigmoid_scale,
+        args.sigmoid_output_scale,
         loss_kind,
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
@@ -4093,7 +4138,7 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
             targets: train_case.targets.clone(),
             entry_weights: train_case.entry_weights.clone(),
         };
-        let cpu_loss_trace = cpu_loss_case.cpu_loss_trace(args.loss_kind);
+        let cpu_loss_trace = cpu_loss_case.cpu_loss_trace(args.loss_kind, args.sigmoid_output_scale);
         let cpu_trace = cpu_case.cpu_dense_backward_trace_with_output_gradients(
             &cpu_forward_trace,
             cpu_loss_trace.mean_output_gradients.clone(),
@@ -4108,7 +4153,15 @@ fn run_nnue_loss_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::R
             batch_size: train_case.batch_size,
             max_active: train_case.max_active,
         };
-        runner.step(&stream, &module, params, train_loss_kind, host_batch, false)?;
+        runner.step(
+            &stream,
+            &module,
+            params,
+            train_loss_kind,
+            args.sigmoid_output_scale,
+            host_batch,
+            false,
+        )?;
         stream.synchronize()?;
 
         let gpu_loss = runner.read_loss(&stream, args.debug_readback)?;
@@ -4249,7 +4302,7 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     };
 
     let case = LossSmokeCase::new(args.loss_case);
-    let cpu_trace = case.cpu_loss_trace(args.loss_kind);
+    let cpu_trace = case.cpu_loss_trace(args.loss_kind, args.sigmoid_output_scale);
     let ptx = match args.ptx {
         Some(ptx) => ptx,
         None => default_nnue_ptx()?,
@@ -4269,7 +4322,15 @@ fn run_loss_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     let mut workspace = ScalarLossWorkspace::new(&stream, layout)?;
 
     match args.loss_kind {
-        LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss(&stream, &module, &device_batch, &mut workspace)?,
+        LossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
+            &stream,
+            &module,
+            &device_batch.outputs,
+            &device_batch.targets,
+            &device_batch.entry_weights,
+            args.sigmoid_output_scale,
+            &mut workspace,
+        )?,
         LossKind::NnuePytorchWrm => {
             loss_forward::launch_nnue_pytorch_wrm_loss(&stream, &module, &device_batch, &mut workspace)?
         }
@@ -5465,14 +5526,14 @@ fn parse_sfnn_forward_case(value: String) -> bulletou_cuda_oxide_runtime::Result
 fn usage() -> &'static str {
     "Usage:\n\
        bulletou-cuda-train [--ptx <PATH>] [--kernel <NAME>] [--device <ID>]\n\
-       bulletou-cuda-train --loss-smoke [--loss-kind sigmoid-mse|wrm] [--loss-case tiny|weighted] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --loss-smoke [--loss-kind sigmoid-mse|wrm] [--loss-case tiny|weighted] [--model-output-scale <F32>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --dense-crelu-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
+       bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--model-output-scale <F32>] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
+       bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--model-output-scale <F32>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --adamw-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --radam-update-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
@@ -5482,7 +5543,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--scale <F32>] [--model-output-scale <F32>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -5878,6 +5939,14 @@ struct SingleRangerUpdateTrace {
 fn validate_nnue_teacher_schedule_args(args: &Args) -> bulletou_cuda_oxide_runtime::Result<()> {
     if !(args.learning_rate.is_finite() && args.learning_rate > 0.0) {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--learning-rate must be finite and > 0".to_string()));
+    }
+    if !(args.sigmoid_scale.is_finite() && args.sigmoid_scale > 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--scale must be finite and > 0".to_string()));
+    }
+    if !(args.sigmoid_output_scale.is_finite() && args.sigmoid_output_scale > 0.0) {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(
+            "--model-output-scale must be finite and > 0".to_string(),
+        ));
     }
     if !(args.lr_min.is_finite() && args.lr_min >= 0.0) {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke("--lr-min must be finite and >= 0".to_string()));
@@ -6488,13 +6557,13 @@ impl LossSmokeCase {
         }
     }
 
-    fn cpu_loss_trace(&self, kind: LossKind) -> LossSmokeTrace {
+    fn cpu_loss_trace(&self, kind: LossKind, sigmoid_output_scale: f32) -> LossSmokeTrace {
         let mut per_sample = Vec::with_capacity(self.outputs.len());
         let mut mean_output_gradients = Vec::with_capacity(self.outputs.len());
         let mut weighted_sum = 0.0_f32;
         let inv_batch = 1.0_f32 / self.outputs.len() as f32;
         for ((&output, &target), &entry_weight) in self.outputs.iter().zip(&self.targets).zip(&self.entry_weights) {
-            let (loss, output_gradient) = loss_value_and_gradient(kind, output, target);
+            let (loss, output_gradient) = loss_value_and_gradient(kind, output, target, sigmoid_output_scale);
             let weighted = entry_weight * loss;
             per_sample.push(weighted);
             mean_output_gradients.push(entry_weight * output_gradient * inv_batch);
@@ -8803,13 +8872,18 @@ fn fill_sfnn_l2_input(l1: &[f32], l1_hidden: usize, out: &mut [f32]) {
 }
 
 #[cfg(feature = "cuda")]
-fn loss_value_and_gradient(kind: LossKind, output: f32, target: f32) -> (f32, f32) {
+fn loss_value_and_gradient(kind: LossKind, output: f32, target: f32, sigmoid_output_scale: f32) -> (f32, f32) {
     match kind {
         LossKind::SigmoidMse => {
-            let prediction = sigmoid(output);
+            let output_inv_scale = if sigmoid_output_scale.is_finite() && sigmoid_output_scale > 0.0 {
+                1.0 / sigmoid_output_scale
+            } else {
+                1.0
+            };
+            let prediction = sigmoid(output * output_inv_scale);
             let error = prediction - target;
             let loss = error * error;
-            let gradient = 2.0 * error * prediction * (1.0 - prediction);
+            let gradient = 2.0 * error * prediction * (1.0 - prediction) * output_inv_scale;
             (loss, gradient)
         }
         LossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss_and_gradient(output, target),

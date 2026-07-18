@@ -22,6 +22,7 @@ pub(crate) fn launch_sigmoid_mse_loss(
         &batch.outputs,
         &batch.targets,
         &batch.entry_weights,
+        1.0,
         workspace,
     )
 }
@@ -33,6 +34,7 @@ pub(crate) fn launch_sigmoid_mse_loss_from_buffers(
     outputs: &DeviceBuffer<f32>,
     targets: &DeviceBuffer<f32>,
     entry_weights: &DeviceBuffer<f32>,
+    output_scale: f32,
     workspace: &mut ScalarLossWorkspace,
 ) -> Result<()> {
     workspace.layout.validate()?;
@@ -40,6 +42,11 @@ pub(crate) fn launch_sigmoid_mse_loss_from_buffers(
     let layout = workspace.layout;
     let plan = ScalarLossLaunchPlan::new(layout);
     let batch_size = layout.batch_size as u32;
+    let output_inv_scale = if output_scale.is_finite() && output_scale > 0.0 {
+        1.0 / output_scale
+    } else {
+        1.0
+    };
 
     unsafe {
         // SAFETY: kernel ABI matches `loss_sigmoid_mse_reduce`; all buffers are
@@ -56,6 +63,7 @@ pub(crate) fn launch_sigmoid_mse_loss_from_buffers(
                 slice(entry_weights),
                 slice_mut(workspace.per_sample),
                 slice_mut(workspace.mean_output_gradients),
+                output_inv_scale,
                 batch_size
             ]
         }

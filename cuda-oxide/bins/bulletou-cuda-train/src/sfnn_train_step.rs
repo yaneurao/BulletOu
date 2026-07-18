@@ -229,6 +229,7 @@ impl SfnnLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: SfnnTrainLossKind,
+        sigmoid_output_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
         profile: bool,
     ) -> Result<()> {
@@ -275,6 +276,7 @@ impl SfnnLossRangerStepRunner {
                 &self.forward_workspace.output,
                 &self.targets,
                 &self.entry_weights,
+                sigmoid_output_scale,
                 &mut self.loss_workspace,
             )?,
             SfnnTrainLossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(

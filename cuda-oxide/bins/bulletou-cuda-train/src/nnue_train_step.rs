@@ -252,12 +252,22 @@ impl NnueLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
+        sigmoid_output_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
         profile: bool,
     ) -> Result<()> {
         let slot = self.next_slot_index();
         self.synchronize_slot_for_blocking_reuse(slot)?;
-        self.enqueue_step_with_blocking_upload(stream, module, params, loss_kind, batch, slot, profile)?;
+        self.enqueue_step_with_blocking_upload(
+            stream,
+            module,
+            params,
+            loss_kind,
+            sigmoid_output_scale,
+            batch,
+            slot,
+            profile,
+        )?;
         self.last_step_slot = Some(slot);
         Ok(())
     }
@@ -268,6 +278,7 @@ impl NnueLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
+        sigmoid_output_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
         include_debug_readback: bool,
         readback_loss: bool,
@@ -290,6 +301,7 @@ impl NnueLossRangerStepRunner {
             module,
             params,
             loss_kind,
+            sigmoid_output_scale,
             batch,
             slot,
             include_debug_readback,
@@ -355,6 +367,7 @@ impl NnueLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
+        sigmoid_output_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
         slot: usize,
         profile: bool,
@@ -367,7 +380,7 @@ impl NnueLossRangerStepRunner {
             slot_ref.targets.copy_from_host(stream, batch.targets)?;
             slot_ref.entry_weights.copy_from_host(stream, batch.entry_weights)?;
         }
-        self.launch_compute_on_slot(stream, module, params, loss_kind, slot, profile)
+        self.launch_compute_on_slot(stream, module, params, loss_kind, sigmoid_output_scale, slot, profile)
     }
 
     fn enqueue_step_with_async_upload_and_readback(
@@ -376,6 +389,7 @@ impl NnueLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
+        sigmoid_output_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
         slot: usize,
         include_debug_readback: bool,
@@ -410,7 +424,7 @@ impl NnueLossRangerStepRunner {
         stream.wait(&upload_done)?;
         self.slots[slot].upload_done = Some(upload_done);
 
-        self.launch_compute_on_slot(stream, module, params, loss_kind, slot, profile)?;
+        self.launch_compute_on_slot(stream, module, params, loss_kind, sigmoid_output_scale, slot, profile)?;
         if readback_loss {
             self.enqueue_loss_readback(stream, slot, include_debug_readback)?;
         }
@@ -423,6 +437,7 @@ impl NnueLossRangerStepRunner {
         module: &Arc<CudaModule>,
         params: RangerUpdateParams,
         loss_kind: NnueTrainLossKind,
+        sigmoid_output_scale: f32,
         slot: usize,
         profile: bool,
     ) -> Result<()> {
@@ -454,6 +469,7 @@ impl NnueLossRangerStepRunner {
                 &slot_ref.forward_workspace.output,
                 &slot_ref.targets,
                 &slot_ref.entry_weights,
+                sigmoid_output_scale,
                 &mut slot_ref.loss_workspace,
             )?,
             NnueTrainLossKind::NnuePytorchWrm => loss_forward::launch_nnue_pytorch_wrm_loss_from_buffers(

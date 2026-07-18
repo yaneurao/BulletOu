@@ -356,9 +356,10 @@ where
             return;
         }
 
+        let cyclic_resume_offset = if single_epoch { resume_offset } else { resume_offset % total_bytes };
         let mut first_sweep = true;
         let mut consecutive_empty_sweeps = 0usize;
-        let mut latest_offset_for_flush = resume_offset.min(total_bytes);
+        let mut latest_offset_for_flush = cyclic_resume_offset.min(total_bytes);
         const MAX_EMPTY_SWEEPS: usize = 2;
 
         'sweeps: loop {
@@ -368,7 +369,7 @@ where
 
             // Resume support: 初回 sweep だけ `resume_offset` byte だけ全ファイル
             // 連結ストリームを先に進めてから読み始める。2周目以降は先頭から。
-            let mut bytes_to_skip = if first_sweep { resume_offset } else { 0 };
+            let mut bytes_to_skip = if first_sweep { cyclic_resume_offset } else { 0 };
             if bytes_to_skip >= total_bytes {
                 if single_epoch {
                     break 'sweeps;

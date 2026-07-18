@@ -102,8 +102,9 @@ impl AccuracyReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationLossKind {
     /// BulletOu's historical sigmoid MSE:
-    /// `(sigmoid(model_output) - target)^2`, where the score component is
-    /// `sigmoid(teacher_score / eval_scale)`.
+    /// `(sigmoid(model_output / model_output_scale) - target)^2`, where
+    /// `model_output_scale=1` gives the historical logit-style behaviour and
+    /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidMse,
     /// nodchip nnue-pytorch shogi WRM value loss with fixed defaults:
     /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
@@ -126,8 +127,10 @@ fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
 /// Compute sign-agreement accuracy AND the matching test-set loss
 /// from parallel arrays.
 ///
-/// `model_outputs[i]` is the raw network output for position `i` (=
-/// the logit, before `sigmoid` is applied by the loss head).
+/// `model_outputs[i]` is the raw network output for position `i`. For
+/// [`ValidationLossKind::SigmoidMse`], `model_output_scale` controls whether
+/// that output is interpreted as a logit (`1.0`) or a centipawn-like value
+/// (`eval_scale`-style).
 /// `teacher_results[i]` is the actual game outcome from the position's
 /// STM perspective: `+1` (STM won), `0` (draw), `-1` (STM lost).
 ///
@@ -157,7 +160,7 @@ fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
 ///   blend  = 1 - lambda
 ///   result_norm = result == +1 ? 1.0 : result == -1 ? 0.0 : 0.5
 ///   target = blend * result_norm + (1 - blend) * sigmoid(score / scale)
-///   loss   = (sigmoid(model_out) - target)^2
+///   loss   = (sigmoid(model_out / model_output_scale) - target)^2
 /// ```
 ///
 /// `score_drop_abs == Some(cap)` filters out positions with
@@ -185,6 +188,7 @@ pub fn compute_sign_accuracy(
         score_drop_abs,
         lambda,
         eval_scale,
+        1.0,
         ValidationLossKind::SigmoidMse,
     )
 }
@@ -196,6 +200,7 @@ pub fn compute_sign_accuracy_with_loss(
     score_drop_abs: Option<u16>,
     lambda: f32,
     eval_scale: f32,
+    model_output_scale: f32,
     loss_kind: ValidationLossKind,
 ) -> AccuracyReport {
     assert_eq!(model_outputs.len(), teacher_scores.len(), "model_outputs and teacher_scores length mismatch");
@@ -206,6 +211,7 @@ pub fn compute_sign_accuracy_with_loss(
     let mut report = AccuracyReport::default();
     let blend = 1.0 - lambda;
     let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
+    let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
     let mut loss_sum = 0.0f32;
     for (i, (m, &s)) in model_outputs.iter().zip(teacher_scores.iter()).enumerate() {
         if let Some(cap) = score_drop_abs {
@@ -274,7 +280,7 @@ pub fn compute_sign_accuracy_with_loss(
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
-                ValidationLossKind::SigmoidMse => sigmoid(*m),
+                ValidationLossKind::SigmoidMse => sigmoid(*m * model_inv_scale),
                 ValidationLossKind::NnuePytorchWrm => wrm_probability(*m * 600.0, 270.0, 340.0),
             };
             let diff = model_p - target;
@@ -642,7 +648,8 @@ mod tests {
     fn test_loss_can_use_nnue_pytorch_wrm() {
         let m = [0.0, 0.0];
         let t = [400i16, -400];
-        let r = compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, ValidationLossKind::NnuePytorchWrm);
+        let r =
+            compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, 1.0, ValidationLossKind::NnuePytorchWrm);
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");
         assert!(loss.is_finite());
