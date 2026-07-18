@@ -1799,11 +1799,6 @@ impl Args {
             if self.cuda_cpp_weights_bin.is_some() {
                 return Err("--cuda-cpp-weights-bin is not yet supported for cuda-cpp SFNN direct trainer".to_string());
             }
-            if self.cuda_cpp_profile_steps != 0 {
-                return Err(
-                    "--cuda-cpp-profile-steps is not yet supported for cuda-cpp SFNN direct trainer".to_string()
-                );
-            }
         }
 
         match self.cuda_cpp_train_steps {
@@ -3265,6 +3260,10 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     );
     eprintln!("  l1 factorized shared term = {}", if args.sfnn_factorized_l1 { "enabled" } else { "disabled" });
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
+    if profile_steps > 0 {
+        eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
+    }
 
     let initial_weights = build_sfnn_halfka2_initial_weights_for_cuda_cpp(args)?;
     let cuda_shape = initial_weights.shape;
@@ -3295,6 +3294,13 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let mut reported_loss_sum = 0.0_f64;
     let mut reported_loss_count = 0usize;
     let mut last_loss = 0.0_f32;
+    let mut profile_upload_ms = 0.0_f64;
+    let mut profile_forward_ms = 0.0_f64;
+    let mut profile_loss_ms = 0.0_f64;
+    let mut profile_backward_ms = 0.0_f64;
+    let mut profile_update_ms = 0.0_f64;
+    let mut profile_total_ms = 0.0_f64;
+    let mut profile_count = 0usize;
     let started = std::time::Instant::now();
 
     let config = SfnnTeacherBatchConfig {
@@ -3342,7 +3348,30 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+        if seen_steps <= profile_steps {
+            let profile = runner
+                .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
+                .map_err(|e| e.to_string())?;
+            profile_upload_ms += f64::from(profile.upload_ms);
+            profile_forward_ms += f64::from(profile.forward_ms);
+            profile_loss_ms += f64::from(profile.loss_ms);
+            profile_backward_ms += f64::from(profile.backward_ms);
+            profile_update_ms += f64::from(profile.update_ms);
+            profile_total_ms += f64::from(profile.total_ms);
+            profile_count += 1;
+            eprintln!(
+                "  profile_cuda_cpp_sfnn step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
+                 backward={:.3}ms update={:.3}ms total={:.3}ms",
+                profile.upload_ms,
+                profile.forward_ms,
+                profile.loss_ms,
+                profile.backward_ms,
+                profile.update_ms,
+                profile.total_ms
+            );
+        } else {
+            runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+        }
         let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
@@ -3367,6 +3396,19 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         "  cuda-cpp SFNN direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
+    if profile_count > 0 {
+        let denom = profile_count as f64;
+        eprintln!(
+            "  cuda-cpp SFNN profile avg: steps={profile_count}, upload={:.3}ms forward={:.3}ms loss={:.3}ms \
+             backward={:.3}ms update={:.3}ms total={:.3}ms",
+            profile_upload_ms / denom,
+            profile_forward_ms / denom,
+            profile_loss_ms / denom,
+            profile_backward_ms / denom,
+            profile_update_ms / denom,
+            profile_total_ms / denom
+        );
+    }
     eprintln!("  cuda-cpp SFNN direct output = pending (nn.bin/state.bin writer/resume not wired yet)");
 
     Ok(())
@@ -8697,6 +8739,36 @@ mod tests {
             "bulletou",
             "--eval-type",
             "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "3",
+            "--cuda-cpp-profile-steps",
+            "2",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+            assert_eq!(args.cuda_cpp_profile_steps, 2);
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_sfnn_profile_steps_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
             "/dev/null",
             "--backend",

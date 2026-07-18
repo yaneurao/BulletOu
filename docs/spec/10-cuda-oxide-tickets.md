@@ -766,8 +766,11 @@ the tickets in order and commit each completed slice.
   - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --cuda-cpp-train-steps N` now streams real `SfnnTeacherBatchConfig` batches through `SfnnTrainStepRunner`;
   - `crates/bulletou_lib::value` now publicly re-exports the SFNN fixed-layout teacher batch helpers needed by the root CLI;
   - SFNN cuda-cpp direct mode accepts optional `--sfnn-factorized-l1`, with `l1fw/l1fb` zero-initialised to match the existing Bullet CLI semantics;
-  - unsupported SFNN direct resume/input-state (`--cuda-cpp-weights-bin`) and per-stage profiling (`--cuda-cpp-profile-steps`) fail fast until their dedicated C++/CUDA support exists;
+  - unsupported SFNN direct resume/input-state (`--cuda-cpp-weights-bin`) fails fast until dedicated C++/CUDA state loading exists;
   - SFNN initial weights use a deterministic nnue-pytorch-style scratch layout: HalfKA2 base rows plus zero virtual piece rows for the factorized FT, and bucket0-copied stacked L1/L2/L3 weights.
+- Added SFNN per-stage direct-step profiling:
+  - `SfnnTrainStepRunner::step_profiled_no_readback` mirrors the NNUE profiled runner and measures upload, forward, scalar loss, backward, Ranger update, and total CUDA time with events;
+  - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2 --cuda-cpp-profile-steps N` now prints per-step and average SFNN profile lines.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -778,7 +781,7 @@ the tickets in order and commit each completed slice.
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed;
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 256 --buffer-mb 64 --threads 4 --sfnn-factorized-l1` passed on Windows and ran two real HCPE SFNN train steps.
+  - Profile smoke with `--cuda-cpp-train-steps 3 --cuda-cpp-profile-steps 2 --batch-size 256 --buffer-mb 64 --threads 4 --sfnn-factorized-l1` passed and reported average profiled GPU time: upload `0.193ms`, forward `2.232ms`, loss `0.176ms`, backward `4.283ms`, Ranger update `5.870ms`, total `12.753ms`.
 - Remaining BO-CUDA-034 work:
   - add SFNN direct output/checkpoint/resume support after the runner exists;
-  - add SFNN per-stage profiling once the direct loop is stable;
   - run real SFNN teacher-data speed/accuracy comparisons against tatara using the fixed yamaoka validation PSV.
