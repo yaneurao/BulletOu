@@ -562,4 +562,22 @@ commit each completed slice.
 - Full-epoch bs65k yamaoka probes:
   - bo039, `wd=0`, `beta1=0.99`, LR `0.014`: `649265152` positions in `447.735s`, `1450109` pos/s, `test_loss=0.067095526`, `test_acc=0.652298`;
   - bo039, `wd=0`, `beta1=0.9`, LR `0.014`: `649265152` positions in `451.525s`, `1437937` pos/s, `test_loss=0.06694752`, `test_acc=0.6571045`;
-  - speed now clears the tatara target, but held-out loss/accuracy are still short of tatara's `0.064964` / `0.663361`; a bs49k full-epoch quality/speed probe is in progress.
+  - speed now clears the tatara target, but held-out loss/accuracy are still short of tatara's `0.064964` / `0.663361`.
+- Full-epoch bs49k yamaoka probes with bo042:
+  - `wd=0`, `beta1=0.9`, LR `0.0105`: `649297920` positions in `480.784s`, `1350499` pos/s, `test_loss=0.06689378`, `test_acc=0.6546936`;
+  - `wd=0`, `beta1=0.9`, LR `0.014`: `649297920` positions in `467.789s`, `1388014` pos/s, `test_loss=0.06720718`, `test_acc=0.6560669`;
+  - bs49k also clears the speed target, but did not close the quality gap; bs65k/beta1=0.9/LR0.014 remains the best full-epoch comparable BulletOu line so far.
+- Full-epoch bs57k yamaoka probe with bo042:
+  - `wd=0`, `beta1=0.9`, LR `0.01225`: `649248768` positions in `475.050s`, `1366695` pos/s, `test_loss=0.06690939`, `test_acc=0.65657043`;
+  - this also clears the speed target, but quality remains in the same band as bs49k/bs65k and still misses tatara's `0.064964` / `0.663361`.
+- Added SFNN train-step upload pipelining:
+  - the runner now owns two device-batch/upload slots and a separate upload stream, so the next batch's sparse indices, buckets, targets, and weights can be copied while the current compute stream is still executing;
+  - weights, optimizer state, folded L0 buffer, and forward/backward workspaces remain single-stream and are reused in compute-stream order, keeping memory growth small;
+  - `cargo check --features cuda,root-loader --package bulletou-cuda-train`, release build, and `--sfnn-ranger-step-smoke --sfnn-forward-case factorized-tiny` pass.
+- Upload-pipelined bo043 yamaoka probes:
+  - bs40k/50M, `teacher_batch=327680`, `wd=0`, `beta1=0.9`, LR `0.014`: `50339840` positions in `36.600s`, `1375396` pos/s, `test_loss=0.07042214`, `test_acc=0.6411133`;
+  - bs40k/full epoch, `teacher_batch=327680`, `wd=0`, `beta1=0.9`, LR `0.014`: `649256960` positions in `436.040s`, `1488985` pos/s, `test_loss=0.06752966`, `test_acc=0.6534729`;
+  - bs32k/50M, `teacher_batch=262144`, `wd=0`, `beta1=0.9`, LR `0.014`: `50331648` positions in `39.003s`, `1290471` pos/s, `test_loss=0.07143991`, `test_acc=0.64115906`;
+  - bs32k/50M, `teacher_batch=262144`, `wd=0`, `beta1=0.9`, LR `0.020`: `50331648` positions in `38.581s`, `1304582` pos/s, `test_loss=0.07097649`, `test_acc=0.6410217`;
+  - bs16k/50M, `teacher_batch=131072`, `wd=0`, `beta1=0.99`, LR `0.000875`: `50331648` positions in `50.208s`, `1002472` pos/s, `test_loss=0.07336029`, `test_acc=0.6298981`;
+  - the pipelined bs40k line now has ample speed headroom over tatara, but quality is still short; bs32k is the current boundary candidate for recovering quality while keeping speed close to the tatara line.
