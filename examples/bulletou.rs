@@ -2973,8 +2973,6 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
 
     let train_steps = args.cuda_cpp_train_steps.expect("validated cuda-cpp train steps");
     let batch_size = effective_batch_size(args);
-    let input_size = ShogiHalfKP.num_inputs();
-    let max_active = ShogiHalfKP.max_active();
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let device = args.cuda_cpp_device;
 
@@ -2984,11 +2982,16 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     );
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
+    let initial_weights = build_halfkp_initial_weights_for_cuda_cpp(args)?;
+    let input_size = initial_weights.shape.input_size;
+    let max_active = {
+        use bulletou_lib::game::inputs::{Factorised, ShogiHalfKPPieceFactorizer};
+        Factorised::from_parts(ShogiHalfKP, ShogiHalfKPPieceFactorizer).max_active()
+    };
     eprintln!("  batch size = {batch_size}");
-    eprintln!("  arch = {} (input {input_size}, {l1_size}x2-{l2_size}-{l3_size})", args.arch().cli_name());
+    eprintln!("  arch = {} (factorized input {input_size}, {l1_size}x2-{l2_size}-{l3_size})", args.arch().cli_name());
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
 
-    let initial_weights = build_halfkp_initial_weights_for_cuda_cpp(args)?;
     let cuda_shape = CudaNnueForwardShape {
         input_size: initial_weights.shape.input_size,
         l1: initial_weights.shape.l1,
@@ -3036,7 +3039,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
-        ft_factorize: false,
+        ft_factorize: true,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: false,
     };
@@ -3113,66 +3116,61 @@ fn build_halfkp_initial_weights_for_cuda_cpp(
     use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiHalfKP.num_inputs();
+    let base_input_size = ShogiHalfKP.num_inputs();
+    let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+    let input_size = base_input_size + virtual_rows;
     let l1_input_dim = 2 * l1_size;
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
-    let mut rng = CudaCppInitRng::new(0x4255_4c4c_4554_4f75);
+    let mut l0w = vec![0.0_f32; input_size * l1_size];
+    let base_l0w = cuda_cpp_tatara_uniform_abs_init(base_input_size * l1_size, 0x5071_e001, 0.01);
+    for row in 0..base_input_size {
+        let src_start = row * l1_size;
+        let dst_start = (virtual_rows + row) * l1_size;
+        l0w[dst_start..dst_start + l1_size].copy_from_slice(&base_l0w[src_start..src_start + l1_size]);
+    }
+
     let weights = NnueForwardOwnedWeights {
         shape,
-        l0w: cuda_cpp_normal_init(input_size * l1_size, cuda_cpp_affine_stdev(input_size), &mut rng),
-        l0b: vec![0.0; l1_size],
-        l1w: cuda_cpp_normal_init(l1_input_dim * l2_size, cuda_cpp_affine_stdev(l1_input_dim), &mut rng),
-        l1b: vec![0.0; l2_size],
-        l2w: cuda_cpp_normal_init(l2_size * l3_size, cuda_cpp_affine_stdev(l2_size), &mut rng),
-        l2b: vec![0.0; l3_size],
-        outw: cuda_cpp_normal_init(l3_size, cuda_cpp_affine_stdev(l3_size), &mut rng),
-        outb: vec![0.0; 1],
+        l0w,
+        l0b: cuda_cpp_tatara_uniform_abs_init(l1_size, 0x5071_e002, 0.01),
+        l1w: cuda_cpp_tatara_uniform_abs_init(l1_input_dim * l2_size, 0x5071_e003, 0.01),
+        l1b: cuda_cpp_tatara_uniform_abs_init(l2_size, 0x5071_e004, 0.01),
+        l2w: cuda_cpp_tatara_uniform_abs_init(l2_size * l3_size, 0x5071_e005, 0.01),
+        l2b: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e006, 0.01),
+        outw: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e007, 0.01),
+        outb: cuda_cpp_tatara_uniform_abs_init(1, 0x5071_e008, 0.01),
     };
     weights.validate().map_err(|e| e.to_string())?;
     Ok(weights)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_affine_stdev(fan_in: usize) -> f32 {
-    (2.0 / fan_in as f32).sqrt()
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_normal_init(len: usize, stdev: f32, rng: &mut CudaCppInitRng) -> Vec<f32> {
-    let mut values = Vec::with_capacity(len);
-    while values.len() < len {
-        let u1 = rng.next_open01().max(f32::MIN_POSITIVE);
-        let u2 = rng.next_open01();
-        let radius = (-2.0 * u1.ln()).sqrt() * stdev;
-        let theta = std::f32::consts::TAU * u2;
-        values.push(radius * theta.cos());
-        if values.len() < len {
-            values.push(radius * theta.sin());
-        }
-    }
-    values
+fn cuda_cpp_tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> Vec<f32> {
+    let mut rng = CudaCppTataraXorShift::new(seed);
+    (0..len).map(|_| rng.next_signed_unit() * half_width).collect()
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Debug)]
-struct CudaCppInitRng(u64);
+struct CudaCppTataraXorShift {
+    state: u64,
+}
 
 #[cfg(feature = "cuda-cpp-backend")]
-impl CudaCppInitRng {
+impl CudaCppTataraXorShift {
     fn new(seed: u64) -> Self {
-        Self(seed.max(1))
+        Self { state: seed.max(1) }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 7;
-        self.0 ^= self.0 >> 9;
-        self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0
+    fn next_unit(&mut self) -> f32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state >> 11) as f32 / ((1u64 << 53) as f32)
     }
 
-    fn next_open01(&mut self) -> f32 {
-        let mantissa = (self.next_u64() >> 40) as u32;
-        (mantissa as f32 + 0.5) * (1.0 / 16_777_216.0)
+    fn next_signed_unit(&mut self) -> f32 {
+        self.next_unit() * 2.0 - 1.0
     }
 }
 
@@ -7774,6 +7772,33 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_halfkp_initial_weights_use_tatara_factorized_shape() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let weights = build_halfkp_initial_weights_for_cuda_cpp(&args).unwrap();
+        let base_input_size = ShogiHalfKP.num_inputs();
+        let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+        assert_eq!(weights.shape.input_size, base_input_size + virtual_rows);
+        assert!(weights.l0w[..virtual_rows * weights.shape.l1].iter().all(|&v| v == 0.0));
+        assert!(weights.l0w[virtual_rows * weights.shape.l1..].iter().any(|&v| v != 0.0));
+        assert!(weights.l0b.iter().any(|&v| v != 0.0));
     }
 
     #[test]
