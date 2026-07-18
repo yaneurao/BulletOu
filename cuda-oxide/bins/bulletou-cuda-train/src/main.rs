@@ -1299,6 +1299,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         LossKind::NnuePytorchWrm => NnueTrainLossKind::NnuePytorchWrm,
     };
     let test_cache = load_nnue_bridge_test_cache(&args)?;
+    let test_teacher_spec = bridge_test_teacher_spec(&args);
     let log_context = NnueBridgeLogContext {
         batch_size: args.batch_size,
         batches_per_superbatch: args.batches_per_superbatch,
@@ -1494,6 +1495,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                     &checkpoint_learning_rates,
                     &checkpoint_sources,
                     &checkpoint_dataloader_positions,
+                    test_teacher_spec.as_deref(),
                     test_metrics,
                     log_context,
                 )?);
@@ -1628,6 +1630,7 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 checkpoint_lr_entries,
                 checkpoint_source_entries,
                 checkpoint_dataloader_pos_entries,
+                test_teacher_spec.as_deref(),
                 test_metrics,
                 log_context,
             )?);
@@ -1715,6 +1718,9 @@ fn run_nnue_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    state      : {}", checkpoint.state_path.display());
         println!("    state_bin  : {}", checkpoint.state_bin_path.display());
         println!("    teacher    : {}", checkpoint.teacher_spec_path.display());
+        if let Some(path) = &checkpoint.test_teacher_spec_path {
+            println!("    test_teacher: {}", path.display());
+        }
         if let Some(path) = &checkpoint.dataloader_pos_path {
             println!("    loader_pos : {}", path.display());
         }
@@ -1839,6 +1845,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         lambda: 1.0,
     };
     let test_cache = load_nnue_bridge_test_cache(&args)?;
+    let test_teacher_spec = bridge_test_teacher_spec(&args);
 
     let mut runner = None;
     let mut losses = Vec::with_capacity(args.train_steps);
@@ -1997,6 +2004,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                         &checkpoint_learning_rates,
                         &checkpoint_sources,
                         &checkpoint_dataloader_positions,
+                        test_teacher_spec.as_deref(),
                         test_metrics,
                         log_context,
                     )?);
@@ -2093,6 +2101,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 checkpoint_lr_entries,
                 checkpoint_source_entries,
                 checkpoint_dataloader_pos_entries,
+                test_teacher_spec.as_deref(),
                 test_metrics,
                 log_context,
             )?);
@@ -2171,6 +2180,9 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         println!("    nn_bin     : {}", checkpoint.nn_bin_path.display());
         println!("    state_bin  : {}", checkpoint.state_bin_path.display());
         println!("    teacher    : {}", checkpoint.teacher_spec_path.display());
+        if let Some(path) = &checkpoint.test_teacher_spec_path {
+            println!("    test_teacher: {}", path.display());
+        }
         if let Some(path) = &checkpoint.dataloader_pos_path {
             println!("    loader_pos : {}", path.display());
         }
@@ -2191,6 +2203,7 @@ struct NnueBridgeCheckpointWrite {
     state_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
     teacher_spec_path: std::path::PathBuf,
+    test_teacher_spec_path: Option<std::path::PathBuf>,
     dataloader_pos_path: Option<std::path::PathBuf>,
     learn_log_path: std::path::PathBuf,
     summary_log_path: std::path::PathBuf,
@@ -2203,6 +2216,7 @@ struct SfnnBridgeCheckpointWrite {
     nn_bin_path: std::path::PathBuf,
     state_bin_path: std::path::PathBuf,
     teacher_spec_path: std::path::PathBuf,
+    test_teacher_spec_path: Option<std::path::PathBuf>,
     dataloader_pos_path: Option<std::path::PathBuf>,
     learn_log_path: std::path::PathBuf,
     summary_log_path: std::path::PathBuf,
@@ -2210,6 +2224,9 @@ struct SfnnBridgeCheckpointWrite {
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
 const BRIDGE_TEACHER_SPEC_NAME: &str = "teacher.txt";
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+const BRIDGE_TEST_TEACHER_SPEC_NAME: &str = "test_teacher.txt";
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
 const BRIDGE_DATALOADER_POS_NAME: &str = "dataloader_pos.txt";
@@ -2236,6 +2253,20 @@ struct NnueBridgeLogContext {
     batches_per_superbatch: usize,
     superbatches_per_epoch: usize,
     lambda: f32,
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn bridge_test_teacher_spec(args: &Args) -> Option<String> {
+    let path = args.test_teacher.as_ref()?;
+    let sample = match args.test_sample {
+        TestSampleMode::Random => "random",
+        TestSampleMode::Sequential => "sequential",
+    };
+    let mut spec = format!("{}\npositions={}\nsample={sample}\n", path, args.test_positions);
+    if matches!(args.test_sample, TestSampleMode::Random) {
+        spec.push_str(&format!("seed={}\n", args.test_seed));
+    }
+    Some(spec)
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
@@ -2573,6 +2604,7 @@ fn write_nnue_bridge_checkpoint(
     learning_rates: &[f32],
     sources: &[String],
     dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
+    test_teacher_spec: Option<&str>,
     test_metrics: Option<NnueBridgeTestMetrics>,
     log_context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<NnueBridgeCheckpointWrite> {
@@ -2604,6 +2636,7 @@ fn write_nnue_bridge_checkpoint(
     let state_path = dir.join("state.boung");
     let state_bin_path = dir.join("state.bin");
     let teacher_spec_path = dir.join(BRIDGE_TEACHER_SPEC_NAME);
+    let test_teacher_spec_path = dir.join(BRIDGE_TEST_TEACHER_SPEC_NAME);
     let dataloader_pos_path = dir.join(BRIDGE_DATALOADER_POS_NAME);
     let learn_log_path = dir.join("learn.log");
     let summary_log_path = output_dir.join("summary-learn.log");
@@ -2629,6 +2662,7 @@ fn write_nnue_bridge_checkpoint(
     write_nnue_train_state_fixture(&state_path, shape, completed_steps, state)?;
     write_nnue_root_state_bin(&state_bin_path, completed_steps, state)?;
     write_bridge_teacher_spec(&teacher_spec_path, teacher_spec)?;
+    let test_teacher_spec_path = write_bridge_test_teacher_spec(&test_teacher_spec_path, test_teacher_spec)?;
     let dataloader_pos_path = write_nnue_bridge_dataloader_pos(&dataloader_pos_path, dataloader_positions)?;
     write_nnue_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, test_metrics, log_context)?;
     append_nnue_bridge_summary_log(
@@ -2650,6 +2684,7 @@ fn write_nnue_bridge_checkpoint(
         state_path,
         state_bin_path,
         teacher_spec_path,
+        test_teacher_spec_path,
         dataloader_pos_path,
         learn_log_path,
         summary_log_path,
@@ -2667,6 +2702,7 @@ fn write_sfnn_bridge_checkpoint(
     learning_rates: &[f32],
     sources: &[String],
     dataloader_positions: &[Option<bulletou_lib::value::TeacherDataloaderPos>],
+    test_teacher_spec: Option<&str>,
     test_metrics: Option<NnueBridgeTestMetrics>,
     log_context: NnueBridgeLogContext,
 ) -> bulletou_cuda_oxide_runtime::Result<SfnnBridgeCheckpointWrite> {
@@ -2696,6 +2732,7 @@ fn write_sfnn_bridge_checkpoint(
     let nn_bin_path = dir.join("nn.bin");
     let state_bin_path = dir.join("state.bin");
     let teacher_spec_path = dir.join(BRIDGE_TEACHER_SPEC_NAME);
+    let test_teacher_spec_path = dir.join(BRIDGE_TEST_TEACHER_SPEC_NAME);
     let dataloader_pos_path = dir.join(BRIDGE_DATALOADER_POS_NAME);
     let learn_log_path = dir.join("learn.log");
     let summary_log_path = output_dir.join("summary-learn.log");
@@ -2703,6 +2740,7 @@ fn write_sfnn_bridge_checkpoint(
     write_sfnn_halfka2_nn_bin(&nn_bin_path, shape, state)?;
     write_sfnn_root_state_bin(&state_bin_path, completed_steps, state)?;
     write_bridge_teacher_spec(&teacher_spec_path, teacher_spec)?;
+    let test_teacher_spec_path = write_bridge_test_teacher_spec(&test_teacher_spec_path, test_teacher_spec)?;
     let dataloader_pos_path = write_nnue_bridge_dataloader_pos(&dataloader_pos_path, dataloader_positions)?;
     write_sfnn_bridge_learn_log(&learn_log_path, losses, learning_rates, sources, test_metrics, log_context)?;
     append_sfnn_bridge_summary_log(
@@ -2722,6 +2760,7 @@ fn write_sfnn_bridge_checkpoint(
         nn_bin_path,
         state_bin_path,
         teacher_spec_path,
+        test_teacher_spec_path,
         dataloader_pos_path,
         learn_log_path,
         summary_log_path,
@@ -7216,6 +7255,46 @@ fn write_bridge_teacher_spec(path: &std::path::Path, teacher_spec: &str) -> bull
         ))
     })?;
     Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn write_bridge_test_teacher_spec(
+    path: &std::path::Path,
+    test_teacher_spec: Option<&str>,
+) -> bulletou_cuda_oxide_runtime::Result<Option<std::path::PathBuf>> {
+    use std::io::Write as _;
+
+    let Some(test_teacher_spec) = test_teacher_spec else {
+        return Ok(None);
+    };
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path).map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to create bridge checkpoint test_teacher.txt {}: {err}",
+            path.display()
+        ))
+    })?);
+    write!(writer, "{test_teacher_spec}").map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to write bridge checkpoint test_teacher.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !test_teacher_spec.ends_with('\n') {
+        writeln!(writer).map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to write bridge checkpoint test_teacher.txt {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    writer.flush().map_err(|err| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "failed to flush bridge checkpoint test_teacher.txt {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(path.to_path_buf()))
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
