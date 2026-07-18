@@ -182,12 +182,7 @@ where
                 batch_count,
                 loader_start_batch,
                 move |visited_batches| {
-                    hcpe_dataloader_pos_after_batch(
-                        base_byte_offset,
-                        total_bytes,
-                        config.batch_size,
-                        visited_batches,
-                    )
+                    hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
                 visitor,
             )
@@ -248,7 +243,16 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            visit_halfkp_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
+            let loader_start_batch = match config.dataloader_resume_pos {
+                Some(pos) => fixed_record_resume_start_batch(
+                    "PSV",
+                    pos,
+                    config.batch_size,
+                    std::mem::size_of::<PackedSfenValue>(),
+                )?,
+                None => config.batch_index,
+            };
+            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
         }
     }
 }
@@ -316,12 +320,7 @@ where
                 batch_count,
                 loader_start_batch,
                 move |visited_batches| {
-                    hcpe_dataloader_pos_after_batch(
-                        base_byte_offset,
-                        total_bytes,
-                        config.batch_size,
-                        visited_batches,
-                    )
+                    hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
                 visitor,
             )
@@ -382,9 +381,48 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            visit_sfnn_batches(loader, format, config, batch_count, config.batch_index, |_| None, visitor)
+            let loader_start_batch = match config.dataloader_resume_pos {
+                Some(pos) => fixed_record_resume_start_batch(
+                    "PSV",
+                    pos,
+                    config.batch_size,
+                    std::mem::size_of::<PackedSfenValue>(),
+                )?,
+                None => config.batch_index,
+            };
+            visit_sfnn_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
         }
     }
+}
+
+fn fixed_record_resume_start_batch(
+    label: &'static str,
+    pos: TeacherDataloaderPos,
+    batch_size: usize,
+    record_size: usize,
+) -> Result<usize, TeacherBatchError> {
+    if pos.plies != 0 {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "{label} dataloader resume position must have plies=0, got {}",
+            pos.plies
+        )));
+    }
+    if record_size == 0 {
+        return Err(TeacherBatchError::invalid_input(format!("{label} record size must be > 0")));
+    }
+    if pos.byte_offset % record_size as u64 != 0 {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "{label} dataloader resume byte offset {} is not aligned to record size {record_size}",
+            pos.byte_offset
+        )));
+    }
+    let record_index = (pos.byte_offset / record_size as u64) as usize;
+    if record_index % batch_size != 0 {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "{label} dataloader resume record index {record_index} is not aligned to batch-size {batch_size}"
+        )));
+    }
+    Ok(record_index / batch_size)
 }
 
 fn total_hcpe_teacher_bytes(paths: &[String]) -> Result<u64, TeacherBatchError> {
@@ -750,9 +788,44 @@ mod tests {
     #[test]
     fn hcpe_dataloader_pos_wraps_at_teacher_end() {
         let total_bytes = 10 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64;
-        let pos = hcpe_dataloader_pos_after_batch(8 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, total_bytes, 4, 0)
-            .unwrap();
-        assert_eq!(pos, TeacherDataloaderPos { byte_offset: 2 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, plies: 0 });
+        let pos =
+            hcpe_dataloader_pos_after_batch(8 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, total_bytes, 4, 0)
+                .unwrap();
+        assert_eq!(
+            pos,
+            TeacherDataloaderPos { byte_offset: 2 * crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64, plies: 0 }
+        );
+    }
+
+    #[test]
+    fn psv_resume_offset_maps_to_batch_index() {
+        let record_size = std::mem::size_of::<PackedSfenValue>();
+        let pos = TeacherDataloaderPos { byte_offset: (6 * record_size) as u64, plies: 0 };
+        assert_eq!(fixed_record_resume_start_batch("PSV", pos, 3, record_size).unwrap(), 2);
+
+        let bad_plies = TeacherDataloaderPos { byte_offset: 0, plies: 1 };
+        assert!(
+            fixed_record_resume_start_batch("PSV", bad_plies, 3, record_size)
+                .unwrap_err()
+                .to_string()
+                .contains("plies=0")
+        );
+
+        let bad_alignment = TeacherDataloaderPos { byte_offset: 1, plies: 0 };
+        assert!(
+            fixed_record_resume_start_batch("PSV", bad_alignment, 3, record_size)
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+
+        let bad_batch = TeacherDataloaderPos { byte_offset: (5 * record_size) as u64, plies: 0 };
+        assert!(
+            fixed_record_resume_start_batch("PSV", bad_batch, 3, record_size)
+                .unwrap_err()
+                .to_string()
+                .contains("batch-size")
+        );
     }
 
     #[test]

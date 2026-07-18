@@ -1849,6 +1849,12 @@ impl Args {
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
+        if self.cuda_cpp_weights_bin.is_some() && (self.resume || self.no_resume) {
+            return Err(
+                "--backend cuda-cpp: --cuda-cpp-weights-bin is an explicit initial state; do not combine it with --resume/--no-resume"
+                    .to_string(),
+            );
+        }
         if self.nnue_pytorch_layer_clip || self.nnue_pytorch_no_bias_clip {
             return Err(
                 "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
@@ -1865,10 +1871,8 @@ impl Args {
             || self.lr_step_gamma.is_some()
             || self.lr_step_positions.is_some()
             || self.save_rate != 1
-            || self.resume
-            || self.no_resume
         {
-            return Err("--backend cuda-cpp direct trainer does not yet honor production schedule or resume flags; \
+            return Err("--backend cuda-cpp direct trainer does not yet honor production schedule flags; \
                  use --cuda-cpp-train-steps only"
                 .to_string());
         }
@@ -2780,8 +2784,11 @@ fn main() {
         std::process::exit(2);
     }
     if args.backend == BackendKind::CudaCpp {
-        if let Err(e) = record_invocation_to_tag_txt(&args) {
-            eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
+        if !args.cuda_cpp_smoke {
+            prepare_resume_config_or_exit(&args);
+            if let Err(e) = record_invocation_to_tag_txt(&args) {
+                eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
+            }
         }
         if let Err(e) = run_cuda_cpp_backend(&args) {
             eprintln!("error: {e}");
@@ -3056,6 +3063,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     );
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
+    let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_halfkp_initial_state_for_cuda_cpp(args)?;
     let initial_weights = &initial_state.weights;
     if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
@@ -3067,6 +3075,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             "weights only"
         };
         eprintln!("  initial state = {} ({state_kind})", path.display());
+    } else if let Some(path) = auto_resume_state_bin.as_deref() {
+        eprintln!("  initial state = {} (auto-resume weights + Ranger optimizer state)", path.display());
     } else {
         eprintln!("  initial weights = tatara-simple factorized scratch");
     }
@@ -3143,12 +3153,16 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let mut profile_count = 0usize;
     let started = std::time::Instant::now();
     let mut last_dataloader_pos = None;
+    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    if let Some(pos) = dataloader_resume_pos {
+        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+    }
 
     let config = HalfkpTeacherBatchConfig {
         teacher: &args.teacher,
         batch_size,
         batch_index: 0,
-        dataloader_resume_pos: None,
+        dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -3310,6 +3324,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     );
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
+    let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_sfnn_halfka2_initial_state_for_cuda_cpp(args)?;
     let initial_weights = &initial_state.weights;
     if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
@@ -3321,6 +3336,8 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             "weights only"
         };
         eprintln!("  initial state = {} ({state_kind})", path.display());
+    } else if let Some(path) = auto_resume_state_bin.as_deref() {
+        eprintln!("  initial state = {} (auto-resume weights + Ranger optimizer state)", path.display());
     } else {
         eprintln!("  initial weights = deterministic nnue-pytorch-style scratch");
     }
@@ -3385,12 +3402,16 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
     let mut last_dataloader_pos = None;
+    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    if let Some(pos) = dataloader_resume_pos {
+        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+    }
 
     let config = SfnnTeacherBatchConfig {
         teacher: &args.teacher,
         batch_size,
         batch_index: 0,
-        dataloader_resume_pos: None,
+        dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
@@ -3582,6 +3603,37 @@ fn run_cuda_cpp_sfnn_halfka2_final_validation(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_auto_resume_state_bin(args: &Args) -> Option<std::path::PathBuf> {
+    if args.cuda_cpp_weights_bin.is_some() {
+        return None;
+    }
+    let output_dir = args.output_dir();
+    find_latest_state_bin(args, &output_dir)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_auto_resume_dataloader_pos(args: &Args) -> Option<bulletou_lib::value::TeacherDataloaderPos> {
+    if args.cuda_cpp_weights_bin.is_some() {
+        return None;
+    }
+    let output_dir = args.output_dir();
+    if !resume_enabled(args, &output_dir) {
+        return None;
+    }
+    if cuda_cpp_resume_teacher_changed(args, &output_dir) {
+        return None;
+    }
+    read_latest_dataloader_pos(&output_dir)
+        .map(|(byte_offset, plies)| bulletou_lib::value::TeacherDataloaderPos { byte_offset, plies })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_resume_teacher_changed(args: &Args, output_dir: &std::path::Path) -> bool {
+    let Some(prev_teacher) = read_latest_saved_teacher(output_dir) else { return false };
+    prev_teacher.trim() != resolve_teacher_for_log(&args.teacher).trim()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_direct_dataloader_pos(
     args: &Args,
     seen_steps: usize,
@@ -3615,13 +3667,17 @@ fn cuda_cpp_direct_dataloader_pos(
     if total_bytes == 0 {
         return Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
     }
+    let base_byte_offset = cuda_cpp_auto_resume_dataloader_pos(args).map(|pos| pos.byte_offset).unwrap_or(0);
     let consumed_records = seen_steps
         .checked_mul(batch_size)
         .ok_or_else(|| format!("cuda-cpp dataloader_pos overflow: steps={seen_steps} batch_size={batch_size}"))?;
     let consumed_bytes = (consumed_records as u64)
         .checked_mul(record_size as u64)
         .ok_or_else(|| format!("cuda-cpp dataloader_pos byte overflow: records={consumed_records}"))?;
-    Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset: consumed_bytes % total_bytes, plies: 0 })
+    Ok(bulletou_lib::value::TeacherDataloaderPos {
+        byte_offset: base_byte_offset.wrapping_add(consumed_bytes) % total_bytes,
+        plies: 0,
+    })
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3713,10 +3769,14 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     )
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
 
+    let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME))
+        .get("nnue")
+        .copied()
+        .unwrap_or(0);
     let mut learn = String::new();
     learn.push_str(LEARN_LOG_HEADER);
     learn.push('\n');
-    learn.push_str(&cuda_cpp_direct_learn_log_row(args, train_steps, train_loss, test_metrics));
+    learn.push_str(&cuda_cpp_direct_learn_log_row(args, train_steps, train_loss, test_metrics, prior_positions));
     std::fs::write(dir.join("learn.log"), learn)
         .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))?;
     append_to_top_level_log(output_dir, idx)
@@ -3729,6 +3789,7 @@ fn cuda_cpp_direct_learn_log_row(
     train_steps: usize,
     train_loss: f32,
     test_metrics: Option<TestMetrics>,
+    prior_positions: usize,
 ) -> String {
     let eval_field = if args.eval_type().uses_arch() {
         format!("{}-{}", args.eval_type().cli_name(), args.arch().cli_name())
@@ -3739,7 +3800,7 @@ fn cuda_cpp_direct_learn_log_row(
         Some(metrics) => (format!("{:.6}", metrics.accuracy), format!("{:.6}", metrics.loss)),
         None => ("-".to_string(), "-".to_string()),
     };
-    let positions = train_steps.saturating_mul(effective_batch_size(args));
+    let positions = prior_positions.saturating_add(train_steps.saturating_mul(effective_batch_size(args)));
     format!(
         "{eval},1,1,{batch},{test_accuracy},{test_loss},{train_loss:.6},{lr:.6},{lr:.6},{lambda:.6},{positions},{teacher}\n",
         eval = eval_field,
@@ -4005,6 +4066,9 @@ impl CudaCppSfnnOptimizerState {
 fn build_sfnn_halfka2_initial_state_for_cuda_cpp(args: &Args) -> Result<CudaCppSfnnInitialState, String> {
     if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
         return load_cuda_cpp_sfnn_halfka2_initial_state(path, args);
+    }
+    if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
+        return load_cuda_cpp_sfnn_halfka2_initial_state(&path, args);
     }
 
     Ok(CudaCppSfnnInitialState {
@@ -4290,6 +4354,9 @@ impl CudaCppRangerGroupState {
 fn build_halfkp_initial_state_for_cuda_cpp(args: &Args) -> Result<CudaCppHalfkpInitialState, String> {
     if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
         return load_cuda_cpp_halfkp_initial_state(path, args);
+    }
+    if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
+        return load_cuda_cpp_halfkp_initial_state(&path, args);
     }
 
     Ok(CudaCppHalfkpInitialState {
@@ -5610,6 +5677,7 @@ fn resume_signature(args: &Args) -> String {
 
     [
         "schema=bulletou-resume-v2".to_string(),
+        format!("backend={}", args.backend.cli_name()),
         format!("eval_type={}", args.eval_type().cli_name()),
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
@@ -9577,8 +9645,10 @@ mod tests {
         let sig_with = resume_signature(&with_superbatches);
         let sig_without = resume_signature(&without_superbatches);
         assert!(sig_with.contains("schema=bulletou-resume-v2"));
+        assert!(sig_with.contains("backend=bullet"));
         assert!(sig_with.contains("positions_per_superbatch=99942400"));
         assert!(sig_with.contains("superbatches=19"));
+        assert!(sig_with.contains("test_sample=random"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
     }
@@ -9760,6 +9830,122 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_auto_resume_dataloader_pos_skips_changed_teacher() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-direct-teacher-change-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = tmp.join("0001");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.bin"), b"").unwrap();
+        std::fs::write(dir.join("dataloader_pos.txt"), "76,0\n").unwrap();
+        std::fs::write(
+            dir.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1,-,-,0.100000,0.000875,0.000875,1.000000,2,old.hcpe\n"
+            ),
+        )
+        .unwrap();
+        let output = tmp.to_str().unwrap();
+
+        let same_teacher = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "old.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--output",
+            output,
+            "--resume",
+        ])
+        .unwrap();
+        assert_eq!(
+            cuda_cpp_auto_resume_dataloader_pos(&same_teacher).unwrap(),
+            bulletou_lib::value::TeacherDataloaderPos { byte_offset: 76, plies: 0 }
+        );
+
+        let changed_teacher = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "new.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--output",
+            output,
+            "--resume",
+        ])
+        .unwrap();
+        assert_eq!(cuda_cpp_auto_resume_dataloader_pos(&changed_teacher), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_resume_flags_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--resume",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_explicit_weights_with_resume_flags() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--cuda-cpp-weights-bin",
+            "weights.bin",
+            "--resume",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--cuda-cpp-weights-bin"
+        } else {
+            "cuda-cpp-backend"
+        }));
     }
 
     #[test]
@@ -11060,6 +11246,31 @@ mod tests {
         assert_eq!(summary_lines.len(), 2);
         assert_eq!(summary_lines[1].split(',').count(), 11);
         assert!(summary_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,"));
+
+        let dir2 = tmp.join("0002");
+        std::fs::create_dir_all(&dir2).unwrap();
+        write_cuda_cpp_direct_checkpoint_metadata(
+            &tmp,
+            2,
+            &dir2,
+            &args,
+            2,
+            0.5,
+            None,
+            bulletou_lib::value::TeacherDataloaderPos { byte_offset: 1000, plies: 0 },
+        )
+        .unwrap();
+
+        let learn2 = std::fs::read_to_string(dir2.join("learn.log")).unwrap();
+        let learn2_lines = learn2.lines().collect::<Vec<_>>();
+        let learn2_cols = learn2_lines[1].split(',').collect::<Vec<_>>();
+        assert_eq!(learn2_cols[10], "25");
+
+        let summary2 = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let summary2_lines = summary2.lines().collect::<Vec<_>>();
+        assert_eq!(summary2_lines.len(), 3);
+        let summary2_cols = summary2_lines[2].split(',').collect::<Vec<_>>();
+        assert_eq!(summary2_cols[9], "25");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

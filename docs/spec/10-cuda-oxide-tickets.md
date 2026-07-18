@@ -41,7 +41,8 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-031 | done | Windows-native C++/CUDA backend foundation | add a `bulletou-cuda-cpp` crate that compiles `.cu` with Windows `nvcc`, exposes Rust FFI, runs without WSL, and has a real CUDA smoke plus a Ranger/RAdam update kernel smoke |
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
 | BO-CUDA-033 | doing | port fixed-layout NNUE trainer to C++/CUDA | port the mature cuda-oxide HalfKP fixed-layout kernels and checkpoint/log bridge onto the C++/CUDA runtime, then match the BO-CUDA-029 4M tatara-beating recipe on Windows without WSL |
-| BO-CUDA-034 | doing | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
+| BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
+| BO-CUDA-035 | todo | cuda-cpp production schedule parity | teach the Windows-native direct backend to honor normal production `--superbatches` / `--max-epochs` / `--save-rate` / LR schedule semantics instead of requiring manual `--cuda-cpp-train-steps` sizing |
 
 ## Notes
 
@@ -686,7 +687,7 @@ the tickets in order and commit each completed slice.
   - the standalone smoke checks one tiny train step by comparing the runner's updated weights against applying the existing host Ranger update to the CPU reference gradients.
 - Connected the runner to the BulletOu root CLI for a Windows-native direct NNUE HalfKP path:
   - `examples/bulletou --backend cuda-cpp --cuda-cpp-train-steps N --eval-type NNUE_HALFKP` now streams real teacher batches through the shared fixed-layout `HalfkpTeacherBatchConfig`;
-  - the direct path is intentionally limited to Ranger, constant-LR direct steps, and no production checkpoint/resume/validation flags yet;
+  - the direct path is intentionally limited to Ranger and constant-LR direct steps; production schedule flags and HalfKP final validation remain follow-up work;
   - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's `device-cuda` runtime just to create the model.
 - Reduced direct-step synchronization overhead:
   - `NnueTrainStepRunner::step_no_readback` runs upload -> forward -> loss -> backward -> Ranger update without downloading the loss every batch;
@@ -704,7 +705,7 @@ the tickets in order and commit each completed slice.
   - if `nnue/{momentum,velocity,slow}/*` records are present, it restores Ranger optimizer buffers too;
   - if `nnue/step_ranger/*` records are present, the direct trainer continues RAdam's step counter from that value;
   - older weights-only files still load, but their optimizer buffers are reinitialized.
-  - this is direct-mode state replay only: teacher dataloader position, production checkpoint numbering, validation logs, and `--resume` orchestration are still separate remaining work.
+  - this is explicit direct-mode state replay; normal numbered-checkpoint continuation now uses `--resume`/auto-resume, so `--cuda-cpp-weights-bin` is rejected when combined with `--resume` or `--no-resume`.
 - Added direct-step CUDA event profiling:
   - `--cuda-cpp-profile-steps N` profiles only the first N direct train steps, leaving normal unprofiled throughput unaffected afterward;
   - each profiled step prints upload / forward / loss / backward / Ranger update / total GPU time.
@@ -743,8 +744,19 @@ the tickets in order and commit each completed slice.
   - after moving L0 bias backward off atomics, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed, `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed, and the unprofiled 100-step release smoke reported `throughput=910234 pos/s`.
   - Added direct-mode numbered checkpoint/log emission alongside the temporary `cuda-cpp-direct` folder:
     `--backend cuda-cpp --eval-type NNUE_HALFKP --cuda-cpp-train-steps 1 --batch-size 64 --output target\cuda-cpp-numbered-halfkp-smoke` wrote `0001/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}`, top-level `summary-learn.log`, and `tag.txt`; `learn.log` / `summary-learn.log` used the production CSV schemas and `dataloader_pos.txt` was `2432,0`.
+- Added direct-mode auto-resume from numbered checkpoints:
+  - `--backend cuda-cpp` now participates in the normal `resume-config.txt` compatibility check, accepts `--resume` / `--no-resume`, and auto-loads the latest numbered `state.bin` when the output directory is compatible;
+  - the direct path resumes both weights and Ranger optimizer state, restores the completed optimizer-step counter, and passes the latest `dataloader_pos.txt` into the shared teacher batch loader;
+  - if `--resume` is forced while the teacher spec differs from the latest checkpoint, weights/optimizer state still resume but the dataloader starts from the new teacher's beginning, matching the normal BulletOu resume rule;
+  - fixed-record PSV teacher batches now map `TeacherDataloaderPos.byte_offset` back to a batch index for both HalfKP and SFNN, while rejecting nonzero plies, record-misaligned offsets, and batch-misaligned offsets;
+  - direct `learn.log` / `summary-learn.log` rows now keep `positions` cumulative across resumed direct runs.
+- Validation for direct auto-resume:
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test -p bulletou_lib psv_resume_offset_maps_to_batch_index -- --nocapture` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (26 cuda-cpp tests);
+  - HalfKP auto-resume smoke on `target\cuda-cpp-numbered-halfkp-smoke` loaded `0002/state.bin`, printed `initial completed optimizer steps = 2`, ran `optimizer_step=3`, wrote `0003/dataloader_pos.txt = 7296,0`, and the corrected `0003/learn.log` row used cumulative `positions=128`.
 - Remaining BO-CUDA-033 work:
-  - wire direct validation and direct full-state replay into `--resume`/`--no-resume` orchestration;
+  - wire HalfKP direct validation into the C++/CUDA path if it is still needed for standard-NNUE comparisons;
   - add async upload/readback ring and/or CUDA Graph capture around `NnueTrainStepRunner::step`;
   - optimise the correctness-first L0 sparse backward atomic-scatter and Ranger update path, which still dominate the CUDA profile after removing the direct-path zero kernel;
   - rerun the BO-CUDA-029 4M same-PSV tatara-beating comparison on Windows without WSL.
@@ -808,6 +820,9 @@ the tickets in order and commit each completed slice.
 - Added the same direct-mode numbered checkpoint/log emission to SFNN C++ direct:
   - after training, the backend still writes the temporary `<output>/cuda-cpp-direct/{nn.bin,weights.bin}` compatibility folder, and now also writes the production-shaped `<output>/<NNNN>/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}` plus top-level `summary-learn.log`;
   - direct `learn.log` is a one-row production CSV for the completed direct run, with final validation metrics populated when `--test-teacher` is present.
+- Added SFNN direct auto-resume through the same numbered-checkpoint path as HalfKP:
+  - compatible `--backend cuda-cpp --eval-type SFNN_HALFKA2` runs now load the latest numbered `state.bin` automatically, restore optional factorized-L1 weights and Ranger state, and continue the optimizer-step counter;
+  - same-teacher resume passes the stored dataloader position to `SfnnTeacherBatchConfig`, including PSV fixed-record offsets.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -816,7 +831,7 @@ the tickets in order and commit each completed slice.
   - `cargo test -p bulletou-cuda-cpp --lib sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed and printed `sfnn_d: [0.06838137, 0.0869026]`;
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (19 cuda-cpp tests);
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (26 cuda-cpp tests);
   - `cargo run --features cuda-cpp-backend --example bulletou -- --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --backend cuda-cpp --cuda-cpp-train-steps 2 --batch-size 256 --buffer-mb 64 --threads 4 --sfnn-factorized-l1` passed on Windows and ran two real HCPE SFNN train steps.
   - Direct output smoke with `--output target\cuda-cpp-sfnn-output-smoke --cuda-cpp-train-steps 1 --batch-size 256 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0` wrote `cuda-cpp-direct/nn.bin` (135,212,356 bytes) and full-state `weights.bin` (2,190,019,306 bytes).
   - Direct resume smoke with `--cuda-cpp-weights-bin target\cuda-cpp-sfnn-output-smoke\cuda-cpp-direct\weights.bin --output target\cuda-cpp-sfnn-resume-smoke --cuda-cpp-train-steps 1 --batch-size 256 --cuda-cpp-loss-readback-interval 0` restored `weights + Ranger optimizer state`, printed `initial completed optimizer steps = 1`, and ran the next update with `optimizer_step=2`.
@@ -844,12 +859,10 @@ the tickets in order and commit each completed slice.
   - After skipping scalar-loss finalization on non-reported SFNN steps, bs131k/50-step final-only release smoke reported `throughput=1301058 pos/s`, and bs262k/20-step final-only release smoke reported `throughput=1320817 pos/s`.
   - Final-validation wiring checks passed:
     `cargo check --features cuda-cpp-backend --example bulletou`,
-    `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` (22 cuda-cpp tests), and
+    `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` (26 cuda-cpp tests), and
     `cargo test --example bulletou cuda_oxide_backend_accepts_sfnn_halfka2_direct_steps -- --nocapture`.
   - Real-data validation smoke on Windows used training `C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe` and held-out `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 128 --test-sample sequential`; it printed `test_value_accuracy=0.5000000`, `test_value_loss=0.17757529`.
   - Full exported-teacher yamaoka comparison on Windows used `target\full-epoch-sfnn-20260718\teacher-all.psv` for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation:
     `--cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-positions 65536 --test-sample sequential --test-batch-size 8192` reported `649199616` positions in `489.182s`, `throughput=1327112 pos/s`, `test_value_loss=0.05579023`, `test_value_accuracy=0.6717072`.
-- Remaining BO-CUDA-034 work:
-  - wire SFNN cuda-cpp direct full-state replay into auto-resume orchestration (`--resume` / `--no-resume`) instead of requiring explicit `--cuda-cpp-weights-bin`;
-  - add deeper backward profiling/optimisation; the large-batch full-teacher C++ direct comparison now clears the tracked tatara speed/quality target, but the backend still has rough direct-mode ergonomics;
-  - consider a clean repeat run and/or smaller-batch quality-speed recipe after normal checkpoint/log support lands.
+  - Auto-resume smoke for SFNN direct wrote `target\cuda-cpp-sfnn-numbered-resume-smoke\0001`, resumed from `0001/state.bin` with `dataloader resume = byte_offset 608, plies 0`, then wrote `0002`; a follow-up resume from `0002/state.bin` printed `initial completed optimizer steps = 2`, ran `optimizer_step=3`, wrote `0003/dataloader_pos.txt = 1824,0`, and the corrected `0003/learn.log` row used cumulative `positions=32`.
+- BO-CUDA-034 is complete for the tracked tatara speed/quality target and Windows-native auto-resume. Follow-up optimisation and production-schedule ergonomics continue under BO-CUDA-033/035.
