@@ -4911,8 +4911,8 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
         DeviceBuffer,
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-            SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
-            SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
+            SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
+            SfnnStackedL3BackwardLayout,
         },
         sfnn::{
             SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardHostBatch, SfnnForwardHostWeights,
@@ -5009,30 +5009,34 @@ fn run_sfnn_output_backward_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Re
 
     let l1_layout =
         SfnnStackedAffineBackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out(), shape.num_stacks);
-    sfnn_backward::launch_sfnn_stacked_affine_backward(
-        &stream,
-        &module,
-        l1_layout,
-        &forward_workspace.combined,
-        &backward_workspace.l1_gradients,
-        &device_weights.l1w,
-        &device_batch.buckets,
-        &mut backward_workspace.combined_gradients,
-        &mut backward_workspace.l1w_gradients,
-        &mut backward_workspace.l1b_gradients,
-    )?;
-    if let Some(l1fw) = &device_weights.l1fw {
-        let l1f_layout = SfnnSharedL1BackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out());
-        sfnn_backward::launch_sfnn_shared_l1_backward(
+    if let (Some(l1fw), Some(_l1fb)) = (&device_weights.l1fw, &device_weights.l1fb) {
+        sfnn_backward::launch_sfnn_factorized_l1_backward(
             &stream,
             &module,
-            l1f_layout,
+            l1_layout,
             &forward_workspace.combined,
             &backward_workspace.l1_gradients,
+            &device_weights.l1w,
             l1fw,
+            &device_batch.buckets,
             &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1w_gradients,
+            &mut backward_workspace.l1b_gradients,
             &mut backward_workspace.l1fw_gradients,
             &mut backward_workspace.l1fb_gradients,
+        )?;
+    } else {
+        sfnn_backward::launch_sfnn_stacked_affine_backward(
+            &stream,
+            &module,
+            l1_layout,
+            &forward_workspace.combined,
+            &backward_workspace.l1_gradients,
+            &device_weights.l1w,
+            &device_batch.buckets,
+            &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1w_gradients,
+            &mut backward_workspace.l1b_gradients,
         )?;
     }
 
@@ -5137,8 +5141,8 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         DeviceBuffer,
         backward::{
             SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-            SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout,
-            SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
+            SfnnPairwiseBackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
+            SfnnStackedL3BackwardLayout,
         },
         optimizer::SfnnRangerOptimizerStates,
         sfnn::{
@@ -5238,30 +5242,34 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
 
     let l1_layout =
         SfnnStackedAffineBackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out(), shape.num_stacks);
-    sfnn_backward::launch_sfnn_stacked_affine_backward(
-        &stream,
-        &module,
-        l1_layout,
-        &forward_workspace.combined,
-        &backward_workspace.l1_gradients,
-        &device_weights.l1w,
-        &device_batch.buckets,
-        &mut backward_workspace.combined_gradients,
-        &mut backward_workspace.l1w_gradients,
-        &mut backward_workspace.l1b_gradients,
-    )?;
-    if let Some(l1fw) = &device_weights.l1fw {
-        let l1f_layout = SfnnSharedL1BackwardLayout::new(case.batch_size, shape.ft_size, shape.l1_out());
-        sfnn_backward::launch_sfnn_shared_l1_backward(
+    if let (Some(l1fw), Some(_l1fb)) = (&device_weights.l1fw, &device_weights.l1fb) {
+        sfnn_backward::launch_sfnn_factorized_l1_backward(
             &stream,
             &module,
-            l1f_layout,
+            l1_layout,
             &forward_workspace.combined,
             &backward_workspace.l1_gradients,
+            &device_weights.l1w,
             l1fw,
+            &device_batch.buckets,
             &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1w_gradients,
+            &mut backward_workspace.l1b_gradients,
             &mut backward_workspace.l1fw_gradients,
             &mut backward_workspace.l1fb_gradients,
+        )?;
+    } else {
+        sfnn_backward::launch_sfnn_stacked_affine_backward(
+            &stream,
+            &module,
+            l1_layout,
+            &forward_workspace.combined,
+            &backward_workspace.l1_gradients,
+            &device_weights.l1w,
+            &device_batch.buckets,
+            &mut backward_workspace.combined_gradients,
+            &mut backward_workspace.l1w_gradients,
+            &mut backward_workspace.l1b_gradients,
         )?;
     }
 

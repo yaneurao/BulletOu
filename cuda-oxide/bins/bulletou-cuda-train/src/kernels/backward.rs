@@ -653,6 +653,93 @@ pub fn sfnn_shared_l1_backward(
 }
 
 #[kernel]
+pub fn sfnn_factorized_l1_backward(
+    inputs: &[f32],
+    output_gradients: &[f32],
+    weights: &[f32],
+    shared_weights: &[f32],
+    buckets: &[i32],
+    mut input_gradients: DisjointSlice<f32>,
+    mut weight_gradients: DisjointSlice<f32>,
+    mut bias_gradients: DisjointSlice<f32>,
+    mut shared_weight_gradients: DisjointSlice<f32>,
+    mut shared_bias_gradients: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    output_dim: u32,
+    num_stacks: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let batch_size = batch as usize;
+    let input_rows = input_dim as usize;
+    let output_rows = output_dim as usize;
+    let stacks = num_stacks as usize;
+    let input_gradient_len = batch_size * input_rows;
+    let weight_scatter_len = batch_size * input_rows * output_rows;
+    let bias_scatter_len = batch_size * output_rows;
+
+    if tid_value < input_gradient_len {
+        let sample = tid_value / input_rows;
+        let in_col = tid_value - sample * input_rows;
+        let stack_i32 = buckets[sample];
+        let mut sum = 0.0_f32;
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let stack_base = stack * output_rows * input_rows;
+            for out_col in 0..output_rows {
+                let grad = output_gradients[sample * output_rows + out_col];
+                let stacked_weight = weights[stack_base + out_col * input_rows + in_col];
+                let shared_weight = shared_weights[in_col * output_rows + out_col];
+                sum += grad * (stacked_weight + shared_weight);
+            }
+        }
+        if let Some(out) = input_gradients.get_mut(tid) {
+            *out = sum;
+        }
+    }
+
+    if tid_value < weight_scatter_len {
+        let out_col = tid_value % output_rows;
+        let input_entry = tid_value / output_rows;
+        let in_col = input_entry % input_rows;
+        let sample = input_entry / input_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let grad = output_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
+
+            let weight_idx = stack * output_rows * input_rows + out_col * input_rows + in_col;
+            let weight_cell = unsafe { &*(weight_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            weight_cell.fetch_add(grad, AtomicOrdering::Relaxed);
+
+            let shared_weight_idx = in_col * output_rows + out_col;
+            let shared_weight_cell =
+                unsafe { &*(shared_weight_gradients.as_mut_ptr().add(shared_weight_idx) as *const DeviceAtomicF32) };
+            shared_weight_cell.fetch_add(grad, AtomicOrdering::Relaxed);
+        }
+    }
+
+    if tid_value < bias_scatter_len {
+        let out_col = tid_value % output_rows;
+        let sample = tid_value / output_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let grad = output_gradients[sample * output_rows + out_col];
+
+            let stack = stack_i32 as usize;
+            let bias_idx = stack * output_rows + out_col;
+            let bias_cell = unsafe { &*(bias_gradients.as_mut_ptr().add(bias_idx) as *const DeviceAtomicF32) };
+            bias_cell.fetch_add(grad, AtomicOrdering::Relaxed);
+
+            let shared_bias_cell =
+                unsafe { &*(shared_bias_gradients.as_mut_ptr().add(out_col) as *const DeviceAtomicF32) };
+            shared_bias_cell.fetch_add(grad, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+#[kernel]
 pub fn sfnn_pairwise_backward(
     stm_l0: &[f32],
     nstm_l0: &[f32],
@@ -729,23 +816,33 @@ pub fn sfnn_pairwise_l0_sparse_backward_train(
         combined_gradients[combined_base + pairwise + pair] * nstm_activations[l0_base + mate_col] * scale;
     let stm_grad = crelu_pre_gradient_from_value(stm_activations[tid_value], stm_output_grad);
     let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid_value], nstm_output_grad);
+    let has_stm_grad = stm_grad != 0.0_f32;
+    let has_nstm_grad = nstm_grad != 0.0_f32;
 
-    let bias_cell = unsafe { &*(l0b_gradients.as_mut_ptr().add(row) as *const DeviceAtomicF32) };
-    bias_cell.fetch_add(stm_grad + nstm_grad, AtomicOrdering::Relaxed);
+    if has_stm_grad || has_nstm_grad {
+        let bias_cell = unsafe { &*(l0b_gradients.as_mut_ptr().add(row) as *const DeviceAtomicF32) };
+        bias_cell.fetch_add(stm_grad + nstm_grad, AtomicOrdering::Relaxed);
+    } else {
+        return;
+    }
 
     for slot in 0..slots {
-        let stm_feature = stm_indices[sparse_base + slot];
-        if stm_feature >= 0 && (stm_feature as usize) < features {
-            let weight_idx = (stm_feature as usize) * rows + row;
-            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
-            cell.fetch_add(stm_grad, AtomicOrdering::Relaxed);
+        if has_stm_grad {
+            let stm_feature = stm_indices[sparse_base + slot];
+            if stm_feature >= 0 && (stm_feature as usize) < features {
+                let weight_idx = (stm_feature as usize) * rows + row;
+                let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+                cell.fetch_add(stm_grad, AtomicOrdering::Relaxed);
+            }
         }
 
-        let nstm_feature = nstm_indices[sparse_base + slot];
-        if nstm_feature >= 0 && (nstm_feature as usize) < features {
-            let weight_idx = (nstm_feature as usize) * rows + row;
-            let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
-            cell.fetch_add(nstm_grad, AtomicOrdering::Relaxed);
+        if has_nstm_grad {
+            let nstm_feature = nstm_indices[sparse_base + slot];
+            if nstm_feature >= 0 && (nstm_feature as usize) < features {
+                let weight_idx = (nstm_feature as usize) * rows + row;
+                let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+                cell.fetch_add(nstm_grad, AtomicOrdering::Relaxed);
+            }
         }
     }
 }

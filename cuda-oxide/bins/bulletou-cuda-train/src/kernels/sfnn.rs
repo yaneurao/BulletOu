@@ -128,6 +128,51 @@ pub fn sfnn_stacked_l1(
 }
 
 #[kernel]
+pub fn sfnn_stacked_l1_factorized(
+    input: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    shared_weights: &[f32],
+    shared_bias: &[f32],
+    buckets: &[i32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    input_dim: u32,
+    output_dim: u32,
+    num_stacks: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (output_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+
+    let out_col = tid.get() % (output_dim as usize);
+    let sample = tid.get() / (output_dim as usize);
+    let stack_i32 = buckets[sample];
+    if stack_i32 < 0 || (stack_i32 as u32) >= num_stacks {
+        return;
+    }
+
+    let stack = stack_i32 as usize;
+    let rows = output_dim as usize;
+    let input_cols = input_dim as usize;
+    let stack_base = stack * rows * input_cols;
+    let mut sum = bias[stack * rows + out_col] + shared_bias[out_col];
+    let input_base = sample * input_cols;
+    for in_col in 0..input_cols {
+        let input_value = input[input_base + in_col];
+        let stacked_weight = weights[stack_base + out_col * input_cols + in_col];
+        let shared_weight = shared_weights[in_col * rows + out_col];
+        sum += input_value * (stacked_weight + shared_weight);
+    }
+
+    if let Some(out) = output.get_mut(tid) {
+        *out = sum;
+    }
+}
+
+#[kernel]
 pub fn sfnn_shared_l1_add(
     input: &[f32],
     weights: &[f32],

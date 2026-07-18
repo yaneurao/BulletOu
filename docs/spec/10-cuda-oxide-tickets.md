@@ -547,3 +547,11 @@ commit each completed slice.
   - `649265152` positions in `520.834s`, `1246587` pos/s;
   - yamaoka validation `test_loss=0.072359465`, `test_acc=0.6563568`;
   - quality remained well behind the tatara full-epoch target even though accuracy improved with more data.
+- Added small-batch SFNN training refinements:
+  - training-only pairwise/L0 sparse backward now skips atomic adds when the CReLU pre-gradient is exactly zero;
+  - HalfKA2 factorized-L0 forward folding is now used only for batches at least `65536`, because bs16k profiling showed no-fold forward (`~3.0ms`) was faster than fold+forward (`~3.8ms`);
+  - factorized L1 forward/backward can use fused kernels that combine bucket-specific and shared L1 terms in one pass; the factorized-tiny forward and Ranger-step smokes passed against CPU goldens.
+- bs16k/50M yamaoka probe after these changes:
+  - command shape: `--sfnn-teacher-train --sfnn-factorized-l1 --teacher teacher-all.psv --test-teacher /mnt/c/shogi/teacher/test/yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --score-drop-abs 0 --batch-size 16384 --teacher-batch-size 131072 --train-steps 3072 --batches-per-superbatch 3072 --optimizer-weight-decay 0 --learning-rate 0.000875 --lr-schedule step`;
+  - result: `50331648` positions in `53.940s`, `933104` pos/s, `test_loss=0.073467635`, `test_acc=0.62983704`;
+  - this is a modest speed improvement over the earlier bs16k full-superbatch speed line, but still far below the tatara full-epoch speed target; next bottlenecks are the dense RAdam update, sparse L0 backward atomics, and upload/compute pipeline overlap.

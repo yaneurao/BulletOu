@@ -101,40 +101,44 @@ pub(crate) fn launch_sfnn_forward_with_l0(
             ]
         }
     }?;
-    unsafe {
-        // SAFETY: stacked dense dimensions are derived from validated layout
-        // and weight shape. Buckets are copied from validated host batch.
-        cuda_launch! {
-            kernel: crate::kernels::sfnn::sfnn_stacked_l1,
-            stream: stream.clone(),
-            module: module.clone(),
-            config: cfg_1d(plan.stacked_l1_threads),
-            args: [
-                slice(workspace.combined),
-                slice(weights.l1w),
-                slice(weights.l1b),
-                slice(batch.buckets),
-                slice_mut(workspace.l1),
-                batch_size, ft_size, l1_out, num_stacks
-            ]
-        }
-    }?;
     if let (Some(l1fw), Some(l1fb)) = (&weights.l1fw, &weights.l1fb) {
         unsafe {
-            // SAFETY: shared L1 dimensions are derived from the same validated
-            // shape as stacked L1. The kernel adds into the L1 buffer produced
-            // by the previous launch in the same stream.
+            // SAFETY: stacked/shared L1 dimensions are derived from validated
+            // layout and weight shape. The fused kernel writes each L1 output
+            // element once using the per-bucket plus shared factorized weight.
             cuda_launch! {
-                kernel: crate::kernels::sfnn::sfnn_shared_l1_add,
+                kernel: crate::kernels::sfnn::sfnn_stacked_l1_factorized,
                 stream: stream.clone(),
                 module: module.clone(),
-                config: cfg_1d(plan.shared_l1_threads),
+                config: cfg_1d(plan.stacked_l1_threads),
                 args: [
                     slice(workspace.combined),
+                    slice(weights.l1w),
+                    slice(weights.l1b),
                     slice(l1fw),
                     slice(l1fb),
+                    slice(batch.buckets),
                     slice_mut(workspace.l1),
-                    batch_size, ft_size, l1_out
+                    batch_size, ft_size, l1_out, num_stacks
+                ]
+            }
+        }?;
+    } else {
+        unsafe {
+            // SAFETY: stacked dense dimensions are derived from validated layout
+            // and weight shape. Buckets are copied from validated host batch.
+            cuda_launch! {
+                kernel: crate::kernels::sfnn::sfnn_stacked_l1,
+                stream: stream.clone(),
+                module: module.clone(),
+                config: cfg_1d(plan.stacked_l1_threads),
+                args: [
+                    slice(workspace.combined),
+                    slice(weights.l1w),
+                    slice(weights.l1b),
+                    slice(batch.buckets),
+                    slice_mut(workspace.l1),
+                    batch_size, ft_size, l1_out, num_stacks
                 ]
             }
         }?;

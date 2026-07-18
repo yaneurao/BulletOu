@@ -6,8 +6,7 @@ use bulletou_cuda_oxide_runtime::{
     CudaModule, CudaStream, DeviceBuffer, Error, Result,
     backward::{
         SfnnBackwardWorkspace, SfnnBackwardWorkspaceLayout, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLayout,
-        SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout,
-        SfnnStackedL3BackwardLayout,
+        SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLayout,
     },
     loss::{ScalarLossLayout, ScalarLossWorkspace},
     optimizer::{RangerUpdateParams, SfnnRangerOptimizerHostStates, SfnnRangerOptimizerStates},
@@ -148,7 +147,7 @@ impl SfnnLossRangerStepRunner {
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
             SfnnBackwardWorkspace::new(stream, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
-        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape)?;
+        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape, batch_size)?;
 
         Ok(Self {
             shape,
@@ -204,7 +203,7 @@ impl SfnnLossRangerStepRunner {
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
             SfnnBackwardWorkspace::new(stream, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
-        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape)?;
+        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape, batch_size)?;
 
         Ok(Self {
             shape,
@@ -375,33 +374,37 @@ impl SfnnLossRangerStepRunner {
             self.shape.l1_out(),
             self.shape.num_stacks,
         );
-        sfnn_backward::launch_sfnn_stacked_affine_backward(
-            stream,
-            module,
-            l1_layout,
-            &self.forward_workspace.combined,
-            &self.backward_workspace.l1_gradients,
-            &self.device_weights.l1w,
-            &self.device_batch.buckets,
-            &mut self.backward_workspace.combined_gradients,
-            &mut self.backward_workspace.l1w_gradients,
-            &mut self.backward_workspace.l1b_gradients,
-        )?;
-        profile_stage(stream, &mut profile_last, "backward_l1")?;
-        if let Some(l1fw) = &self.device_weights.l1fw {
-            let l1f_layout = SfnnSharedL1BackwardLayout::new(self.batch_size, self.shape.ft_size, self.shape.l1_out());
-            sfnn_backward::launch_sfnn_shared_l1_backward(
+        if let (Some(l1fw), Some(_l1fb)) = (&self.device_weights.l1fw, &self.device_weights.l1fb) {
+            sfnn_backward::launch_sfnn_factorized_l1_backward(
                 stream,
                 module,
-                l1f_layout,
+                l1_layout,
                 &self.forward_workspace.combined,
                 &self.backward_workspace.l1_gradients,
+                &self.device_weights.l1w,
                 l1fw,
+                &self.device_batch.buckets,
                 &mut self.backward_workspace.combined_gradients,
+                &mut self.backward_workspace.l1w_gradients,
+                &mut self.backward_workspace.l1b_gradients,
                 &mut self.backward_workspace.l1fw_gradients,
                 &mut self.backward_workspace.l1fb_gradients,
             )?;
-            profile_stage(stream, &mut profile_last, "backward_l1_shared")?;
+            profile_stage(stream, &mut profile_last, "backward_l1_factorized")?;
+        } else {
+            sfnn_backward::launch_sfnn_stacked_affine_backward(
+                stream,
+                module,
+                l1_layout,
+                &self.forward_workspace.combined,
+                &self.backward_workspace.l1_gradients,
+                &self.device_weights.l1w,
+                &self.device_batch.buckets,
+                &mut self.backward_workspace.combined_gradients,
+                &mut self.backward_workspace.l1w_gradients,
+                &mut self.backward_workspace.l1b_gradients,
+            )?;
+            profile_stage(stream, &mut profile_last, "backward_l1")?;
         }
 
         let l0_layout = SfnnL0SparseBackwardLayout::new(
@@ -535,13 +538,18 @@ const SFNN_HALFKA2_BASE_INPUT_SIZE: usize = 131_949;
 const SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS: usize = 1_629;
 const SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE: usize =
     SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS;
+const SFNN_HALFKA2_FOLD_L0W_MIN_BATCH: usize = 65_536;
 
 fn sfnn_halfka2_ft_factorized_input_size(input_size: usize) -> bool {
     input_size == SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE
 }
 
-fn sfnn_halfka2_folded_l0w(stream: &Arc<CudaStream>, shape: SfnnForwardShape) -> Result<Option<DeviceBuffer<f32>>> {
-    if sfnn_halfka2_ft_factorized_input_size(shape.input_size) {
+fn sfnn_halfka2_folded_l0w(
+    stream: &Arc<CudaStream>,
+    shape: SfnnForwardShape,
+    batch_size: usize,
+) -> Result<Option<DeviceBuffer<f32>>> {
+    if sfnn_halfka2_ft_factorized_input_size(shape.input_size) && batch_size >= SFNN_HALFKA2_FOLD_L0W_MIN_BATCH {
         let len = SFNN_HALFKA2_BASE_INPUT_SIZE.saturating_mul(shape.ft_size);
         Ok(Some(DeviceBuffer::<f32>::zeroed(stream, len)?))
     } else {

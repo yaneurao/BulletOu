@@ -251,6 +251,62 @@ pub(crate) fn launch_sfnn_shared_l1_backward(
 }
 
 #[allow(dead_code)]
+pub(crate) fn launch_sfnn_factorized_l1_backward(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnStackedAffineBackwardLayout,
+    inputs: &DeviceBuffer<f32>,
+    output_gradients: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    shared_weights: &DeviceBuffer<f32>,
+    buckets: &DeviceBuffer<i32>,
+    mut input_gradients: &mut DeviceBuffer<f32>,
+    mut weight_gradients: &mut DeviceBuffer<f32>,
+    mut bias_gradients: &mut DeviceBuffer<f32>,
+    mut shared_weight_gradients: &mut DeviceBuffer<f32>,
+    mut shared_bias_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let plan = SfnnStackedAffineBackwardLaunchPlan::new(layout);
+    let batch = layout.batch_size as u32;
+    let input_dim = layout.input_dim as u32;
+    let output_dim = layout.output_dim as u32;
+    let num_stacks = layout.num_stacks as u32;
+    let scatter_threads = layout.batch_size.saturating_mul(layout.input_dim).saturating_mul(layout.output_dim);
+    let threads = plan.threads.max(scatter_threads);
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_factorized_l1_backward`; the fused
+        // kernel writes the combined input gradient once and accumulates both
+        // per-bucket and shared L1 parameter gradients.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_factorized_l1_backward,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(threads),
+            args: [
+                slice(inputs),
+                slice(output_gradients),
+                slice(weights),
+                slice(shared_weights),
+                slice(buckets),
+                slice_mut(input_gradients),
+                slice_mut(weight_gradients),
+                slice_mut(bias_gradients),
+                slice_mut(shared_weight_gradients),
+                slice_mut(shared_bias_gradients),
+                batch,
+                input_dim,
+                output_dim,
+                num_stacks
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn launch_sfnn_pairwise_backward(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
