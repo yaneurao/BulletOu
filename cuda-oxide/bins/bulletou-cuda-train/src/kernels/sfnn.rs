@@ -10,6 +10,32 @@ const SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS: u32 = 1_629;
 const SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE: u32 = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS;
 
 #[kernel]
+pub fn sfnn_halfka2_fold_factorized_l0w(
+    train_weights: &[f32],
+    mut forward_weights: DisjointSlice<f32>,
+    ft_size: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let rows = ft_size as usize;
+    let base_features = SFNN_HALFKA2_BASE_INPUT_SIZE as usize;
+    let piece_inputs = SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS as usize;
+    let total = base_features * rows;
+    if tid_value >= total {
+        return;
+    }
+
+    let feature = tid_value / rows;
+    let row = tid_value - feature * rows;
+    let virtual_feature = base_features + feature % piece_inputs;
+    let virtual_idx = virtual_feature * rows + row;
+    let value = train_weights[tid_value] + train_weights[virtual_idx];
+    if let Some(out) = forward_weights.get_mut(tid) {
+        *out = value;
+    }
+}
+
+#[kernel]
 pub fn sfnn_sparse_l0_crelu(
     indices: &[i32],
     weights: &[f32],

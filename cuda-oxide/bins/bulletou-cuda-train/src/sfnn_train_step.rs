@@ -70,6 +70,7 @@ pub(crate) struct SfnnLossRangerStepRunner {
     batch_size: usize,
     max_active: usize,
     device_weights: SfnnForwardDeviceWeights,
+    folded_l0w: Option<DeviceBuffer<f32>>,
     optimizer_states: SfnnRangerOptimizerStates,
     device_batch: SfnnForwardDeviceBatch,
     targets: DeviceBuffer<f32>,
@@ -147,12 +148,14 @@ impl SfnnLossRangerStepRunner {
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
             SfnnBackwardWorkspace::new(stream, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
+        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape)?;
 
         Ok(Self {
             shape,
             batch_size,
             max_active,
             device_weights,
+            folded_l0w,
             optimizer_states,
             device_batch,
             targets,
@@ -201,12 +204,14 @@ impl SfnnLossRangerStepRunner {
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
             SfnnBackwardWorkspace::new(stream, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
+        let folded_l0w = sfnn_halfka2_folded_l0w(stream, shape)?;
 
         Ok(Self {
             shape,
             batch_size,
             max_active,
             device_weights,
+            folded_l0w,
             optimizer_states,
             device_batch,
             targets,
@@ -260,13 +265,33 @@ impl SfnnLossRangerStepRunner {
         self.upload_done = Some(stream.record_event(None)?);
         profile_stage(stream, &mut profile_last, "upload")?;
 
-        sfnn_forward::launch_sfnn_forward(
-            stream,
-            module,
-            &self.device_batch,
-            &self.device_weights,
-            &mut self.forward_workspace,
-        )?;
+        if let Some(folded_l0w) = &mut self.folded_l0w {
+            sfnn_forward::launch_sfnn_halfka2_fold_factorized_l0w(
+                stream,
+                module,
+                &self.device_weights.l0w,
+                folded_l0w,
+                self.shape.ft_size,
+            )?;
+            profile_stage(stream, &mut profile_last, "fold_l0w")?;
+            sfnn_forward::launch_sfnn_forward_with_l0(
+                stream,
+                module,
+                &self.device_batch,
+                &self.device_weights,
+                &mut self.forward_workspace,
+                folded_l0w,
+                SFNN_HALFKA2_BASE_INPUT_SIZE,
+            )?;
+        } else {
+            sfnn_forward::launch_sfnn_forward(
+                stream,
+                module,
+                &self.device_batch,
+                &self.device_weights,
+                &mut self.forward_workspace,
+            )?;
+        }
         profile_stage(stream, &mut profile_last, "forward")?;
 
         match loss_kind {
@@ -522,8 +547,22 @@ impl SfnnLossRangerStepRunner {
     }
 }
 
+const SFNN_HALFKA2_BASE_INPUT_SIZE: usize = 131_949;
+const SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS: usize = 1_629;
+const SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE: usize =
+    SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS;
+
 fn sfnn_halfka2_ft_factorized_input_size(input_size: usize) -> bool {
-    input_size == 131_949 + 1_629
+    input_size == SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE
+}
+
+fn sfnn_halfka2_folded_l0w(stream: &Arc<CudaStream>, shape: SfnnForwardShape) -> Result<Option<DeviceBuffer<f32>>> {
+    if sfnn_halfka2_ft_factorized_input_size(shape.input_size) {
+        let len = SFNN_HALFKA2_BASE_INPUT_SIZE.saturating_mul(shape.ft_size);
+        Ok(Some(DeviceBuffer::<f32>::zeroed(stream, len)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn profile_stage(stream: &Arc<CudaStream>, last: &mut Option<std::time::Instant>, label: &'static str) -> Result<()> {

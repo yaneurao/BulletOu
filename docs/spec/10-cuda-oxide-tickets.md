@@ -33,7 +33,9 @@ commit each completed slice.
 | BO-CUDA-025 | done | final folder-teacher parity audit | reran the standard-NNUE parity harness using the requested teacher directory and validation HCPE, confirming same-PSV tatara/BulletOu accuracy parity and BulletOu speed parity |
 | BO-CUDA-026 | done | longer standard NNUE speed benchmark | reran the folder-teacher parity harness on 4M positions and exposed that the remaining gap was not the loader, but tatara's default HalfKP FT factorizer path |
 | BO-CUDA-027 | done | tatara-style HalfKP FT factorizer | BulletOu cuda-oxide standard NNUE training now uses tatara's piece-input factorizer for scratch HalfKP runs, folds it when writing `nn.bin`, and matches tatara's 4M same-PSV loss/accuracy/speed envelope |
-| BO-CUDA-028 | doing | beat tatara on 4M speed and accuracy | reduce cuda-oxide host readback overhead and tune the 4M same-PSV recipe until BulletOu exceeds the latest tatara 4M reference in both held-out accuracy and train throughput |
+| BO-CUDA-028 | done | beat tatara on 4M speed and accuracy | reduce cuda-oxide host readback overhead and tune the 4M same-PSV recipe until BulletOu exceeds the latest tatara 4M reference in both held-out accuracy and train throughput |
+| BO-CUDA-029 | done | NNUE idle recompare after external GPU load stopped | remeasure tatara/BulletOu on the same 4M PSV slice with the GPU idle and record a BulletOu recipe that exceeds tatara in speed and accuracy |
+| BO-CUDA-030 | doing | SFNN full-teacher tatara parity | using the full shuffled SFNN teacher for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, improve `SFNN_halfka2_1024_7_64_k3k3` until BulletOu exceeds tatara in train throughput, held-out loss, and held-out accuracy |
 
 ## Notes
 
@@ -513,3 +515,25 @@ commit each completed slice.
   - the stronger BO-CUDA-028 speed criterion is now met on the 4,194,304-position same-PSV benchmark.
 - Recommended reproducible BulletOu speed/accuracy probe:
   - `--train-steps 256 --batch-size 16384 --batches-per-superbatch 4 --threads 10 --loss-kind nnue-pytorch-wrm --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024 --lr-min 0 --lr-schedule fixed --loss-readback-interval 64`.
+
+### BO-CUDA-030
+
+- Current SFNN target:
+  - train: full exported PSV at `target\full-epoch-sfnn-20260718\teacher-all.psv`;
+  - validation must use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` (`C:\shogi\teacher\test\yamaoka-floodgate.hcpe` may be converted to that PSV in-place if needed);
+  - do not use the shuffled training teacher as held-out validation data.
+- Tatara reference for `SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3`, 1 epoch over the full teacher:
+  - `BatchSize=16384`, `Superbatches=4`, `BatchesPerSuperbatch=9907`, default Ranger schedule;
+  - final superbatch: about `1.29M` pos/s, `test_loss=0.064964`, `test_acc=0.663361` on the yamaoka PSV validation set.
+- BulletOu pre-fold observations:
+  - `BatchSize=262144`, LR `0.056`, 1 epoch: about `1.32M` pos/s, but final `test_loss=0.070951`, `test_acc=0.652969`;
+  - large batches can beat tatara speed, but not yet the held-out loss/accuracy.
+- Added a HalfKA2 factorized-L0 forward folding path for cuda-oxide SFNN training:
+  - before each train step, a CUDA kernel materializes `base_feature_row + virtual_piece_row` into a base-shaped L0 forward buffer;
+  - the backward path still accumulates gradients in the factorized train-state layout and reduces virtual gradients as before;
+  - WSL smoke with nonzero virtual rows: `--sfnn-forward-smoke --sfnn-forward-case halfka2-factorized-nonzero-virtual` passed with max output diff about `7.3e-11`;
+  - WSL train-step smoke with nonzero virtual rows: `--sfnn-ranger-step-smoke --sfnn-forward-case halfka2-factorized-nonzero-virtual` passed.
+- Short real-data probe with yamaoka validation:
+  - command shape: `--sfnn-teacher-train --sfnn-factorized-l1 --teacher teacher-all.psv --test-teacher /mnt/c/shogi/teacher/test/yamaoka-floodgate.psv --test-positions 65536 --test-sample sequential --score-drop-abs 0 --train-steps 192 --batch-size 262144 --teacher-batch-size 262144 --lr 0.056 --lr-schedule fixed`;
+  - result: `50331648` positions in `35.303s`, `1425699` pos/s, `test_loss=0.073977835`, `test_acc=0.63442993`;
+  - this improves the speed side but quality still needs LR/schedule/batch-size work before the full-epoch tatara target is met.

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use bulletou_cuda_oxide_runtime::{
-    CudaModule, CudaStream, LaunchConfig, Result,
+    CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
     sfnn::{
         SfnnForwardDeviceBatch, SfnnForwardDeviceWeights, SfnnForwardLaunchPlan, SfnnForwardWorkspace, SfnnLayoutError,
     },
@@ -22,6 +22,19 @@ pub(crate) fn launch_sfnn_forward(
     weights: &SfnnForwardDeviceWeights,
     workspace: &mut SfnnForwardWorkspace,
 ) -> Result<()> {
+    launch_sfnn_forward_with_l0(stream, module, batch, weights, workspace, &weights.l0w, weights.shape.input_size)
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_forward_with_l0(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &mut SfnnForwardWorkspace,
+    l0w: &DeviceBuffer<f32>,
+    l0_input_size: usize,
+) -> Result<()> {
     validate_forward_layout(batch, weights, workspace)?;
 
     let layout = workspace.layout;
@@ -29,7 +42,7 @@ pub(crate) fn launch_sfnn_forward(
     let plan = SfnnForwardLaunchPlan::new(layout);
     let batch_size = layout.batch_size as u32;
     let max_active = batch.max_active as u32;
-    let input_size = shape.input_size as u32;
+    let input_size = l0_input_size as u32;
     let ft_size = shape.ft_size as u32;
     let l1_out = shape.l1_out() as u32;
     let l1_hidden = shape.l1_hidden as u32;
@@ -48,7 +61,7 @@ pub(crate) fn launch_sfnn_forward(
             config: cfg_1d(plan.sparse_l0_threads_per_perspective),
             args: [
                 slice(batch.stm_indices),
-                slice(weights.l0w),
+                slice(l0w),
                 slice(weights.l0b),
                 slice_mut(workspace.stm_l0),
                 batch_size, max_active, input_size, ft_size
@@ -65,7 +78,7 @@ pub(crate) fn launch_sfnn_forward(
             config: cfg_1d(plan.sparse_l0_threads_per_perspective),
             args: [
                 slice(batch.nstm_indices),
-                slice(weights.l0w),
+                slice(l0w),
                 slice(weights.l0b),
                 slice_mut(workspace.nstm_l0),
                 batch_size, max_active, input_size, ft_size
@@ -179,6 +192,35 @@ pub(crate) fn launch_sfnn_forward(
         }
     }?;
 
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_halfka2_fold_factorized_l0w(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    train_l0w: &DeviceBuffer<f32>,
+    mut forward_l0w: &mut DeviceBuffer<f32>,
+    ft_size: usize,
+) -> Result<()> {
+    let threads = 131_949_usize.saturating_mul(ft_size);
+    let ft_size = ft_size as u32;
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_halfka2_fold_factorized_l0w`.
+        // `forward_l0w` is the base HalfKA2 shape and each thread writes one
+        // disjoint folded weight.
+        cuda_launch! {
+            kernel: crate::kernels::sfnn::sfnn_halfka2_fold_factorized_l0w,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(threads),
+            args: [
+                slice(train_l0w),
+                slice_mut(forward_l0w),
+                ft_size
+            ]
+        }
+    }?;
     Ok(())
 }
 
