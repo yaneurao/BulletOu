@@ -1318,6 +1318,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     cuda_cpp_profile_steps: usize,
 
+    /// Read and print C++/CUDA direct-trainer loss every N steps. This
+    /// synchronises the compute stream, so use 0 for throughput probes
+    /// where only the final loss is needed.
+    #[arg(long, default_value = "10")]
+    cuda_cpp_loss_readback_interval: usize,
+
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
     /// `.psv`), a directory containing such files (all matching files are
     /// concatenated), or a comma-separated list of either. Format is
@@ -3048,6 +3054,14 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     if profile_steps > 0 {
         eprintln!("  cuda-cpp profile steps = {profile_steps}");
     }
+    eprintln!(
+        "  cuda-cpp loss readback interval = {}",
+        if args.cuda_cpp_loss_readback_interval == 0 {
+            "final-only".to_string()
+        } else {
+            args.cuda_cpp_loss_readback_interval.to_string()
+        }
+    );
 
     let cuda_shape = CudaNnueForwardShape {
         input_size: initial_weights.shape.input_size,
@@ -3168,7 +3182,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         } else {
             runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
         }
-        let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
@@ -3264,6 +3278,14 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     if profile_steps > 0 {
         eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
     }
+    eprintln!(
+        "  cuda-cpp SFNN loss readback interval = {}",
+        if args.cuda_cpp_loss_readback_interval == 0 {
+            "final-only".to_string()
+        } else {
+            args.cuda_cpp_loss_readback_interval.to_string()
+        }
+    );
     eprintln!("  cuda-cpp SFNN upload pipeline = enabled (2 slots; non-profiled steps)");
 
     let initial_weights = build_sfnn_halfka2_initial_weights_for_cuda_cpp(args)?;
@@ -3376,7 +3398,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
                 .step_pipelined_no_readback(&ctx, &upload_ctx, params, loss_kind, output_inv_scale, batch)
                 .map_err(|e| e.to_string())?;
         }
-        let should_report = seen_steps == 1 || seen_steps == train_steps || seen_steps % 10 == 0;
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
@@ -4013,6 +4035,17 @@ fn cuda_cpp_tatara_uniform_fan_in_init(len: usize, seed: u64, fan_in: usize, ini
     let fan_in = fan_in.max(1) as f32;
     let half_width = init_scale * (1.0 / fan_in).sqrt();
     cuda_cpp_tatara_uniform_abs_init(len, seed, half_width)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_should_read_loss(step: usize, total_steps: usize, interval: usize) -> bool {
+    if step == total_steps {
+        true
+    } else if interval == 0 {
+        false
+    } else {
+        step == 1 || step % interval == 0
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8791,6 +8824,19 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_loss_readback_interval_controls_reporting_steps() {
+        assert!(cuda_cpp_should_read_loss(1, 50, 10));
+        assert!(cuda_cpp_should_read_loss(10, 50, 10));
+        assert!(!cuda_cpp_should_read_loss(11, 50, 10));
+        assert!(cuda_cpp_should_read_loss(50, 50, 10));
+
+        assert!(!cuda_cpp_should_read_loss(1, 50, 0));
+        assert!(!cuda_cpp_should_read_loss(49, 50, 0));
+        assert!(cuda_cpp_should_read_loss(50, 50, 0));
     }
 
     #[test]

@@ -780,6 +780,9 @@ the tickets in order and commit each completed slice.
   - `SfnnTrainStepRunner` owns two `SfnnTrainStepUploadSlot`s containing sparse indices, buckets, targets, entry weights, upload-ready events, and compute-done events;
   - `step_pipelined_no_readback` uploads the next batch on `upload_ctx`, makes the compute stream wait on the upload-ready event, then records compute-done after Ranger update so slot reuse cannot overwrite buffers still read by kernels;
   - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2` uses the pipeline for non-profiled direct steps while keeping profiled steps serial for clean stage timings.
+- Reduced direct-loop loss readback synchronization:
+  - `--cuda-cpp-loss-readback-interval N` controls how often the direct C++/CUDA trainer synchronizes the compute stream to read/report loss;
+  - the default `10` preserves the previous step1/every10/final reporting cadence, while `0` keeps only the final readback for throughput probes.
 - Validation on Windows, CUDA Toolkit `v13.1`, RTX 4090:
   - `cargo check -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
@@ -807,6 +810,7 @@ the tickets in order and commit each completed slice.
   - Release bs65k no-profile direct smoke after upload pipelining:
     `--cuda-cpp-train-steps 50 --batch-size 65536 --buffer-mb 512 --threads 10 --sfnn-factorized-l1` reported `throughput=1064822 pos/s`;
     a shorter post-display-change bs65k/20-step smoke reported `throughput=1059357 pos/s`.
+  - With final-only loss readback, the same bs65k/50-step release smoke plus `--cuda-cpp-loss-readback-interval 0` reported `throughput=1120866 pos/s`.
 - Remaining BO-CUDA-034 work:
   - add SFNN direct output/checkpoint/resume support after the runner exists;
   - add deeper backward profiling/optimisation; current C++ direct speed is improved but still below the tatara target (`~1.29M pos/s`);
