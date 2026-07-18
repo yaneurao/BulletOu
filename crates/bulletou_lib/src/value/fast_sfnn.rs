@@ -11,7 +11,7 @@ use bullet_gpu::runtime::Gpu;
 use bullet_trainer::model::Model;
 
 use crate::{
-    game::inputs::HALFKA2_DIMENSIONS,
+    game::inputs::{HALFKA2_DIMENSIONS, PIECE_INPUTS},
     value::{FastBatchHost, fast_batch::active_feature_indices},
 };
 
@@ -26,6 +26,8 @@ pub struct SfnnForwardShape {
 
 pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape =
     SfnnForwardShape { input_size: HALFKA2_DIMENSIONS, ft_size: 1024, l1_hidden: 7, l2_size: 64, num_stacks: 9 };
+
+pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
 
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
@@ -363,6 +365,20 @@ fn affine_sparse_padded(weights: &[f32], bias: &[f32], rows: usize, cols: usize,
         for row in 0..rows {
             out[row] += weights[base + row];
         }
+        if let Some(virtual_feature) = halfka2_ft_factorized_virtual_feature(feature, cols) {
+            let base = virtual_feature * rows;
+            for row in 0..rows {
+                out[row] += weights[base + row];
+            }
+        }
+    }
+}
+
+fn halfka2_ft_factorized_virtual_feature(feature: usize, cols: usize) -> Option<usize> {
+    if cols == SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE && feature < HALFKA2_DIMENSIONS {
+        Some(HALFKA2_DIMENSIONS + feature % PIECE_INPUTS)
+    } else {
+        None
     }
 }
 
@@ -371,29 +387,29 @@ fn affine_stacked(
     bias: &[f32],
     input: &[f32],
     rows: usize,
-    num_stacks: usize,
+    _num_stacks: usize,
     stack: usize,
     out: &mut [f32],
 ) {
     let bias_base = stack * rows;
     out.copy_from_slice(&bias[bias_base..bias_base + rows]);
-    let stack_stride = num_stacks * rows;
+    let stack_base = stack * rows * input.len();
     for (input_idx, &x) in input.iter().enumerate() {
         if x == 0.0 {
             continue;
         }
-        let base = input_idx * stack_stride + stack * rows;
         for row in 0..rows {
-            out[row] += weights[base + row] * x;
+            out[row] += weights[stack_base + row * input.len() + input_idx] * x;
         }
     }
 }
 
-fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], num_stacks: usize, stack: usize) -> f32 {
+fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], _num_stacks: usize, stack: usize) -> f32 {
     let mut out = bias[stack];
+    let stack_base = stack * input.len();
     for (input_idx, &x) in input.iter().enumerate() {
         if x != 0.0 {
-            out += weights[input_idx * num_stacks + stack] * x;
+            out += weights[stack_base + input_idx] * x;
         }
     }
     out
@@ -402,8 +418,9 @@ fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], num_stack
 fn pairwise_mul_scaled(input: &[f32], out: &mut [f32]) {
     debug_assert_eq!(input.len() / 2, out.len());
     const SCALE: f32 = 127.0 / 128.0;
-    for (idx, pair) in input.chunks_exact(2).enumerate() {
-        out[idx] = pair[0] * pair[1] * SCALE;
+    let half = input.len() / 2;
+    for idx in 0..half {
+        out[idx] = input[idx] * input[half + idx] * SCALE;
     }
 }
 

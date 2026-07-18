@@ -290,61 +290,151 @@ fn nnue_ranger_params_with_clamp(
 }
 
 #[allow(dead_code)]
+pub(crate) fn launch_radam_update_reset_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: RAdamUpdateLayout,
+    params: RAdamUpdateParams,
+    mut gradients: &mut DeviceBuffer<f32>,
+    mut weights: &mut DeviceBuffer<f32>,
+    mut momentum: &mut DeviceBuffer<f32>,
+    mut velocity: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    params.validate()?;
+    let step_scale = params.step_scale()?;
+    let plan = RAdamUpdateLaunchPlan::new(layout);
+    let len = layout.len as u32;
+    let use_denom = u32::from(step_scale.use_denom);
+
+    unsafe {
+        // SAFETY: kernel ABI matches `radam_update_reset_gradients`; all
+        // buffers are device allocations owned by the same CUDA context and
+        // live until the caller synchronizes.
+        cuda_launch! {
+            kernel: crate::kernels::optimizer::radam_update_reset_gradients,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(plan.threads),
+            args: [
+                slice_mut(gradients),
+                slice_mut(weights),
+                slice_mut(momentum),
+                slice_mut(velocity),
+                len,
+                params.gradient_factor,
+                params.learning_rate,
+                step_scale.step_size,
+                use_denom,
+                params.decay,
+                params.beta1,
+                params.beta2,
+                params.epsilon,
+                params.min_weight,
+                params.max_weight
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_ranger_update_reset_gradients(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: RangerUpdateLayout,
+    params: RangerUpdateParams,
+    gradients: &mut DeviceBuffer<f32>,
+    weights: &mut DeviceBuffer<f32>,
+    state: &mut RangerOptimizerState,
+) -> Result<()> {
+    layout.validate()?;
+    params.validate()?;
+    ensure_ranger_state_len("ranger_update_reset_gradients", layout, state)?;
+    launch_radam_update_reset_gradients(
+        stream,
+        module,
+        RAdamUpdateLayout::new(layout.len),
+        params.radam,
+        gradients,
+        weights,
+        &mut state.momentum,
+        &mut state.velocity,
+    )?;
+
+    if params.should_lookahead()? {
+        launch_ranger_lookahead(
+            stream,
+            module,
+            RangerLookaheadLayout::new(layout.len),
+            params.lookahead,
+            weights,
+            &mut state.slow_params,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn launch_sfnn_ranger_update(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     params: RangerUpdateParams,
     weights: &mut SfnnForwardDeviceWeights,
-    gradients: &SfnnBackwardWorkspace,
+    gradients: &mut SfnnBackwardWorkspace,
     states: &mut SfnnRangerOptimizerStates,
 ) -> Result<()> {
     ensure_sfnn_update_shapes(weights, gradients, states)?;
     let layout = states.layout;
+    let no_clamp_params = nnue_ranger_params_with_clamp(params, NNUE_NO_CLAMP_MIN, NNUE_NO_CLAMP_MAX);
+    let quant_clamp_params = nnue_ranger_params_with_clamp(params, NNUE_QUANT_CLAMP_MIN, NNUE_QUANT_CLAMP_MAX);
 
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l0w_state_layout().state_len()),
-        params,
-        &gradients.l0w_gradients,
+        no_clamp_params,
+        &mut gradients.l0w_gradients,
         &mut weights.l0w,
         &mut states.l0w,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l0b_state_layout().state_len()),
-        params,
-        &gradients.l0b_gradients,
+        no_clamp_params,
+        &mut gradients.l0b_gradients,
         &mut weights.l0b,
         &mut states.l0b,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l1w_state_layout().state_len()),
-        params,
-        &gradients.l1w_gradients,
+        quant_clamp_params,
+        &mut gradients.l1w_gradients,
         &mut weights.l1w,
         &mut states.l1w,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l1b_state_layout().state_len()),
-        params,
-        &gradients.l1b_gradients,
+        quant_clamp_params,
+        &mut gradients.l1b_gradients,
         &mut weights.l1b,
         &mut states.l1b,
     )?;
     match (&mut weights.l1fw, &mut states.l1fw) {
         (Some(l1fw), Some(l1fw_state)) => {
-            launch_ranger_update(
+            launch_ranger_update_reset_gradients(
                 stream,
                 module,
                 RangerUpdateLayout::new(layout.l1fw_state_layout().state_len()),
-                params,
-                &gradients.l1fw_gradients,
+                quant_clamp_params,
+                &mut gradients.l1fw_gradients,
                 l1fw,
                 l1fw_state,
             )?;
@@ -356,12 +446,12 @@ pub(crate) fn launch_sfnn_ranger_update(
     }
     match (&mut weights.l1fb, &mut states.l1fb) {
         (Some(l1fb), Some(l1fb_state)) => {
-            launch_ranger_update(
+            launch_ranger_update_reset_gradients(
                 stream,
                 module,
                 RangerUpdateLayout::new(layout.l1fb_state_layout().state_len()),
-                params,
-                &gradients.l1fb_gradients,
+                quant_clamp_params,
+                &mut gradients.l1fb_gradients,
                 l1fb,
                 l1fb_state,
             )?;
@@ -371,39 +461,39 @@ pub(crate) fn launch_sfnn_ranger_update(
             return Err(Error::Smoke("SFNN shared L1 weight/state mismatch for l1fb update".to_string()));
         }
     }
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l2w_state_layout().state_len()),
-        params,
-        &gradients.l2w_gradients,
+        quant_clamp_params,
+        &mut gradients.l2w_gradients,
         &mut weights.l2w,
         &mut states.l2w,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l2b_state_layout().state_len()),
-        params,
-        &gradients.l2b_gradients,
+        quant_clamp_params,
+        &mut gradients.l2b_gradients,
         &mut weights.l2b,
         &mut states.l2b,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l3w_state_layout().state_len()),
-        params,
-        &gradients.l3w_gradients,
+        quant_clamp_params,
+        &mut gradients.l3w_gradients,
         &mut weights.l3w,
         &mut states.l3w,
     )?;
-    launch_ranger_update(
+    launch_ranger_update_reset_gradients(
         stream,
         module,
         RangerUpdateLayout::new(layout.l3b_state_layout().state_len()),
-        params,
-        &gradients.l3b_gradients,
+        no_clamp_params,
+        &mut gradients.l3b_gradients,
         &mut weights.l3b,
         &mut states.l3b,
     )?;

@@ -2,27 +2,27 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Add, Div, Mul, Neg, Sub},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use bullet_compiler::{
     ir::NodeId,
     tensor::{
+        DType, DValue, IRBuilder, Size, TNode, TType, TValue,
         operation::{
+            BroadcastAcrossDimension, CABinary, CABinaryOp, Matmul, MatrixLayout, PadAcrossDimension, PassThrough,
+            Power, ReduceAcrossDimension, Reduction, Select, SliceAcrossDimension, SparseMatmul, Unary, UnaryOp,
             autograd::{
                 Autograd, AutogradOp, CReLU, DiffableFromOutput, DiffableFromOutputOp, FauxQuantise, ReLU, SCReLU,
                 Sigmoid, SoftmaxCrossEntropyLoss,
             },
-            BroadcastAcrossDimension, CABinary, CABinaryOp, Matmul, MatrixLayout, PadAcrossDimension, PassThrough,
-            Power, ReduceAcrossDimension, Reduction, Select, SliceAcrossDimension, SparseMatmul, Unary, UnaryOp,
         },
         transform::{
             autograd::{LowerForward, TakeGradient},
             inline::InlineSubgraphs,
         },
-        DType, DValue, IRBuilder, Size, TNode, TType, TValue,
     },
 };
 use bullet_gpu::{
@@ -31,7 +31,7 @@ use bullet_gpu::{
     runtime::{Device, Gpu},
 };
 
-use crate::model::{make_tensor_bindings, rng, Model, Shape};
+use crate::model::{Model, Shape, make_tensor_bindings, rng};
 
 /// 重みテンソルの初期化方式。
 ///

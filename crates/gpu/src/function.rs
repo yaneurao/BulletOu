@@ -308,10 +308,7 @@ impl<G: Gpu> Function<G> {
     }
 
     pub fn input_slot(&self, node: NodeId) -> Option<FunctionInput> {
-        self.maps
-            .binary_search_by_key(&node, |(node, _)| *node)
-            .ok()
-            .map(|idx| self.maps[idx].1)
+        self.maps.binary_search_by_key(&node, |(node, _)| *node).ok().map(|idx| self.maps[idx].1)
     }
 
     pub fn execute_resolved_binding_refs<'a>(

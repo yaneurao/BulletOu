@@ -3,15 +3,12 @@
 use crate::{nnue::NnueForwardWeightLayout, sfnn::SfnnForwardWeightLayout};
 
 #[cfg(feature = "cuda")]
-use crate::{
-    nnue::NnueForwardHostWeights, sfnn::SfnnForwardHostWeights, CudaStream, DeviceBuffer, Result,
-};
+use crate::{CudaStream, DeviceBuffer, Result, nnue::NnueForwardHostWeights, sfnn::SfnnForwardHostWeights};
 
 pub const ADAMW_UPDATE_KERNEL: &str = "adamw_update";
 pub const RADAM_UPDATE_KERNEL: &str = "radam_update";
 pub const RANGER_LOOKAHEAD_KERNEL: &str = "ranger_lookahead";
-pub const OPTIMIZER_KERNEL_NAMES: [&str; 3] =
-    [ADAMW_UPDATE_KERNEL, RADAM_UPDATE_KERNEL, RANGER_LOOKAHEAD_KERNEL];
+pub const OPTIMIZER_KERNEL_NAMES: [&str; 3] = [ADAMW_UPDATE_KERNEL, RADAM_UPDATE_KERNEL, RANGER_LOOKAHEAD_KERNEL];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdamWUpdateParams {
@@ -54,10 +51,7 @@ impl AdamWUpdateParams {
             Err(OptimizerLayoutError::InvalidBeta { name: "beta2" })
         } else if !(self.epsilon.is_finite() && self.epsilon > 0.0) {
             Err(OptimizerLayoutError::InvalidEpsilon)
-        } else if !(self.min_weight.is_finite()
-            && self.max_weight.is_finite()
-            && self.min_weight <= self.max_weight)
-        {
+        } else if !(self.min_weight.is_finite() && self.max_weight.is_finite() && self.min_weight <= self.max_weight) {
             Err(OptimizerLayoutError::InvalidClamp)
         } else {
             Ok(())
@@ -76,11 +70,7 @@ impl OptimizerStateLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
-        if self.len == 0 {
-            Err(OptimizerLayoutError::EmptyParameters)
-        } else {
-            Ok(())
-        }
+        if self.len == 0 { Err(OptimizerLayoutError::EmptyParameters) } else { Ok(()) }
     }
 
     pub fn state_len(self) -> usize {
@@ -372,16 +362,8 @@ impl NnueRangerOptimizerStates {
             l1b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l1b_state_layout(), weights.l1b)?,
             l2w: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2w_state_layout(), weights.l2w)?,
             l2b: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.l2b_state_layout(), weights.l2b)?,
-            outw: RangerOptimizerState::zeroed_with_host_slow_params(
-                stream,
-                layout.outw_state_layout(),
-                weights.outw,
-            )?,
-            outb: RangerOptimizerState::zeroed_with_host_slow_params(
-                stream,
-                layout.outb_state_layout(),
-                weights.outb,
-            )?,
+            outw: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.outw_state_layout(), weights.outw)?,
+            outb: RangerOptimizerState::zeroed_with_host_slow_params(stream, layout.outb_state_layout(), weights.outb)?,
         })
     }
 
@@ -511,6 +493,30 @@ impl SfnnRangerOptimizerStates {
         })
     }
 
+    pub fn zeroed_for_host_weights(stream: &CudaStream, weights: &SfnnForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        let layout = SfnnOptimizerStateLayout::new(SfnnForwardWeightLayout::new(weights.shape));
+        Ok(Self {
+            layout,
+            l0w: RangerOptimizerState::new_zeroed(stream, layout.l0w_state_layout())?,
+            l0b: RangerOptimizerState::new_zeroed(stream, layout.l0b_state_layout())?,
+            l1w: RangerOptimizerState::new_zeroed(stream, layout.l1w_state_layout())?,
+            l1b: RangerOptimizerState::new_zeroed(stream, layout.l1b_state_layout())?,
+            l1fw: match weights.l1fw {
+                Some(_) => Some(RangerOptimizerState::new_zeroed(stream, layout.l1fw_state_layout())?),
+                None => None,
+            },
+            l1fb: match weights.l1fb {
+                Some(_) => Some(RangerOptimizerState::new_zeroed(stream, layout.l1fb_state_layout())?),
+                None => None,
+            },
+            l2w: RangerOptimizerState::new_zeroed(stream, layout.l2w_state_layout())?,
+            l2b: RangerOptimizerState::new_zeroed(stream, layout.l2b_state_layout())?,
+            l3w: RangerOptimizerState::new_zeroed(stream, layout.l3w_state_layout())?,
+            l3b: RangerOptimizerState::new_zeroed(stream, layout.l3b_state_layout())?,
+        })
+    }
+
     pub fn from_host_weights(stream: &CudaStream, weights: &SfnnForwardHostWeights<'_>) -> Result<Self> {
         weights.validate()?;
         let layout = SfnnOptimizerStateLayout::new(SfnnForwardWeightLayout::new(weights.shape));
@@ -621,10 +627,7 @@ impl RAdamUpdateParams {
             Err(OptimizerLayoutError::InvalidNSmaThreshold)
         } else if !(self.epsilon.is_finite() && self.epsilon > 0.0) {
             Err(OptimizerLayoutError::InvalidEpsilon)
-        } else if !(self.min_weight.is_finite()
-            && self.max_weight.is_finite()
-            && self.min_weight <= self.max_weight)
-        {
+        } else if !(self.min_weight.is_finite() && self.max_weight.is_finite() && self.min_weight <= self.max_weight) {
             Err(OptimizerLayoutError::InvalidClamp)
         } else {
             let step = self.step_scale()?;
@@ -716,11 +719,7 @@ impl RangerUpdateParams {
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
         self.radam.validate()?;
         self.lookahead.validate()?;
-        if self.k == 0 {
-            Err(OptimizerLayoutError::InvalidLookaheadPeriod)
-        } else {
-            Ok(())
-        }
+        if self.k == 0 { Err(OptimizerLayoutError::InvalidLookaheadPeriod) } else { Ok(()) }
     }
 
     pub fn should_lookahead(self) -> std::result::Result<bool, OptimizerLayoutError> {
@@ -740,11 +739,7 @@ impl AdamWUpdateLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
-        if self.len == 0 {
-            Err(OptimizerLayoutError::EmptyParameters)
-        } else {
-            Ok(())
-        }
+        if self.len == 0 { Err(OptimizerLayoutError::EmptyParameters) } else { Ok(()) }
     }
 }
 
@@ -770,11 +765,7 @@ impl RAdamUpdateLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
-        if self.len == 0 {
-            Err(OptimizerLayoutError::EmptyParameters)
-        } else {
-            Ok(())
-        }
+        if self.len == 0 { Err(OptimizerLayoutError::EmptyParameters) } else { Ok(()) }
     }
 }
 
@@ -800,11 +791,7 @@ impl RangerLookaheadLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
-        if self.len == 0 {
-            Err(OptimizerLayoutError::EmptyParameters)
-        } else {
-            Ok(())
-        }
+        if self.len == 0 { Err(OptimizerLayoutError::EmptyParameters) } else { Ok(()) }
     }
 }
 
@@ -830,11 +817,7 @@ impl RangerUpdateLayout {
     }
 
     pub fn validate(self) -> std::result::Result<(), OptimizerLayoutError> {
-        if self.len == 0 {
-            Err(OptimizerLayoutError::EmptyParameters)
-        } else {
-            Ok(())
-        }
+        if self.len == 0 { Err(OptimizerLayoutError::EmptyParameters) } else { Ok(()) }
     }
 }
 
@@ -909,10 +892,7 @@ mod tests {
 
     #[test]
     fn adamw_layout_rejects_empty_parameters() {
-        assert_eq!(
-            AdamWUpdateLayout::new(0).validate().unwrap_err(),
-            OptimizerLayoutError::EmptyParameters
-        );
+        assert_eq!(AdamWUpdateLayout::new(0).validate().unwrap_err(), OptimizerLayoutError::EmptyParameters);
     }
 
     #[test]
@@ -935,32 +915,23 @@ mod tests {
             OptimizerLayoutError::InvalidEpsilon
         );
         assert_eq!(
-            AdamWUpdateParams { min_weight: 2.0, max_weight: 1.0, ..Default::default() }
-                .validate()
-                .unwrap_err(),
+            AdamWUpdateParams { min_weight: 2.0, max_weight: 1.0, ..Default::default() }.validate().unwrap_err(),
             OptimizerLayoutError::InvalidClamp
         );
     }
 
     #[test]
     fn optimizer_state_layout_rejects_empty_parameters() {
-        assert_eq!(
-            OptimizerStateLayout::new(0).validate().unwrap_err(),
-            OptimizerLayoutError::EmptyParameters
-        );
+        assert_eq!(OptimizerStateLayout::new(0).validate().unwrap_err(), OptimizerLayoutError::EmptyParameters);
     }
 
     #[test]
     fn momentum_velocity_host_state_validates_lengths() {
         let layout = OptimizerStateLayout::new(3);
-        MomentumVelocityHostState { momentum: &[0.0; 3], velocity: &[0.0; 3] }
-            .validate(layout)
-            .unwrap();
+        MomentumVelocityHostState { momentum: &[0.0; 3], velocity: &[0.0; 3] }.validate(layout).unwrap();
 
         assert_eq!(
-            MomentumVelocityHostState { momentum: &[0.0; 2], velocity: &[0.0; 3] }
-                .validate(layout)
-                .unwrap_err(),
+            MomentumVelocityHostState { momentum: &[0.0; 2], velocity: &[0.0; 3] }.validate(layout).unwrap_err(),
             OptimizerLayoutError::StateLength { name: "momentum", expected: 3, actual: 2 }
         );
     }
@@ -982,8 +953,7 @@ mod tests {
 
     #[test]
     fn nnue_optimizer_state_layout_counts_parameter_groups() {
-        let weights =
-            NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
+        let weights = NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
         let layout = NnueOptimizerStateLayout::new(weights);
 
         assert_eq!(layout.l0w_state_layout().state_len(), 8);
@@ -1001,34 +971,14 @@ mod tests {
 
     #[test]
     fn nnue_ranger_host_states_validate_group_lengths() {
-        let weights =
-            NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
+        let weights = NnueForwardWeightLayout::new(NnueForwardShape { input_size: 4, l1: 2, l2: 3, l3: 1 });
         let layout = NnueOptimizerStateLayout::new(weights);
-        let l0w_state = RangerOptimizerHostState {
-            momentum: &[0.0; 8],
-            velocity: &[0.0; 8],
-            slow_params: &[0.0; 8],
-        };
-        let l0b_state = RangerOptimizerHostState {
-            momentum: &[0.0; 2],
-            velocity: &[0.0; 2],
-            slow_params: &[0.0; 2],
-        };
-        let l1w_state = RangerOptimizerHostState {
-            momentum: &[0.0; 12],
-            velocity: &[0.0; 12],
-            slow_params: &[0.0; 12],
-        };
-        let l1b_state = RangerOptimizerHostState {
-            momentum: &[0.0; 3],
-            velocity: &[0.0; 3],
-            slow_params: &[0.0; 3],
-        };
-        let len1_state = RangerOptimizerHostState {
-            momentum: &[0.0; 1],
-            velocity: &[0.0; 1],
-            slow_params: &[0.0; 1],
-        };
+        let l0w_state = RangerOptimizerHostState { momentum: &[0.0; 8], velocity: &[0.0; 8], slow_params: &[0.0; 8] };
+        let l0b_state = RangerOptimizerHostState { momentum: &[0.0; 2], velocity: &[0.0; 2], slow_params: &[0.0; 2] };
+        let l1w_state =
+            RangerOptimizerHostState { momentum: &[0.0; 12], velocity: &[0.0; 12], slow_params: &[0.0; 12] };
+        let l1b_state = RangerOptimizerHostState { momentum: &[0.0; 3], velocity: &[0.0; 3], slow_params: &[0.0; 3] };
+        let len1_state = RangerOptimizerHostState { momentum: &[0.0; 1], velocity: &[0.0; 1], slow_params: &[0.0; 1] };
 
         NnueRangerOptimizerHostStates {
             l0w: l0w_state,
@@ -1045,11 +995,7 @@ mod tests {
 
         assert_eq!(
             NnueRangerOptimizerHostStates {
-                l0w: RangerOptimizerHostState {
-                    momentum: &[0.0; 7],
-                    velocity: &[0.0; 8],
-                    slow_params: &[0.0; 8],
-                },
+                l0w: RangerOptimizerHostState { momentum: &[0.0; 7], velocity: &[0.0; 8], slow_params: &[0.0; 8] },
                 l0b: l0b_state,
                 l1w: l1w_state,
                 l1b: l1b_state,
@@ -1097,10 +1043,7 @@ mod tests {
 
     #[test]
     fn radam_layout_rejects_empty_parameters() {
-        assert_eq!(
-            RAdamUpdateLayout::new(0).validate().unwrap_err(),
-            OptimizerLayoutError::EmptyParameters
-        );
+        assert_eq!(RAdamUpdateLayout::new(0).validate().unwrap_err(), OptimizerLayoutError::EmptyParameters);
     }
 
     #[test]
@@ -1150,10 +1093,7 @@ mod tests {
 
     #[test]
     fn ranger_lookahead_layout_rejects_empty_parameters() {
-        assert_eq!(
-            RangerLookaheadLayout::new(0).validate().unwrap_err(),
-            OptimizerLayoutError::EmptyParameters
-        );
+        assert_eq!(RangerLookaheadLayout::new(0).validate().unwrap_err(), OptimizerLayoutError::EmptyParameters);
     }
 
     #[test]
@@ -1163,14 +1103,8 @@ mod tests {
 
     #[test]
     fn ranger_lookahead_params_reject_invalid_alpha() {
-        assert_eq!(
-            RangerLookaheadParams { alpha: -0.1 }.validate().unwrap_err(),
-            OptimizerLayoutError::InvalidAlpha
-        );
-        assert_eq!(
-            RangerLookaheadParams { alpha: 1.1 }.validate().unwrap_err(),
-            OptimizerLayoutError::InvalidAlpha
-        );
+        assert_eq!(RangerLookaheadParams { alpha: -0.1 }.validate().unwrap_err(), OptimizerLayoutError::InvalidAlpha);
+        assert_eq!(RangerLookaheadParams { alpha: 1.1 }.validate().unwrap_err(), OptimizerLayoutError::InvalidAlpha);
     }
 
     #[test]
@@ -1182,10 +1116,7 @@ mod tests {
 
     #[test]
     fn ranger_update_layout_rejects_empty_parameters() {
-        assert_eq!(
-            RangerUpdateLayout::new(0).validate().unwrap_err(),
-            OptimizerLayoutError::EmptyParameters
-        );
+        assert_eq!(RangerUpdateLayout::new(0).validate().unwrap_err(), OptimizerLayoutError::EmptyParameters);
     }
 
     #[test]
@@ -1203,19 +1134,23 @@ mod tests {
 
     #[test]
     fn ranger_update_params_detect_lookahead_step() {
-        assert!(!RangerUpdateParams {
-            radam: RAdamUpdateParams { step: 5, ..Default::default() },
-            k: 3,
-            ..Default::default()
-        }
-        .should_lookahead()
-        .unwrap());
-        assert!(RangerUpdateParams {
-            radam: RAdamUpdateParams { step: 6, ..Default::default() },
-            k: 3,
-            ..Default::default()
-        }
-        .should_lookahead()
-        .unwrap());
+        assert!(
+            !RangerUpdateParams {
+                radam: RAdamUpdateParams { step: 5, ..Default::default() },
+                k: 3,
+                ..Default::default()
+            }
+            .should_lookahead()
+            .unwrap()
+        );
+        assert!(
+            RangerUpdateParams {
+                radam: RAdamUpdateParams { step: 6, ..Default::default() },
+                k: 3,
+                ..Default::default()
+            }
+            .should_lookahead()
+            .unwrap()
+        );
     }
 }

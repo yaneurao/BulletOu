@@ -65,11 +65,7 @@ impl PreparedBatchHost {
                 return Err(format!("Mismatched DType: {:?} != {:?}", tensor.dtype(), value.dtype()).into());
             }
 
-            entries.push(PreparedBatchUploadEntry {
-                name: id.clone(),
-                input_index,
-                tensor: tensor.clone(),
-            });
+            entries.push(PreparedBatchUploadEntry { name: id.clone(), input_index, tensor: tensor.clone() });
         }
 
         Ok(PreparedBatchUploadPlan { entries })
@@ -92,9 +88,7 @@ impl PreparedBatchHost {
         let mut sync = SyncOnDrop::with_capacity(stream.clone(), plan.entries.len());
 
         for entry in &plan.entries {
-            let value = self
-                .planned_input(&entry.name, entry.input_index)
-                .ok_or("Missing input!".into())?;
+            let value = self.planned_input(&entry.name, entry.input_index).ok_or("Missing input!".into())?;
 
             if entry.tensor.size() != value.size() {
                 return Err(format!("Mismatched sizes: {} != {}", entry.tensor.size(), value.size()).into());

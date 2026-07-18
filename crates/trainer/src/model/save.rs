@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    io,
-    rc::Rc,
-};
+use std::{collections::BTreeMap, io, rc::Rc};
 
 use bullet_compiler::tensor::TValue;
 use bullet_gpu::runtime::Gpu;

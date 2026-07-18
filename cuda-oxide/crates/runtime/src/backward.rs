@@ -20,7 +20,8 @@ pub const SFNN_STACKED_AFFINE_BACKWARD_KERNEL: &str = "sfnn_stacked_affine_backw
 pub const SFNN_SHARED_L1_BACKWARD_KERNEL: &str = "sfnn_shared_l1_backward";
 pub const SFNN_PAIRWISE_BACKWARD_KERNEL: &str = "sfnn_pairwise_backward";
 pub const SFNN_L0_SPARSE_BACKWARD_KERNEL: &str = "sfnn_l0_sparse_backward";
-pub const BACKWARD_KERNEL_NAMES: [&str; 15] = [
+pub const SFNN_L0_REDUCE_VIRTUAL_GRAD_KERNEL: &str = "sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad";
+pub const BACKWARD_KERNEL_NAMES: [&str; 16] = [
     DENSE_OUTPUT_BACKWARD_KERNEL,
     DENSE_CRELU_BACKWARD_KERNEL,
     DENSE_CRELU_PRE_GRADIENTS_KERNEL,
@@ -36,6 +37,7 @@ pub const BACKWARD_KERNEL_NAMES: [&str; 15] = [
     SFNN_SHARED_L1_BACKWARD_KERNEL,
     SFNN_PAIRWISE_BACKWARD_KERNEL,
     SFNN_L0_SPARSE_BACKWARD_KERNEL,
+    SFNN_L0_REDUCE_VIRTUAL_GRAD_KERNEL,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,7 +995,8 @@ mod tests {
                 "sfnn_stacked_affine_backward",
                 "sfnn_shared_l1_backward",
                 "sfnn_pairwise_backward",
-                "sfnn_l0_sparse_backward"
+                "sfnn_l0_sparse_backward",
+                "sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad"
             ]
         );
     }

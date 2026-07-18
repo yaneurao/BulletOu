@@ -92,9 +92,9 @@ impl<G: Gpu> Model<G> {
     ) -> Result<SyncOnValue<G, &Function<G>>, G::Error> {
         self.forward.execute_resolved_binding_refs(
             stream.clone(),
-            self.fwd_bindings.iter().map(|binding| {
-                (binding.input, resolve_tensor_ref(&binding.source, inputs, outputs, None).unwrap())
-            }),
+            self.fwd_bindings
+                .iter()
+                .map(|binding| (binding.input, resolve_tensor_ref(&binding.source, inputs, outputs, None).unwrap())),
         )
     }
 

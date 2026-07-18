@@ -321,6 +321,28 @@ pub fn read_random_teacher_positions(teacher: &str, n: usize, seed: u64) -> std:
     }
 }
 
+/// Read the first `n` positions from a fixed-record teacher spec,
+/// decoding each into `PackedSfenValue`.
+///
+/// This is intended for cross-tool parity runs where the validation
+/// subset must be byte-for-byte identical to another trainer that consumes
+/// the held-out file sequentially.
+pub fn read_teacher_positions_prefix(teacher: &str, n: usize) -> std::io::Result<Vec<PackedSfenValue>> {
+    let paths = expand_teacher(teacher).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format =
+        infer_data_format(&path_refs).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    match format {
+        DataFormat::Hcpe | DataFormat::Psv => read_fixed_teacher_positions_prefix(&paths, format, n),
+        DataFormat::Hcpe3 | DataFormat::Pack => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "--test-teacher format {format:?} is variable-length; export it to .psv with export_teacher_psv first"
+            ),
+        )),
+    }
+}
+
 /// Backwards-compatible HCPE-only entry point.
 pub fn read_random_hcpe_positions(path: &str, n: usize, seed: u64) -> std::io::Result<Vec<PackedSfenValue>> {
     read_random_fixed_teacher_positions(&[path.to_string()], DataFormat::Hcpe, n, seed)
@@ -339,6 +361,31 @@ fn read_random_fixed_teacher_positions(
     n: usize,
     seed: u64,
 ) -> std::io::Result<Vec<PackedSfenValue>> {
+    let (files, total_records, record_size) = fixed_teacher_files(paths, format)?;
+    if total_records == 0 {
+        return Ok(Vec::new());
+    }
+
+    let indices = sample_record_indices(total_records, n, seed);
+    read_fixed_teacher_indices(&files, format, record_size, &indices)
+}
+
+fn read_fixed_teacher_positions_prefix(
+    paths: &[String],
+    format: DataFormat,
+    n: usize,
+) -> std::io::Result<Vec<PackedSfenValue>> {
+    let (files, total_records, record_size) = fixed_teacher_files(paths, format)?;
+    if total_records == 0 {
+        return Ok(Vec::new());
+    }
+
+    let take = total_records.min(n);
+    let indices = (0..take).collect::<Vec<_>>();
+    read_fixed_teacher_indices(&files, format, record_size, &indices)
+}
+
+fn fixed_teacher_files(paths: &[String], format: DataFormat) -> std::io::Result<(Vec<FixedTeacherFile>, usize, usize)> {
     let record_size = fixed_record_size(format).expect("caller validated fixed-record format");
     let mut files = Vec::with_capacity(paths.len());
     let mut total_records = 0usize;
@@ -365,12 +412,7 @@ fn read_random_fixed_teacher_positions(
             .checked_add(records)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "teacher record count overflow"))?;
     }
-    if total_records == 0 {
-        return Ok(Vec::new());
-    }
-
-    let indices = sample_record_indices(total_records, n, seed);
-    read_fixed_teacher_indices(&files, format, record_size, &indices)
+    Ok((files, total_records, record_size))
 }
 
 fn fixed_record_size(format: DataFormat) -> Option<usize> {
@@ -676,6 +718,36 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got.iter().map(PackedSfenValue::score).collect::<Vec<_>>(), vec![123, -45, 0]);
         assert_eq!(got.iter().map(PackedSfenValue::game_result).collect::<Vec<_>>(), vec![1, -1, 0]);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_teacher_positions_prefix_reads_first_records() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-validate-test-prefix-psv-{}-{}.psv",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        fn psv_with(score: i16, result: i8) -> PackedSfenValue {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut()[32..34].copy_from_slice(&score.to_le_bytes());
+            psv.as_bytes_mut()[38] = result as u8;
+            psv
+        }
+
+        let records = [psv_with(11, 1), psv_with(22, -1), psv_with(33, 1), psv_with(44, -1)];
+        let mut bytes = Vec::new();
+        for psv in &records {
+            bytes.extend_from_slice(psv.as_bytes());
+        }
+        std::fs::write(&tmp, bytes).unwrap();
+
+        let got = read_teacher_positions_prefix(tmp.to_str().unwrap(), 3).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.iter().map(PackedSfenValue::score).collect::<Vec<_>>(), vec![11, 22, 33]);
+        assert_eq!(got.iter().map(PackedSfenValue::game_result).collect::<Vec<_>>(), vec![1, -1, 1]);
 
         let _ = std::fs::remove_file(&tmp);
     }

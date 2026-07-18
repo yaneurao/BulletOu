@@ -83,6 +83,52 @@ pub fn radam_update(
 }
 
 #[kernel]
+pub fn radam_update_reset_gradients(
+    mut gradients: DisjointSlice<f32>,
+    mut weights: DisjointSlice<f32>,
+    mut momentum: DisjointSlice<f32>,
+    mut velocity: DisjointSlice<f32>,
+    len: u32,
+    gradient_factor: f32,
+    learning_rate: f32,
+    step_size: f32,
+    use_denom: u32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    min_weight: f32,
+    max_weight: f32,
+) {
+    let tid = thread::index_1d();
+    let idx = tid.get();
+    if idx >= len as usize {
+        return;
+    }
+
+    let rate = learning_rate * step_size;
+    unsafe {
+        let gradient = gradients.get_unchecked_mut(idx);
+        let weight = weights.get_unchecked_mut(idx);
+        let momentum_value = momentum.get_unchecked_mut(idx);
+        let velocity_value = velocity.get_unchecked_mut(idx);
+        let grad = gradient_factor * *gradient;
+
+        *weight *= 1.0_f32 - decay * rate;
+        *momentum_value = beta1 * *momentum_value + (1.0_f32 - beta1) * grad;
+        *velocity_value = beta2 * *velocity_value + (1.0_f32 - beta2) * grad * grad;
+
+        let mut value = *momentum_value;
+        if use_denom != 0 {
+            value /= core::intrinsics::sqrtf32(*velocity_value) + epsilon;
+        }
+        *weight -= rate * value;
+        *weight = clamp_f32(*weight, min_weight, max_weight);
+        *gradient = 0.0;
+    }
+}
+
+#[kernel]
 pub fn ranger_lookahead(mut weights: DisjointSlice<f32>, mut slow_params: DisjointSlice<f32>, len: u32, alpha: f32) {
     let tid = thread::index_1d();
     let idx = tid.get();

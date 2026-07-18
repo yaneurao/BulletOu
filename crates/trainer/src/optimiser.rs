@@ -151,37 +151,20 @@ impl<G: Gpu, S: OptimiserState<G>> Optimiser<G, S> {
         }
 
         if self.state.len() == gradients.len() && self.state.keys().zip(gradients.keys()).all(|(a, b)| a == b) {
-            for (((id, single), (weight_id, weight)), (grad_id, grads)) in self
-                .state
-                .iter_mut()
-                .zip(self.model.weights().iter())
-                .zip(gradients.iter())
+            for (((id, single), (weight_id, weight)), (grad_id, grads)) in
+                self.state.iter_mut().zip(self.model.weights().iter()).zip(gradients.iter())
             {
                 debug_assert_eq!(id, weight_id);
                 debug_assert_eq!(id, grad_id);
 
-                single.update_into(
-                    &mut sync,
-                    stream,
-                    weight,
-                    grads,
-                    gradient_factor,
-                    learning_rate,
-                )?;
+                single.update_into(&mut sync, stream, weight, grads, gradient_factor, learning_rate)?;
             }
         } else {
             for ((id, single), (weight_id, weight)) in self.state.iter_mut().zip(self.model.weights().iter()) {
                 debug_assert_eq!(id, weight_id);
 
                 if let Some(grads) = gradients.get(id) {
-                    single.update_into(
-                        &mut sync,
-                        stream,
-                        weight,
-                        grads,
-                        gradient_factor,
-                        learning_rate,
-                    )?;
+                    single.update_into(&mut sync, stream, weight, grads, gradient_factor, learning_rate)?;
                 }
             }
         }

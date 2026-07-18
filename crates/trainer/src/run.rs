@@ -48,13 +48,7 @@ where
     B: FnMut(&mut Trainer<G, O, S>, usize, usize, f32),
     C: FnMut(&mut Trainer<G, O, S>, usize),
 {
-    let TValue::F32(loss) = pending
-        .copy
-        .value()
-        .map_err(TrainerError::Unexpected)?
-    else {
-        panic!()
-    };
+    let TValue::F32(loss) = pending.copy.value().map_err(TrainerError::Unexpected)? else { panic!() };
     let [loss] = loss[..] else { panic!() };
     let error = loss / pending.batch_size as f32;
 
@@ -169,14 +163,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         model.make_backward_output_tensors().map_err(TrainerError::Unexpected)?,
     ];
     let losses = [
-        outputs[0]
-            .get("outputs/loss")
-            .expect("`Trainer` must have a \"loss\" output!")
-            .clone(),
-        outputs[1]
-            .get("outputs/loss")
-            .expect("`Trainer` must have a \"loss\" output!")
-            .clone(),
+        outputs[0].get("outputs/loss").expect("`Trainer` must have a \"loss\" output!").clone(),
+        outputs[1].get("outputs/loss").expect("`Trainer` must have a \"loss\" output!").clone(),
     ];
     let gradients = model.make_gradient_tensors().map_err(TrainerError::Unexpected)?;
     let tlr = Buffer::from_host(&device, &TValue::F32(vec![0.0])).map_err(TrainerError::Unexpected)?;
@@ -193,12 +181,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             (id.clone(), buf.unwrap())
         })
         .collect();
-    let mut batch_upload_plan = first_batch
-        .upload_plan(&batch_on_device)
-        .map_err(TrainerError::Unexpected)?;
-    let mut next_upload_plan = first_batch
-        .upload_plan(&next_on_device)
-        .map_err(TrainerError::Unexpected)?;
+    let mut batch_upload_plan = first_batch.upload_plan(&batch_on_device).map_err(TrainerError::Unexpected)?;
+    let mut next_upload_plan = first_batch.upload_plan(&next_on_device).map_err(TrainerError::Unexpected)?;
 
     let mut batch_queued = true;
     let mut output_slot = 0usize;
@@ -233,9 +217,8 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         lr_value.write(0, DValue::F32(lrate));
         let lrdrop = tlr.copy_from_host_async(&copy_stream, &lr_value).map_err(TrainerError::Unexpected)?;
         gradient_factor_value.write(0, DValue::F32(1.0 / this_batch_size as f32));
-        let gfdrop = tgf
-            .copy_from_host_async(&copy_stream, &gradient_factor_value)
-            .map_err(TrainerError::Unexpected)?;
+        let gfdrop =
+            tgf.copy_from_host_async(&copy_stream, &gradient_factor_value).map_err(TrainerError::Unexpected)?;
 
         if curr_batch == 0 {
             if lrate < prev_lr {
@@ -274,9 +257,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
         let compute_block1 = unsafe { compute_block1.detach_value() };
 
         let mut scalar_upload = unsafe { lrdrop.detach_value() };
-        scalar_upload
-            .merge(unsafe { gfdrop.detach_value() })
-            .map_err(TrainerError::Unexpected)?;
+        scalar_upload.merge(unsafe { gfdrop.detach_value() }).map_err(TrainerError::Unexpected)?;
         scalar_upload.sync().map_err(TrainerError::Unexpected)?;
 
         let compute_block2 = trainer
@@ -334,9 +315,7 @@ pub fn train_custom<G: Gpu, O: OptimiserState<G>, S>(
             )?;
         }
 
-        let current_loss = losses[output_slot]
-            .to_host_async(&loss_stream)
-            .map_err(TrainerError::Unexpected)?;
+        let current_loss = losses[output_slot].to_host_async(&loss_stream).map_err(TrainerError::Unexpected)?;
         let current_loss = PendingLoss {
             copy: current_loss,
             superbatch: batch_superbatch,

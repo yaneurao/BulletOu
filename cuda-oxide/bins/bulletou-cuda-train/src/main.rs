@@ -101,6 +101,7 @@ struct Args {
     test_positions: usize,
     test_batch_size: usize,
     test_seed: u64,
+    test_sample: TestSampleMode,
     sfnn_factorized_l1: bool,
     output: Option<std::path::PathBuf>,
     train_steps: usize,
@@ -165,6 +166,13 @@ enum LossKind {
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestSampleMode {
+    Random,
+    Sequential,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrainLrScheduleKind {
     Fixed,
     Step,
@@ -220,6 +228,7 @@ impl Args {
             test_positions: 100_000,
             test_batch_size: 1024,
             test_seed: 0,
+            test_sample: TestSampleMode::Random,
             sfnn_factorized_l1: false,
             output: None,
             train_steps: 1,
@@ -340,6 +349,12 @@ impl Args {
                 }
                 "--test-seed" => {
                     parsed.test_seed = parse_u64_arg(required_arg(&mut args, "--test-seed")?, "--test-seed")?;
+                }
+                "--test-sample" => {
+                    parsed.test_sample = parse_test_sample_mode(required_arg(&mut args, "--test-sample")?)?;
+                }
+                "--test-sequential" => {
+                    parsed.test_sample = TestSampleMode::Sequential;
                 }
                 "--sfnn-factorized-l1" => {
                     parsed.sfnn_factorized_l1 = true;
@@ -1772,9 +1787,10 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 .to_string(),
         ));
     }
+    let initial_weights_are_loaded = true;
     let mut initial_case = match args.weights_bin.as_deref() {
         Some(path) => load_root_halfka2_weights_as_sfnn_case(path)?,
-        None => SfnnForwardCase::new(SfnnForwardCaseKind::Halfka2),
+        None => SfnnForwardCase::halfka2_1024_7_64_k3k3_ft_factorized(),
     };
     if args.sfnn_factorized_l1 {
         initial_case.ensure_zero_factorized_l1();
@@ -1789,14 +1805,17 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         }
     }
     let shape = restored_state.as_ref().map(|state| state.shape).unwrap_or(initial_case.shape);
-    if shape != bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3 {
+    if !sfnn_halfka2_supported_train_shape(shape) {
+        let base = sfnn_halfka2_base_shape();
+        let factorized = sfnn_halfka2_ft_factorized_shape();
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "--sfnn-teacher-train currently supports only SFNN HalfKA2 shape input={} ft={} h1={} h2={} stacks={}, but weights have input={} ft={} h1={} h2={} stacks={}",
-            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.input_size,
-            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.ft_size,
-            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.l1_hidden,
-            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.l2_size,
-            bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3.num_stacks,
+            "--sfnn-teacher-train currently supports SFNN HalfKA2 base input={} or FT-factorized input={} with ft={} h1={} h2={} stacks={}, but weights have input={} ft={} h1={} h2={} stacks={}",
+            base.input_size,
+            factorized.input_size,
+            base.ft_size,
+            base.l1_hidden,
+            base.l2_size,
+            base.num_stacks,
             shape.input_size,
             shape.ft_size,
             shape.l1_hidden,
@@ -1833,6 +1852,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     let mut bridge_checkpoints = Vec::new();
     let mut last_batch_size = 0usize;
     let mut last_max_active = 0usize;
+    let use_async_teacher_queue = !args.profile_train_step;
     let mut train_timer: Option<std::time::Instant> = None;
     let mut train_positions = 0usize;
     let mut run_steps = 0usize;
@@ -1857,12 +1877,11 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         scale: 400.0,
         nnue_pytorch_wrm_loss: matches!(args.loss_kind, LossKind::NnuePytorchWrm),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        profile_prepare: args.profile_train_step,
     };
 
-    bulletou_lib::value::teacher_batch::for_each_sfnn_halfka2_teacher_fast_batch(
-        &teacher_batch_config,
-        args.train_steps,
-        |loaded| -> bulletou_cuda_oxide_runtime::Result<()> {
+    let mut handle_loaded_batch =
+        |loaded: bulletou_lib::value::teacher_batch::SfnnTeacherBatch| -> bulletou_cuda_oxide_runtime::Result<()> {
             let source = loaded.source;
             let dataloader_pos = loaded.dataloader_pos;
             let batch = loaded.batch;
@@ -1890,12 +1909,21 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                             l3w: &initial_case.l3w,
                             l3b: &initial_case.l3b,
                         };
-                        SfnnLossRangerStepRunner::new(
-                            &stream,
-                            &host_weights,
-                            batch.layout.batch_size,
-                            batch.layout.max_active,
-                        )?
+                        if initial_weights_are_loaded {
+                            SfnnLossRangerStepRunner::new(
+                                &stream,
+                                &host_weights,
+                                batch.layout.batch_size,
+                                batch.layout.max_active,
+                            )?
+                        } else {
+                            SfnnLossRangerStepRunner::new_from_scratch(
+                                &stream,
+                                &host_weights,
+                                batch.layout.batch_size,
+                                batch.layout.max_active,
+                            )?
+                        }
                     }
                 });
             }
@@ -1922,21 +1950,35 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
             train_timer.get_or_insert_with(std::time::Instant::now);
             train_positions = train_positions.saturating_add(batch.layout.batch_size);
             let runner_ref = runner.as_mut().expect("runner is initialized");
-            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch)?;
-            stream.synchronize()?;
+            runner_ref.step(&stream, &module, params, train_loss_kind, host_batch, args.profile_train_step)?;
 
-            let loss = runner_ref.read_loss(&stream)?;
-            losses.push((step, loss.weighted_sum[0], loss.mean[0]));
-            learning_rates.push(learning_rate);
-            sources.push(source);
-            dataloader_positions.push(dataloader_pos);
-            checkpoint_losses.push((step, loss.weighted_sum[0], loss.mean[0]));
-            checkpoint_learning_rates.push(learning_rate);
-            checkpoint_sources.push(sources.last().expect("just pushed SFNN source").clone());
-            checkpoint_dataloader_positions.push(dataloader_pos);
             last_batch_size = batch.layout.batch_size;
             last_max_active = batch.layout.max_active;
             run_steps += 1;
+
+            let periodic_loss_readback = if args.loss_readback_interval > 0 {
+                step % args.loss_readback_interval == 0
+            } else {
+                step % args.batches_per_superbatch == 0
+            };
+            let checkpoint_loss_readback =
+                args.output.is_some() && save_interval_steps.map(|interval| run_steps % interval == 0).unwrap_or(false);
+            let readback_loss = args.profile_train_step
+                || step == completed_step_offset + args.train_steps
+                || periodic_loss_readback
+                || checkpoint_loss_readback;
+            if readback_loss {
+                let loss = runner_ref.read_loss(&stream)?;
+                let loss_entry = (step, loss.weighted_sum[0], loss.mean[0]);
+                losses.push(loss_entry);
+                learning_rates.push(learning_rate);
+                sources.push(source.clone());
+                dataloader_positions.push(dataloader_pos);
+                checkpoint_losses.push(loss_entry);
+                checkpoint_learning_rates.push(learning_rate);
+                checkpoint_sources.push(source);
+                checkpoint_dataloader_positions.push(dataloader_pos);
+            }
 
             if let (Some(output_dir), Some(interval)) = (&args.output, save_interval_steps) {
                 if run_steps % interval == 0 {
@@ -1965,16 +2007,58 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 }
             }
             Ok(())
-        },
-    )
-    .map_err(|err| {
-        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "failed to stream SFNN teacher batches from {teacher}: {err}"
-        ))
-    })?;
+        };
+
+    let train_steps = args.train_steps;
+    if args.profile_train_step {
+        bulletou_lib::value::teacher_batch::for_each_sfnn_halfka2_teacher_fast_batch(
+            &teacher_batch_config,
+            train_steps,
+            |loaded| handle_loaded_batch(loaded),
+        )
+        .map_err(|err| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "failed to stream SFNN teacher batches from {teacher}: {err}"
+            ))
+        })?;
+    } else {
+        std::thread::scope(|scope| -> bulletou_cuda_oxide_runtime::Result<()> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(args.teacher_queue_depth.max(1));
+            let producer = scope.spawn(move || {
+                bulletou_lib::value::teacher_batch::for_each_sfnn_halfka2_teacher_fast_batch(
+                    &teacher_batch_config,
+                    train_steps,
+                    |loaded| tx.send(loaded).map_err(|err| format!("teacher batch consumer stopped: {err}")),
+                )
+            });
+
+            let mut consumer_result: bulletou_cuda_oxide_runtime::Result<()> = Ok(());
+            while let Ok(loaded) = rx.recv() {
+                if let Err(err) = handle_loaded_batch(loaded) {
+                    consumer_result = Err(err);
+                    break;
+                }
+            }
+            drop(rx);
+
+            let producer_result = producer.join().map_err(|_| {
+                bulletou_cuda_oxide_runtime::Error::Smoke("SFNN teacher batch producer panicked".to_string())
+            })?;
+            if let Err(err) = consumer_result {
+                return Err(err);
+            }
+            producer_result.map_err(|err| {
+                bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                    "failed to stream SFNN teacher batches from {teacher}: {err}"
+                ))
+            })?;
+            Ok(())
+        })?;
+    }
 
     let train_elapsed = train_timer.map(|started| started.elapsed());
     let runner = runner.as_ref().expect("validated non-empty teacher train steps");
+    let mut final_test_metrics = None;
     if let Some(output_dir) = &args.output {
         let should_write_final_bridge_checkpoint =
             save_interval_steps.is_none() || !checkpoint_losses.is_empty() || bridge_checkpoints.is_empty();
@@ -1998,6 +2082,7 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 Some(cache) => Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?),
                 None => None,
             };
+            final_test_metrics = test_metrics;
             bridge_checkpoints.push(write_sfnn_bridge_checkpoint(
                 output_dir,
                 shape,
@@ -2012,6 +2097,9 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
                 log_context,
             )?);
         }
+    } else if let Some(cache) = &test_cache {
+        let state = runner.read_state(&stream)?;
+        final_test_metrics = Some(run_sfnn_bridge_test_pass(shape, &state, cache, &args)?);
     }
 
     println!("bulletou-cuda-train SFNN teacher train");
@@ -2042,8 +2130,18 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
         shape.input_size, shape.ft_size, shape.l1_hidden, shape.l2_size, shape.num_stacks
     );
     println!("  start_step   : {}", completed_step_offset + 1);
-    println!("  steps        : {}", losses.len());
+    println!("  steps        : {}", run_steps);
+    println!("  loss_points  : {}", losses.len());
     println!("  batches/sb   : {}", args.batches_per_superbatch);
+    println!("  queue_depth  : {}", args.teacher_queue_depth.max(1));
+    if use_async_teacher_queue {
+        let interval = if args.loss_readback_interval > 0 {
+            args.loss_readback_interval
+        } else {
+            args.batches_per_superbatch
+        };
+        println!("  loss_readback: every {interval} batches");
+    }
     println!("  lr_schedule  : {}", train_lr_schedule_label(args.lr_schedule));
     if let Some(first_lr) = learning_rates.first() {
         println!("  lr_start     : {first_lr}");
@@ -2053,11 +2151,16 @@ fn run_sfnn_teacher_train(args: Args) -> bulletou_cuda_oxide_runtime::Result<()>
     }
     let factorized_l1 =
         restored_state.as_ref().map(SfnnTrainStateCase::has_factorized_l1).unwrap_or(initial_case.l1fw.is_some());
+    println!("  ft_factor    : {}", if sfnn_halfka2_uses_ft_factorize(shape) { "enabled" } else { "disabled" });
     println!("  l1_factor    : {}", if factorized_l1 { "enabled" } else { "disabled" });
     if let Some(elapsed) = train_elapsed {
         let seconds = elapsed.as_secs_f64();
         let pos_per_sec = train_positions as f64 / seconds.max(1e-9);
         println!("  throughput   : positions={train_positions} time={seconds:.3}s pos/sec={pos_per_sec:.0}");
+    }
+    if let Some(metrics) = final_test_metrics {
+        println!("  test_loss    : {}", metrics.loss);
+        println!("  test_acc     : {}", metrics.accuracy);
     }
     for (step, weighted_sum, mean) in &losses {
         println!("  step{step}_loss  : weighted_sum={weighted_sum} mean={mean}");
@@ -2140,13 +2243,20 @@ fn load_nnue_bridge_test_cache(args: &Args) -> bulletou_cuda_oxide_runtime::Resu
     let Some(path) = args.test_teacher.as_deref() else {
         return Ok(None);
     };
-    let positions = bulletou_lib::validate::read_random_teacher_positions(path, args.test_positions, args.test_seed)
-        .map_err(|err| {
-            bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read --test-teacher {path}: {err}"))
-        })?;
+    let positions = match args.test_sample {
+        TestSampleMode::Random => {
+            bulletou_lib::validate::read_random_teacher_positions(path, args.test_positions, args.test_seed)
+        }
+        TestSampleMode::Sequential => bulletou_lib::validate::read_teacher_positions_prefix(path, args.test_positions),
+    }
+    .map_err(|err| bulletou_cuda_oxide_runtime::Error::Smoke(format!("failed to read --test-teacher {path}: {err}")))?;
     let teacher_scores = positions.iter().map(|p| p.score()).collect();
     let teacher_results = positions.iter().map(|p| p.game_result()).collect();
-    eprintln!("  cuda-oxide validation: loaded {} test positions from {path}", positions.len());
+    eprintln!(
+        "  cuda-oxide validation: loaded {} test positions from {path} ({:?})",
+        positions.len(),
+        args.test_sample
+    );
     Ok(Some(NnueBridgeTestCache { positions, teacher_scores, teacher_results }))
 }
 
@@ -2278,12 +2388,20 @@ fn run_sfnn_bridge_test_pass(
         },
     };
 
+    let validation_shape = if sfnn_halfka2_uses_ft_factorize(shape) { sfnn_halfka2_base_shape() } else { shape };
     let root_shape = bulletou_lib::value::SfnnForwardShape {
-        input_size: shape.input_size,
+        input_size: validation_shape.input_size,
         ft_size: shape.ft_size,
         l1_hidden: shape.l1_hidden,
         l2_size: shape.l2_size,
         num_stacks: shape.num_stacks,
+    };
+    let folded_l0w;
+    let l0w = if sfnn_halfka2_uses_ft_factorize(shape) {
+        folded_l0w = fold_sfnn_halfka2_ft_factorized_l0w(&state.l0w.weights, shape.ft_size)?;
+        folded_l0w.as_slice()
+    } else {
+        state.l0w.weights.as_slice()
     };
     let mut folded_l1w = state.l1w.weights.clone();
     let mut folded_l1b = state.l1b.weights.clone();
@@ -2300,7 +2418,7 @@ fn run_sfnn_bridge_test_pass(
     }
     let forward_weights = SfnnForwardWeights {
         shape: root_shape,
-        l0w: &state.l0w.weights,
+        l0w,
         l0b: &state.l0b.weights,
         l1w: &folded_l1w,
         l1b: &folded_l1b,
@@ -2368,6 +2486,41 @@ fn run_sfnn_bridge_test_pass(
 }
 
 #[cfg(all(feature = "cuda", feature = "root-loader"))]
+fn fold_sfnn_halfka2_ft_factorized_l0w(
+    weights: &[f32],
+    ft_size: usize,
+) -> bulletou_cuda_oxide_runtime::Result<Vec<f32>> {
+    let base_input_size = sfnn_halfka2_base_shape().input_size;
+    let virtual_rows = bulletou_lib::game::inputs::PIECE_INPUTS;
+    let expected = base_input_size
+        .checked_add(virtual_rows)
+        .and_then(|rows| rows.checked_mul(ft_size))
+        .ok_or_else(|| {
+            bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+                "factorized SFNN HalfKA2 l0w shape overflow: base_input_size={base_input_size} virtual_rows={virtual_rows} ft_size={ft_size}"
+            ))
+        })?;
+    if weights.len() != expected {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "factorized SFNN HalfKA2 l0w length mismatch: expected {expected}, got {}",
+            weights.len()
+        )));
+    }
+
+    let mut folded = weights[..base_input_size * ft_size].to_vec();
+    let virtual_base = base_input_size * ft_size;
+    for feature in 0..base_input_size {
+        let piece = feature % virtual_rows;
+        let dst_start = feature * ft_size;
+        let virtual_start = virtual_base + piece * ft_size;
+        for row in 0..ft_size {
+            folded[dst_start + row] += weights[virtual_start + row];
+        }
+    }
+    Ok(folded)
+}
+
+#[cfg(all(feature = "cuda", feature = "root-loader"))]
 fn fold_sfnn_factorized_l1(
     shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape,
     l1fw: &[f32],
@@ -2391,17 +2544,16 @@ fn fold_sfnn_factorized_l1(
     }
 
     let l1_out = shape.l1_out();
-    let stack_stride = shape.num_stacks.saturating_mul(l1_out);
     for stack in 0..shape.num_stacks {
         let bias_base = stack * l1_out;
         for row in 0..l1_out {
             l1b[bias_base + row] += l1fb[row];
         }
+        let stack_base = stack * l1_out * shape.ft_size;
         for input in 0..shape.ft_size {
-            let base = input * stack_stride + stack * l1_out;
             let shared_base = input * l1_out;
             for row in 0..l1_out {
-                l1w[base + row] += l1fw[shared_base + row];
+                l1w[stack_base + row * shape.ft_size + input] += l1fw[shared_base + row];
             }
         }
     }
@@ -2899,16 +3051,24 @@ fn write_sfnn_halfka2_nn_bin(
     };
 
     let feature_set = NnueFeatureSet::HalfKa2;
-    if shape.input_size != feature_set.input_size() {
+    let base_input_size = feature_set.input_size();
+    let factorized_input_size = base_input_size + bulletou_lib::game::inputs::PIECE_INPUTS;
+    if shape.input_size != base_input_size && shape.input_size != factorized_input_size {
         return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
-            "cannot write SFNN HalfKA2 nn.bin for input_size={}, expected {}",
-            shape.input_size,
-            feature_set.input_size()
+            "cannot write SFNN HalfKA2 nn.bin for input_size={}, expected {} or factorized {}",
+            shape.input_size, base_input_size, factorized_input_size
         )));
     }
+    let folded_l0w;
+    let l0w_for_export = if shape.input_size == base_input_size {
+        state.l0w.weights.clone()
+    } else {
+        folded_l0w = fold_sfnn_halfka2_ft_factorized_l0w(&state.l0w.weights, shape.ft_size)?;
+        folded_l0w
+    };
 
     let mut graph_records = vec![
-        ("l0w", state.l0w.weights.clone()),
+        ("l0w", l0w_for_export),
         ("l0b", state.l0b.weights.clone()),
         ("l1w", state.l1w.weights.clone()),
         ("l1b", state.l1b.weights.clone()),
@@ -2933,7 +3093,7 @@ fn write_sfnn_halfka2_nn_bin(
     let graph = ModelWeights::from_f32_values(graph_records);
     let formats = build_sfnn_1536_save_format(Sfnn1536SaveParams {
         feature_set,
-        input_size: shape.input_size,
+        input_size: base_input_size,
         ft_size: shape.ft_size,
         l1_hidden: shape.l1_hidden,
         l2_size: shape.l2_size,
@@ -3675,14 +3835,13 @@ fn load_root_halfka2_train_state_case(
     }
 
     let root_shape = bulletou_lib::value::SFNN_HALFKA2_1024_7_64_K3K3;
-    let shape = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+    let base_shape = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
         input_size: root_shape.input_size,
         ft_size: root_shape.ft_size,
         l1_hidden: root_shape.l1_hidden,
         l2_size: root_shape.l2_size,
         num_stacks: root_shape.num_stacks,
     };
-    let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
     let weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
     let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "momentum");
     let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "velocity");
@@ -3690,6 +3849,29 @@ fn load_root_halfka2_train_state_case(
     let slow = if slow.is_empty() { &weights } else { &slow };
     let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "step_ranger");
     let completed_steps = read_root_state_completed_steps(path, "root SFNN train state", &steps)?;
+    let l0w_len = weights.get("l0w").map(|values| values.len()).ok_or_else(|| {
+        bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "root SFNN train state {} is missing nnue/weights/l0w",
+            path.display()
+        ))
+    })?;
+    let base_layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(base_shape);
+    let factorized_shape = sfnn_halfka2_ft_factorized_shape();
+    let factorized_layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(factorized_shape);
+    let shape = if l0w_len == base_layout.l0w_len() {
+        base_shape
+    } else if l0w_len == factorized_layout.l0w_len() {
+        factorized_shape
+    } else {
+        return Err(bulletou_cuda_oxide_runtime::Error::Smoke(format!(
+            "root SFNN train state {} record nnue/weights/l0w has len {}, expected base {} or factorized {}",
+            path.display(),
+            l0w_len,
+            base_layout.l0w_len(),
+            factorized_layout.l0w_len()
+        )));
+    };
+    let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
 
     fn take_record(
         path: &std::path::Path,
@@ -4960,7 +5142,7 @@ fn run_sfnn_ranger_step_smoke(args: Args) -> bulletou_cuda_oxide_runtime::Result
         &module,
         params,
         &mut device_weights,
-        &backward_workspace,
+        &mut backward_workspace,
         &mut optimizer_states,
     )?;
     stream.synchronize()?;
@@ -5193,6 +5375,15 @@ fn parse_loss_kind(value: String) -> bulletou_cuda_oxide_runtime::Result<LossKin
 }
 
 #[cfg(feature = "cuda")]
+fn parse_test_sample_mode(value: String) -> bulletou_cuda_oxide_runtime::Result<TestSampleMode> {
+    match value.as_str() {
+        "random" => Ok(TestSampleMode::Random),
+        "sequential" | "prefix" | "first" => Ok(TestSampleMode::Sequential),
+        _ => usage_error(format!("--test-sample must be one of: random, sequential (got {value})")),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn parse_train_lr_schedule(value: String) -> bulletou_cuda_oxide_runtime::Result<TrainLrScheduleKind> {
     match value.as_str() {
         "fixed" => Ok(TrainLrScheduleKind::Fixed),
@@ -5240,7 +5431,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --dense-output-backward-smoke [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-dense-backward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
        bulletou-cuda-train --nnue-fixture-train [--nnue-train-state-fixture <PATH>] --nnue-train-fixture <PATH>|--nnue-train-batch-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
-       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
+       bulletou-cuda-train --nnue-teacher-train --teacher <PATH> [--weights-bin <PATH>] [--nnue-train-state-fixture <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--loss-readback-interval <N>] [--batches-per-superbatch <N>] [--batch-size <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--teacher-queue-depth <N>] [--threads <N>] [--score-drop-abs <N>] [--write-nnue-trained-forward-fixture <PATH>] [--write-nnue-train-state-fixture <PATH>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback] [--profile-train-step]\n\
        bulletou-cuda-train --nnue-forward-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--write-nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-loss-ranger-step-smoke --nnue-train-fixture <PATH> [--nnue-train-fixture <PATH> | --nnue-train-batch-fixture <PATH> ...] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --nnue-ranger-step-smoke [--nnue-forward-case tiny|halfkp] [--nnue-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
@@ -5252,7 +5443,7 @@ fn usage() -> &'static str {
        bulletou-cuda-train --sfnn-output-backward-smoke [alias of --sfnn-dense-backward-smoke]\n\
        bulletou-cuda-train --sfnn-forward-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--write-sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>] [--debug-readback]\n\
        bulletou-cuda-train --sfnn-ranger-step-smoke [--sfnn-forward-case tiny|factorized-tiny|halfka2] [--sfnn-forward-fixture <PATH>] [--ptx <PATH>] [--device <ID>] [--tolerance <F32>]\n\
-       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
+       bulletou-cuda-train --sfnn-teacher-train --teacher <PATH> [--sfnn-factorized-l1] [--weights-bin <PATH>] [--nnue-train-state-bin <PATH>] [--output <DIR>] [--train-steps <N>] [--save-rate <N>] [--batches-per-superbatch <N>] [--superbatches-per-epoch <N>] [--batch-size <N>] [--test-teacher <PATH>] [--test-positions <N>] [--test-batch-size <N>] [--test-seed <N>] [--test-sample random|sequential] [--test-sequential] [--lr-schedule fixed|step|geometric|cos] [--learning-rate <F32>] [--lr-min <F32>] [--lr-step-gamma <F32>] [--lr-step-positions <N>] [--lr-period-positions <N>] [--optimizer-weight-decay <F32>] [--optimizer-epsilon <F32>] [--optimizer-beta1 <F32>] [--optimizer-beta2 <F32>] [--buffer-mb <N>] [--loader-threads <N>] [--threads <N>] [--score-drop-abs <N>] [--loss-kind sigmoid-mse|wrm] [--ptx <PATH>] [--device <ID>] [--debug-readback]\n\
      \n\
      CO-004 smoke command: load a PTX module, resolve a kernel symbol, launch a\n\
      zero-argument kernel, and verify a host-device-host buffer round trip. If\n\
@@ -5788,9 +5979,13 @@ fn grouped_ranger_step_params_for_step_with_hyperparams(
 }
 
 #[cfg(feature = "cuda")]
+const CUDA_HALFKP_PIECE_INPUTS: usize = 1_548;
+#[cfg(feature = "cuda")]
+const CUDA_HALFKA2_PIECE_INPUTS: usize = 1_629;
+
+#[cfg(feature = "cuda")]
 fn nnue_halfkp_factorized_input_size() -> usize {
-    bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.input_size
-        + bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS
+    bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.input_size + CUDA_HALFKP_PIECE_INPUTS
 }
 
 #[cfg(feature = "cuda")]
@@ -5799,6 +5994,33 @@ fn nnue_halfkp_uses_ft_factorize(shape: bulletou_cuda_oxide_runtime::nnue::NnueF
         && shape.l1 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l1
         && shape.l2 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l2
         && shape.l3 == bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32.l3
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_halfka2_base_shape() -> bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+    bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_halfka2_ft_factorized_shape() -> bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+    let base = sfnn_halfka2_base_shape();
+    bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape {
+        input_size: base.input_size + CUDA_HALFKA2_PIECE_INPUTS,
+        ft_size: base.ft_size,
+        l1_hidden: base.l1_hidden,
+        l2_size: base.l2_size,
+        num_stacks: base.num_stacks,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_halfka2_uses_ft_factorize(shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape) -> bool {
+    shape == sfnn_halfka2_ft_factorized_shape()
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_halfka2_supported_train_shape(shape: bulletou_cuda_oxide_runtime::sfnn::SfnnForwardShape) -> bool {
+    shape == sfnn_halfka2_base_shape() || sfnn_halfka2_uses_ft_factorize(shape)
 }
 
 #[cfg(feature = "cuda")]
@@ -6346,7 +6568,7 @@ impl NnueForwardCase {
 
     fn tatara_simple_factorized_halfkp_256x2_32_32() -> Self {
         let base_shape = bulletou_cuda_oxide_runtime::nnue::NNUE_HALFKP_256X2_32_32;
-        let virtual_rows = bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS;
+        let virtual_rows = CUDA_HALFKP_PIECE_INPUTS;
         let shape = bulletou_cuda_oxide_runtime::nnue::NnueForwardShape {
             input_size: base_shape.input_size + virtual_rows,
             l1: base_shape.l1,
@@ -7402,16 +7624,48 @@ impl SfnnForwardCase {
             stm,
             nstm,
             buckets: vec![0, 8],
-            l0w: deterministic_f32_vec(layout.l0w_len(), 0x5F23_4CB8, 0.004, 0.0),
-            l0b: deterministic_f32_vec(layout.l0b_len(), 0x10B1_5F23, 0.02, 0.10),
-            l1w: deterministic_f32_vec(layout.l1w_len(), 0xC1A5_5F23, 0.002, 0.0),
-            l1b: deterministic_f32_vec(layout.l1b_len(), 0xB1A5_5F23, 0.004, 0.02),
-            l1fw: None,
-            l1fb: None,
-            l2w: deterministic_f32_vec(layout.l2w_len(), 0xD2A5_5F23, 0.003, 0.0),
-            l2b: deterministic_f32_vec(layout.l2b_len(), 0xB2A5_5F23, 0.004, 0.02),
-            l3w: deterministic_f32_vec(layout.l3w_len(), 0xD3A5_5F23, 0.02, 0.0),
-            l3b: deterministic_f32_vec(layout.l3b_len(), 0xB3A5_5F23, 0.002, 0.01),
+            l0w: tatara_uniform_fan_in_init(layout.l0w_len(), 0x100, shape.input_size),
+            l0b: vec![0.0; layout.l0b_len()],
+            l1w: tatara_uniform_abs_init(layout.l1w_len(), 0x101, 0.01),
+            l1b: vec![0.0; layout.l1b_len()],
+            l1fw: Some(tatara_uniform_abs_init(layout.l1fw_len(), 0x102, 0.01)),
+            l1fb: Some(vec![0.0; layout.l1fb_len()]),
+            l2w: tatara_uniform_abs_init(layout.l2w_len(), 0x103, 0.01),
+            l2b: vec![0.0; layout.l2b_len()],
+            l3w: tatara_uniform_abs_init(layout.l3w_len(), 0x104, 0.01),
+            l3b: vec![0.0; layout.l3b_len()],
+        }
+    }
+
+    fn halfka2_1024_7_64_k3k3_ft_factorized() -> Self {
+        let base_shape = bulletou_cuda_oxide_runtime::sfnn::SFNN_HALFKA2_1024_7_64_K3K3;
+        let shape = sfnn_halfka2_ft_factorized_shape();
+        let layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(shape);
+        let base_layout = bulletou_cuda_oxide_runtime::sfnn::SfnnForwardWeightLayout::new(base_shape);
+        let batch_size = 2;
+        let max_active = 40;
+        let (stm, nstm) = deterministic_sparse_batch(batch_size, max_active, base_shape.input_size);
+        let mut l0w = tatara_uniform_fan_in_init(base_layout.l0w_len(), 0x100, base_shape.input_size);
+        l0w.resize(layout.l0w_len(), 0.0);
+
+        Self {
+            label: "halfka2-1024-7-64-k3k3-ft-factorized",
+            shape,
+            batch_size,
+            max_active,
+            stm,
+            nstm,
+            buckets: vec![0, 8],
+            l0w,
+            l0b: vec![0.0; layout.l0b_len()],
+            l1w: tatara_uniform_abs_init(layout.l1w_len(), 0x101, 0.01),
+            l1b: vec![0.0; layout.l1b_len()],
+            l1fw: Some(tatara_uniform_abs_init(layout.l1fw_len(), 0x102, 0.01)),
+            l1fb: Some(vec![0.0; layout.l1fb_len()]),
+            l2w: tatara_uniform_abs_init(layout.l2w_len(), 0x103, 0.01),
+            l2b: vec![0.0; layout.l2b_len()],
+            l3w: tatara_uniform_abs_init(layout.l3w_len(), 0x104, 0.01),
+            l3b: vec![0.0; layout.l3b_len()],
         }
     }
 
@@ -7903,6 +8157,12 @@ fn tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> Vec<f32> {
 }
 
 #[cfg(feature = "cuda")]
+fn tatara_uniform_fan_in_init(len: usize, seed: u64, fan_in: usize) -> Vec<f32> {
+    let fan_in = fan_in.max(1) as f32;
+    tatara_uniform_abs_init(len, seed, (1.0 / fan_in).sqrt())
+}
+
+#[cfg(feature = "cuda")]
 struct TataraXorShift {
     state: u64,
 }
@@ -7943,6 +8203,12 @@ fn affine_sparse_padded(weights: &[f32], bias: &[f32], rows: usize, cols: usize,
         let base = feature as usize * rows;
         for row in 0..rows {
             out[row] += weights[base + row];
+        }
+        if let Some(virtual_feature) = sfnn_halfka2_ft_factorized_virtual_feature(feature as usize, cols) {
+            let base = virtual_feature * rows;
+            for row in 0..rows {
+                out[row] += weights[base + row];
+            }
         }
     }
 }
@@ -8027,8 +8293,9 @@ fn sfnn_stacked_l3_backward_trace(
         bias_gradients[stack] += out_grad;
         l1_gradients[sample * l1_out + l1_out - 1] = out_grad;
         for row in 0..input_dim {
-            input_gradients[sample * input_dim + row] = out_grad * weights[row * num_stacks + stack];
-            weight_gradients[row * num_stacks + stack] += out_grad * inputs[sample * input_dim + row];
+            let weight_idx = stack * input_dim + row;
+            input_gradients[sample * input_dim + row] = out_grad * weights[weight_idx];
+            weight_gradients[weight_idx] += out_grad * inputs[sample * input_dim + row];
         }
     }
 
@@ -8048,9 +8315,9 @@ fn sfnn_stacked_crelu_backward_trace(
     num_stacks: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut input_gradients = vec![0.0_f32; batch_size * input_dim];
-    let stack_stride = num_stacks * output_dim;
-    let mut weight_gradients = vec![0.0_f32; input_dim * stack_stride];
-    let mut bias_gradients = vec![0.0_f32; stack_stride];
+    let stack_stride = output_dim * input_dim;
+    let mut weight_gradients = vec![0.0_f32; num_stacks * stack_stride];
+    let mut bias_gradients = vec![0.0_f32; num_stacks * output_dim];
 
     for sample in 0..batch_size {
         let stack_i32 = buckets[sample];
@@ -8058,6 +8325,7 @@ fn sfnn_stacked_crelu_backward_trace(
             continue;
         }
         let stack = stack_i32 as usize;
+        let stack_base = stack * stack_stride;
         let sample_input_start = sample * input_dim;
         let sample_output_start = sample * output_dim;
 
@@ -8069,7 +8337,7 @@ fn sfnn_stacked_crelu_backward_trace(
             bias_gradients[stacked_out_col] += pre_grad;
             for in_col in 0..input_dim {
                 let input_value = inputs[sample_input_start + in_col];
-                let weight_idx = in_col * stack_stride + stacked_out_col;
+                let weight_idx = stack_base + out_col * input_dim + in_col;
                 input_gradients[sample_input_start + in_col] += pre_grad * weights[weight_idx];
                 weight_gradients[weight_idx] += pre_grad * input_value;
             }
@@ -8121,9 +8389,9 @@ fn sfnn_stacked_affine_backward_trace(
     num_stacks: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut input_gradients = vec![0.0_f32; batch_size * input_dim];
-    let stack_stride = num_stacks * output_dim;
-    let mut weight_gradients = vec![0.0_f32; input_dim * stack_stride];
-    let mut bias_gradients = vec![0.0_f32; stack_stride];
+    let stack_stride = output_dim * input_dim;
+    let mut weight_gradients = vec![0.0_f32; num_stacks * stack_stride];
+    let mut bias_gradients = vec![0.0_f32; num_stacks * output_dim];
 
     for sample in 0..batch_size {
         let stack_i32 = buckets[sample];
@@ -8131,6 +8399,7 @@ fn sfnn_stacked_affine_backward_trace(
             continue;
         }
         let stack = stack_i32 as usize;
+        let stack_base = stack * stack_stride;
         let sample_input_start = sample * input_dim;
         let sample_output_start = sample * output_dim;
 
@@ -8140,7 +8409,7 @@ fn sfnn_stacked_affine_backward_trace(
             bias_gradients[stacked_out_col] += grad;
             for in_col in 0..input_dim {
                 let input_value = inputs[sample_input_start + in_col];
-                let weight_idx = in_col * stack_stride + stacked_out_col;
+                let weight_idx = stack_base + out_col * input_dim + in_col;
                 input_gradients[sample_input_start + in_col] += grad * weights[weight_idx];
                 weight_gradients[weight_idx] += grad * input_value;
             }
@@ -8198,8 +8467,8 @@ fn sfnn_pairwise_backward_trace(
         let l0_base = sample * ft_size;
         let combined_base = sample * ft_size;
         for col in 0..ft_size {
-            let pair = col / 2;
-            let mate_col = pair * 2 + (1 - (col - pair * 2));
+            let pair = col % pairwise;
+            let mate_col = if col < pairwise { pairwise + pair } else { pair };
             stm_gradients[l0_base + col] =
                 combined_gradients[combined_base + pair] * stm_l0[l0_base + mate_col] * SCALE;
             nstm_gradients[l0_base + col] =
@@ -8376,6 +8645,22 @@ fn accumulate_sparse_l0_weight_gradients(
         for row in 0..l1 {
             weight_gradients[weight_start + row] += gradients[row];
         }
+        if let Some(virtual_feature) = sfnn_halfka2_ft_factorized_virtual_feature(feature as usize, input_size) {
+            let weight_start = virtual_feature * l1;
+            for row in 0..l1 {
+                weight_gradients[weight_start + row] += gradients[row];
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sfnn_halfka2_ft_factorized_virtual_feature(feature: usize, input_size: usize) -> Option<usize> {
+    let base_input_size = sfnn_halfka2_base_shape().input_size;
+    if input_size == sfnn_halfka2_ft_factorized_shape().input_size && feature < base_input_size {
+        Some(base_input_size + feature % CUDA_HALFKA2_PIECE_INPUTS)
+    } else {
+        None
     }
 }
 
@@ -8390,30 +8675,30 @@ fn affine_stacked(
     bias: &[f32],
     input: &[f32],
     rows: usize,
-    num_stacks: usize,
+    _num_stacks: usize,
     stack: usize,
     out: &mut [f32],
 ) {
     let bias_base = stack * rows;
     out.copy_from_slice(&bias[bias_base..bias_base + rows]);
-    let stack_stride = num_stacks * rows;
+    let stack_base = stack * rows * input.len();
     for (input_idx, &value) in input.iter().enumerate() {
         if value == 0.0 {
             continue;
         }
-        let base = input_idx * stack_stride + stack * rows;
         for row in 0..rows {
-            out[row] += weights[base + row] * value;
+            out[row] += weights[stack_base + row * input.len() + input_idx] * value;
         }
     }
 }
 
 #[cfg(feature = "cuda")]
-fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], num_stacks: usize, stack: usize) -> f32 {
+fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], _num_stacks: usize, stack: usize) -> f32 {
     let mut out = bias[stack];
+    let stack_base = stack * input.len();
     for (input_idx, &value) in input.iter().enumerate() {
         if value != 0.0 {
-            out += weights[input_idx * num_stacks + stack] * value;
+            out += weights[stack_base + input_idx] * value;
         }
     }
     out
@@ -8421,9 +8706,11 @@ fn affine_stacked_scalar(weights: &[f32], bias: &[f32], input: &[f32], num_stack
 
 #[cfg(feature = "cuda")]
 fn pairwise_mul_scaled(input: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(input.len() / 2, out.len());
     const SCALE: f32 = 127.0 / 128.0;
-    for (idx, pair) in input.chunks_exact(2).enumerate() {
-        out[idx] = pair[0] * pair[1] * SCALE;
+    let half = input.len() / 2;
+    for idx in 0..half {
+        out[idx] = input[idx] * input[half + idx] * SCALE;
     }
 }
 

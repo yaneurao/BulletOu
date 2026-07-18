@@ -22,7 +22,7 @@ use super::SparseInputType;
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::{E_KING, F_KING, FE_HAND_END},
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square},
+    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, PieceType, Square},
 };
 
 // =============================================================================
@@ -532,20 +532,19 @@ fn map_halfka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     let stm_kb = king_index_nonmirror(stm_king_sq, stm);
     let nstm_kb = king_index_nonmirror(nstm_king_sq, nstm);
 
-    for &pt in &BOARD_PIECE_TYPES {
-        for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
-                let piece = Piece::new(color, pt);
-
-                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
-                let stm_idx = halfka2_index(stm_kb, stm_bp.value() as usize);
-
-                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
-                let nstm_idx = halfka2_index(nstm_kb, nstm_bp.value() as usize);
-
-                f(stm_idx, nstm_idx);
-            }
+    for (sq_idx, &piece) in board.board.iter().enumerate() {
+        if piece.is_none() || piece.piece_type == PieceType::King {
+            continue;
         }
+
+        let sq = Square::from_index(sq_idx);
+        let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+        let stm_idx = halfka2_index(stm_kb, stm_bp.value() as usize);
+
+        let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+        let nstm_idx = halfka2_index(nstm_kb, nstm_bp.value() as usize);
+
+        f(stm_idx, nstm_idx);
     }
 
     {

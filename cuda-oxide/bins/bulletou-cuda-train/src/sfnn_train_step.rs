@@ -16,6 +16,7 @@ use bulletou_cuda_oxide_runtime::{
         SfnnForwardWeightLayout, SfnnForwardWorkspace, SfnnForwardWorkspaceLayout,
     },
 };
+use cuda_core::{CudaEvent, PinnedHostBuffer};
 
 use crate::{loss_forward, optimizer_update, sfnn_backward, sfnn_forward};
 
@@ -73,23 +74,61 @@ pub(crate) struct SfnnLossRangerStepRunner {
     device_batch: SfnnForwardDeviceBatch,
     targets: DeviceBuffer<f32>,
     entry_weights: DeviceBuffer<f32>,
+    upload_stm_indices: PinnedHostBuffer<i32>,
+    upload_nstm_indices: PinnedHostBuffer<i32>,
+    upload_buckets: PinnedHostBuffer<i32>,
+    upload_targets: PinnedHostBuffer<f32>,
+    upload_entry_weights: PinnedHostBuffer<f32>,
+    upload_done: Option<CudaEvent>,
     forward_workspace: SfnnForwardWorkspace,
     loss_workspace: ScalarLossWorkspace,
     backward_workspace: SfnnBackwardWorkspace,
 }
 
 impl SfnnLossRangerStepRunner {
+    pub(crate) fn new_from_scratch(
+        stream: &Arc<CudaStream>,
+        weights: &SfnnForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        Self::new_with_optimizer_state_factory(
+            stream,
+            weights,
+            batch_size,
+            max_active,
+            SfnnRangerOptimizerStates::zeroed_for_host_weights,
+        )
+    }
+
     pub(crate) fn new(
         stream: &Arc<CudaStream>,
         weights: &SfnnForwardHostWeights<'_>,
         batch_size: usize,
         max_active: usize,
     ) -> Result<Self> {
+        Self::new_with_optimizer_state_factory(
+            stream,
+            weights,
+            batch_size,
+            max_active,
+            SfnnRangerOptimizerStates::from_host_weights,
+        )
+    }
+
+    fn new_with_optimizer_state_factory(
+        stream: &Arc<CudaStream>,
+        weights: &SfnnForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+        optimizer_states: fn(&CudaStream, &SfnnForwardHostWeights<'_>) -> Result<SfnnRangerOptimizerStates>,
+    ) -> Result<Self> {
         weights.validate()?;
         let shape = weights.shape;
         let sparse_len = batch_size.saturating_mul(max_active);
+        let ctx = stream.context();
         let device_weights = SfnnForwardDeviceWeights::from_host(stream, weights)?;
-        let optimizer_states = SfnnRangerOptimizerStates::from_host_weights(stream, weights)?;
+        let optimizer_states = optimizer_states(stream, weights)?;
         let device_batch = SfnnForwardDeviceBatch {
             batch_size,
             max_active,
@@ -99,6 +138,11 @@ impl SfnnLossRangerStepRunner {
         };
         let targets = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
         let entry_weights = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
+        let upload_stm_indices = PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?;
+        let upload_nstm_indices = PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?;
+        let upload_buckets = PinnedHostBuffer::<i32>::zeroed(ctx, batch_size)?;
+        let upload_targets = PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?;
+        let upload_entry_weights = PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?;
         let forward_workspace = SfnnForwardWorkspace::new(stream, SfnnForwardWorkspaceLayout::new(shape, batch_size))?;
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
@@ -113,6 +157,12 @@ impl SfnnLossRangerStepRunner {
             device_batch,
             targets,
             entry_weights,
+            upload_stm_indices,
+            upload_nstm_indices,
+            upload_buckets,
+            upload_targets,
+            upload_entry_weights,
+            upload_done: None,
             forward_workspace,
             loss_workspace,
             backward_workspace,
@@ -129,6 +179,7 @@ impl SfnnLossRangerStepRunner {
         weights.validate()?;
         let shape = weights.shape;
         let sparse_len = batch_size.saturating_mul(max_active);
+        let ctx = stream.context();
         let device_weights = SfnnForwardDeviceWeights::from_host(stream, weights)?;
         let optimizer_states =
             SfnnRangerOptimizerStates::from_host_states(stream, SfnnForwardWeightLayout::new(shape), optimizer_state)?;
@@ -141,6 +192,11 @@ impl SfnnLossRangerStepRunner {
         };
         let targets = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
         let entry_weights = DeviceBuffer::<f32>::zeroed(stream, batch_size)?;
+        let upload_stm_indices = PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?;
+        let upload_nstm_indices = PinnedHostBuffer::<i32>::zeroed(ctx, sparse_len)?;
+        let upload_buckets = PinnedHostBuffer::<i32>::zeroed(ctx, batch_size)?;
+        let upload_targets = PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?;
+        let upload_entry_weights = PinnedHostBuffer::<f32>::zeroed(ctx, batch_size)?;
         let forward_workspace = SfnnForwardWorkspace::new(stream, SfnnForwardWorkspaceLayout::new(shape, batch_size))?;
         let loss_workspace = ScalarLossWorkspace::new(stream, ScalarLossLayout::new(batch_size))?;
         let backward_workspace =
@@ -155,6 +211,12 @@ impl SfnnLossRangerStepRunner {
             device_batch,
             targets,
             entry_weights,
+            upload_stm_indices,
+            upload_nstm_indices,
+            upload_buckets,
+            upload_targets,
+            upload_entry_weights,
+            upload_done: None,
             forward_workspace,
             loss_workspace,
             backward_workspace,
@@ -168,13 +230,34 @@ impl SfnnLossRangerStepRunner {
         params: RangerUpdateParams,
         loss_kind: SfnnTrainLossKind,
         batch: SfnnTrainStepHostBatch<'_>,
+        profile: bool,
     ) -> Result<()> {
         self.validate_batch(batch)?;
-        self.device_batch.stm_indices.copy_from_host(stream, batch.stm_indices)?;
-        self.device_batch.nstm_indices.copy_from_host(stream, batch.nstm_indices)?;
-        self.device_batch.buckets.copy_from_host(stream, batch.buckets)?;
-        self.targets.copy_from_host(stream, batch.targets)?;
-        self.entry_weights.copy_from_host(stream, batch.entry_weights)?;
+        let mut profile_last = if profile {
+            stream.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if let Some(event) = self.upload_done.take() {
+            event.synchronize()?;
+        }
+        self.upload_stm_indices.as_mut_slice().copy_from_slice(batch.stm_indices);
+        self.upload_nstm_indices.as_mut_slice().copy_from_slice(batch.nstm_indices);
+        self.upload_buckets.as_mut_slice().copy_from_slice(batch.buckets);
+        self.upload_targets.as_mut_slice().copy_from_slice(batch.targets);
+        self.upload_entry_weights.as_mut_slice().copy_from_slice(batch.entry_weights);
+        // SAFETY: the pinned upload buffers are not reused until `upload_done`
+        // is synchronized at the beginning of a later `step` call.
+        unsafe {
+            self.device_batch.stm_indices.copy_from_pinned_host_async(stream, &self.upload_stm_indices)?;
+            self.device_batch.nstm_indices.copy_from_pinned_host_async(stream, &self.upload_nstm_indices)?;
+            self.device_batch.buckets.copy_from_pinned_host_async(stream, &self.upload_buckets)?;
+            self.targets.copy_from_pinned_host_async(stream, &self.upload_targets)?;
+            self.entry_weights.copy_from_pinned_host_async(stream, &self.upload_entry_weights)?;
+        }
+        self.upload_done = Some(stream.record_event(None)?);
+        profile_stage(stream, &mut profile_last, "upload")?;
 
         sfnn_forward::launch_sfnn_forward(
             stream,
@@ -183,6 +266,7 @@ impl SfnnLossRangerStepRunner {
             &self.device_weights,
             &mut self.forward_workspace,
         )?;
+        profile_stage(stream, &mut profile_last, "forward")?;
 
         match loss_kind {
             SfnnTrainLossKind::SigmoidMse => loss_forward::launch_sigmoid_mse_loss_from_buffers(
@@ -202,6 +286,7 @@ impl SfnnLossRangerStepRunner {
                 &mut self.loss_workspace,
             )?,
         }
+        profile_stage(stream, &mut profile_last, "loss")?;
 
         let l3_layout = SfnnStackedL3BackwardLayout::new(
             self.batch_size,
@@ -222,6 +307,7 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l3w_gradients,
             &mut self.backward_workspace.l3b_gradients,
         )?;
+        profile_stage(stream, &mut profile_last, "backward_l3")?;
 
         let l2_layout = SfnnStackedCReluBackwardLayout::new(
             self.batch_size,
@@ -242,6 +328,7 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l2w_gradients,
             &mut self.backward_workspace.l2b_gradients,
         )?;
+        profile_stage(stream, &mut profile_last, "backward_l2_crelu")?;
 
         let l2_input_layout = SfnnL2InputBackwardLayout::new(self.batch_size, self.shape.l1_hidden);
         sfnn_backward::launch_sfnn_l2_input_backward(
@@ -253,6 +340,7 @@ impl SfnnLossRangerStepRunner {
             &self.backward_workspace.l2_input_gradients,
             &mut self.backward_workspace.l1_gradients,
         )?;
+        profile_stage(stream, &mut profile_last, "backward_l2_input")?;
 
         let l1_layout = SfnnStackedAffineBackwardLayout::new(
             self.batch_size,
@@ -272,6 +360,7 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l1w_gradients,
             &mut self.backward_workspace.l1b_gradients,
         )?;
+        profile_stage(stream, &mut profile_last, "backward_l1")?;
         if let Some(l1fw) = &self.device_weights.l1fw {
             let l1f_layout = SfnnSharedL1BackwardLayout::new(self.batch_size, self.shape.ft_size, self.shape.l1_out());
             sfnn_backward::launch_sfnn_shared_l1_backward(
@@ -285,6 +374,7 @@ impl SfnnLossRangerStepRunner {
                 &mut self.backward_workspace.l1fw_gradients,
                 &mut self.backward_workspace.l1fb_gradients,
             )?;
+            profile_stage(stream, &mut profile_last, "backward_l1_shared")?;
         }
 
         let pairwise_layout = SfnnPairwiseBackwardLayout::new(self.batch_size, self.shape.ft_size);
@@ -298,6 +388,7 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.stm_l0_gradients,
             &mut self.backward_workspace.nstm_l0_gradients,
         )?;
+        profile_stage(stream, &mut profile_last, "backward_pairwise")?;
 
         let l0_layout = SfnnL0SparseBackwardLayout::new(
             self.batch_size,
@@ -320,15 +411,26 @@ impl SfnnLossRangerStepRunner {
             &mut self.backward_workspace.l0w_gradients,
             &mut self.backward_workspace.l0b_gradients,
         )?;
+        if sfnn_halfka2_ft_factorized_input_size(self.shape.input_size) {
+            sfnn_backward::launch_sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad(
+                stream,
+                module,
+                l0_layout,
+                &mut self.backward_workspace.l0w_gradients,
+            )?;
+        }
+        profile_stage(stream, &mut profile_last, "backward_l0_sparse")?;
 
         optimizer_update::launch_sfnn_ranger_update(
             stream,
             module,
             params,
             &mut self.device_weights,
-            &self.backward_workspace,
+            &mut self.backward_workspace,
             &mut self.optimizer_states,
-        )
+        )?;
+        profile_stage(stream, &mut profile_last, "optimizer")?;
+        Ok(())
     }
 
     pub(crate) fn read_loss(&self, stream: &Arc<CudaStream>) -> Result<SfnnTrainStepLossReadback> {
@@ -416,4 +518,18 @@ impl SfnnLossRangerStepRunner {
 
         Ok(())
     }
+}
+
+fn sfnn_halfka2_ft_factorized_input_size(input_size: usize) -> bool {
+    input_size == 131_949 + 1_629
+}
+
+fn profile_stage(stream: &Arc<CudaStream>, last: &mut Option<std::time::Instant>, label: &'static str) -> Result<()> {
+    if let Some(previous) = last {
+        stream.synchronize()?;
+        let now = std::time::Instant::now();
+        println!("  profile_sfnn_step : {label:<20} {:>9.3} ms", now.duration_since(*previous).as_secs_f64() * 1000.0);
+        *previous = now;
+    }
+    Ok(())
 }

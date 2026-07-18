@@ -3,6 +3,10 @@
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::{DisjointSlice, kernel, thread};
 
+const SFNN_HALFKA2_BASE_INPUT_SIZE: u32 = 131_949;
+const SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS: u32 = 1_629;
+const SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE: u32 = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS;
+
 #[kernel]
 pub fn dense_output_backward(
     inputs: &[f32],
@@ -334,6 +338,27 @@ pub fn nnue_l0_sparse_backward(
 }
 
 #[kernel]
+pub fn sfnn_dense_zero_gradients(
+    mut weight_gradients: DisjointSlice<f32>,
+    mut bias_gradients: DisjointSlice<f32>,
+    weight_len: u32,
+    bias_len: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    if tid_value < weight_len as usize {
+        if let Some(out) = weight_gradients.get_mut(tid) {
+            *out = 0.0;
+        }
+    }
+    if tid_value < bias_len as usize {
+        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
+            *out = 0.0;
+        }
+    }
+}
+
+#[kernel]
 pub fn sfnn_stacked_l3_backward(
     inputs: &[f32],
     output_gradients: &[f32],
@@ -356,19 +381,25 @@ pub fn sfnn_stacked_l3_backward(
     let stacks = num_stacks as usize;
     let input_gradient_len = batch_size * rows;
     let l1_gradient_len = batch_size * l1_rows;
-    let weight_len = rows * stacks;
 
     if tid_value < input_gradient_len {
         let sample = tid_value / rows;
         let row = tid_value - sample * rows;
         let stack_i32 = buckets[sample];
         let value = if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
-            output_gradients[sample] * weights[row * stacks + stack_i32 as usize]
+            output_gradients[sample] * weights[(stack_i32 as usize) * rows + row]
         } else {
             0.0_f32
         };
         if let Some(out) = input_gradients.get_mut(tid) {
             *out = value;
+        }
+
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let weight_idx = stack * rows + row;
+            let weight_cell = unsafe { &*(weight_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            weight_cell.fetch_add(output_gradients[sample] * inputs[sample * rows + row], AtomicOrdering::Relaxed);
         }
     }
 
@@ -381,29 +412,11 @@ pub fn sfnn_stacked_l3_backward(
         }
     }
 
-    if tid_value < weight_len {
-        let row = tid_value / stacks;
-        let stack = tid_value - row * stacks;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == stack as i32 {
-                sum += output_gradients[sample] * inputs[sample * rows + row];
-            }
-        }
-        if let Some(out) = weight_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
-        }
-    }
-
-    if tid_value < stacks {
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == tid_value as i32 {
-                sum += output_gradients[sample];
-            }
-        }
-        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+    if tid_value < batch_size {
+        let stack_i32 = buckets[tid_value];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let cell = unsafe { &*(bias_gradients.as_mut_ptr().add(stack_i32 as usize) as *const DeviceAtomicF32) };
+            cell.fetch_add(output_gradients[tid_value], AtomicOrdering::Relaxed);
         }
     }
 }
@@ -430,9 +443,8 @@ pub fn sfnn_stacked_crelu_backward(
     let output_rows = output_dim as usize;
     let stacks = num_stacks as usize;
     let input_gradient_len = batch_size * input_rows;
-    let stack_stride = stacks * output_rows;
-    let weight_len = input_rows * stack_stride;
-    let bias_len = stack_stride;
+    let weight_scatter_len = batch_size * input_rows * output_rows;
+    let bias_scatter_len = batch_size * output_rows;
 
     if tid_value < input_gradient_len {
         let sample = tid_value / input_rows;
@@ -441,9 +453,10 @@ pub fn sfnn_stacked_crelu_backward(
         let mut sum = 0.0_f32;
         if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
             let stack = stack_i32 as usize;
+            let stack_base = stack * output_rows * input_rows;
             for out_col in 0..output_rows {
                 let grad = dense_crelu_pre_gradient(activations, output_gradients, sample, out_col, output_rows);
-                sum += grad * weights[in_col * stack_stride + stack * output_rows + out_col];
+                sum += grad * weights[stack_base + out_col * input_rows + in_col];
             }
         }
         if let Some(out) = input_gradients.get_mut(tid) {
@@ -451,34 +464,31 @@ pub fn sfnn_stacked_crelu_backward(
         }
     }
 
-    if tid_value < weight_len {
-        let in_col = tid_value / stack_stride;
-        let rem = tid_value - in_col * stack_stride;
-        let stack = rem / output_rows;
-        let out_col = rem - stack * output_rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == stack as i32 {
-                let grad = dense_crelu_pre_gradient(activations, output_gradients, sample, out_col, output_rows);
-                sum += grad * inputs[sample * input_rows + in_col];
-            }
-        }
-        if let Some(out) = weight_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+    if tid_value < weight_scatter_len {
+        let out_col = tid_value % output_rows;
+        let input_entry = tid_value / output_rows;
+        let in_col = input_entry % input_rows;
+        let sample = input_entry / input_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let grad = dense_crelu_pre_gradient(activations, output_gradients, sample, out_col, output_rows);
+            let weight_idx = stack * output_rows * input_rows + out_col * input_rows + in_col;
+            let cell = unsafe { &*(weight_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(grad * inputs[sample * input_rows + in_col], AtomicOrdering::Relaxed);
         }
     }
 
-    if tid_value < bias_len {
-        let stack = tid_value / output_rows;
-        let out_col = tid_value - stack * output_rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == stack as i32 {
-                sum += dense_crelu_pre_gradient(activations, output_gradients, sample, out_col, output_rows);
-            }
-        }
-        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+    if tid_value < bias_scatter_len {
+        let out_col = tid_value % output_rows;
+        let sample = tid_value / output_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let bias_idx = stack * output_rows + out_col;
+            let grad = dense_crelu_pre_gradient(activations, output_gradients, sample, out_col, output_rows);
+            let cell = unsafe { &*(bias_gradients.as_mut_ptr().add(bias_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(grad, AtomicOrdering::Relaxed);
         }
     }
 }
@@ -541,9 +551,8 @@ pub fn sfnn_stacked_affine_backward(
     let output_rows = output_dim as usize;
     let stacks = num_stacks as usize;
     let input_gradient_len = batch_size * input_rows;
-    let stack_stride = stacks * output_rows;
-    let weight_len = input_rows * stack_stride;
-    let bias_len = stack_stride;
+    let weight_scatter_len = batch_size * input_rows * output_rows;
+    let bias_scatter_len = batch_size * output_rows;
 
     if tid_value < input_gradient_len {
         let sample = tid_value / input_rows;
@@ -552,9 +561,10 @@ pub fn sfnn_stacked_affine_backward(
         let mut sum = 0.0_f32;
         if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
             let stack = stack_i32 as usize;
+            let stack_base = stack * output_rows * input_rows;
             for out_col in 0..output_rows {
                 sum += output_gradients[sample * output_rows + out_col]
-                    * weights[in_col * stack_stride + stack * output_rows + out_col];
+                    * weights[stack_base + out_col * input_rows + in_col];
             }
         }
         if let Some(out) = input_gradients.get_mut(tid) {
@@ -562,33 +572,30 @@ pub fn sfnn_stacked_affine_backward(
         }
     }
 
-    if tid_value < weight_len {
-        let in_col = tid_value / stack_stride;
-        let rem = tid_value - in_col * stack_stride;
-        let stack = rem / output_rows;
-        let out_col = rem - stack * output_rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == stack as i32 {
-                sum += output_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
-            }
-        }
-        if let Some(out) = weight_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+    if tid_value < weight_scatter_len {
+        let out_col = tid_value % output_rows;
+        let input_entry = tid_value / output_rows;
+        let in_col = input_entry % input_rows;
+        let sample = input_entry / input_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let weight_idx = stack * output_rows * input_rows + out_col * input_rows + in_col;
+            let grad = output_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
+            let cell = unsafe { &*(weight_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(grad, AtomicOrdering::Relaxed);
         }
     }
 
-    if tid_value < bias_len {
-        let stack = tid_value / output_rows;
-        let out_col = tid_value - stack * output_rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            if buckets[sample] == stack as i32 {
-                sum += output_gradients[sample * output_rows + out_col];
-            }
-        }
-        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+    if tid_value < bias_scatter_len {
+        let out_col = tid_value % output_rows;
+        let sample = tid_value / output_rows;
+        let stack_i32 = buckets[sample];
+        if stack_i32 >= 0 && (stack_i32 as usize) < stacks {
+            let stack = stack_i32 as usize;
+            let bias_idx = stack * output_rows + out_col;
+            let cell = unsafe { &*(bias_gradients.as_mut_ptr().add(bias_idx) as *const DeviceAtomicF32) };
+            cell.fetch_add(output_gradients[sample * output_rows + out_col], AtomicOrdering::Relaxed);
         }
     }
 }
@@ -611,7 +618,8 @@ pub fn sfnn_shared_l1_backward(
     let input_rows = input_dim as usize;
     let output_rows = output_dim as usize;
     let input_gradient_len = batch_size * input_rows;
-    let weight_len = input_rows * output_rows;
+    let weight_scatter_len = batch_size * input_rows * output_rows;
+    let bias_scatter_len = batch_size * output_rows;
 
     if tid_value < input_gradient_len {
         let sample = tid_value / input_rows;
@@ -625,26 +633,22 @@ pub fn sfnn_shared_l1_backward(
         }
     }
 
-    if tid_value < weight_len {
-        let in_col = tid_value / output_rows;
-        let out_col = tid_value - in_col * output_rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            sum += output_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
-        }
-        if let Some(out) = weight_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
-        }
+    if tid_value < weight_scatter_len {
+        let out_col = tid_value % output_rows;
+        let input_entry = tid_value / output_rows;
+        let in_col = input_entry % input_rows;
+        let sample = input_entry / input_rows;
+        let weight_idx = in_col * output_rows + out_col;
+        let grad = output_gradients[sample * output_rows + out_col] * inputs[sample * input_rows + in_col];
+        let cell = unsafe { &*(weight_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+        cell.fetch_add(grad, AtomicOrdering::Relaxed);
     }
 
-    if tid_value < output_rows {
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            sum += output_gradients[sample * output_rows + tid_value];
-        }
-        if let Some(out) = bias_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
-        }
+    if tid_value < bias_scatter_len {
+        let out_col = tid_value % output_rows;
+        let sample = tid_value / output_rows;
+        let cell = unsafe { &*(bias_gradients.as_mut_ptr().add(out_col) as *const DeviceAtomicF32) };
+        cell.fetch_add(output_gradients[sample * output_rows + out_col], AtomicOrdering::Relaxed);
     }
 }
 
@@ -669,8 +673,8 @@ pub fn sfnn_pairwise_backward(
     let pairwise = ft / 2;
     let sample = tid_value / ft;
     let col = tid_value - sample * ft;
-    let pair = col / 2;
-    let mate_col = pair * 2 + (1 - (col - pair * 2));
+    let pair = col % pairwise;
+    let mate_col = if col < pairwise { pairwise + pair } else { pair };
     let l0_base = sample * ft;
     let combined_base = sample * ft;
     let scale = 127.0_f32 / 128.0_f32;
@@ -682,6 +686,32 @@ pub fn sfnn_pairwise_backward(
     }
     if let Some(out) = nstm_gradients.get_mut(thread::index_1d()) {
         *out = nstm_grad;
+    }
+}
+
+#[kernel]
+pub fn sfnn_l0_sparse_zero_gradients(
+    mut l0w_gradients: DisjointSlice<f32>,
+    mut l0b_gradients: DisjointSlice<f32>,
+    input_size: u32,
+    ft_size: u32,
+) {
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let rows = ft_size as usize;
+    let features = input_size as usize;
+    let weight_len = features * rows;
+
+    if tid_value < weight_len {
+        if let Some(out) = l0w_gradients.get_mut(tid) {
+            *out = 0.0;
+        }
+    }
+
+    if tid_value < rows {
+        if let Some(out) = l0b_gradients.get_mut(thread::index_1d()) {
+            *out = 0.0;
+        }
     }
 }
 
@@ -709,9 +739,11 @@ pub fn sfnn_l0_sparse_backward(
     let rows = ft_size as usize;
     let features = input_size as usize;
     let l0_len = batch_size * rows;
-    let weight_len = features * rows;
 
     if tid_value < l0_len {
+        let row = tid_value % rows;
+        let sample = tid_value / rows;
+        let sparse_base = sample * slots;
         let stm_grad = crelu_pre_gradient_from_value(stm_activations[tid_value], stm_output_gradients[tid_value]);
         let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[tid_value], nstm_output_gradients[tid_value]);
         if let Some(out) = stm_pre_gradients.get_mut(tid) {
@@ -720,41 +752,80 @@ pub fn sfnn_l0_sparse_backward(
         if let Some(out) = nstm_pre_gradients.get_mut(thread::index_1d()) {
             *out = nstm_grad;
         }
-    }
 
-    if tid_value < weight_len {
-        let feature = tid_value / rows;
-        let row = tid_value - feature * rows;
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            let sparse_base = sample * slots;
-            let grad_idx = sample * rows + row;
-            let stm_grad = crelu_pre_gradient_from_value(stm_activations[grad_idx], stm_output_gradients[grad_idx]);
-            let nstm_grad = crelu_pre_gradient_from_value(nstm_activations[grad_idx], nstm_output_gradients[grad_idx]);
-            for slot in 0..slots {
-                if stm_indices[sparse_base + slot] == feature as i32 {
-                    sum += stm_grad;
-                }
-                if nstm_indices[sparse_base + slot] == feature as i32 {
-                    sum += nstm_grad;
-                }
+        let cell = unsafe { &*(l0b_gradients.as_mut_ptr().add(row) as *const DeviceAtomicF32) };
+        cell.fetch_add(stm_grad + nstm_grad, AtomicOrdering::Relaxed);
+
+        for slot in 0..slots {
+            let stm_feature = stm_indices[sparse_base + slot];
+            if stm_feature >= 0 && (stm_feature as usize) < features {
+                let stm_feature = stm_feature as u32;
+                let weight_idx = (stm_feature as usize) * rows + row;
+                let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+                cell.fetch_add(stm_grad, AtomicOrdering::Relaxed);
+            }
+
+            let nstm_feature = nstm_indices[sparse_base + slot];
+            if nstm_feature >= 0 && (nstm_feature as usize) < features {
+                let nstm_feature = nstm_feature as u32;
+                let weight_idx = (nstm_feature as usize) * rows + row;
+                let cell = unsafe { &*(l0w_gradients.as_mut_ptr().add(weight_idx) as *const DeviceAtomicF32) };
+                cell.fetch_add(nstm_grad, AtomicOrdering::Relaxed);
             }
         }
-        if let Some(out) = l0w_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
-        }
+    }
+}
+
+#[kernel]
+pub fn sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad(
+    mut l0w_gradients: DisjointSlice<f32>,
+    input_size: u32,
+    ft_size: u32,
+) {
+    if input_size != SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE {
+        return;
     }
 
-    if tid_value < rows {
-        let mut sum = 0.0_f32;
-        for sample in 0..batch_size {
-            let grad_idx = sample * rows + tid_value;
-            sum += crelu_pre_gradient_from_value(stm_activations[grad_idx], stm_output_gradients[grad_idx]);
-            sum += crelu_pre_gradient_from_value(nstm_activations[grad_idx], nstm_output_gradients[grad_idx]);
+    let tid = thread::index_1d();
+    let tid_value = tid.get();
+    let rows = ft_size as usize;
+    let piece_inputs = SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS as usize;
+    let base_input_size = SFNN_HALFKA2_BASE_INPUT_SIZE as usize;
+    let total = piece_inputs * rows;
+    if tid_value >= total {
+        return;
+    }
+
+    let piece = tid_value / rows;
+    let row = tid_value - piece * rows;
+    let row_stride = piece_inputs * rows;
+    let base = piece * rows + row;
+    let repeats = base_input_size / piece_inputs;
+    let ptr = l0w_gradients.as_mut_ptr();
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
+    let mut kb = 0_usize;
+    let unroll_end = repeats.saturating_sub(3);
+    while kb < unroll_end {
+        unsafe {
+            sum0 += ptr.add(base + kb * row_stride).read();
+            sum1 += ptr.add(base + (kb + 1) * row_stride).read();
+            sum2 += ptr.add(base + (kb + 2) * row_stride).read();
+            sum3 += ptr.add(base + (kb + 3) * row_stride).read();
         }
-        if let Some(out) = l0b_gradients.get_mut(thread::index_1d()) {
-            *out = sum;
+        kb += 4;
+    }
+    while kb < repeats {
+        unsafe {
+            sum0 += ptr.add(base + kb * row_stride).read();
         }
+        kb += 1;
+    }
+    let virtual_idx = base_input_size * rows + piece * rows + row;
+    unsafe {
+        ptr.add(virtual_idx).write((sum0 + sum1) + (sum2 + sum3));
     }
 }
 

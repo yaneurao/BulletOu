@@ -5,11 +5,11 @@ use std::sync::Arc;
 use bulletou_cuda_oxide_runtime::{
     CudaModule, CudaStream, DeviceBuffer, LaunchConfig, Result,
     backward::{
-        SfnnL0SparseBackwardLaunchPlan, SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLaunchPlan,
-        SfnnL2InputBackwardLayout, SfnnPairwiseBackwardLaunchPlan, SfnnPairwiseBackwardLayout,
-        SfnnSharedL1BackwardLaunchPlan, SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLaunchPlan,
-        SfnnStackedAffineBackwardLayout, SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout,
-        SfnnStackedL3BackwardLaunchPlan, SfnnStackedL3BackwardLayout,
+        SfnnL0SparseBackwardLayout, SfnnL2InputBackwardLaunchPlan, SfnnL2InputBackwardLayout,
+        SfnnPairwiseBackwardLaunchPlan, SfnnPairwiseBackwardLayout, SfnnSharedL1BackwardLaunchPlan,
+        SfnnSharedL1BackwardLayout, SfnnStackedAffineBackwardLaunchPlan, SfnnStackedAffineBackwardLayout,
+        SfnnStackedCReluBackwardLaunchPlan, SfnnStackedCReluBackwardLayout, SfnnStackedL3BackwardLaunchPlan,
+        SfnnStackedL3BackwardLayout,
     },
 };
 use cuda_host::cuda_launch;
@@ -84,6 +84,8 @@ pub(crate) fn launch_sfnn_stacked_crelu_backward(
     let input_dim = layout.input_dim as u32;
     let output_dim = layout.output_dim as u32;
     let num_stacks = layout.num_stacks as u32;
+    let scatter_threads = layout.batch_size.saturating_mul(layout.input_dim).saturating_mul(layout.output_dim);
+    let threads = plan.threads.max(scatter_threads);
 
     unsafe {
         // SAFETY: kernel ABI matches `sfnn_stacked_crelu_backward`; all
@@ -93,7 +95,7 @@ pub(crate) fn launch_sfnn_stacked_crelu_backward(
             kernel: crate::kernels::backward::sfnn_stacked_crelu_backward,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.threads),
+            config: cfg_1d(threads),
             args: [
                 slice(inputs),
                 slice(activations),
@@ -171,6 +173,8 @@ pub(crate) fn launch_sfnn_stacked_affine_backward(
     let input_dim = layout.input_dim as u32;
     let output_dim = layout.output_dim as u32;
     let num_stacks = layout.num_stacks as u32;
+    let scatter_threads = layout.batch_size.saturating_mul(layout.input_dim).saturating_mul(layout.output_dim);
+    let threads = plan.threads.max(scatter_threads);
 
     unsafe {
         // SAFETY: kernel ABI matches `sfnn_stacked_affine_backward`; all
@@ -180,7 +184,7 @@ pub(crate) fn launch_sfnn_stacked_affine_backward(
             kernel: crate::kernels::backward::sfnn_stacked_affine_backward,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.threads),
+            config: cfg_1d(threads),
             args: [
                 slice(inputs),
                 slice(output_gradients),
@@ -217,6 +221,8 @@ pub(crate) fn launch_sfnn_shared_l1_backward(
     let batch = layout.batch_size as u32;
     let input_dim = layout.input_dim as u32;
     let output_dim = layout.output_dim as u32;
+    let scatter_threads = layout.batch_size.saturating_mul(layout.input_dim).saturating_mul(layout.output_dim);
+    let threads = plan.threads.max(scatter_threads);
 
     unsafe {
         // SAFETY: kernel ABI matches `sfnn_shared_l1_backward`; the kernel
@@ -226,7 +232,7 @@ pub(crate) fn launch_sfnn_shared_l1_backward(
             kernel: crate::kernels::backward::sfnn_shared_l1_backward,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.threads),
+            config: cfg_1d(threads),
             args: [
                 slice(inputs),
                 slice(output_gradients),
@@ -300,21 +306,21 @@ pub(crate) fn launch_sfnn_l0_sparse_backward(
     mut l0b_gradients: &mut DeviceBuffer<f32>,
 ) -> Result<()> {
     layout.validate()?;
-    let plan = SfnnL0SparseBackwardLaunchPlan::new(layout);
     let batch = layout.batch_size as u32;
     let max_active = layout.max_active as u32;
     let input_size = layout.input_size as u32;
     let ft_size = layout.ft_size as u32;
+    let scatter_threads = layout.l0_len();
 
     unsafe {
-        // SAFETY: kernel ABI matches `sfnn_l0_sparse_backward`; each launched
-        // thread owns one output gradient element in every mutable output it
-        // writes, and weight/bias gradients are race-free scan outputs.
+        // SAFETY: kernel ABI matches `sfnn_l0_sparse_backward`; pre-gradient
+        // writes are disjoint, while weight/bias gradient accumulation is
+        // performed through device atomics inside the kernel.
         cuda_launch! {
             kernel: crate::kernels::backward::sfnn_l0_sparse_backward,
             stream: stream.clone(),
             module: module.clone(),
-            config: cfg_1d(plan.threads),
+            config: cfg_1d(scatter_threads),
             args: [
                 slice(stm_indices),
                 slice(nstm_indices),
@@ -328,6 +334,39 @@ pub(crate) fn launch_sfnn_l0_sparse_backward(
                 slice_mut(l0b_gradients),
                 batch,
                 max_active,
+                input_size,
+                ft_size
+            ]
+        }
+    }?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    layout: SfnnL0SparseBackwardLayout,
+    mut l0w_gradients: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    layout.validate()?;
+    let input_size = layout.input_size as u32;
+    let ft_size = layout.ft_size as u32;
+    let virtual_rows = 1_629_usize;
+    let threads = virtual_rows * layout.ft_size;
+
+    unsafe {
+        // SAFETY: kernel ABI matches `sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad`.
+        // The kernel only reads base HalfKA2 L0 gradient rows and overwrites
+        // the disjoint virtual FT-factorizer rows.
+        cuda_launch! {
+            kernel: crate::kernels::backward::sfnn_halfka2_ft_factorized_l0_reduce_virtual_grad,
+            stream: stream.clone(),
+            module: module.clone(),
+            config: cfg_1d(threads),
+            args: [
+                slice_mut(l0w_gradients),
                 input_size,
                 ft_size
             ]

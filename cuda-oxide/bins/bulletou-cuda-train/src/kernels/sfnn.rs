@@ -5,6 +5,10 @@
 
 use cuda_device::{DisjointSlice, device, kernel, thread};
 
+const SFNN_HALFKA2_BASE_INPUT_SIZE: u32 = 131_949;
+const SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS: u32 = 1_629;
+const SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE: u32 = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS;
+
 #[kernel]
 pub fn sfnn_sparse_l0_crelu(
     indices: &[i32],
@@ -30,13 +34,27 @@ pub fn sfnn_sparse_l0_crelu(
     for slot in 0..(max_active as usize) {
         let feature = indices[sparse_base + slot];
         if feature >= 0 && (feature as u32) < input_size {
+            let feature = feature as u32;
             let weight_base = (feature as usize) * (rows as usize);
             sum += weights[weight_base + row];
+            if let Some(virtual_feature) = sfnn_forward_halfka2_ft_factorized_virtual_feature(feature, input_size) {
+                let virtual_weight_base = (virtual_feature as usize) * (rows as usize);
+                sum += weights[virtual_weight_base + row];
+            }
         }
     }
 
     if let Some(out) = output.get_mut(tid) {
         *out = sfnn_crelu(sum);
+    }
+}
+
+#[device]
+fn sfnn_forward_halfka2_ft_factorized_virtual_feature(feature: u32, input_size: u32) -> Option<u32> {
+    if input_size == SFNN_HALFKA2_FT_FACTORIZE_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE {
+        Some(SFNN_HALFKA2_BASE_INPUT_SIZE + feature % SFNN_HALFKA2_FT_FACTORIZE_PIECE_INPUTS)
+    } else {
+        None
     }
 }
 
@@ -59,9 +77,9 @@ pub fn sfnn_pairwise_concat(
     let col = tid.get() % ft_size;
     let sample = tid.get() / ft_size;
     let pair = col % pairwise;
-    let l0_base = sample * ft_size + pair * 2;
+    let l0_base = sample * ft_size;
     let source = if col < pairwise { stm_l0 } else { nstm_l0 };
-    let value = source[l0_base] * source[l0_base + 1] * (127.0_f32 / 128.0_f32);
+    let value = source[l0_base + pair] * source[l0_base + pairwise + pair] * (127.0_f32 / 128.0_f32);
 
     if let Some(out) = combined.get_mut(tid) {
         *out = value;
@@ -181,8 +199,9 @@ pub fn sfnn_stacked_l3_output(
     let stack = stack_i32 as usize;
     let input_base = sample * (input_dim as usize);
     let mut sum = bias[stack];
+    let weight_base = stack * (input_dim as usize);
     for idx in 0..(input_dim as usize) {
-        sum += input[input_base + idx] * weights[idx * (num_stacks as usize) + stack];
+        sum += input[input_base + idx] * weights[weight_base + idx];
     }
 
     let skip = l1[sample * ((l1_hidden as usize) + 1) + (l1_hidden as usize)];
@@ -219,11 +238,12 @@ fn stacked_affine(
 
     let stack = stack_i32 as usize;
     let rows = output_dim as usize;
-    let stack_stride = (num_stacks as usize) * rows;
+    let input_cols = input_dim as usize;
+    let stack_base = stack * rows * input_cols;
     let mut sum = bias[stack * rows + out_col];
-    let input_base = sample * (input_dim as usize);
-    for in_col in 0..(input_dim as usize) {
-        sum += input[input_base + in_col] * weights[in_col * stack_stride + stack * rows + out_col];
+    let input_base = sample * input_cols;
+    for in_col in 0..input_cols {
+        sum += input[input_base + in_col] * weights[stack_base + out_col * input_cols + in_col];
     }
 
     if apply_crelu {
