@@ -42,7 +42,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-032 | done | persistent C++/CUDA device runtime | replace host-copy smoke calls with persistent device buffers, streams, events, async upload slots, and CUDA Graph capture/replay hooks suitable for NNUE/SFNN train steps |
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
-| BO-CUDA-035 | doing | cuda-cpp production schedule parity | teach the Windows-native direct backend to honor normal production `--superbatches` / `--max-epochs` / `--save-rate` / LR schedule semantics instead of requiring manual `--cuda-cpp-train-steps` sizing |
+| BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
 | BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | optimise the remaining HalfKP sparse L0 backward/update hot spots and first-step library warmup so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
 
 ## Notes
@@ -896,9 +896,7 @@ the tickets in order and commit each completed slice.
   - bounded production mode expands `superbatches * max_epochs * effective_batches_per_superbatch` into direct C++/CUDA train steps and chunks checkpoint saves by `--save-rate`;
   - each save chunk writes a normal numbered checkpoint and summary row, so `--save-rate 1` produces one checkpoint per superbatch and larger values save at the end of each save-rate chunk;
   - step/geometric/cos LR schedules are applied to the actual C++/CUDA Ranger update per batch using the same positions-based LR formulas as the normal trainer, with epoch-local warm restarts.
-- Current limitations:
-  - production mode is intentionally bounded and requires `--max-epochs` to avoid accidental infinite direct runs;
-  - plateau LR orchestration remains on the normal/cuda-oxide paths for now.
+- Production mode is intentionally bounded and requires `--max-epochs` to avoid accidental infinite direct runs, matching the cuda-oxide production wrapper's safety guard.
 - Added production-mode resume scheduling:
   - mid-epoch resume detects the latest saved superbatch and resumes from `last_sb + 1` while keeping the displayed epoch number stable;
   - cleanly completed epochs continue as additional epochs with `epoch = previous_max_epoch + 1` and `superbatch = 1`;
@@ -918,3 +916,8 @@ the tickets in order and commit each completed slice.
   - Re-running the same HalfKP production smoke auto-resumed from `0002/state.bin`, restored `optimizer_step=3`, resumed the teacher at `4864,0`, wrote `0003` and `0004` as `epoch=2, superbatch=1..2`, logged `positions=192` then `256`, and advanced `dataloader_pos.txt` to `7296,0` then `9728,0`.
   - HalfKP plateau accept smoke with yamaoka PSV validation wrote `0001`, logged `lr_start=lr_end=0.001000`, and advanced `dataloader_pos.txt` to `2432,0`.
   - HalfKP plateau reject smoke using `--lr-plateau-monitor accuracy --lr 0.001 --lr-min 0.001` accepted `0001`, rejected the second attempted superbatch, left no `0002`, and wrote `0001/plateau_epoch_done.txt`.
+  - SFNN HalfKA2/factorized-L1 plateau smoke on Windows:
+    `--backend cuda-cpp --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --sfnn-factorized-l1 --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --superbatches 1 --max-epochs 1 --positions-per-superbatch 8 --batch-size 8 --save-rate 1 --lr-schedule plateau --test-teacher C:\shogi\teacher\test\yamaoka-floodgate.psv --test-positions 8 --test-sample sequential`
+    wrote `0001/{nn.bin,state.bin,learn.log,dataloader_pos.txt}`, logged `test_value_accuracy=0.625000`, `test_value_loss=0.239121`, `positions=8`, `lr_start=lr_end=0.001000`, and wrote `dataloader_pos.txt = 304,0`.
+- Result:
+  - BO-CUDA-035 is complete for bounded production-schedule parity on the Windows-native C++/CUDA direct backend. Remaining work now moves to BO-CUDA-036's post-parity HalfKP optimisation.
