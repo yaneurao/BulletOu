@@ -5,13 +5,9 @@ pub use bullet_trainer::model::{
     builder::{Affine, InitSettings, ModelBuilder, ModelNode},
 };
 
-#[cfg(feature = "device-cuda")]
-pub type ExecutionContext = bullet_gpu::runtime::cuda::Cuda;
-
-#[cfg(feature = "device-rocm")]
-pub type ExecutionContext = bullet_gpu::runtime::rocm::ROCm;
-
-#[cfg(not(any(feature = "device-cuda", feature = "device-rocm")))]
+/// Legacy Bullet model-builder examples still type-check through the mock
+/// runtime. Production GPU training is handled by BulletOu's `cuda-cpp`
+/// backend, not by the old `bullet-gpu` hardware runtime.
 pub type ExecutionContext = bullet_gpu::runtime::mock::MockGpu;
 
 pub type Model = TrainerModel<ExecutionContext>;

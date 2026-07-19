@@ -3,7 +3,7 @@
 <a href="../../ja/shogi/shogi_progress_kpabs_train.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 Tools for training `progress.bin` (the KP-Absolute progress model) used for LayerStack bucket selection.
-Two variants are provided: a CPU version and a CUDA version.
+The maintained helper is the CPU version. The old `bullet-gpu` CUDA helper was removed when BulletOu moved to the `cuda-cpp` training backend.
 
 The generated `progress.bin` is referenced in LayerStack training as
 `--bucket-mode progress8kpabs --progress-coeff progress.bin`.
@@ -65,18 +65,13 @@ y = clamp((game_ply - 1) / (ply_max - 1), 0, 1)
 | Implementation | Binary name | Teacher mode | Training granularity | Backend |
 |---|---|---|---|---|
 | CPU | `shogi_progress_kpabs_train` | both exact and approximate | position-level minibatch (approximate) / 1 game = 1 step (exact) | single-thread CPU |
-| CUDA | `shogi_progress_kpabs_train_cuda` | exact only | K games = 1 step minibatch | GPU (cudarc + NVRTC) with parallel reader threads |
 
-Both solve the same convex optimisation problem, so they converge to the same optimum. Only the training trajectory and speed differ.
+The removed CUDA helper solved the same convex optimisation problem, but it belonged to the retired `bullet-gpu` runtime and is no longer built.
 
 Build:
 
 ```bash
-# CPU version
 cargo build --release --example shogi_progress_kpabs_train
-
-# CUDA version (CUDA backend required; builds with the repo's default settings)
-cargo build --release --example shogi_progress_kpabs_train_cuda
 ```
 
 ---
@@ -104,10 +99,6 @@ and `interleave_pack_groups()` performs **round-robin reordering** that pulls on
 |---|---|---|
 | CPU / approximate | `RoundRobinPackStream`: round-robin 1 record at a time across files | val_positions (the first N positions) → remaining `max_positions` is train (same stream) |
 | CPU / exact | `MultiFileGameIterator`: sequential traversal in interleaved order, yielding per-game | **First 5%** (`packs.len() / 20`) is val, rest is train |
-| CUDA (exact only) | Reader threads decode files in parallel from a shared queue and feed the main GPU thread | **Last `--val-files-ratio`** (default 0.05) is val, rest is train |
-
-> Note: CPU exact mode and the CUDA version take val from **opposite ends** (first vs. last) of the file order.
-
 ### Pitfall in automatic val splitting
 
 Because the file split is based on the deterministic order produced by `interleave_pack_groups`, certain **game subsets** may be over-represented in val depending on the dataset composition.
@@ -117,7 +108,7 @@ For example, if "normal self-play files" and "specialised files (entering-king, 
 Workarounds:
 
 - Unify the filename convention so `pack_group_key` returns the same group for all files
-- Or set `--val-games` / `--val-files-ratio` explicitly, and if needed, pre-shuffle the training dataset (i.e., produce mixed-source binary files in advance)
+- Or set `--val-games` explicitly, and if needed, pre-shuffle the training dataset (i.e., produce mixed-source binary files in advance)
 
 ---
 
@@ -141,32 +132,6 @@ Workarounds:
 | `--val-games` | 0 (auto) | Max games scanned per val pass (exact mode) |
 | `--log-interval-games` | 1,000 | Log interval per game (exact mode) |
 | `--save-each-epoch` | false | Also save `<output_stem>.eN.<ext>` after each epoch |
-
-### CUDA version (`shogi_progress_kpabs_train_cuda`)
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--data` | required | Comma-separated files or directories |
-| `--output` | required | Path of the output `progress.bin` |
-| `--init-from` | (none) | Warm-start weights from an existing `progress.bin` |
-| `--games-per-step` | 1,024 | Games aggregated into one Adam step (K games) |
-| `--max-games` | 0 (unlimited) | Training games per epoch |
-| `--val-games` | 0 (scan all val files) | Max games per val evaluation |
-| `--val-files-ratio` | 0.05 | Fraction of files moved to val (taken from the tail) |
-| `--epochs` | 1 | Training passes |
-| `--lr` | 1e-3 | Adam reference learning rate |
-| `--lr-scale` | `sqrt` | lr scaling against batch size: `none` (lr as-is) / `sqrt` (`lr × √K`) |
-| `--log-interval-steps` | 100 | Log interval per step |
-| `--save-each-epoch` | false | Also save `<output_stem>.eN.<ext>` after each epoch |
-| `--device` | 0 | CUDA device ordinal |
-| `--reader-threads` | 4 | CPU threads for PSV decode + batch construction |
-| `--prefetch-depth` | 4 | Number of batches buffered ahead of the GPU |
-
-> Adam already self-normalises gradients via its second moment, so strictly speaking
-> lr correction for batch averaging is not required. Setting `--lr-scale none` runs at
-> the same lr as the CPU version (which is 1 game = 1 step).
-
----
 
 ## Command examples
 
@@ -201,32 +166,6 @@ cargo run --release --example shogi_progress_kpabs_train -- \
 ```
 
 Use this when shuffled data is already available. Adjust `--ply-max` to match actual game lengths in the data.
-
-### CUDA version (recommended for large-scale, game-ordered data)
-
-```bash
-cargo run --release --example shogi_progress_kpabs_train_cuda -- \
-  --data /path/to/dir1,/path/to/dir2 \
-  --output progress.bin \
-  --games-per-step 1024 \
-  --epochs 1 \
-  --lr 1e-3 \
-  --lr-scale none \
-  --val-files-ratio 0.05 \
-  --reader-threads 12 \
-  --prefetch-depth 8 \
-  --save-each-epoch \
-  --log-interval-steps 1000
-```
-
-The model is small and the GPU uses `atomicAdd(double*)`, so GPU utilisation is modest. The end-to-end throughput tends to scale with how much CPU prefetch you can sustain. Try setting `--reader-threads` close to your actual CPU core count.
-
-With `--save-each-epoch` you also get `progress.e1.bin`, `progress.e2.bin`, ..., while the final epoch's weights are also written under the `progress.bin` name.
-
-> The CUDA version uses `atomicAdd(double*)`, requiring features at `compute_60` or later
-> (works on Pascal-generation NVIDIA GPUs and onward).
-
----
 
 ## Usage in NNUE training
 

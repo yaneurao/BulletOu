@@ -30,25 +30,16 @@ You can build `bullet-utils` with `cargo b -r --package bullet-utils`, to do the
 
 Use `./target/release/bullet-utils[.exe] help` to see specific usage.
 
-This does **not** require CUDA or HIP.
+This does **not** require CUDA.
 
-### Backends
+### Backend
 
-#### CUDA
+BulletOu's maintained trainer backend is `cuda-cpp` for NVIDIA GPUs:
 
-For users with NVIDIA GPUs.
+```bash
+cargo build --release --features cuda-cpp-backend --example bulletou
+```
 
-- Enable the `cuda` feature
-- Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
-    - Recommended to use as recent a version as possible
-    - If the toolkit version is too old you should receive a relatively clear error, either at compile time via a linker error or at runtime
-- The `CUDA_PATH` environment variable must be set to the CUDA install location (should contain the `bin`, `lib` and `include` directories)
-
-#### ROCm
-
-For users with AMD GPUs.
-
-- Enable the `rocm` feature
-- Install the [HIP SDK](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/how-to/install.html)
-- The `HIP_PATH` environment variable must be set to the HIP install location (should contain the `bin`, `lib` and `include` directories)
-- You will probably need to specify the `GCN_ARCH_NAME` environment variable - which you should be able to find using `rocminfo` on Linux, or `hipinfo` on Windows
+- Install the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit).
+- The `CUDA_PATH` environment variable must be set to the CUDA install location.
+- ROCm/HIP support and the old `bullet-gpu` feature backends have been retired from the maintained build.

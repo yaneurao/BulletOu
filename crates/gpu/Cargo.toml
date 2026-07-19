@@ -7,11 +7,8 @@ repository = { workspace = true }
 readme = { workspace = true }
 rust-version = { workspace = true }
 edition = { workspace = true }
-description = "Compile and execute tensor DAGs on CUDA/ROCm devices"
+description = "Compile tensor DAGs for BulletOu's host-side model builder"
 
 [dependencies]
 bullet-compiler = { workspace = true }
 
-[features]
-device-cuda = []
-device-rocm = []

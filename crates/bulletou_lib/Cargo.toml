@@ -21,8 +21,6 @@ sfbinpack = "0.6.0"
 viriformat = "2.0.1"
 
 [features]
-device-cuda = ["bullet-gpu/device-cuda", "bullet-trainer/device-cuda"]
-device-rocm = ["bullet-gpu/device-rocm", "bullet-trainer/device-rocm"]
 cuda-cpp-backend = ["dep:bulletou-cuda-cpp"]
 # Threat profile gate. canonical test を除外するために使う build-time フラグ。
 # 通常の build では無効 (= canonical test 有効)。
@@ -105,11 +103,6 @@ path = "../../examples/shogi_bucket_survey.rs"
 [[example]]
 name = "shogi_progress_kpabs_train"
 path = "../../examples/shogi_progress_kpabs_train.rs"
-
-[[example]]
-name = "shogi_progress_kpabs_train_cuda"
-path = "../../examples/shogi_progress_kpabs_train_cuda.rs"
-required-features = ["device-cuda"]
 
 [[example]]
 name = "compare_progress_buckets"

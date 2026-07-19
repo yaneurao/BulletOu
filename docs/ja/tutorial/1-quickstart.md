@@ -10,12 +10,12 @@
 
 以下が必要:
 
-- **NVIDIA または AMD の GPU** (新しめのもの)。CPU だけでの学習はサポートされていない (GPU 前提の設計)
+- **NVIDIA GPU** (新しめのもの)。CPU だけでの学習はサポートされていない (現在の保守 backend は CUDA 前提)
 - **Rust ツールチェーン** (stable、1.87 以降)。OS 別の具体手順は §1.1.1 を参照
-- **CUDA Toolkit 12.x** (NVIDIA GPU の場合) または **HIP SDK / ROCm** (AMD GPU の場合)
+- **CUDA Toolkit 12.x**
 - ビルドとテストデータ用に **10 GB 程度の空きディスク**
 
-Windows + NVIDIA の場合、cuDNN (および任意で TensorRT) のバージョンを揃える必要がある。詳細は本ワークスペース側の調査メモ ([onnxruntime-gpu-windows.md](https://github.com/yaneurao/BulletOu)) を参照 (これは ONNX Runtime の話だが、CUDA 周りの DLL 設定は共通)。
+Windows の場合、Cargo を実行する shell から MSVC C++ build tools も見える必要がある。
 
 > **CPU だけで動かしたい?** ソースツリーには `mock` GPU バックエンドがあるが、これは型チェック用のスタブで実際の学習はできない。GPU がない場合、このチュートリアルは動かない。クラウド GPU (Vast.ai / Lambda Labs / Paperspace / Google Colab 等) を借りるのが現実的。
 

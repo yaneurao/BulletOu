@@ -5,14 +5,13 @@ use crate::runtime::{
     bindings::{DeviceProps, GemmConfig, GpuBindings},
 };
 
-/// Used to type check code without requiring CUDA/ROCm
+/// Used to type check code without requiring a hardware GPU runtime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MockGpu;
 
 type MockResult = Result<(), String>;
 
-static MSG: &str =
-    "This is a mock runtime! It can't actually do anything! You need to enable either the `cuda` or `rocm` features!";
+static MSG: &str = "This is a mock runtime! It can't actually train. Use BulletOu's cuda-cpp backend instead.";
 
 #[allow(unused)]
 impl GpuBindings for MockGpu {

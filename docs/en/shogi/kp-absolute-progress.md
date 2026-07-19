@@ -4,7 +4,7 @@
 
 This document explains the concept, specification, and usage notes of **KP-Absolute** (KP絶対) based logistic regression, one of the game-progress estimation methods adopted by BulletOu (and its upstream `bullet-shogi`).
 
-For the CLI specification and command examples of the training tools (`shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda`), see [`shogi_progress_kpabs_train.md`](shogi_progress_kpabs_train.md).
+For the CLI specification and command examples of the training tool (`shogi_progress_kpabs_train`), see [`shogi_progress_kpabs_train.md`](shogi_progress_kpabs_train.md).
 
 ---
 
@@ -245,7 +245,7 @@ BulletOu (via bullet-shogi) contains multiple progress-estimator implementations
 | Parameter count | A few (features + bias) | A few dozen (features + bias) | 125,388 |
 | Standardisation | z-score | z-score | None |
 | Coefficient file | JSON | JSON | Binary `progress.bin` (`f64`, 1,003,104 bytes) |
-| Training script | External | External | `train_progress.py` in `nodchip/nnue-pytorch`, or BulletOu's `shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda` |
+| Training script | External | External | `train_progress.py` in `nodchip/nnue-pytorch`, or BulletOu's `shogi_progress_kpabs_train` |
 | Expressiveness | Low (local details are washed out) | Medium | High (memorises king position × every piece placement) |
 | Origin | Hand-crafted, inspired by Gikou's progress features | Extension of the above | From YaneuraOu/tanuki- |
 
@@ -306,7 +306,6 @@ While integration into the YaneuraOu mainline was shelved, `nodchip/nnue-pytorch
 | `crates/bulletou_lib/src/game/outputs.rs` | All progress-estimator implementations (`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`) |
 | `examples/shogi_layerstack.rs` | LayerStack training; impl switching via `BucketMode` |
 | `examples/shogi_progress_kpabs_train.rs` | `progress.bin` trainer (CPU version) |
-| `examples/shogi_progress_kpabs_train_cuda.rs` | `progress.bin` trainer (CUDA + parallel reader) |
 | `docs/en/shogi/shogi_progress_kpabs_train.md` / `docs/ja/shogi/shogi_progress_kpabs_train.md` | CLI spec and command examples |
 
 ### yaneurao/YaneuraOu (<https://github.com/yaneurao/YaneuraOu>)

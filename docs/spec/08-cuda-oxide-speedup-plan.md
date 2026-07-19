@@ -77,7 +77,7 @@ tatara はこの制約を受け入れ、NNUE 専用の fused kernel を手書き
 現行方式の利点:
 
 - 任意の `ModelBuilder` graph を扱える
-- CUDA / ROCm の両 backend を持てる
+- 当時は旧 Bullet GPU runtime として複数のハードウェア backend を持てる設計だった
 - optimizer / loss / layer 構成を比較的自由に差し替えられる
 
 現行方式の弱点:

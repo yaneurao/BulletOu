@@ -1,11 +1,7 @@
-//! Minimal runtime around CUDA/ROCm devices
+//! Minimal runtime abstractions used by BulletOu's host-side model builder.
 
 mod bindings;
-#[cfg(feature = "device-cuda")]
-pub mod cuda;
 pub mod mock;
-#[cfg(feature = "device-rocm")]
-pub mod rocm;
 
 use std::{
     ffi::{CString, c_void},
@@ -19,7 +15,7 @@ use std::{
 
 pub use bindings::{DeviceProps, Dim3, GemmConfig};
 
-/// Marker trait for the CUDA and ROCm runtimes to implement
+/// Marker trait for GPU-like runtimes to implement.
 pub trait Gpu: bindings::GpuBindings<Err = Self::Error, Ptr = Self::DevicePtr> {
     type Error: fmt::Debug + Eq + From<String>;
     type DevicePtr: Copy + Default + Eq + Hash + Ord;
@@ -421,133 +417,6 @@ impl<G: Gpu> Blas<G> {
         unsafe {
             G::blas_set_stream(self.handle, stream.inner)?;
             G::blas_gemm_batched(self.handle, batch.try_into().unwrap(), cfg, a, b, c)
-        }
-    }
-}
-
-#[cfg(any(feature = "device-cuda", feature = "device-rocm"))]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn create_malloc_copy_sync_drop<G: Gpu>() -> Result<(), G::Error> {
-        let host_src = [1.0f32, 2.0, 3.0, 4.0];
-        let mut host_dst = [0.0, 0.0, 0.0, 0.0];
-
-        let device = Device::<G>::new(0)?;
-        let stream = device.new_stream()?;
-
-        unsafe {
-            let dev_ptr = device.malloc(16)?;
-            stream.sync()?;
-            stream.memcpy_h2d(host_src.as_ptr().cast(), dev_ptr, 16)?;
-            stream.memcpy_d2h(dev_ptr, host_dst.as_mut_ptr().cast(), 16)?;
-            stream.sync()?;
-            device.free(dev_ptr)?;
-        }
-
-        assert_eq!(host_dst, host_src);
-
-        Ok(())
-    }
-
-    fn multiple_device_instances<G: Gpu>() -> Result<(), G::Error> {
-        let a = Device::<G>::new(0)?;
-        let sa = a.new_stream()?;
-        let b = Device::<G>::new(0)?;
-        let sb = b.new_stream()?;
-
-        drop(sa);
-        drop(a);
-        drop(sb);
-        drop(b);
-
-        Ok(())
-    }
-
-    fn compile_load_execute_kernel<G: Gpu>() -> Result<(), G::Error> {
-        let host_src = [1.0f32, 2.0, 3.0, 4.0];
-        let mut host_dst = [0.0, 0.0, 0.0, 0.0];
-
-        let device = Device::<G>::new(0)?;
-        let stream = device.new_stream()?;
-
-        let add_one_kernel = "
-            extern \"C\" __global__ void kernel(const int size, const float* src, float* dst) {
-                const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-                if (tid < size) dst[tid] = src[tid] + 1.0;
-            }
-        ";
-
-        let module = Module::new(device.clone(), add_one_kernel)?;
-        let kernel = module.get_kernel("kernel")?;
-
-        unsafe {
-            let dev_src = device.malloc(16)?;
-            let dev_dst = device.malloc(16)?;
-
-            stream.memcpy_h2d(host_src.as_ptr().cast(), dev_src, 16)?;
-
-            let gdim = Dim3 { x: 1, y: 1, z: 1 };
-            let size = 4i32;
-            let mut args = Vec::new();
-            args.push((&size) as *const i32 as *mut c_void);
-            args.push((&dev_src) as *const G::DevicePtr as *mut c_void);
-            args.push((&dev_dst) as *const G::DevicePtr as *mut c_void);
-
-            kernel.launch(&stream, gdim, 4, args.as_mut_ptr(), 0)?;
-
-            stream.memcpy_d2h(dev_dst, host_dst.as_mut_ptr().cast(), 16)?;
-            stream.sync()?;
-
-            device.free(dev_src)?;
-            device.free(dev_dst)?;
-        }
-
-        for (d, s) in host_dst.into_iter().zip(host_src) {
-            assert_eq!(d, s + 1.0);
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "device-cuda")]
-    mod cuda {
-        use crate::runtime::cuda::{Cuda, CudaError};
-
-        #[test]
-        fn create_malloc_copy_sync_drop() -> Result<(), CudaError> {
-            super::create_malloc_copy_sync_drop::<Cuda>()
-        }
-
-        #[test]
-        fn multiple_device_instances() -> Result<(), CudaError> {
-            super::multiple_device_instances::<Cuda>()
-        }
-
-        #[test]
-        fn compile_load_execute_kernel() -> Result<(), CudaError> {
-            super::compile_load_execute_kernel::<Cuda>()
-        }
-    }
-
-    #[cfg(feature = "device-rocm")]
-    mod rocm {
-        use crate::runtime::rocm::{ROCm, ROCmError};
-
-        #[test]
-        fn create_malloc_copy_sync_drop() -> Result<(), ROCmError> {
-            super::create_malloc_copy_sync_drop::<ROCm>()
-        }
-
-        #[test]
-        fn multiple_device_instances() -> Result<(), ROCmError> {
-            super::multiple_device_instances::<ROCm>()
-        }
-
-        #[test]
-        fn compile_load_execute_kernel() -> Result<(), ROCmError> {
-            super::compile_load_execute_kernel::<ROCm>()
         }
     }
 }

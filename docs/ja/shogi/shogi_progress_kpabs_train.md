@@ -2,8 +2,8 @@
 
 <a href="../../en/shogi/shogi_progress_kpabs_train.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-LayerStack の bucket 選択に使う `progress.bin`（KP-absolute 進行度モデル）を学習するツール群。
-CPU 版・CUDA 版の 2 バリアントが提供される。
+LayerStack の bucket 選択に使う `progress.bin`（KP-absolute 進行度モデル）を学習するツール。
+現在保守しているのは CPU 版のみ。旧 `bullet-gpu` CUDA 版は、BulletOu の学習 backend を `cuda-cpp` に移行したタイミングで削除した。
 
 生成した `progress.bin` は LayerStack 学習で
 `--bucket-mode progress8kpabs --progress-coeff progress.bin` として参照する。
@@ -65,18 +65,13 @@ y = clamp((game_ply - 1) / (ply_max - 1), 0, 1)
 | 実装 | バイナリ名 | 教師値モード | 学習粒度 | バックエンド |
 |---|---|---|---|---|
 | CPU 版 | `shogi_progress_kpabs_train` | 近似 / 厳密 両対応 | 局面単位ミニバッチ（近似）/ 1 game = 1 step（厳密） | 単スレッド CPU |
-| CUDA 版 | `shogi_progress_kpabs_train_cuda` | 厳密のみ | K games = 1 step ミニバッチ | GPU (cudarc + NVRTC) + reader threads 並列 |
 
-両者は同じ凸最適化問題を解くため、収束先（最適解）は同一。学習軌跡と速度のみ異なる。
+削除済みの CUDA 版も同じ凸最適化問題を解いていたが、旧 `bullet-gpu` runtime 依存だったため現在はビルド対象外。
 
 ビルド:
 
 ```bash
-# CPU 版
 cargo build --release --example shogi_progress_kpabs_train
-
-# CUDA 版（CUDA backend が必要、本リポジトリの既定設定でビルド可能）
-cargo build --release --example shogi_progress_kpabs_train_cuda
 ```
 
 ---
@@ -106,9 +101,6 @@ cargo build --release --example shogi_progress_kpabs_train_cuda
 |---|---|---|
 | CPU 版・近似モード | `RoundRobinPackStream`：ファイル間を 1 レコードずつ round-robin | val_positions（先頭から N 局面）→ 残り max_positions が train（同一ストリーム）|
 | CPU 版・厳密モード | `MultiFileGameIterator`：interleave 後の順序でファイル順次走査、対局単位で yield | **先頭 5%**（`packs.len() / 20`）を val に、残りを train |
-| CUDA 版（厳密のみ）| reader threads が共有ファイルキューから 1 ファイルずつ並列に decode、メイン GPU スレッドへ送信 | **末尾 `--val-files-ratio`**（既定 0.05）を val に、残りを train |
-
-> CPU 厳密モードと CUDA 版で「val 側を先頭 / 末尾どちらから取るか」が逆になる点に注意。
 
 ### val 自動分割の落とし穴
 
@@ -122,7 +114,7 @@ cargo build --release --example shogi_progress_kpabs_train_cuda
 回避策:
 
 - ファイル名規則を統一して `pack_group_key` が同一グループを返すようにする
-- もしくは `--val-games` / `--val-files-ratio` を明示し、必要なら学習対象データセット側を
+- もしくは `--val-games` を明示し、必要なら学習対象データセット側を
   事前にシャッフル（=複数ソース混合バイナリを生成）する
 
 ---
@@ -147,32 +139,6 @@ cargo build --release --example shogi_progress_kpabs_train_cuda
 | `--val-games` | 0 (auto) | 厳密モードの val ファイル走査時の最大対局数 |
 | `--log-interval-games` | 1,000 | 対局ごとのログ出力間隔（厳密モード） |
 | `--save-each-epoch` | false | 各 epoch 後に `<output_stem>.eN.<ext>` を追加保存 |
-
-### CUDA 版 (`shogi_progress_kpabs_train_cuda`)
-
-| パラメータ | デフォルト | 説明 |
-|---|---|---|
-| `--data` | (必須) | カンマ区切りのファイルまたはディレクトリ |
-| `--output` | (必須) | 出力 `progress.bin` のパス |
-| `--init-from` | (なし) | 既存 `progress.bin` から重みをウォームスタート |
-| `--games-per-step` | 1,024 | 1 Adam step に集約する対局数（K games） |
-| `--max-games` | 0 (無制限) | 1 epoch あたり学習対局数 |
-| `--val-games` | 0 (val ファイル全走査) | val 側の 1 評価あたり最大対局数 |
-| `--val-files-ratio` | 0.05 | val 側に回すファイル数の割合（末尾から取得） |
-| `--epochs` | 1 | 学習パス数 |
-| `--lr` | 1e-3 | Adam の基準学習率 |
-| `--lr-scale` | `sqrt` | バッチサイズに対する lr スケーリング: `none`（lr そのまま）/ `sqrt`（`lr × √K`） |
-| `--log-interval-steps` | 100 | step ごとのログ出力間隔 |
-| `--save-each-epoch` | false | 各 epoch 後に `<output_stem>.eN.<ext>` を追加保存 |
-| `--device` | 0 | CUDA デバイス序数 |
-| `--reader-threads` | 4 | PSV decode + バッチ構築に使う CPU スレッド数 |
-| `--prefetch-depth` | 4 | GPU の前段にバッファするバッチ数 |
-
-> Adam では二次モーメントで勾配を自動正規化するため、batch averaging に対する
-> 学習率補正は厳密には不要である。`--lr-scale none` を選ぶと
-> CPU 版（1 game = 1 step）と同じ lr で動かせる。
-
----
 
 ## コマンド例
 
@@ -207,35 +173,6 @@ cargo run --release --example shogi_progress_kpabs_train -- \
 ```
 
 シャッフル済みデータが既にある場合に使う。`--ply-max` は実データの対局長に合わせて調整する。
-
-### CUDA 版（推奨：大規模・対局順保持データ）
-
-```bash
-cargo run --release --example shogi_progress_kpabs_train_cuda -- \
-  --data /path/to/dir1,/path/to/dir2 \
-  --output progress.bin \
-  --games-per-step 1024 \
-  --epochs 1 \
-  --lr 1e-3 \
-  --lr-scale none \
-  --val-files-ratio 0.05 \
-  --reader-threads 12 \
-  --prefetch-depth 8 \
-  --save-each-epoch \
-  --log-interval-steps 1000
-```
-
-モデルが小さく `atomicAdd(double*)` を使うため GPU 利用率は低めだが、
-CPU prefetch を厚くするほど全体スループットが上がる傾向がある。
-`--reader-threads` は実 CPU コア数に近い値を試す。
-
-`--save-each-epoch` を付けると `progress.e1.bin`, `progress.e2.bin`, ... が残り、
-最終 epoch の重みは `progress.bin` 名でも書き出される。
-
-> CUDA 版は `atomicAdd(double*)` を使うため `compute_60` 相当以降の機能を要求する
-> （Pascal 世代以降の NVIDIA GPU で動作）。
-
----
 
 ## NNUE 学習での使用
 

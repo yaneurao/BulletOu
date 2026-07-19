@@ -691,7 +691,7 @@ current cuda-cpp follow-up queue.
 - Connected the runner to the BulletOu root CLI for a Windows-native direct NNUE HalfKP path:
   - `examples/bulletou --backend cuda-cpp --cuda-cpp-train-steps N --eval-type NNUE_HALFKP` now streams real teacher batches through the shared fixed-layout `HalfkpTeacherBatchConfig`;
   - the direct path is intentionally limited to Ranger and constant-LR direct steps; production schedule flags remain follow-up work under BO-CUDA-035;
-  - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's `device-cuda` runtime just to create the model.
+  - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's old GPU runtime just to create the model.
 - Reduced direct-step synchronization overhead:
   - `NnueTrainStepRunner::step_no_readback` runs upload -> forward -> loss -> backward -> Ranger update without downloading the loss every batch;
   - the compatibility `step` method remains readback-producing, while the direct CLI now samples loss only at step 1, every 10 steps, and the final step.

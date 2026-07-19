@@ -10,12 +10,12 @@ We are **not** trying to train a strong NNUE here — that comes later. This is 
 
 You need:
 
-- **A modern NVIDIA or AMD GPU.** CPU-only training is not supported (the GPU runtime is built into the design).
+- **A modern NVIDIA GPU.** CPU-only training is not supported (the maintained trainer backend uses CUDA).
 - **Rust toolchain** (stable, 1.87 or later). See §1.1.1 below for OS-specific install steps.
-- **CUDA Toolkit 12.x** (for NVIDIA GPUs) or **HIP SDK / ROCm** (for AMD GPUs).
+- **CUDA Toolkit 12.x**.
 - About **10 GB of free disk space** for the build and test data.
 
-If you are on Windows and using NVIDIA, you also need the matching versions of cuDNN (and optionally TensorRT). See the [reference doc on Windows GPU setup](https://github.com/yaneurao/BulletOu) when in doubt.
+On Windows, you also need the MSVC C++ build tools visible to the shell that runs Cargo.
 
 > **CPU-only?** There is a `mock` GPU backend in the source tree, but it is a type-checking stub — it cannot actually train. If you have no GPU, this tutorial is not going to work. Consider using a cloud GPU instance (e.g. Vast.ai, Lambda Labs, Paperspace, or Google Colab).
 

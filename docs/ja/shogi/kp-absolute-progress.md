@@ -5,7 +5,7 @@
 bullet-shogi が採用している進行度推定方式の 1 つである **KP絶対（KP Absolute）**
 ベースのロジスティック回帰について、概念・仕様・利用上の注意点を解説する。
 
-学習ツール（`shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda`）の
+学習ツール（`shogi_progress_kpabs_train`）の
 CLI 仕様・コマンド例は [`shogi_progress_kpabs_train.md`](shogi_progress_kpabs_train.md) を参照。
 
 ---
@@ -256,7 +256,7 @@ bullet-shogi には複数の進行度推定実装が存在し、LayerStack の b
 | パラメータ数 | 数個（特徴量 + bias） | 数十個（特徴量 + bias） | 125,388 |
 | 標準化 | z-score あり | z-score あり | なし |
 | 係数ファイル | JSON | JSON | バイナリ `progress.bin`（`f64`、1,003,104 bytes） |
-| 学習スクリプト | 別途用意 | 別途用意 | `nodchip/nnue-pytorch` の `train_progress.py`、または bullet-shogi の `shogi_progress_kpabs_train` / `shogi_progress_kpabs_train_cuda` |
+| 学習スクリプト | 別途用意 | 別途用意 | `nodchip/nnue-pytorch` の `train_progress.py`、または bullet-shogi の `shogi_progress_kpabs_train` |
 | 表現力 | 低（局面の細部が消える） | 中 | 高（玉位置と各駒配置を記憶） |
 | 由来 | 技巧（Gikou）の進行度特徴量を参考にした手作り | 同上の拡張 | YaneuraOu/tanuki- 由来 |
 
@@ -323,7 +323,6 @@ YaneuraOu 本体への組み込みは見送られたが、`nodchip/nnue-pytorch`
 | `crates/bulletou_lib/src/game/outputs.rs` | 進行度推定の各種実装（`ShogiProgressBucket8` / `ShogiProgressBucket8GikouLite` / `ShogiProgressKPAbs`） |
 | `examples/shogi_layerstack.rs` | LayerStack 学習・`BucketMode` による実装切り替え |
 | `examples/shogi_progress_kpabs_train.rs` | progress.bin 学習ツール（CPU 版） |
-| `examples/shogi_progress_kpabs_train_cuda.rs` | progress.bin 学習ツール（CUDA + reader 並列版） |
 | `docs/shogi/shogi_progress_kpabs_train.md` | 学習ツールの CLI 仕様・コマンド例 |
 
 ### yaneurao/YaneuraOu (<https://github.com/yaneurao/YaneuraOu>)
