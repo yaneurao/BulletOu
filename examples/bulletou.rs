@@ -3129,6 +3129,11 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     eprintln!("  cuda-cpp device {device}: {name}");
     eprintln!("  batch size = {batch_size}");
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    eprintln!(
+        "  cuda-cpp loss progress log = {} ({})",
+        cuda_cpp_loss_progress_log_path(args).display(),
+        cuda_cpp_loss_progress_policy(args)
+    );
 
     for component in [CudaCppKpptComponent::Kk, CudaCppKpptComponent::Kkp, CudaCppKpptComponent::Kpp] {
         eprintln!("\n=== [cuda-cpp {}] training ===", component.label());
@@ -3139,7 +3144,7 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
     match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_CUDA_CPP, Some(args)) {
         Ok((_first_idx, last_idx)) => {
-            append_to_top_level_log(&output_dir, last_idx).map_err(|err| {
+            append_to_top_level_log(&output_dir, last_idx, Some(args)).map_err(|err| {
                 format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display())
             })?;
         }
@@ -3232,6 +3237,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         batch_queue_size
     );
     let started = std::time::Instant::now();
+    let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let teacher_options = CudaCppNnueTeacherOptions {
         batch_size,
         batch_index: 0,
@@ -3282,25 +3288,34 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             .step_no_readback_with_loss_finalize(&ctx, params, loss_kind, output_inv_scale, batch, should_report)
             .map_err(|e| e.to_string())?;
         if should_report {
+            let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
-            let progress = cuda_cpp_progress_label(schedule, seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let elapsed = started.elapsed().as_secs_f64();
-            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
-            eprintln!(
-                "  cuda-cpp {} step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
+            let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
+            let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
+            append_cuda_cpp_progress_log(
+                args,
                 component.label(),
+                schedule,
+                seen_steps,
+                train_steps,
+                Some(optimizer_step),
+                positions,
+                train_elapsed_sec,
+                positions_per_sec,
                 loss.mean,
-                teacher_batch.source
-            );
+                &teacher_batch.source,
+            )?;
+            excluded_elapsed = excluded_elapsed.saturating_add(log_started.elapsed());
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
             if chunk.save_checkpoint {
+                let checkpoint_started = std::time::Instant::now();
                 let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                 let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                 let checkpoint_dir = write_cuda_cpp_kppt_component_checkpoint(
@@ -3314,7 +3329,16 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                     schedule.batches_per_superbatch,
                     dataloader_pos,
                 )?;
-                eprintln!("  cuda-cpp {} component checkpoint = {}", component.label(), checkpoint_dir.display());
+                excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
+                let progress = cuda_cpp_progress_label(schedule, seen_steps);
+                let positions = seen_steps.saturating_mul(batch_size);
+                let (_train_elapsed_sec, positions_per_sec) =
+                    cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                eprintln!(
+                    "  cuda-cpp {} checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+                    component.label(),
+                    checkpoint_dir.display()
+                );
             } else {
                 eprintln!(
                     "  cuda-cpp {} checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
@@ -3339,10 +3363,10 @@ fn run_cuda_cpp_kppt_component_direct_steps(
 
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
-    let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp {} train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
+        "  cuda-cpp {} train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
         component.label()
     );
@@ -3757,12 +3781,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         eprintln!("  cuda-cpp profile steps = {profile_steps}");
     }
     eprintln!(
-        "  cuda-cpp loss readback interval = {}",
-        if args.cuda_cpp_loss_readback_interval == 0 {
-            "final-only".to_string()
-        } else {
-            args.cuda_cpp_loss_readback_interval.to_string()
-        }
+        "  cuda-cpp loss progress log = {} ({})",
+        cuda_cpp_loss_progress_log_path(args).display(),
+        cuda_cpp_loss_progress_policy(args)
     );
 
     let cuda_shape = CudaNnueForwardShape {
@@ -3820,6 +3841,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let mut profile_total_ms = 0.0_f64;
     let mut profile_count = 0usize;
     let started = std::time::Instant::now();
+    let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
     if let Some(pos) = dataloader_resume_pos {
@@ -3945,6 +3967,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         chunk.steps
                     ));
                 }
+                let checkpoint_started = std::time::Instant::now();
                 let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
                 last_loss = loss.mean;
                 reported_loss_sum += f64::from(loss.mean);
@@ -3987,6 +4010,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     )
                     .map_err(|e| e.to_string())?;
                     completed_steps = snapshot_completed_steps;
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
                 } else {
                     completed_steps = snapshot_completed_steps + chunk_seen_steps;
                     accepted_steps_total += chunk_seen_steps;
@@ -4010,7 +4034,15 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             dataloader_pos: accepted_dataloader_pos,
                         },
                     )?;
-                    eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
+                    let progress = cuda_cpp_progress_label(&schedule, accepted_steps_total);
+                    let positions = accepted_steps_total.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    eprintln!(
+                        "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+                        checkpoint_dir.display()
+                    );
                     last_checkpoint_metrics = Some(test_metrics);
                 }
 
@@ -4118,12 +4150,12 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         ctx.synchronize().map_err(|e| e.to_string())?;
         let elapsed = started.elapsed().as_secs_f64();
         let positions = accepted_steps_total.saturating_mul(batch_size);
-        let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+        let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
         let reported_avg_loss =
             if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
             "  cuda-cpp plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             positions={positions}, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
+             positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
              reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
         );
         let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
@@ -4222,32 +4254,35 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 .map_err(|e| e.to_string())?;
         }
         if should_report {
+            let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
-            let progress = cuda_cpp_progress_label(&schedule, seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let elapsed = started.elapsed().as_secs_f64();
-            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
-            if completed_step_offset > 0 {
-                eprintln!(
-                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} {progress} optimizer_step={optimizer_step} \
-                     positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
-                    loss.mean, teacher_batch.source
-                );
-            } else {
-                eprintln!(
-                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
-                    loss.mean, teacher_batch.source
-                );
-            }
+            let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
+            let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
+            append_cuda_cpp_progress_log(
+                args,
+                "NNUE",
+                &schedule,
+                seen_steps,
+                train_steps,
+                Some(optimizer_step),
+                positions,
+                train_elapsed_sec,
+                positions_per_sec,
+                loss.mean,
+                &teacher_batch.source,
+            )?;
+            excluded_elapsed = excluded_elapsed.saturating_add(log_started.elapsed());
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
             if schedule.production {
                 if chunk.save_checkpoint {
+                    let checkpoint_started = std::time::Instant::now();
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                     let test_metrics = run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
@@ -4270,7 +4305,15 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             dataloader_pos,
                         },
                     )?;
-                    eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
+                    let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+                    let positions = seen_steps.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    eprintln!(
+                        "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+                        checkpoint_dir.display()
+                    );
                     if let Some(metrics) = test_metrics {
                         eprintln!(
                             "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
@@ -4296,10 +4339,10 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     ctx.synchronize().map_err(|e| e.to_string())?;
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
-    let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
+        "  cuda-cpp direct train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
     if profile_count > 0 {
@@ -4375,7 +4418,11 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 dataloader_pos,
             },
         )?;
-        eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+        let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+        eprintln!(
+            "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+            checkpoint_dir.display()
+        );
         if let Some(metrics) = test_metrics {
             eprintln!(
                 "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
@@ -4537,12 +4584,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
     }
     eprintln!(
-        "  cuda-cpp SFNN loss readback interval = {}",
-        if args.cuda_cpp_loss_readback_interval == 0 {
-            "final-only".to_string()
-        } else {
-            args.cuda_cpp_loss_readback_interval.to_string()
-        }
+        "  cuda-cpp SFNN loss progress log = {} ({})",
+        cuda_cpp_loss_progress_log_path(args).display(),
+        cuda_cpp_loss_progress_policy(args)
     );
     eprintln!("  cuda-cpp SFNN upload pipeline = enabled (2 slots; non-profiled steps)");
 
@@ -4588,6 +4632,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut profile_count = 0usize;
     let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
+    let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
     if let Some(pos) = dataloader_resume_pos {
@@ -4722,6 +4767,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         chunk.steps
                     ));
                 }
+                let checkpoint_started = std::time::Instant::now();
                 let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
                 last_loss = loss.mean;
                 reported_loss_sum += f64::from(loss.mean);
@@ -4753,6 +4799,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     )
                     .map_err(|e| e.to_string())?;
                     completed_steps = snapshot_completed_steps;
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
                 } else {
                     completed_steps = snapshot_completed_steps + chunk_seen_steps;
                     accepted_steps_total += chunk_seen_steps;
@@ -4776,7 +4823,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos: accepted_dataloader_pos,
                         },
                     )?;
-                    eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
+                    let progress = cuda_cpp_progress_label(&schedule, accepted_steps_total);
+                    let positions = accepted_steps_total.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    eprintln!(
+                        "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+                        checkpoint_dir.display()
+                    );
                     last_checkpoint_metrics = Some(test_metrics);
                 }
 
@@ -4884,12 +4939,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ctx.synchronize().map_err(|e| e.to_string())?;
         let elapsed = started.elapsed().as_secs_f64();
         let positions = accepted_steps_total.saturating_mul(batch_size);
-        let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+        let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
         let reported_avg_loss =
             if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
             "  cuda-cpp SFNN plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             positions={positions}, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
+             positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
              reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
         );
         let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
@@ -5004,32 +5059,35 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 .map_err(|e| e.to_string())?;
         }
         if should_report {
+            let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
-            let progress = cuda_cpp_progress_label(&schedule, seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let elapsed = started.elapsed().as_secs_f64();
-            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
-            if completed_step_offset > 0 {
-                eprintln!(
-                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} {progress} optimizer_step={optimizer_step} \
-                     positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
-                    loss.mean, teacher_batch.source
-                );
-            } else {
-                eprintln!(
-                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
-                    loss.mean, teacher_batch.source
-                );
-            }
+            let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
+            let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
+            append_cuda_cpp_progress_log(
+                args,
+                "SFNN",
+                &schedule,
+                seen_steps,
+                train_steps,
+                Some(optimizer_step),
+                positions,
+                train_elapsed_sec,
+                positions_per_sec,
+                loss.mean,
+                &teacher_batch.source,
+            )?;
+            excluded_elapsed = excluded_elapsed.saturating_add(log_started.elapsed());
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
             if schedule.production {
                 if chunk.save_checkpoint {
+                    let checkpoint_started = std::time::Instant::now();
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                     let test_metrics = run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
@@ -5052,7 +5110,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos,
                         },
                     )?;
-                    eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+                    excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
+                    let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+                    let positions = seen_steps.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    eprintln!(
+                        "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+                        checkpoint_dir.display()
+                    );
                     if let Some(metrics) = test_metrics {
                         eprintln!(
                             "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
@@ -5078,10 +5144,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     ctx.synchronize().map_err(|e| e.to_string())?;
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
-    let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp SFNN direct train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
+        "  cuda-cpp SFNN direct train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
          throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
     );
     if profile_count > 0 {
@@ -5167,7 +5233,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 dataloader_pos,
             },
         )?;
-        eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+        let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+        eprintln!(
+            "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
+            checkpoint_dir.display()
+        );
         if let Some(metrics) = test_metrics {
             eprintln!(
                 "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
@@ -5524,7 +5594,7 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     learn.push_str(&cuda_cpp_direct_learn_log_row(args, log, prior_positions));
     std::fs::write(dir.join("learn.log"), learn)
         .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))?;
-    append_to_top_level_log(output_dir, idx)
+    append_to_top_level_log(output_dir, idx, Some(args))
         .map_err(|err| format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display()))
 }
 
@@ -7242,6 +7312,83 @@ fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> 
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_train_timing(
+    positions: usize,
+    started: &std::time::Instant,
+    excluded_elapsed: std::time::Duration,
+) -> (f64, f64) {
+    let train_elapsed = started.elapsed().saturating_sub(excluded_elapsed).as_secs_f64();
+    let positions_per_sec = if train_elapsed > 0.0 { positions as f64 / train_elapsed } else { 0.0 };
+    (train_elapsed, positions_per_sec)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_loss_progress_log_path(args: &Args) -> PathBuf {
+    args.output_dir().join(CUDA_CPP_PROGRESS_LOG_NAME)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_loss_progress_policy(args: &Args) -> String {
+    if args.cuda_cpp_loss_readback_interval == 0 {
+        "checkpoint/final only".to_string()
+    } else {
+        format!("step 1, every {} step(s), checkpoint, final", args.cuda_cpp_loss_readback_interval)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn append_cuda_cpp_progress_log(
+    args: &Args,
+    kind: &str,
+    schedule: &CudaCppRunSchedule,
+    seen_steps: usize,
+    train_steps: usize,
+    optimizer_step: Option<usize>,
+    positions: usize,
+    train_elapsed_sec: f64,
+    positions_per_sec: f64,
+    loss_mean: f32,
+    source: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let path = cuda_cpp_loss_progress_log_path(args);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let write_header = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    if write_header {
+        writeln!(file, "{CUDA_CPP_PROGRESS_LOG_HEADER}")
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    let progress = schedule.progress_for_step(seen_steps).unwrap_or(CudaCppScheduleProgress {
+        epoch: 0,
+        superbatch: 0,
+        superbatches_per_epoch: schedule.superbatches_per_epoch,
+        batch_in_superbatch: 0,
+        batches_per_superbatch: schedule.batches_per_superbatch,
+    });
+    let optimizer_step = optimizer_step.map(|step| step.to_string()).unwrap_or_else(|| "-".to_string());
+    writeln!(
+        file,
+        "{kind},{seen_steps},{train_steps},{optimizer_step},{epoch},{superbatch},{sbs_per_epoch},{batch},{batches_per_sb},{positions},{train_elapsed_sec:.6},{positions_per_sec:.0},{loss_mean:.8},{source}",
+        kind = csv_escape(kind),
+        epoch = progress.epoch,
+        superbatch = progress.superbatch,
+        sbs_per_epoch = progress.superbatches_per_epoch,
+        batch = progress.batch_in_superbatch,
+        batches_per_sb = progress.batches_per_superbatch,
+        source = csv_escape(source),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let batch_size = effective_batch_size(args);
     let default_lr_step_positions = effective_lr_step_positions(args, 1);
@@ -7701,17 +7848,28 @@ fn prepare_resume_config_or_exit(args: &Args) {
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
+/// Legacy schema for `<output>/summary-learn.log` before the validation
+/// teacher column was added.
+const SUMMARY_LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+
 /// Schema for the top-level `<output>/summary-learn.log`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
-/// (= the effective superbatch boundary) and conveys no info.
-const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+/// (= the effective superbatch boundary) and conveys no info. The
+/// rightmost `test_teacher` column records the validation file specified
+/// by `--test-teacher` so the accuracy/loss columns remain attributable.
+const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
 /// the summary lives next to them so they don't shadow each other.
 const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
+
+/// Fine-grained cuda-cpp loss progress is intentionally written to a file
+/// instead of stdout; console output stays at checkpoint/validation granularity.
+const CUDA_CPP_PROGRESS_LOG_NAME: &str = "cuda-cpp-progress.log";
+const CUDA_CPP_PROGRESS_LOG_HEADER: &str = "kind,step,total_steps,optimizer_step,epoch,superbatch,superbatches_per_epoch,batch,batches_per_superbatch,positions,train_elapsed_sec,pos_per_sec,loss_mean,source";
 const PLATEAU_EPOCH_DONE_NAME: &str = "plateau_epoch_done.txt";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
@@ -7857,6 +8015,13 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+fn resolve_test_teacher_for_summary(args: Option<&Args>) -> String {
+    args.and_then(|args| args.test_teacher.as_ref())
+        .map(|path| path.display().to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 /// Per-superbatch validation result attached to a single save dir's
 /// enriched `learn.log`. When `Some`, only the LAST row of each
 /// superbatch in that dir carries the metric (validation runs once per
@@ -7987,11 +8152,12 @@ fn enrich_bullet_log_to_csv(
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
 /// Reads the **summary** log [`SUMMARY_LEARN_LOG_NAME`] (`<output>/
-/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (11
+/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (12
 /// columns, NO `curr_batch`):
 ///
 ///   eval, epoch, superbatch, test_value_accuracy, test_value_loss,
-///   train_value_loss, lr_start, lr_end, lambda, **positions**, teacher
+///   train_value_loss, lr_start, lr_end, lambda, **positions**, teacher,
+///   test_teacher
 ///
 /// `positions` is at index 9 in the current schema. Older summary logs
 /// used a single `lr` column and had `positions` at index 8; accept both
@@ -8211,6 +8377,29 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
     last_teacher
 }
 
+fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(top)?;
+    let mut lines = content.lines();
+    let Some(first_line) = lines.next() else {
+        return Ok(());
+    };
+    if first_line != SUMMARY_LEARN_LOG_HEADER_V1 {
+        return Ok(());
+    }
+
+    let mut upgraded = String::new();
+    upgraded.push_str(SUMMARY_LEARN_LOG_HEADER);
+    upgraded.push('\n');
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        upgraded.push_str(line);
+        upgraded.push_str(",-\n");
+    }
+    std::fs::write(top, upgraded)
+}
+
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 12-column CSV from cuda-cpp checkpoint writing / `assemble_numbered_dirs`) onto
 /// the top-level `<output>/summary-learn.log`, writing the CSV header on first
@@ -8230,16 +8419,15 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
 /// `bulletou` with a different header, returns `InvalidData` so the
 /// caller can alert the user to clear the old file rather than
 /// silently mixing schemas.
-fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std::io::Result<()> {
+fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: Option<&Args>) -> std::io::Result<()> {
     use std::io::Write;
     let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed = top.is_file();
 
-    // Detect schema mismatch on existing file. The summary file is
-    // assumed to start with [`SUMMARY_LEARN_LOG_HEADER`] followed by
-    // 11-col data rows.
+    // Detect schema mismatch on existing file. V1 is upgraded in-place
+    // by appending a placeholder `test_teacher` column to old rows.
     if top_existed {
         let mut head_buf = String::new();
         if let Ok(mut f) = std::fs::File::open(&top) {
@@ -8253,7 +8441,9 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
                 }
             }
         }
-        if !head_buf.is_empty() && head_buf != SUMMARY_LEARN_LOG_HEADER {
+        if head_buf == SUMMARY_LEARN_LOG_HEADER_V1 {
+            upgrade_summary_log_to_current_schema(&top)?;
+        } else if !head_buf.is_empty() && head_buf != SUMMARY_LEARN_LOG_HEADER {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -8279,6 +8469,7 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
     // Keep only the last row of each (eval, sb) group and drop the
     // `curr_batch` column (= index 3 in the 12-col per-dir layout).
     let lines: Vec<&str> = body_no_header.lines().filter(|l| !l.is_empty()).collect();
+    let test_teacher_csv = csv_escape(&resolve_test_teacher_for_summary(args));
     let key_of = |line: &str| -> Option<(String, String)> {
         let parts: Vec<&str> = line.splitn(12, ',').collect();
         if parts.len() < 3 {
@@ -8303,6 +8494,8 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize) -> std
             }
             out.push_str(p);
         }
+        out.push(',');
+        out.push_str(&test_teacher_csv);
         Some(out)
     };
     for (i, line) in lines.iter().enumerate() {
@@ -9556,7 +9749,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
-            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,-,-,0.1,0.1,0.1,1.000000,64,teacher.hcpe\n"
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,-,-,0.1,0.1,0.1,1.000000,64,teacher.hcpe,-\n"
         ))
         .unwrap();
 
@@ -9623,7 +9816,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
-            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe\n"
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe,-\n"
         ))
         .unwrap();
 
@@ -10897,25 +11090,76 @@ mod tests {
             header = LEARN_LOG_HEADER,
         );
         std::fs::write(dir.join("learn.log"), body).unwrap();
-        append_to_top_level_log(&tmp, 1).unwrap();
+        append_to_top_level_log(&tmp, 1, None).unwrap();
         let top = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let lines: Vec<&str> = top.lines().collect();
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER, "first line is summary header (no curr_batch)");
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
         // boundary row (b=64); intermediate rows dropped, and the
-        // curr_batch column itself is also stripped, leaving 11 cols.
+        // curr_batch column itself is also stripped. `test_teacher` is
+        // appended as the rightmost summary-only column.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 11, "summary row has 11 cols (no curr_batch)");
+        assert_eq!(cols1.len(), 12, "summary row has 12 cols (no curr_batch + test_teacher)");
         assert_eq!(cols1[2], "1", "first kept row is sb=1");
         // Index 3 is now `test_value_accuracy` (was `curr_batch`).
         assert_eq!(cols1[3], "0.50", "col 3 is test_value_accuracy (curr_batch dropped)");
         assert_eq!(cols1[6], "0.001", "lr_start is preserved");
         assert_eq!(cols1[7], "0.0007", "lr_end is preserved");
+        assert_eq!(cols1[11], "-", "no Args were passed, so test_teacher is unknown");
         let cols2: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(cols2.len(), 11);
+        assert_eq!(cols2.len(), 12);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
         assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
+        assert_eq!(cols2[11], "-");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_to_top_level_log_upgrades_v1_summary_header() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-toplog-upgrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tmp.join("0001");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            tmp.join(SUMMARY_LEARN_LOG_NAME),
+            format!(
+                "{SUMMARY_LEARN_LOG_HEADER_V1}\n\
+                 E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 E,1,2,64,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe\n",
+            ),
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "new-teacher.hcpe",
+            "--test-teacher",
+            "validation-set.hcpe",
+        ])
+        .unwrap();
+
+        append_to_top_level_log(&tmp, 1, Some(&args)).unwrap();
+        let top = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines: Vec<&str> = top.lines().collect();
+        assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER);
+        assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-");
+        assert_eq!(lines[2], "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -10939,6 +11183,8 @@ mod tests {
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
             "teacher.psv",
+            "--test-teacher",
+            "validation.hcpe",
             "--backend",
             "cuda-cpp",
             "--cuda-cpp-train-steps",
@@ -10983,8 +11229,9 @@ mod tests {
         let summary_lines = summary.lines().collect::<Vec<_>>();
         assert_eq!(summary_lines[0], SUMMARY_LEARN_LOG_HEADER);
         assert_eq!(summary_lines.len(), 2);
-        assert_eq!(summary_lines[1].split(',').count(), 11);
+        assert_eq!(summary_lines[1].split(',').count(), 12);
         assert!(summary_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,"));
+        assert!(summary_lines[1].ends_with(",validation.hcpe"));
 
         let dir2 = tmp.join("0002");
         std::fs::create_dir_all(&dir2).unwrap();
@@ -11017,6 +11264,7 @@ mod tests {
         assert_eq!(summary2_lines.len(), 3);
         let summary2_cols = summary2_lines[2].split(',').collect::<Vec<_>>();
         assert_eq!(summary2_cols[9], "25");
+        assert_eq!(summary2_cols[11], "validation.hcpe");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

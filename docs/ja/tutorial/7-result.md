@@ -42,6 +42,8 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ### CSV のサンプル
 
+per-save `learn.log` は下の 12-column per-batch schema。top-level `summary-learn.log` は `curr_batch` を除き、右端に `test_teacher` 列を追加して、どの `--test-teacher` ファイルで accuracy/loss を計測したかを示す。
+
 ```csv
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,32,-,-,0.6234,0.001000,0.000999,1.000000,2097152,teachers/

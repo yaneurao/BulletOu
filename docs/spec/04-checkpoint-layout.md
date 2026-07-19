@@ -194,13 +194,24 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1525,0.576647,0.181778,0.071046,0.001000
 
 bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト batch-size 65536 では、1 sb 内に約 48 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
 
-### top-level `<output>/summary-learn.log` (= 11 列、sb 境界のみ抽出)
+### top-level `<output>/summary-learn.log` (= 12 列、sb 境界のみ抽出)
 
 ```
-eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199884800,teachers/
+eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/,test.hcpe
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199884800,teachers/,test.hcpe
 ```
+
+`test_teacher` is summary-only: it records the `--test-teacher` path that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
+
+cuda-cpp batch-level loss progress is not streamed to stdout. It is appended to `<output>/cuda-cpp-progress.log` as CSV:
+
+```
+kind,step,total_steps,optimizer_step,epoch,superbatch,superbatches_per_epoch,batch,batches_per_superbatch,positions,train_elapsed_sec,pos_per_sec,loss_mean,source
+SFNN,5300,21960,5300,1,3,36,1220,610,86835200,12.345678,7034567,0.06564487,C:\shogi\teacher\tayayan\good-testpsv20260717.psv
+```
+
+The cuda-cpp stdout `pos/s` and progress-log `pos_per_sec` exclude checkpoint file saving, validation, loss readback, and progress-log write time.
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
 

@@ -40,6 +40,8 @@ The loss trajectory of every run, both during training and afterwards, is record
 - **Top-level `<output>/summary-learn.log`** — the **cumulative** file across all runs/resumes. Use this as the default.
 - **Per-save `0NNN/learn.log`** — a snapshot up to that save point. Use this when you want to see "what did things look like at save 0005?".
 
+The per-save `learn.log` keeps the 12-column per-batch schema shown below. The top-level `summary-learn.log` omits `curr_batch` and appends a rightmost `test_teacher` column so each validation accuracy/loss row records which `--test-teacher` file produced it.
+
 ### Sample CSV
 
 ```csv
@@ -70,6 +72,7 @@ Bullet writes **one row every 32 batches**. With the default (`--positions-per-s
 | `lambda` | the `--lambda` value (constant per run, fixed 6-decimal) | `1.000000` |
 | `positions` | cumulative teacher positions (**carries across resumes**) | `2097152` |
 | `teacher` | the `--teacher` value | `teachers/` |
+| `test_teacher` | top-level `summary-learn.log` only: the `--test-teacher` path used for validation, or `-` when unset | `test.hcpe` |
 
 NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.
 
