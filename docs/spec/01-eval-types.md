@@ -68,4 +68,21 @@ NNUE / SFNN 系は `<eval-type>-<arch>`、KPPT 系は `<eval-type>` のみ。`<e
 
 ## アクティベーション
 
-KPPT および NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 / NNUE_HALFKPVM では **ClippedReLU のみ**。SFNN-1536 family は **ClippedReLU + SqrClippedReLU の pair** (`fc_0` 出力に対し CReLU と SqrCReLU を別々に適用してから concat) を使う。歴史的経緯は [05-activation-history.md](05-activation-history.md) を参照。
+KPPT および NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 / NNUE_HALFKPVM / NNUE_SHARDKP では **ClippedReLU のみ**。SFNN-1536 family は **ClippedReLU + SqrClippedReLU の pair** (`fc_0` 出力に対し CReLU と SqrCReLU を別々に適用してから concat) を使う。歴史的経緯は [05-activation-history.md](05-activation-history.md) を参照。
+
+## Experimental: NNUE_SHARDKP
+
+`NNUE_SHARDKP` is an experimental cuda-cpp NNUE target imported from the
+`shardKP` branch. It uses the dense-L0 prototype input
+`ShogiShardKp`, where each K+P feature is expanded to one common connection
+plus six shard connection IDs.
+
+- default arch: `NNUE_shardkp_c256_s128x64_f6_16_16`
+- input dims: `1710 * 7 = 11970`
+- max active: `40 * 7 = 280`
+- L1 dims: `256 + 128 * 64 = 8448`
+- activation: ClippedReLU
+- default output: `checkpoints/NNUE_SHARDKP-NNUE_shardkp_c256_s128x64_f6_16_16`
+
+The emitted `nn.bin` is BulletOu-internal experimental output and requires an
+engine build that implements the same ShardKP feature hash/layout.
