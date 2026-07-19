@@ -30,6 +30,18 @@ struct BulletOuCudaCppI32Buffer {
     int* ptr = nullptr;
 };
 
+struct BulletOuCudaCppPinnedF32Buffer {
+    int device = 0;
+    size_t len = 0;
+    float* ptr = nullptr;
+};
+
+struct BulletOuCudaCppPinnedI32Buffer {
+    int device = 0;
+    size_t len = 0;
+    int* ptr = nullptr;
+};
+
 struct BulletOuCudaCppEvent {
     int device = 0;
     cudaEvent_t event = nullptr;
@@ -116,6 +128,19 @@ int checked_malloc(T** ptr, size_t len, const char* label) {
         return 0;
     }
     cudaError_t status = cudaMalloc(reinterpret_cast<void**>(ptr), len * sizeof(T));
+    if (status != cudaSuccess) {
+        return fail(label, status);
+    }
+    return 0;
+}
+
+template <typename T>
+int checked_host_malloc(T** ptr, size_t len, const char* label) {
+    if (len == 0) {
+        *ptr = nullptr;
+        return 0;
+    }
+    cudaError_t status = cudaMallocHost(reinterpret_cast<void**>(ptr), len * sizeof(T));
     if (status != cudaSuccess) {
         return fail(label, status);
     }
@@ -1688,6 +1713,92 @@ int validate_i32_buffer(BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* b
     return 0;
 }
 
+int validate_pinned_f32_buffer(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppPinnedF32Buffer* buffer,
+    size_t len,
+    const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (buffer == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s pinned buffer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->ptr == nullptr && buffer->len != 0) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s pinned host pointer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->device != ctx->device) {
+        char message[256];
+        std::snprintf(
+            message,
+            sizeof(message),
+            "%s pinned buffer belongs to device %d, context is device %d",
+            name,
+            buffer->device,
+            ctx->device);
+        return fail_message(message);
+    }
+    if (buffer->len < len) {
+        char message[256];
+        std::snprintf(
+            message,
+            sizeof(message),
+            "%s pinned buffer length %zu is smaller than requested length %zu",
+            name,
+            buffer->len,
+            len);
+        return fail_message(message);
+    }
+    return 0;
+}
+
+int validate_pinned_i32_buffer(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppPinnedI32Buffer* buffer,
+    size_t len,
+    const char* name) {
+    if (validate_context(ctx) != 0) {
+        return -1;
+    }
+    if (buffer == nullptr) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s pinned buffer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->ptr == nullptr && buffer->len != 0) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "%s pinned host pointer must not be null", name);
+        return fail_message(message);
+    }
+    if (buffer->device != ctx->device) {
+        char message[256];
+        std::snprintf(
+            message,
+            sizeof(message),
+            "%s pinned buffer belongs to device %d, context is device %d",
+            name,
+            buffer->device,
+            ctx->device);
+        return fail_message(message);
+    }
+    if (buffer->len < len) {
+        char message[256];
+        std::snprintf(
+            message,
+            sizeof(message),
+            "%s pinned buffer length %zu is smaller than requested length %zu",
+            name,
+            buffer->len,
+            len);
+        return fail_message(message);
+    }
+    return 0;
+}
+
 int set_context_device(BulletOuCudaCppContext* ctx) {
     if (validate_context(ctx) != 0) {
         return -1;
@@ -2867,6 +2978,144 @@ extern "C" int bulletou_cuda_cpp_i32_buffer_destroy(BulletOuCudaCppI32Buffer* bu
         }
     }
     delete buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_pinned_f32_buffer_create(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    BulletOuCudaCppPinnedF32Buffer** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("pinned_f32_buffer_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    BulletOuCudaCppPinnedF32Buffer* buffer = new BulletOuCudaCppPinnedF32Buffer();
+    buffer->device = ctx->device;
+    buffer->len = len;
+    if (checked_host_malloc(&buffer->ptr, len, "cudaMallocHost pinned f32 buffer") != 0) {
+        delete buffer;
+        return -1;
+    }
+
+    *out = buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_pinned_f32_buffer_destroy(BulletOuCudaCppPinnedF32Buffer* buffer) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(buffer->device);
+    if (status != cudaSuccess) {
+        delete buffer;
+        return fail("cudaSetDevice", status);
+    }
+    if (buffer->ptr != nullptr) {
+        status = cudaFreeHost(buffer->ptr);
+        if (status != cudaSuccess) {
+            delete buffer;
+            return fail("cudaFreeHost pinned f32 buffer", status);
+        }
+    }
+    delete buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_pinned_i32_buffer_create(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    BulletOuCudaCppPinnedI32Buffer** out) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (out == nullptr) {
+        return fail_message("pinned_i32_buffer_create output pointer must not be null");
+    }
+    *out = nullptr;
+
+    BulletOuCudaCppPinnedI32Buffer* buffer = new BulletOuCudaCppPinnedI32Buffer();
+    buffer->device = ctx->device;
+    buffer->len = len;
+    if (checked_host_malloc(&buffer->ptr, len, "cudaMallocHost pinned i32 buffer") != 0) {
+        delete buffer;
+        return -1;
+    }
+
+    *out = buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_pinned_i32_buffer_destroy(BulletOuCudaCppPinnedI32Buffer* buffer) {
+    if (buffer == nullptr) {
+        return 0;
+    }
+    cudaError_t status = cudaSetDevice(buffer->device);
+    if (status != cudaSuccess) {
+        delete buffer;
+        return fail("cudaSetDevice", status);
+    }
+    if (buffer->ptr != nullptr) {
+        status = cudaFreeHost(buffer->ptr);
+        if (status != cudaSuccess) {
+            delete buffer;
+            return fail("cudaFreeHost pinned i32 buffer", status);
+        }
+    }
+    delete buffer;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_upload_staged(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* dst,
+    BulletOuCudaCppPinnedF32Buffer* staging,
+    const float* src,
+    size_t len) {
+    if (validate_buffer(ctx, dst, len, "dst") != 0 ||
+        validate_pinned_f32_buffer(ctx, staging, len, "staging") != 0 ||
+        validate_host_ptr(src, len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    std::memcpy(staging->ptr, src, len * sizeof(float));
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, staging->ptr, len * sizeof(float), cudaMemcpyHostToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync staged f32 upload", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_i32_upload_staged(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppI32Buffer* dst,
+    BulletOuCudaCppPinnedI32Buffer* staging,
+    const int* src,
+    size_t len) {
+    if (validate_i32_buffer(ctx, dst, len, "dst") != 0 ||
+        validate_pinned_i32_buffer(ctx, staging, len, "staging") != 0 ||
+        validate_host_ptr(src, len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    std::memcpy(staging->ptr, src, len * sizeof(int));
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, staging->ptr, len * sizeof(int), cudaMemcpyHostToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync staged i32 upload", status);
+    }
     return ok();
 }
 

@@ -3173,6 +3173,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp warmup = done (NNUE dense-backward kernels)");
+    let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
+    eprintln!("  cuda-cpp HalfKP upload pipeline = enabled (2 pinned slots; non-profiled steps)");
 
     let loss_kind =
         if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
@@ -3578,7 +3580,15 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             );
         } else {
             runner
-                .step_no_readback_with_loss_finalize(&ctx, params, loss_kind, output_inv_scale, batch, should_report)
+                .step_pipelined_no_readback_with_loss_finalize(
+                    &ctx,
+                    &upload_ctx,
+                    params,
+                    loss_kind,
+                    output_inv_scale,
+                    batch,
+                    should_report,
+                )
                 .map_err(|e| e.to_string())?;
         }
         if should_report {

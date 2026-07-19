@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, and CPU/GPU teacher-prepare overlap are in; remaining work is pinned/upload and sparse L0/update hot spots so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, and pinned staged upload are in; remaining work is sparse L0/update hot spots and speed/quality recipe selection against the previous cuda-oxide 4M throughput ceiling |
 
 ## Notes
 
@@ -949,6 +949,15 @@ the tickets in order and commit each completed slice.
 - Held-out validation check used only `C:\shogi\teacher\test\yamaoka-floodgate.psv`:
   - bs16k/4M with the same WRM/optimizer settings and `--test-positions 8192 --test-sample sequential --test-batch-size 1024` reported training `throughput=2196263 pos/s`, then post-timer validation `test_value_loss=0.05183934`, `test_value_accuracy=0.6716309`;
   - the final numbered checkpoint and validation summary were written after the measured training line, confirming the direct-mode timing cleanup.
+- Adopted pinned staged upload for the HalfKP C++ direct path:
+  - added C++/CUDA pinned host buffers backed by `cudaMallocHost` and staged `f32` / `i32` upload entry points;
+  - `NnueTrainStepRunner` now owns two upload slots, each with device batch buffers, pinned host staging buffers, upload-ready events, and compute-done events;
+  - non-profiled HalfKP direct/prod steps upload the next batch through a separate upload context while the compute stream finishes the previous step; profiled steps keep the serial path for clean stage timing.
+- HalfKP 4M speed after pinned staged upload on the same HCPE teacher and WRM settings:
+  - bs16k reported `2311626` pos/s, similar to the previous overlap-only best;
+  - bs65k improved from the overlap-only `~2.51M` pos/s line to `2752872` pos/s, and a validation run reported `2715894` pos/s with yamaoka `test_value_loss=0.05523509`, `test_value_accuracy=0.6442871`;
+  - bs131k reported `2670155` pos/s, so the best speed point in this short 4M probe moved to bs65k;
+  - bs16k with `--threads 16` reported `2389868` pos/s and yamaoka `test_value_loss=0.05368488`, `test_value_accuracy=0.6662598`, but the bs16k quality probe still needs a larger validation/sample comparison before changing the recommended quality recipe.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;

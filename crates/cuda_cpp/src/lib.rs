@@ -155,6 +155,18 @@ pub struct I32Buffer {
 }
 
 #[derive(Debug)]
+pub struct F32PinnedBuffer {
+    raw: NonNull<ffi::BulletOuCudaCppPinnedF32Buffer>,
+    len: usize,
+}
+
+#[derive(Debug)]
+pub struct I32PinnedBuffer {
+    raw: NonNull<ffi::BulletOuCudaCppPinnedI32Buffer>,
+    len: usize,
+}
+
+#[derive(Debug)]
 pub struct F32UploadSlot {
     buffer: F32Buffer,
     ready: Event,
@@ -203,6 +215,104 @@ impl I32UploadSlot {
 
     pub fn buffer(&self) -> &I32Buffer {
         &self.buffer
+    }
+}
+
+impl F32PinnedBuffer {
+    pub fn new(ctx: &Context, len: usize) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `ctx` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_pinned_f32_buffer_create(ctx.as_ptr(), len, &mut raw) })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| CudaCppError::message("C++/CUDA pinned_f32_buffer_create returned null"))?;
+        Ok(Self { raw, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn upload_to_device(&self, ctx: &Context, dst: &F32Buffer, values: &[f32]) -> Result<()> {
+        if values.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "staged f32 upload length {} exceeds pinned buffer length {}",
+                values.len(),
+                self.len
+            )));
+        }
+        if values.len() > dst.len() {
+            return Err(CudaCppError::message(format!(
+                "staged f32 upload length {} exceeds device buffer length {}",
+                values.len(),
+                dst.len()
+            )));
+        }
+        // SAFETY: host slice is copied into an owned pinned host buffer before enqueueing the device copy.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_f32_upload_staged(
+                ctx.as_ptr(),
+                dst.as_ptr(),
+                self.raw.as_ptr(),
+                values.as_ptr(),
+                values.len(),
+            )
+        })
+    }
+}
+
+impl Drop for F32PinnedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_pinned_f32_buffer_destroy(self.raw.as_ptr()) };
+    }
+}
+
+impl I32PinnedBuffer {
+    pub fn new(ctx: &Context, len: usize) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out pointer and `ctx` is valid.
+        check(unsafe { ffi::bulletou_cuda_cpp_pinned_i32_buffer_create(ctx.as_ptr(), len, &mut raw) })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| CudaCppError::message("C++/CUDA pinned_i32_buffer_create returned null"))?;
+        Ok(Self { raw, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn upload_to_device(&self, ctx: &Context, dst: &I32Buffer, values: &[i32]) -> Result<()> {
+        if values.len() > self.len {
+            return Err(CudaCppError::message(format!(
+                "staged i32 upload length {} exceeds pinned buffer length {}",
+                values.len(),
+                self.len
+            )));
+        }
+        if values.len() > dst.len() {
+            return Err(CudaCppError::message(format!(
+                "staged i32 upload length {} exceeds device buffer length {}",
+                values.len(),
+                dst.len()
+            )));
+        }
+        // SAFETY: host slice is copied into an owned pinned host buffer before enqueueing the device copy.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_i32_upload_staged(
+                ctx.as_ptr(),
+                dst.as_ptr(),
+                self.raw.as_ptr(),
+                values.as_ptr(),
+                values.len(),
+            )
+        })
+    }
+}
+
+impl Drop for I32PinnedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is owned by this wrapper and should be destroyed once.
+        let _ = unsafe { ffi::bulletou_cuda_cpp_pinned_i32_buffer_destroy(self.raw.as_ptr()) };
     }
 }
 
@@ -2372,6 +2482,98 @@ pub struct NnueTrainStepProfile {
 }
 
 #[derive(Debug)]
+pub struct NnueTrainStepUploadSlot {
+    pub device_batch: NnueForwardDeviceBatch,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+    pinned_stm_indices: I32PinnedBuffer,
+    pinned_nstm_indices: I32PinnedBuffer,
+    pinned_targets: F32PinnedBuffer,
+    pinned_entry_weights: F32PinnedBuffer,
+    upload_ready: Event,
+    compute_done: Event,
+    in_use: bool,
+}
+
+impl NnueTrainStepUploadSlot {
+    pub fn new(ctx: &Context, batch_size: usize, max_active: usize) -> Result<Self> {
+        if batch_size == 0 {
+            return Err(CudaCppError::message("NNUE upload slot batch_size must be greater than zero"));
+        }
+        if max_active == 0 {
+            return Err(CudaCppError::message("NNUE upload slot max_active must be greater than zero"));
+        }
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("NNUE upload slot sparse length overflow"))?;
+        Ok(Self {
+            device_batch: NnueForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+            },
+            targets: F32Buffer::new(ctx, batch_size)?,
+            entry_weights: F32Buffer::new(ctx, batch_size)?,
+            pinned_stm_indices: I32PinnedBuffer::new(ctx, sparse_len)?,
+            pinned_nstm_indices: I32PinnedBuffer::new(ctx, sparse_len)?,
+            pinned_targets: F32PinnedBuffer::new(ctx, batch_size)?,
+            pinned_entry_weights: F32PinnedBuffer::new(ctx, batch_size)?,
+            upload_ready: Event::new(ctx)?,
+            compute_done: Event::new(ctx)?,
+            in_use: false,
+        })
+    }
+
+    fn upload(&mut self, upload_ctx: &Context, batch: NnueTrainStepHostBatch<'_>) -> Result<()> {
+        batch.validate()?;
+        if batch.batch_size != self.device_batch.batch_size || batch.max_active != self.device_batch.max_active {
+            return Err(CudaCppError::message(format!(
+                "NNUE upload slot batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.device_batch.batch_size, self.device_batch.max_active
+            )));
+        }
+        if self.in_use {
+            self.compute_done.wait(upload_ctx)?;
+        }
+        self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
+        self.pinned_nstm_indices.upload_to_device(upload_ctx, &self.device_batch.nstm_indices, batch.nstm_indices)?;
+        self.pinned_targets.upload_to_device(upload_ctx, &self.targets, batch.targets)?;
+        self.pinned_entry_weights.upload_to_device(upload_ctx, &self.entry_weights, batch.entry_weights)?;
+        self.upload_ready.record(upload_ctx)?;
+        self.in_use = true;
+        Ok(())
+    }
+
+    fn wait_upload_on(&self, compute_ctx: &Context) -> Result<()> {
+        self.upload_ready.wait(compute_ctx)
+    }
+
+    fn record_compute_done(&self, compute_ctx: &Context) -> Result<()> {
+        self.compute_done.record(compute_ctx)
+    }
+
+    fn validate(&self, batch_size: usize, max_active: usize) -> Result<()> {
+        if self.device_batch.batch_size != batch_size || self.device_batch.max_active != max_active {
+            return Err(CudaCppError::message(format!(
+                "NNUE upload slot layout mismatch: slot batch_size={} max_active={}, expected batch_size={} max_active={}",
+                self.device_batch.batch_size, self.device_batch.max_active, batch_size, max_active
+            )));
+        }
+        self.device_batch.validate()?;
+        expect_len("nnue upload slot targets", batch_size, self.targets.len())?;
+        expect_len("nnue upload slot entry_weights", batch_size, self.entry_weights.len())?;
+        expect_len("nnue upload slot pinned targets", batch_size, self.pinned_targets.len())?;
+        expect_len("nnue upload slot pinned entry_weights", batch_size, self.pinned_entry_weights.len())?;
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("NNUE upload slot sparse length overflow"))?;
+        expect_len("nnue upload slot pinned stm_indices", sparse_len, self.pinned_stm_indices.len())?;
+        expect_len("nnue upload slot pinned nstm_indices", sparse_len, self.pinned_nstm_indices.len())
+    }
+}
+
+#[derive(Debug)]
 pub struct NnueTrainStepRunner {
     pub shape: NnueForwardShape,
     pub batch_size: usize,
@@ -2384,6 +2586,8 @@ pub struct NnueTrainStepRunner {
     pub forward_workspace: NnueForwardWorkspace,
     pub loss_workspace: ScalarLossWorkspace,
     pub backward_workspace: NnueBackwardWorkspace,
+    pub upload_slots: Vec<NnueTrainStepUploadSlot>,
+    pub next_upload_slot: usize,
 }
 
 impl NnueTrainStepRunner {
@@ -2428,6 +2632,10 @@ impl NnueTrainStepRunner {
         let sparse_len = batch_size
             .checked_mul(max_active)
             .ok_or_else(|| CudaCppError::message("NNUE train-step sparse length overflow"))?;
+        let mut upload_slots = Vec::with_capacity(2);
+        for _ in 0..2 {
+            upload_slots.push(NnueTrainStepUploadSlot::new(ctx, batch_size, max_active)?);
+        }
         Ok(Self {
             shape,
             batch_size,
@@ -2448,6 +2656,8 @@ impl NnueTrainStepRunner {
                 ctx,
                 NnueBackwardWorkspaceLayout::new(shape, batch_size, max_active),
             )?,
+            upload_slots,
+            next_upload_slot: 0,
         })
     }
 
@@ -2529,6 +2739,82 @@ impl NnueTrainStepRunner {
             &self.backward_workspace,
         )?;
         self.update_weights(ctx, params)
+    }
+
+    pub fn step_pipelined_no_readback(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.step_pipelined_no_readback_with_loss_finalize(
+            ctx,
+            upload_ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            true,
+        )
+    }
+
+    pub fn step_pipelined_no_readback_with_loss_finalize(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+    ) -> Result<()> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "NNUE train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+        if self.upload_slots.is_empty() {
+            return Err(CudaCppError::message("NNUE train-step runner has no upload slots"));
+        }
+
+        let slot_idx = self.next_upload_slot;
+        self.next_upload_slot = (self.next_upload_slot + 1) % self.upload_slots.len();
+        {
+            let slot = &mut self.upload_slots[slot_idx];
+            slot.upload(upload_ctx, batch)?;
+        }
+        {
+            let slot = &self.upload_slots[slot_idx];
+            slot.wait_upload_on(ctx)?;
+            nnue_forward_device(ctx, &slot.device_batch, &self.weights, &self.forward_workspace)?;
+            scalar_loss_device_from_buffers_with_finalize(
+                ctx,
+                loss_kind,
+                output_inv_scale,
+                self.batch_size,
+                &self.forward_workspace.output,
+                &slot.targets,
+                &slot.entry_weights,
+                &self.loss_workspace,
+                finalize_loss,
+            )?;
+            nnue_backward_device_reusing_zeroed_l0_gradients(
+                ctx,
+                &slot.device_batch,
+                &self.weights,
+                &self.forward_workspace,
+                &self.loss_workspace,
+                &self.backward_workspace,
+            )?;
+        }
+        self.update_weights(ctx, params)?;
+        self.upload_slots[slot_idx].record_compute_done(ctx)
     }
 
     pub fn step_profiled_no_readback(
@@ -2628,7 +2914,11 @@ impl NnueTrainStepRunner {
         self.loss_workspace.validate()?;
         self.backward_workspace.validate()?;
         expect_len("train targets", self.batch_size, self.targets.len())?;
-        expect_len("train entry_weights", self.batch_size, self.entry_weights.len())
+        expect_len("train entry_weights", self.batch_size, self.entry_weights.len())?;
+        for slot in &self.upload_slots {
+            slot.validate(self.batch_size, self.max_active)?;
+        }
+        Ok(())
     }
 
     fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
@@ -3558,6 +3848,16 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct BulletOuCudaCppPinnedF32Buffer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct BulletOuCudaCppPinnedI32Buffer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
     pub struct BulletOuCudaCppEvent {
         _private: [u8; 0],
     }
@@ -3611,9 +3911,28 @@ mod ffi {
             out: *mut *mut BulletOuCudaCppI32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_i32_buffer_destroy(buffer: *mut BulletOuCudaCppI32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_pinned_f32_buffer_create(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            out: *mut *mut BulletOuCudaCppPinnedF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_pinned_f32_buffer_destroy(buffer: *mut BulletOuCudaCppPinnedF32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_pinned_i32_buffer_create(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            out: *mut *mut BulletOuCudaCppPinnedI32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_pinned_i32_buffer_destroy(buffer: *mut BulletOuCudaCppPinnedI32Buffer) -> i32;
         pub fn bulletou_cuda_cpp_i32_upload(
             ctx: *mut BulletOuCudaCppContext,
             dst: *mut BulletOuCudaCppI32Buffer,
+            src: *const i32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_i32_upload_staged(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppI32Buffer,
+            staging: *mut BulletOuCudaCppPinnedI32Buffer,
             src: *const i32,
             len: usize,
         ) -> i32;
@@ -3626,6 +3945,13 @@ mod ffi {
         pub fn bulletou_cuda_cpp_f32_upload(
             ctx: *mut BulletOuCudaCppContext,
             dst: *mut BulletOuCudaCppF32Buffer,
+            src: *const f32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_upload_staged(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppF32Buffer,
+            staging: *mut BulletOuCudaCppPinnedF32Buffer,
             src: *const f32,
             len: usize,
         ) -> i32;
@@ -4363,6 +4689,22 @@ mod tests {
         let upload_i = I32UploadSlot::new(&upload_ctx, 3).unwrap();
         upload_i.upload(&upload_ctx, &[7, 8, 9]).unwrap();
         assert_eq!(upload_i.wait_on(&ctx).unwrap().download(&ctx).unwrap(), vec![7, 8, 9]);
+
+        let staged_x = F32Buffer::new(&ctx, 3).unwrap();
+        let staged_x_host = F32PinnedBuffer::new(&upload_ctx, 3).unwrap();
+        staged_x_host.upload_to_device(&upload_ctx, &staged_x, &[3.0, 4.0, 5.0]).unwrap();
+        let staged_ready = Event::new(&upload_ctx).unwrap();
+        staged_ready.record(&upload_ctx).unwrap();
+        staged_ready.wait(&ctx).unwrap();
+        assert_eq!(staged_x.download(&ctx).unwrap(), vec![3.0, 4.0, 5.0]);
+
+        let staged_i = I32Buffer::new(&ctx, 3).unwrap();
+        let staged_i_host = I32PinnedBuffer::new(&upload_ctx, 3).unwrap();
+        staged_i_host.upload_to_device(&upload_ctx, &staged_i, &[3, 4, 5]).unwrap();
+        let staged_i_ready = Event::new(&upload_ctx).unwrap();
+        staged_i_ready.record(&upload_ctx).unwrap();
+        staged_i_ready.wait(&ctx).unwrap();
+        assert_eq!(staged_i.download(&ctx).unwrap(), vec![3, 4, 5]);
     }
 
     fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
