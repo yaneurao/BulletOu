@@ -1386,6 +1386,53 @@ fn print_cuda_cpp_checkpoint_with_timing(
     }
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_superbatch_progress(
+    prefix: &str,
+    progress: Option<CudaCppScheduleProgress>,
+    batch_size: usize,
+    positions: usize,
+    positions_per_sec: f64,
+) {
+    match progress {
+        Some(progress) => {
+            let sb_total_positions = progress.batches_per_superbatch.saturating_mul(batch_size);
+            let batch_word = if progress.batches_per_superbatch == 1 { "batch" } else { "batches" };
+            eprintln!(
+                "  {} {}  {}  {}  {}  {}  {}  {}",
+                paint(prefix, ConsoleColor::Dim),
+                paint("[progress]", ConsoleColor::BoldCyan),
+                paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
+                paint(
+                    format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
+                    ConsoleColor::BoldYellow
+                ),
+                paint(
+                    format!(
+                        "this-sb={} pos ({} {} x {})",
+                        format_count(sb_total_positions),
+                        format_count(progress.batches_per_superbatch),
+                        batch_word,
+                        format_count(batch_size)
+                    ),
+                    ConsoleColor::Yellow
+                ),
+                paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
+                colored_train_time(positions, positions_per_sec),
+                colored_pos_s(positions_per_sec)
+            );
+        }
+        None => eprintln!(
+            "  {} {}  {}  {}  {}",
+            paint(prefix, ConsoleColor::Dim),
+            paint("[progress]", ConsoleColor::BoldCyan),
+            paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
+            colored_train_time(positions, positions_per_sec),
+            colored_pos_s(positions_per_sec)
+        ),
+    }
+}
+
 fn print_cuda_cpp_validation_summary(prefix: &str, epoch_superbatch: Option<(usize, usize)>, accuracy: f32, loss: f32) {
     print_cuda_cpp_validation_summary_elapsed(prefix, epoch_superbatch, accuracy, loss, None);
 }
@@ -3799,6 +3846,21 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 );
             }
             checkpoint_chunk_idx += 1;
+        } else if schedule.production
+            && schedule
+                .progress_for_step(seen_steps)
+                .is_some_and(|progress| progress.batch_in_superbatch == progress.batches_per_superbatch)
+        {
+            let progress = schedule.progress_for_step(seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            print_cuda_cpp_superbatch_progress(
+                &format!("cuda-cpp {}", component.label()),
+                progress,
+                batch_size,
+                positions,
+                positions_per_sec,
+            );
         }
         Ok::<(), String>(())
     })?;
@@ -4859,6 +4921,15 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
             checkpoint_chunk_idx += 1;
+        } else if schedule.production
+            && schedule
+                .progress_for_step(seen_steps)
+                .is_some_and(|progress| progress.batch_in_superbatch == progress.batches_per_superbatch)
+        {
+            let progress = schedule.progress_for_step(seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, positions_per_sec);
         }
         Ok::<(), String>(())
     })
@@ -5746,6 +5817,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
             checkpoint_chunk_idx += 1;
+        } else if schedule.production
+            && schedule
+                .progress_for_step(seen_steps)
+                .is_some_and(|progress| progress.batch_in_superbatch == progress.batches_per_superbatch)
+        {
+            let progress = schedule.progress_for_step(seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            print_cuda_cpp_superbatch_progress("cuda-cpp SFNN", progress, batch_size, positions, positions_per_sec);
         }
         Ok::<(), String>(())
     })
