@@ -32,7 +32,7 @@ KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単
 |---|---|---|
 | `KPPT` / `KPP_KKPT` | 使わない (固定 architecture) | n/a |
 | `NNUE_HALFKP` / `NNUE_KP` / `NNUE_KA2` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` | 使う | `NNUE_<feature>_<L1>x2_<L2>_<L3>` |
-| `SFNN_HALFKA1HM` / `SFNN_HALFKA2HM` / `SFNN_HALFKA2` / `SFNN_KA2` | 使う | `SFNN_<feature>_<FT>_<H1>_<H2>_k3k3` |
+| `SFNN_HALFKA1HM` / `SFNN_HALFKA2HM` / `SFNN_HALFKA2` / `SFNN_KA2` | 使う | `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3` |
 
 `--arch` の値は、やねうら王 Makefile の `YANEURAOU_ENGINE_` prefix を除いた architecture 名。SFNN の `SFNN_halfkahm2_1536_15_32_k3k3` は `(ft_size=1536, l1_hidden=15, l2_size=32)` と k3k3(king3-by-king3) LayerStacks にマップされ、`l1_hidden + 1` の PSQT shortcut neuron は内部で自動付加される (`fc_0` の出力次元は実際には 16)。
 

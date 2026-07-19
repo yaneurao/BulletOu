@@ -800,11 +800,11 @@ pub struct SfnnForwardShape {
     pub l1_hidden: usize,
     pub l2_size: usize,
     pub num_stacks: usize,
+    /// `1` means normal dense stacked L1. Values greater than one mean
+    /// grouped L1: `ft_size / l1_group_count` inputs connect to
+    /// `l1_out / l1_group_count` outputs in each group.
+    pub l1_group_count: usize,
 }
-
-const SFNN_G4_L1_GROUP_COUNT: usize = 4;
-const SFNN_G4_L1_GROUP_INPUT: usize = 1024;
-const SFNN_G4_L1_GROUP_OUTPUT: usize = 2;
 
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
@@ -819,15 +819,33 @@ impl SfnnForwardShape {
         self.ft_size / 2
     }
 
+    pub fn l1_group_count(self) -> usize {
+        self.l1_group_count
+    }
+
     pub fn has_grouped_l1(self) -> bool {
-        self.ft_size == 4096 && self.l1_hidden == 7 && self.l2_size == 64 && self.num_stacks == 9
+        self.l1_group_count > 1
+    }
+
+    pub fn l1_group_input(self) -> usize {
+        self.ft_size / self.l1_group_count
+    }
+
+    pub fn l1_group_output(self) -> usize {
+        self.l1_out() / self.l1_group_count
     }
 
     pub fn l1w_len(self) -> Result<usize> {
         if self.has_grouped_l1() {
+            if self.l1_group_count == 0
+                || self.ft_size % self.l1_group_count != 0
+                || self.l1_out() % self.l1_group_count != 0
+            {
+                return Err(CudaCppError::message(format!("SFNN grouped-L1 shape dimensions are invalid: {self:?}")));
+            }
             checked_product(
                 "sfnn grouped l1w",
-                &[self.num_stacks, SFNN_G4_L1_GROUP_COUNT, SFNN_G4_L1_GROUP_OUTPUT, SFNN_G4_L1_GROUP_INPUT],
+                &[self.num_stacks, self.l1_group_count, self.l1_group_output(), self.l1_group_input()],
             )
         } else {
             checked_product("sfnn l1w", &[self.num_stacks, self.l1_out(), self.ft_size])
@@ -837,9 +855,9 @@ impl SfnnForwardShape {
     pub fn l1w_len_saturating(self) -> usize {
         if self.has_grouped_l1() {
             self.num_stacks
-                .saturating_mul(SFNN_G4_L1_GROUP_COUNT)
-                .saturating_mul(SFNN_G4_L1_GROUP_OUTPUT)
-                .saturating_mul(SFNN_G4_L1_GROUP_INPUT)
+                .saturating_mul(self.l1_group_count)
+                .saturating_mul(self.l1_group_output())
+                .saturating_mul(self.l1_group_input())
         } else {
             self.num_stacks.saturating_mul(self.l1_out()).saturating_mul(self.ft_size)
         }
@@ -1158,6 +1176,7 @@ pub fn sfnn_forward_device(
             shape.l1_hidden,
             shape.l2_size,
             shape.num_stacks,
+            shape.l1_group_count,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2083,6 +2102,7 @@ pub fn sfnn_backward_train_profile_device(
             shape.l1_hidden,
             shape.l2_size,
             shape.num_stacks,
+            shape.l1_group_count,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2186,6 +2206,7 @@ fn sfnn_backward_device_impl(
                 shape.l1_hidden,
                 shape.l2_size,
                 shape.num_stacks,
+                shape.l1_group_count,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -2231,6 +2252,7 @@ fn sfnn_backward_device_impl(
                 shape.l1_hidden,
                 shape.l2_size,
                 shape.num_stacks,
+                shape.l1_group_count,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -4416,12 +4438,12 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         || shape.l1_hidden == 0
         || shape.l2_size == 0
         || shape.num_stacks == 0
+        || shape.l1_group_count == 0
         || shape.ft_size % 2 != 0
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
     } else if shape.has_grouped_l1()
-        && (shape.ft_size != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT
-            || shape.l1_out() != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT)
+        && (shape.ft_size % shape.l1_group_count != 0 || shape.l1_out() % shape.l1_group_count != 0)
     {
         Err(CudaCppError::message(format!("SFNN grouped-L1 shape dimensions are invalid: {shape:?}")))
     } else {
@@ -5006,6 +5028,7 @@ mod ffi {
             l1_hidden: usize,
             l2_size: usize,
             num_stacks: usize,
+            l1_group_count: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5037,6 +5060,7 @@ mod ffi {
             l1_hidden: usize,
             l2_size: usize,
             num_stacks: usize,
+            l1_group_count: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5080,6 +5104,7 @@ mod ffi {
             l1_hidden: usize,
             l2_size: usize,
             num_stacks: usize,
+            l1_group_count: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5124,6 +5149,7 @@ mod ffi {
             l1_hidden: usize,
             l2_size: usize,
             num_stacks: usize,
+            l1_group_count: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5265,7 +5291,8 @@ mod tests {
 
     #[test]
     fn sfnn_workspace_layout_counts_forward_activations() {
-        let shape = SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2 };
+        let shape =
+            SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
         assert_eq!(shape.l1_out(), 3);
@@ -5280,7 +5307,8 @@ mod tests {
 
     #[test]
     fn sfnn_backward_workspace_layout_counts_gradients() {
-        let shape = SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2 };
+        let shape =
+            SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
         assert_eq!(layout.l2_gradients_len(), 15);
@@ -5301,14 +5329,23 @@ mod tests {
     }
 
     #[test]
-    fn sfnn_g4_l1w_layout_is_compact() {
-        let shape = SfnnForwardShape { input_size: 133578, ft_size: 4096, l1_hidden: 7, l2_size: 64, num_stacks: 9 };
+    fn sfnn_grouped_l1w_layout_is_compact() {
+        let shape = SfnnForwardShape {
+            input_size: 133578,
+            ft_size: 8192,
+            l1_hidden: 15,
+            l2_size: 64,
+            num_stacks: 9,
+            l1_group_count: 16,
+        };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
         assert!(shape.has_grouped_l1());
-        assert_eq!(shape.l1_out(), 8);
-        assert_eq!(shape.l1w_len().unwrap(), 9 * 4 * 2 * 1024);
-        assert_eq!(layout.l1w_gradients_len(), 9 * 4 * 2 * 1024);
+        assert_eq!(shape.l1_out(), 16);
+        assert_eq!(shape.l1_group_input(), 512);
+        assert_eq!(shape.l1_group_output(), 1);
+        assert_eq!(shape.l1w_len().unwrap(), 9 * 16 * 1 * 512);
+        assert_eq!(layout.l1w_gradients_len(), 9 * 16 * 1 * 512);
         assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
     }
 
@@ -5687,7 +5724,7 @@ mod tests {
     }
 
     fn tiny_sfnn_shape() -> SfnnForwardShape {
-        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2 }
+        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 }
     }
 
     fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {

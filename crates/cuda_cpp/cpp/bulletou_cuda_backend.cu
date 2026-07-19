@@ -643,23 +643,15 @@ __global__ void dense_add_bias_kernel(
 constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
-constexpr size_t SFNN_G4_L1_FT_SIZE = 4096;
-constexpr size_t SFNN_G4_L1_HIDDEN = 7;
-constexpr size_t SFNN_G4_L2_SIZE = 64;
-constexpr size_t SFNN_G4_L1_STACKS = 9;
-constexpr size_t SFNN_G4_L1_GROUP_COUNT = 4;
-constexpr size_t SFNN_G4_L1_GROUP_INPUT = 1024;
-constexpr size_t SFNN_G4_L1_GROUP_OUTPUT = 2;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
 
-bool sfnn_is_grouped_l1_shape(size_t ft_size, size_t l1_hidden, size_t l2_size, size_t num_stacks) {
-    return ft_size == SFNN_G4_L1_FT_SIZE && l1_hidden == SFNN_G4_L1_HIDDEN &&
-        l2_size == SFNN_G4_L2_SIZE && num_stacks == SFNN_G4_L1_STACKS;
+bool sfnn_is_grouped_l1_shape(size_t l1_group_count) {
+    return l1_group_count > 1;
 }
 
-size_t sfnn_l1w_len_for_shape(size_t ft_size, size_t l1_hidden, size_t l2_size, size_t num_stacks) {
-    if (sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks)) {
-        return num_stacks * SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+size_t sfnn_l1w_len_for_shape(size_t ft_size, size_t l1_hidden, size_t num_stacks, size_t l1_group_count) {
+    if (sfnn_is_grouped_l1_shape(l1_group_count)) {
+        return num_stacks * l1_group_count * ((l1_hidden + 1) / l1_group_count) * (ft_size / l1_group_count);
     }
     return num_stacks * (l1_hidden + 1) * ft_size;
 }
@@ -797,7 +789,10 @@ __global__ void sfnn_grouped_l1_kernel(
     size_t batch,
     size_t input_dim,
     size_t output_dim,
-    size_t num_stacks) {
+    size_t num_stacks,
+    size_t group_count,
+    size_t group_input,
+    size_t group_output) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
@@ -808,22 +803,22 @@ __global__ void sfnn_grouped_l1_kernel(
     size_t sample = tid / output_dim;
     int stack_i32 = buckets[sample];
     if (stack_i32 < 0 || static_cast<size_t>(stack_i32) >= num_stacks ||
-        out_col >= SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT ||
-        input_dim != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT) {
+        out_col >= group_count * group_output ||
+        input_dim != group_count * group_input) {
         output[tid] = 0.0f;
         return;
     }
 
     size_t stack = static_cast<size_t>(stack_i32);
-    size_t group = out_col / SFNN_G4_L1_GROUP_OUTPUT;
-    size_t local_out = out_col - group * SFNN_G4_L1_GROUP_OUTPUT;
-    size_t input_base = sample * input_dim + group * SFNN_G4_L1_GROUP_INPUT;
-    size_t stack_stride = SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+    size_t group = out_col / group_output;
+    size_t local_out = out_col - group * group_output;
+    size_t input_base = sample * input_dim + group * group_input;
+    size_t stack_stride = group_count * group_output * group_input;
     size_t weight_base = stack * stack_stride +
-        group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT +
-        local_out * SFNN_G4_L1_GROUP_INPUT;
+        group * group_output * group_input +
+        local_out * group_input;
     float sum = bias[stack * output_dim + out_col];
-    for (size_t local_in = 0; local_in < SFNN_G4_L1_GROUP_INPUT; ++local_in) {
+    for (size_t local_in = 0; local_in < group_input; ++local_in) {
         sum += input[input_base + local_in] * weights[weight_base + local_in];
     }
     output[tid] = sum;
@@ -1235,12 +1230,15 @@ __global__ void sfnn_grouped_l1_backward_kernel(
     size_t batch,
     size_t input_dim,
     size_t output_dim,
-    size_t num_stacks) {
+    size_t num_stacks,
+    size_t group_count,
+    size_t group_input,
+    size_t group_output) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
-    size_t weight_scatter_len = batch * input_dim * SFNN_G4_L1_GROUP_OUTPUT;
+    size_t weight_scatter_len = batch * input_dim * group_output;
     size_t bias_scatter_len = batch * output_dim;
-    size_t stack_stride = SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+    size_t stack_stride = group_count * group_output * group_input;
 
     if (tid < input_gradient_len) {
         size_t sample = tid / input_dim;
@@ -1248,17 +1246,16 @@ __global__ void sfnn_grouped_l1_backward_kernel(
         int stack_i32 = buckets[sample];
         float sum = 0.0f;
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks &&
-            in_col < SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT) {
+            in_col < group_count * group_input) {
             size_t stack = static_cast<size_t>(stack_i32);
-            size_t group = in_col / SFNN_G4_L1_GROUP_INPUT;
-            size_t local_in = in_col - group * SFNN_G4_L1_GROUP_INPUT;
-            size_t group_weight_base = stack * stack_stride +
-                group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
-            for (size_t local_out = 0; local_out < SFNN_G4_L1_GROUP_OUTPUT; ++local_out) {
-                size_t out_col = group * SFNN_G4_L1_GROUP_OUTPUT + local_out;
+            size_t group = in_col / group_input;
+            size_t local_in = in_col - group * group_input;
+            size_t group_weight_base = stack * stack_stride + group * group_output * group_input;
+            for (size_t local_out = 0; local_out < group_output; ++local_out) {
+                size_t out_col = group * group_output + local_out;
                 float grad = output_gradients[sample * output_dim + out_col];
                 if (grad != 0.0f) {
-                    sum += grad * weights[group_weight_base + local_out * SFNN_G4_L1_GROUP_INPUT + local_in];
+                    sum += grad * weights[group_weight_base + local_out * group_input + local_in];
                 }
             }
         }
@@ -1266,23 +1263,23 @@ __global__ void sfnn_grouped_l1_backward_kernel(
     }
 
     if (tid < weight_scatter_len) {
-        size_t local_out = tid % SFNN_G4_L1_GROUP_OUTPUT;
-        size_t input_entry = tid / SFNN_G4_L1_GROUP_OUTPUT;
+        size_t local_out = tid % group_output;
+        size_t input_entry = tid / group_output;
         size_t in_col = input_entry % input_dim;
         size_t sample = input_entry / input_dim;
         int stack_i32 = buckets[sample];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks &&
-            in_col < SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT) {
+            in_col < group_count * group_input) {
             size_t stack = static_cast<size_t>(stack_i32);
-            size_t group = in_col / SFNN_G4_L1_GROUP_INPUT;
-            size_t local_in = in_col - group * SFNN_G4_L1_GROUP_INPUT;
-            size_t out_col = group * SFNN_G4_L1_GROUP_OUTPUT + local_out;
+            size_t group = in_col / group_input;
+            size_t local_in = in_col - group * group_input;
+            size_t out_col = group * group_output + local_out;
             float output_gradient = output_gradients[sample * output_dim + out_col];
             float input_value = inputs[sample * input_dim + in_col];
             if (output_gradient != 0.0f && input_value != 0.0f) {
                 size_t weight_idx = stack * stack_stride +
-                    group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT +
-                    local_out * SFNN_G4_L1_GROUP_INPUT +
+                    group * group_output * group_input +
+                    local_out * group_input +
                     local_in;
                 atomicAdd(&weight_gradients[weight_idx], output_gradient * input_value);
             }
@@ -2439,13 +2436,17 @@ int validate_sfnn_shape(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active) {
-    if (input_size == 0 || ft_size == 0 || l1_hidden == 0 || l2_size == 0 || num_stacks == 0) {
+    if (input_size == 0 || ft_size == 0 || l1_hidden == 0 || l2_size == 0 || num_stacks == 0 || l1_group_count == 0) {
         return fail_message("SFNN shape dimensions must be greater than zero");
     }
     if ((ft_size % 2) != 0) {
         return fail_message("SFNN ft_size must be even");
+    }
+    if (sfnn_is_grouped_l1_shape(l1_group_count) && (ft_size % l1_group_count != 0 || ((l1_hidden + 1) % l1_group_count) != 0)) {
+        return fail_message("SFNN grouped L1 requires ft_size and l1_hidden+1 to be divisible by l1_group_count");
     }
     if (batch == 0) {
         return fail_message("SFNN batch size must be greater than zero");
@@ -2614,6 +2615,7 @@ int launch_sfnn_forward_kernels(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const int* stm_indices,
@@ -2637,7 +2639,7 @@ int launch_sfnn_forward_kernels(
     float* l2_input,
     float* l2,
     float* output) {
-    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, l1_group_count, batch, max_active) != 0) {
         return -1;
     }
     if (set_context_device(ctx) != 0) {
@@ -2649,7 +2651,7 @@ int launch_sfnn_forward_kernels(
     const size_t pairwise = ft_size / 2;
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const bool grouped_l1 = sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks);
+    const bool grouped_l1 = sfnn_is_grouped_l1_shape(l1_group_count);
     if (grouped_l1 && has_l1f != 0) {
         return fail_message("SFNN grouped L1 does not support factorized shared L1");
     }
@@ -2674,6 +2676,8 @@ int launch_sfnn_forward_kernels(
     }
 
     if (grouped_l1) {
+        const size_t group_input = ft_size / l1_group_count;
+        const size_t group_output = l1_out / l1_group_count;
         if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_grouped_l1_kernel") != 0) {
             return -1;
         }
@@ -2686,7 +2690,10 @@ int launch_sfnn_forward_kernels(
             batch,
             ft_size,
             l1_out,
-            num_stacks);
+            num_stacks,
+            l1_group_count,
+            group_input,
+            group_output);
         if (check_kernel_launch("sfnn_grouped_l1_kernel launch") != 0) {
             return -1;
         }
@@ -2764,6 +2771,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     float* l0w_gradients,
     float* l0b_gradients,
     float* l1w_gradients,
@@ -2777,7 +2785,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     int zero_l0w_gradients) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, l2_size, num_stacks);
+    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count);
     if (zero_l0w_gradients != 0 &&
         launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0) {
         return -1;
@@ -3036,6 +3044,7 @@ int launch_sfnn_backward_kernels(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const int* stm_indices,
@@ -3075,7 +3084,7 @@ int launch_sfnn_backward_kernels(
     int fuse_pairwise_l0,
     float* profile_ms,
     size_t profile_ms_len) {
-    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, l1_group_count, batch, max_active) != 0) {
         return -1;
     }
     if (set_context_device(ctx) != 0) {
@@ -3084,7 +3093,7 @@ int launch_sfnn_backward_kernels(
 
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const bool grouped_l1 = sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks);
+    const bool grouped_l1 = sfnn_is_grouped_l1_shape(l1_group_count);
     if (grouped_l1 && has_l1f != 0) {
         return fail_message("SFNN grouped L1 does not support factorized shared L1");
     }
@@ -3103,6 +3112,7 @@ int launch_sfnn_backward_kernels(
                 l1_hidden,
                 l2_size,
                 num_stacks,
+                l1_group_count,
                 l0w_gradients,
                 l0b_gradients,
                 l1w_gradients,
@@ -3184,7 +3194,9 @@ int launch_sfnn_backward_kernels(
     }
 
     if (grouped_l1) {
-        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * SFNN_G4_L1_GROUP_OUTPUT);
+        const size_t group_input = ft_size / l1_group_count;
+        const size_t group_output = l1_out / l1_group_count;
+        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * group_output);
         l1_threads = std::max(l1_threads, batch * l1_out);
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_grouped_l1_backward_kernel") != 0) {
             return -1;
@@ -3200,7 +3212,10 @@ int launch_sfnn_backward_kernels(
             batch,
             ft_size,
             l1_out,
-            num_stacks);
+            num_stacks,
+            l1_group_count,
+            group_input,
+            group_output);
         if (check_kernel_launch("sfnn_grouped_l1_backward_kernel launch") != 0) {
             return -1;
         }
@@ -4555,6 +4570,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -4580,9 +4596,9 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     BulletOuCudaCppF32Buffer* output) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    const bool grouped_l1 = sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count);
+    const bool grouped_l1 = sfnn_is_grouped_l1_shape(l1_group_count);
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, l1_group_count, batch, max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
@@ -4622,6 +4638,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             l1_hidden,
             l2_size,
             num_stacks,
+            l1_group_count,
             batch,
             max_active,
             stm_indices->ptr,
@@ -5250,6 +5267,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -5287,9 +5305,9 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     BulletOuCudaCppF32Buffer* l3b_gradients) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    const bool grouped_l1 = sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count);
+    const bool grouped_l1 = sfnn_is_grouped_l1_shape(l1_group_count);
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, l1_group_count, batch, max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
@@ -5341,6 +5359,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l1_hidden,
             l2_size,
             num_stacks,
+            l1_group_count,
             batch,
             max_active,
             stm_indices->ptr,
@@ -5393,6 +5412,7 @@ int sfnn_backward_train_device_impl(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -5433,9 +5453,9 @@ int sfnn_backward_train_device_impl(
     size_t profile_ms_len) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    const bool grouped_l1 = sfnn_is_grouped_l1_shape(ft_size, l1_hidden, l2_size, num_stacks);
-    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
+    const size_t l1w_len = sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count);
+    const bool grouped_l1 = sfnn_is_grouped_l1_shape(l1_group_count);
+    if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, l1_group_count, batch, max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
@@ -5487,6 +5507,7 @@ int sfnn_backward_train_device_impl(
             l1_hidden,
             l2_size,
             num_stacks,
+            l1_group_count,
             batch,
             max_active,
             stm_indices->ptr,
@@ -5539,6 +5560,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -5582,6 +5604,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l1_hidden,
         l2_size,
         num_stacks,
+        l1_group_count,
         batch,
         max_active,
         stm_indices,
@@ -5629,6 +5652,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     size_t l1_hidden,
     size_t l2_size,
     size_t num_stacks,
+    size_t l1_group_count,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -5674,6 +5698,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         l1_hidden,
         l2_size,
         num_stacks,
+        l1_group_count,
         batch,
         max_active,
         stm_indices,

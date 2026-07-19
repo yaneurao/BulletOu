@@ -307,7 +307,7 @@ fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static>
 }
 
 fn tiny_sfnn_shape() -> SfnnForwardShape {
-    SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2 }
+    SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 }
 }
 
 fn tiny_sfnn_batch() -> SfnnForwardHostBatch<'static> {

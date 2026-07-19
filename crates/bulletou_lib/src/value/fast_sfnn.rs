@@ -22,15 +22,19 @@ pub struct SfnnForwardShape {
     pub l1_hidden: usize,
     pub l2_size: usize,
     pub num_stacks: usize,
+    pub l1_group_count: usize,
 }
 
-pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape =
-    SfnnForwardShape { input_size: HALFKA2_DIMENSIONS, ft_size: 1024, l1_hidden: 7, l2_size: 64, num_stacks: 9 };
+pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
+    input_size: HALFKA2_DIMENSIONS,
+    ft_size: 1024,
+    l1_hidden: 7,
+    l2_size: 64,
+    num_stacks: 9,
+    l1_group_count: 1,
+};
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
-const SFNN_G4_L1_GROUP_COUNT: usize = 4;
-const SFNN_G4_L1_GROUP_INPUT: usize = 1024;
-const SFNN_G4_L1_GROUP_OUTPUT: usize = 2;
 
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
@@ -45,16 +49,28 @@ impl SfnnForwardShape {
         self.ft_size / 2
     }
 
+    pub fn l1_group_count(self) -> usize {
+        self.l1_group_count
+    }
+
     pub fn has_grouped_l1(self) -> bool {
-        self.ft_size == 4096 && self.l1_hidden == 7 && self.l2_size == 64 && self.num_stacks == 9
+        self.l1_group_count > 1
+    }
+
+    pub fn l1_group_input(self) -> usize {
+        self.ft_size / self.l1_group_count
+    }
+
+    pub fn l1_group_output(self) -> usize {
+        self.l1_out() / self.l1_group_count
     }
 
     pub fn l1w_len(self) -> usize {
         if self.has_grouped_l1() {
             self.num_stacks
-                .saturating_mul(SFNN_G4_L1_GROUP_COUNT)
-                .saturating_mul(SFNN_G4_L1_GROUP_OUTPUT)
-                .saturating_mul(SFNN_G4_L1_GROUP_INPUT)
+                .saturating_mul(self.l1_group_count)
+                .saturating_mul(self.l1_group_output())
+                .saturating_mul(self.l1_group_input())
         } else {
             self.ft_size.saturating_mul(self.num_stacks).saturating_mul(self.l1_out())
         }
@@ -79,19 +95,21 @@ impl SfnnForwardShape {
         if self.num_stacks == 0 {
             return Err(FastSfnnError::Shape("num_stacks must be > 0".to_string()));
         }
+        if self.l1_group_count == 0 {
+            return Err(FastSfnnError::Shape("l1_group_count must be > 0".to_string()));
+        }
         if self.has_grouped_l1() {
-            if self.l1_out() != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT {
+            if self.ft_size % self.l1_group_count != 0 {
                 return Err(FastSfnnError::Shape(format!(
-                    "grouped g4 L1 requires l1_out={}, got {}",
-                    SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT,
-                    self.l1_out()
+                    "grouped L1 requires ft_size to be divisible by group count: ft_size={}, group_count={}",
+                    self.ft_size, self.l1_group_count
                 )));
             }
-            if self.ft_size != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT {
+            if self.l1_out() % self.l1_group_count != 0 {
                 return Err(FastSfnnError::Shape(format!(
-                    "grouped g4 L1 requires ft_size={}, got {}",
-                    SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT,
-                    self.ft_size
+                    "grouped L1 requires l1_out to be divisible by group count: l1_out={}, group_count={}",
+                    self.l1_out(),
+                    self.l1_group_count
                 )));
             }
         }
@@ -391,16 +409,19 @@ fn affine_sfnn_l1(
     let rows = shape.l1_out();
     let bias_base = stack * rows;
     out.copy_from_slice(&bias[bias_base..bias_base + rows]);
-    let stack_stride = SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+    let group_count = shape.l1_group_count();
+    let group_input = shape.l1_group_input();
+    let group_output = shape.l1_group_output();
+    let stack_stride = group_count * group_output * group_input;
     let stack_base = stack * stack_stride;
-    for group in 0..SFNN_G4_L1_GROUP_COUNT {
-        let input_base = group * SFNN_G4_L1_GROUP_INPUT;
-        let group_weight_base = stack_base + group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
-        for local_out in 0..SFNN_G4_L1_GROUP_OUTPUT {
-            let out_col = group * SFNN_G4_L1_GROUP_OUTPUT + local_out;
-            let weight_base = group_weight_base + local_out * SFNN_G4_L1_GROUP_INPUT;
+    for group in 0..group_count {
+        let input_base = group * group_input;
+        let group_weight_base = stack_base + group * group_output * group_input;
+        for local_out in 0..group_output {
+            let out_col = group * group_output + local_out;
+            let weight_base = group_weight_base + local_out * group_input;
             let mut sum = out[out_col];
-            for local_in in 0..SFNN_G4_L1_GROUP_INPUT {
+            for local_in in 0..group_input {
                 let x = input[input_base + local_in];
                 if x != 0.0 {
                     sum += weights[weight_base + local_in] * x;
@@ -525,7 +546,8 @@ mod tests {
 
     #[test]
     fn workspace_layout_counts_forward_activations() {
-        let shape = SfnnForwardShape { input_size: 4, ft_size: 6, l1_hidden: 2, l2_size: 3, num_stacks: 2 };
+        let shape =
+            SfnnForwardShape { input_size: 4, ft_size: 6, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
         assert_eq!(layout.l0_len(), 30);
@@ -640,7 +662,8 @@ mod tests {
 
     #[test]
     fn shape_validation_requires_even_ft_size() {
-        let shape = SfnnForwardShape { input_size: 4, ft_size: 3, l1_hidden: 2, l2_size: 2, num_stacks: 2 };
+        let shape =
+            SfnnForwardShape { input_size: 4, ft_size: 3, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 };
 
         let err = shape.validate().unwrap_err();
 
@@ -648,7 +671,7 @@ mod tests {
     }
 
     fn tiny_shape() -> SfnnForwardShape {
-        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2 }
+        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 }
     }
 
     fn tiny_batch() -> FastBatchHost {
