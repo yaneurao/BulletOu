@@ -28,6 +28,9 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape =
     SfnnForwardShape { input_size: HALFKA2_DIMENSIONS, ft_size: 1024, l1_hidden: 7, l2_size: 64, num_stacks: 9 };
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
+const SFNN_G4_L1_GROUP_COUNT: usize = 4;
+const SFNN_G4_L1_GROUP_INPUT: usize = 1024;
+const SFNN_G4_L1_GROUP_OUTPUT: usize = 2;
 
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
@@ -40,6 +43,21 @@ impl SfnnForwardShape {
 
     pub fn pairwise_size(self) -> usize {
         self.ft_size / 2
+    }
+
+    pub fn has_grouped_l1(self) -> bool {
+        self.ft_size == 4096 && self.l1_hidden == 7 && self.l2_size == 64 && self.num_stacks == 9
+    }
+
+    pub fn l1w_len(self) -> usize {
+        if self.has_grouped_l1() {
+            self.num_stacks
+                .saturating_mul(SFNN_G4_L1_GROUP_COUNT)
+                .saturating_mul(SFNN_G4_L1_GROUP_OUTPUT)
+                .saturating_mul(SFNN_G4_L1_GROUP_INPUT)
+        } else {
+            self.ft_size.saturating_mul(self.num_stacks).saturating_mul(self.l1_out())
+        }
     }
 
     pub fn validate(self) -> Result<(), FastSfnnError> {
@@ -60,6 +78,22 @@ impl SfnnForwardShape {
         }
         if self.num_stacks == 0 {
             return Err(FastSfnnError::Shape("num_stacks must be > 0".to_string()));
+        }
+        if self.has_grouped_l1() {
+            if self.l1_out() != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT {
+                return Err(FastSfnnError::Shape(format!(
+                    "grouped g4 L1 requires l1_out={}, got {}",
+                    SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT,
+                    self.l1_out()
+                )));
+            }
+            if self.ft_size != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT {
+                return Err(FastSfnnError::Shape(format!(
+                    "grouped g4 L1 requires ft_size={}, got {}",
+                    SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT,
+                    self.ft_size
+                )));
+            }
         }
         Ok(())
     }
@@ -251,7 +285,7 @@ impl<'a> SfnnForwardWeights<'a> {
         shape.validate()?;
         expect_len("l0w", shape.input_size * shape.ft_size, self.l0w.len())?;
         expect_len("l0b", shape.ft_size, self.l0b.len())?;
-        expect_len("l1w", shape.ft_size * shape.num_stacks * shape.l1_out(), self.l1w.len())?;
+        expect_len("l1w", shape.l1w_len(), self.l1w.len())?;
         expect_len("l1b", shape.num_stacks * shape.l1_out(), self.l1b.len())?;
         expect_len("l2w", shape.l2_in() * shape.num_stacks * shape.l2_size, self.l2w.len())?;
         expect_len("l2b", shape.num_stacks * shape.l2_size, self.l2b.len())?;
@@ -324,7 +358,7 @@ impl<'a> SfnnForwardWeights<'a> {
 
             let combined = &trace.combined[combined_start..combined_end];
             let l1 = &mut trace.l1[l1_start..l1_end];
-            affine_stacked(self.l1w, self.l1b, combined, shape.l1_out(), shape.num_stacks, stack, l1);
+            affine_sfnn_l1(self.l1w, self.l1b, combined, shape, stack, l1);
 
             let l1_skip = l1[shape.l1_hidden];
             fill_l2_input(l1, shape.l1_hidden, &mut trace.l2_input[l2_input_start..l2_input_end]);
@@ -338,6 +372,42 @@ impl<'a> SfnnForwardWeights<'a> {
         }
 
         Ok(trace)
+    }
+}
+
+fn affine_sfnn_l1(
+    weights: &[f32],
+    bias: &[f32],
+    input: &[f32],
+    shape: SfnnForwardShape,
+    stack: usize,
+    out: &mut [f32],
+) {
+    if !shape.has_grouped_l1() {
+        affine_stacked(weights, bias, input, shape.l1_out(), shape.num_stacks, stack, out);
+        return;
+    }
+
+    let rows = shape.l1_out();
+    let bias_base = stack * rows;
+    out.copy_from_slice(&bias[bias_base..bias_base + rows]);
+    let stack_stride = SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+    let stack_base = stack * stack_stride;
+    for group in 0..SFNN_G4_L1_GROUP_COUNT {
+        let input_base = group * SFNN_G4_L1_GROUP_INPUT;
+        let group_weight_base = stack_base + group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+        for local_out in 0..SFNN_G4_L1_GROUP_OUTPUT {
+            let out_col = group * SFNN_G4_L1_GROUP_OUTPUT + local_out;
+            let weight_base = group_weight_base + local_out * SFNN_G4_L1_GROUP_INPUT;
+            let mut sum = out[out_col];
+            for local_in in 0..SFNN_G4_L1_GROUP_INPUT {
+                let x = input[input_base + local_in];
+                if x != 0.0 {
+                    sum += weights[weight_base + local_in] * x;
+                }
+            }
+            out[out_col] = sum;
+        }
     }
 }
 
@@ -475,7 +545,7 @@ mod tests {
 
         let outputs = weights.forward_batch(&batch).unwrap();
 
-        assert_close_slice("outputs", &outputs, &[0.35577899, 0.20324218]);
+        assert_close_slice("outputs", &outputs, &[0.06307903, 0.04701126]);
     }
 
     #[test]
@@ -492,16 +562,16 @@ mod tests {
         assert_close_slice(
             "combined",
             &trace.combined,
-            &[0.09921875, 0.17859375, 0.0, 0.24804688, 0.079375, 0.0, 0.029765625, 0.1984375],
+            &[0.05953125, 0.29765625, 0.049609375, 0.0, 0.0, 0.1190625, 0.1190625, 0.049609375],
         );
-        assert_close_slice("l1", &trace.l1, &[0.09921875, 0.17859375, 0.24804688, 0.029765625, 0.1984375, 0.079375]);
+        assert_close_slice("l1", &trace.l1, &[0.05953125, 0.29765625, 0.0, 0.049609375, 0.0, 0.1190625]);
         assert_close_slice(
             "l2_input",
             &trace.l2_input,
-            &[0.009767451, 0.031646542, 0.09921875, 0.17859375, 0.00087907, 0.039069805, 0.029765625, 0.1984375],
+            &[0.0035162825, 0.08790706, 0.05953125, 0.29765625, 0.0024418628, 0.0, 0.049609375, 0.0],
         );
-        assert_close_slice("l2", &trace.l2, &[0.1089862, 0.21024029, 0.029765625, 0.1984375]);
-        assert_close_slice("outputs", &trace.outputs, &[0.35577899, 0.20324218]);
+        assert_close_slice("l2", &trace.l2, &[0.0035162825, 0.08790706, 0.05205124, 0.0]);
+        assert_close_slice("outputs", &trace.outputs, &[0.06307903, 0.04701126]);
     }
 
     #[test]

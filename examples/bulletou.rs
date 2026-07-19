@@ -230,6 +230,7 @@ impl LayerStackMode {
 /// - `NNUE_halfkp_256x2_32_32`
 /// - `NNUE_ka2_256x2_64_64`
 /// - `SFNN_halfka2_1024_7_64_k3k3`
+/// - `SFNN_halfka2_4096_7_64_g4_k3k3`
 /// - `SFNN_halfkahm2_1536_15_32_king3_by_king3`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NnueArch {
@@ -239,6 +240,7 @@ struct NnueArch {
     l2: usize,
     l3: usize,
     layerstack: Option<LayerStackMode>,
+    sfnn_l1_group_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,12 +271,25 @@ impl NnueArch {
         l3: usize,
         layerstack: Option<LayerStackMode>,
     ) -> Self {
-        Self { family, feature, l1, l2, l3, layerstack }
+        Self { family, feature, l1, l2, l3, layerstack, sfnn_l1_group_count: None }
     }
 
     /// `(l1, l2, l3)` triple.
     fn dims(self) -> (usize, usize, usize) {
         (self.l1, self.l2, self.l3)
+    }
+
+    fn with_sfnn_l1_group_count(mut self, group_count: Option<usize>) -> Self {
+        self.sfnn_l1_group_count = group_count;
+        self
+    }
+
+    fn sfnn_l1_group_count(self) -> usize {
+        self.sfnn_l1_group_count.unwrap_or(1)
+    }
+
+    fn has_grouped_sfnn_l1(self) -> bool {
+        self.sfnn_l1_group_count().saturating_sub(1) > 0
     }
 
     /// The arch's canonical CLI value.
@@ -294,14 +309,25 @@ impl NnueArch {
             }
             NnueArchFamily::Sfnn => {
                 let layerstack = self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
-                format!(
-                    "SFNN_{}_{}_{}_{}_{}",
-                    self.feature.arch_suffix(),
-                    self.l1,
-                    self.l2,
-                    self.l3,
-                    layerstack.arch_suffix()
-                )
+                match self.sfnn_l1_group_count {
+                    Some(group_count) => format!(
+                        "SFNN_{}_{}_{}_{}_g{}_{}",
+                        self.feature.arch_suffix(),
+                        self.l1,
+                        self.l2,
+                        self.l3,
+                        group_count,
+                        layerstack.arch_suffix()
+                    ),
+                    None => format!(
+                        "SFNN_{}_{}_{}_{}_{}",
+                        self.feature.arch_suffix(),
+                        self.l1,
+                        self.l2,
+                        self.l3,
+                        layerstack.arch_suffix()
+                    ),
+                }
             }
         }
     }
@@ -382,6 +408,30 @@ impl NnueArch {
             return Err(format!(
                 "invalid arch `{original}`: L1 (= {}) must be a multiple of 32 (FT SIMD-padding requirement)",
                 self.l1
+            ));
+        }
+        if let Some(group_count) = self.sfnn_l1_group_count {
+            if self.family != NnueArchFamily::Sfnn {
+                return Err(format!("invalid arch `{original}`: grouped L1 is only valid for SFNN"));
+            }
+            if group_count != 4 {
+                return Err(format!("invalid arch `{original}`: only g4 grouped SFNN L1 is currently supported"));
+            }
+            if self.l1 != 4096 || self.l2 != 7 || self.l3 != 64 {
+                return Err(format!("invalid arch `{original}`: g4 currently requires SFNN FT=4096, H1=7, H2=64"));
+            }
+            if self.layerstack != Some(LayerStackMode::Kingrank3by3) {
+                return Err(format!("invalid arch `{original}`: g4 currently requires k3k3 LayerStack"));
+            }
+            let l1_out = self.l2 + 1;
+            if self.l1 % group_count != 0 || l1_out % group_count != 0 {
+                return Err(format!(
+                    "invalid arch `{original}`: grouped SFNN L1 requires FT and H1+1 to be divisible by group count"
+                ));
+            }
+        } else if self.family == NnueArchFamily::Sfnn && self.l1 == 4096 && self.l2 == 7 && self.l3 == 64 {
+            return Err(format!(
+                "invalid arch `{original}`: SFNN 4096_7_64 is the experimental grouped-L1 layout; use `_g4_k3k3`"
             ));
         }
         Ok(self)
@@ -559,7 +609,7 @@ impl std::str::FromStr for NnueArch {
             }
             NnueArchFamily::Sfnn => {
                 if tokens.len() < 6 {
-                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>_k3k3`"));
+                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_g4]_k3k3`"));
                 }
                 let l1: usize = tokens[2]
                     .parse()
@@ -570,7 +620,22 @@ impl std::str::FromStr for NnueArch {
                 let l3: usize = tokens[4]
                     .parse()
                     .map_err(|_| format!("invalid arch `{s}`: H2 `{}` is not a positive integer", tokens[4]))?;
-                let layerstack = match tokens[5..].join("_").to_ascii_lowercase().as_str() {
+                let mut layerstack_start = 5usize;
+                let mut sfnn_l1_group_count = None;
+                if let Some(group_raw) = tokens[5].strip_prefix('g').or_else(|| tokens[5].strip_prefix('G')) {
+                    if group_raw.is_empty() {
+                        return Err(format!("invalid arch `{s}`: SFNN group token `{}` must look like g4", tokens[5]));
+                    }
+                    let group_count = group_raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid arch `{s}`: SFNN group count `{group_raw}` is not an integer"))?;
+                    sfnn_l1_group_count = Some(group_count);
+                    layerstack_start = 6;
+                }
+                if tokens.len() <= layerstack_start {
+                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_g4]_k3k3`"));
+                }
+                let layerstack = match tokens[layerstack_start..].join("_").to_ascii_lowercase().as_str() {
                     "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
                     "ls9" => {
                         return Err(format!(
@@ -583,7 +648,9 @@ impl std::str::FromStr for NnueArch {
                         ));
                     }
                 };
-                NnueArch::new(family, feature, l1, l2, l3, Some(layerstack)).validate_dims(s)
+                NnueArch::new(family, feature, l1, l2, l3, Some(layerstack))
+                    .with_sfnn_l1_group_count(sfnn_l1_group_count)
+                    .validate_dims(s)
             }
         }
     }
@@ -2081,6 +2148,11 @@ impl Args {
                 expected.cli_name(),
                 eval_type.cli_name()
             ));
+        }
+        if arch.has_grouped_sfnn_l1() && self.sfnn_factorized_l1 {
+            return Err(
+                "--sfnn-factorized-l1 is not supported with grouped SFNN L1 architectures such as g4".to_string()
+            );
         }
 
         Ok(())
@@ -5208,6 +5280,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     eprintln!("  l1 factorized shared term = {}", if initial_weights.l1fw.is_some() { "enabled" } else { "disabled" });
+    if args.arch().has_grouped_sfnn_l1() {
+        eprintln!(
+            "  l1 grouped = g{} ({} inputs -> {} outputs per group; compact state)",
+            args.arch().sfnn_l1_group_count(),
+            SFNN_G4_L1_GROUP_INPUT,
+            SFNN_G4_L1_GROUP_OUTPUT
+        );
+    }
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
@@ -6717,7 +6797,7 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     l1fb: Option<&[f32]>,
 ) -> Result<(), String> {
     let l1_out = shape.l1_out();
-    let expected_l1w = shape.num_stacks * l1_out * shape.ft_size;
+    let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
     let expected_l1b = shape.num_stacks * l1_out;
     if l1w.len() != expected_l1w {
         return Err(format!("SFNN l1w length mismatch: got {}, expected {expected_l1w}", l1w.len()));
@@ -6727,6 +6807,9 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     }
     match (l1fw, l1fb) {
         (Some(shared_w), Some(shared_b)) => {
+            if cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+                return Err("SFNN grouped L1 does not support factorized shared L1 weights".to_string());
+            }
             let expected_l1fw = shape.ft_size * l1_out;
             if shared_w.len() != expected_l1fw {
                 return Err(format!("SFNN l1fw length mismatch: got {}, expected {expected_l1fw}", shared_w.len()));
@@ -7099,6 +7182,85 @@ fn build_sfnn_initial_state_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+const SFNN_G4_L1_GROUP_COUNT: usize = 4;
+#[cfg(feature = "cuda-cpp-backend")]
+const SFNN_G4_L1_GROUP_INPUT: usize = 1024;
+#[cfg(feature = "cuda-cpp-backend")]
+const SFNN_G4_L1_GROUP_OUTPUT: usize = 2;
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_is_grouped_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
+    shape.ft_size == 4096 && shape.l1_hidden == 7 && shape.l2_size == 64 && shape.num_stacks == 9
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_l1w_len_for_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
+    if cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+        return shape
+            .num_stacks
+            .checked_mul(SFNN_G4_L1_GROUP_COUNT)
+            .and_then(|value| value.checked_mul(SFNN_G4_L1_GROUP_OUTPUT))
+            .and_then(|value| value.checked_mul(SFNN_G4_L1_GROUP_INPUT))
+            .ok_or_else(|| "SFNN grouped l1w length overflow".to_string());
+    }
+    shape
+        .num_stacks
+        .checked_mul(shape.l1_out())
+        .and_then(|value| value.checked_mul(shape.ft_size))
+        .ok_or_else(|| "SFNN l1w length overflow".to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_dense_l1w_len_for_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
+    shape
+        .num_stacks
+        .checked_mul(shape.l1_out())
+        .and_then(|value| value.checked_mul(shape.ft_size))
+        .ok_or_else(|| "SFNN dense l1w length overflow".to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    compact: &[f32],
+) -> Result<Vec<f32>, String> {
+    if !cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+        return Ok(compact.to_vec());
+    }
+    if shape.l1_out() != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT {
+        return Err(format!(
+            "SFNN g4 l1_out mismatch: got {}, expected {}",
+            shape.l1_out(),
+            SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT
+        ));
+    }
+    let expected_compact = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
+    if compact.len() != expected_compact {
+        return Err(format!("SFNN grouped l1w length mismatch: got {}, expected {expected_compact}", compact.len()));
+    }
+    let dense_len = cuda_cpp_sfnn_dense_l1w_len_for_shape(shape)?;
+    let mut dense = vec![0.0_f32; dense_len];
+    let compact_stack_stride = SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT;
+    let dense_stack_stride = shape.l1_out() * shape.ft_size;
+    for stack in 0..shape.num_stacks {
+        let compact_stack_base = stack * compact_stack_stride;
+        let dense_stack_base = stack * dense_stack_stride;
+        for group in 0..SFNN_G4_L1_GROUP_COUNT {
+            for local_out in 0..SFNN_G4_L1_GROUP_OUTPUT {
+                let out_col = group * SFNN_G4_L1_GROUP_OUTPUT + local_out;
+                let compact_base = compact_stack_base
+                    + group * SFNN_G4_L1_GROUP_OUTPUT * SFNN_G4_L1_GROUP_INPUT
+                    + local_out * SFNN_G4_L1_GROUP_INPUT;
+                let dense_base = dense_stack_base + out_col * shape.ft_size + group * SFNN_G4_L1_GROUP_INPUT;
+                dense[dense_base..dense_base + SFNN_G4_L1_GROUP_INPUT]
+                    .copy_from_slice(&compact[compact_base..compact_base + SFNN_G4_L1_GROUP_INPUT]);
+            }
+        }
+    }
+    Ok(dense)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn build_sfnn_initial_weights_for_cuda_cpp(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -7112,6 +7274,14 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let shape = bulletou_cuda_cpp::SfnnForwardShape { input_size, ft_size, l1_hidden, l2_size, num_stacks };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
+    let grouped_l1 = args.arch().has_grouped_sfnn_l1();
+    if grouped_l1 != cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+        return Err(format!(
+            "SFNN grouped-L1 arch/shape mismatch for {}: arch_group_count={}, shape={shape:?}",
+            args.arch().cli_name(),
+            args.arch().sfnn_l1_group_count()
+        ));
+    }
 
     let mut l0w =
         cuda_cpp_tatara_uniform_fan_in_init(base_input_size * ft_size, 0x5f11_e001, base_input_size, init_scale);
@@ -7120,16 +7290,30 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     }
     let l0b = cuda_cpp_tatara_uniform_fan_in_init(ft_size, 0x5f11_e002, base_input_size, init_scale);
 
-    let l1_bound = init_scale * (1.0 / ft_size.max(1) as f32).sqrt();
+    let l1_fan_in = if grouped_l1 { SFNN_G4_L1_GROUP_INPUT } else { ft_size };
+    let l1_bound = init_scale * (1.0 / l1_fan_in.max(1) as f32).sqrt();
     let l2_bound = init_scale * (1.0 / l2_in.max(1) as f32).sqrt();
     let l3_bound = init_scale * (1.0 / l2_size.max(1) as f32).sqrt();
-    let l1w = cuda_cpp_tatara_stacked_row_major_bucket0_init(ft_size, l1_out, num_stacks, 0x5f11_e003, l1_bound);
+    let l1w = if grouped_l1 {
+        cuda_cpp_tatara_stacked_row_major_bucket0_init(
+            SFNN_G4_L1_GROUP_INPUT,
+            l1_out,
+            num_stacks,
+            0x5f11_e003,
+            l1_bound,
+        )
+    } else {
+        cuda_cpp_tatara_stacked_row_major_bucket0_init(ft_size, l1_out, num_stacks, 0x5f11_e003, l1_bound)
+    };
     let l1b = cuda_cpp_tatara_stacked_bias_bucket0_init(l1_out, num_stacks, 0x5f11_e004, l1_bound);
     let l2w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_in, l2_size, num_stacks, 0x5f11_e005, l2_bound);
     let l2b = cuda_cpp_tatara_stacked_bias_bucket0_init(l2_size, num_stacks, 0x5f11_e006, l2_bound);
     let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
     let (l1fw, l1fb) = if args.sfnn_factorized_l1 {
+        if grouped_l1 {
+            return Err("--sfnn-factorized-l1 is not supported with grouped SFNN L1 architectures".to_string());
+        }
         (Some(vec![0.0; ft_size * l1_out]), Some(vec![0.0; l1_out]))
     } else {
         (None, None)
@@ -7837,6 +8021,16 @@ fn write_cuda_cpp_sfnn_nn_bin(
     if l1fw.is_some() != l1fb.is_some() {
         return Err("cuda-cpp SFNN weights have partial l1f state".to_string());
     }
+    let dense_l1w_for_export;
+    let l1w_for_export: &[f32] = if cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+        if l1fw.is_some() {
+            return Err("SFNN grouped L1 cannot be exported with factorized shared L1 weights".to_string());
+        }
+        dense_l1w_for_export = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &weights.l1w)?;
+        &dense_l1w_for_export
+    } else {
+        &weights.l1w
+    };
 
     for stack in 0..shape.num_stacks {
         writer
@@ -7858,7 +8052,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         for out_col in 0..l1_out {
             for in_col in 0..l1_pad_in {
                 let q = if in_col < shape.ft_size {
-                    let mut value = weights.l1w[stack * l1_out * shape.ft_size + out_col * shape.ft_size + in_col];
+                    let mut value = l1w_for_export[stack * l1_out * shape.ft_size + out_col * shape.ft_size + in_col];
                     if let Some(shared_weights) = l1fw {
                         value += shared_weights[in_col * l1_out + out_col];
                     }
@@ -9991,6 +10185,10 @@ mod tests {
             NnueArch::from_str("sfnn_HALFKA2_1024_7_64_K3K3").unwrap().cli_name(),
             "SFNN_halfka2_1024_7_64_k3k3"
         );
+        let g4 = NnueArch::from_str("SFNN_halfka2_4096_7_64_g4_k3k3").unwrap();
+        assert_eq!(g4.dims(), (4096, 7, 64));
+        assert_eq!(g4.sfnn_l1_group_count(), 4);
+        assert_eq!(g4.cli_name(), "SFNN_halfka2_4096_7_64_g4_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10007,6 +10205,7 @@ mod tests {
             "NNUE_ka2_256x2_64_64",
             "NNUE_shardkp_c256_s128x64_f6_16_16",
             "SFNN_halfka2_1024_7_64_k3k3",
+            "SFNN_halfka2_4096_7_64_g4_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -10026,6 +10225,8 @@ mod tests {
         assert!(NnueArch::from_str("NNUE_shardkp_8448x2_16_16").is_err());
         assert!(NnueArch::from_str("NNUE_shardkp_c256_s128x63_f6_16_16").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_ls9").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g3_k3k3").is_err());
     }
 
     #[test]
@@ -11837,6 +12038,55 @@ mod tests {
         let stack_stride = l1_out * weights.shape.ft_size;
         assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
         assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_g4_initial_weights_use_compact_l1_shape() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_4096_7_64_g4_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let weights = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Halfka2).unwrap();
+        assert_eq!(weights.shape.ft_size, 4096);
+        assert_eq!(weights.shape.l1_out(), 8);
+        assert_eq!(weights.l1w.len(), 9 * 4 * 2 * 1024);
+        assert_eq!(weights.l1w.len(), cuda_cpp_sfnn_l1w_len_for_shape(weights.shape).unwrap());
+        assert!(weights.l1w.len() < weights.shape.num_stacks * weights.shape.l1_out() * weights.shape.ft_size);
+        assert!(weights.l1w.iter().any(|&v| v != 0.0));
+        weights.validate().unwrap();
+
+        let err = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_4096_7_64_g4_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorized-l1",
+        ])
+        .unwrap()
+        .validate_arch_flags()
+        .unwrap_err();
+        assert!(err.contains("factorized"));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

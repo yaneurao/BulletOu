@@ -826,6 +826,10 @@ pub struct SfnnForwardShape {
     pub num_stacks: usize,
 }
 
+const SFNN_G4_L1_GROUP_COUNT: usize = 4;
+const SFNN_G4_L1_GROUP_INPUT: usize = 1024;
+const SFNN_G4_L1_GROUP_OUTPUT: usize = 2;
+
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
         self.l1_hidden + 1
@@ -837,6 +841,32 @@ impl SfnnForwardShape {
 
     pub fn pairwise_size(self) -> usize {
         self.ft_size / 2
+    }
+
+    pub fn has_grouped_l1(self) -> bool {
+        self.ft_size == 4096 && self.l1_hidden == 7 && self.l2_size == 64 && self.num_stacks == 9
+    }
+
+    pub fn l1w_len(self) -> Result<usize> {
+        if self.has_grouped_l1() {
+            checked_product(
+                "sfnn grouped l1w",
+                &[self.num_stacks, SFNN_G4_L1_GROUP_COUNT, SFNN_G4_L1_GROUP_OUTPUT, SFNN_G4_L1_GROUP_INPUT],
+            )
+        } else {
+            checked_product("sfnn l1w", &[self.num_stacks, self.l1_out(), self.ft_size])
+        }
+    }
+
+    pub fn l1w_len_saturating(self) -> usize {
+        if self.has_grouped_l1() {
+            self.num_stacks
+                .saturating_mul(SFNN_G4_L1_GROUP_COUNT)
+                .saturating_mul(SFNN_G4_L1_GROUP_OUTPUT)
+                .saturating_mul(SFNN_G4_L1_GROUP_INPUT)
+        } else {
+            self.num_stacks.saturating_mul(self.l1_out()).saturating_mul(self.ft_size)
+        }
     }
 }
 
@@ -888,14 +918,13 @@ impl SfnnForwardHostWeights<'_> {
         validate_sfnn_shape(shape)?;
         expect_len("sfnn l0w", checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, self.l0w.len())?;
         expect_len("sfnn l0b", shape.ft_size, self.l0b.len())?;
-        expect_len(
-            "sfnn l1w",
-            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
-            self.l1w.len(),
-        )?;
+        expect_len("sfnn l1w", shape.l1w_len()?, self.l1w.len())?;
         expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
         match (self.l1fw, self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
+                if shape.has_grouped_l1() {
+                    return Err(CudaCppError::message("SFNN grouped L1 does not support factorized L1 weights"));
+                }
                 expect_len("sfnn l1fw", checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, l1fw.len())?;
                 expect_len("sfnn l1fb", shape.l1_out(), l1fb.len())?;
             }
@@ -988,11 +1017,7 @@ impl SfnnForwardDeviceWeights {
             self.l0w.len(),
         )?;
         expect_len("device sfnn l0b", shape.ft_size, self.l0b.len())?;
-        expect_len(
-            "device sfnn l1w",
-            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
-            self.l1w.len(),
-        )?;
+        expect_len("device sfnn l1w", shape.l1w_len()?, self.l1w.len())?;
         expect_len(
             "device sfnn l1b",
             checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?,
@@ -1000,6 +1025,9 @@ impl SfnnForwardDeviceWeights {
         )?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
+                if shape.has_grouped_l1() {
+                    return Err(CudaCppError::message("device SFNN grouped L1 does not support factorized L1 weights"));
+                }
                 expect_len(
                     "device sfnn l1fw",
                     checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
@@ -1817,7 +1845,7 @@ impl SfnnBackwardWorkspaceLayout {
     }
 
     pub fn l1w_gradients_len(self) -> usize {
-        self.shape.num_stacks.saturating_mul(self.shape.l1_out()).saturating_mul(self.shape.ft_size)
+        self.shape.l1w_len_saturating()
     }
 
     pub fn l1b_gradients_len(self) -> usize {
@@ -3175,16 +3203,23 @@ impl SfnnRangerOptimizerStates {
     ) -> Result<Self> {
         validate_sfnn_shape(shape)?;
         let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?;
-        let l1w_len = checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?;
+        let l1w_len = shape.l1w_len()?;
         let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
         let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
         let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
             (Some(l1fw), Some(l1fb)) => (
-                Some(RangerParamState::from_host_state(
-                    ctx,
-                    checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
-                    l1fw,
-                )?),
+                {
+                    if shape.has_grouped_l1() {
+                        return Err(CudaCppError::message(
+                            "SFNN grouped L1 does not support factorized optimizer state",
+                        ));
+                    }
+                    Some(RangerParamState::from_host_state(
+                        ctx,
+                        checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
+                        l1fw,
+                    )?)
+                },
                 Some(RangerParamState::from_host_state(ctx, shape.l1_out(), l1fb)?),
             ),
             (None, None) => (None, None),
@@ -3223,13 +3258,13 @@ impl SfnnRangerOptimizerStates {
     fn validate(&self, shape: SfnnForwardShape) -> Result<()> {
         self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, "optimizer sfnn l0w")?;
         self.l0b.validate(shape.ft_size, "optimizer sfnn l0b")?;
-        self.l1w.validate(
-            checked_product("sfnn l1w", &[shape.num_stacks, shape.l1_out(), shape.ft_size])?,
-            "optimizer sfnn l1w",
-        )?;
+        self.l1w.validate(shape.l1w_len()?, "optimizer sfnn l1w")?;
         self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
+                if shape.has_grouped_l1() {
+                    return Err(CudaCppError::message("SFNN grouped L1 does not support factorized optimizer state"));
+                }
                 l1fw.validate(checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, "optimizer sfnn l1fw")?;
                 l1fb.validate(shape.l1_out(), "optimizer sfnn l1fb")?;
             }
@@ -4408,6 +4443,11 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         || shape.ft_size % 2 != 0
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
+    } else if shape.has_grouped_l1()
+        && (shape.ft_size != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_INPUT
+            || shape.l1_out() != SFNN_G4_L1_GROUP_COUNT * SFNN_G4_L1_GROUP_OUTPUT)
+    {
+        Err(CudaCppError::message(format!("SFNN grouped-L1 shape dimensions are invalid: {shape:?}")))
     } else {
         Ok(())
     }
@@ -5294,6 +5334,18 @@ mod tests {
         assert_eq!(layout.l2b_gradients_len(), 6);
         assert_eq!(layout.l3w_gradients_len(), 6);
         assert_eq!(layout.l3b_gradients_len(), 2);
+    }
+
+    #[test]
+    fn sfnn_g4_l1w_layout_is_compact() {
+        let shape = SfnnForwardShape { input_size: 133578, ft_size: 4096, l1_hidden: 7, l2_size: 64, num_stacks: 9 };
+        let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
+
+        assert!(shape.has_grouped_l1());
+        assert_eq!(shape.l1_out(), 8);
+        assert_eq!(shape.l1w_len().unwrap(), 9 * 4 * 2 * 1024);
+        assert_eq!(layout.l1w_gradients_len(), 9 * 4 * 2 * 1024);
+        assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
     }
 
     #[test]
