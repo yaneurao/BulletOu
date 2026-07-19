@@ -5478,17 +5478,56 @@ fn run_cuda_cpp_nnue_final_validation(
     }
 
     let validation_weights = cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights)?;
+    let validation_shape = bulletou_cuda_cpp::NnueForwardShape {
+        input_size: validation_weights.shape.input_size,
+        l1: validation_weights.shape.l1,
+        l2: validation_weights.shape.l2,
+        l3: validation_weights.shape.l3,
+    };
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::NnueForwardDeviceWeights::from_host(
+        &ctx,
+        bulletou_cuda_cpp::NnueForwardHostWeights {
+            shape: validation_shape,
+            l0w: &validation_weights.l0w,
+            l0b: &validation_weights.l0b,
+            l1w: &validation_weights.l1w,
+            l1b: &validation_weights.l1b,
+            l2w: &validation_weights.l2w,
+            l2b: &validation_weights.l2b,
+            outw: &validation_weights.outw,
+            outb: &validation_weights.outb,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let batch_size = args.test_batch_size.max(1);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
         let batch = build_nnue_validation_fast_batch(feature_kind, positions)?;
-        let mut chunk_outputs = validation_weights.forward_batch(&batch).map_err(|e| e.to_string())?;
+        let device_batch = bulletou_cuda_cpp::NnueForwardDeviceBatch::from_host(
+            &ctx,
+            bulletou_cuda_cpp::NnueForwardHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let workspace = bulletou_cuda_cpp::NnueForwardWorkspace::new(
+            &ctx,
+            bulletou_cuda_cpp::NnueForwardWorkspaceLayout::new(validation_shape, batch.layout.batch_size),
+        )
+        .map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::nnue_forward_device(&ctx, &device_batch, &device_weights, &workspace)
+            .map_err(|e| e.to_string())?;
+        let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
     let elapsed = started.elapsed().as_secs_f64();
     eprintln!(
-        "  cuda-cpp {} final validation forward = ok: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        "  cuda-cpp {} final validation forward = gpu: positions={}, batch_size={}, elapsed={elapsed:.3}s",
         feature_kind.source_label(),
         outputs.len(),
         batch_size
@@ -5516,17 +5555,60 @@ fn run_cuda_cpp_sfnn_final_validation(
     }
 
     let validation_weights = cuda_cpp_sfnn_weights_for_cpu_validation(feature_kind, shape, weights)?;
+    let validation_shape = bulletou_cuda_cpp::SfnnForwardShape {
+        input_size: validation_weights.shape.input_size,
+        ft_size: validation_weights.shape.ft_size,
+        l1_hidden: validation_weights.shape.l1_hidden,
+        l2_size: validation_weights.shape.l2_size,
+        num_stacks: validation_weights.shape.num_stacks,
+    };
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(
+        &ctx,
+        bulletou_cuda_cpp::SfnnForwardHostWeights {
+            shape: validation_shape,
+            l0w: &validation_weights.l0w,
+            l0b: &validation_weights.l0b,
+            l1w: &validation_weights.l1w,
+            l1b: &validation_weights.l1b,
+            l1fw: None,
+            l1fb: None,
+            l2w: &validation_weights.l2w,
+            l2b: &validation_weights.l2b,
+            l3w: &validation_weights.l3w,
+            l3b: &validation_weights.l3b,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let batch_size = args.test_batch_size.max(1);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
         let batch = build_sfnn_validation_fast_batch(feature_kind, positions)?;
-        let mut chunk_outputs = validation_weights.forward_batch(&batch).map_err(|e| e.to_string())?;
+        let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                buckets: &batch.buckets,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(validation_shape, batch.layout.batch_size),
+        )
+        .map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace)
+            .map_err(|e| e.to_string())?;
+        let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
     let elapsed = started.elapsed().as_secs_f64();
     eprintln!(
-        "  cuda-cpp {} final validation forward = ok: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        "  cuda-cpp {} final validation forward = gpu: positions={}, batch_size={}, elapsed={elapsed:.3}s",
         feature_kind.source_label(),
         outputs.len(),
         batch_size
