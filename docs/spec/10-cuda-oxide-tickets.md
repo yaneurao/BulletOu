@@ -896,6 +896,8 @@ the tickets in order and commit each completed slice.
   - adding pinned staged host buffers to `SfnnTrainStepUploadSlot` did not improve the bs131k/128-step speed materially and corrupted the yamaoka check (`test_value_accuracy=0.6073761`, `test_value_loss=0.05824073`), while the serial upload control stayed healthy, so the pinned SFNN upload change was reverted.
 - Rejected SFNN scatter micro-optimisation:
   - moving input-value loads behind `grad != 0.0f` checks in the stacked L1/L2/L3 weight-gradient scatter kernels passed the tiny GPU backward/train smokes, but regressed the bs131k/6-step WRM profile (`backward=69.416ms` vs `65.129ms` baseline), so it was reverted.
+- Rechecked the SFNN pairwise-L0 train fuse:
+  - temporarily switching the train entry back to the older non-fused pairwise + L0 sparse backward path worsened the bs131k/6-step WRM profile (`backward=74.532ms`), confirming the fused `sfnn_pairwise_l0_sparse_backward_kernel` remains the faster path.
 - BO-CUDA-034 is complete for the tracked tatara speed/quality target and Windows-native auto-resume. Follow-up optimisation and production-schedule ergonomics continue under BO-CUDA-033/035.
 
 ### BO-CUDA-035
