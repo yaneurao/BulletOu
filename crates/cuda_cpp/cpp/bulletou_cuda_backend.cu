@@ -16,6 +16,18 @@ struct BulletOuCudaCppContext {
     int device = 0;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
+    int* sfnn_inverse_counts = nullptr;
+    size_t sfnn_inverse_counts_len = 0;
+    int* sfnn_inverse_offsets = nullptr;
+    size_t sfnn_inverse_offsets_len = 0;
+    int* sfnn_inverse_block_sums = nullptr;
+    size_t sfnn_inverse_block_sums_len = 0;
+    int* sfnn_inverse_block_offsets = nullptr;
+    size_t sfnn_inverse_block_offsets_len = 0;
+    int* sfnn_inverse_write_counters = nullptr;
+    size_t sfnn_inverse_write_counters_len = 0;
+    int* sfnn_inverse_positions = nullptr;
+    size_t sfnn_inverse_positions_len = 0;
 };
 
 struct BulletOuCudaCppF32Buffer {
@@ -128,6 +140,39 @@ int checked_malloc(T** ptr, size_t len, const char* label) {
         return 0;
     }
     cudaError_t status = cudaMalloc(reinterpret_cast<void**>(ptr), len * sizeof(T));
+    if (status != cudaSuccess) {
+        return fail(label, status);
+    }
+    return 0;
+}
+
+int ensure_i32_scratch(int** ptr, size_t* capacity, size_t len, const char* label) {
+    if (len <= *capacity) {
+        return 0;
+    }
+    if (*ptr != nullptr) {
+        cudaError_t free_status = cudaFree(*ptr);
+        if (free_status != cudaSuccess) {
+            return fail(label, free_status);
+        }
+        *ptr = nullptr;
+        *capacity = 0;
+    }
+    if (checked_malloc(ptr, len, label) != 0) {
+        return -1;
+    }
+    *capacity = len;
+    return 0;
+}
+
+int free_i32_scratch(int*& ptr, size_t& capacity, const char* label) {
+    if (ptr == nullptr) {
+        capacity = 0;
+        return 0;
+    }
+    cudaError_t status = cudaFree(ptr);
+    ptr = nullptr;
+    capacity = 0;
     if (status != cudaSuccess) {
         return fail(label, status);
     }
@@ -1240,6 +1285,221 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     }
 }
 
+__global__ void sfnn_pairwise_l0_pregrad_kernel(
+    const float* stm_activations,
+    const float* nstm_activations,
+    const float* combined_gradients,
+    float* stm_pre_gradients,
+    float* nstm_pre_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t ft_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t pairwise = ft_size / 2;
+    size_t total = batch * pairwise;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t pair = tid % pairwise;
+    size_t sample = tid / pairwise;
+    size_t row0 = pair;
+    size_t row1 = pairwise + pair;
+    size_t l0_base = sample * ft_size;
+
+    float stm0 = stm_activations[l0_base + row0];
+    float stm1 = stm_activations[l0_base + row1];
+    float nstm0 = nstm_activations[l0_base + row0];
+    float nstm1 = nstm_activations[l0_base + row1];
+    float stm_pair_grad = combined_gradients[l0_base + pair] * SFNN_PAIRWISE_SCALE;
+    float nstm_pair_grad = combined_gradients[l0_base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
+    float stm_grad0 = crelu_pre_gradient_from_value(stm0, stm_pair_grad * stm1);
+    float stm_grad1 = crelu_pre_gradient_from_value(stm1, stm_pair_grad * stm0);
+    float nstm_grad0 = crelu_pre_gradient_from_value(nstm0, nstm_pair_grad * nstm1);
+    float nstm_grad1 = crelu_pre_gradient_from_value(nstm1, nstm_pair_grad * nstm0);
+
+    stm_pre_gradients[l0_base + row0] = stm_grad0;
+    stm_pre_gradients[l0_base + row1] = stm_grad1;
+    nstm_pre_gradients[l0_base + row0] = nstm_grad0;
+    nstm_pre_gradients[l0_base + row1] = nstm_grad1;
+
+    float bias_grad0 = stm_grad0 + nstm_grad0;
+    float bias_grad1 = stm_grad1 + nstm_grad1;
+    if (bias_grad0 != 0.0f) {
+        atomicAdd(&l0b_gradients[row0], bias_grad0);
+    }
+    if (bias_grad1 != 0.0f) {
+        atomicAdd(&l0b_gradients[row1], bias_grad1);
+    }
+}
+
+__global__ void sfnn_inverse_feature_counts_kernel(
+    const int* indices,
+    int* counts,
+    size_t total_entries,
+    size_t max_active,
+    size_t n_features) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_entries) {
+        return;
+    }
+    int feature = indices[tid];
+    if (feature >= 0 && static_cast<size_t>(feature) < n_features) {
+        atomicAdd(&counts[feature], 1);
+    }
+}
+
+__global__ void sfnn_inverse_prefix_sum_block_local_kernel(
+    const int* counts,
+    int* offsets,
+    int* block_sums,
+    size_t n_features) {
+    __shared__ int partials[1024];
+    size_t tid = threadIdx.x;
+    size_t idx = blockIdx.x * blockDim.x + tid;
+    int value = idx < n_features ? counts[idx] : 0;
+    partials[tid] = value;
+    __syncthreads();
+
+    for (size_t stride = 1; stride < blockDim.x; stride <<= 1) {
+        int add = tid >= stride ? partials[tid - stride] : 0;
+        __syncthreads();
+        partials[tid] += add;
+        __syncthreads();
+    }
+
+    if (idx < n_features) {
+        offsets[idx] = tid == 0 ? 0 : partials[tid - 1];
+    }
+    if (tid == blockDim.x - 1) {
+        block_sums[blockIdx.x] = partials[tid];
+    }
+}
+
+__global__ void sfnn_inverse_prefix_sum_small_kernel(
+    const int* block_sums,
+    int* block_offsets,
+    size_t num_blocks) {
+    __shared__ int partials[1024];
+    size_t tid = threadIdx.x;
+    int value = tid < num_blocks ? block_sums[tid] : 0;
+    partials[tid] = value;
+    __syncthreads();
+
+    for (size_t stride = 1; stride < blockDim.x; stride <<= 1) {
+        int add = tid >= stride ? partials[tid - stride] : 0;
+        __syncthreads();
+        partials[tid] += add;
+        __syncthreads();
+    }
+
+    if (tid < num_blocks) {
+        block_offsets[tid] = tid == 0 ? 0 : partials[tid - 1];
+    }
+    if (num_blocks > 0 && tid == num_blocks - 1) {
+        block_offsets[num_blocks] = partials[tid];
+    }
+}
+
+__global__ void sfnn_inverse_prefix_add_block_offsets_kernel(
+    int* offsets,
+    const int* block_offsets,
+    size_t n_features,
+    size_t num_blocks) {
+    size_t tid = threadIdx.x;
+    size_t idx = blockIdx.x * blockDim.x + tid;
+    if (idx < n_features) {
+        offsets[idx] += block_offsets[blockIdx.x];
+    }
+    if (blockIdx.x == 0 && tid == 0) {
+        offsets[n_features] = block_offsets[num_blocks];
+    }
+}
+
+__global__ void sfnn_inverse_scatter_positions_kernel(
+    const int* indices,
+    const int* offsets,
+    int* write_counters,
+    int* positions,
+    size_t total_entries,
+    size_t max_active,
+    size_t n_features) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_entries) {
+        return;
+    }
+    size_t sample = tid / max_active;
+    int feature = indices[tid];
+    if (feature >= 0 && static_cast<size_t>(feature) < n_features) {
+        int pos = atomicAdd(&write_counters[feature], 1);
+        positions[offsets[feature] + pos] = static_cast<int>(sample);
+    }
+}
+
+__global__ void sfnn_inverse_gather_l0w_gradients_kernel(
+    const float* pre_gradients,
+    const int* positions,
+    const int* offsets,
+    float* l0w_gradients,
+    size_t n_features,
+    size_t ft_size,
+    int add_to_existing) {
+    size_t feature = blockIdx.x;
+    size_t row = blockIdx.y * blockDim.x + threadIdx.x;
+    if (feature >= n_features || row >= ft_size) {
+        return;
+    }
+
+    size_t off_start = static_cast<size_t>(offsets[feature]);
+    size_t off_end = static_cast<size_t>(offsets[feature + 1]);
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    size_t i = off_start;
+    size_t unroll_end = off_end >= off_start + 3 ? off_end - 3 : off_start;
+    while (i < unroll_end) {
+        size_t sample0 = static_cast<size_t>(positions[i]);
+        size_t sample1 = static_cast<size_t>(positions[i + 1]);
+        size_t sample2 = static_cast<size_t>(positions[i + 2]);
+        size_t sample3 = static_cast<size_t>(positions[i + 3]);
+        sum0 += pre_gradients[sample0 * ft_size + row];
+        sum1 += pre_gradients[sample1 * ft_size + row];
+        sum2 += pre_gradients[sample2 * ft_size + row];
+        sum3 += pre_gradients[sample3 * ft_size + row];
+        i += 4;
+    }
+    while (i < off_end) {
+        size_t sample = static_cast<size_t>(positions[i]);
+        sum0 += pre_gradients[sample * ft_size + row];
+        ++i;
+    }
+    float sum = (sum0 + sum1) + (sum2 + sum3);
+    size_t weight_idx = feature * ft_size + row;
+    if (add_to_existing != 0) {
+        l0w_gradients[weight_idx] += sum;
+    } else {
+        l0w_gradients[weight_idx] = sum;
+    }
+}
+
+__global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
+    float* l0w_gradients,
+    size_t ft_size) {
+    size_t piece = blockIdx.x;
+    size_t row = blockIdx.y * blockDim.x + threadIdx.x;
+    if (piece >= SFNN_HALFKA2_PIECE_INPUTS || row >= ft_size) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (size_t feature = piece; feature < SFNN_HALFKA2_BASE_INPUT_SIZE; feature += SFNN_HALFKA2_PIECE_INPUTS) {
+        sum += l0w_gradients[feature * ft_size + row];
+    }
+    size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
+    l0w_gradients[virtual_feature * ft_size + row] = sum;
+}
+
 __device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value) {
     size_t weight_idx = feature * rows + row;
     atomicAdd(&gradients[weight_idx], value);
@@ -2211,11 +2471,15 @@ int launch_zero_sfnn_backward_parameter_gradients(
     float* l2w_gradients,
     float* l2b_gradients,
     float* l3w_gradients,
-    float* l3b_gradients) {
+    float* l3b_gradients,
+    int zero_l0w_gradients) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
-    if (launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0 ||
-        launch_fill_f32_raw(ctx, l0b_gradients, ft_size, 0.0f, "sfnn zero l0b_gradients") != 0 ||
+    if (zero_l0w_gradients != 0 &&
+        launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0) {
+        return -1;
+    }
+    if (launch_fill_f32_raw(ctx, l0b_gradients, ft_size, 0.0f, "sfnn zero l0b_gradients") != 0 ||
         launch_fill_f32_raw(ctx, l1w_gradients, num_stacks * l1_out * ft_size, 0.0f, "sfnn zero l1w_gradients") != 0 ||
         launch_fill_f32_raw(ctx, l1b_gradients, num_stacks * l1_out, 0.0f, "sfnn zero l1b_gradients") != 0 ||
         launch_fill_f32_raw(ctx, l1fw_gradients, ft_size * l1_out, 0.0f, "sfnn zero l1fw_gradients") != 0 ||
@@ -2226,6 +2490,239 @@ int launch_zero_sfnn_backward_parameter_gradients(
         launch_fill_f32_raw(ctx, l3b_gradients, num_stacks, 0.0f, "sfnn zero l3b_gradients") != 0) {
         return -1;
     }
+    return 0;
+}
+
+int memset_i32_async(BulletOuCudaCppContext* ctx, int* ptr, size_t len, int value, const char* label) {
+    if (len == 0) {
+        return 0;
+    }
+    if (value != 0) {
+        return fail_message("memset_i32_async currently supports only zero fills");
+    }
+    cudaError_t status = cudaMemsetAsync(ptr, 0, len * sizeof(int), ctx->stream);
+    if (status != cudaSuccess) {
+        return fail(label, status);
+    }
+    return 0;
+}
+
+int ensure_sfnn_inverse_index_scratch(
+    BulletOuCudaCppContext* ctx,
+    size_t n_features,
+    size_t total_entries,
+    size_t prefix_blocks) {
+    if (prefix_blocks == 0 || prefix_blocks > 1024) {
+        return fail_message("SFNN inverse-index prefix block count must be in 1..=1024");
+    }
+    if (ensure_i32_scratch(
+            &ctx->sfnn_inverse_counts,
+            &ctx->sfnn_inverse_counts_len,
+            n_features,
+            "cudaMalloc sfnn inverse counts") != 0 ||
+        ensure_i32_scratch(
+            &ctx->sfnn_inverse_offsets,
+            &ctx->sfnn_inverse_offsets_len,
+            n_features + 1,
+            "cudaMalloc sfnn inverse offsets") != 0 ||
+        ensure_i32_scratch(
+            &ctx->sfnn_inverse_block_sums,
+            &ctx->sfnn_inverse_block_sums_len,
+            prefix_blocks,
+            "cudaMalloc sfnn inverse block sums") != 0 ||
+        ensure_i32_scratch(
+            &ctx->sfnn_inverse_block_offsets,
+            &ctx->sfnn_inverse_block_offsets_len,
+            prefix_blocks + 1,
+            "cudaMalloc sfnn inverse block offsets") != 0 ||
+        ensure_i32_scratch(
+            &ctx->sfnn_inverse_write_counters,
+            &ctx->sfnn_inverse_write_counters_len,
+            n_features,
+            "cudaMalloc sfnn inverse write counters") != 0 ||
+        ensure_i32_scratch(
+            &ctx->sfnn_inverse_positions,
+            &ctx->sfnn_inverse_positions_len,
+            total_entries,
+            "cudaMalloc sfnn inverse positions") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_sfnn_inverse_index_for_perspective(
+    BulletOuCudaCppContext* ctx,
+    const int* indices,
+    const float* pre_gradients,
+    float* l0w_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t n_features,
+    size_t ft_size,
+    int add_to_existing) {
+    constexpr int count_threads = 256;
+    constexpr int scan_threads = 1024;
+    constexpr int gather_threads = 128;
+    const size_t total_entries = batch * max_active;
+    const size_t prefix_blocks = (n_features + scan_threads - 1) / scan_threads;
+    if (ensure_sfnn_inverse_index_scratch(ctx, n_features, total_entries, prefix_blocks) != 0) {
+        return -1;
+    }
+
+    if (memset_i32_async(ctx, ctx->sfnn_inverse_counts, n_features, 0, "cudaMemsetAsync sfnn inverse counts") != 0 ||
+        memset_i32_async(
+            ctx,
+            ctx->sfnn_inverse_write_counters,
+            n_features,
+            0,
+            "cudaMemsetAsync sfnn inverse write counters") != 0) {
+        return -1;
+    }
+
+    int blocks = 0;
+    if (block_count_1d(total_entries, count_threads, &blocks, "sfnn_inverse_feature_counts_kernel") != 0) {
+        return -1;
+    }
+    sfnn_inverse_feature_counts_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
+        indices,
+        ctx->sfnn_inverse_counts,
+        total_entries,
+        max_active,
+        n_features);
+    if (check_kernel_launch("sfnn_inverse_feature_counts_kernel launch") != 0) {
+        return -1;
+    }
+
+    sfnn_inverse_prefix_sum_block_local_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
+        ctx->sfnn_inverse_counts,
+        ctx->sfnn_inverse_offsets,
+        ctx->sfnn_inverse_block_sums,
+        n_features);
+    if (check_kernel_launch("sfnn_inverse_prefix_sum_block_local_kernel launch") != 0) {
+        return -1;
+    }
+    sfnn_inverse_prefix_sum_small_kernel<<<1, scan_threads, 0, ctx->stream>>>(
+        ctx->sfnn_inverse_block_sums,
+        ctx->sfnn_inverse_block_offsets,
+        prefix_blocks);
+    if (check_kernel_launch("sfnn_inverse_prefix_sum_small_kernel launch") != 0) {
+        return -1;
+    }
+    sfnn_inverse_prefix_add_block_offsets_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
+        ctx->sfnn_inverse_offsets,
+        ctx->sfnn_inverse_block_offsets,
+        n_features,
+        prefix_blocks);
+    if (check_kernel_launch("sfnn_inverse_prefix_add_block_offsets_kernel launch") != 0) {
+        return -1;
+    }
+
+    sfnn_inverse_scatter_positions_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
+        indices,
+        ctx->sfnn_inverse_offsets,
+        ctx->sfnn_inverse_write_counters,
+        ctx->sfnn_inverse_positions,
+        total_entries,
+        max_active,
+        n_features);
+    if (check_kernel_launch("sfnn_inverse_scatter_positions_kernel launch") != 0) {
+        return -1;
+    }
+
+    dim3 gather_grid(
+        static_cast<unsigned int>(n_features),
+        static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
+        1);
+    sfnn_inverse_gather_l0w_gradients_kernel<<<gather_grid, gather_threads, 0, ctx->stream>>>(
+        pre_gradients,
+        ctx->sfnn_inverse_positions,
+        ctx->sfnn_inverse_offsets,
+        l0w_gradients,
+        n_features,
+        ft_size,
+        add_to_existing);
+    if (check_kernel_launch("sfnn_inverse_gather_l0w_gradients_kernel launch") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_sfnn_inverse_index_l0_backward(
+    BulletOuCudaCppContext* ctx,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_l0,
+    const float* nstm_l0,
+    const float* combined_gradients,
+    float* stm_l0_pre_gradients,
+    float* nstm_l0_pre_gradients,
+    float* l0w_gradients,
+    float* l0b_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t input_size,
+    size_t ft_size) {
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
+        return -1;
+    }
+    sfnn_pairwise_l0_pregrad_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_l0,
+        nstm_l0,
+        combined_gradients,
+        stm_l0_pre_gradients,
+        nstm_l0_pre_gradients,
+        l0b_gradients,
+        batch,
+        ft_size);
+    if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
+        return -1;
+    }
+
+    size_t n_features = input_size;
+    const bool halfka2_factorized = input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE;
+    if (halfka2_factorized) {
+        n_features = SFNN_HALFKA2_BASE_INPUT_SIZE;
+    }
+
+    if (launch_sfnn_inverse_index_for_perspective(
+            ctx,
+            stm_indices,
+            stm_l0_pre_gradients,
+            l0w_gradients,
+            batch,
+            max_active,
+            n_features,
+            ft_size,
+            0) != 0 ||
+        launch_sfnn_inverse_index_for_perspective(
+            ctx,
+            nstm_indices,
+            nstm_l0_pre_gradients,
+            l0w_gradients,
+            batch,
+            max_active,
+            n_features,
+            ft_size,
+            1) != 0) {
+        return -1;
+    }
+
+    if (halfka2_factorized) {
+        constexpr int gather_threads = 128;
+        dim3 reduce_grid(
+            static_cast<unsigned int>(SFNN_HALFKA2_PIECE_INPUTS),
+            static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
+            1);
+        sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
+            l0w_gradients,
+            ft_size);
+        if (check_kernel_launch("sfnn_reduce_halfka2_virtual_l0w_gradients_kernel launch") != 0) {
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -2308,7 +2805,8 @@ int launch_sfnn_backward_kernels(
                 l2w_gradients,
                 l2b_gradients,
                 l3w_gradients,
-                l3b_gradients) != 0) {
+                l3b_gradients,
+                fuse_pairwise_l0 == 0 ? 1 : 0) != 0) {
             return -1;
         }
     }
@@ -2429,22 +2927,21 @@ int launch_sfnn_backward_kernels(
     }
 
     if (fuse_pairwise_l0 != 0) {
-        if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_sparse_backward_kernel") != 0) {
-            return -1;
-        }
-        sfnn_pairwise_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            stm_indices,
-            nstm_indices,
-            stm_l0,
-            nstm_l0,
-            combined_gradients,
-            l0w_gradients,
-            l0b_gradients,
-            batch,
-            max_active,
-            input_size,
-            ft_size);
-        if (check_kernel_launch("sfnn_pairwise_l0_sparse_backward_kernel launch") != 0) {
+        if (launch_sfnn_inverse_index_l0_backward(
+                ctx,
+                stm_indices,
+                nstm_indices,
+                stm_l0,
+                nstm_l0,
+                combined_gradients,
+                stm_l0_pre_gradients,
+                nstm_l0_pre_gradients,
+                l0w_gradients,
+                l0b_gradients,
+                batch,
+                max_active,
+                input_size,
+                ft_size) != 0) {
             return -1;
         }
     } else {
@@ -2790,6 +3287,15 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (status != cudaSuccess) {
         delete ctx;
         return fail("cudaSetDevice", status);
+    }
+    if (free_i32_scratch(ctx->sfnn_inverse_counts, ctx->sfnn_inverse_counts_len, "cudaFree sfnn inverse counts") != 0 ||
+        free_i32_scratch(ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_offsets_len, "cudaFree sfnn inverse offsets") != 0 ||
+        free_i32_scratch(ctx->sfnn_inverse_block_sums, ctx->sfnn_inverse_block_sums_len, "cudaFree sfnn inverse block sums") != 0 ||
+        free_i32_scratch(ctx->sfnn_inverse_block_offsets, ctx->sfnn_inverse_block_offsets_len, "cudaFree sfnn inverse block offsets") != 0 ||
+        free_i32_scratch(ctx->sfnn_inverse_write_counters, ctx->sfnn_inverse_write_counters_len, "cudaFree sfnn inverse write counters") != 0 ||
+        free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0) {
+        delete ctx;
+        return -1;
     }
     if (ctx->blas != nullptr) {
         cublasStatus_t blas_status = cublasDestroy(ctx->blas);

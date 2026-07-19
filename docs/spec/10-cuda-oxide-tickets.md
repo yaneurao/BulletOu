@@ -1047,6 +1047,15 @@ the tickets in order and commit each completed slice.
   - average top-level profile: upload `6.747ms`, forward `20.518ms`, loss `2.217ms`, backward `72.677ms`, update `5.360ms`, total `107.520ms`;
   - average C++/CUDA backward stage profile: zero `0.575ms`, L3 `0.625ms`, L2 `5.305ms`, L2-input `0.041ms`, L1 `7.738ms`, pairwise/L0 `53.644ms`, total `67.928ms`;
   - the SFNN optimisation target is therefore the fused pairwise/L0 sparse backward kernel first, not the L1 factorized scatter.
+- Adopted an inverse-index SFNN L0 backward path for the Windows-native C++/CUDA train entry:
+  - the train-only `fuse_pairwise_l0` path now computes STM/NSTM L0 pre-gradients, builds a feature→positions inverse index for each perspective, gathers/sums gradients per `(feature,row)` cell, and reduces HalfKA2 virtual piece-input rows from the base rows;
+  - this mirrors tatara's count → prefix-sum → scatter → gather+sum sparse FT backward design and avoids the previous per-sample/per-row/per-active-feature atomic scatter storm;
+  - the old atomic-scatter fused kernel remains in the source as a fallback/reference, while the C++ context owns reusable inverse-index scratch buffers to avoid per-step `cudaMalloc`;
+  - because inverse gather overwrites every `l0w_gradients` cell, the train path now skips the otherwise redundant huge `l0w` zero-fill when inverse L0 is active;
+  - bs131k/6-step WRM profile before the `l0w` zero skip: L0 `14.659ms` vs the old `53.644ms`, total backward `28.346ms` vs `67.928ms`, and profile-throughput `1710841` pos/s;
+  - after the zero skip, the zero stage dropped from about `0.576ms` to `0.101ms`; the final checkpoint write of that profile failed because the local disk was full, but the six profiled train steps completed and reported the same final loss line;
+  - non-profiled speed probes on `shuffled-001.hcpe`, WRM, `wd=0`, bs131k reported 4M `2072550` pos/s and 16M `2169540` pos/s;
+  - yamaoka-fixed 16M validation used only `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 65536 --test-sample sequential --test-batch-size 4096`, reporting `2121025` pos/s, `test_loss=0.03670566`, `test_acc=0.6138458`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
