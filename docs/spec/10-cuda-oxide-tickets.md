@@ -1056,6 +1056,12 @@ the tickets in order and commit each completed slice.
   - after the zero skip, the zero stage dropped from about `0.576ms` to `0.101ms`; the final checkpoint write of that profile failed because the local disk was full, but the six profiled train steps completed and reported the same final loss line;
   - non-profiled speed probes on `shuffled-001.hcpe`, WRM, `wd=0`, bs131k reported 4M `2072550` pos/s and 16M `2169540` pos/s;
   - yamaoka-fixed 16M validation used only `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 65536 --test-sample sequential --test-batch-size 4096`, reporting `2121025` pos/s, `test_loss=0.03670566`, `test_acc=0.6138458`.
+- Added `--cuda-cpp-skip-final-output` for C++/CUDA direct-step benchmarking:
+  - valid only with `--cuda-cpp-train-steps`, not production schedule mode;
+  - it skips the final numbered checkpoint and `cuda-cpp-direct` full-state output, and also avoids downloading optimizer states when no file output is requested;
+  - held-out validation still works in this mode by downloading only the trained weights;
+  - a 1-step SFNN smoke wrote only tiny `resume-config.txt`/`tag.txt` files and printed `cuda-cpp SFNN final output skipped`;
+  - with the inverse-index L0 + zero skip, bs131k/128-step WRM and yamaoka-fixed validation completed without writing the multi-GB `state.bin`: `2153395` pos/s, `test_loss=0.03670243`, `test_acc=0.6138611`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;

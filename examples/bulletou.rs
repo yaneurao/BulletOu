@@ -1363,6 +1363,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     cuda_cpp_profile_steps: usize,
 
+    /// In C++/CUDA direct-step mode, skip the final numbered checkpoint and
+    /// `cuda-cpp-direct` full-state output. Useful for throughput/validation
+    /// probes where writing multi-GB optimizer state would dominate disk use.
+    #[arg(long)]
+    cuda_cpp_skip_final_output: bool,
+
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
     /// for clearer per-batch timings, so use it only for diagnosis.
@@ -1839,6 +1845,9 @@ impl Args {
             if self.cuda_cpp_profile_steps != 0 {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-profile-steps cannot be used together".to_string());
             }
+            if self.cuda_cpp_skip_final_output {
+                return Err("--cuda-cpp-smoke and --cuda-cpp-skip-final-output cannot be used together".to_string());
+            }
             if self.cuda_cpp_profile_teacher_prepare {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-profile-teacher-prepare cannot be used together".to_string());
             }
@@ -1878,6 +1887,9 @@ impl Args {
                     .to_string());
             }
             _ => {}
+        }
+        if self.cuda_cpp_skip_final_output && self.cuda_cpp_train_steps.is_none() {
+            return Err("--cuda-cpp-skip-final-output is only valid with --cuda-cpp-train-steps direct-step mode".to_string());
         }
         if production_schedule && self.max_epochs.is_none() {
             return Err(
@@ -3716,6 +3728,41 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     }
 
     let completed_steps = completed_step_offset + seen_steps;
+    if args.cuda_cpp_skip_final_output {
+        if let Some((chunk, _)) = deferred_direct_checkpoint {
+            if let Some(metrics) = {
+                let trained_weights = if args.test_teacher.is_some() {
+                    Some(runner.read_weights(&ctx).map_err(|e| e.to_string())?)
+                } else {
+                    None
+                };
+                match trained_weights.as_ref() {
+                    Some(weights) => run_cuda_cpp_halfkp_final_validation(args, cuda_shape, weights)?,
+                    None => None,
+                }
+            } {
+                eprintln!(
+                    "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                );
+                last_checkpoint_metrics = Some(metrics);
+            }
+        }
+        if checkpoint_chunk_idx != schedule.chunks.len() {
+            return Err(format!(
+                "cuda-cpp schedule ended after {checkpoint_chunk_idx} checkpoints, expected {}",
+                schedule.chunks.len()
+            ));
+        }
+        if let Some(metrics) = last_checkpoint_metrics {
+            eprintln!(
+                "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+                metrics.accuracy, metrics.loss
+            );
+        }
+        eprintln!("  cuda-cpp final output skipped (--cuda-cpp-skip-final-output)");
+        return Ok(());
+    }
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
     if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
@@ -4396,6 +4443,41 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         );
     }
     let completed_steps = completed_step_offset + seen_steps;
+    if args.cuda_cpp_skip_final_output {
+        if let Some((chunk, _)) = deferred_direct_checkpoint {
+            if let Some(metrics) = {
+                let trained_weights = if args.test_teacher.is_some() {
+                    Some(runner.read_weights(&ctx).map_err(|e| e.to_string())?)
+                } else {
+                    None
+                };
+                match trained_weights.as_ref() {
+                    Some(weights) => run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, weights)?,
+                    None => None,
+                }
+            } {
+                eprintln!(
+                    "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                );
+                last_checkpoint_metrics = Some(metrics);
+            }
+        }
+        if checkpoint_chunk_idx != schedule.chunks.len() {
+            return Err(format!(
+                "cuda-cpp SFNN schedule ended after {checkpoint_chunk_idx} checkpoints, expected {}",
+                schedule.chunks.len()
+            ));
+        }
+        if let Some(metrics) = last_checkpoint_metrics {
+            eprintln!(
+                "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
+                metrics.accuracy, metrics.loss
+            );
+        }
+        eprintln!("  cuda-cpp SFNN final output skipped (--cuda-cpp-skip-final-output)");
+        return Ok(());
+    }
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
     if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
@@ -11817,6 +11899,63 @@ mod tests {
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
             assert_eq!(args.cuda_cpp_profile_steps, 2);
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_skip_final_output_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "3",
+            "--cuda-cpp-skip-final-output",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+            assert!(args.cuda_cpp_skip_final_output);
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_skip_final_output_for_production_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "1",
+            "--max-epochs",
+            "1",
+            "--cuda-cpp-skip-final-output",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.unwrap_err().contains("--cuda-cpp-skip-final-output"));
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
