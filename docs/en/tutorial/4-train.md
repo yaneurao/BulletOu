@@ -41,6 +41,8 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | SFNN-1536 with k3k3(king3-by-king3) LayerStacks |
+| `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
+| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input (`--eval-type SFNN_KA2`) |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -50,6 +52,8 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 ```
 
 Omitting `--arch` uses the per-eval-type default. For example, `NNUE_HALFKP` defaults to `NNUE_halfkp_256x2_32_32`, and `NNUE_KP` defaults to `NNUE_kp_256x2_32_32`. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
+
+Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_15_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=15`, and L1 is split into 8 groups. KA2 variants must be paired with `--eval-type SFNN_KA2`; HalfKA2 variants must be paired with `--eval-type SFNN_HALFKA2`.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 

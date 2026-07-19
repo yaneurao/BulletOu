@@ -20,6 +20,7 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
     bulletou --eval-type SFNN_HALFKA2HM --arch SFNN_halfkahm2_1536_15_32_k3k3
     bulletou --eval-type SFNN_HALFKA2   --arch SFNN_halfka2_1024_7_64_k3k3
+    bulletou --eval-type SFNN_KA2       --arch SFNN_ka2_4096_15_64_g16_k3k3
 
 `--arch` uses the YaneuraOu Makefile architecture name with the
 `YANEURAOU_ENGINE_` prefix removed.
@@ -230,6 +231,7 @@ impl LayerStackMode {
 /// - `SFNN_halfka2_8192_7_64_g8_k3k3`
 /// - `SFNN_halfka2_8192_15_64_g16_k3k3`
 /// - `SFNN_halfka2_4096_31_64_g32_k3k3`
+/// - `SFNN_ka2_4096_15_64_g16_k3k3`
 /// - `SFNN_halfkahm2_1536_15_32_king3_by_king3`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NnueArch {
@@ -10310,6 +10312,11 @@ mod tests {
         assert_eq!(g32.dims(), (4096, 31, 64));
         assert_eq!(g32.sfnn_l1_group_count(), 32);
         assert_eq!(g32.cli_name(), "SFNN_halfka2_4096_31_64_g32_k3k3");
+        let ka2_g16 = NnueArch::from_str("SFNN_ka2_2048_15_64_g16_k3k3").unwrap();
+        assert_eq!(ka2_g16.dims(), (2048, 15, 64));
+        assert_eq!(ka2_g16.expected_eval_type(), EvalType::SfnnKa2);
+        assert_eq!(ka2_g16.sfnn_l1_group_count(), 16);
+        assert_eq!(ka2_g16.cli_name(), "SFNN_ka2_2048_15_64_g16_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10332,6 +10339,16 @@ mod tests {
             "SFNN_halfka2_8192_15_64_g16_k3k3",
             "SFNN_halfka2_4096_31_64_g32_k3k3",
             "SFNN_halfka2_2048_31_64_g16_k3k3",
+            "SFNN_ka2_2048_7_64_g8_k3k3",
+            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "SFNN_ka2_4096_7_64_g8_k3k3",
+            "SFNN_ka2_4096_15_64_g16_k3k3",
+            "SFNN_ka2_8192_7_15_g8_k3k3",
+            "SFNN_ka2_8192_15_15_g16_k3k3",
+            "SFNN_ka2_16384_7_15_g8_k3k3",
+            "SFNN_ka2_16384_15_15_g16_k3k3",
+            "SFNN_ka2_32768_7_15_g8_k3k3",
+            "SFNN_ka2_32768_15_15_g16_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -12283,6 +12300,64 @@ mod tests {
         .validate_arch_flags()
         .unwrap_err();
         assert!(err.contains("factorized"));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_ka2_grouped_arches_use_compact_l1_shape() {
+        use clap::Parser as _;
+
+        for (arch, ft_size, l1_out, l2_size, group_count, group_input, group_output) in [
+            ("SFNN_ka2_2048_7_64_g8_k3k3", 2048, 8, 64, 8, 256, 1),
+            ("SFNN_ka2_2048_15_64_g16_k3k3", 2048, 16, 64, 16, 128, 1),
+            ("SFNN_ka2_4096_7_64_g8_k3k3", 4096, 8, 64, 8, 512, 1),
+            ("SFNN_ka2_4096_15_64_g16_k3k3", 4096, 16, 64, 16, 256, 1),
+            ("SFNN_ka2_8192_7_15_g8_k3k3", 8192, 8, 15, 8, 1024, 1),
+            ("SFNN_ka2_8192_15_15_g16_k3k3", 8192, 16, 15, 16, 512, 1),
+            ("SFNN_ka2_16384_7_15_g8_k3k3", 16384, 8, 15, 8, 2048, 1),
+            ("SFNN_ka2_16384_15_15_g16_k3k3", 16384, 16, 15, 16, 1024, 1),
+            ("SFNN_ka2_32768_7_15_g8_k3k3", 32768, 8, 15, 8, 4096, 1),
+            ("SFNN_ka2_32768_15_15_g16_k3k3", 32768, 16, 15, 16, 2048, 1),
+        ] {
+            let args = Args::try_parse_from([
+                "bulletou",
+                "--eval-type",
+                "SFNN_KA2",
+                "--arch",
+                arch,
+                "--teacher",
+                "/dev/null",
+                "--backend",
+                "cuda-cpp",
+                "--cuda-cpp-train-steps",
+                "1",
+            ])
+            .unwrap();
+            args.validate_arch_flags().unwrap();
+            args.validate_backend_flags().unwrap();
+
+            let shape = bulletou_cuda_cpp::SfnnForwardShape {
+                input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
+                ft_size,
+                l1_hidden: l1_out - 1,
+                l2_size,
+                num_stacks: 9,
+                l1_group_count: args.arch().sfnn_l1_group_count(),
+            };
+            assert_eq!(shape.input_size, ShogiKa2.num_inputs(), "{arch}");
+            assert_eq!(shape.l1_group_count(), group_count, "{arch}");
+            assert_eq!(shape.l1_group_input(), group_input, "{arch}");
+            assert_eq!(shape.l1_group_output(), group_output, "{arch}");
+            assert_eq!(
+                cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(),
+                9 * group_count * group_output * group_input,
+                "{arch}"
+            );
+            assert!(
+                cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size,
+                "{arch}"
+            );
+        }
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

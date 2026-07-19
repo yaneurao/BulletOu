@@ -41,6 +41,8 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 | `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3(king3-by-king3) LayerStacks の SFNN-1536 |
+| `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
+| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN (`--eval-type SFNN_KA2`) |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -50,6 +52,8 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 ```
 
 `--arch` を省略すると eval-type ごとのデフォルトが適用される。たとえば `NNUE_HALFKP` は `NNUE_halfkp_256x2_32_32`、`NNUE_KP` は `NNUE_kp_256x2_32_32`。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
+
+grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。たとえば `SFNN_ka2_8192_7_15_g8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=15`, `L1 を 8 group に分割` という意味。KA2 版は必ず `--eval-type SFNN_KA2`、HalfKA2 版は `--eval-type SFNN_HALFKA2` と組み合わせる。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 
