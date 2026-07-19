@@ -3555,6 +3555,10 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     } else {
         eprintln!("  cuda-cpp KPPT schedule = direct train-steps smoke mode");
     }
+    if schedule.production && train_steps == 0 {
+        print_cuda_cpp_no_remaining_work(args);
+        return Ok(());
+    }
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     eprintln!("  batch size = {batch_size}");
@@ -4194,6 +4198,10 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     } else {
         eprintln!("  cuda-cpp schedule = direct train-steps smoke mode");
     }
+    if schedule.production && train_steps == 0 {
+        print_cuda_cpp_no_remaining_work(args);
+        return Ok(());
+    }
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -4355,7 +4363,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let mut checkpoint_chunk_idx = 0usize;
         while checkpoint_chunk_idx < schedule.chunks.len() {
             let epoch = schedule.chunks[checkpoint_chunk_idx].epoch;
-            let display_max_epochs = args.max_epochs.map(|n| n + epoch.saturating_sub(1)).unwrap_or(epoch);
+            let display_max_epochs = args.max_epochs.unwrap_or(epoch);
             print_epoch_banner(epoch, display_max_epochs);
             let mut plateau_state = PlateauLrState::new(
                 args.lr,
@@ -5086,6 +5094,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         eprintln!("  cuda-cpp SFNN schedule = direct train-steps smoke mode");
     }
+    if schedule.production && train_steps == 0 {
+        print_cuda_cpp_no_remaining_work(args);
+        return Ok(());
+    }
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -5226,7 +5238,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let mut checkpoint_chunk_idx = 0usize;
         while checkpoint_chunk_idx < schedule.chunks.len() {
             let epoch = schedule.chunks[checkpoint_chunk_idx].epoch;
-            let display_max_epochs = args.max_epochs.map(|n| n + epoch.saturating_sub(1)).unwrap_or(epoch);
+            let display_max_epochs = args.max_epochs.unwrap_or(epoch);
             print_epoch_banner(epoch, display_max_epochs);
             let mut plateau_state = PlateauLrState::new(
                 args.lr,
@@ -8124,6 +8136,14 @@ fn cuda_cpp_uses_production_schedule(args: &Args) -> bool {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_no_remaining_work(args: &Args) {
+    eprintln!(
+        "  cuda-cpp schedule = complete: no remaining training steps; latest checkpoint already reached --max-epochs {}",
+        args.max_epochs.unwrap_or(1).max(1)
+    );
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Debug)]
 struct CudaCppScheduleChunk {
     epoch: usize,
@@ -8365,18 +8385,17 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let max_epoch_in_log =
         if resume_enabled { read_latest_epoch_in_top_level_log(&top_level_log).unwrap_or(0) } else { 0 };
     let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_superbatch.is_some();
-    let epoch_offset = if mid_epoch_resume {
-        max_epoch_in_log.saturating_sub(1)
+    let start_epoch = if !resume_enabled {
+        1
+    } else if mid_epoch_resume {
+        max_epoch_in_log.max(1)
     } else if resume_enabled {
-        max_epoch_in_log
+        max_epoch_in_log.saturating_add(1).max(1)
     } else {
-        0
+        1
     };
-    let first_epoch_start_superbatch = if teacher_changed || prev_run_completed_epoch {
-        1usize
-    } else {
-        latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1)
-    };
+    let first_epoch_start_superbatch =
+        if mid_epoch_resume { latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1) } else { 1usize };
     let prior_positions = if resume_enabled {
         let positions = read_prior_positions(&top_level_log);
         if matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt) {
@@ -8392,9 +8411,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let mut cumulative_steps = 0usize;
     let save_rate = effective_save_rate(args).max(1);
     let save_epoch_end = effective_save_epoch_end(args);
-    for local_epoch in 1..=max_epochs {
-        let epoch = epoch_offset + local_epoch;
-        let mut first_superbatch = if local_epoch == 1 { first_epoch_start_superbatch } else { 1 };
+    for epoch in start_epoch..=max_epochs {
+        let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let save_boundary = first_superbatch.saturating_add(save_rate).saturating_sub(1);
             let (last_superbatch, save_checkpoint) =
@@ -8438,10 +8456,6 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             first_superbatch = last_superbatch + 1;
         }
     }
-    if chunks.is_empty() {
-        return Err("--backend cuda-cpp production schedule has no remaining chunks to train".to_string());
-    }
-
     let total_steps = chunks.iter().map(|chunk| chunk.steps).sum();
     Ok(CudaCppRunSchedule {
         production: true,
@@ -10815,7 +10829,7 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_run_schedule_continues_after_completed_epoch() {
+    fn cuda_cpp_run_schedule_continues_after_completed_epoch_when_max_epochs_is_higher() {
         use clap::Parser as _;
 
         let tmp = std::env::temp_dir().join(format!(
@@ -10836,7 +10850,7 @@ mod tests {
             "--superbatches",
             "3",
             "--max-epochs",
-            "1",
+            "2",
             "--save-rate",
             "1",
             "--batch-size",
@@ -10877,6 +10891,69 @@ mod tests {
         assert_eq!(schedule.chunks[2].epoch, 2);
         assert_eq!(schedule.chunks[2].superbatch, 3);
         assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6, "completed epoch should warm-restart LR");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_stops_when_resume_already_reached_max_epochs() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-schedule-complete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("0001")).unwrap();
+        let output = tmp.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "teacher.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "3",
+            "--save-rate",
+            "1",
+            "--batch-size",
+            "64",
+            "--positions-per-superbatch",
+            "64",
+            "--lr",
+            "0.1",
+            "--lr-min",
+            "0.01",
+            "--output",
+            output,
+        ])
+        .unwrap();
+        write_resume_config(&tmp, &args).unwrap();
+        std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("dataloader_pos.txt"), "576,0\n").unwrap();
+        std::fs::write(
+            tmp.join("0001").join("learn.log"),
+            format!(
+            "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,3,3,1,-,-,0.1,0.1,0.1,1.000000,576,teacher.hcpe\n"
+        ),
+        )
+        .unwrap();
+        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,3,3,-,-,0.1,0.1,0.1,1.000000,576,teacher.hcpe,-\n"
+        ))
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.prior_positions, 576);
+        assert_eq!(schedule.total_steps, 0);
+        assert!(schedule.chunks.is_empty(), "max-epochs=3 must not schedule epoch 4");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
