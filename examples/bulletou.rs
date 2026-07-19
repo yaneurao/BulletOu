@@ -229,6 +229,7 @@ impl LayerStackMode {
 /// - `SFNN_halfka2_4096_7_64_g4_k3k3`
 /// - `SFNN_halfka2_8192_7_64_g8_k3k3`
 /// - `SFNN_halfka2_8192_15_64_g16_k3k3`
+/// - `SFNN_halfka2_4096_31_64_g32_k3k3`
 /// - `SFNN_halfkahm2_1536_15_32_king3_by_king3`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NnueArch {
@@ -10305,6 +10306,10 @@ mod tests {
         assert_eq!(g16.dims(), (8192, 15, 64));
         assert_eq!(g16.sfnn_l1_group_count(), 16);
         assert_eq!(g16.cli_name(), "SFNN_halfka2_8192_15_64_g16_k3k3");
+        let g32 = NnueArch::from_str("SFNN_halfka2_4096_31_64_g32_k3k3").unwrap();
+        assert_eq!(g32.dims(), (4096, 31, 64));
+        assert_eq!(g32.sfnn_l1_group_count(), 32);
+        assert_eq!(g32.cli_name(), "SFNN_halfka2_4096_31_64_g32_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10325,6 +10330,8 @@ mod tests {
             "SFNN_halfka2_4096_7_64_g8_k3k3",
             "SFNN_halfka2_4096_15_64_g16_k3k3",
             "SFNN_halfka2_8192_15_64_g16_k3k3",
+            "SFNN_halfka2_4096_31_64_g32_k3k3",
+            "SFNN_halfka2_2048_31_64_g16_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -12218,6 +12225,8 @@ mod tests {
             ("SFNN_halfka2_4096_7_64_g8_k3k3", 4096, 8, 8, 512, 1),
             ("SFNN_halfka2_4096_15_64_g16_k3k3", 4096, 16, 16, 256, 1),
             ("SFNN_halfka2_8192_15_64_g16_k3k3", 8192, 16, 16, 512, 1),
+            ("SFNN_halfka2_4096_31_64_g32_k3k3", 4096, 32, 32, 128, 1),
+            ("SFNN_halfka2_2048_31_64_g16_k3k3", 2048, 32, 16, 128, 2),
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
