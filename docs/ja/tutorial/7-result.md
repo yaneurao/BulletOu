@@ -17,7 +17,7 @@ checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── summary-learn.log                  ← 全 run / resume を連結した sb 単位の累積ログ
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
-│   ├── state.bin                      ← resume 用の重み + Adam moments
+│   ├── state.bin                      ← resume 用の重み + Ranger optimizer state
 │   └── learn.log                      ← この save 時点の学習ログ snapshot
 ├── 0002/
 ├── ...

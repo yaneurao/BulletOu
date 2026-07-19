@@ -63,38 +63,29 @@ cd BulletOu
 
 ## 1.3 ビルド
 
-GPU に応じて以下の **どちらか** を実行:
+現在の BulletOu 学習 backend をビルドする:
 
 ```bash
-# NVIDIA GPU (CUDA)
-CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
+# NVIDIA GPU (CUDA 12.x)
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-```bash
-# AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features device-rocm
-```
-
-(Windows では `set CUDA_PATH=...` または PowerShell の `$env:CUDA_PATH=...` で環境変数を設定する。)
+Windows では CUDA Toolkit と対応する Visual Studio C++ build tools がビルド環境から見えるようにしておく。
 
 初回ビルドは数分〜十数分かかる。エラーなく完了すれば準備 OK。
 
 ### よくあるビルドエラー
 
-- **`CUDA_PATH is not defined`** — 環境変数を CUDA のインストール先 (例: `/usr/local/cuda`、`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`) に設定する
-- **`cublas` / `nvrtc` のリンクエラー** — CUDA のバージョンが古すぎる可能性。12.x 以降を使う
-- **`hipblas` / `hiprtc` のリンクエラー** — HIP SDK をインストールし、`HIP_PATH` を設定する。場合により `GCN_ARCH_NAME` も設定が必要 (Linux なら `rocminfo`、Windows なら `hipinfo` で取得できる)
+- **`CUDA_PATH is not defined`** — 環境変数を CUDA のインストール先 (例: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`、`/usr/local/cuda`) に設定する
+- **Windows で `nvcc` / MSVC build error が出る** — CUDA Toolkit と Visual Studio C++ build tools を入れ、両方が見える shell から実行する
+- **CUDA runtime library のリンクエラー** — CUDA のバージョンが古すぎる可能性。12.x 以降を使う
 
 ## 1.4 smoke test 用の学習を動かす
 
-`simple` example は小さなチェス (将棋ではない) の NNUE を学習する。外部データが不要で、数分で終わる。パイプラインを端から端まで通すには十分。
+CUDA C++ smoke test は教師データ不要。CUDA 初期化、kernel launch、小さな Ranger update が通るかを確認する。
 
 ```bash
-# NVIDIA
-cargo run --release --features device-cuda --example simple
-
-# AMD
-cargo run --release --features device-rocm --example simple
+cargo run --release --features cuda-cpp-backend --example bulletou -- --cuda-cpp-smoke
 ```
 
 正常に動けば、以下のような出力が出る:

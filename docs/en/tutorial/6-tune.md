@@ -12,7 +12,7 @@ Main flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--backend` | Training backend. The default fast path is Windows-native `cuda-cpp`; all public BulletOu eval types can train through it. Pass `bullet` only when you intentionally want the legacy generic backend for debugging/comparison | `cuda-cpp` |
+| `--backend` | Training backend. BulletOu training is Windows-native `cuda-cpp`; this option remains only for explicit scripts and currently accepts only `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 to match tatara | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
@@ -20,7 +20,7 @@ Main flags:
 | `--save-rate` | Save a checkpoint every N superbatches. By default, the final superbatch of each epoch is also saved even when it is not on a save-rate boundary. Plateau scheduling still requires `--save-rate 1` | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit checkpoint at the final superbatch of each epoch | on |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.000875 |
-| `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `ranger` |
+| `--optimizer` | Optimizer. BulletOu currently exposes Ranger (RAdam+Lookahead), matching the tatara/bullet-shogi recipe | `ranger` |
 | `--lr-schedule` | `step` (= staircase StepLR), `geometric` (= log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
 | `--lr-min` | Floor LR. For `step` / `plateau`, this is the lower bound. For `geometric` / `cos`, this is reached at the end of each cycle | 0.00001 |
 | `--lr-step-gamma` | Multiplicative LR factor for `step`. If omitted and `--superbatches` is set, BulletOu computes the value that reaches `--lr-min` from `--lr` within one epoch. If the epoch length is open-ended, it falls back to `0.992` | auto / 0.992 |
@@ -35,8 +35,6 @@ Main flags:
 | `--optimizer-epsilon` | Override epsilon for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
 | `--optimizer-beta1` | Override beta1 for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
 | `--optimizer-beta2` | Override beta2 for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
-| `--nnue-pytorch-layer-clip` | Use nnue-pytorch-compatible per-layer weight clipping | off |
-| `--nnue-pytorch-no-bias-clip` | Effectively disable optimizer clipping for bias tensors | off |
 
 Example (100M positions × 40 superbatches = 4 billion positions total):
 
@@ -282,7 +280,7 @@ Example:
 
 ### Optimizer Selection
 
-Use `--optimizer` to switch between `adamw`, `radam`, and `ranger`. The default is `ranger`, matching bullet-shogi's shogi examples.
+`--optimizer` currently accepts only `ranger`, matching bullet-shogi's shogi examples and the tatara reference recipe.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -306,7 +304,7 @@ Use `--optimizer` to switch between `adamw`, `radam`, and `ranger`. The default 
     --optimizer-epsilon 0.0000001
 ```
 
-If `--optimizer-beta1`, `--optimizer-beta2`, or `--optimizer-epsilon` is omitted, BulletOu uses the selected optimizer's own defaults. In particular, `ranger` defaults to bullet-shogi's `beta1=0.99`, not AdamW's `0.9`.
+If `--optimizer-beta1`, `--optimizer-beta2`, or `--optimizer-epsilon` is omitted, BulletOu uses Ranger's defaults. In particular, `ranger` defaults to bullet-shogi's `beta1=0.99`, not the common Adam-style `0.9`.
 
 ### Optimizer Weight Decay
 
@@ -330,7 +328,7 @@ If omitted, BulletOu uses the selected optimizer's own epsilon default. nodchip 
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
-    --tag sfnn-adamw-eps1e-7 \
+    --tag sfnn-ranger-eps1e-7 \
     --optimizer-epsilon 0.0000001
 ```
 
@@ -338,7 +336,7 @@ This is another optimizer-condition ablation. Compare it by itself first.
 
 ### Optimizer Beta
 
-Optimizer `beta1` / `beta2` can also be set from the CLI. If omitted, BulletOu uses the selected optimizer's own defaults. `ranger` defaults to `beta1=0.99`, `beta2=0.999`; `adamw` / `radam` default to `beta1=0.9`, `beta2=0.999`.
+Optimizer `beta1` / `beta2` can also be set from the CLI. If omitted, BulletOu uses Ranger's defaults: `beta1=0.99`, `beta2=0.999`.
 
 If you want to isolate only the optimizer momentum time constants, pass `--optimizer-beta1` / `--optimizer-beta2`.
 
@@ -352,37 +350,6 @@ If you want to isolate only the optimizer momentum time constants, pass `--optim
 ```
 
 This is not a Ranger21 compatibility mode by itself. Compare it by itself before combining it with weight decay or epsilon changes.
-
-### nnue-pytorch layer clipping
-
-Add `--nnue-pytorch-layer-clip` to move the selected optimizer's weight clipping bounds closer to nnue-pytorch's quantisation scales.
-
-- hidden weight: `[-127/64, 127/64]`
-- final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
-
-This is an experimental NNUE / SFNN flag. It does not change the loss formula or weight decay, so compare it by itself before combining it with other experimental flags.
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
-    --tag sfnn-layer-clip \
-    --nnue-pytorch-layer-clip
-```
-
-### Disabling bias clipping
-
-nnue-pytorch's `WeightClippingCallback` clips weight tensors only; it does not clip bias tensors. BulletOu's default optimizer settings clip every parameter, including biases. Use `--nnue-pytorch-no-bias-clip` to compare that difference by itself.
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
-    --tag sfnn-no-bias-clip \
-    --nnue-pytorch-no-bias-clip
-```
-
-You can combine this with `--nnue-pytorch-layer-clip`, but compare it alone first.
 
 ```bash
 # elmo-style 50/50 blend on KPPT

@@ -84,14 +84,14 @@ nnue-pytorch は `Ranger21` を使う。
 | scheduler | `StepLR(gamma=0.992)` |
 | default lr | `8.75e-4` |
 
-BulletOu の `examples/bulletou.rs` 経路は `--optimizer adamw|radam|ranger`
-で optimizer を切り替えられる。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
+BulletOu の `examples/bulletou.rs` 経路は現在 `--optimizer ranger`
+のみを受け付ける。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
 `ranger` は BulletOu 既存の RAdam+Lookahead 実装であり、nnue-pytorch の
 Ranger21 完全互換ではない。
 
 optimizer 条件の上書きは `--optimizer-weight-decay` /
 `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` で行う。
-`epsilon` / `beta1` / `beta2` を省略した場合は、選択中 optimizer 自身の既定値を使う。
+`epsilon` / `beta1` / `beta2` を省略した場合は、`ranger` 自身の既定値を使う。
 そのため `ranger` の既定値は `bullet-shogi` と同じ `beta=(0.99,0.999)` で、
 AdamW の `beta=(0.9,0.999)` は混ざらない。標準設定は tatara の
 SFNN-1536 reference run に寄せて `weight_decay=0.0`、全 weight を一律
@@ -184,13 +184,12 @@ clip される。
 BulletOu の標準 optimizer 設定は全 weight に一律 `[-1.98, 1.98]` を適用する。
 output weight の上限が nnue-pytorch より広く、L1 factorized term も考慮していない。
 
-`--nnue-pytorch-layer-clip` を付けると、hidden weight は `[-127/64, 127/64]`、
-final output weight だけは `[-127*127/(600*16), 127*127/(600*16)]` にする。
-
 nnue-pytorch の `WeightClippingCallback` は `l1.linear.weight`, `l2.linear.weight`,
 `output.linear.weight` だけを clip 対象にしており、bias は clip しない。
 BulletOu の標準 optimizer 設定は bias も含めて全 parameter を clip するため、
-`--nnue-pytorch-no-bias-clip` で bias tensor の clip を実質無効化できるようにした。
+この点も差分として残る。現行 cuda-cpp backend では layer-specific clipping /
+bias-excluding clipping の CLI は提供しない。必要になった場合は cuda-cpp backend 側に
+実装して、同じ教師・同じ検証局面で単独 ablation として比較する。
 
 ### 6. FeatureSet の一致
 
@@ -250,16 +249,14 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - `eps=1e-7` は `--optimizer-epsilon 0.0000001` で単独比較する
    - `beta1` / `beta2` は `--optimizer-beta1` / `--optimizer-beta2` で単独比較する
      - 省略時は optimizer 固有の既定値。`ranger` は `0.99` / `0.999`
-   - optimizer 種別は `--optimizer adamw|radam|ranger` で比較する
+   - optimizer 種別は現行では `ranger` 固定
      - `ranger` は RAdam+Lookahead であり Ranger21 完全互換ではない
 
-5. layer-specific clipping を入れる
+5. layer-specific clipping を検討する
    - hidden と output を別範囲にする
    - L1 factorized term がある場合は実効 weight 基準で clip する
-   - 実装済み: `--nnue-pytorch-layer-clip` で opt-in
-   - 現時点の実装は final output weight の clip 差分だけを検証するためのもの。
-     factorized L1 の実効 weight clip は未対応。
-   - bias clip 無効化は `--nnue-pytorch-no-bias-clip` で別 ablation として試す
+   - 現行 cuda-cpp backend では未実装。入れるなら backend 側の実装と検証を追加する
+   - bias clip 無効化も同様に、別 ablation として実装・比較する
 
 6. data loader / epoch / scheduler 条件を揃える
    - nnue-pytorch default epoch size は 100,000,000 positions

@@ -4,7 +4,7 @@ bulletou — BulletOu trainer entry point.
 Dispatches to the appropriate training routine via `--eval-type`. The
 "family" eval-types train all three KPPT components (KK + KKP + KPP)
 sequentially in a single invocation and assemble the result into
-`<output>/final/`:
+numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
     bulletou --eval-type KPPT            (KPPT family, KPP int16 × 2)
     bulletou --eval-type KPP_KKPT        (KPP_KKPT factorised, KPP int16)
@@ -38,7 +38,7 @@ share the same extension.
 Usage:
 
     # Build once
-    cargo build --release --features device-cuda --example bulletou
+    cargo build --release --features cuda-cpp-backend --example bulletou
 
     # Then run
     ./target/release/examples/bulletou \
@@ -48,11 +48,12 @@ Usage:
         --superbatches 20
 */
 
+#![cfg_attr(not(feature = "cuda-cpp-backend"), allow(dead_code, unused_imports))]
+
 #[cfg(feature = "cuda-cpp-backend")]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bullet_compiler::tensor::TValue;
 #[cfg(feature = "cuda-cpp-backend")]
 use bulletou_lib::value::nnue_save_sfnn1536::{
     FT_HASH_SFNN, KHASH_SFNN, NETWORK_HASH_SFNN, QA as SFNN_QA, QB as SFNN_QB,
@@ -63,31 +64,21 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
-    nn::{ExecutionContext, ModelNode, optimiser},
+    nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
-    trainer::{
-        save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, wdl},
-        settings::LocalSettings,
-    },
     validate::{
         ValidationLossKind, compute_sign_accuracy_with_loss, read_random_teacher_positions,
         read_teacher_positions_prefix,
     },
     value::{
-        ValueTrainer, ValueTrainerBuilder,
-        loader::{DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader, ShogiPackLoader},
         nnue_save::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
             network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
         },
-        nnue_save_sfnn1536::{
-            LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION, Sfnn1536SaveParams, build_sfnn_1536_save_format,
-        },
+        nnue_save_sfnn1536::{LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION},
         yaneuraou_kppt::{
-            KppFormat, STATE_BACKEND_BULLET, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval,
-            unbundle_component_state, write_state_backend_marker,
+            KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, write_state_backend_marker,
         },
     },
 };
@@ -172,16 +163,13 @@ enum EvalType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 enum BackendKind {
-    /// Existing generic Bullet backend. Supports every eval type.
-    Bullet,
-    /// Windows-native C++/CUDA fixed-layout backend bring-up path.
+    /// Windows-native C++/CUDA trainer.
     CudaCpp,
 }
 
 impl BackendKind {
     fn cli_name(self) -> &'static str {
         match self {
-            BackendKind::Bullet => "bullet",
             BackendKind::CudaCpp => "cuda-cpp",
         }
     }
@@ -741,12 +729,10 @@ impl EvalType {
     }
 }
 
-/// Default `--yaneuraou-quant-scale` for each KPPT component. Used inside
-/// [`run_kppt_all`] to inject the component-appropriate scale into the
-/// child `Args` before dispatching to [`run_kppt_kk`] / [`run_kppt_kkp`] /
-/// [`run_kppt_kpp`]. The values exist as constants rather than as methods
-/// on `EvalType` because the public CLI no longer exposes per-component
-/// eval types.
+/// Default `--yaneuraou-quant-scale` for each KPPT component. The cuda-cpp
+/// KPPT trainer writes KK / KKP / KPP checkpoints separately before assembling
+/// each save into one numbered engine-facing directory, so each component
+/// keeps its own quantisation scale.
 ///
 /// - KK / KKP entries are i32 (large dynamic range) so 4000 = eval_scale * 10.
 /// - KPP entries are i16 (smaller dynamic range) so the scale is an order
@@ -923,51 +909,6 @@ impl LrScheduler for CosineLR {
 }
 
 #[derive(Clone, Debug)]
-struct FixedLR {
-    value: f32,
-}
-
-impl LrScheduler for FixedLR {
-    fn lr(&self, _batch: usize, _superbatch: usize) -> f32 {
-        self.value
-    }
-
-    fn colourful(&self) -> String {
-        format!("plateau: fixed lr {}", self.value)
-    }
-}
-
-/// Wrapper enum so the macro can pass either schedule into bullet's
-/// generic `Trainer::train_custom` (which takes a single
-/// `impl LrScheduler` per run).
-#[derive(Clone, Debug)]
-enum LrSchedulerImpl {
-    Step(StepLR),
-    Geometric(GeometricLR),
-    Cos(CosineLR),
-    Fixed(FixedLR),
-}
-
-impl LrScheduler for LrSchedulerImpl {
-    fn lr(&self, batch: usize, superbatch: usize) -> f32 {
-        match self {
-            LrSchedulerImpl::Step(s) => s.lr(batch, superbatch),
-            LrSchedulerImpl::Geometric(s) => s.lr(batch, superbatch),
-            LrSchedulerImpl::Cos(s) => s.lr(batch, superbatch),
-            LrSchedulerImpl::Fixed(s) => s.lr(batch, superbatch),
-        }
-    }
-    fn colourful(&self) -> String {
-        match self {
-            LrSchedulerImpl::Step(s) => s.colourful(),
-            LrSchedulerImpl::Geometric(s) => s.colourful(),
-            LrSchedulerImpl::Cos(s) => s.colourful(),
-            LrSchedulerImpl::Fixed(s) => s.colourful(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 struct PlateauLrState {
     current_lr: f32,
     min_lr: f32,
@@ -1133,10 +1074,6 @@ impl PlateauLrState {
     }
 }
 
-fn effective_max_epochs(args: &Args) -> usize {
-    args.max_epochs.unwrap_or(usize::MAX).max(1)
-}
-
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     if max_epochs == usize::MAX {
         eprintln!("\n=== epoch {epoch} / unlimited ===");
@@ -1171,16 +1108,12 @@ impl LrScheduleKind {
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[clap(rename_all = "lowercase")]
 enum OptimizerKind {
-    Adamw,
-    Radam,
     Ranger,
 }
 
 impl OptimizerKind {
     fn cli_name(self) -> &'static str {
         match self {
-            OptimizerKind::Adamw => "adamw",
-            OptimizerKind::Radam => "radam",
             OptimizerKind::Ranger => "ranger",
         }
     }
@@ -1299,8 +1232,8 @@ struct Args {
     #[arg(long, value_enum, required_unless_present = "count_teacher")]
     eval_type: Option<EvalType>,
 
-    /// Training backend. `bullet` is the existing generic backend.
-    /// `cuda-cpp` is the Windows-native C++/CUDA fixed-layout backend.
+    /// Training backend. BulletOu training is Windows-native C++/CUDA;
+    /// this option remains for explicit scripts and currently accepts only `cuda-cpp`.
     #[arg(long, value_enum, default_value = "cuda-cpp")]
     backend: BackendKind,
 
@@ -1436,11 +1369,9 @@ struct Args {
     #[arg(long, default_value = "0.000875")]
     lr: f32,
 
-    /// Optimizer used for training. The default is `ranger`, matching
-    /// the tatara reference recipe and bullet-shogi's shogi examples.
-    /// `ranger` is BulletOu's existing
-    /// RAdam+Lookahead implementation; it is useful for ablation against
-    /// nnue-pytorch's Ranger21, but is not a full Ranger21 clone.
+    /// Optimizer used for training. BulletOu currently exposes Ranger
+    /// (RAdam+Lookahead), matching the tatara reference recipe and
+    /// bullet-shogi's shogi examples.
     #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerKind,
 
@@ -1567,19 +1498,6 @@ struct Args {
     #[arg(long)]
     optimizer_beta2: Option<f32>,
 
-    /// Use nnue-pytorch-style layer-specific AdamW clipping for NNUE / SFNN
-    /// scalar value networks. Hidden weights use +/-127/64, while only the
-    /// final output weight tensor uses +/-127*127/(600*16). Default is off
-    /// for A/B comparisons.
-    #[arg(long)]
-    nnue_pytorch_layer_clip: bool,
-
-    /// Do not clip bias tensors in AdamW for NNUE / SFNN scalar value
-    /// networks. nnue-pytorch's WeightClippingCallback clips only selected
-    /// weight tensors, not biases. Default is off for A/B comparisons.
-    #[arg(long)]
-    nnue_pytorch_no_bias_clip: bool,
-
     /// f32 -> integer quantisation scale for the YaneuraOu KPPT output.
     /// If omitted, per-component defaults are used (4000 for KK/KKP, 400
     /// for KPP). Ignored by NNUE eval types.
@@ -1606,22 +1524,23 @@ struct Args {
     #[arg(long, default_value = "32")]
     batch_queue_size: usize,
 
-    /// Loader read buffer size in megabytes. PSV 1 record = 40 byte
-    /// なので `--buffer-mb 4096` で 107M 局面 (= 約 1 superbatch 分) が
-    /// read buffer に貯められる。BulletOu は学習時に追加シャッフルしないので、
-    /// 教師ファイルは事前にシャッフル済みのものを渡すこと。
+    /// Loader read buffer size in megabytes. PSV uses 40 bytes per record, so
+    /// `--buffer-mb 4096` can hold about 107M positions (roughly one default
+    /// superbatch) in the read buffer. BulletOu does not reshuffle during
+    /// training; pass pre-shuffled teacher files.
     ///
-    /// RAM 消費: buffer のみで `buffer_mb` MB。学習中の他の構造
-    /// (model / optimiser / batch queue) と合わせて peak はこの 2 倍弱を見込む。
+    /// RAM usage: the buffer itself is `buffer_mb` MB. Including model,
+    /// optimiser, and batch-queue data, expect peak memory to be somewhat
+    /// higher than this buffer alone.
     #[arg(long, default_value = "4096")]
     buffer_mb: usize,
 
-    /// HCPE デコード並列度。`0` (デフォルト) で auto =
-    /// `available_parallelism()` (= 論理コア数)。学習中に他プロセスへ
-    /// CPU を譲りたいときなどに `--loader-threads 8` 等で上限を絞れる。
-    /// 起動時に `read buffer ready: ... (N decode threads)` で
-    /// 実際に使われた値が表示される。
-    /// 現状 HCPE ローダーのみ反映 (HCPE3 / .pack / .psv は未対応)。
+    /// HCPE decode parallelism. `0` (default) means auto =
+    /// `available_parallelism()` (logical core count). Use
+    /// `--loader-threads 8` etc. to leave CPU for other processes. The actual
+    /// value is printed at startup as `read buffer ready: ... (N decode threads)`.
+    /// Currently this only affects the HCPE loader; HCPE3 / .pack / .psv do not
+    /// use this knob.
     #[arg(long, default_value = "0")]
     loader_threads: usize,
 
@@ -1652,19 +1571,6 @@ struct Args {
     /// behaviour for A/B comparisons.
     #[arg(long)]
     sfnn_factorized_l1: bool,
-
-    /// Dump SFNN / LayerStack activation saturation statistics on the
-    /// held-out `--test-teacher` positions at startup and after each save.
-    /// Currently supported for SFNN eval types only.
-    #[arg(long)]
-    dump_activation_stats: bool,
-
-    /// Number of `--test-teacher` positions used for
-    /// `--dump-activation-stats`. This is intentionally independent of
-    /// `--test-positions` because the CPU-side diagnostic is heavier than
-    /// normal GPU validation.
-    #[arg(long, default_value = "1024")]
-    activation_stats_positions: usize,
 
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
@@ -1743,18 +1649,6 @@ impl Args {
         self.net_id.clone().unwrap_or_else(|| self.eval_type().default_net_id().to_string())
     }
 
-    /// YaneuraOu integer-quantisation scale to multiply into f32 weights at
-    /// save time. The KPPT components have different defaults
-    /// (`KPPT_KK_DEFAULT_QUANT_SCALE` etc.); `run_kppt_all` injects the
-    /// right value into each child Args before calling
-    /// `run_kppt_kk` / `run_kppt_kkp` / `run_kppt_kpp`. By the time this is
-    /// read inside `run_training_inline!`, `yaneuraou_quant_scale` is
-    /// always populated (either by the user via the CLI flag or by the
-    /// parent run helper).
-    fn yaneuraou_scale(&self) -> f32 {
-        self.yaneuraou_quant_scale.expect("yaneuraou_quant_scale must be set before invoking the KPPT trainer")
-    }
-
     fn kpp_format(&self) -> KppFormat {
         self.eval_type().kpp_format()
     }
@@ -1798,10 +1692,7 @@ impl Args {
     }
 
     fn validate_backend_flags(&self) -> Result<(), String> {
-        match self.backend {
-            BackendKind::Bullet => Ok(()),
-            BackendKind::CudaCpp => self.validate_cuda_cpp_backend_options(),
-        }
+        self.validate_cuda_cpp_backend_options()
     }
 
     fn validate_cuda_cpp_backend_options(&self) -> Result<(), String> {
@@ -1898,11 +1789,6 @@ impl Args {
                     .to_string(),
             );
         }
-        if self.nnue_pytorch_layer_clip || self.nnue_pytorch_no_bias_clip {
-            return Err(
-                "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
-            );
-        }
         if !production_schedule
             && (self.max_epochs.is_some()
                 || self.lr_schedule != LrScheduleKind::Step
@@ -1945,29 +1831,6 @@ impl Args {
     }
 }
 
-type ValueLossFn = for<'a> fn(ModelNode<'a>, ModelNode<'a>) -> ModelNode<'a>;
-
-fn sigmoid_mse_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>) -> ModelNode<'a> {
-    output.sigmoid().squared_error(target)
-}
-
-fn nnue_pytorch_wrm_value_loss<'a>(output: ModelNode<'a>, target: ModelNode<'a>) -> ModelNode<'a> {
-    const NNUE2SCORE: f32 = 600.0;
-    const IN_OFFSET: f32 = 270.0;
-    const IN_SCALING: f32 = 340.0;
-    const POW_EXP: f32 = 2.5;
-
-    let scorenet = output * NNUE2SCORE;
-    let q = ((scorenet - IN_OFFSET) / IN_SCALING).sigmoid();
-    let qm = ((-scorenet - IN_OFFSET) / IN_SCALING).sigmoid();
-    let prediction = (1.0 + q - qm) * 0.5;
-    prediction.power_error(target, POW_EXP)
-}
-
-fn value_loss_fn(args: &Args) -> ValueLossFn {
-    if args.nnue_pytorch_wrm_loss { nnue_pytorch_wrm_value_loss } else { sigmoid_mse_value_loss }
-}
-
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
     if args.nnue_pytorch_wrm_loss {
         ValidationLossKind::NnuePytorchWrm
@@ -1976,49 +1839,9 @@ fn validation_loss_kind(args: &Args) -> ValidationLossKind {
     }
 }
 
-const BULLETOU_DEFAULT_ADAMW_CLIP: f32 = 1.98;
-const NNUE_PYTORCH_HIDDEN_CLIP: f32 = 127.0 / 64.0;
-const NNUE_PYTORCH_OUTPUT_CLIP: f32 = 127.0 * 127.0 / (600.0 * 16.0);
-const ADAMW_UNCLIPPED_BIAS_LIMIT: f32 = 1.0e30;
+const BULLETOU_DEFAULT_RANGER_CLIP: f32 = 1.98;
 #[cfg(feature = "cuda-cpp-backend")]
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
-
-fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
-    let mut params = optimiser::AdamWParams {
-        decay: args.optimizer_weight_decay,
-        min_weight: -clip,
-        max_weight: clip,
-        ..Default::default()
-    };
-    if let Some(epsilon) = args.optimizer_epsilon {
-        params.epsilon = epsilon;
-    }
-    if let Some(beta1) = args.optimizer_beta1 {
-        params.beta1 = beta1;
-    }
-    if let Some(beta2) = args.optimizer_beta2 {
-        params.beta2 = beta2;
-    }
-    params
-}
-
-fn radam_params(args: &Args, clip: f32) -> bullet_trainer::optimiser::radam::RAdamParams {
-    let mut params = bullet_trainer::optimiser::radam::RAdamParams {
-        decay: args.optimizer_weight_decay,
-        clip: Some((-clip, clip)),
-        ..Default::default()
-    };
-    if let Some(epsilon) = args.optimizer_epsilon {
-        params.epsilon = epsilon;
-    }
-    if let Some(beta1) = args.optimizer_beta1 {
-        params.beta1 = beta1;
-    }
-    if let Some(beta2) = args.optimizer_beta2 {
-        params.beta2 = beta2;
-    }
-    params
-}
 
 fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
     let mut params = optimiser::RangerParams {
@@ -2039,181 +1862,16 @@ fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
     params
 }
 
-trait BulletouOptimizer: optimiser::OptimiserType + Default {
-    fn configure<Inp, Out>(
-        args: &Args,
-        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
-        output_weight_ids: &[&str],
-        bias_ids: &[&str],
-    ) where
-        Inp: SparseInputType,
-        Out: OutputBuckets<Inp::RequiredDataType>;
-}
-
-impl BulletouOptimizer for optimiser::AdamW {
-    fn configure<Inp, Out>(
-        args: &Args,
-        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
-        output_weight_ids: &[&str],
-        bias_ids: &[&str],
-    ) where
-        Inp: SparseInputType,
-        Out: OutputBuckets<Inp::RequiredDataType>,
-    {
-        let global_clip =
-            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
-        trainer.optimiser.set_params(adamw_params(args, global_clip));
-
-        if args.nnue_pytorch_layer_clip {
-            let output_params = adamw_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
-            for id in output_weight_ids {
-                trainer.optimiser.set_params_for_weight(id, output_params);
-            }
-        }
-
-        if args.nnue_pytorch_no_bias_clip {
-            let bias_params = adamw_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
-            for id in bias_ids {
-                trainer.optimiser.set_params_for_weight(id, bias_params);
-            }
-        }
-    }
-}
-
-impl BulletouOptimizer for optimiser::RAdam {
-    fn configure<Inp, Out>(
-        args: &Args,
-        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
-        output_weight_ids: &[&str],
-        bias_ids: &[&str],
-    ) where
-        Inp: SparseInputType,
-        Out: OutputBuckets<Inp::RequiredDataType>,
-    {
-        let global_clip =
-            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
-        trainer.optimiser.set_params(radam_params(args, global_clip));
-
-        if args.nnue_pytorch_layer_clip {
-            let output_params = radam_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
-            for id in output_weight_ids {
-                trainer.optimiser.set_params_for_weight(id, output_params);
-            }
-        }
-
-        if args.nnue_pytorch_no_bias_clip {
-            let bias_params = radam_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
-            for id in bias_ids {
-                trainer.optimiser.set_params_for_weight(id, bias_params);
-            }
-        }
-    }
-}
-
-impl BulletouOptimizer for optimiser::Ranger {
-    fn configure<Inp, Out>(
-        args: &Args,
-        trainer: &mut ValueTrainer<Self::Optimiser, Inp, Out>,
-        output_weight_ids: &[&str],
-        bias_ids: &[&str],
-    ) where
-        Inp: SparseInputType,
-        Out: OutputBuckets<Inp::RequiredDataType>,
-    {
-        let global_clip =
-            if args.nnue_pytorch_layer_clip { NNUE_PYTORCH_HIDDEN_CLIP } else { BULLETOU_DEFAULT_ADAMW_CLIP };
-        trainer.optimiser.set_params(ranger_params(args, global_clip));
-
-        if args.nnue_pytorch_layer_clip {
-            let output_params = ranger_params(args, NNUE_PYTORCH_OUTPUT_CLIP);
-            for id in output_weight_ids {
-                trainer.optimiser.set_params_for_weight(id, output_params);
-            }
-        }
-
-        if args.nnue_pytorch_no_bias_clip {
-            let bias_params = ranger_params(args, ADAMW_UNCLIPPED_BIAS_LIMIT);
-            for id in bias_ids {
-                trainer.optimiser.set_params_for_weight(id, bias_params);
-            }
-        }
-    }
-}
-
-fn configure_optimizer<O, Inp, Out>(
-    args: &Args,
-    trainer: &mut ValueTrainer<O::Optimiser, Inp, Out>,
-    output_weight_ids: &[&str],
-    bias_ids: &[&str],
-) where
-    O: BulletouOptimizer,
-    Inp: SparseInputType,
-    Out: OutputBuckets<Inp::RequiredDataType>,
-{
-    O::configure(args, trainer, output_weight_ids, bias_ids);
-}
-
 // ----- epoch period ------------------------------------------------------
-
-/// Compute the warm-restart cycle period (= one epoch's positions), shared by
-/// `step`, `geometric`, and `cos` schedules.
-///
-/// Semantics:
-/// - If `--superbatches N` is set, period = `N * effective_sb_size`.
-///   `effective_sb_size` is `--positions-per-superbatch` rounded down to
-///   a multiple of `--batch-size`. This is the most common case: 1 cycle
-///   per epoch.
-/// - Otherwise (= unlimited sb cap), fall back to the teacher's total
-///   position count. For HCPE / PSV (fixed-length records) we just
-///   read `file_size / record_size` per file. HCPE3 / pack (variable
-///   length) would need to walk every game so this combination is
-///   rejected — the user is expected to set `--superbatches` for
-///   variable-length teachers.
-fn auto_epoch_period(
-    args: &Args,
-    format: DataFormat,
-    data_files: &[String],
-    batches_per_superbatch: usize,
-) -> Result<u64, String> {
-    let sb_size = (batches_per_superbatch as u64) * (effective_batch_size(args) as u64);
-    if let Some(superbatches) = args.superbatches {
-        return Ok(sb_size * (superbatches as u64));
-    }
-    let record_size: u64 = match format {
-        DataFormat::Hcpe => 38,
-        DataFormat::Psv => 40,
-        DataFormat::Hcpe3 | DataFormat::Pack => {
-            return Err(format!(
-                "position-based LR schedule with variable-length teacher format \
-                 ({format:?}) requires --superbatches to be set so the \
-                 cosine cycle period is well-defined (no way to compute \
-                 epoch length without walking the file). Use \
-                 --count-teacher on an equivalent HCPE / PSV teacher \
-                 to estimate the right --superbatches value."
-            ));
-        }
-    };
-    let mut total: u64 = 0;
-    for p in data_files {
-        let size = std::fs::metadata(p).map_err(|e| format!("stat {p}: {e}"))?.len();
-        if size % record_size != 0 {
-            return Err(format!(
-                "{p}: size {size} not a multiple of {record_size} byte — \
-                 possibly corrupted / truncated"
-            ));
-        }
-        total += size / record_size;
-    }
-    Ok(total)
-}
 
 // ----- count-teacher -----------------------------------------------------
 
-/// `--count-teacher` 実装: `--teacher` の指す全ファイルの局面数を集計して
-/// stdout に出す。HCPE (38 byte 固定長) / PSV (40 byte 固定長) は file size
-/// から即計算。HCPE3 / pack は可変長なので拒否 (= 別途 walker が必要)。
+/// Count positions in all files passed via `--teacher` and print the result to
+/// stdout. HCPE (38-byte fixed record) and PSV (40-byte fixed record) can be
+/// computed from file size; HCPE3 / pack are variable-length and are rejected.
 ///
-/// 1 sb ≒ 100M 局面に対して `--superbatches N` を選ぶための補助。
+/// Helper for choosing `--superbatches N` relative to the default ~100M-position
+/// superbatch.
 fn run_count_teacher(teacher: &str) -> Result<(), String> {
     let paths = expand_teacher(teacher)?;
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
@@ -2239,7 +1897,7 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         let size = meta.len();
         if size % record_size != 0 {
             return Err(format!(
-                "{path}: size {size} is not a multiple of {record_size} byte — \
+                "{path}: size {size} is not a multiple of {record_size} byte -- \
                  possibly corrupted / truncated"
             ));
         }
@@ -2616,16 +2274,6 @@ fn main() {
         eprintln!("error: --sfnn-factorized-l1 currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
-    if args.dump_activation_stats {
-        if !args.eval_type().uses_layerstack() {
-            eprintln!("error: --dump-activation-stats currently supports SFNN / LayerStack eval types only.");
-            std::process::exit(2);
-        }
-        if args.activation_stats_positions == 0 {
-            eprintln!("error: --activation-stats-positions must be > 0.");
-            std::process::exit(2);
-        }
-    }
     // `geometric` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
     // `step` and `plateau` reduce `--lr` multiplicatively down to
     // `--lr-min`. `--lr-min` must be > 0 for geometric/multiplicative schedules.
@@ -2686,14 +2334,6 @@ fn main() {
         eprintln!("error: --nnue-pytorch-wrm-loss currently applies to NNUE / SFNN eval types only.");
         std::process::exit(2);
     }
-    if args.nnue_pytorch_layer_clip && !args.eval_type().uses_arch() {
-        eprintln!("error: --nnue-pytorch-layer-clip currently applies to NNUE / SFNN eval types only.");
-        std::process::exit(2);
-    }
-    if args.nnue_pytorch_no_bias_clip && !args.eval_type().uses_arch() {
-        eprintln!("error: --nnue-pytorch-no-bias-clip currently applies to NNUE / SFNN eval types only.");
-        std::process::exit(2);
-    }
     if args.lr_schedule == LrScheduleKind::Plateau {
         if args.test_teacher.is_none() {
             eprintln!("error: --lr-schedule plateau requires --test-teacher so validation metrics can be monitored.");
@@ -2732,91 +2372,15 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
-    if args.backend == BackendKind::CudaCpp {
-        if !args.cuda_cpp_smoke {
-            prepare_resume_config_or_exit(&args);
-            if let Err(e) = record_invocation_to_tag_txt(&args) {
-                eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
-            }
+    if !args.cuda_cpp_smoke {
+        prepare_resume_config_or_exit(&args);
+        if let Err(e) = record_invocation_to_tag_txt(&args) {
+            eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
         }
-        if let Err(e) = run_cuda_cpp_backend(&args) {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }
-        return;
     }
-    if args.batch_size.is_none() {
-        eprintln!("  batch size = {} (auto for {})", effective_batch_size(&args), args.eval_type().cli_name());
-    }
-    if args.nnue_pytorch_wrm_loss {
-        eprintln!("  nnue-pytorch WRM loss = enabled");
-    }
-    if args.optimizer != OptimizerKind::Ranger {
-        eprintln!("  optimizer = {}", args.optimizer.cli_name());
-    }
-    if args.optimizer_weight_decay != 0.0 {
-        eprintln!("  optimizer weight decay = {}", args.optimizer_weight_decay);
-    }
-    if let Some(epsilon) = args.optimizer_epsilon {
-        eprintln!("  optimizer epsilon = {}", epsilon);
-    }
-    if let Some(beta1) = args.optimizer_beta1 {
-        eprintln!("  optimizer beta1 = {}", beta1);
-    }
-    if let Some(beta2) = args.optimizer_beta2 {
-        eprintln!("  optimizer beta2 = {}", beta2);
-    }
-    if args.lr_schedule == LrScheduleKind::Plateau {
-        eprintln!("  plateau monitor = {}", args.lr_plateau_monitor.cli_name());
-    }
-    if args.lr_schedule == LrScheduleKind::Step {
-        let (gamma, auto_gamma) = effective_lr_step_gamma(&args, batches_per_superbatch).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-        let gamma_source = if args.lr_step_gamma.is_some() {
-            "explicit"
-        } else if auto_gamma {
-            "auto"
-        } else {
-            "default"
-        };
-        eprintln!(
-            "  step scheduler = gamma {} ({gamma_source}), step_positions {}, epoch_positions {}",
-            gamma,
-            args.lr_step_positions.map(|v| v.to_string()).unwrap_or_else(|| "one superbatch".to_string()),
-            args.superbatches
-                .map(|n| (n as u64)
-                    .saturating_mul(effective_batch_size(&args) as u64)
-                    .saturating_mul(batches_per_superbatch as u64)
-                    .to_string())
-                .unwrap_or_else(|| "open-ended".to_string())
-        );
-    }
-    if args.nnue_pytorch_layer_clip {
-        eprintln!(
-            "  nnue-pytorch layer clipping = enabled (hidden +/-{:.6}, output weight +/-{:.6})",
-            NNUE_PYTORCH_HIDDEN_CLIP, NNUE_PYTORCH_OUTPUT_CLIP
-        );
-    }
-    if args.nnue_pytorch_no_bias_clip {
-        eprintln!("  nnue-pytorch bias clipping = disabled");
-    }
-    prepare_resume_config_or_exit(&args);
-    if let Err(e) = record_invocation_to_tag_txt(&args) {
-        eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
-    }
-    match args.eval_type() {
-        EvalType::Kppt | EvalType::KppKkpt => run_kppt_all(&args),
-        EvalType::NnueHalfkp => run_halfkp(&args),
-        EvalType::NnueKp => run_kp(&args),
-        EvalType::NnueKa2 => run_nnue_ka2(&args),
-        EvalType::NnueHalfkpe9 => run_halfkpe9(&args),
-        EvalType::NnueHalfkpvm => run_halfkpvm(&args),
-        EvalType::SfnnHalfka1hm => run_sfnn_1536(&args, ShogiHalfKaHm1, NnueFeatureSet::HalfKaHm1),
-        EvalType::SfnnHalfka2hm => run_sfnn_1536(&args, ShogiHalfKaHm2, NnueFeatureSet::HalfKaHm2),
-        EvalType::SfnnHalfka2 => run_sfnn_1536(&args, ShogiHalfKa2, NnueFeatureSet::HalfKa2),
-        EvalType::SfnnKa2 => run_sfnn_1536(&args, ShogiKa2, NnueFeatureSet::Ka2),
+    if let Err(e) = run_cuda_cpp_backend(&args) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
 }
 
@@ -3685,7 +3249,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
@@ -4332,7 +3896,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         chunk_last_pos = teacher_batch.dataloader_pos;
                         let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
                         let fast = teacher_batch.batch;
-                        let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+                        let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
                         let params = RangerUpdateParams {
                             radam: RAdamUpdateParams {
                                 step: optimizer_step as u64,
@@ -4590,7 +4154,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
@@ -5105,7 +4669,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     chunk_last_pos = teacher_batch.dataloader_pos;
                     let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
                     let fast = teacher_batch.batch;
-                    let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+                    let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
                     let params = RangerUpdateParams {
                         radam: RAdamUpdateParams {
                             step: optimizer_step as u64,
@@ -5352,7 +4916,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
@@ -7898,8 +7462,6 @@ fn resume_signature(args: &Args) -> String {
             "optimizer_beta2={}",
             args.optimizer_beta2.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
         ),
-        format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
-        format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", effective_save_rate(args)),
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
@@ -7953,10 +7515,6 @@ fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::
 
 fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     find_latest_state_bin_raw(output_dir).and_then(|p| p.parent().map(|dir| dir.to_path_buf()))
-}
-
-fn latest_checkpoint_has_file(output_dir: &std::path::Path, filename: &str) -> bool {
-    latest_checkpoint_dir(output_dir).map(|dir| dir.join(filename).is_file()).unwrap_or(false)
 }
 
 fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
@@ -8038,105 +7596,6 @@ fn prepare_resume_config_or_exit(args: &Args) {
     }
 }
 
-// ----- KPPT family: KK + KKP + KPP sequential dispatch -------------------
-
-/// Run the three KPPT components (KK, KKP, KPP) sequentially, then assemble
-/// the three resulting `.bin` files into `<output>/final/` so the engine has
-/// a single directory to point at.
-///
-/// `--eval-type KPPT` uses the KPPT KPP layout (int16 × 2, with turn channel).
-/// `--eval-type KPP_KKPT` uses the KPP_KKPT KPP layout (int16, no turn channel).
-fn run_kppt_all(args: &Args) {
-    let output_dir = args.output_dir();
-
-    eprintln!("=== bulletou: running {} family (3 components) ===", args.eval_type().cli_name());
-
-    // ---- Resume support -------------------------------------------------
-    // If `<output>` already contains a numbered dir with a `state.bin`,
-    // unbundle each component's records into a per-component
-    // `optimiser_state/` triplet under `<output>/.bulletou_resume/<comp>/`,
-    // and let each child run_kppt_* call `trainer.load_from_checkpoint(<comp>)`
-    // immediately after building its trainer.
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dirs: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> =
-        resume_state_bin.as_ref().map(|state_bin_path| {
-            eprintln!("=== resume detected: {} ===", state_bin_path.display());
-            let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-                eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-                std::process::exit(1);
-            });
-            let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-                eprintln!("error: failed to parse state.bin: {e}");
-                std::process::exit(1);
-            });
-            let resume_root = output_dir.join(".bulletou_resume");
-            // Fresh extraction each run; old contents may correspond to a
-            // different save point.
-            let _ = std::fs::remove_dir_all(&resume_root);
-            let mut paths: Vec<std::path::PathBuf> = Vec::new();
-            for comp in ["kk", "kkp", "kpp"] {
-                let comp_dir = resume_root.join(comp);
-                unbundle_component_state(&records, comp, &comp_dir.join("optimiser_state")).unwrap_or_else(|e| {
-                    eprintln!("error: state.bin missing `{comp}/*` records: {e}");
-                    std::process::exit(1);
-                });
-                paths.push(comp_dir);
-            }
-            (paths[0].clone(), paths[1].clone(), paths[2].clone())
-        });
-
-    // Each component gets its own child Args with the right net_id +
-    // component-specific yaneuraou_quant_scale default (user override via
-    // `--yaneuraou-quant-scale` is preserved). The parent's `args.eval_type`
-    // (KPPT or KPP_KKPT) flows through unchanged so `args.kpp_format()`
-    // inside `run_kppt_kpp` selects the right on-disk KPP layout.
-    let make_child = |net_id: &str, default_quant_scale: f32| -> Args {
-        let mut child = args.clone();
-        child.net_id = Some(net_id.to_string());
-        if child.yaneuraou_quant_scale.is_none() {
-            child.yaneuraou_quant_scale = Some(default_quant_scale);
-        }
-        child
-    };
-
-    eprintln!("\n=== [KK] training ===");
-    let child_kk = make_child("kk", KPPT_KK_DEFAULT_QUANT_SCALE);
-    run_kppt_kk(&child_kk, resume_dirs.as_ref().map(|d| d.0.as_path()));
-
-    eprintln!("\n=== [KKP] training ===");
-    let child_kkp = make_child("kkp", KPPT_KKP_DEFAULT_QUANT_SCALE);
-    run_kppt_kkp(&child_kkp, resume_dirs.as_ref().map(|d| d.1.as_path()));
-
-    eprintln!("\n=== [KPP] training ===");
-    let child_kpp = make_child("kpp", KPPT_KPP_DEFAULT_QUANT_SCALE);
-    run_kppt_kpp(&child_kpp, resume_dirs.as_ref().map(|d| d.2.as_path()));
-
-    // Cleanup the scratch resume dir if it was used.
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    // Re-organise per-component checkpoint subdirs into a flat, zero-padded
-    // series `0001/`, `0002/`, ..., each containing the three `.bin` files
-    // at the corresponding save point. The original `kk-*/` / `kkp-*/` /
-    // `kpp-*/` subdirs are removed after assembly.
-    let ctx = LogContext::from_args(args, 0);
-    let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
-    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_BULLET, None) {
-        Ok((_first_idx, last_idx)) => {
-            // Append the new run's per-sb summary rows to a top-level
-            // `<output>/summary-learn.log` so the user has a single
-            // growing file spanning all resumes. Per-save
-            // `<output>/0NNN/learn.log` files are kept as snapshots.
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to assemble numbered checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 /// CSV header for per-save `0NNN/learn.log`. The top-level
 /// `<output>/summary-learn.log` uses [`SUMMARY_LEARN_LOG_HEADER`] because
 /// it drops `curr_batch`. Column meanings (12 total):
@@ -8155,8 +7614,9 @@ fn run_kppt_all(args: &Args) {
 ///   (= `--positions-per-superbatch` rounded down to whole batches).
 /// - `curr_batch`: 1-indexed batch counter within the current superbatch
 ///   (= the `curr_batch` field bullet records every 32 batches: 32, 64,
-///   96, ...). Combine with `superbatch` for "(superbatch − 1) ×
-///   effective_batches_per_superbatch + curr_batch" to get the total batch count.
+///   96, ...). Combine with `superbatch` for
+///   `(superbatch - 1) * effective_batches_per_superbatch + curr_batch` to get
+///   the total batch count.
 /// - `value_loss`: bullet's per-32-batch loss value at that point.
 /// - `lr_start`: learning rate at the start of the row's interval.
 /// - `lr_end`: learning rate used by the last batch in the row's interval.
@@ -8217,8 +7677,8 @@ struct LogContext {
     /// `CosineLR::lr_at_positions` (cos).
     lr_schedule: LrScheduleKind,
     /// Period of one warm-restart cycle (= one epoch's worth of
-    /// positions), shared by both schedules. Computed via
-    /// [`auto_epoch_period`] at training start.
+    /// positions), shared by step/geometric/cos schedules. In cuda-cpp
+    /// training this comes from [`cuda_cpp_run_schedule`].
     lr_period: u64,
     /// Decay factor and interval used by `step`.
     lr_step_gamma: f32,
@@ -8243,14 +7703,11 @@ fn resolve_teacher_for_log(teacher: &str) -> String {
 }
 
 impl LogContext {
-    /// `lr_cosine_period_override` is the cosine cycle period in
-    /// positions, pre-computed by [`auto_epoch_period`] when the
-    /// `lr_period_override` is the warm-restart cycle period (= one
-    /// epoch's positions), pre-computed by [`auto_epoch_period`] when
-    /// training is about to run. Both step and cos schedules share
-    /// the same period. For non-training callers (post-training log
-    /// enrich paths), pass 0; the lr column in enrich is only
-    /// meaningful when we know what the trainer actually used.
+    /// `lr_period_override` is the warm-restart cycle period (= one epoch's
+    /// positions), computed by the cuda-cpp run schedule before training.
+    /// For non-training callers (post-training log enrich paths), pass 0;
+    /// the lr column in enrich is only meaningful when we know what the
+    /// trainer actually used.
     fn from_args(args: &Args, lr_period_override: u64) -> Self {
         let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
             eprintln!("error: {e}");
@@ -8684,7 +8141,7 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
 }
 
 /// Append the body of the latest save dir's `learn.log` (already enriched
-/// 12-column CSV from `assemble_numbered_dirs` / `finalize_nnue_dirs`) onto
+/// 12-column CSV from cuda-cpp checkpoint writing / `assemble_numbered_dirs`) onto
 /// the top-level `<output>/summary-learn.log`, writing the CSV header on first
 /// file creation. The result is a single pure CSV — no section headers,
 /// no separators — that pandas / Excel can load directly.
@@ -8947,7 +8404,7 @@ fn run_kppt_component_dirs_final_validation(
 }
 
 /// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
-/// produced by the three children of `run_kppt_all`, and assemble them into
+/// produced by the cuda-cpp KPPT component trainers, and assemble them into
 /// flat `<output>/0001/`, `0002/`, ... directories each containing the
 /// three `.bin` files. Removes the per-component subdirs after assembly so
 /// the user sees a clean numbered layout.
@@ -9019,7 +8476,7 @@ fn assemble_numbered_dirs(
                 std::fs::copy(src, dst.join(name))?;
             }
         }
-        // bundle the three components' resume state (Adam weights + momentum + velocity)
+        // Bundle the three components' resume state (weights + Ranger optimizer state).
         // into a single `state.bin` so the dir holds everything needed to resume.
         let mut state_buf: Vec<u8> = write_state_backend_marker(state_backend);
         bundle_component_state(&mut state_buf, "kk", &kk_dir.join("optimiser_state"))?;
@@ -9063,464 +8520,6 @@ fn assemble_numbered_dirs(
     }
 
     Ok((existing_count + 1, existing_count + n))
-}
-
-// `Trainer<G, O, S>` の concrete type は bullet API として直接露出していないので、
-// 3 branch を generic helper でまとめる代わりに、共通の schedule / settings /
-// loader dispatch をマクロで encapsulate する。
-//
-// 各 branch は: (a) save_format / weight ID を決め、(b) ValueTrainerBuilder で
-// trainer を構築し、(c) `run_training_inline!(args, trainer)` を呼ぶ。
-macro_rules! run_training_inline {
-    ($args:expr, $trainer:expr) => {{
-        let args: &Args = $args;
-        let trainer = $trainer;
-
-        let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-
-        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-        let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-
-        let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-
-        // --superbatches が未指定なら epoch ごとに loader EOF まで回す (= usize::MAX で
-        // 上限なし、loader 側で EOF が来たら trainer.run が返る)。
-        let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
-        let teacher_single_epoch = args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
-
-        let net_id_base = args.net_id();
-        let output_dir_buf = args.output_dir();
-        let yaneuraou_scale = args.yaneuraou_scale();
-        let kpp_format = args.kpp_format();
-        let max_epochs = effective_max_epochs(args);
-
-        let output_dir_str = args.output_dir();
-        let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
-
-        // Warm-restart cycle period = one epoch's positions. `step`,
-        // `geometric`, and `cos` use this period; `plateau` is validation-driven.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
-            || (matches!(args.lr_schedule, LrScheduleKind::Step) && args.superbatches.is_none())
-        {
-            0
-        } else {
-            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(2);
-            })
-        };
-        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
-        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)
-            .unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(2);
-            })
-            .0;
-
-        // Tracks whether bullet fired the save callback at least once across
-        // all epochs. If 教師 is smaller than a single superbatch (or any
-        // other reason no superbatch boundary is crossed), bullet writes no
-        // checkpoint at all and we'd end up with an empty output dir. After
-        // all epochs finish we check this flag and, if no save happened, do
-        // a final fallback save so at least the current trainer state is
-        // persisted. This is *not* an EOF-triggered save — it fires exactly
-        // once per training run and only as a last resort.
-        let saved_any = std::cell::Cell::new(false);
-        let trained_without_save = std::cell::Cell::new(false);
-        // Remember the last per-epoch net_id we used so the fallback save can
-        // reuse the same naming convention (so assembly pairs the dirs by
-        // sort order alongside any future numbered checkpoints).
-        let mut last_net_id_for_epoch: String = net_id_base.clone();
-        // The error_record returned by the most recent `trainer.run` call.
-        // bullet writes `log.txt` itself at each save, but if zero saves
-        // happened we need to write it ourselves in the fallback path.
-        let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
-
-        // First-time CUDA setup heads-up: see comment in the NNUE macro
-        // for the full story. Same warning applies to KPPT training.
-        eprintln!(
-            "  note: first-batch run will trigger CUDA JIT-compile of GPU kernels\n  \
-             (≈30–60s on first run for this GPU model; cached afterwards). \
-             If both CPU and\n  GPU look idle for a minute, that is expected — \
-             the NVIDIA driver is compiling."
-        );
-
-        // KPPT macro: persistent HCPE loader hoisting is NOT applied here
-        // (= no cb_dataloader_resume_offset in scope, this code path doesn't
-        // wire the saved-pointer resume). KPPT-with-HCPE is rare; the per-chunk
-        // loader creation remains.
-        let persistent_hcpe_loader: Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> = None;
-
-        for epoch in 1..=max_epochs {
-            print_epoch_banner(epoch, max_epochs);
-
-            // checkpoint dir 名は max_epochs=1 のとき従来通り `<net_id>-<superbatch>`、
-            // 複数 epoch のときは `<net_id>-e<epoch>-<superbatch>` で重複を避ける。
-            let net_id_for_epoch = if max_epochs > 1 { format!("{net_id_base}-e{epoch}") } else { net_id_base.clone() };
-            last_net_id_for_epoch = net_id_for_epoch.clone();
-
-            let schedule = TrainingSchedule {
-                net_id: net_id_for_epoch.clone(),
-                eval_scale: args.scale as f32,
-                steps: TrainingSteps {
-                    batch_size: effective_batch_size(args),
-                    batches_per_superbatch,
-                    // KPPT family does not get auto-resume yet (the 3-component
-                    // assembly makes the bookkeeping non-trivial); always starts at sb=1.
-                    start_superbatch: 1,
-                    end_superbatch,
-                },
-                wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                // KPPT family uses positions-based LR for consistency
-                // with the NNUE family, but does not currently track
-                // cumulative `prior_positions` across resumes (KPPT
-                // resume support is itself limited), so prior is 0.
-                lr_scheduler: match args.lr_schedule {
-                    LrScheduleKind::Step => LrSchedulerImpl::Step(StepLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        gamma: lr_step_gamma,
-                        step_positions: lr_step_positions,
-                        period_positions: lr_period,
-                        prior_positions: 0,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        period_positions: lr_period,
-                        prior_positions: 0,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        period_positions: lr_period,
-                        prior_positions: 0,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Plateau => LrSchedulerImpl::Fixed(FixedLR { value: args.lr }),
-                },
-                save_rate: effective_save_rate(args),
-                save_epoch_end: effective_save_epoch_end(args),
-            };
-
-            let net_id_for_cb = net_id_for_epoch.clone();
-            let output_dir_for_cb = output_dir_buf.clone();
-            let saved_any_ref = &saved_any;
-            let on_checkpoint_saved = move |superbatch: usize| {
-                saved_any_ref.set(true);
-                let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
-                match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
-                    Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
-                    Err(e) => {
-                        eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display())
-                    }
-                }
-            };
-
-            let settings = LocalSettings {
-                threads: args.threads,
-                test_set: None,
-                output_directory: output_dir,
-                batch_queue_size: args.batch_queue_size,
-                on_checkpoint_saved: Some(&on_checkpoint_saved),
-            };
-
-            last_error_record = match format {
-                DataFormat::Hcpe => {
-                    // KPPT path: chunk-local loader (no persistent producer
-                    // hoisting here; the macro lacks the resume-offset wiring
-                    // that the NNUE macro has).
-                    let _ = &persistent_hcpe_loader; // suppress unused
-                    let loader = HcpeDataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_loader_threads(args.loader_threads)
-                        .with_single_epoch(teacher_single_epoch);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Hcpe3 => {
-                    let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_single_epoch(teacher_single_epoch);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Pack => {
-                    let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                        .with_single_epoch(teacher_single_epoch);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-                DataFormat::Psv => {
-                    let loader =
-                        DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(teacher_single_epoch);
-                    trainer.run(&schedule, &settings, &loader)
-                }
-            };
-            if !effective_save_epoch_end(args)
-                && end_superbatch != usize::MAX
-                && !end_superbatch.is_multiple_of(effective_save_rate(args).max(1))
-                && error_record_completed_superbatch(&last_error_record, end_superbatch, batches_per_superbatch)
-            {
-                trained_without_save.set(true);
-                eprintln!(
-                    "  checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
-                    epoch, end_superbatch
-                );
-            }
-        }
-
-        // End-of-training fallback save (see the comment on `saved_any`):
-        // executes only when bullet never crossed a superbatch boundary,
-        // except when the run intentionally ended on a train-only tail via
-        // `--no-save-epoch-end`.
-        if !saved_any.get() && !trained_without_save.get() {
-            let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
-            eprintln!(
-                "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
-                ckpt_dir.display()
-            );
-            let ckpt_dir_str = ckpt_dir.to_str().expect("checkpoint path is utf-8");
-            trainer.save_to_checkpoint(ckpt_dir_str);
-            // bullet's save loop normally writes `log.txt` itself, but for the
-            // fallback path no save ever fired, so write the in-memory loss
-            // record (same `superbatch,batch,loss` CSV format) ourselves.
-            if let Err(e) = write_loss_csv(&ckpt_dir.join("log.txt"), &last_error_record) {
-                eprintln!("  WARN: failed to write log.txt in {}: {e}", ckpt_dir.display());
-            }
-            match save_yaneuraou_eval(&ckpt_dir, yaneuraou_scale, kpp_format) {
-                Ok(()) => eprintln!("  also wrote YaneuraOu eval binary in {}", ckpt_dir.display()),
-                Err(e) => eprintln!("  WARN: failed to write YaneuraOu eval binary in {}: {e}", ckpt_dir.display()),
-            }
-        }
-    }};
-}
-
-/// Write loss records as CSV (`superbatch,batch,loss`), matching the format
-/// bullet writes to `log.txt` at each save. Used by the end-of-training
-/// fallback save path.
-fn write_loss_csv(path: &std::path::Path, records: &[(usize, usize, f32)]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    for (sb, b, loss) in records {
-        writeln!(file, "{sb},{b},{loss}")?;
-    }
-    Ok(())
-}
-
-fn error_record_completed_superbatch(
-    records: &[(usize, usize, f32)],
-    superbatch: usize,
-    batches_per_superbatch: usize,
-) -> bool {
-    records.iter().any(|(sb, batch, _)| *sb == superbatch && *batch == batches_per_superbatch)
-}
-
-// ----- KPPT: KK ---------------------------------------------------------
-
-fn run_kppt_kk(args: &Args, resume_dir: Option<&std::path::Path>) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_kppt_kk_impl::<optimiser::AdamW>(args, resume_dir),
-        OptimizerKind::Radam => run_kppt_kk_impl::<optimiser::RAdam>(args, resume_dir),
-        OptimizerKind::Ranger => run_kppt_kk_impl::<optimiser::Ranger>(args, resume_dir),
-    }
-}
-
-fn run_kppt_kk_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
-    let qa: i16 = 256;
-    let qb: i16 = 64;
-    let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
-
-    let save_format: Vec<SavedFormat> = vec![
-        SavedFormat::id("kkw").round().quantise::<i16>(qa),
-        SavedFormat::id("kkb").round().quantise::<i16>(qa),
-        SavedFormat::id("outw").transpose().round().quantise::<i16>(qb),
-        SavedFormat::id("outb").round().quantise::<i16>(qab),
-    ];
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiKk)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let kk = builder.new_affine("kk", 6561, 1);
-        let out = builder.new_affine("out", 2, 1);
-        let stm_eval = kk.forward(stm_inputs);
-        let ntm_eval = kk.forward(ntm_inputs);
-        let combined = stm_eval.concat(ntm_eval);
-        out.forward(combined)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
-
-    if let Some(dir) = resume_dir {
-        eprintln!("  [KK] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline!(args, &mut trainer);
-}
-
-// ----- KPPT: KKP --------------------------------------------------------
-
-fn run_kppt_kkp(args: &Args, resume_dir: Option<&std::path::Path>) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_kppt_kkp_impl::<optimiser::AdamW>(args, resume_dir),
-        OptimizerKind::Radam => run_kppt_kkp_impl::<optimiser::RAdam>(args, resume_dir),
-        OptimizerKind::Ranger => run_kppt_kkp_impl::<optimiser::Ranger>(args, resume_dir),
-    }
-}
-
-fn run_kppt_kkp_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
-    let qa: i16 = 256;
-    let qb: i16 = 64;
-    let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
-
-    let save_format: Vec<SavedFormat> = vec![
-        SavedFormat::id("kkpw").round().quantise::<i16>(qa),
-        SavedFormat::id("kkpb").round().quantise::<i16>(qa),
-        SavedFormat::id("outw").transpose().round().quantise::<i16>(qb),
-        SavedFormat::id("outb").round().quantise::<i16>(qab),
-    ];
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiKkp)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let kkp = builder.new_affine("kkp", 81 * 81 * 1548, 1);
-        let out = builder.new_affine("out", 2, 1);
-        let stm_eval = kkp.forward(stm_inputs);
-        let ntm_eval = kkp.forward(ntm_inputs);
-        let combined = stm_eval.concat(ntm_eval);
-        out.forward(combined)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
-
-    if let Some(dir) = resume_dir {
-        eprintln!("  [KKP] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline!(args, &mut trainer);
-}
-
-// ----- KPPT: KPP --------------------------------------------------------
-
-fn run_kppt_kpp(args: &Args, resume_dir: Option<&std::path::Path>) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_kppt_kpp_impl::<optimiser::AdamW>(args, resume_dir),
-        OptimizerKind::Radam => run_kppt_kpp_impl::<optimiser::RAdam>(args, resume_dir),
-        OptimizerKind::Ranger => run_kppt_kpp_impl::<optimiser::Ranger>(args, resume_dir),
-    }
-}
-
-fn run_kppt_kpp_impl<O: BulletouOptimizer>(args: &Args, resume_dir: Option<&std::path::Path>) {
-    let qa: i16 = 256;
-    let qb: i16 = 64;
-    let qab: i16 = qa.checked_mul(qb).expect("qa*qb fits in i16");
-
-    let save_format: Vec<SavedFormat> = vec![
-        SavedFormat::id("kppw").round().quantise::<i16>(qa),
-        SavedFormat::id("kppb").round().quantise::<i16>(qa),
-        SavedFormat::id("outw").transpose().round().quantise::<i16>(qb),
-        SavedFormat::id("outb").round().quantise::<i16>(qab),
-    ];
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiKpp)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let kpp = builder.new_affine("kpp", 81 * 1548 * 1548, 1);
-        let out = builder.new_affine("out", 2, 1);
-        let stm_eval = kpp.forward(stm_inputs);
-        let ntm_eval = kpp.forward(ntm_inputs);
-        let combined = stm_eval.concat(ntm_eval);
-        out.forward(combined)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &[], &[]);
-
-    if let Some(dir) = resume_dir {
-        eprintln!("  [KPP] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline!(args, &mut trainer);
-}
-
-// ----- NNUE HalfKP ------------------------------------------------------
-
-/// Convert a freshly-saved bullet checkpoint dir to the NNUE final layout:
-///
-/// - bundle `optimiser_state/{weights,momentum,velocity}.bin` into `state.bin`
-///   (under the `"nnue"` component label, reusing the helpers originally
-///   written for KPPT — they take a `component: &str` so they're generic),
-/// - rename `quantised.bin` -> `nn.bin` (the contents are already the
-///   YaneuraOu / Stockfish NNUE binary because the trainer's `save_format`
-///   includes the version header and component hashes),
-/// - delete the bullet-internal artefacts (`raw.bin`, original
-///   `quantised.bin`, `optimiser_state/`).
-///
-/// `log.txt` is left in place; the final assembly step (`finalize_nnue_dirs`)
-/// will rename it to `learn.log` alongside the dir's number-rename.
-fn convert_save_dir_to_nnue_layout(dir: &std::path::Path) -> std::io::Result<()> {
-    let optimiser_state = dir.join("optimiser_state");
-    let mut state_buf: Vec<u8> = write_state_backend_marker(STATE_BACKEND_BULLET);
-    bundle_component_state(&mut state_buf, "nnue", &optimiser_state)?;
-    std::fs::write(dir.join("state.bin"), &state_buf)?;
-
-    let quantised = dir.join("quantised.bin");
-    let nn = dir.join("nn.bin");
-    std::fs::rename(&quantised, &nn)?;
-
-    let _ = std::fs::remove_file(dir.join("raw.bin"));
-    let _ = std::fs::remove_dir_all(&optimiser_state);
-    Ok(())
 }
 
 /// Cache of test-set positions used for per-save validation. Loaded
@@ -9575,287 +8574,6 @@ impl TestPositionsCache {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SfnnActivationShape {
-    ft_size: usize,
-    l1_hidden: usize,
-    l1_out: usize,
-    l2_in: usize,
-    l2_size: usize,
-    num_stacks: usize,
-}
-
-#[derive(Clone, Copy)]
-struct RunningActivationStats {
-    count: usize,
-    zero: usize,
-    maxed: usize,
-    sum: f64,
-    sum_sq: f64,
-    min: f32,
-    max: f32,
-}
-
-impl Default for RunningActivationStats {
-    fn default() -> Self {
-        Self { count: 0, zero: 0, maxed: 0, sum: 0.0, sum_sq: 0.0, min: f32::INFINITY, max: f32::NEG_INFINITY }
-    }
-}
-
-impl RunningActivationStats {
-    fn observe(&mut self, value: f32) {
-        const EPS: f32 = 1.0e-6;
-        self.count += 1;
-        if value <= EPS {
-            self.zero += 1;
-        }
-        if value >= 1.0 - EPS {
-            self.maxed += 1;
-        }
-        self.sum += f64::from(value);
-        self.sum_sq += f64::from(value) * f64::from(value);
-        self.min = self.min.min(value);
-        self.max = self.max.max(value);
-    }
-
-    fn mean(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.sum / self.count as f64 }
-    }
-
-    fn variance(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            let mean = self.mean();
-            (self.sum_sq / self.count as f64 - mean * mean).max(0.0)
-        }
-    }
-
-    fn stddev(&self) -> f64 {
-        self.variance().sqrt()
-    }
-
-    fn zero_ratio(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.zero as f64 / self.count as f64 }
-    }
-
-    fn max_ratio(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.maxed as f64 / self.count as f64 }
-    }
-}
-
-struct LayerActivationStats {
-    label: &'static str,
-    all: RunningActivationStats,
-    by_neuron: Vec<RunningActivationStats>,
-}
-
-impl LayerActivationStats {
-    fn new(label: &'static str, neurons: usize) -> Self {
-        Self {
-            label,
-            all: RunningActivationStats::default(),
-            by_neuron: vec![RunningActivationStats::default(); neurons],
-        }
-    }
-
-    fn observe(&mut self, neuron: usize, value: f32) {
-        self.all.observe(value);
-        self.by_neuron[neuron].observe(value);
-    }
-
-    fn print(&self) {
-        let flat = self.by_neuron.iter().filter(|s| s.count > 0 && s.variance() < 1.0e-10).count();
-        let max_stuck = self.by_neuron.iter().filter(|s| s.count > 0 && s.max_ratio() > 0.999).count();
-        let zero_stuck = self.by_neuron.iter().filter(|s| s.count > 0 && s.zero_ratio() > 0.999).count();
-        eprintln!(
-            "    {:<16} values={} mean={:.6} std={:.6} min={:.6} max={:.6} zero={:.3}% maxclip={:.3}% flat_neurons={} zero_stuck={} max_stuck={}",
-            self.label,
-            self.all.count,
-            self.all.mean(),
-            self.all.stddev(),
-            self.all.min,
-            self.all.max,
-            self.all.zero_ratio() * 100.0,
-            self.all.max_ratio() * 100.0,
-            flat,
-            zero_stuck,
-            max_stuck,
-        );
-    }
-}
-
-fn model_weight_f32<Opt, I>(trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>, id: &str) -> Option<Vec<f32>>
-where
-    Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
-    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue>,
-{
-    match trainer.optimiser.model.get_weights(id) {
-        Some(TValue::F32(values)) => Some(values),
-        Some(_) => {
-            eprintln!("  WARN: activation stats skipped: weight `{id}` is not f32");
-            None
-        }
-        None => {
-            eprintln!("  WARN: activation stats skipped: missing weight `{id}`");
-            None
-        }
-    }
-}
-
-fn affine_sparse(weights: &[f32], bias: &[f32], rows: usize, active: &[usize], out: &mut [f32]) {
-    out.copy_from_slice(&bias[..rows]);
-    for &feature in active {
-        let base = feature * rows;
-        for row in 0..rows {
-            out[row] += weights[base + row];
-        }
-    }
-}
-
-fn affine_stacked_selected(
-    weights: &[f32],
-    bias: &[f32],
-    input: &[f32],
-    output_size_per_bucket: usize,
-    buckets: usize,
-    bucket: usize,
-    out: &mut [f32],
-) {
-    let rows = output_size_per_bucket * buckets;
-    let row_base = bucket * output_size_per_bucket;
-    out.copy_from_slice(&bias[row_base..row_base + output_size_per_bucket]);
-    for (input_idx, &x) in input.iter().enumerate() {
-        if x == 0.0 {
-            continue;
-        }
-        let base = input_idx * rows + row_base;
-        for row in 0..output_size_per_bucket {
-            out[row] += weights[base + row] * x;
-        }
-    }
-}
-
-fn affine_add_dense(weights: &[f32], bias: &[f32], input: &[f32], rows: usize, out: &mut [f32]) {
-    for row in 0..rows {
-        out[row] += bias[row];
-    }
-    for (input_idx, &x) in input.iter().enumerate() {
-        if x == 0.0 {
-            continue;
-        }
-        let base = input_idx * rows;
-        for row in 0..rows {
-            out[row] += weights[base + row] * x;
-        }
-    }
-}
-
-fn observe_crelu(layer: &mut LayerActivationStats, values: &mut [f32]) {
-    for (idx, value) in values.iter_mut().enumerate() {
-        *value = value.clamp(0.0, 1.0);
-        layer.observe(idx, *value);
-    }
-}
-
-fn pairwise_mul_scaled(input: &[f32], output: &mut [f32]) {
-    let half = input.len() / 2;
-    debug_assert_eq!(output.len(), half);
-    for idx in 0..half {
-        output[idx] = input[idx] * input[idx + half] * (127.0 / 128.0);
-    }
-}
-
-fn dump_sfnn_activation_stats<Opt, I>(
-    args: &Args,
-    trainer: &ValueTrainer<Opt, I, ShogiLayerStackBucket9>,
-    input: I,
-    bucket_impl: ShogiLayerStackBucket9,
-    cache: &TestPositionsCache,
-    shape: SfnnActivationShape,
-) where
-    Opt: bullet_trainer::optimiser::OptimiserState<ExecutionContext>,
-    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
-{
-    let sample_size = cache.positions.len().min(args.activation_stats_positions);
-    if sample_size == 0 {
-        return;
-    }
-
-    let Some(l0w) = model_weight_f32(trainer, "l0w") else { return };
-    let Some(l0b) = model_weight_f32(trainer, "l0b") else { return };
-    let Some(l1w) = model_weight_f32(trainer, "l1w") else { return };
-    let Some(l1b) = model_weight_f32(trainer, "l1b") else { return };
-    let (l1fw, l1fb) = if args.sfnn_factorized_l1 {
-        let Some(l1fw) = model_weight_f32(trainer, "l1fw") else { return };
-        let Some(l1fb) = model_weight_f32(trainer, "l1fb") else { return };
-        (Some(l1fw), Some(l1fb))
-    } else {
-        (None, None)
-    };
-    let Some(l2w) = model_weight_f32(trainer, "l2w") else { return };
-    let Some(l2b) = model_weight_f32(trainer, "l2b") else { return };
-
-    let mut l0_stats = LayerActivationStats::new("l0.crelu", shape.ft_size);
-    let mut l1_stats = LayerActivationStats::new("l1.to_l2.crelu", shape.l2_in);
-    let mut l2_stats = LayerActivationStats::new("l2.crelu", shape.l2_size);
-
-    let mut stm_active = Vec::with_capacity(input.max_active());
-    let mut ntm_active = Vec::with_capacity(input.max_active());
-    let mut stm_l0 = vec![0.0; shape.ft_size];
-    let mut ntm_l0 = vec![0.0; shape.ft_size];
-    let mut stm_pair = vec![0.0; shape.ft_size / 2];
-    let mut ntm_pair = vec![0.0; shape.ft_size / 2];
-    let mut combined = vec![0.0; shape.ft_size];
-    let mut l1_out = vec![0.0; shape.l1_out];
-    let mut l2_input = vec![0.0; shape.l2_in];
-    let mut l2_out = vec![0.0; shape.l2_size];
-
-    for pos in cache.positions.iter().take(sample_size) {
-        stm_active.clear();
-        ntm_active.clear();
-        input.map_features_split(pos, |stm, ntm| {
-            if let Some(idx) = stm {
-                stm_active.push(idx);
-            }
-            if let Some(idx) = ntm {
-                ntm_active.push(idx);
-            }
-        });
-
-        affine_sparse(&l0w, &l0b, shape.ft_size, &stm_active, &mut stm_l0);
-        affine_sparse(&l0w, &l0b, shape.ft_size, &ntm_active, &mut ntm_l0);
-        observe_crelu(&mut l0_stats, &mut stm_l0);
-        observe_crelu(&mut l0_stats, &mut ntm_l0);
-
-        pairwise_mul_scaled(&stm_l0, &mut stm_pair);
-        pairwise_mul_scaled(&ntm_l0, &mut ntm_pair);
-        combined[..shape.ft_size / 2].copy_from_slice(&stm_pair);
-        combined[shape.ft_size / 2..].copy_from_slice(&ntm_pair);
-
-        let bucket = bucket_impl.bucket(pos) as usize;
-        affine_stacked_selected(&l1w, &l1b, &combined, shape.l1_out, shape.num_stacks, bucket, &mut l1_out);
-        if let (Some(l1fw), Some(l1fb)) = (&l1fw, &l1fb) {
-            affine_add_dense(l1fw, l1fb, &combined, shape.l1_out, &mut l1_out);
-        }
-
-        for idx in 0..shape.l1_hidden {
-            let x = l1_out[idx];
-            l2_input[idx] = x.abs().powi(2) * (127.0 / 128.0);
-            l2_input[shape.l1_hidden + idx] = x;
-        }
-        observe_crelu(&mut l1_stats, &mut l2_input);
-
-        affine_stacked_selected(&l2w, &l2b, &l2_input, shape.l2_size, shape.num_stacks, bucket, &mut l2_out);
-        observe_crelu(&mut l2_stats, &mut l2_out);
-    }
-
-    eprintln!("  activation stats: sample={} / test_positions={}", sample_size, cache.positions.len());
-    l0_stats.print();
-    l1_stats.print();
-    l2_stats.print();
-}
-
 /// Run validation on the cached test positions and produce per-save
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
@@ -9884,1880 +8602,6 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: V
         report.loss_sampled,
     );
     TestMetrics { accuracy, loss }
-}
-
-/// returned by `trainer.run`), but with NNUE-specific save handling:
-/// the per-save callback converts each bullet save dir to the
-/// `nn.bin` + `state.bin` (+ `log.txt`) layout via
-/// `convert_save_dir_to_nnue_layout`.
-macro_rules! run_training_inline_nnue {
-    ($args:expr, $trainer:expr) => {{
-        run_training_inline_nnue!(@impl none, $args, $trainer);
-    }};
-    ($args:expr, $trainer:expr, $activation_stats:expr) => {{
-        run_training_inline_nnue!(@impl some($activation_stats), $args, $trainer);
-    }};
-    (@dump none, $trainer:ident, $cache:ident) => {{
-        let _ = $cache;
-    }};
-    (@dump some($activation_stats:expr), $trainer:ident, $cache:ident) => {{
-        $activation_stats(&*$trainer, $cache);
-    }};
-    (@impl $stats_mode:ident $(($activation_stats:expr))?, $args:expr, $trainer:expr) => {{
-        let args: &Args = $args;
-        let trainer = $trainer;
-
-        let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-
-        let data_files_owned = expand_teacher(&args.teacher).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-        let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-
-        let format = infer_data_format(&data_files_ref).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-
-        let end_superbatch = args.superbatches.unwrap_or(usize::MAX);
-        let net_id_base = args.net_id();
-        let output_dir_buf = args.output_dir();
-        let max_epochs = effective_max_epochs(args);
-        // `--superbatches` が未指定の非 plateau だけは、従来通り「教師 1 周
-        // = epoch」として EOF で epoch を終える。`--superbatches N` 指定時は
-        // epoch は LR/validation の周期であり、教師 stream は EOF で先頭へ
-        // cyclic に戻って epoch を跨いでも継続する。
-        let teacher_single_epoch =
-            args.superbatches.is_none() && !matches!(args.lr_schedule, LrScheduleKind::Plateau);
-
-        let output_dir_str = args.output_dir();
-        let output_dir = output_dir_str.to_str().unwrap_or("checkpoints");
-
-        // Warm-restart cycle period = one epoch's positions. `step`,
-        // `geometric`, and `cos` use this period; `plateau` is validation-driven.
-        let lr_period: u64 = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
-            || (matches!(args.lr_schedule, LrScheduleKind::Step) && args.superbatches.is_none())
-        {
-            0
-        } else {
-            auto_epoch_period(args, format, &data_files_owned, batches_per_superbatch).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(2);
-            })
-        };
-        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
-        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }).0;
-
-        let saved_any = std::cell::Cell::new(false);
-        let trained_without_save = std::cell::Cell::new(false);
-        let mut last_net_id_for_epoch: String = net_id_base.clone();
-        let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
-
-        // Auto-resume: if a previous run left numbered checkpoint dirs
-        // under output_dir, continue the sb counter (and therefore the LR
-        // schedule) from the last saved superbatch + 1 instead of silently
-        // restarting at sb=1.
-        let mut cb_ctx = LogContext::from_args(args, lr_period);
-        let cb_top_level_log = output_dir_buf.join(SUMMARY_LEARN_LOG_NAME);
-        let resume_enabled = resume_enabled(args, &output_dir_buf);
-        let auto_resume_sb_raw = if resume_enabled {
-            read_latest_saved_superbatch(&output_dir_buf)
-        } else {
-            None
-        };
-        // Teacher-change detection: bullet's dataloader skips
-        // `(start_sb - 1) * batches_per_sb` records at startup, which
-        // assumes the resume run uses the same teacher data. If the
-        // teacher path changed (e.g. the user is doing yane-distill
-        // round-2 training on a new chunk), the new file may not have
-        // enough records to reach the skip target → trainer.run hits
-        // EOF before any batch is delivered → `NoBatchesReceived`
-        // panic.
-        //
-        // Resolution: tell bullet `start_superbatch=1` so the dataloader
-        // reads the new file from the beginning. The LR schedule is
-        // already positions-based and uses `prior_positions` (carried
-        // from the top-level log) for continuity, so it survives the sb
-        // reset on its own.
-        // Compare the *resolved* (= expanded file list) form on both
-        // sides — `from_args` writes the resolved list to the log, so
-        // raw `args.teacher` would never match a stored directory.
-        let prev_teacher = if resume_enabled {
-            read_latest_saved_teacher(&output_dir_buf)
-        } else {
-            None
-        };
-        let resolved_now = resolve_teacher_for_log(&args.teacher);
-        let teacher_changed = match prev_teacher.as_deref() {
-            Some(prev) => prev.trim() != resolved_now.trim(),
-            None => false,
-        };
-        // "Previous run cleanly completed its --superbatches target": the
-        // last saved sb (per-epoch counter) already reached end_superbatch.
-        // Treat the new invocation as "add more epochs" — start the next
-        // epoch from sb=1 with a fresh dataloader, instead of trying to
-        // resume sb=last_sb+1 (which would skip past end_superbatch and
-        // train zero batches).
-        let prev_run_completed_epoch = if matches!(args.lr_schedule, LrScheduleKind::Plateau)
-            && latest_checkpoint_has_file(&output_dir_buf, PLATEAU_EPOCH_DONE_NAME)
-        {
-            true
-        } else {
-            auto_resume_sb_raw.map(|last_sb| last_sb >= end_superbatch).unwrap_or(false)
-        };
-        // Displayed sb in `learn.log` is intrinsically per-epoch (= 1..N
-        // each epoch), so no cross-run offset is applied. Only the
-        // dataloader's bullet-internal start_sb differs by case below.
-        let effective_start_superbatch = if teacher_changed {
-            // Teacher changed: dataloader fresh (start_sb=1) so the
-            // skip-ahead doesn't run past EOF of the new file.
-            1usize
-        } else if prev_run_completed_epoch {
-            // Same teacher, previous run completed its epoch(s) cleanly:
-            // start the next epoch from sb=1.
-            1usize
-        } else if let Some(last_sb) = auto_resume_sb_raw {
-            // Same teacher, previous run died mid-epoch: let bullet's
-            // dataloader skip ahead so this epoch finishes from
-            // last_sb+1. Epoch≥2 will reset to sb=1 in the chunk loop.
-            last_sb + 1
-        } else {
-            // First run.
-            1usize
-        };
-        // Epoch display offset for continued-training runs. Bullet's
-        // per-invocation `for epoch in 1..=max_epochs` resets to 1, so
-        // without this offset the second run after "3 epochs done"
-        // would write `epoch=1` over the top of `epoch=3` rows.
-        //
-        // - Fresh first run (no top-level log): offset = 0.
-        // - Clean continuation (previous run finished its last epoch,
-        //   teacher unchanged): offset = max_epoch (so new local
-        //   epoch=1 displays as max_epoch+1).
-        // - Teacher changed (new epoch against new data): same as
-        //   clean continuation — offset = max_epoch.
-        // - Mid-epoch resume (previous run died inside epoch K, this
-        //   run finishes that same epoch K from last_sb+1): offset
-        //   = max_epoch - 1, so this run's local epoch=1 displays as
-        //   K (same as the previous partial save), and its local
-        //   epoch=2 displays as K+1.
-        let max_epoch_in_log = if resume_enabled {
-            read_latest_epoch_in_top_level_log(&cb_top_level_log).unwrap_or(0)
-        } else {
-            0
-        };
-        let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && auto_resume_sb_raw.is_some();
-        cb_ctx.epoch_offset = if mid_epoch_resume { max_epoch_in_log.saturating_sub(1) } else { max_epoch_in_log };
-        // The LR columns are derived from `positions` (= prior + per-row
-        // offset within this run), so we always need the cumulative
-        // carry-over from the existing top-level log here so the enrich
-        // path's `positions` matches what `GeometricLR` saw.
-        // この変数は `cb_top_level_log` (= `<output>/summary-learn.log`) の最大
-        // positions 値を保持する。enrich path で「この run の sb 1 が始まる
-        // 前までに何局面学習されたか」を表し、各 save 行の positions 列に
-        // `prior + (sb-1)*sb_size + b*batch_size` で書き込まれる。
-        //
-        // bullet の sb counter は trainer.run 呼び出し毎にリセットされる
-        // (= 各 epoch / 各 chunk で 1 から始まる) ので、epoch を跨ぐと
-        // positions も sb counter と一緒にリセットされてしまう。これを
-        // 防ぐため、各 epoch 開始時にこの値を learn.log から再読み込み
-        // して累積を反映させる。`mut` で更新される。
-        let mut cb_prior_position = if resume_enabled {
-            read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(0)
-        } else {
-            0
-        };
-        let cb_next_idx = std::cell::Cell::new(count_existing_numbered_dirs(&output_dir_buf) + 1);
-        // HCPE データローダー再開用 byte offset。最新の checkpoint dir に
-        // `dataloader_pos.txt` があればそこから読み、なければ 0 (= 先頭から)。
-        // 教師が変わった場合は 0 にリセット (新教師の先頭から)。
-        // (byte_offset, plies_within_unit) のペアで保持する。HCPE / PSV
-        // (固定長レコード) では plies は常に 0。HCPE3 / pack (棋譜単位の
-        // 可変長) では plies は「現在の game header から何手分進んだ位置か」。
-        let latest_dataloader_pos = if resume_enabled {
-            read_latest_dataloader_pos(&output_dir_buf)
-        } else {
-            None
-        };
-        let resume_teacher_from_latest_pos = !teacher_changed
-            && latest_dataloader_pos.is_some()
-            && !(prev_run_completed_epoch && teacher_single_epoch);
-        let initial_dataloader_resume_exact = resume_teacher_from_latest_pos;
-        let cb_dataloader_resume_offset = std::cell::Cell::new(if resume_teacher_from_latest_pos {
-            latest_dataloader_pos.unwrap_or((0, 0))
-        } else {
-            // Teacher-changed runs and the old omitted-`--superbatches`
-            // non-plateau mode start a new epoch as a new teacher pass.
-            // With explicit `--superbatches N`, epoch is only an
-            // LR/validation cycle, so clean continuations use the latest
-            // dataloader position above instead of rewinding the teacher.
-            (0u64, 0usize)
-        });
-        let cb_dataloader_resume_exact = std::cell::Cell::new(initial_dataloader_resume_exact);
-
-        if teacher_changed {
-            if let Some(prev) = prev_teacher.as_deref() {
-                eprintln!(
-                    "  teacher path differs from previous run\n    previous: {prev}\n    current:  {}\n  \
-                     dataloader will read the new file from the beginning; new epochs start at sb=1.\n  \
-                     model + optimiser are loaded from the latest state.bin as usual.",
-                    args.teacher,
-                );
-            }
-        } else if prev_run_completed_epoch {
-            let sb_text = auto_resume_sb_raw
-                .map(|last_sb| format!("{} superbatch{}", last_sb, if last_sb == 1 { "" } else { "es" }))
-                .unwrap_or_else(|| "a plateau epoch".to_string());
-            if resume_teacher_from_latest_pos {
-                let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
-                eprintln!(
-                    "  previous run completed {sb_text} cleanly; \
-                     continuing as additional epoch(s) from sb=1. \
-                     The teacher stream continues from dataloader offset {resume_off}, plies {resume_plies}."
-                );
-            } else {
-                eprintln!(
-                    "  previous run completed {sb_text} cleanly; \
-                     continuing as additional epoch(s) from sb=1, reading the teacher from the beginning."
-                );
-            }
-        } else if let Some(last_sb) = auto_resume_sb_raw {
-            eprintln!("  auto-resuming from superbatch {} (last saved: {}).", effective_start_superbatch, last_sb);
-        }
-
-        // Build the LR scheduler. Positions-based for both kinds:
-        // `prior_positions` carries the cumulative-trained count from
-        // the existing top-level log so the schedule stays continuous
-        // across resumes. Bullet's local sb resets per `trainer.run`
-        // call (= per epoch / chunk), but the cumulative position offset
-        // keeps `step` continuous. `geometric` / `cos` still use their
-        // configured cycle period.
-        // Note: lr_scheduler_for_run は each-epoch で再構築する
-        // (`for epoch in 1..=max_epochs` 内)。`cb_prior_position` が epoch
-        // を跨いで前 epoch の累積を反映するため、各 epoch で正しい LR
-        // を計算できる。
-
-        // Per-save validation cache: load test positions ONCE up front
-        // (random-pick happens here), then reuse the same positions for
-        // every save event. `None` if --test-teacher unset or load failed.
-        let test_cache = TestPositionsCache::try_load(args);
-        if matches!(args.lr_schedule, LrScheduleKind::Plateau) && test_cache.is_none() {
-            eprintln!("error: --lr-schedule plateau requires a readable --test-teacher.");
-            std::process::exit(2);
-        }
-        if args.dump_activation_stats {
-            if let Some(cache) = test_cache.as_ref() {
-                run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
-            } else {
-                eprintln!("  WARN: --dump-activation-stats requires a readable --test-teacher; activation stats disabled");
-            }
-        }
-
-        // Per-save incremental finalize: rename `<net_id>-<sb>` →
-        // `<NNNN>/`, generate per-dir `learn.log` (with per-save test
-        // metrics), append to top-level `summary-learn.log`. Done OUTSIDE
-        // `trainer.run` (= once per save chunk) so we can call
-        // `trainer.eval_packed_batch` for validation between chunks.
-        // Killing training mid-run still leaves a clean numbered layout
-        // and a resumable top-level log.
-
-        // First-time CUDA setup heads-up: bullet's display ends with
-        // "Training on <GPU>" and the very next thing is the first batch
-        // run, which triggers cuBLAS handle init + JIT-compilation of the
-        // PTX kernels into SASS for the local GPU's compute capability.
-        // On a fresh machine / fresh `~/.nv/ComputeCache` this can take
-        // ~30–60s during which both CPU and GPU look idle — the work is
-        // happening inside the NVIDIA driver and is not always visible
-        // to Task Manager / nvidia-smi. Subsequent invocations reuse the
-        // cached SASS and skip this delay. We can't progress-report on
-        // the driver-side work itself, but at least telling the user it
-        // is expected.
-        eprintln!(
-            "  note: first-batch run will trigger CUDA JIT-compile of GPU kernels\n  \
-             (≈30–60s on first run for this GPU model; cached afterwards). \
-             If both CPU and\n  GPU look idle for a minute, that is expected — \
-             the NVIDIA driver is compiling."
-        );
-
-        // HCPE 専用: persistent loader。Producer thread を chunk loop の外で
-        // 立ち上げ、複数 trainer.run 呼び出しを跨いで pre-fetch を継続する。
-        // teacher-single-epoch mode では各 epoch 開始時に新しい loader を
-        // spawn し直す。明示 `--superbatches N` では epoch は LR/validation
-        // cycle なので、同じ loader を持ち越して教師ストリームを継続する。
-        let hcpe_loader_buffer_records = effective_save_rate(args)
-            .max(1)
-            .min(end_superbatch)
-            .saturating_mul(batches_per_superbatch)
-            .saturating_mul(effective_batch_size(args));
-        let new_hcpe_loader =
-            |resume_off: u64,
-             resume_exact: bool|
-             -> Option<HcpeDataLoader<fn(&bulletou_lib::shogi::PackedSfenValue) -> bool>> {
-                if matches!(format, DataFormat::Hcpe) {
-                    let loader = HcpeDataLoader::new_concat_multiple(
-                        &data_files_ref,
-                        args.buffer_mb,
-                        (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
-                    )
-                    .with_buffer_records(hcpe_loader_buffer_records)
-                    .with_loader_threads(args.loader_threads)
-                    .with_single_epoch(teacher_single_epoch);
-                    Some(if resume_exact {
-                        loader.with_exact_resume_offset(resume_off)
-                    } else {
-                        loader.with_resume_offset(resume_off)
-                    })
-                } else {
-                    None
-                }
-            };
-        let mut persistent_hcpe_loader =
-            new_hcpe_loader(cb_dataloader_resume_offset.get().0, cb_dataloader_resume_exact.get());
-        let mut previous_epoch_final_metrics = if prev_run_completed_epoch && test_cache.is_some() {
-            read_latest_nnue_test_metrics_in_top_level_log(&cb_top_level_log)
-        } else {
-            None
-        };
-        if let Some(metrics) = previous_epoch_final_metrics {
-            eprintln!(
-                "  previous completed epoch final validation metrics = loss {:.6}, accuracy {:.6}",
-                metrics.loss, metrics.accuracy
-            );
-        }
-        if !matches!(args.lr_schedule, LrScheduleKind::Plateau) && max_epochs > 1 && test_cache.is_none() {
-            let fallback = if max_epochs == usize::MAX {
-                "no epoch cap is set, so training will continue until interrupted."
-            } else {
-                "--max-epochs will be used."
-            };
-            eprintln!(
-                "  note: epoch-final early stop requires a readable --test-teacher; \
-                 validation metrics are unavailable, so {fallback}"
-            );
-        }
-        let mut last_epoch_for_fallback = 1usize;
-        for epoch in 1..=max_epochs {
-            last_epoch_for_fallback = epoch;
-            let display_epoch = epoch + cb_ctx.epoch_offset;
-            let display_max_epochs =
-                if max_epochs == usize::MAX { usize::MAX } else { max_epochs + cb_ctx.epoch_offset };
-            print_epoch_banner(display_epoch, display_max_epochs);
-            let mut stop_training_after_epoch = false;
-            let mut plateau_epoch_final_metrics: Option<PlateauMetrics> = None;
-            let mut epoch_final_metrics: Option<PlateauMetrics> = None;
-            let mut plateau_state = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
-                Some(PlateauLrState::new(
-                    args.lr,
-                    args.lr_min,
-                    args.lr_plateau_factor,
-                    args.lr_plateau_min_delta,
-                    args.lr_plateau_monitor,
-                ))
-            } else {
-                None
-            };
-            // Epoch boundary (epoch >= 2): in teacher-single-epoch mode,
-            // a new epoch is a new pass over the teacher, so reset the
-            // dataloader. When `--superbatches N` is set, epoch is an
-            // LR/validation cycle; the teacher stream must continue from
-            // its current position across epoch boundaries.
-            if epoch > 1 && teacher_single_epoch {
-                cb_dataloader_resume_offset.set((0, 0));
-                cb_dataloader_resume_exact.set(false);
-                if matches!(format, DataFormat::Hcpe) {
-                    persistent_hcpe_loader = new_hcpe_loader(0, false);
-                }
-            }
-            // Epoch >= 2: re-read the top-level summary-learn.log so `cb_prior_position`
-            // picks up the cumulative positions across the previous epoch(s).
-            // Without this, bullet's sb counter reset at trainer.run boundary
-            // would also reset the `positions` column.
-            if epoch > 1 {
-                cb_prior_position =
-                    read_prior_positions(&cb_top_level_log).get("nnue").copied().unwrap_or(cb_prior_position);
-            }
-            let net_id_for_epoch = if max_epochs > 1 || cb_ctx.epoch_offset > 0 {
-                format!("{net_id_base}-e{display_epoch}")
-            } else {
-                net_id_base.clone()
-            };
-            last_net_id_for_epoch = net_id_for_epoch.clone();
-
-            // Run the epoch in chunks of `save_rate` superbatches. Each
-            // chunk ends at a save boundary, after which we validate (if
-            // requested) and finalise the saved dir with the test metrics.
-            //
-            // chunk_start: epoch 1 honours the auto-resume / user-set
-            // start sb so an interrupted previous epoch picks up where it
-            // left off. Epoch>=2 always starts at displayed sb=1. This
-            // resets the LR/validation cycle only; with explicit
-            // `--superbatches N`, the dataloader position continues
-            // across the boundary.
-            let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
-            let chunk_size = effective_save_rate(args).max(1);
-            let plateau_rollback_dir = output_dir_buf.join(".bulletou_plateau_rollback");
-            'epoch: loop {
-                if chunk_start > end_superbatch {
-                    break;
-                }
-                let chunk_resume_before = cb_dataloader_resume_offset.get();
-                let chunk_resume_exact_before = cb_dataloader_resume_exact.get();
-                let chunk_end = chunk_start.saturating_add(chunk_size).saturating_sub(1).min(end_superbatch);
-                let lr_for_chunk = plateau_state.as_ref().map(|s| s.current_lr);
-                if plateau_state.is_some() {
-                    let _ = std::fs::remove_dir_all(&plateau_rollback_dir);
-                    let rollback_path = plateau_rollback_dir.to_str().expect("checkpoint path is utf-8");
-                    trainer.save_to_checkpoint(rollback_path);
-                }
-                let lr_scheduler_for_chunk = match args.lr_schedule {
-                    LrScheduleKind::Step => LrSchedulerImpl::Step(StepLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        gamma: lr_step_gamma,
-                        step_positions: lr_step_positions,
-                        period_positions: lr_period,
-                        prior_positions: cb_prior_position as u64,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Geometric => LrSchedulerImpl::Geometric(GeometricLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        period_positions: lr_period,
-                        prior_positions: cb_prior_position as u64,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Cos => LrSchedulerImpl::Cos(CosineLR {
-                        start: args.lr,
-                        min: args.lr_min,
-                        period_positions: lr_period,
-                        prior_positions: cb_prior_position as u64,
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                    }),
-                    LrScheduleKind::Plateau => {
-                        LrSchedulerImpl::Fixed(FixedLR { value: lr_for_chunk.unwrap_or(args.lr) })
-                    }
-                };
-
-                let schedule = TrainingSchedule {
-                    net_id: net_id_for_epoch.clone(),
-                    eval_scale: args.scale as f32,
-                    steps: TrainingSteps {
-                        batch_size: effective_batch_size(args),
-                        batches_per_superbatch,
-                        start_superbatch: chunk_start,
-                        end_superbatch: chunk_end,
-                    },
-                    wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
-                    lr_scheduler: lr_scheduler_for_chunk,
-                    save_rate: effective_save_rate(args),
-                    save_epoch_end: effective_save_epoch_end(args),
-                };
-
-                // Per-chunk callback only records that the save happened
-                // (no in-callback finalize). The actual rename + enrich
-                // runs outside `trainer.run` so it can take per-save test
-                // metrics computed via `trainer.eval_packed_batch`.
-                let net_id_for_cb = net_id_for_epoch.clone();
-                let output_dir_for_cb = output_dir_buf.clone();
-                let saved_any_ref = &saved_any;
-                let saved_dir_in_chunk: std::cell::RefCell<Option<std::path::PathBuf>> = std::cell::RefCell::new(None);
-                let saved_dir_ref = &saved_dir_in_chunk;
-                let on_checkpoint_saved = move |superbatch: usize| {
-                    saved_any_ref.set(true);
-                    let ckpt_dir = output_dir_for_cb.join(format!("{net_id_for_cb}-{superbatch}"));
-                    if let Err(e) = convert_save_dir_to_nnue_layout(&ckpt_dir) {
-                        eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display());
-                        return;
-                    }
-                    eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display());
-                    *saved_dir_ref.borrow_mut() = Some(ckpt_dir);
-                };
-
-                let settings = LocalSettings {
-                    threads: args.threads,
-                    test_set: None,
-                    output_directory: output_dir,
-                    batch_queue_size: args.batch_queue_size,
-                    on_checkpoint_saved: Some(&on_checkpoint_saved),
-                };
-
-                // Resume pointer: 「ここまで処理した」を Consumer 側が書く
-                // (offset, plies) のハンドル。trainer.run 後にこのペアを読んで
-                // dataloader_pos.txt に書き出す。HCPE / PSV のような固定長
-                // フォーマットでは plies は常に 0、HCPE3 / pack のような
-                // 棋譜フォーマットでは ply 単位の正確な位置になる。
-                let dl_offset_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
-                    std::cell::Cell::new(None);
-                let dl_plies_handle: std::cell::Cell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
-                    std::cell::Cell::new(None);
-
-                last_error_record = match format {
-                    DataFormat::Hcpe => {
-                        // Persistent loader: chunk loop の外で 1 度だけ生成済み。
-                        // 内部の producer thread が複数の trainer.run 呼び出しを
-                        // 跨いで pre-fetch を継続する。
-                        let loader = persistent_hcpe_loader
-                            .as_ref()
-                            .expect("persistent_hcpe_loader initialised for DataFormat::Hcpe");
-                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
-                        trainer.run(&schedule, &settings, loader)
-                    }
-                    DataFormat::Hcpe3 => {
-                        let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
-                        let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_buffer_records(hcpe_loader_buffer_records)
-                            .with_single_epoch(teacher_single_epoch);
-                        let loader = if cb_dataloader_resume_exact.get() {
-                            loader.with_exact_resume_offset(resume_off, resume_plies)
-                        } else {
-                            loader.with_resume_offset(resume_off, resume_plies)
-                        };
-                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
-                        dl_plies_handle.set(Some(loader.consumed_plies_handle()));
-                        trainer.run(&schedule, &settings, &loader)
-                    }
-                    DataFormat::Pack => {
-                        let (resume_off, resume_plies) = cb_dataloader_resume_offset.get();
-                        let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, args.buffer_mb, |_| true)
-                            .with_single_epoch(teacher_single_epoch);
-                        let loader = if cb_dataloader_resume_exact.get() {
-                            loader.with_exact_resume_offset(resume_off, resume_plies)
-                        } else {
-                            loader.with_resume_offset(resume_off, resume_plies)
-                        };
-                        dl_offset_handle.set(Some(loader.consumed_offset_handle()));
-                        dl_plies_handle.set(Some(loader.consumed_plies_handle()));
-                        trainer.run(&schedule, &settings, &loader)
-                    }
-                    DataFormat::Psv => {
-                        // PSV is fixed 40-byte; DirectSequentialDataLoader
-                        // already byte-seeks via `start_position * 40`, so
-                        // no `dataloader_pos.txt` write is needed.
-                        let loader = DirectSequentialDataLoader::new(&data_files_ref)
-                            .with_single_epoch(teacher_single_epoch);
-                        trainer.run(&schedule, &settings, &loader)
-                    }
-                };
-
-                // Consumer が「ここまで処理した」を表す (offset, plies) を
-                // 読み出し、次 chunk 用 resume として保持しておく。ファイル
-                // 書き出しは finalize_one_nnue_dir 成功後にやる。
-                let consumed_offset_val =
-                    dl_offset_handle.take().map(|arc| arc.load(std::sync::atomic::Ordering::Acquire));
-                let consumed_plies_val =
-                    dl_plies_handle.take().map(|arc| arc.load(std::sync::atomic::Ordering::Acquire));
-                if let Some(off) = consumed_offset_val {
-                    cb_dataloader_resume_offset.set((off, consumed_plies_val.unwrap_or(0)));
-                    cb_dataloader_resume_exact.set(true);
-                }
-
-                // Closure dropped → its borrow of saved_dir_in_chunk released.
-                let saved_ckpt_dir = saved_dir_in_chunk.into_inner();
-                let planned_train_only_tail = !effective_save_epoch_end(args)
-                    && chunk_end == end_superbatch
-                    && !chunk_end.is_multiple_of(effective_save_rate(args).max(1));
-                if saved_ckpt_dir.is_none()
-                    && planned_train_only_tail
-                    && error_record_completed_superbatch(&last_error_record, chunk_end, batches_per_superbatch)
-                {
-                    trained_without_save.set(true);
-                    eprintln!(
-                        "  checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
-                        display_epoch, chunk_end
-                    );
-                    chunk_start = chunk_end + 1;
-                    continue 'epoch;
-                }
-                // 教師が sb 境界を跨がず途中で EOF した場合、bullet の save
-                // callback は発火しない (= `saved_ckpt_dir` is None) が、
-                // last_error_record には partial sb のロスが残っている。この
-                // 場合は手動で trainer.save_to_checkpoint + log.txt 書き出し
-                // を行い、partial sb 分も `0NNN/` ディレクトリ + learn.log
-                // に残す。bullet が batch 0 個でも返ってきた (`last_error_record`
-                // 空) ケースは、非 plateau では epoch 終了、plateau では教師先頭に
-                // 巻き戻して同じ epoch を継続する。
-                let (ckpt_dir, is_partial_save) = match saved_ckpt_dir {
-                    Some(dir) => (dir, false),
-                    None => {
-                        if last_error_record.is_empty() {
-                            if plateau_state.is_some() {
-                                if chunk_resume_before == (0, 0) && chunk_resume_exact_before {
-                                    eprintln!(
-                                        "error: --lr-schedule plateau reached teacher EOF immediately after rewinding; \
-                                         teacher appears empty or unreadable."
-                                    );
-                                    break 'epoch;
-                                }
-                                cb_dataloader_resume_offset.set((0, 0));
-                                cb_dataloader_resume_exact.set(true);
-                                if matches!(format, DataFormat::Hcpe) {
-                                    persistent_hcpe_loader = new_hcpe_loader(0, true);
-                                }
-                                eprintln!(
-                                    "  plateau: teacher EOF reached before a new superbatch; rewinding teacher to the beginning."
-                                );
-                                continue 'epoch;
-                            }
-                            break 'epoch;
-                        }
-                        let partial_dir = output_dir_buf.join(format!("{net_id_for_epoch}-{chunk_start}"));
-                        eprintln!(
-                            "  partial superbatch {} (teacher EOF mid-sb); \
-                             saving partial state to {}",
-                            chunk_start,
-                            partial_dir.display(),
-                        );
-                        let s = partial_dir.to_str().expect("checkpoint path is utf-8");
-                        trainer.save_to_checkpoint(s);
-                        if let Err(e) = write_loss_csv(&partial_dir.join("log.txt"), &last_error_record) {
-                            eprintln!("  WARN: failed to write log.txt in {}: {e}", partial_dir.display());
-                        }
-                        match convert_save_dir_to_nnue_layout(&partial_dir) {
-                            Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", partial_dir.display()),
-                            Err(e) => eprintln!("  WARN: failed to convert save dir {}: {e}", partial_dir.display()),
-                        }
-                        saved_any.set(true);
-                        (partial_dir, true)
-                    }
-                };
-
-                // Per-save validation (if --test-teacher cached positions).
-                let test_metrics = test_cache.as_ref().map(|cache| {
-                    let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
-                    run_one_test_pass(cache, args, outputs)
-                });
-                if !matches!(args.lr_schedule, LrScheduleKind::Plateau) {
-                    epoch_final_metrics = test_metrics.map(Into::into);
-                }
-                if args.dump_activation_stats {
-                    if let Some(cache) = test_cache.as_ref() {
-                        run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
-                    }
-                }
-                cb_ctx.lr_override = lr_for_chunk;
-
-                let plateau_action = plateau_state.as_mut().map(|state| {
-                    let metrics = test_metrics.expect("plateau requires --test-teacher");
-                    state.observe(metrics.into())
-                });
-                let retry_same_chunk = plateau_action.map(plateau_action_retries_teacher).unwrap_or(false);
-                let reject_checkpoint = plateau_action.map(plateau_action_rejects_update).unwrap_or(false);
-                if reject_checkpoint {
-                    let rollback_path = plateau_rollback_dir.to_str().expect("checkpoint path is utf-8");
-                    trainer.load_from_checkpoint(rollback_path);
-                    if let Err(e) = std::fs::remove_dir_all(&ckpt_dir) {
-                        eprintln!("  WARN: failed to remove rejected plateau checkpoint {}: {e}", ckpt_dir.display());
-                    }
-                }
-                let dataloader_pos_to_write = if retry_same_chunk {
-                    Some(chunk_resume_before)
-                } else {
-                    consumed_offset_val.map(|off| (off, consumed_plies_val.unwrap_or(0)))
-                };
-                let plateau_epoch_done = matches!(plateau_action, Some(PlateauAction::FinalImproved { .. }));
-
-                // Finalise this saved dir into <NNNN>/ with the test metrics.
-                let idx = cb_next_idx.get();
-                if !reject_checkpoint {
-                    match finalize_one_nnue_dir(
-                        &output_dir_buf,
-                        &ckpt_dir,
-                        &cb_ctx,
-                        epoch,
-                        idx,
-                        cb_prior_position,
-                        test_metrics,
-                        !is_partial_save,
-                    ) {
-                        Ok(dst) => {
-                            cb_next_idx.set(idx + 1);
-                            if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
-                                eprintln!(
-                                    "  WARN: failed to update {}: {e}",
-                                    output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
-                                );
-                            }
-                            // Consumer が「ここまで処理した」を表す pair を
-                            // `dataloader_pos.txt` に書く (`<offset>,<plies>` 形式)。
-                            // HCPE / PSV のような固定長レコードでは plies=0、HCPE3
-                            // / pack のような棋譜単位なら ply 内の位置まで含めて
-                            // 厳密に再開できる。
-                            if let Some((off, plies)) = dataloader_pos_to_write {
-                                let pos_file = dst.join("dataloader_pos.txt");
-                                if let Err(e) = std::fs::write(&pos_file, format!("{off},{plies}\n")) {
-                                    eprintln!("  WARN: failed to write {}: {e}", pos_file.display());
-                                }
-                            }
-                            if plateau_epoch_done {
-                                let marker = dst.join(PLATEAU_EPOCH_DONE_NAME);
-                                if let Err(e) = std::fs::write(&marker, b"1\n") {
-                                    eprintln!("  WARN: failed to write {}: {e}", marker.display());
-                                }
-                            }
-                            eprintln!("  -> {}/", dst.display());
-                        }
-                        Err(e) => {
-                            eprintln!("  WARN: failed to finalise {} into NNNN/: {e}", ckpt_dir.display());
-                        }
-                    }
-                }
-
-                if let Some(action) = plateau_action {
-                    let current_lr = plateau_state.as_ref().map(|s| s.current_lr).unwrap_or(args.lr);
-                    let monitor_label = args.lr_plateau_monitor.label();
-                    match action {
-                        PlateauAction::First { metrics } => {
-                            eprintln!("  plateau: initial validation metrics = {}; lr stays {current_lr}", plateau_metrics_text(metrics));
-                        }
-                        PlateauAction::Improved { old_best, new_best } => {
-                            eprintln!(
-                                "  plateau: {monitor_label} improved (best {} -> {}); lr stays {}",
-                                plateau_metrics_text(old_best),
-                                plateau_metrics_text(new_best),
-                                current_lr,
-                            );
-                        }
-                        PlateauAction::Keep { metrics, best } => {
-                            eprintln!(
-                                "  plateau: {monitor_label} did not improve (current {}, best {}); lr stays {}",
-                                plateau_metrics_text(metrics),
-                                plateau_metrics_text(best),
-                                current_lr,
-                            );
-                        }
-                        PlateauAction::Reduced { old_lr, new_lr, metrics, best } => {
-                            eprintln!(
-                                "  plateau: {monitor_label} did not improve (current {}, best {}); lr {old_lr} -> {new_lr}",
-                                plateau_metrics_text(metrics),
-                                plateau_metrics_text(best),
-                            );
-                        }
-                        PlateauAction::ScheduledFinal { old_lr, min_lr, metrics, best } => {
-                            eprintln!(
-                                "  plateau: {monitor_label} did not improve (current {}, best {}); \
-                                 next lr would fall below lr_min, so one final superbatch will run at lr_min {min_lr} \
-                                 (old lr {old_lr})",
-                                plateau_metrics_text(metrics),
-                                plateau_metrics_text(best),
-                            );
-                        }
-                        PlateauAction::FinalImproved { old_best, new_best } => {
-                            plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
-                            eprintln!(
-                                "  plateau: final lr_min superbatch improved {monitor_label} (best {} -> {}); \
-                                 accepting it and ending this epoch.",
-                                plateau_metrics_text(old_best),
-                                plateau_metrics_text(new_best),
-                            );
-                            break 'epoch;
-                        }
-                        PlateauAction::FinalRejected { metrics, best } => {
-                            plateau_epoch_final_metrics = plateau_action_epoch_final_metrics(action);
-                            eprintln!(
-                                "  plateau: final lr_min superbatch did not improve {monitor_label} (current {}, best {}); \
-                                 discarding it and ending this epoch.",
-                                plateau_metrics_text(metrics),
-                                plateau_metrics_text(best),
-                            );
-                            mark_latest_checkpoint_epoch_done(&output_dir_buf);
-                            break 'epoch;
-                        }
-                    }
-                }
-
-                if retry_same_chunk {
-                    cb_dataloader_resume_offset.set(chunk_resume_before);
-                    cb_dataloader_resume_exact.set(chunk_resume_exact_before);
-                    if matches!(format, DataFormat::Hcpe) {
-                        persistent_hcpe_loader = new_hcpe_loader(chunk_resume_before.0, chunk_resume_exact_before);
-                    }
-                    eprintln!(
-                        "  plateau: restored model + optimiser, then rewinding teacher to retry superbatch {chunk_start} at lowered lr."
-                    );
-                    continue 'epoch;
-                }
-
-                // Partial save (= 教師 EOF mid-sb) was just finalised. Non-plateau
-                // treats this as epoch end. Plateau keeps the same epoch alive by
-                // wrapping the teacher to the beginning until lr_min final run.
-                if is_partial_save {
-                    if plateau_state.is_some() {
-                        cb_dataloader_resume_offset.set((0, 0));
-                        cb_dataloader_resume_exact.set(true);
-                        if matches!(format, DataFormat::Hcpe) {
-                            persistent_hcpe_loader = new_hcpe_loader(0, true);
-                        }
-                        eprintln!(
-                            "  plateau: teacher EOF reached after partial superbatch; rewinding teacher to the beginning."
-                        );
-                        chunk_start = chunk_end + 1;
-                        continue 'epoch;
-                    }
-                    break 'epoch;
-                }
-
-                chunk_start = chunk_end + 1;
-            }
-            let current_epoch_final_metrics = if matches!(args.lr_schedule, LrScheduleKind::Plateau) {
-                plateau_epoch_final_metrics
-            } else {
-                epoch_final_metrics
-            };
-            if let Some(current_metrics) = current_epoch_final_metrics {
-                if epoch_final_should_stop(
-                    previous_epoch_final_metrics,
-                    current_metrics,
-                    PlateauMonitor::LossOrAccuracy,
-                    0.0,
-                ) {
-                    let previous_metrics = previous_epoch_final_metrics.expect("checked by predicate");
-                    eprintln!(
-                        "  {}: epoch-final validation metrics did not improve from previous epoch \
-                         (loss {:.6} -> {:.6}, accuracy {:.6} -> {:.6}); stopping training.",
-                        args.lr_schedule.cli_name(),
-                        previous_metrics.loss,
-                        current_metrics.loss,
-                        previous_metrics.accuracy,
-                        current_metrics.accuracy
-                    );
-                    stop_training_after_epoch = true;
-                }
-                previous_epoch_final_metrics = Some(current_metrics);
-            } else if matches!(args.lr_schedule, LrScheduleKind::Plateau) && max_epochs == usize::MAX {
-                eprintln!(
-                    "  plateau: epoch ended before epoch-final validation metrics were established; stopping unlimited run."
-                );
-                stop_training_after_epoch = true;
-            }
-            if stop_training_after_epoch {
-                break;
-            }
-        }
-
-        // End-of-training fallback save: skip it when `--no-save-epoch-end`
-        // intentionally left a completed train-only tail without checkpoints.
-        if !saved_any.get() && !trained_without_save.get() {
-            let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
-            eprintln!(
-                "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
-                ckpt_dir.display()
-            );
-            let ckpt_dir_str = ckpt_dir.to_str().expect("checkpoint path is utf-8");
-            trainer.save_to_checkpoint(ckpt_dir_str);
-            if let Err(e) = write_loss_csv(&ckpt_dir.join("log.txt"), &last_error_record) {
-                eprintln!("  WARN: failed to write log.txt in {}: {e}", ckpt_dir.display());
-            }
-            match convert_save_dir_to_nnue_layout(&ckpt_dir) {
-                Ok(()) => eprintln!("  wrote NNUE nn.bin + state.bin in {}", ckpt_dir.display()),
-                Err(e) => eprintln!("  WARN: failed to convert save dir {}: {e}", ckpt_dir.display()),
-            }
-            // The fallback path bypasses the per-chunk callback flow, so
-            // run validation here too (when --test-teacher is set) and
-            // finalise the dir directly. Without this, the leftover dir
-            // gets enriched by the post-macro `finalize_nnue_dirs` call
-            // with `None` test_metrics, causing test_value_* columns to
-            // come out as "-" even though --test-teacher was given.
-            let test_metrics = test_cache.as_ref().map(|cache| {
-                let outputs = trainer.eval_packed_batch(&cache.positions, args.test_batch_size);
-                run_one_test_pass(cache, args, outputs)
-            });
-            if args.dump_activation_stats {
-                if let Some(cache) = test_cache.as_ref() {
-                    run_training_inline_nnue!(@dump $stats_mode $(($activation_stats))?, trainer, cache);
-                }
-            }
-            let idx = cb_next_idx.get();
-            match finalize_one_nnue_dir(
-                &output_dir_buf,
-                &ckpt_dir,
-                &cb_ctx,
-                /*epoch=*/ last_epoch_for_fallback,
-                idx,
-                cb_prior_position,
-                test_metrics,
-                false,
-            ) {
-                Ok(dst) => {
-                    cb_next_idx.set(idx + 1);
-                    if let Err(e) = append_to_top_level_log(&output_dir_buf, idx) {
-                        eprintln!(
-                            "  WARN: failed to update {}: {e}",
-                            output_dir_buf.join(SUMMARY_LEARN_LOG_NAME).display()
-                        );
-                    }
-                    eprintln!("  -> {}/", dst.display());
-                }
-                Err(e) => {
-                    eprintln!("  WARN: failed to finalise fallback save dir {} into NNNN/: {e}", ckpt_dir.display());
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(output_dir_buf.join(".bulletou_plateau_rollback"));
-    }};
-}
-
-/// Build the NNUE Standard output `save_format` for the trainer. The
-/// returned vector, when consumed by `trainer.save_to_checkpoint` /
-/// `save_quantised`, produces a `quantised.bin` that is byte-identical to
-/// nnue-pytorch's NNUE file format (which YaneuraOu and Stockfish read).
-/// `convert_save_dir_to_nnue_layout` later renames that file to `nn.bin`.
-///
-/// The layer-stack architecture (L0 -> ClippedReLU -> L1 -> ClippedReLU ->
-/// L2 -> ClippedReLU -> Out) is shared across NNUE_HALFKP / NNUE_KP / ...,
-/// so only the feature set varies between them. Pass the matching
-/// [`NnueFeatureSet`] for the correct header / hash bytes.
-fn build_nnue_save_format(
-    feature_set: NnueFeatureSet,
-    l1_size: usize,
-    l2_size: usize,
-    l3_size: usize,
-) -> Vec<SavedFormat> {
-    // Quantisation scales for the original-style NNUE (Nasu-san PR #75,
-    // 2018) which uses ClippedReLU throughout:
-    // - L0 weights/biases use qa=127 (CReLU output range is 0..127).
-    // - L1/L2/Out weights use qb=64 (i8 row-major after .transpose()).
-    // SqrClippedReLU (SCReLU) is a later, separate activation added in
-    // PR #311 (2026) for SFNNwoPSQT-1536 and is NOT used here.
-    let qa: i16 = 127;
-    let qb: i16 = 64;
-
-    let l1_input_dim = 2 * l1_size; // dual perspective concat
-    let l1_bias = l1_bias_scale(NnueActivation::Crelu, /*pairwise=*/ false, qa, qb);
-
-    vec![
-        SavedFormat::custom(header_bytes(feature_set, l1_size, l2_size, l3_size)),
-        SavedFormat::custom(ft_hash_bytes(feature_set, l1_size)),
-        // L0: biases first, then weights (standard nnue-pytorch order).
-        SavedFormat::id("l0b").round().quantise::<i16>(qa),
-        SavedFormat::id("l0w").round().quantise::<i16>(qa),
-        // Network layer hash (between FT and the FC stack).
-        SavedFormat::custom(network_layer_hash_bytes(l1_size, l2_size, l3_size)),
-        // L1: bias i32, weights i8 (row-major, 32B-padded). Stockfish /
-        // YaneuraOu's SIMD inference pads each layer's input dim to a
-        // multiple of 32.
-        SavedFormat::id("l1b").round().quantise::<i32>(l1_bias),
-        SavedFormat::id("l1w")
-            .transpose()
-            .transform({
-                let out_dim = l2_size;
-                let in_dim = l1_input_dim;
-                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-            })
-            .round()
-            .quantise::<i8>(qb),
-        // L2: bias i32, weights i8 (row-major, padded). L2 input scale after
-        // crelu_i32_to_u8 is always 127.
-        SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
-        SavedFormat::id("l2w")
-            .transpose()
-            .transform({
-                let out_dim = l3_size;
-                let in_dim = l2_size;
-                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-            })
-            .round()
-            .quantise::<i8>(qb),
-        // Output: bias i32, weights i8 (row-major, padded).
-        SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
-        SavedFormat::id("outw")
-            .transpose()
-            .transform({
-                let out_dim = 1;
-                let in_dim = l3_size;
-                move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-            })
-            .round()
-            .quantise::<i8>(qb),
-    ]
-}
-
-/// NNUE HalfKP training entry point.
-///
-/// 4-layer ClippedReLU network with dual-perspective HalfKP input. L1 /
-/// L2 / L3 sizes come from `--arch` (`NNUE_halfkp_256x2_32_32`, …);
-/// the layer structure and activation function are fixed across all
-/// presets — only the sizes vary, matching YaneuraOu's per-arch
-/// `halfkp_*.h` headers.
-/// - Dual-perspective HalfKP feature transformer -> L1 (ClippedReLU)
-/// - L1 -> L2 (ClippedReLU)
-/// - L2 -> L3 (ClippedReLU)
-/// - L3 -> 1 (eval scalar)
-///
-/// Per-save layout (after `convert_save_dir_to_nnue_layout`):
-///   `<output>/<net_id>-<sb>/{nn.bin, state.bin, log.txt}`
-/// then at end-of-training renamed to `<output>/0NNN/{nn.bin, state.bin, learn.log}`.
-fn run_halfkp(args: &Args) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_halfkp_impl::<optimiser::AdamW>(args),
-        OptimizerKind::Radam => run_halfkp_impl::<optimiser::RAdam>(args),
-        OptimizerKind::Ranger => run_halfkp_impl::<optimiser::Ranger>(args),
-    }
-}
-
-fn run_halfkp_impl<O: BulletouOptimizer>(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiHalfKP.num_inputs();
-    let l1_input_dim = 2 * l1_size;
-
-    eprintln!(
-        "=== bulletou: running NNUE_HALFKP ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
-        l1_size, l2_size, l3_size
-    );
-
-    // ---- Resume support -------------------------------------------------
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    let save_format = build_nnue_save_format(NnueFeatureSet::HalfKp, l1_size, l2_size, l3_size);
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiHalfKP)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let l0 = builder.new_affine("l0", input_size, l1_size);
-        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-        let l2 = builder.new_affine("l2", l2_size, l3_size);
-        let out = builder.new_affine("out", l3_size, 1);
-
-        let stm_hidden = l0.forward(stm_inputs).crelu();
-        let ntm_hidden = l0.forward(ntm_inputs).crelu();
-        let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).crelu();
-        let hidden2 = l2.forward(hidden1).crelu();
-        out.forward(hidden2)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline_nnue!(args, &mut trainer);
-
-    // Cleanup the scratch resume dir if it was used.
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    // Single-component finalisation: rename `<net_id>-*/` to `0NNN/` and
-    // enrich each dir's bullet `log.txt` into the 7-column `learn.log`.
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// NNUE K-P training entry point. Structurally identical to [`run_halfkp`]
-/// but uses YaneuraOu's `FeatureSet<K, P>` (`kp_256x2-32-32.h`) as input:
-/// K (162 dims, both kings) + P (1548 dims, non-king pieces) = 1710 dims
-/// per perspective. The network stack (L0 -> ClippedReLU -> L1 ->
-/// ClippedReLU -> L2 -> ClippedReLU -> Out) is the same as halfkp_256x2-32-32.
-fn run_kp(args: &Args) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_kp_impl::<optimiser::AdamW>(args),
-        OptimizerKind::Radam => run_kp_impl::<optimiser::RAdam>(args),
-        OptimizerKind::Ranger => run_kp_impl::<optimiser::Ranger>(args),
-    }
-}
-
-fn run_kp_impl<O: BulletouOptimizer>(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiKp.num_inputs();
-    let l1_input_dim = 2 * l1_size;
-
-    eprintln!(
-        "=== bulletou: running NNUE_KP ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
-        l1_size, l2_size, l3_size
-    );
-
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    let save_format = build_nnue_save_format(NnueFeatureSet::Kp, l1_size, l2_size, l3_size);
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiKp)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let l0 = builder.new_affine("l0", input_size, l1_size);
-        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-        let l2 = builder.new_affine("l2", l2_size, l3_size);
-        let out = builder.new_affine("out", l3_size, 1);
-
-        let stm_hidden = l0.forward(stm_inputs).crelu();
-        let ntm_hidden = l0.forward(ntm_inputs).crelu();
-        let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).crelu();
-        let hidden2 = l2.forward(hidden1).crelu();
-        out.forward(hidden2)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline_nnue!(args, &mut trainer);
-
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// NNUE K-A2 training entry point. Mirrors `run_kp` exactly, only the input
-/// feature differs: K (162 dims) + A2 (1629 dims, kings collapsed onto friend
-/// plane via v2 encoding) = 1791 dims per perspective. Network topology is
-/// the same 4-layer ClippedReLU as halfkp_256x2-32-32 / kp_256x2-32-32.
-/// Architecture is selected via `--arch` (default `NNUE_ka2_256x2_32_32`).
-fn run_nnue_ka2(args: &Args) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_nnue_ka2_impl::<optimiser::AdamW>(args),
-        OptimizerKind::Radam => run_nnue_ka2_impl::<optimiser::RAdam>(args),
-        OptimizerKind::Ranger => run_nnue_ka2_impl::<optimiser::Ranger>(args),
-    }
-}
-
-fn run_nnue_ka2_impl<O: BulletouOptimizer>(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiKa2.num_inputs();
-    let l1_input_dim = 2 * l1_size;
-
-    eprintln!(
-        "=== bulletou: running NNUE_KA2 ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
-        l1_size, l2_size, l3_size
-    );
-
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    let save_format = build_nnue_save_format(NnueFeatureSet::Ka2, l1_size, l2_size, l3_size);
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiKa2)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let l0 = builder.new_affine("l0", input_size, l1_size);
-        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-        let l2 = builder.new_affine("l2", l2_size, l3_size);
-        let out = builder.new_affine("out", l3_size, 1);
-
-        let stm_hidden = l0.forward(stm_inputs).crelu();
-        let ntm_hidden = l0.forward(ntm_inputs).crelu();
-        let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).crelu();
-        let hidden2 = l2.forward(hidden1).crelu();
-        out.forward(hidden2)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline_nnue!(args, &mut trainer);
-
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// NNUE HalfKPE9 training entry point. Same 4-layer ClippedReLU network as
-/// HalfKP / K-P, but the input is `ShogiHalfKpe9` (1,128,492 dims per
-/// perspective = HalfKP × 9 effect-count buckets). The effect-count
-/// computation is done once per training position by `ShogiHalfKpe9`'s
-/// `map_features` using the threat module's `for_each_attack`.
-fn run_halfkpe9(args: &Args) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_halfkpe9_impl::<optimiser::AdamW>(args),
-        OptimizerKind::Radam => run_halfkpe9_impl::<optimiser::RAdam>(args),
-        OptimizerKind::Ranger => run_halfkpe9_impl::<optimiser::Ranger>(args),
-    }
-}
-
-fn run_halfkpe9_impl<O: BulletouOptimizer>(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiHalfKpe9.num_inputs();
-    let l1_input_dim = 2 * l1_size;
-
-    eprintln!(
-        "=== bulletou: running NNUE_HALFKPE9 ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
-        l1_size, l2_size, l3_size
-    );
-
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    let save_format = build_nnue_save_format(NnueFeatureSet::HalfKpe9, l1_size, l2_size, l3_size);
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiHalfKpe9)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let l0 = builder.new_affine("l0", input_size, l1_size);
-        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-        let l2 = builder.new_affine("l2", l2_size, l3_size);
-        let out = builder.new_affine("out", l3_size, 1);
-
-        let stm_hidden = l0.forward(stm_inputs).crelu();
-        let ntm_hidden = l0.forward(ntm_inputs).crelu();
-        let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).crelu();
-        let hidden2 = l2.forward(hidden1).crelu();
-        out.forward(hidden2)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline_nnue!(args, &mut trainer);
-
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// NNUE HalfKP_vm training entry point. Identical wiring to `run_halfkp`,
-/// only the input feature type swaps from `ShogiHalfKP` (125,388 dims) to
-/// `ShogiHalfKPvm` (69,660 dims, file-mirror folded). The 4-layer
-/// ClippedReLU network and quantisation pipeline are unchanged.
-fn run_halfkpvm(args: &Args) {
-    match args.optimizer {
-        OptimizerKind::Adamw => run_halfkpvm_impl::<optimiser::AdamW>(args),
-        OptimizerKind::Radam => run_halfkpvm_impl::<optimiser::RAdam>(args),
-        OptimizerKind::Ranger => run_halfkpvm_impl::<optimiser::Ranger>(args),
-    }
-}
-
-fn run_halfkpvm_impl<O: BulletouOptimizer>(args: &Args) {
-    let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = ShogiHalfKPvm.num_inputs();
-    let l1_input_dim = 2 * l1_size;
-
-    eprintln!(
-        "=== bulletou: running NNUE_HALFKPVM ({}x2-{}-{} ClippedReLU, dual-perspective) ===",
-        l1_size, l2_size, l3_size
-    );
-
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    let save_format = build_nnue_save_format(NnueFeatureSet::HalfKpvm, l1_size, l2_size, l3_size);
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(ShogiHalfKPvm)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs| {
-        let l0 = builder.new_affine("l0", input_size, l1_size);
-        let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-        let l2 = builder.new_affine("l2", l2_size, l3_size);
-        let out = builder.new_affine("out", l3_size, 1);
-
-        let stm_hidden = l0.forward(stm_inputs).crelu();
-        let ntm_hidden = l0.forward(ntm_inputs).crelu();
-        let combined = stm_hidden.concat(ntm_hidden);
-        let hidden1 = l1.forward(combined).crelu();
-        let hidden2 = l2.forward(hidden1).crelu();
-        out.forward(hidden2)
-    });
-
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["outw"], &["l0b", "l1b", "l2b", "outb"]);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    run_training_inline_nnue!(args, &mut trainer);
-
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// SFNN / LayerStacks training entry point. Generic over the input feature so
-/// HalfKA_hm1, HalfKA_hm2, HalfKA2, and K+A2 share the pipeline; only the
-/// `input` and `feature_set` arguments differ between the callers.
-///
-/// Network topology mirrors YaneuraOu SFNN dynamic architecture:
-/// per-perspective FT (`l0`) → CReLU → pairwise-mul → concat
-/// across perspectives → bucket-specific L1 (= hidden + 1 PSQT
-/// shortcut neuron) → split off the PSQT neuron as a residual bypass
-/// → `[SqrCReLU; CReLU]` concat → L2 (32 dim) → CReLU → L3 (scalar)
-/// → add PSQT residual.
-///
-/// The bucket-specific layers `l1` and `l2` use the LayerStacks pattern:
-/// the weight tensor is `(NUM_STACKS × out_dim, in_dim)` and a
-/// `.select(output_buckets)` per forward pass picks the active slice
-/// based on `ShogiLayerStackBucket9` (= `--arch` LayerStack suffix).
-///
-fn run_sfnn_1536<I>(args: &Args, input: I, feature_set: NnueFeatureSet)
-where
-    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
-{
-    match args.optimizer {
-        OptimizerKind::Adamw => run_sfnn_1536_impl::<optimiser::AdamW, I>(args, input, feature_set),
-        OptimizerKind::Radam => run_sfnn_1536_impl::<optimiser::RAdam, I>(args, input, feature_set),
-        OptimizerKind::Ranger => run_sfnn_1536_impl::<optimiser::Ranger, I>(args, input, feature_set),
-    }
-}
-
-fn run_sfnn_1536_impl<O, I>(args: &Args, input: I, feature_set: NnueFeatureSet)
-where
-    O: BulletouOptimizer,
-    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue> + Copy,
-{
-    let arch = args.arch();
-    let (ft_size, l1_hidden, l2_size) = arch.dims();
-    // L1 output = effective hidden + 1 PSQT-shortcut neuron (matches
-    // yaneuraou `kHidden1Dims + 1` in the SFNN architecture).
-    let l1_out = l1_hidden + 1;
-    let l1_effective = l1_hidden;
-    let l2_in = l1_effective * 2; // [SqrCReLU; CReLU] concat
-    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
-    let num_stacks = layerstack.num_stacks();
-    let input_size = input.num_inputs();
-
-    eprintln!(
-        "=== bulletou: running {} ({}x2-{}-{} CReLU+SqrCReLU, dual-perspective, LayerStacks={} via {}) ===",
-        args.eval_type().cli_name(),
-        ft_size,
-        l1_hidden,
-        l2_size,
-        num_stacks,
-        layerstack.cli_name()
-    );
-    if args.nnue_pytorch_init_scale != 1.0 {
-        eprintln!("  nnue-pytorch init scale = {}", args.nnue_pytorch_init_scale);
-    }
-    if args.sfnn_factorized_l1 {
-        eprintln!("  SFNN factorized L1 shared term = enabled");
-    }
-    let output_dir = args.output_dir();
-    let resume_state_bin = find_latest_state_bin(args, &output_dir);
-    let resume_dir: Option<std::path::PathBuf> = resume_state_bin.as_ref().map(|state_bin_path| {
-        eprintln!("=== resume detected: {} ===", state_bin_path.display());
-        let bytes = std::fs::read(state_bin_path).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {}: {e}", state_bin_path.display());
-            std::process::exit(1);
-        });
-        let records = parse_model_weights_bin(&bytes).unwrap_or_else(|e| {
-            eprintln!("error: failed to parse state.bin: {e}");
-            std::process::exit(1);
-        });
-        let resume_root = output_dir.join(".bulletou_resume");
-        let _ = std::fs::remove_dir_all(&resume_root);
-        unbundle_component_state(&records, "nnue", &resume_root.join("optimiser_state")).unwrap_or_else(|e| {
-            eprintln!("error: state.bin missing `nnue/*` records: {e}");
-            std::process::exit(1);
-        });
-        resume_root
-    });
-
-    // LayerStack bucket selector. `Kingrank9` matches YaneuraOu's
-    // `stack_index_for_nnue` (3×3 = 9 buckets by king ranks).
-    let bucket_impl = match layerstack {
-        LayerStackMode::Kingrank3by3 => ShogiLayerStackBucket9::KingRank9,
-    };
-
-    // YaneuraOu SFNN 互換 nn.bin の save format。`Sfnn1536SaveParams`
-    // で feature set / 各層のサイズ / LayerStacks 数を受け、`bulletou_lib::value::nnue_save_sfnn1536`
-    // が組み立てた `SavedFormat` 列を渡す。出力は `EvalDir` で yaneuraou
-    // (`YANEURAOU_ENGINE_SFNN_*` ビルド) が load できる layout。
-    let save_format = build_sfnn_1536_save_format(Sfnn1536SaveParams {
-        feature_set,
-        input_size,
-        ft_size,
-        l1_hidden,
-        l2_size,
-        num_stacks,
-        factorized_l1: args.sfnn_factorized_l1,
-    });
-
-    let mut builder = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(O::default())
-        .inputs(input)
-        .output_buckets(bucket_impl)
-        .save_format(&save_format)
-        .loss_fn(value_loss_fn(args));
-
-    if args.nnue_pytorch_wrm_loss {
-        builder = builder.use_win_rate_model();
-    }
-
-    if args.score_drop_abs > 0 {
-        builder = builder.score_drop_abs(args.score_drop_abs);
-    }
-
-    let mut trainer = builder.build(|builder, stm_inputs, ntm_inputs, output_buckets| {
-        let l0 = builder.new_affine("l0", input_size, ft_size);
-        l0.init_nnue_pytorch_feature_transformer_scaled(input_size, args.nnue_pytorch_init_scale);
-
-        // L1: yaneuraou's SFNN stores one independent `fc_0` per LayerStack.
-        // With --sfnn-factorized-l1, also train nnue-pytorch's zero-initialised
-        // shared L1 term and fold it into every bucket when saving `nn.bin`.
-        // Match nnue-pytorch's StackedLinear initialisation: initialise bucket
-        // 0 and copy it to every bucket. The output bias is zero-initialised.
-        let l1 = builder.new_stacked_affine_nnue_pytorch_scaled(
-            "l1",
-            ft_size,
-            l1_out,
-            num_stacks,
-            false,
-            args.nnue_pytorch_init_scale,
-        );
-        let l1f = if args.sfnn_factorized_l1 {
-            let l1f = builder.new_affine("l1f", ft_size, l1_out);
-            l1f.init_zeroed();
-            Some(l1f)
-        } else {
-            None
-        };
-        let l2 = builder.new_stacked_affine_nnue_pytorch_scaled(
-            "l2",
-            l2_in,
-            l2_size,
-            num_stacks,
-            false,
-            args.nnue_pytorch_init_scale,
-        );
-        let l3 = builder.new_stacked_affine_nnue_pytorch_scaled(
-            "l3",
-            l2_size,
-            1,
-            num_stacks,
-            true,
-            args.nnue_pytorch_init_scale,
-        );
-
-        // Per-perspective FT → CReLU → pairwise-mul → concat. After the
-        // pairwise-mul the dim is ft_size/2; concat of stm/ntm brings it
-        // back to ft_size (matching `kInputDims = kTransformedFeatureDimensions`
-        // in sfnnwop-1536.h).
-        let stm = l0.forward(stm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
-        let ntm = l0.forward(ntm_inputs).crelu().pairwise_mul() * (127.0 / 128.0);
-        let combined = stm.concat(ntm);
-
-        let mut l1_out_t = l1.forward(combined).select(output_buckets);
-        if let Some(l1f) = l1f {
-            l1_out_t = l1_out_t + l1f.forward(combined);
-        }
-
-        // Split the L1 output: rows 0..l1_effective are the hidden, the
-        // last row is the PSQT shortcut neuron that bypasses everything
-        // and adds straight into the final scalar.
-        let l1_main = l1_out_t.slice_rows(0, l1_effective);
-        let l1_skip = l1_out_t.slice_rows(l1_effective, l1_out);
-
-        // [SqrCReLU; CReLU] pair, matching yaneuraou's
-        // `memcpy(ac_sqr_0_out + kHidden1Dims, ac_0_out, ...)` concat layout.
-        let l1_sqr = l1_main.abs_pow(2.0) * (127.0 / 128.0);
-        let l2_input = l1_sqr.concat(l1_main).crelu();
-
-        let l2_out_t = l2.forward(l2_input).select(output_buckets).crelu();
-        let l3_out = l3.forward(l2_out_t).select(output_buckets);
-
-        // PSQT bypass: final = L3(bucket) + PSQT shortcut neuron, matching
-        // yaneuraou's `buf.fc_2_out[0] += buf.fc_0_out[kHidden1Dims]`.
-        l3_out + l1_skip
-    });
-
-    let bias_ids: &[&str] = if args.sfnn_factorized_l1 {
-        &["l0b", "l1b", "l1fb", "l2b", "l3b"]
-    } else {
-        &["l0b", "l1b", "l2b", "l3b"]
-    };
-    configure_optimizer::<O, _, _>(args, &mut trainer, &["l3w"], bias_ids);
-
-    if let Some(dir) = resume_dir.as_ref() {
-        eprintln!("  [NNUE] restoring optimiser state from {}", dir.display());
-        trainer.load_from_checkpoint(dir.to_str().expect("resume dir UTF-8"));
-    }
-
-    let activation_shape = SfnnActivationShape { ft_size, l1_hidden, l1_out, l2_in, l2_size, num_stacks };
-    run_training_inline_nnue!(args, &mut trainer, |trainer, cache| {
-        dump_sfnn_activation_stats(args, trainer, input, bucket_impl, cache, activation_shape);
-    });
-
-    let _ = std::fs::remove_dir_all(output_dir.join(".bulletou_resume"));
-
-    let ctx = LogContext::from_args(args, 0);
-    let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let prior_position = read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0);
-    match finalize_nnue_dirs(&output_dir, &ctx, &args.net_id(), prior_position) {
-        // (0, 0) = nothing left to do (per-superbatch callback already
-        // finalised everything during training). Top-level learn.log was
-        // appended incrementally too, so skip the extra append here.
-        Ok((_first_idx, 0)) => {}
-        Ok((_first_idx, last_idx)) => {
-            if let Err(e) = append_to_top_level_log(&output_dir, last_idx) {
-                eprintln!("warning: failed to update {}: {e}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
-            }
-        }
-        Err(e) => {
-            eprintln!("error: failed to finalise NNUE checkpoint dirs: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    // Derive the YaneuraOu edition name that matches this trained nn.bin.
-    // Format follows nnue_arch_gen.py / source/Makefile: the feature suffix
-    // is the lowercase tag the python script dispatches on, and the dim
-    // segments use underscores (not hyphens) so the resulting -D macro is a
-    // valid C identifier (avoids clang -Wc99-extensions warning).
-    let feature_suffix = match feature_set {
-        NnueFeatureSet::HalfKaHm1 => "halfkahm1",
-        NnueFeatureSet::HalfKaHm2 => "halfkahm2",
-        NnueFeatureSet::HalfKa2 => "halfka2",
-        NnueFeatureSet::Ka2 => "ka2",
-        // run_sfnn_1536 is only invoked from SFNN eval-type dispatch in main(),
-        // so any other feature set means a new EvalType variant was added
-        // without updating this arm.
-        other => unreachable!("run_sfnn_1536 received unsupported feature set: {other:?}"),
-    };
-    let edition_name =
-        format!("YANEURAOU_ENGINE_SFNN_{feature_suffix}_{ft_size}_{l1_hidden}_{l2_size}_{}", layerstack.arch_suffix());
-    let alias_note = if matches!(feature_set, NnueFeatureSet::HalfKaHm2)
-        && ft_size == 1536
-        && l1_hidden == 15
-        && l2_size == 32
-        && num_stacks == 9
-    {
-        "\n  (alias: YANEURAOU_ENGINE_SFNN1536)"
-    } else {
-        ""
-    };
-
-    eprintln!(
-        "note: nn.bin in each save dir targets a YaneuraOu build with edition\n  \
-             {edition_name}{alias_note}\n\
-         Build it with `make normal YANEURAOU_EDITION=<edition>`."
-    );
-}
-
-/// Single-component analogue of `assemble_numbered_dirs`: list `<net_id>-*/`
-/// (or `<net_id>-e<epoch>-<sb>/` for multi-epoch) under `output_dir`, sort
-/// by (epoch, sb), rename them to `0NNN/` starting at `existing_count + 1`,
-/// and enrich each dir's bullet-format `log.txt` into the current CSV
-/// `learn.log` shared with KPPT.
-/// Single-dir version of [`finalize_nnue_dirs`]: rename `src` to
-/// `output_dir/<idx:04>/` and convert its raw `log.txt` to the enriched
-/// `learn.log` in the new location. Used by the per-superbatch save callback
-/// in [`run_training_inline_nnue`] so that `learn.log` and the `0001/`
-/// numbered layout are in place even if training is killed mid-run.
-fn finalize_one_nnue_dir(
-    output_dir: &std::path::Path,
-    src: &std::path::Path,
-    ctx: &LogContext,
-    epoch: usize,
-    idx: usize,
-    prior_position: usize,
-    test_metrics: Option<TestMetrics>,
-    last_superbatch_complete: bool,
-) -> std::io::Result<std::path::PathBuf> {
-    let dst = output_dir.join(format!("{idx:04}"));
-    std::fs::rename(src, &dst)?;
-    let log_txt = dst.join("log.txt");
-    let learn_log = dst.join("learn.log");
-    let raw = std::fs::read_to_string(&log_txt).unwrap_or_default();
-    let body =
-        enrich_bullet_log_to_csv(&raw, ctx, epoch, "nnue", prior_position, test_metrics, last_superbatch_complete);
-    let mut content = String::with_capacity(body.len() + LEARN_LOG_HEADER.len() + 1);
-    content.push_str(LEARN_LOG_HEADER);
-    content.push('\n');
-    content.push_str(&body);
-    std::fs::write(&learn_log, content)?;
-    let _ = std::fs::remove_file(&log_txt);
-    Ok(dst)
-}
-
-/// Sweep any remaining bullet-named (`<net_id>-<sb>`) checkpoint dirs that
-/// were not finalised incrementally by the per-superbatch callback in
-/// [`run_training_inline_nnue`]. In normal flow this is empty (the callback
-/// finalises each dir as it is written); the only case where it has work
-/// to do is the "教師 < 1 superbatch" fallback save, which writes its
-/// bullet-named dir AFTER the training loop and so misses the callback.
-///
-/// Returns `(first_idx, last_idx)` of dirs finalised here, both `0` when
-/// nothing was left to do.
-fn finalize_nnue_dirs(
-    output_dir: &std::path::Path,
-    ctx: &LogContext,
-    net_id_prefix: &str,
-    prior_position: usize,
-) -> std::io::Result<(usize, usize)> {
-    let src_dirs = list_component_checkpoints_sorted(output_dir, net_id_prefix);
-    let n = src_dirs.len();
-    if n == 0 {
-        return Ok((0, 0));
-    }
-
-    let existing_count = count_existing_numbered_dirs(output_dir);
-
-    eprintln!(
-        "\n=== finalising {n} leftover NNUE checkpoint dir(s) under {} (starting at #{}) ===",
-        output_dir.display(),
-        existing_count + 1
-    );
-    for (i, (epoch, _sb, src)) in src_dirs.iter().enumerate() {
-        let idx = existing_count + i + 1;
-        // Leftover dirs were not finalised by the per-save callback so we
-        // also have no test metrics for them (validation runs in the
-        // training loop, not in this fallback path).
-        let dst = finalize_one_nnue_dir(output_dir, src, ctx, *epoch, idx, prior_position, None, true)?;
-        eprintln!("  -> {}/", dst.display());
-    }
-    Ok((existing_count + 1, existing_count + n))
 }
 
 #[cfg(test)]
@@ -11823,79 +8667,9 @@ mod tests {
         assert!(NnueArch::from_str("SFNN_halfka2_100_7_64_k3k3").is_err());
     }
 
-    /// `finalize_one_nnue_dir` が bullet 形式の checkpoint dir を `<NNNN>/`
-    /// に rename し、`log.txt` を current schema の `learn.log` に変換することを確認。
-    /// per-superbatch save callback で呼ばれた場合の単発動作と等価。
-    #[test]
-    fn finalize_one_nnue_dir_renames_and_enriches() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-finalize-one-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let src = tmp.join("shogi_nnue_ka2-3");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("nn.bin"), b"dummy").unwrap();
-        std::fs::write(src.join("state.bin"), b"dummy").unwrap();
-        // bullet's raw 3-column log.txt (superbatch, batch, loss)
-        std::fs::write(src.join("log.txt"), "3,32,0.123\n3,64,0.099\n").unwrap();
-
-        let ctx = LogContext {
-            eval_type: "SFNN_KA2",
-            arch: "SFNN_ka2_1536_15_32_k3k3".to_string(),
-            lr_start: 0.001,
-            lambda: 1.0,
-            batch_size: 16384,
-            batches_per_superbatch: 6104,
-            teacher_csv: "teachers/foo.hcpe".to_string(),
-            epoch_offset: 0,
-            lr_schedule: LrScheduleKind::Step,
-            lr_period: 500_000_000,
-            lr_step_gamma: 0.992,
-            lr_step_positions: 100_000_000,
-            lr_min: 0.00001,
-            lr_override: None,
-        };
-
-        let dst = finalize_one_nnue_dir(
-            &tmp, &src, &ctx, /*epoch=*/ 1, /*idx=*/ 5, /*prior=*/ 0, /*test_metrics=*/ None, true,
-        )
-        .expect("finalize ok");
-
-        // src is gone, dst is `0005/`
-        assert!(!src.exists(), "src dir should have been renamed away");
-        assert_eq!(dst, tmp.join("0005"));
-        assert!(dst.is_dir());
-        // contents preserved
-        assert!(dst.join("nn.bin").is_file());
-        assert!(dst.join("state.bin").is_file());
-        // log.txt removed, learn.log written with header + 2 rows
-        assert!(!dst.join("log.txt").exists(), "log.txt should be deleted");
-        let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
-        assert!(learn.starts_with(LEARN_LOG_HEADER), "learn.log should start with header");
-        let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
-        assert_eq!(body_lines.len(), 2, "two body rows expected");
-        // each row has 12 comma-separated fields (= LEARN_LOG_HEADER columns)
-        // and the two test_value_* columns are "-" because we passed None.
-        for row in &body_lines {
-            assert_eq!(row.split(',').count(), 12, "row `{row}` should be 12 columns");
-            assert!(row.starts_with("SFNN_KA2-SFNN_ka2_1536_15_32_k3k3,"));
-            // Columns: eval, epoch, sb, batch, test_value_accuracy,
-            // test_value_loss, train_value_loss, lr_start, lr_end, lambda,
-            // positions, teacher
-            // → indexes 4 and 5 should be "-"
-            let cols: Vec<&str> = row.split(',').collect();
-            assert_eq!(cols[4], "-", "test_value_accuracy should be '-' when no test_metrics");
-            assert_eq!(cols[5], "-", "test_value_loss should be '-' when no test_metrics");
-        }
-        // cleanup
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// `--tag` を指定すると、自動命名された出力フォルダ名の末尾に
-    /// `-<tag>` が付くこと、`--output` 指定時は `--tag` が無視されて
-    /// ユーザー指定パスがそのまま使われることを確認。
+    /// Verify that `--tag` appends `-<tag>` to the auto-generated output
+    /// directory name, and that an explicit `--output` path takes precedence
+    /// over `--tag`.
     #[test]
     fn output_dir_applies_tag_suffix() {
         use clap::Parser as _;
@@ -12042,10 +8816,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_bullet_backend_keeps_generic_path_available() {
+    fn removed_bullet_backend_cli_value_is_rejected() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from([
+        let err = Args::try_parse_from([
             "bulletou",
             "--eval-type",
             "NNUE_HALFKP",
@@ -12054,10 +8828,9 @@ mod tests {
             "--backend",
             "bullet",
         ])
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(args.backend, BackendKind::Bullet);
-        assert!(args.validate_backend_flags().is_ok());
+        assert!(err.to_string().contains("invalid value"));
     }
 
     #[test]
@@ -13822,41 +10595,6 @@ mod tests {
     }
 
     #[test]
-    fn max_epochs_omitted_is_unlimited_for_all_schedules() {
-        use clap::Parser as _;
-
-        for schedule in ["step", "geometric", "cos", "plateau"] {
-            let args = Args::try_parse_from([
-                "bulletou",
-                "--eval-type",
-                "NNUE_HALFKP",
-                "--teacher",
-                "/dev/null",
-                "--lr-schedule",
-                schedule,
-                "--test-teacher",
-                "/tmp/test.hcpe",
-            ])
-            .unwrap();
-            assert_eq!(effective_max_epochs(&args), usize::MAX, "schedule={schedule}");
-        }
-
-        let capped = Args::try_parse_from([
-            "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
-            "--teacher",
-            "/dev/null",
-            "--lr-schedule",
-            "cos",
-            "--max-epochs",
-            "3",
-        ])
-        .unwrap();
-        assert_eq!(effective_max_epochs(&capped), 3);
-    }
-
-    #[test]
     fn optimizer_flags_feed_params_and_resume_signature() {
         use clap::Parser as _;
 
@@ -13877,20 +10615,9 @@ mod tests {
         ])
         .unwrap();
 
-        let params = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
-        assert_eq!(params.decay, 0.0);
-        assert_eq!(params.epsilon, 0.0000001);
-        assert_eq!(params.beta1, 0.85);
-        assert_eq!(params.beta2, 0.995);
 
-        let radam = radam_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
-        assert_eq!(radam.decay, 0.0);
-        assert_eq!(radam.epsilon, 0.0000001);
-        assert_eq!(radam.beta1, 0.85);
-        assert_eq!(radam.beta2, 0.995);
-
-        let ranger = ranger_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
+        let ranger = ranger_params(&args, BULLETOU_DEFAULT_RANGER_CLIP);
         assert_eq!(ranger.decay, 0.0);
         assert_eq!(ranger.epsilon, 0.0000001);
         assert_eq!(ranger.beta1, 0.85);
@@ -13911,11 +10638,28 @@ mod tests {
         let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
-        let adamw = adamw_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
-        let ranger = ranger_params(&args, BULLETOU_DEFAULT_ADAMW_CLIP);
-        assert_eq!(adamw.beta1, 0.9);
+        let ranger = ranger_params(&args, BULLETOU_DEFAULT_RANGER_CLIP);
         assert_eq!(ranger.beta1, 0.99);
         assert_eq!(ranger.beta2, 0.999);
+    }
+
+    #[test]
+    fn removed_adamw_radam_optimizer_values_are_rejected() {
+        use clap::Parser as _;
+
+        for optimizer in ["adamw", "radam"] {
+            let err = Args::try_parse_from([
+                "bulletou",
+                "--eval-type",
+                "NNUE_HALFKP",
+                "--teacher",
+                "/dev/null",
+                "--optimizer",
+                optimizer,
+            ])
+            .unwrap_err();
+            assert!(err.to_string().contains("invalid value"));
+        }
     }
 
     #[test]
@@ -14004,80 +10748,6 @@ mod tests {
         assert!(parsed.is_err());
     }
 
-    #[test]
-    fn latest_checkpoint_has_file_checks_latest_numbered_state_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-latest-marker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let d1 = tmp.join("0001");
-        std::fs::create_dir(&d1).unwrap();
-        std::fs::write(d1.join("state.bin"), b"dummy").unwrap();
-        std::fs::write(d1.join(PLATEAU_EPOCH_DONE_NAME), b"1\n").unwrap();
-        assert!(latest_checkpoint_has_file(&tmp, PLATEAU_EPOCH_DONE_NAME));
-
-        let d2 = tmp.join("0002");
-        std::fs::create_dir(&d2).unwrap();
-        std::fs::write(d2.join("state.bin"), b"dummy").unwrap();
-        assert!(!latest_checkpoint_has_file(&tmp, PLATEAU_EPOCH_DONE_NAME));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// finalize_one_nnue_dir with Some(TestMetrics) emits actual values
-    /// in the test_value_* columns rather than `-`.
-    #[test]
-    fn finalize_one_nnue_dir_emits_test_metrics_when_provided() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-finalize-with-metrics-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let src = tmp.join("shogi_sfnn_ka2-7");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("nn.bin"), b"dummy").unwrap();
-        std::fs::write(src.join("state.bin"), b"dummy").unwrap();
-        std::fs::write(src.join("log.txt"), "7,32,0.111\n7,64,0.099\n").unwrap();
-
-        let ctx = LogContext {
-            eval_type: "NNUE_KA2",
-            arch: "NNUE_ka2_256x2_32_32".to_string(),
-            lr_start: 0.001,
-            lambda: 1.0,
-            batch_size: 16384,
-            batches_per_superbatch: 6104,
-            teacher_csv: "teachers/foo.hcpe".to_string(),
-            epoch_offset: 0,
-            lr_schedule: LrScheduleKind::Geometric,
-            lr_period: 500_000_000,
-            lr_step_gamma: 0.992,
-            lr_step_positions: 100_000_000,
-            lr_min: 0.00001,
-            lr_override: None,
-        };
-        let metrics = TestMetrics { accuracy: 0.8765, loss: 0.0512 };
-        let dst = finalize_one_nnue_dir(&tmp, &src, &ctx, 1, 9, 0, Some(metrics), true).unwrap();
-        let learn = std::fs::read_to_string(dst.join("learn.log")).unwrap();
-        let body_lines: Vec<&str> = learn.lines().skip(1).filter(|l| !l.is_empty()).collect();
-        assert_eq!(body_lines.len(), 2);
-        // Validation runs once per superbatch, so only the LAST row of
-        // each sb (here: the second of two rows for sb=7) carries the
-        // metric. Earlier rows show `-` for the test_value_* columns.
-        let cols0: Vec<&str> = body_lines[0].split(',').collect();
-        assert_eq!(cols0.len(), 12);
-        assert_eq!(cols0[4], "-", "non-boundary row's test_value_accuracy should be `-`");
-        assert_eq!(cols0[5], "-", "non-boundary row's test_value_loss should be `-`");
-        let cols1: Vec<&str> = body_lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 12);
-        assert_eq!(cols1[4], "0.876500", "sb-boundary row carries test_value_accuracy");
-        assert_eq!(cols1[5], "0.051200", "sb-boundary row carries test_value_loss");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
     /// `append_to_top_level_log` should keep only the LAST row of each
     /// (eval, sb) group so the top-level summary stays sb-granularity
     /// even though per-dir `learn.log` is per-batch granularity.
@@ -14108,7 +10778,7 @@ mod tests {
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER, "first line is summary header (no curr_batch)");
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
         // boundary row (b=64); intermediate rows dropped, and the
-        // curr_batch column itself is also stripped — leaving 11 cols.
+        // curr_batch column itself is also stripped, leaving 11 cols.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
         assert_eq!(cols1.len(), 11, "summary row has 11 cols (no curr_batch)");
@@ -14225,30 +10895,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// geometric schedule の検証: 1 epoch 末で lr_min、cycle 跨ぎで
-    /// warm restart して lr_max に戻る。
+    /// Geometric schedule reaches lr_min near the end of one epoch and
+    /// warm-restarts to lr_max at the cycle boundary.
     #[test]
     fn geometric_lr_warm_restarts() {
         let max = 0.001f32;
         let min = 0.00001f32;
         let period = 500_000_000u64;
-        // t=0 → lr_max
+        // t=0 -> lr_max
         let lr = GeometricLR::lr_at_positions(max, min, period, 0);
         assert!((lr - max).abs() < 1e-7, "t=0 should be lr_max, got {lr}");
-        // t=0.5 → log-space midpoint = sqrt(max * min)
+        // t=0.5 -> log-space midpoint = sqrt(max * min)
         let lr = GeometricLR::lr_at_positions(max, min, period, period / 2);
         let geomean = (max as f64 * min as f64).sqrt() as f32;
         assert!((lr - geomean).abs() < 1e-6, "t=0.5 should be geomean {geomean}, got {lr}");
-        // Just before cycle end → near lr_min
+        // Just before cycle end -> near lr_min
         let lr = GeometricLR::lr_at_positions(max, min, period, period - 1);
         assert!(lr < min * 1.1, "near t=1 should approach lr_min, got {lr}");
-        // Exact cycle boundary → warm restart to lr_max
+        // Exact cycle boundary -> warm restart to lr_max
         let lr = GeometricLR::lr_at_positions(max, min, period, period);
         assert!((lr - max).abs() < 1e-7, "cycle boundary should warm-restart to lr_max, got {lr}");
     }
 
-    /// step は指定局面数ごとに gamma を掛け、epoch 境界で lr_max に戻る。
-    /// lr_min を下回ったら floor する。
+    /// Step schedule applies gamma every fixed position interval, restarts to
+    /// lr_max at epoch boundaries, and floors at lr_min.
     #[test]
     fn step_lr_drops_by_fixed_gamma_and_restarts_each_epoch() {
         let max = 0.000875f32;
@@ -14295,25 +10965,25 @@ mod tests {
         assert!((scheduler.lr(0, 3) - 0.000875).abs() < 1e-12);
     }
 
-    /// CosineLR の式: lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt)) が
-    /// t=0 で lr_max、t=0.5 で midpoint、t=1 で lr_min を取ることを確認。
-    /// warm restart (cycle 跨ぎ) で lr_max に戻ることも確認。
+    /// CosineLR formula: `lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt))`.
+    /// It should return lr_max at t=0, midpoint at t=0.5, lr_min near t=1,
+    /// and warm-restart to lr_max at the cycle boundary.
     #[test]
     fn cosine_lr_formula_endpoints_and_restart() {
         let max = 0.001f32;
         let min = 0.00001f32;
         let period = 500_000_000u64;
-        // t=0 → lr_max
+        // t=0 -> lr_max
         let lr = CosineLR::lr_at_positions(max, min, period, 0);
         assert!((lr - max).abs() < 1e-7, "t=0 should be lr_max, got {lr}");
-        // t=0.5 → midpoint
+        // t=0.5 -> midpoint
         let lr = CosineLR::lr_at_positions(max, min, period, period / 2);
         let mid = min + 0.5 * (max - min);
         assert!((lr - mid).abs() < 1e-6, "t=0.5 should be midpoint {mid}, got {lr}");
-        // Just before cycle end → near lr_min
+        // Just before cycle end -> near lr_min
         let lr = CosineLR::lr_at_positions(max, min, period, period - 1);
         assert!(lr < min + 1e-5, "near t=1 should approach lr_min, got {lr}");
-        // Exactly at cycle boundary → restart at lr_max (cycle index increments,
+        // Exactly at cycle boundary -> restart at lr_max (cycle index increments,
         // in_cycle = 0).
         let lr = CosineLR::lr_at_positions(max, min, period, period);
         assert!((lr - max).abs() < 1e-7, "cycle boundary should warm-restart to lr_max, got {lr}");
@@ -14506,7 +11176,7 @@ mod tests {
         assert!((lr_end - 0.00025).abs() < 1e-12, "plateau lr_end should use exact override, got {lr_end}");
     }
 
-    /// enrich path が `LrScheduleKind::Cos` のとき CosineLR を呼ぶことを確認。
+    /// Verify that the enrich path uses CosineLR for `LrScheduleKind::Cos`.
     #[test]
     fn enrich_uses_cosine_when_schedule_is_cos() {
         let ctx = LogContext {
@@ -14525,12 +11195,12 @@ mod tests {
             lr_min: 0.0,
             lr_override: None,
         };
-        // batch=32, prior=0 → positions = 524,288 → t ≈ 0.00524 → lr ≈ lr_max
+        // batch=32, prior=0 -> positions = 524,288 -> t ~= 0.00524 -> lr ~= lr_max
         let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 0, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
         let lr_start: f32 = cols[7].parse().unwrap();
         assert!(lr_start > 0.0009, "near cycle start, lr_start should be near lr_max=0.001, got {lr_start}");
-        // Push to half a cycle = 50M positions → midpoint = 0.0005
+        // Push to half a cycle = 50M positions -> midpoint = 0.0005
         let body = enrich_bullet_log_to_csv("1,32,0.10\n", &ctx, 1, "nnue", 50_000_000, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
         let lr_start: f32 = cols[7].parse().unwrap();
@@ -14569,9 +11239,9 @@ mod tests {
         assert!(lr_end < 0.001 && lr_end > 0.00098, "lr_end should be near the cosine value at sb end, got {lr_end}");
     }
 
-    /// enrich の sb 列が bullet の local sb をそのまま表示すること、および
-    /// LR / positions 列が prior_positions オフセット込みで計算されることを
-    /// 確認。継続学習 run (= 前回までの positions を carry-over) の整合性。
+    /// Verify that enrich keeps bullet's local sb column and computes
+    /// LR / positions with the prior_positions offset. This checks
+    /// continued-training carry-over from previous runs.
     #[test]
     fn enrich_emits_local_sb_with_prior_positions_offset() {
         let ctx = LogContext {
@@ -14611,10 +11281,9 @@ mod tests {
         assert_eq!(cols0[10], "60524288", "positions = prior + (local_sb-1)*sb_size + b*batch_size");
     }
 
-    /// `LogContext.epoch_offset` が enrich の epoch 列に正しく加算され、
-    /// 追加学習 run (= 前回の max_epoch を引き継ぐ) で epoch 表示が連続する
-    /// ことを確認。bullet 側の local epoch counter は invocation ごとに 1 から
-    /// 始まるので、offset を足さないと 1 にリセットされてしまうのが背景。
+    /// Verify that `LogContext.epoch_offset` is added to the enriched epoch
+    /// column, so additional-training runs continue the displayed epoch count
+    /// instead of resetting to 1 for each invocation.
     #[test]
     fn enrich_with_epoch_offset_emits_absolute_epoch() {
         let ctx = LogContext {
@@ -14634,14 +11303,14 @@ mod tests {
             lr_override: None,
         };
         let raw = "1,32,0.07\n";
-        // local epoch=1 + offset 3 → display epoch=4
+        // local epoch=1 + offset 3 -> display epoch=4
         let body = enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", 0, None, false);
         let cols: Vec<&str> = body.lines().next().unwrap().split(',').collect();
         assert_eq!(cols[1], "4", "absolute epoch (= local 1 + offset 3)");
     }
 
-    /// `read_latest_epoch_in_top_level_log` が summary-learn.log の epoch 列
-    /// (= index 1) の最大値を拾うことを確認。複数行を読んで max を返す。
+    /// Verify that `read_latest_epoch_in_top_level_log` reads the maximum epoch
+    /// column (index 1) from summary-learn.log.
     #[test]
     fn read_latest_epoch_picks_max() {
         let tmp = std::env::temp_dir().join(format!(
@@ -14652,10 +11321,10 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("summary-learn.log");
 
-        // 存在しない → None
+        // Missing file -> None.
         assert_eq!(read_latest_epoch_in_top_level_log(&log), None);
 
-        // header + 3 行 (epoch 1, 2, 3) → max = 3
+        // Header + 3 rows (epoch 1, 2, 3) -> max = 3.
         std::fs::write(
             &log,
             "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher\n\
@@ -14697,8 +11366,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// `read_latest_saved_superbatch` が `<NNNN>/learn.log` の sb 列を
-    /// 正しく拾うことを確認。auto-resume の出発点。
+    /// Verify that `read_latest_saved_superbatch` reads the sb column from the
+    /// latest `<NNNN>/learn.log`, which is the auto-resume starting point.
     #[test]
     fn read_latest_saved_superbatch_picks_max_sb() {
         let tmp = std::env::temp_dir().join(format!(
@@ -14708,15 +11377,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // 空 dir → None
+        // Empty dir -> None.
         assert_eq!(read_latest_saved_superbatch(&tmp), None);
 
-        // 0001/ だけあって learn.log 無し → None
+        // 0001/ exists but learn.log is missing -> None.
         let d1 = tmp.join("0001");
         std::fs::create_dir(&d1).unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), None);
 
-        // 0001/learn.log の sb 列が 1 → 1 が返る
+        // 0001/learn.log has sb=1 -> returns 1.
         std::fs::write(
             d1.join("learn.log"),
             format!(
@@ -14727,7 +11396,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(1));
 
-        // 0004/ も追加 (sb=4 のログ) → 最高番号 dir の sb が返る
+        // Add 0004/ with sb=4 -> the highest-numbered dir wins.
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
         std::fs::write(
@@ -14737,16 +11406,16 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
 
-        // 不正 dir 名 (foo/) は無視
+        // Non-numbered dirs are ignored.
         std::fs::create_dir(tmp.join("foo")).unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `read_latest_saved_teacher` が `<NNNN>/learn.log` の teacher 列
-    /// (= 12-列の最終フィールド) を取り、auto-resume の教師変更検出に
-    /// 使えることを確認。
+    /// Verify that `read_latest_saved_teacher` reads the teacher column (the
+    /// final field of the 12-column row) from `<NNNN>/learn.log` so auto-resume
+    /// can detect teacher changes.
     #[test]
     fn read_latest_saved_teacher_picks_last_teacher() {
         let tmp = std::env::temp_dir().join(format!(
@@ -14756,15 +11425,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // 空 dir → None
+        // Empty dir -> None.
         assert_eq!(read_latest_saved_teacher(&tmp), None);
 
-        // 0001 だけあって learn.log 無し → None
+        // 0001/ exists but learn.log is missing -> None.
         let d1 = tmp.join("0001");
         std::fs::create_dir(&d1).unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), None);
 
-        // 12-列 row が 1 つあれば teacher が拾える
+        // A single 12-column row is enough to read the teacher.
         std::fs::write(
             d1.join("learn.log"),
             format!(
@@ -14786,7 +11455,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("bar.hcpe".to_string()));
 
-        // 9-列のレガシー row は無視される (parts.len() < 11 で skip)
+        // 9-column legacy rows are ignored (parts.len() < 11).
         let d5 = tmp.join("0005");
         std::fs::create_dir(&d5).unwrap();
         std::fs::write(
@@ -14796,37 +11465,6 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), None, "legacy 9-col row should be skipped");
 
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// `finalize_nnue_dirs` がレガシー (= callback 未通過) dir をまとめて
-    /// 処理し、空のときは `(0, 0)` を返すことを確認。
-    #[test]
-    fn finalize_nnue_dirs_handles_empty_gracefully() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-finalize-empty-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let ctx = LogContext {
-            eval_type: "NNUE_KA2",
-            arch: "NNUE_ka2_256x2_32_32".to_string(),
-            lr_start: 0.001,
-            lambda: 1.0,
-            batch_size: 16384,
-            batches_per_superbatch: 6104,
-            teacher_csv: "teachers/foo.hcpe".to_string(),
-            epoch_offset: 0,
-            lr_schedule: LrScheduleKind::Step,
-            lr_period: 500_000_000,
-            lr_step_gamma: 0.992,
-            lr_step_positions: 100_000_000,
-            lr_min: 0.00001,
-            lr_override: None,
-        };
-        let res = finalize_nnue_dirs(&tmp, &ctx, "shogi_nnue_ka2", 0).unwrap();
-        assert_eq!(res, (0, 0), "empty dir should return (0,0), not Err");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -32,7 +32,7 @@ HalfKP sparse input (125,388 dims, per perspective)
 
 ### Prerequisites
 
-- BulletOu built (`cargo build --release --features device-cuda --example bulletou`)
+- BulletOu built (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - Training data (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)
 
 ### Command
@@ -53,7 +53,7 @@ checkpoints/my-halfkp/
 ├── summary-learn.log                  ← top-level cumulative log across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
-│   ├── state.bin                      ← resume data (weights + Adam moments)
+│   ├── state.bin                      ← resume data (weights + Ranger optimizer state)
 │   └── learn.log                      ← snapshot of the training log at this save point
 ├── 0002/
 │   ├── ...

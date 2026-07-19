@@ -30,7 +30,7 @@ Continued training works with the same auto-resume mechanism as §5: **same `--t
 
 On the second invocation:
 - Detects the output dir `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-round1/`.
-- Loads the latest `0018/state.bin` (weights + Adam moments).
+- Loads the latest `0018/state.bin` (weights + Ranger optimizer state).
 - New saves start at `0019/`.
 - `summary-learn.log` keeps growing — cumulative across runs.
 
@@ -89,7 +89,7 @@ To change any of these, pass a different `--tag` and run as a separate experimen
 
 Changing `--batch-size` can slightly change the rounded effective sb_size. If you need an exactly matched LR cycle length, set `--positions-per-superbatch` explicitly as well.
 
-### Adam moments are slightly out of sync
+### Optimizer state is slightly out of sync
 
 A 2× larger batch reduces gradient noise by ~√2. Adam's second-moment estimate was tuned to the previous noise level, so the first 1-2 sb may be very slightly over- or under-shooting. In practice this is invisible in the loss curve; don't panic if the first save looks slightly different.
 

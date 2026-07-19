@@ -46,7 +46,7 @@
 
 | フラグ | 注意点 |
 |---|---|
-| `--batch-size` | state.bin は batch_size 非依存。Adam moments も per-parameter なので互換 |
+| `--batch-size` | state.bin は batch_size 非依存。Ranger optimizer state も per-parameter なので互換 |
 | `--positions-per-superbatch` | 1 superbatch の局面数が変わる。実効値は `batch_size` の倍数へ切り捨て |
 | `--lr` | `step` では StepLR の開始値、`geometric` / `cos` では lr_max |
 | `--lr-min` | LR の下限 |
@@ -56,7 +56,7 @@
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
 
-これらはモデル構造とは無関係なので、重みと Adam moments 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
+これらはモデル構造とは無関係なので、重みと Ranger optimizer state 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
 
 `--teacher` だけは例外で、同じ設定のまま教師だけ変える fine-tune は auto resume できる。教師変更検出が働き、dataloader は新ファイルの先頭から読む ([§5.5.4](#554-教師を変えて-fine-tune))。
 
@@ -95,7 +95,7 @@
 
 `--batch-size` を変えると切り捨て後の実効 sb_size は少し変わる。完全に同じ LR cycle 長へ揃えたい場合は、`--positions-per-superbatch` も明示して調整する。
 
-### Adam moments の意味の差
+### Optimizer state の意味の差
 
 batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなります。Adam の second moment は前 run の noise レベルで計算されているので、最初の 1-2 sb は微妙に過大/過小評価される可能性があります。実用上は気にならないレベルですが、loss が一瞬不自然になっても狼狽しないでください。
 

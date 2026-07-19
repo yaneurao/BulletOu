@@ -88,7 +88,7 @@ index = fe_end × king_sq + bonapiece
 
 ```bash
 # Build (1 回だけ)
-cargo build --release --features device-cuda --example bulletou
+cargo build --release --features cuda-cpp-backend --example bulletou
 
 # Run
 ./target/release/examples/bulletou \

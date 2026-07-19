@@ -41,13 +41,13 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ### 必要なもの
 
-- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bulletou`)
+- BulletOu をビルド済み (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` のいずれか)
 - 4 GB+ の空き GPU メモリ (KPP 学習は ~2.3 GB を使う)
 
 ### KPPT (elmo 互換)
 
-`--eval-type KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、最後に `<output>/final/` に 3 ファイルを集約する。
+`--eval-type KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、各 save を `<output>/0001/`, `<output>/0002/`, ... の番号付き checkpoint directory に集約する。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -67,7 +67,7 @@ checkpoints/my-kppt/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
-│   ├── state.bin                      ← resume 用の重み + Adam moments (3 component ぶん)
+│   ├── state.bin                      ← resume 用の重み + Ranger optimizer state (3 component ぶん)
 │   └── learn.log                      ← この save 時点の学習ログの snapshot
 ├── 0002/
 │   ├── ...

@@ -15,7 +15,7 @@ checkpoints/.../
 
 How it works:
 - On startup, `bulletou` looks under `--output` for numbered dirs containing `state.bin`.
-- The highest-numbered `state.bin` is loaded, restoring weights and Adam moments.
+- The highest-numbered `state.bin` is loaded, restoring weights and Ranger optimizer state.
 - New saves continue numbering from one past the existing maximum (`0004/` here).
 - The cumulative `summary-learn.log` keeps appending CSV rows for the resumed run. The superbatch counter resets to 1, but the `positions` column continues from the previous run's max (read off the existing `summary-learn.log` at startup). For `step` / `geometric` / `cos`, the LR cycle restarts from `--lr` at epoch boundaries.
 

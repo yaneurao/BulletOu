@@ -16,7 +16,7 @@ checkpoints/.../
 仕組み:
 - `bulletou` 起動時、`--output` 配下に番号付き dir + `state.bin` があれば検出
 - `<output>/resume-config.txt` と現在の学習設定を比較し、一致した場合だけ auto resume する
-- 最大番号の `state.bin` から重みと Adam moments を復元
+- 最大番号の `state.bin` から重みと Ranger optimizer state を復元
 - 新 save は既存最大番号の次から書く (前例で `0003/` まであれば `0004/` から)
 - `summary-learn.log` (累積版) には新 run の CSV 行がそのまま追記される。superbatch カウンタは 1 から再開するが、`positions` 列は累積される (新 run 開始時に既存 `summary-learn.log` の最大 positions を読み取って続きから書く)。`step` / `geometric` / `cos` の LR cycle は epoch 境界で `--lr` から再開する
 

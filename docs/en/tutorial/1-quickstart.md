@@ -63,38 +63,29 @@ cd BulletOu
 
 ## 1.3 Build
 
-Choose **one** of the following depending on your GPU:
+Build the maintained BulletOu trainer backend:
 
 ```bash
-# NVIDIA GPU (CUDA)
-CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
+# NVIDIA GPU (CUDA 12.x)
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-```bash
-# AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features device-rocm
-```
-
-(On Windows, set the env vars accordingly: `set CUDA_PATH=...` or use PowerShell `$env:CUDA_PATH=...`.)
+On Windows, make sure the CUDA Toolkit and a compatible Visual Studio C++ toolchain are available in the build environment.
 
 The first build will take several minutes. If it succeeds without errors, you're ready.
 
 ### Common build problems
 
-- **`CUDA_PATH is not defined`** — set the environment variable to your CUDA install path (e.g. `/usr/local/cuda`, `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`).
-- **Linker error mentioning `cublas` / `nvrtc`** — the CUDA version may be too old. Use 12.x or newer.
-- **Linker error mentioning `hipblas` / `hiprtc`** — install the HIP SDK, set `HIP_PATH`, and possibly set `GCN_ARCH_NAME` (find it with `rocminfo` on Linux or `hipinfo` on Windows).
+- **`CUDA_PATH is not defined`** — set the environment variable to your CUDA install path (e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x` or `/usr/local/cuda`).
+- **`nvcc` / MSVC build errors on Windows** — install the CUDA Toolkit and Visual Studio C++ build tools, then run from a shell where both are visible.
+- **Linker error mentioning CUDA runtime libraries** — the CUDA version may be too old. Use 12.x or newer.
 
 ## 1.4 Run a smoke-test training
 
-The `simple` example trains a tiny chess (yes, chess) NNUE. It does not need any external data and only takes a few minutes. It exercises the full pipeline end-to-end, which is what we want at this stage.
+The CUDA C++ smoke test does not need teacher data. It checks that the backend can initialize CUDA, launch kernels, and run a tiny Ranger update.
 
 ```bash
-# NVIDIA
-cargo run --release --features device-cuda --example simple
-
-# AMD
-cargo run --release --features device-rocm --example simple
+cargo run --release --features cuda-cpp-backend --example bulletou -- --cuda-cpp-smoke
 ```
 
 If everything is working, you will see output like:

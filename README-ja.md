@@ -19,10 +19,13 @@
 - KPP_KKPT
 - NNUE_HALFKP
 - NNUE_KP
+- NNUE_KA2
 - NNUE_HALFKPE9
 - NNUE_HALFKPVM
 - SFNN_HALFKA1HM
 - SFNN_HALFKA2HM
+- SFNN_HALFKA2
+- SFNN_KA2
 
 対応するLayerStack:
 
@@ -38,14 +41,11 @@
 ### ビルド
 
 ```bash
-# NVIDIA GPU (CUDA 12.x + cuDNN 9.x)
-CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
-
-# AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features device-rocm
+# NVIDIA GPU (CUDA 12.x; Windows-native CUDA C++ backend)
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-CPU のみでの学習はサポートされていない (mock GPU ランタイムは型チェック用のスタブのみ)。
+CPU のみでの学習はサポートされていない。現在の BulletOu 学習 backend は `cuda-cpp`。
 
 
 ### 系譜・上流

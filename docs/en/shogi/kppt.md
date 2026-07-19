@@ -41,13 +41,13 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 ### Prerequisites
 
-- BulletOu built (`cargo build --release --features device-cuda --example bulletou`)
+- BulletOu built (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - Training data (`.hcpe` / `.hcpe3` / `.pack`)
 - 4 GB+ of free GPU memory (KPP training uses ~2.3 GB)
 
 ### KPPT (elmo-compatible)
 
-`--eval-type KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles the three resulting `.bin` files into `<output>/final/`:
+`--eval-type KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles each save into numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
 ```bash
 ./target/release/examples/bulletou \
@@ -67,7 +67,7 @@ checkpoints/my-kppt/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
 │   ├── KPP_synthesized.bin
-│   ├── state.bin                      ← resume data (weights + Adam moments for all 3 components)
+│   ├── state.bin                      ← resume data (weights + Ranger optimizer state for all 3 components)
 │   └── learn.log                      ← snapshot of the training log at this save point
 ├── 0002/
 │   ├── ...

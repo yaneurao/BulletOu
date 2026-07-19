@@ -9,7 +9,7 @@
 ├── summary-learn.log                  ← トップレベル累積ログ (= 全 run の sb 境界行だけを連結)
 ├── 0001/                              ← 1 個目の save
 │   ├── (eval-type specific files)
-│   ├── state.bin                      ← resume 用 (重み + Adam moments)
+│   ├── state.bin                      ← resume 用 (重み + Ranger optimizer state)
 │   ├── dataloader_pos.txt             ← HCPE/HCPE3/pack の byte offset resume 用 (= 同教師継続再開)
 │   └── learn.log                      ← この save 時点までの per-batch loss snapshot
 ├── 0002/
@@ -55,7 +55,7 @@ resume 時は **既存番号の続きから連番**。例えば前回 `0005/` �
 
 ## `state.bin`
 
-resume 用のバイナリ。bullet の既存 record format を流用。
+resume 用のバイナリ。BulletOu の record format を使う。
 
 ### バイナリ format
 
@@ -79,12 +79,14 @@ record を必要なだけ連結したものが `state.bin`。
 | 部位 | 取りうる値 |
 |---|---|
 | `<component>` | KPPT: `kk` / `kkp` / `kpp`、NNUE: `nnue` |
-| `<section>` | `weights` / `momentum` / `velocity` (Adam moments) |
+| `<section>` | `weights` / `momentum` / `velocity` / `slow` / `step_ranger` |
 | `<weight_id>` | bullet のモデル内重み ID (例: `kkw` / `kkpb` / `l0w` / `l0b` 等) |
 
 例:
-- KPPT save (3 component): `kk/weights/kkw`, `kk/momentum/kkw`, `kk/velocity/kkw`, `kkp/weights/kkpw`, ..., `kpp/velocity/kppw`
-- NNUE_HALFKP save (1 component): `nnue/weights/l0w`, `nnue/weights/l0b`, `nnue/weights/l1w`, ..., `nnue/velocity/outb`
+- KPPT save (3 component): `kk/weights/kkw`, `kk/momentum/kkw`, `kk/velocity/kkw`, `kk/slow/kkw`, `kk/step_ranger/kkw`, `kkp/weights/kkpw`, ..., `kpp/step_ranger/kppw`
+- NNUE_HALFKP save (1 component): `nnue/weights/l0w`, `nnue/weights/l0b`, `nnue/weights/l1w`, ..., `nnue/step_ranger/outb`
+
+`momentum` / `velocity` / `slow` / `step_ranger` は Ranger optimizer state。`step_ranger` は各 parameter group の completed-step counter を f32 1 要素で保存する。
 
 ### meta records
 
@@ -95,6 +97,7 @@ shape, so component restore helpers ignore them naturally.
 Current backend marker:
 
 ```text
+meta/state_backend/cuda-cpp    -> [1.0]
 meta/state_backend/bullet       -> [1.0]
 meta/state_backend/cuda-oxide   -> [1.0]
 ```
@@ -102,7 +105,8 @@ meta/state_backend/cuda-oxide   -> [1.0]
 The marker records which backend wrote the optimizer state. Model weights can
 still be extracted from compatible `*/weights/*` records, but an incompatible
 optimizer-state resume can be rejected explicitly instead of failing later in a
-backend-specific loader.
+backend-specific loader. Current BulletOu writes `cuda-cpp`; `bullet` and
+`cuda-oxide` are legacy markers kept for reading older checkpoints.
 
 ### 生成・展開 API
 
@@ -110,7 +114,7 @@ backend-specific loader.
 
 | 関数 | 用途 |
 |---|---|
-| `bundle_component_state(out, component, optimiser_state_dir)` | `optimiser_state/{weights,momentum,velocity}.bin` を読んで `<component>/<section>/<id>` namespace で state.bin に追記 |
+| `bundle_component_state(out, component, optimiser_state_dir)` | `optimiser_state/{weights,momentum,velocity,slow}.bin` と `step_ranger.txt` を読んで `<component>/<section>/<id>` namespace で state.bin に追記 |
 | `parse_model_weights_bin(bytes)` | state.bin を parse して `BTreeMap<ID string, Vec<f32>>` に展開 |
 | `unbundle_component_state(records, component, optimiser_state_dir)` | parse 結果から特定 component を取り出して `<dir>/optimiser_state/{weights,momentum,velocity}.bin` に書き戻す |
 
@@ -227,13 +231,13 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 
 ## ファイル名規約 (一時)
 
-学習中、bullet 自体は `<output>/<net_id>-<superbatch>/` という命名の dir に書き出す (`net_id` は `--net-id` または `--eval-type` 由来のデフォルト)。
+学習中、cuda-cpp backend は save ごとの staging directory を作り、save callback / 終了処理で番号付き checkpoint directory に変換する。
 
 各 save の callback でこれを以下に変換する:
 
 | eval-type | 変換 |
 |---|---|
-| KPPT / KPP_KKPT | `KK_synthesized.bin` 等を produce、`state.bin` を bundle |
-| NNUE 系 | `quantised.bin` を `nn.bin` に rename、`state.bin` を bundle |
+| KPPT / KPP_KKPT | component 別 staging から `KK_synthesized.bin` 等を assemble、`state.bin` を bundle |
+| NNUE / SFNN 系 | `nn.bin` と `state.bin` を番号付き dir に write |
 
-run 終了後、これらの per-component subdir を `<output>/0NNN/` 形式の番号付き dir に rename / assemble する (`assemble_numbered_dirs` for KPPT, `finalize_nnue_dirs` for NNUE)。
+run 終了後も同じ `<output>/0NNN/` 形式を維持する。KPPT / KPP_KKPT は `assemble_numbered_dirs` で 3 component をまとめる。NNUE / SFNN は cuda-cpp checkpoint writer が直接番号付き dir を作る。

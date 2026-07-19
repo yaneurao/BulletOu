@@ -88,7 +88,7 @@ YaneuraOu's `kHashValue` in `features/half_kpe9.h` is literally `0x5D69D5B9 ^ (F
 
 ```bash
 # Build (once)
-cargo build --release --features device-cuda --example bulletou
+cargo build --release --features cuda-cpp-backend --example bulletou
 
 # Run
 ./target/release/examples/bulletou \

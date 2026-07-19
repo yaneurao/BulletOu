@@ -32,7 +32,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 
 ### 必要なもの
 
-- BulletOu をビルド済み (`cargo build --release --features device-cuda --example bulletou`)
+- BulletOu をビルド済み (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` / `.psv` のいずれか)
 
 ### コマンド
@@ -53,7 +53,7 @@ checkpoints/my-halfkp/
 ├── summary-learn.log                  ← トップレベルの通算ログ (全 run / resume を連結)
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換の NNUE バイナリ
-│   ├── state.bin                      ← resume 用の重み + Adam moments
+│   ├── state.bin                      ← resume 用の重み + Ranger optimizer state
 │   └── learn.log                      ← この save 時点の学習ログ snapshot
 ├── 0002/
 │   ├── ...

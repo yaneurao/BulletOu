@@ -12,7 +12,7 @@
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--backend` | 学習 backend。デフォルトの高速経路は Windows-native `cuda-cpp`。現行の公開 eval type はすべて `cuda-cpp` で学習可能。旧汎用 backend を debug / 比較用に使う場合だけ `bullet` を明示する | `cuda-cpp` |
+| `--backend` | 学習 backend。現行は Windows-native `cuda-cpp` のみ対応。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
@@ -20,7 +20,7 @@
 | `--save-rate` | N superbatch ごとに checkpoint を保存。デフォルトでは save-rate 境界でなくても各 epoch の最後の superbatch も保存する。`plateau` では引き続き `--save-rate 1` が必要 | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | 各 epoch 最後の superbatch を暗黙に保存するかどうか | on |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
-| `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
+| `--optimizer` | optimizer。現行は `ranger` のみ対応。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
 | `--lr-schedule` | `step` (= 階段状 StepLR)、`geometric` (= 対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `plateau` では下限、`geometric` / `cos` では cycle 末で到達する値 | 0.00001 |
 | `--lr-step-gamma` | `step` で LR に掛ける係数。省略時、`--superbatches` があれば 1 epoch 内で `--lr` から `--lr-min` へ届く値を自動計算する。epoch 長が決まらない場合は `0.992` | 自動 / 0.992 |
@@ -35,8 +35,6 @@
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta2` | 選択中 optimizer の beta2 を上書き。省略時は optimizer 固有の既定値 | 省略 |
-| `--nnue-pytorch-layer-clip` | nnue-pytorch 互換の layer 別 weight clipping を使う | off |
-| `--nnue-pytorch-no-bias-clip` | bias tensor の optimizer clipping を実質無効にする | off |
 
 実行例 (1 億局面 × 40 superbatch = 計 40 億局面):
 
@@ -292,7 +290,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 ### Optimizer の選択
 
-`--optimizer` で `adamw` / `radam` / `ranger` を切り替えられる。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
+`--optimizer` は現在 `ranger` のみを受け付ける。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -340,7 +338,7 @@ BulletOu の optimizer epsilon は省略時に選択中 optimizer の既定値�
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --eval-type SFNN_HALFKA2 \
-    --tag sfnn-adamw-eps1e-7 \
+    --tag sfnn-ranger-eps1e-7 \
     --optimizer-epsilon 0.0000001
 ```
 
@@ -348,7 +346,7 @@ BulletOu の optimizer epsilon は省略時に選択中 optimizer の既定値�
 
 ### Optimizer beta
 
-optimizer の `beta1` / `beta2` も CLI から変更できる。省略時は optimizer 固有の既定値を使う。`ranger` の既定値は `beta1=0.99`, `beta2=0.999`、`adamw` / `radam` の既定値は `beta1=0.9`, `beta2=0.999`。
+optimizer の `beta1` / `beta2` も CLI から変更できる。省略時は `ranger` の既定値 (`beta1=0.99`, `beta2=0.999`) を使う。
 
 optimizer の momentum 条件だけを動かして切り分けたい場合は、`--optimizer-beta1` / `--optimizer-beta2` を指定する。
 
@@ -362,37 +360,6 @@ optimizer の momentum 条件だけを動かして切り分けたい場合は、
 ```
 
 これは内部時定数だけを見る ablation。weight decay や epsilon と混ぜず、まず単独で比較する。
-
-### nnue-pytorch layer clipping
-
-`--nnue-pytorch-layer-clip` を付けると、選択中 optimizer の weight clipping 範囲を nnue-pytorch の量子化スケールに寄せる。
-
-- hidden weight: `[-127/64, 127/64]`
-- final output weight: `[-127*127/(600*16), 127*127/(600*16)]`
-
-これは NNUE / SFNN 用の実験フラグ。loss 定義や weight decay は変えないので、まず他の実験フラグと混ぜずに単独で比較する。
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
-    --tag sfnn-layer-clip \
-    --nnue-pytorch-layer-clip
-```
-
-### bias clipping の無効化
-
-nnue-pytorch の `WeightClippingCallback` は weight tensor だけを clip し、bias tensor は clip しない。BulletOu の標準 optimizer 設定は bias も含めて全 parameter を clip するため、`--nnue-pytorch-no-bias-clip` でこの差分を単独比較できる。
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
-    --tag sfnn-no-bias-clip \
-    --nnue-pytorch-no-bias-clip
-```
-
-`--nnue-pytorch-layer-clip` と組み合わせることもできるが、まずは単独で ON/OFF 比較する。
 
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習

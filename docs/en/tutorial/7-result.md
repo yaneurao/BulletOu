@@ -17,7 +17,7 @@ checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── summary-learn.log                  ← top-level cumulative sb-level log across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
-│   ├── state.bin                      ← resume data (weights + Adam moments)
+│   ├── state.bin                      ← resume data (weights + Ranger optimizer state)
 │   └── learn.log                      ← snapshot of the training log at this save point
 ├── 0002/
 ├── ...

@@ -107,7 +107,7 @@ checkpoints/my-ka2/
 ├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換 NNUE バイナリ
-│   ├── state.bin                      ← resume 用の重み + Adam moments
+│   ├── state.bin                      ← resume 用の重み + Ranger optimizer state
 │   └── learn.log
 ├── 0002/
 ├── ...

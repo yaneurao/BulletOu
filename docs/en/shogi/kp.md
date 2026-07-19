@@ -86,7 +86,7 @@ checkpoints/my-kp/
 ├── summary-learn.log
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
-│   ├── state.bin                      ← resume data (weights + Adam moments)
+│   ├── state.bin                      ← resume data (weights + Ranger optimizer state)
 │   └── learn.log
 ├── 0002/
 ├── ...

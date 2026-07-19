@@ -41,14 +41,11 @@ Target LayerStacks:
 ### Building
 
 ```bash
-# NVIDIA GPU (CUDA 12.x + cuDNN 9.x)
-CUDA_PATH=/usr/local/cuda cargo build --release --features device-cuda
-
-# AMD GPU (ROCm)
-HIP_PATH=/opt/rocm cargo build --release --features device-rocm
+# NVIDIA GPU (CUDA 12.x; Windows-native CUDA C++ backend)
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-CPU-only training is not supported (the mock GPU runtime is a type-checking stub only).
+CPU-only training is not supported. The maintained BulletOu trainer backend is `cuda-cpp`.
 
 
 ### Lineage / Upstream

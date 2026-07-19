@@ -11,10 +11,10 @@
 まず `bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK:
 
 ```bash
-cargo build --release --features device-cuda --example bulletou
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-(AMD GPU なら `--features device-cuda` を `--features device-rocm` に。Windows の場合、生成されるバイナリは `.\target\release\examples\bulletou.exe`。以下のコマンド例は Unix 形式で書くので適宜読み替え。)
+Windows の場合、生成されるバイナリは `.\target\release\examples\bulletou.exe`。以下のコマンド例は Unix 形式で書くので適宜読み替え。
 
 ## 4.2 最小コマンド (NNUE HalfKP)
 

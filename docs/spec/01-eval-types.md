@@ -22,7 +22,7 @@
 
 ## 内部 helper として存在するが CLI に公開しない要素
 
-KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単独学習」を順番に走らせる構造を持つ (`run_kppt_kk` / `run_kppt_kkp` / `run_kppt_kpp` という Rust 関数として存在する) が、これらは **`--eval-type` の値としては公開しない**。
+KPPT family は内部的に「KK 単独学習」「KKP 単独学習」「KPP 単独学習」を順番に走らせる構造を持つが、これらは **`--eval-type` の値としては公開しない**。
 
 理由: やねうら王の KPPT エンジンは `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` の 3 ファイル組を要求するので、単一 component だけ出力されたディレクトリは engine が load できず、ユーザー視点で価値が無いため。3 component を統合した `KPPT` / `KPP_KKPT` のみが engine-loadable。
 

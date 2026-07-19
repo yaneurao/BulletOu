@@ -11,10 +11,10 @@ This page assumes you have already completed [3. Prepare training data](3-data.m
 Build `bulletou` first. You only need this once, until the source changes:
 
 ```bash
-cargo build --release --features device-cuda --example bulletou
+cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-(Use `--features device-rocm` instead of `cuda` for AMD GPUs. On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run commands below use Unix-style paths — translate as needed.)
+On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run commands below use Unix-style paths — translate as needed.
 
 ## 4.2 Minimal command (NNUE HalfKP)
 
