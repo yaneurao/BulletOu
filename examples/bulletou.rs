@@ -1374,6 +1374,16 @@ fn print_cuda_cpp_checkpoint_with_timing(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_validation_overhead(prefix: &str, timing: CudaCppCheckpointTiming) {
+    eprintln!(
+        "  {} {}: {}",
+        paint(prefix, ConsoleColor::Dim),
+        paint("validation overhead", ConsoleColor::BoldYellow),
+        cuda_cpp_checkpoint_timing_text(timing, None)
+    );
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn print_cuda_cpp_superbatch_progress(
     prefix: &str,
     progress: Option<CudaCppScheduleProgress>,
@@ -1517,6 +1527,10 @@ fn effective_batch_size(args: &Args) -> usize {
 
 fn effective_save_rate(args: &Args) -> usize {
     args.save_rate.unwrap_or(DEFAULT_SAVE_RATE)
+}
+
+fn effective_validation_rate(args: &Args) -> usize {
+    args.validation_rate.unwrap_or_else(|| effective_save_rate(args))
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
@@ -1890,6 +1904,11 @@ struct Args {
     #[arg(long)]
     save_rate: Option<usize>,
 
+    /// Run held-out validation every N superbatches. If omitted, validation
+    /// uses `--save-rate` so older commands keep the same behaviour.
+    #[arg(long)]
+    validation_rate: Option<usize>,
+
     /// Also save the final superbatch of each epoch even when it is not on a save-rate boundary.
     #[arg(long, default_value_t = true, action = ArgAction::SetTrue)]
     save_epoch_end: bool,
@@ -1956,7 +1975,8 @@ struct Args {
 
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
-    /// each save event (= every `--save-rate` superbatches): samples
+    /// each validation event (= every `--validation-rate` superbatches,
+    /// defaulting to `--save-rate`) and also at save events: samples
     /// `--test-positions` positions from this file, runs them
     /// through the model, and emits per-superbatch
     /// `test_value_accuracy` and `test_value_loss` columns into
@@ -1969,7 +1989,7 @@ struct Args {
     #[arg(long)]
     test_teacher: Option<PathBuf>,
 
-    /// Number of positions to sample from `--test-teacher` per save
+    /// Number of positions to sample from `--test-teacher` per validation
     /// event.
     #[arg(long, default_value = "100000")]
     test_positions: usize,
@@ -1988,7 +2008,7 @@ struct Args {
 
     /// Seed for the random sampler in `--test-teacher`. `0`
     /// (default) means "use a time-based seed" (= different sample
-    /// each save event). Pass any non-zero value for a reproducible
+    /// each validation event). Pass any non-zero value for a reproducible
     /// sample (same positions every time).
     #[arg(long, default_value = "0")]
     test_seed: u64,
@@ -2167,6 +2187,9 @@ impl Args {
         if effective_batch_size(self) == 0 {
             return Err("--batch-size must be > 0 for --backend cuda-cpp".to_string());
         }
+        if self.validation_rate.is_some_and(|validation_rate| validation_rate == 0) {
+            return Err("--validation-rate must be > 0".to_string());
+        }
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
@@ -2182,6 +2205,7 @@ impl Args {
                 || self.lr_step_gamma.is_some()
                 || self.lr_step_positions.is_some()
                 || self.save_rate.is_some_and(|save_rate| save_rate != 1)
+                || self.validation_rate.is_some_and(|validation_rate| validation_rate != 1)
                 || self.no_save_epoch_end)
         {
             return Err(
@@ -2204,6 +2228,9 @@ impl Args {
             }
             if effective_save_rate(self) != 1 {
                 return Err("--backend cuda-cpp --lr-schedule plateau requires --save-rate 1".to_string());
+            }
+            if effective_validation_rate(self) != 1 {
+                return Err("--backend cuda-cpp --lr-schedule plateau requires --validation-rate 1".to_string());
             }
         }
 
@@ -2728,6 +2755,10 @@ fn main() {
         }
         if effective_save_rate(&args) != 1 {
             eprintln!("error: --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions.");
+            std::process::exit(2);
+        }
+        if effective_validation_rate(&args) != 1 {
+            eprintln!("error: --lr-schedule plateau requires --validation-rate 1 for per-superbatch LR decisions.");
             std::process::exit(2);
         }
         if args.lr <= 0.0 {
@@ -4187,10 +4218,11 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     );
     if schedule.production {
         eprintln!(
-            "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+            "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
             effective_save_rate(args),
+            effective_validation_rate(args),
             effective_save_epoch_end(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
@@ -4776,10 +4808,16 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                     let readback_elapsed = readback_started.elapsed();
-                    let validation_started = std::time::Instant::now();
-                    let test_metrics =
-                        run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
-                    let validation_elapsed = validation_started.elapsed();
+                    let mut validation_elapsed = std::time::Duration::ZERO;
+                    let test_metrics = if chunk.run_validation {
+                        let validation_started = std::time::Instant::now();
+                        let metrics =
+                            run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                        validation_elapsed = validation_started.elapsed();
+                        metrics
+                    } else {
+                        None
+                    };
                     let save_started = std::time::Instant::now();
                     let checkpoint_dir = write_cuda_cpp_nnue_numbered_checkpoint(
                         args,
@@ -4816,10 +4854,60 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
-                            test_metrics.map(|_| validation_elapsed),
+                            chunk.run_validation.then_some(validation_elapsed),
                             Some(save_elapsed),
                             checkpoint_elapsed,
                         )),
+                    );
+                    if let Some(metrics) = test_metrics {
+                        print_cuda_cpp_validation_summary_elapsed(
+                            "cuda-cpp",
+                            Some((chunk.epoch, chunk.superbatch)),
+                            metrics.accuracy,
+                            metrics.loss,
+                            Some(validation_elapsed),
+                        );
+                    }
+                    last_checkpoint_metrics = test_metrics;
+                } else if chunk.run_validation {
+                    let validation_event_started = std::time::Instant::now();
+                    let readback_started = std::time::Instant::now();
+                    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                    let readback_elapsed = readback_started.elapsed();
+                    let validation_started = std::time::Instant::now();
+                    let test_metrics =
+                        run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                    let validation_elapsed = validation_started.elapsed();
+                    let validation_event_elapsed = validation_event_started.elapsed();
+                    excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
+                    append_cuda_cpp_direct_summary_log_row(
+                        &args.output_dir(),
+                        args,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics,
+                            lr_start: chunk.lr_start,
+                            lr_end: chunk.lr_end,
+                            dataloader_pos,
+                        },
+                    )?;
+                    let progress = schedule.progress_for_step(seen_steps);
+                    let positions = seen_steps.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, positions_per_sec);
+                    print_cuda_cpp_validation_overhead(
+                        "cuda-cpp",
+                        CudaCppCheckpointTiming::new(
+                            readback_elapsed,
+                            Some(validation_elapsed),
+                            None,
+                            validation_event_elapsed,
+                        ),
                     );
                     if let Some(metrics) = test_metrics {
                         print_cuda_cpp_validation_summary_elapsed(
@@ -5074,10 +5162,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     );
     if schedule.production {
         eprintln!(
-            "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+            "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
             effective_save_rate(args),
+            effective_validation_rate(args),
             effective_save_epoch_end(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
@@ -5677,10 +5766,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let readback_started = std::time::Instant::now();
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                     readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
-                    let validation_started = std::time::Instant::now();
-                    let test_metrics =
-                        run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
-                    let validation_elapsed = validation_started.elapsed();
+                    let mut validation_elapsed = std::time::Duration::ZERO;
+                    let test_metrics = if chunk.run_validation {
+                        let validation_started = std::time::Instant::now();
+                        let metrics =
+                            run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                        validation_elapsed = validation_started.elapsed();
+                        metrics
+                    } else {
+                        None
+                    };
                     let readback_started = std::time::Instant::now();
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                     readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
@@ -5720,10 +5815,66 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
-                            test_metrics.map(|_| validation_elapsed),
+                            chunk.run_validation.then_some(validation_elapsed),
                             Some(save_elapsed),
                             checkpoint_elapsed,
                         )),
+                    );
+                    if let Some(metrics) = test_metrics {
+                        print_cuda_cpp_validation_summary_elapsed(
+                            "cuda-cpp SFNN",
+                            Some((chunk.epoch, chunk.superbatch)),
+                            metrics.accuracy,
+                            metrics.loss,
+                            Some(validation_elapsed),
+                        );
+                    }
+                    last_checkpoint_metrics = test_metrics;
+                } else if chunk.run_validation {
+                    let validation_event_started = std::time::Instant::now();
+                    let readback_started = std::time::Instant::now();
+                    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                    let readback_elapsed = readback_started.elapsed();
+                    let validation_started = std::time::Instant::now();
+                    let test_metrics =
+                        run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                    let validation_elapsed = validation_started.elapsed();
+                    let validation_event_elapsed = validation_event_started.elapsed();
+                    excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
+                    append_cuda_cpp_direct_summary_log_row(
+                        &args.output_dir(),
+                        args,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics,
+                            lr_start: chunk.lr_start,
+                            lr_end: chunk.lr_end,
+                            dataloader_pos,
+                        },
+                    )?;
+                    let progress = schedule.progress_for_step(seen_steps);
+                    let positions = seen_steps.saturating_mul(batch_size);
+                    let (_train_elapsed_sec, positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    print_cuda_cpp_superbatch_progress(
+                        "cuda-cpp SFNN",
+                        progress,
+                        batch_size,
+                        positions,
+                        positions_per_sec,
+                    );
+                    print_cuda_cpp_validation_overhead(
+                        "cuda-cpp SFNN",
+                        CudaCppCheckpointTiming::new(
+                            readback_elapsed,
+                            Some(validation_elapsed),
+                            None,
+                            validation_event_elapsed,
+                        ),
                     );
                     if let Some(metrics) = test_metrics {
                         print_cuda_cpp_validation_summary_elapsed(
@@ -6490,6 +6641,58 @@ fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog, prior_p
         lambda = args.lambda,
         teacher = csv_escape(&resolve_teacher_for_log(&args.teacher)),
     )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog, prior_positions: usize) -> String {
+    let eval_field = if args.eval_type().uses_arch() {
+        format!("{}-{}", args.eval_type().cli_name(), args.arch().cli_name())
+    } else {
+        args.eval_type().cli_name().to_string()
+    };
+    let (test_accuracy, test_loss) = match log.test_metrics {
+        Some(metrics) => (format!("{:.6}", metrics.accuracy), format!("{:.6}", metrics.loss)),
+        None => ("-".to_string(), "-".to_string()),
+    };
+    let positions = prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
+    format!(
+        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher}\n",
+        eval = eval_field,
+        epoch = log.epoch,
+        superbatch = log.superbatch,
+        train_loss = log.train_loss,
+        lr_start = log.lr_start,
+        lr_end = log.lr_end,
+        lambda = args.lambda,
+        teacher = csv_escape(&resolve_teacher_for_log(&args.teacher)),
+        test_teacher = csv_escape(&resolve_test_teacher_for_summary(Some(args))),
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn append_cuda_cpp_direct_summary_log_row(
+    output_dir: &std::path::Path,
+    args: &Args,
+    log: CudaCppCheckpointLog,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let top_existed =
+        ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
+    let prior_positions = read_prior_positions(&top).get("nnue").copied().unwrap_or(0);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&top)
+        .map_err(|err| format!("failed to open {}: {err}", top.display()))?;
+    if !top_existed {
+        writeln!(file, "{SUMMARY_LEARN_LOG_HEADER}")
+            .map_err(|err| format!("failed to write {}: {err}", top.display()))?;
+    }
+    file.write_all(cuda_cpp_direct_summary_log_row(args, log, prior_positions).as_bytes())
+        .map_err(|err| format!("failed to write {}: {err}", top.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8217,6 +8420,7 @@ struct CudaCppScheduleChunk {
     steps: usize,
     cumulative_steps: usize,
     save_checkpoint: bool,
+    run_validation: bool,
     lr_start: f32,
     lr_end: f32,
 }
@@ -8312,6 +8516,17 @@ fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> 
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_should_schedule_validation(args: &Args) -> bool {
+    args.test_teacher.is_some() && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn next_superbatch_rate_boundary(first_superbatch: usize, rate: usize) -> usize {
+    let rate = rate.max(1);
+    first_superbatch.div_ceil(rate).saturating_mul(rate)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_train_timing(
     positions: usize,
     started: &std::time::Instant,
@@ -8330,9 +8545,9 @@ fn cuda_cpp_loss_progress_log_path(args: &Args) -> PathBuf {
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_loss_progress_policy(args: &Args) -> String {
     if args.cuda_cpp_loss_readback_interval == 0 {
-        "checkpoint/final only".to_string()
+        "checkpoint/validation/final only".to_string()
     } else {
-        format!("step 1, every {} step(s), checkpoint, final", args.cuda_cpp_loss_readback_interval)
+        format!("step 1, every {} step(s), checkpoint, validation, final", args.cuda_cpp_loss_readback_interval)
     }
 }
 
@@ -8409,6 +8624,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 steps: train_steps,
                 cumulative_steps: train_steps,
                 save_checkpoint: true,
+                run_validation: args.test_teacher.is_some()
+                    && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt),
                 lr_start: lr,
                 lr_end: lr,
             }],
@@ -8476,13 +8693,22 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let mut chunks = Vec::new();
     let mut cumulative_steps = 0usize;
     let save_rate = effective_save_rate(args).max(1);
+    let validation_enabled = cuda_cpp_should_schedule_validation(args);
+    let validation_rate = if validation_enabled { effective_validation_rate(args).max(1) } else { save_rate };
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
-            let save_boundary = first_superbatch.saturating_add(save_rate).saturating_sub(1);
-            let (last_superbatch, save_checkpoint) =
-                if save_boundary <= superbatches { (save_boundary, true) } else { (superbatches, save_epoch_end) };
+            let save_boundary = next_superbatch_rate_boundary(first_superbatch, save_rate);
+            let validation_boundary = if validation_enabled {
+                next_superbatch_rate_boundary(first_superbatch, validation_rate)
+            } else {
+                usize::MAX
+            };
+            let last_superbatch = save_boundary.min(validation_boundary).min(superbatches);
+            let save_checkpoint = (save_boundary <= superbatches && last_superbatch == save_boundary)
+                || (last_superbatch == superbatches && save_boundary > superbatches && save_epoch_end);
+            let run_validation = validation_enabled && (last_superbatch == validation_boundary || save_checkpoint);
             let superbatch_count = last_superbatch - first_superbatch + 1;
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
@@ -8516,6 +8742,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 steps,
                 cumulative_steps,
                 save_checkpoint,
+                run_validation,
                 lr_start,
                 lr_end,
             });
@@ -8696,6 +8923,7 @@ fn resume_signature(args: &Args) -> String {
             args.optimizer_beta2.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
         ),
         format!("save_rate={}", effective_save_rate(args)),
+        format!("validation_rate={}", effective_validation_rate(args)),
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -8717,7 +8945,24 @@ fn write_resume_config(output_dir: &std::path::Path, args: &Args) -> std::io::Re
 
 fn resume_config_matches(output_dir: &std::path::Path, args: &Args) -> Result<bool, std::io::Error> {
     let stored = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME))?;
-    Ok(stored.trim_end() == resume_signature(args).trim_end())
+    Ok(resume_signature_matches(&stored, args))
+}
+
+fn resume_signature_without_validation_rate(signature: &str) -> String {
+    let mut out = signature.lines().filter(|line| !line.starts_with("validation_rate=")).collect::<Vec<_>>().join("\n");
+    out.push('\n');
+    out
+}
+
+fn resume_signature_matches(stored: &str, args: &Args) -> bool {
+    let current = resume_signature(args);
+    if stored.trim_end() == current.trim_end() {
+        return true;
+    }
+    let stored_has_validation_rate = stored.lines().any(|line| line.starts_with("validation_rate="));
+    !stored_has_validation_rate
+        && effective_validation_rate(args) == effective_save_rate(args)
+        && stored.trim_end() == resume_signature_without_validation_rate(&current).trim_end()
 }
 
 fn numbered_checkpoint_dirs_desc(output_dir: &std::path::Path) -> Vec<(usize, std::path::PathBuf)> {
@@ -8761,6 +9006,66 @@ fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::
 
 fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     latest_complete_checkpoint_dir_raw(output_dir)
+}
+
+fn read_checkpoint_epoch_superbatch(dir: &std::path::Path) -> Option<(usize, usize)> {
+    let content = std::fs::read_to_string(dir.join("learn.log")).ok()?;
+    let mut latest: Option<(usize, usize)> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(4, ',').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(epoch) = parts[1].parse::<usize>() else { continue };
+        let Ok(superbatch) = parts[2].parse::<usize>() else { continue };
+        latest = Some(latest.map_or((epoch, superbatch), |current| current.max((epoch, superbatch))));
+    }
+    latest
+}
+
+fn latest_checkpoint_epoch_superbatch(output_dir: &std::path::Path) -> Option<(usize, usize)> {
+    latest_complete_checkpoint_dir_raw(output_dir).and_then(|dir| read_checkpoint_epoch_superbatch(&dir))
+}
+
+fn truncate_summary_log_after_checkpoint(
+    output_dir: &std::path::Path,
+    checkpoint_epoch_superbatch: (usize, usize),
+) -> std::io::Result<usize> {
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let Ok(content) = std::fs::read_to_string(&top) else { return Ok(0) };
+    let mut kept = Vec::new();
+    let mut removed = 0usize;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("eval,") {
+            kept.push(line.to_string());
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(4, ',').collect();
+        let keep = if parts.len() >= 3 {
+            match (parts[1].parse::<usize>(), parts[2].parse::<usize>()) {
+                (Ok(epoch), Ok(superbatch)) => (epoch, superbatch) <= checkpoint_epoch_superbatch,
+                _ => true,
+            }
+        } else {
+            true
+        };
+        if keep {
+            kept.push(line.to_string());
+        } else {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        let mut output = kept.join("\n");
+        output.push('\n');
+        std::fs::write(top, output)?;
+    }
+    Ok(removed)
 }
 
 fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
@@ -8833,6 +9138,22 @@ fn prepare_resume_config_or_exit(args: &Args) {
             Err(e) => {
                 eprintln!("error: failed to read {}: {e}", output_dir.join(RESUME_CONFIG_NAME).display());
                 std::process::exit(2);
+            }
+        }
+    }
+
+    if resume_enabled(args, &output_dir) {
+        if let Some(anchor) = latest_checkpoint_epoch_superbatch(&output_dir) {
+            match truncate_summary_log_after_checkpoint(&output_dir, anchor) {
+                Ok(0) => {}
+                Ok(removed) => eprintln!(
+                    "  WARN: removed {removed} non-resumable summary row(s) after latest checkpoint epoch={} sb={}",
+                    anchor.0, anchor.1
+                ),
+                Err(e) => eprintln!(
+                    "  WARN: failed to trim {} after latest checkpoint: {e}",
+                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
+                ),
             }
         }
     }
@@ -9099,7 +9420,7 @@ fn enrich_bullet_log_to_csv(
         None => ("-".to_string(), "-".to_string()),
     };
     // Pre-parse so we can identify the last raw row of each superbatch.
-    // Validation runs once per sb save, so the metric only applies to
+    // Validation runs once per validation event, so the metric only applies to
     // the row that closes the sb; intermediate per-batch rows show `-`.
     let parsed: Vec<(usize, usize, &str)> = raw
         .lines()
@@ -9470,15 +9791,8 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
 /// `bulletou` with a different header, returns `InvalidData` so the
 /// caller can alert the user to clear the old file rather than
 /// silently mixing schemas.
-fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: Option<&Args>) -> std::io::Result<()> {
-    use std::io::Write;
-    let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
-    let body = std::fs::read_to_string(&latest_log)?;
-    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
     let top_existed = top.is_file();
-
-    // Detect schema mismatch on existing file. V1 is upgraded in-place
-    // by appending a placeholder `test_teacher` column to old rows.
     if top_existed {
         let mut head_buf = String::new();
         if let Ok(mut f) = std::fs::File::open(&top) {
@@ -9506,7 +9820,15 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
             ));
         }
     }
+    Ok(top_existed)
+}
 
+fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: Option<&Args>) -> std::io::Result<()> {
+    use std::io::Write;
+    let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
+    let body = std::fs::read_to_string(&latest_log)?;
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let top_existed = ensure_summary_log_schema(&top)?;
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&top)?;
     // Per-dir learn.log is 12-col (includes curr_batch); strip its
     // header before filtering data rows.
@@ -9837,7 +10159,7 @@ fn assemble_numbered_dirs(
     Ok((existing_count + 1, existing_count + n))
 }
 
-/// Cache of test-set positions used for per-save validation. Loaded
+/// Cache of test-set positions used for validation events. Loaded
 /// once at the start of training (when `--test-teacher` is set) and
 /// reused for every subsequent validation forward pass — the random
 /// sampling happens once at load time, not on each save.
@@ -9925,7 +10247,7 @@ impl TestPositionsCache {
     }
 }
 
-/// Run validation on the cached test positions and produce per-save
+/// Run validation on the cached test positions and produce per-validation
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
 fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: Vec<f32>) -> TestMetrics {
@@ -10594,6 +10916,70 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_plateau_requires_validation_rate_one() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+            "--save-rate",
+            "1",
+            "--validation-rate",
+            "2",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--validation-rate 1"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_zero_validation_rate() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--validation-rate",
+            "0",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--validation-rate must be > 0"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
     fn cuda_cpp_backend_rejects_mixed_direct_and_production_schedule() {
         use clap::Parser as _;
 
@@ -10687,6 +11073,7 @@ mod tests {
         assert_eq!(schedule.total_steps, 24);
         assert_eq!(schedule.chunks.len(), 4);
         assert!(schedule.chunks.iter().all(|chunk| chunk.save_checkpoint));
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_validation));
         assert_eq!(schedule.chunks[0].epoch, 1);
         assert_eq!(schedule.chunks[0].superbatch, 2);
         assert_eq!(schedule.chunks[0].steps, 8);
@@ -10760,6 +11147,51 @@ mod tests {
         );
         assert_eq!(schedule.progress_for_step(25), None);
         assert_eq!(cuda_cpp_progress_label(&schedule, 9), "epoch=1 sb=3/3 batch=1/4");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_validation_rate_splits_without_extra_saves() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "5",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "4",
+            "--validation-rate",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "2048",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+
+        assert_eq!(schedule.batches_per_superbatch, 2);
+        assert_eq!(schedule.total_steps, 10);
+        assert_eq!(schedule.chunks.len(), 5);
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.superbatch).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            schedule.chunks.iter().map(|chunk| chunk.save_checkpoint).collect::<Vec<_>>(),
+            vec![false, false, false, true, true]
+        );
+        assert!(schedule.chunks.iter().all(|chunk| chunk.run_validation));
+        assert!(schedule.chunks.iter().all(|chunk| chunk.steps == 2));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -12252,6 +12684,40 @@ mod tests {
         assert!(sig.contains("optimizer_epsilon=0.000000100"));
         assert!(sig.contains("optimizer_beta1=0.850000024"));
         assert!(sig.contains("optimizer_beta2=0.995000005"));
+        assert!(sig.contains("validation_rate=20"));
+    }
+
+    #[test]
+    fn resume_signature_accepts_old_configs_when_validation_rate_matches_save_rate() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--save-rate",
+            "7",
+        ])
+        .unwrap();
+        let old_signature = resume_signature_without_validation_rate(&resume_signature(&args));
+
+        assert!(resume_signature_matches(&old_signature, &args));
+
+        let changed = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--save-rate",
+            "7",
+            "--validation-rate",
+            "1",
+        ])
+        .unwrap();
+        assert!(!resume_signature_matches(&old_signature, &changed));
     }
 
     #[test]
@@ -12303,6 +12769,8 @@ mod tests {
         assert_eq!(args.scale, 290);
         assert_eq!(args.save_rate, None);
         assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);
+        assert_eq!(args.validation_rate, None);
+        assert_eq!(effective_validation_rate(&args), DEFAULT_SAVE_RATE);
         assert!(args.save_epoch_end);
         assert!(!args.no_save_epoch_end);
         assert!(effective_save_epoch_end(&args));
@@ -12486,6 +12954,94 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolve_test_teacher_for_summary(Some(&args)), "validation-set.hcpe");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_direct_validation_summary_row_appends_without_checkpoint_dir() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-validation-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "teacher.psv",
+            "--test-teacher",
+            "validation.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "5",
+        ])
+        .unwrap();
+
+        append_cuda_cpp_direct_summary_log_row(
+            &tmp,
+            &args,
+            CudaCppCheckpointLog {
+                epoch: 1,
+                superbatch: 1,
+                curr_batch: 1,
+                train_steps: 3,
+                train_loss: 0.25,
+                test_metrics: Some(TestMetrics { accuracy: 0.625, loss: 0.125 }),
+                lr_start: args.lr,
+                lr_end: args.lr,
+                dataloader_pos: bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 },
+            },
+        )
+        .unwrap();
+
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1],
+            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,0.250000,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn truncate_summary_log_after_checkpoint_drops_non_resumable_validation_rows() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-truncate-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(SUMMARY_LEARN_LOG_NAME),
+            format!(
+                "{SUMMARY_LEARN_LOG_HEADER}\n\
+                 E,1,19,0.50,0.30,0.08,0.001,0.0007,1.000,190,teacher.psv,validation.hcpe\n\
+                 E,1,20,0.51,0.29,0.07,0.001,0.0007,1.000,200,teacher.psv,validation.hcpe\n\
+                 E,1,21,0.52,0.28,0.06,0.001,0.0007,1.000,210,teacher.psv,validation.hcpe\n\
+                 E,2,1,0.53,0.27,0.05,0.001,0.0007,1.000,220,teacher.psv,validation.hcpe\n"
+            ),
+        )
+        .unwrap();
+
+        let removed = truncate_summary_log_after_checkpoint(&tmp, (1, 20)).unwrap();
+
+        assert_eq!(removed, 2);
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].starts_with("E,1,20,"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

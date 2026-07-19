@@ -192,7 +192,7 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,64,-,-,0.231,0.000999,0.000998,1.000000,
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1525,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/
 ```
 
-bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト batch-size 65536 では、1 sb 内に約 48 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-` (= save event でのみ validation が走るため)。
+bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト batch-size 65536 では、1 sb 内に約 48 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-`。cuda-cpp では `--validation-rate` で validation 間隔を `--save-rate` から分離できる。未指定時は従来通り `--save-rate` と同じ。
 
 ### top-level `<output>/summary-learn.log` (= 12 列、sb 境界のみ抽出)
 
@@ -203,6 +203,12 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.00
 ```
 
 `test_teacher` is summary-only: it records the filename (basename) of the `--test-teacher` file that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
+
+When `--validation-rate` is smaller than `--save-rate`, `summary-learn.log`
+can contain validation-only rows that do not have a matching numbered
+checkpoint directory. Those rows are observation logs, not resumable state;
+on resume, rows after the latest complete checkpoint are trimmed before
+schedule calculation.
 
 cuda-cpp batch-level loss progress is not streamed to stdout. It is appended to `<output>/cuda-cpp-progress.log` as CSV:
 

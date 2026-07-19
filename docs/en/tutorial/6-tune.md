@@ -18,6 +18,7 @@ Main flags:
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
 | `--max-epochs` | Maximum number of epochs. `--max-epoch` is also accepted as an alias. For `step` / `geometric` / `cos`, this is the number of LR cycles. For `plateau`, this caps plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
 | `--save-rate` | Save a checkpoint every N superbatches. By default, the final superbatch of each epoch is also saved even when it is not on a save-rate boundary. Plateau scheduling still requires `--save-rate 1` | 20 |
+| `--validation-rate` | Run `--test-teacher` validation every N superbatches without necessarily saving a checkpoint. If omitted, it follows `--save-rate`. Plateau scheduling requires `--validation-rate 1` | same as `--save-rate` |
 | `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit checkpoint at the final superbatch of each epoch | on |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.000875 |
 | `--optimizer` | Optimizer. BulletOu currently exposes Ranger (RAdam+Lookahead), matching the tatara/bullet-shogi recipe | `ranger` |
@@ -157,6 +158,7 @@ Constraints:
 
 - `--test-teacher` is required.
 - `--save-rate 1` is required because LR is decided once per superbatch.
+- `--validation-rate 1` is also required for the same reason.
 - `plateau` is currently supported for NNUE/SFNN eval types.
 
 #### Comparing `step` vs `cos`

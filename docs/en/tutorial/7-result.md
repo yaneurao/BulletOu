@@ -33,7 +33,9 @@ For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three fi
 
 ## 7.2 Reading the training log (`learn.log`)
 
-The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/summary-learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). The files have different granularities: `summary-learn.log` has one row per saved superbatch, while each `0NNN/learn.log` is a per-batch snapshot.
+The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/summary-learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). The files have different granularities: `summary-learn.log` has one row per validated/saved superbatch, while each `0NNN/learn.log` is a per-batch snapshot for a saved checkpoint.
+
+`--validation-rate` controls how often held-out accuracy/loss are computed. It defaults to `--save-rate`, but you can set a smaller value (for example `--validation-rate 1 --save-rate 20`) to validate every superbatch while saving checkpoints less often. Validation-only summary rows do not have a matching numbered checkpoint directory; if training is interrupted, rows after the latest complete checkpoint are trimmed on resume because that unsaved model state cannot be restored.
 
 ### Which one to look at
 

@@ -8,9 +8,15 @@
 
 | 経路 | 計算タイミング | 対象モデル |
 |---|---|---|
-| **BulletOu `test_value_accuracy`** | 学習中、各 save event (= `--save-rate` ごと) | 量子化前 f32 model output |
+| **BulletOu `test_value_accuracy`** | 学習中、各 validation event (= `--validation-rate` ごと。未指定なら `--save-rate`) および save event | 量子化前 f32 model output |
 | **YaneuraOu `test eval_accuracy <psv>`** | 学習完了後、`nn.bin` を load した engine 上 | 量子化後 i16 NNUE + Eval::evaluate() |
 | **dlshogi `train.py` の検証** | 学習中、本家 dlshogi トレーナーの validation phase | dlshogi の Python model |
+
+Current cuda-cpp training can decouple validation from checkpoint saves:
+`--validation-rate N` runs `test_value_accuracy` / `test_value_loss` every
+N superbatches, while `--save-rate` controls checkpoint writes. If
+`--validation-rate` is omitted, it defaults to `--save-rate` for backward
+compatibility.
 
 3 経路で **同じ局面集**を渡して **同じ accuracy 数値**が出るのが理想。量子化前後の差 (BulletOu vs YaneuraOu) は本物のモデル差、ツール間の数値差はバグ。
 
