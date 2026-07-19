@@ -73,16 +73,20 @@ KPPT および NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 / NNUE_HALFKPVM / NNUE_SHAR
 ## Experimental: NNUE_SHARDKP
 
 `NNUE_SHARDKP` is an experimental cuda-cpp NNUE target imported from the
-`shardKP` branch. It uses the dense-L0 prototype input
-`ShogiShardKp`, where each K+P feature is expanded to one common connection
-plus six shard connection IDs.
+`shardKP` branch. The feature stream is `ShogiShardKp`, where each K+P feature
+is expanded to one common connection plus six shard connection IDs. The
+cuda-cpp trainer stores the first-layer weights in the compact row-sparse
+ShardKP layout instead of materializing the logical dense L0 matrix.
 
 - default arch: `NNUE_shardkp_c256_s128x64_f6_16_16`
 - input dims: `1710 * 7 = 11970`
-- max active: `40 * 7 = 280`
+- cuda-cpp teacher upload: base KP indices, max active `40` (expanded on GPU)
+- logical expanded max active: `40 * 7 = 280`
 - L1 dims: `256 + 128 * 64 = 8448`
+- compact L0 storage: `1710 * (256 + 6 * 128) = 1,751,040` f32 weights
 - activation: ClippedReLU
 - default output: `checkpoints/NNUE_SHARDKP-NNUE_shardkp_c256_s128x64_f6_16_16`
 
-The emitted `nn.bin` is BulletOu-internal experimental output and requires an
-engine build that implements the same ShardKP feature hash/layout.
+The emitted `nn.bin` and `state.bin` are BulletOu-internal experimental output
+and require an engine/build path that implements the same compact ShardKP
+feature hash and L0 storage layout.

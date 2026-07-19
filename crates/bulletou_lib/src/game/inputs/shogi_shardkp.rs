@@ -6,11 +6,11 @@
 //! - each K+P feature is expanded to one common connection plus six shard
 //!   connection IDs.
 //!
-//! This is the experimental dense-L0 version. BulletOu's sparse matmul adds
-//! each active feature to every accumulator row, so the connection IDs below do
-//! not yet enforce row-sparse shard routing. They preserve the branch's feature
-//! indexing convention so a future row-sparse transformer can reuse the same
-//! `shard_for_feature()` / `connection_index()` rules.
+//! BulletOu's cuda-cpp backend stores L0 in a compact row-sparse layout:
+//! each K+P feature owns 256 common weights and six 128-row shard slices.
+//! The generic sparse feature type can still emit expanded connection IDs, but
+//! the cuda-cpp trainer uploads base K+P indices and expands them on GPU to
+//! avoid 7x larger teacher batches.
 
 use super::{
     SparseInputType,

@@ -491,6 +491,38 @@ pub struct NnueForwardShape {
 }
 
 pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape { input_size: 125_388, l1: 256, l2: 32, l3: 32 };
+pub const NNUE_SHARDKP_KP_DIMENSIONS: usize = 1_710;
+pub const NNUE_SHARDKP_CONNECTIONS_PER_FEATURE: usize = 7;
+pub const NNUE_SHARDKP_INPUT_SIZE: usize = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
+pub const NNUE_SHARDKP_COMMON_DIMENSIONS: usize = 256;
+pub const NNUE_SHARDKP_SHARD_DIMENSIONS: usize = 128;
+pub const NNUE_SHARDKP_SHARD_COUNT: usize = 64;
+pub const NNUE_SHARDKP_FANOUT: usize = 6;
+pub const NNUE_SHARDKP_L1: usize =
+    NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_SHARD_DIMENSIONS * NNUE_SHARDKP_SHARD_COUNT;
+pub const NNUE_SHARDKP_COMPACT_L0_STRIDE: usize =
+    NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_FANOUT * NNUE_SHARDKP_SHARD_DIMENSIONS;
+pub const NNUE_SHARDKP_COMPACT_L0W_LEN: usize = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_COMPACT_L0_STRIDE;
+
+pub fn is_nnue_shardkp_shape(shape: NnueForwardShape) -> bool {
+    shape.input_size == NNUE_SHARDKP_INPUT_SIZE && shape.l1 == NNUE_SHARDKP_L1
+}
+
+pub fn nnue_l0w_len(shape: NnueForwardShape) -> Result<usize> {
+    if is_nnue_shardkp_shape(shape) {
+        Ok(NNUE_SHARDKP_COMPACT_L0W_LEN)
+    } else {
+        checked_product("l0w", &[shape.input_size, shape.l1])
+    }
+}
+
+fn nnue_l0w_len_saturating(shape: NnueForwardShape) -> usize {
+    if is_nnue_shardkp_shape(shape) {
+        NNUE_SHARDKP_COMPACT_L0W_LEN
+    } else {
+        shape.input_size.saturating_mul(shape.l1)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct NnueForwardHostBatch<'a> {
@@ -534,7 +566,7 @@ impl NnueForwardHostWeights<'_> {
     pub fn validate(self) -> Result<()> {
         let shape = self.shape;
         validate_nnue_shape(shape)?;
-        expect_len("l0w", checked_product("l0w", &[shape.input_size, shape.l1])?, self.l0w.len())?;
+        expect_len("l0w", nnue_l0w_len(shape)?, self.l0w.len())?;
         expect_len("l0b", shape.l1, self.l0b.len())?;
         expect_len("l1w", checked_product("l1w", &[shape.l1, 2, shape.l2])?, self.l1w.len())?;
         expect_len("l1b", shape.l2, self.l1b.len())?;
@@ -606,7 +638,7 @@ impl NnueForwardDeviceWeights {
     fn validate(&self) -> Result<()> {
         let shape = self.shape;
         validate_nnue_shape(shape)?;
-        expect_len("device l0w", checked_product("l0w", &[shape.input_size, shape.l1])?, self.l0w.len())?;
+        expect_len("device l0w", nnue_l0w_len(shape)?, self.l0w.len())?;
         expect_len("device l0b", shape.l1, self.l0b.len())?;
         expect_len("device l1w", checked_product("l1w", &[shape.l1, 2, shape.l2])?, self.l1w.len())?;
         expect_len("device l1b", shape.l2, self.l1b.len())?;
@@ -1452,7 +1484,7 @@ impl NnueBackwardWorkspaceLayout {
     }
 
     pub fn l0w_gradients_len(self) -> usize {
-        self.shape.input_size.saturating_mul(self.shape.l1)
+        nnue_l0w_len_saturating(self.shape)
     }
 
     pub fn l0b_gradients_len(self) -> usize {
@@ -2356,7 +2388,7 @@ impl NnueRangerOptimizerStates {
         states: NnueRangerOptimizerHostStates<'_>,
     ) -> Result<Self> {
         validate_nnue_shape(shape)?;
-        let l0w_len = checked_product("l0w", &[shape.input_size, shape.l1])?;
+        let l0w_len = nnue_l0w_len(shape)?;
         let l1w_len = checked_product("l1w", &[shape.l1, 2, shape.l2])?;
         let l2w_len = checked_product("l2w", &[shape.l2, shape.l3])?;
         Ok(Self {
@@ -2385,7 +2417,7 @@ impl NnueRangerOptimizerStates {
     }
 
     fn validate(&self, shape: NnueForwardShape) -> Result<()> {
-        self.l0w.validate(checked_product("l0w", &[shape.input_size, shape.l1])?, "optimizer l0w")?;
+        self.l0w.validate(nnue_l0w_len(shape)?, "optimizer l0w")?;
         self.l0b.validate(shape.l1, "optimizer l0b")?;
         self.l1w.validate(checked_product("l1w", &[shape.l1, 2, shape.l2])?, "optimizer l1w")?;
         self.l1b.validate(shape.l2, "optimizer l1b")?;
@@ -5201,6 +5233,18 @@ mod tests {
         let err = weights.validate().unwrap_err();
 
         assert!(err.to_string().contains("l0w length mismatch"));
+    }
+
+    #[test]
+    fn nnue_l0w_len_uses_compact_shardkp_storage() {
+        let shardkp = NnueForwardShape { input_size: NNUE_SHARDKP_INPUT_SIZE, l1: NNUE_SHARDKP_L1, l2: 16, l3: 16 };
+        assert!(is_nnue_shardkp_shape(shardkp));
+        assert_eq!(nnue_l0w_len(shardkp).unwrap(), NNUE_SHARDKP_COMPACT_L0W_LEN);
+        assert!(NNUE_SHARDKP_COMPACT_L0W_LEN < NNUE_SHARDKP_INPUT_SIZE * NNUE_SHARDKP_L1);
+
+        let kp = NnueForwardShape { input_size: NNUE_SHARDKP_KP_DIMENSIONS, l1: 256, l2: 32, l3: 32 };
+        assert!(!is_nnue_shardkp_shape(kp));
+        assert_eq!(nnue_l0w_len(kp).unwrap(), kp.input_size * kp.l1);
     }
 
     #[test]

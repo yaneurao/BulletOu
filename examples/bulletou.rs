@@ -135,7 +135,7 @@ enum EvalType {
     /// buckets × 1548 piece inputs). Same 4-layer ClippedReLU network as
     /// the rest of the NNUE family.
     NnueHalfkpvm,
-    /// NNUE ShardKP experimental dense-L0 input.
+    /// NNUE ShardKP experimental row-sparse compact-L0 input.
     NnueShardkp,
     /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
     /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
@@ -2992,7 +2992,7 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => ShogiKa2.max_active(),
             Self::Halfkpe9 => ShogiHalfKpe9.max_active(),
             Self::Halfkpvm => ShogiHalfKPvm.max_active(),
-            Self::Shardkp => ShogiShardKp.max_active(),
+            Self::Shardkp => ShogiKp.max_active(),
         }
     }
 
@@ -3003,9 +3003,48 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => "deterministic NNUE_KA2 scratch",
             Self::Halfkpe9 => "deterministic NNUE_HALFKPE9 scratch",
             Self::Halfkpvm => "deterministic NNUE_HALFKPVM scratch",
-            Self::Shardkp => "deterministic NNUE_SHARDKP scratch",
+            Self::Shardkp => "deterministic NNUE_SHARDKP compact-L0 scratch",
         }
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_nnue_l0w_len_for_shape(shape: bulletou_lib::value::NnueForwardShape) -> Result<usize, String> {
+    bulletou_cuda_cpp::nnue_l0w_len(bulletou_cuda_cpp::NnueForwardShape {
+        input_size: shape.input_size,
+        l1: shape.l1,
+        l2: shape.l2,
+        l3: shape.l3,
+    })
+    .map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn validate_cuda_cpp_nnue_owned_weights(
+    feature_kind: CudaCppNnueFeatureKind,
+    weights: &bulletou_lib::value::NnueForwardOwnedWeights,
+) -> Result<(), String> {
+    let shape = weights.shape;
+    let l0w_len = cuda_cpp_nnue_l0w_len_for_shape(shape)?;
+    let expected = [
+        ("l0w", l0w_len, weights.l0w.len()),
+        ("l0b", shape.l1, weights.l0b.len()),
+        ("l1w", shape.l1.saturating_mul(2).saturating_mul(shape.l2), weights.l1w.len()),
+        ("l1b", shape.l2, weights.l1b.len()),
+        ("l2w", shape.l2.saturating_mul(shape.l3), weights.l2w.len()),
+        ("l2b", shape.l3, weights.l2b.len()),
+        ("outw", shape.l3, weights.outw.len()),
+        ("outb", 1, weights.outb.len()),
+    ];
+    for (name, expected, actual) in expected {
+        if expected != actual {
+            return Err(format!(
+                "cuda-cpp {} weight {name} length mismatch: expected {expected}, got {actual}",
+                feature_kind.source_label()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3282,7 +3321,7 @@ where
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_kppt_teacher_fast_batch(
-                ShogiShardKp,
+                ShogiKp,
                 feature_kind.input_label(),
                 &config,
                 batch_count,
@@ -4192,6 +4231,19 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             feature_kind.source_label()
         );
     }
+    if feature_kind == CudaCppNnueFeatureKind::Shardkp {
+        eprintln!(
+            "  shardkp L0 storage = compact: {} K+P features x {} rows = {} weights ({:.1} MiB)",
+            bulletou_cuda_cpp::NNUE_SHARDKP_KP_DIMENSIONS,
+            bulletou_cuda_cpp::NNUE_SHARDKP_COMPACT_L0_STRIDE,
+            format_count(initial_weights.l0w.len()),
+            (initial_weights.l0w.len() * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  shardkp feature upload = base KP indices: max_active={} (expanded on GPU to common+6 shards)",
+            max_active
+        );
+    }
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
@@ -4233,7 +4285,12 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     }
     .map_err(|e| e.to_string())?;
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
-    eprintln!("  cuda-cpp warmup = done (NNUE dense-backward kernels)");
+    let l0_layout_label = if feature_kind == CudaCppNnueFeatureKind::Shardkp {
+        "compact ShardKP L0 kernels"
+    } else {
+        "dense-backward kernels"
+    };
+    eprintln!("  cuda-cpp warmup = done (NNUE {l0_layout_label})");
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
     eprintln!(
         "  cuda-cpp {} upload pipeline = enabled (2 pinned slots; non-profiled steps)",
@@ -5972,14 +6029,51 @@ fn run_cuda_cpp_nnue_final_validation(
     }
 
     let fold_started = std::time::Instant::now();
-    let validation_weights = cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights)?;
+    let validation_weights_owned = (feature_kind != CudaCppNnueFeatureKind::Shardkp)
+        .then(|| cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights))
+        .transpose()?;
     let weight_fold_elapsed = fold_started.elapsed();
-    let validation_shape = bulletou_cuda_cpp::NnueForwardShape {
-        input_size: validation_weights.shape.input_size,
-        l1: validation_weights.shape.l1,
-        l2: validation_weights.shape.l2,
-        l3: validation_weights.shape.l3,
-    };
+    let validation_shape = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| bulletou_cuda_cpp::NnueForwardShape {
+            input_size: validation_weights.shape.input_size,
+            l1: validation_weights.shape.l1,
+            l2: validation_weights.shape.l2,
+            l3: validation_weights.shape.l3,
+        })
+        .unwrap_or(shape);
+    let validation_l0w = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l0w.as_slice())
+        .unwrap_or(weights.l0w.as_slice());
+    let validation_l0b = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l0b.as_slice())
+        .unwrap_or(weights.l0b.as_slice());
+    let validation_l1w = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l1w.as_slice())
+        .unwrap_or(weights.l1w.as_slice());
+    let validation_l1b = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l1b.as_slice())
+        .unwrap_or(weights.l1b.as_slice());
+    let validation_l2w = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l2w.as_slice())
+        .unwrap_or(weights.l2w.as_slice());
+    let validation_l2b = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.l2b.as_slice())
+        .unwrap_or(weights.l2b.as_slice());
+    let validation_outw = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.outw.as_slice())
+        .unwrap_or(weights.outw.as_slice());
+    let validation_outb = validation_weights_owned
+        .as_ref()
+        .map(|validation_weights| validation_weights.outb.as_slice())
+        .unwrap_or(weights.outb.as_slice());
     let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
     let context_elapsed = context_started.elapsed();
@@ -5988,14 +6082,14 @@ fn run_cuda_cpp_nnue_final_validation(
         &ctx,
         bulletou_cuda_cpp::NnueForwardHostWeights {
             shape: validation_shape,
-            l0w: &validation_weights.l0w,
-            l0b: &validation_weights.l0b,
-            l1w: &validation_weights.l1w,
-            l1b: &validation_weights.l1b,
-            l2w: &validation_weights.l2w,
-            l2b: &validation_weights.l2b,
-            outw: &validation_weights.outw,
-            outb: &validation_weights.outb,
+            l0w: validation_l0w,
+            l0b: validation_l0b,
+            l1w: validation_l1w,
+            l1b: validation_l1b,
+            l2w: validation_l2w,
+            l2b: validation_l2b,
+            outw: validation_outw,
+            outb: validation_outb,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -6626,7 +6720,7 @@ fn build_nnue_validation_fast_batch(
                 &mut nstm[sparse_offset..sparse_offset + max_active],
             )?,
             CudaCppNnueFeatureKind::Shardkp => fill_sparse_validation_features(
-                ShogiShardKp,
+                ShogiKp,
                 feature_kind.source_label(),
                 pos,
                 &mut stm[sparse_offset..sparse_offset + max_active],
@@ -7229,10 +7323,11 @@ fn build_nnue_initial_weights_for_cuda_cpp(
     let input_size = feature_kind.training_input_size();
     let l1_input_dim = 2 * l1_size;
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
+    let l0w_len = cuda_cpp_nnue_l0w_len_for_shape(shape)?;
     let l0w = if virtual_rows == 0 {
-        cuda_cpp_tatara_uniform_abs_init(input_size * l1_size, 0x5071_e001, 0.01)
+        cuda_cpp_tatara_uniform_abs_init(l0w_len, 0x5071_e001, 0.01)
     } else {
-        let mut l0w = vec![0.0_f32; input_size * l1_size];
+        let mut l0w = vec![0.0_f32; l0w_len];
         let base_l0w = cuda_cpp_tatara_uniform_abs_init(base_input_size * l1_size, 0x5071_e001, 0.01);
         for row in 0..base_input_size {
             let src_start = row * l1_size;
@@ -7253,7 +7348,7 @@ fn build_nnue_initial_weights_for_cuda_cpp(
         outw: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e007, 0.01),
         outb: cuda_cpp_tatara_uniform_abs_init(1, 0x5071_e008, 0.01),
     };
-    weights.validate().map_err(|e| e.to_string())?;
+    validate_cuda_cpp_nnue_owned_weights(feature_kind, &weights)?;
     Ok(weights)
 }
 
@@ -7265,12 +7360,33 @@ fn build_halfkp_initial_weights_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_nnue_owned_weights(
+    feature_kind: CudaCppNnueFeatureKind,
+    shape: bulletou_lib::value::NnueForwardShape,
+    records: &BTreeMap<String, Vec<f32>>,
+) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
+    let weights = bulletou_lib::value::NnueForwardOwnedWeights {
+        shape,
+        l0w: load_cuda_cpp_weight_record(records, "l0w")?,
+        l0b: load_cuda_cpp_weight_record(records, "l0b")?,
+        l1w: load_cuda_cpp_weight_record(records, "l1w")?,
+        l1b: load_cuda_cpp_weight_record(records, "l1b")?,
+        l2w: load_cuda_cpp_weight_record(records, "l2w")?,
+        l2b: load_cuda_cpp_weight_record(records, "l2b")?,
+        outw: load_cuda_cpp_weight_record(records, "outw")?,
+        outb: load_cuda_cpp_weight_record(records, "outb")?,
+    };
+    validate_cuda_cpp_nnue_owned_weights(feature_kind, &weights)?;
+    Ok(weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_nnue_initial_state(
     path: &Path,
     args: &Args,
     feature_kind: CudaCppNnueFeatureKind,
 ) -> Result<CudaCppHalfkpInitialState, String> {
-    use bulletou_lib::value::{NnueForwardOwnedWeights, NnueForwardShape as FastNnueForwardShape};
+    use bulletou_lib::value::NnueForwardShape as FastNnueForwardShape;
 
     let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let records =
@@ -7281,7 +7397,7 @@ fn load_cuda_cpp_nnue_initial_state(
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = feature_kind.training_input_size();
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
-    let weights = NnueForwardOwnedWeights::from_weight_map(shape, weights).map_err(|err| {
+    let weights = load_cuda_cpp_nnue_owned_weights(feature_kind, shape, weights).map_err(|err| {
         format!(
             "failed to load cuda-cpp {} weights from {} for arch {}: {err}",
             feature_kind.source_label(),
@@ -11499,6 +11615,35 @@ mod tests {
         assert_eq!(weights.l0w.len(), ShogiKp.num_inputs() * weights.shape.l1);
         assert!(weights.l0w.iter().any(|&v| v != 0.0));
         assert!(weights.l0b.iter().any(|&v| v != 0.0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_shardkp_initial_weights_use_compact_l0_shape() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_SHARDKP",
+            "--arch",
+            "NNUE_shardkp_c256_s128x64_f6_16_16",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let weights = build_nnue_initial_weights_for_cuda_cpp(&args, CudaCppNnueFeatureKind::Shardkp).unwrap();
+        assert_eq!(weights.shape.input_size, ShogiShardKp.num_inputs());
+        assert_eq!(weights.shape.l1, SHARDKP_TOTAL_L1);
+        assert_eq!(weights.l0w.len(), bulletou_cuda_cpp::NNUE_SHARDKP_COMPACT_L0W_LEN);
+        assert!(weights.l0w.len() < weights.shape.input_size * weights.shape.l1);
+        assert!(weights.l0w.iter().any(|&v| v != 0.0));
+        validate_cuda_cpp_nnue_owned_weights(CudaCppNnueFeatureKind::Shardkp, &weights).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
