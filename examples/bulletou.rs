@@ -50,9 +50,7 @@ Usage:
 
 #[cfg(feature = "cuda-cpp-backend")]
 use std::collections::BTreeMap;
-#[cfg(feature = "cuda-cpp-backend")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bullet_compiler::tensor::TValue;
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1909,12 +1907,6 @@ impl Args {
                 "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
             );
         }
-        if self.test_teacher.is_some() && matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
-            return Err(
-                "--backend cuda-cpp direct final validation is currently wired only for NNUE_HALFKP, NNUE_KP, and SFNN_HALFKA2; KPPT/KPP_KKPT currently skip --test-teacher validation"
-                    .to_string(),
-            );
-        }
         if !production_schedule
             && (self.max_epochs.is_some()
                 || self.lr_schedule != LrScheduleKind::Step
@@ -1929,6 +1921,12 @@ impl Args {
             );
         }
         if production_schedule && self.lr_schedule == LrScheduleKind::Plateau {
+            if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
+                return Err(
+                    "--backend cuda-cpp KPPT/KPP_KKPT does not yet implement plateau rollback; use step/geometric/cos"
+                        .to_string(),
+                );
+            }
             if self.test_teacher.is_none() {
                 return Err(
                     "--backend cuda-cpp --lr-schedule plateau requires --test-teacher so validation metrics can be monitored"
@@ -3366,7 +3364,7 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
 
     let ctx = LogContext::from_args(args, schedule.lr_period);
     let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
-    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_CUDA_CPP) {
+    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_CUDA_CPP, Some(args)) {
         Ok((_first_idx, last_idx)) => {
             append_to_top_level_log(&output_dir, last_idx).map_err(|err| {
                 format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display())
@@ -7719,7 +7717,7 @@ fn run_kppt_all(args: &Args) {
     // `kpp-*/` subdirs are removed after assembly.
     let ctx = LogContext::from_args(args, 0);
     let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
-    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_BULLET) {
+    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_BULLET, None) {
         Ok((_first_idx, last_idx)) => {
             // Append the new run's per-sb summary rows to a top-level
             // `<output>/summary-learn.log` so the user has a single
@@ -8425,6 +8423,126 @@ fn list_component_checkpoints_sorted(
     entries
 }
 
+struct KpptF32ValidationWeights {
+    kk: Vec<f32>,
+    kkp: Vec<f32>,
+    kpp: Vec<f32>,
+}
+
+impl KpptF32ValidationWeights {
+    fn from_component_dirs(kk_dir: &Path, kkp_dir: &Path, kpp_dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            kk: read_kppt_component_f32_weight(kk_dir, "kkw", ShogiKk.num_inputs())?,
+            kkp: read_kppt_component_f32_weight(kkp_dir, "kkpw", ShogiKkp.num_inputs())?,
+            kpp: read_kppt_component_f32_weight(kpp_dir, "kppw", ShogiKpp.num_inputs())?,
+        })
+    }
+
+    fn forward_one(&self, pos: &bulletou_lib::shogi::PackedSfenValue) -> std::io::Result<f32> {
+        let board = bulletou_lib::shogi::ShogiBoard::from_packed_sfen(pos);
+        let stm_is_black = board.side_to_move == bulletou_lib::shogi::types::Color::Black;
+
+        let (kk_stm, kk_nstm) = kppt_sparse_sums(ShogiKk, pos, &self.kk)?;
+        let (kkp_stm, kkp_nstm) = kppt_sparse_sums(ShogiKkp, pos, &self.kkp)?;
+        let (kpp_stm, kpp_nstm) = kppt_sparse_sums(ShogiKpp, pos, &self.kpp)?;
+
+        // `kkw` / `kkpw` are exported as YaneuraOu's black-perspective
+        // turn-independent tables. For White-to-move positions, the engine
+        // negates the black-perspective board score; in our sparse feature
+        // pair the NSTM side is the black perspective in that case.
+        let kk = kppt_black_perspective_component(stm_is_black, kk_stm, kk_nstm);
+        let kkp = kppt_black_perspective_component(stm_is_black, kkp_stm, kkp_nstm);
+        // KPP contributes BKPP - WKPP, then flips to side-to-move. Because
+        // `ShogiKpp` emits `(STM perspective, NSTM perspective)`, this is
+        // simply `stm - nstm` for either side to move.
+        let kpp = kpp_stm - kpp_nstm;
+
+        Ok(kk + kkp + kpp)
+    }
+}
+
+fn read_kppt_component_f32_weight(dir: &Path, id: &str, expected_len: usize) -> std::io::Result<Vec<f32>> {
+    let weights_path = dir.join("optimiser_state").join("weights.bin");
+    let bytes = std::fs::read(&weights_path)?;
+    let records = parse_model_weights_bin(&bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to parse {}: {err}", weights_path.display()),
+        )
+    })?;
+    let values = records.get(id).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} is missing `{id}`", weights_path.display()))
+    })?;
+    if values.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} record `{id}` has length {}, expected {expected_len}", weights_path.display(), values.len()),
+        ));
+    }
+    Ok(values.clone())
+}
+
+fn kppt_sparse_sums<I>(
+    input: I,
+    pos: &bulletou_lib::shogi::PackedSfenValue,
+    weights: &[f32],
+) -> std::io::Result<(f32, f32)>
+where
+    I: SparseInputType<RequiredDataType = bulletou_lib::shogi::PackedSfenValue>,
+{
+    let mut stm_sum = 0.0_f32;
+    let mut nstm_sum = 0.0_f32;
+    let mut out_of_range = None;
+    input.map_features(pos, |stm, nstm| {
+        if let Some(value) = weights.get(stm) {
+            stm_sum += *value;
+        } else {
+            out_of_range = Some(stm);
+            return;
+        }
+        if let Some(value) = weights.get(nstm) {
+            nstm_sum += *value;
+        } else {
+            out_of_range = Some(nstm);
+        }
+    });
+    if let Some(idx) = out_of_range {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("KPPT validation feature index {idx} is outside weight length {}", weights.len()),
+        ));
+    }
+    Ok((stm_sum, nstm_sum))
+}
+
+fn kppt_black_perspective_component(stm_is_black: bool, stm_sum: f32, nstm_sum: f32) -> f32 {
+    if stm_is_black { stm_sum } else { -nstm_sum }
+}
+
+fn run_kppt_component_dirs_final_validation(
+    args: &Args,
+    cache: &TestPositionsCache,
+    kk_dir: &Path,
+    kkp_dir: &Path,
+    kpp_dir: &Path,
+) -> std::io::Result<Option<TestMetrics>> {
+    if cache.positions.is_empty() {
+        eprintln!("  WARN: --test-teacher yielded no positions; KPPT final validation skipped");
+        return Ok(None);
+    }
+
+    let weights = KpptF32ValidationWeights::from_component_dirs(kk_dir, kkp_dir, kpp_dir)?;
+    let mut outputs = Vec::with_capacity(cache.positions.len());
+    let started = std::time::Instant::now();
+    for pos in &cache.positions {
+        outputs.push(weights.forward_one(pos)?);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    eprintln!("  KPPT f32 composed validation forward = ok: positions={}, elapsed={elapsed:.3}s", outputs.len());
+
+    Ok(Some(run_one_test_pass(cache, args, outputs)))
+}
+
 /// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
 /// produced by the three children of `run_kppt_all`, and assemble them into
 /// flat `<output>/0001/`, `0002/`, ... directories each containing the
@@ -8439,6 +8557,7 @@ fn assemble_numbered_dirs(
     ctx: &LogContext,
     prior_positions: &std::collections::BTreeMap<String, usize>,
     state_backend: &str,
+    validation_args: Option<&Args>,
 ) -> std::io::Result<(usize, usize)> {
     let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
     let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
@@ -8479,6 +8598,7 @@ fn assemble_numbered_dirs(
         output_dir.display(),
         existing_count + 1
     );
+    let validation_cache = validation_args.and_then(TestPositionsCache::try_load);
     for i in 0..n {
         let idx = existing_count + i + 1;
         let dst = output_dir.join(format!("{idx:04}"));
@@ -8503,6 +8623,12 @@ fn assemble_numbered_dirs(
         bundle_component_state(&mut state_buf, "kkp", &kkp_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
         std::fs::write(dst.join("state.bin"), &state_buf)?;
+        let test_metrics = match (validation_args, validation_cache.as_ref()) {
+            (Some(args), Some(cache)) => {
+                run_kppt_component_dirs_final_validation(args, cache, kk_dir, kkp_dir, kpp_dir)?
+            }
+            _ => None,
+        };
         // Each component's bullet `log.txt` is the raw
         // `superbatch,curr_batch,loss` CSV. Enrich each into the current
         // `learn.log` format (header + data rows for kk, then kkp, then
@@ -8517,10 +8643,10 @@ fn assemble_numbered_dirs(
             ("kpp", *kpp_epoch, kpp_dir, prior_kpp),
         ] {
             let raw = std::fs::read_to_string(dir.join("log.txt")).unwrap_or_default();
-            // KPPT family does not run --test-teacher validation (out tensor
-            // shape doesn't match the single-scalar assumption); always emit
-            // `-` for the test_value_* columns by passing None.
-            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior, None, true));
+            // KPPT validation is a final-eval metric: the same f32
+            // KK+KKP+KPP composed output is repeated on each component row
+            // for this save.
+            log_buf.push_str(&enrich_bullet_log_to_csv(&raw, ctx, epoch, label, prior, test_metrics, true));
         }
         std::fs::write(dst.join("learn.log"), log_buf)?;
         eprintln!("  -> {}/", dst.display());
@@ -11237,6 +11363,12 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    fn kppt_black_perspective_component_flips_white_to_move() {
+        assert_eq!(kppt_black_perspective_component(true, 12.5, 99.0), 12.5);
+        assert_eq!(kppt_black_perspective_component(false, 99.0, 12.5), -12.5);
+    }
+
+    #[test]
     fn nnue_arch_parse_known_presets() {
         assert_eq!(NnueArch::from_str("NNUE_halfkp_256x2_32_32").unwrap().dims(), (256, 32, 32));
         assert_eq!(NnueArch::from_str("NNUE_halfkp_1024x2_8_64").unwrap().dims(), (1024, 8, 64));
@@ -11681,7 +11813,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_cpp_backend_rejects_kppt_validation_teacher() {
+    fn cuda_cpp_backend_accepts_kppt_validation_teacher() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -11699,12 +11831,12 @@ mod tests {
         ])
         .unwrap();
 
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "KPPT/KPP_KKPT currently skip"
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
         } else {
-            "cuda-cpp-backend"
-        }));
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
     }
 
     #[test]
@@ -11825,6 +11957,35 @@ mod tests {
 
         let err = args.validate_backend_flags().unwrap_err();
         assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "--test-teacher" } else { "cuda-cpp-backend" }));
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_kppt_plateau_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "1",
+            "--max-epochs",
+            "1",
+            "--lr-schedule",
+            "plateau",
+            "--test-teacher",
+            "yamaoka-floodgate.psv",
+            "--save-rate",
+            "1",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "plateau rollback" } else { "cuda-cpp-backend" }));
     }
 
     #[test]
