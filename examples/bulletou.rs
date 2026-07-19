@@ -1202,6 +1202,28 @@ fn effective_batch_size(args: &Args) -> usize {
     args.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_default_cpu_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).clamp(4, 24))
+        .unwrap_or(24)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_effective_teacher_threads(args: &Args) -> usize {
+    if args.threads == 4 { cuda_cpp_default_cpu_threads() } else { args.threads }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_effective_loader_threads(args: &Args) -> usize {
+    if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_effective_batch_queue_size(args: &Args) -> usize {
+    if args.batch_queue_size == 32 { 4 } else { args.batch_queue_size }
+}
+
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
     let batch_size = effective_batch_size(args);
     if batch_size == 0 {
@@ -3199,6 +3221,13 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     if let Some(pos) = dataloader_resume_pos {
         eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
     }
+    let teacher_threads = cuda_cpp_effective_teacher_threads(args);
+    let loader_threads = cuda_cpp_effective_loader_threads(args);
+    let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
+    eprintln!(
+        "  cuda-cpp teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
+        teacher_threads, loader_threads, batch_queue_size
+    );
 
     let config = HalfkpTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3206,9 +3235,9 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         batch_index: 0,
         dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
-        loader_threads: args.loader_threads,
-        threads: args.threads,
-        queue_depth: args.batch_queue_size,
+        loader_threads,
+        threads: teacher_threads,
+        queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3255,9 +3284,9 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                     batch_index: 0,
                     dataloader_resume_pos: chunk_resume_pos,
                     buffer_mb: args.buffer_mb,
-                    loader_threads: args.loader_threads,
-                    threads: args.threads,
-                    queue_depth: args.batch_queue_size,
+                    loader_threads,
+                    threads: teacher_threads,
+                    queue_depth: batch_queue_size,
                     lambda: args.lambda,
                     scale: args.scale as f32,
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3846,6 +3875,12 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     if let Some(pos) = dataloader_resume_pos {
         eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
     }
+    let teacher_threads = cuda_cpp_effective_teacher_threads(args);
+    let loader_threads = cuda_cpp_effective_loader_threads(args);
+    eprintln!(
+        "  cuda-cpp SFNN teacher CPU = prepare_threads={}, loader_threads={}",
+        teacher_threads, loader_threads
+    );
 
     let config = SfnnTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3853,8 +3888,8 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         batch_index: 0,
         dataloader_resume_pos,
         buffer_mb: args.buffer_mb,
-        loader_threads: args.loader_threads,
-        threads: args.threads,
+        loader_threads,
+        threads: teacher_threads,
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3900,8 +3935,8 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
                     batch_index: 0,
                     dataloader_resume_pos: chunk_resume_pos,
                     buffer_mb: args.buffer_mb,
-                    loader_threads: args.loader_threads,
-                    threads: args.threads,
+                    loader_threads,
+                    threads: teacher_threads,
                     lambda: args.lambda,
                     scale: args.scale as f32,
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -11720,6 +11755,60 @@ mod tests {
         assert!(!cuda_cpp_should_read_loss(1, 50, 0));
         assert!(!cuda_cpp_should_read_loss(49, 50, 0));
         assert!(cuda_cpp_should_read_loss(50, 50, 0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_teacher_cpu_defaults_are_autotuned_for_gpu_backend() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let default_threads = cuda_cpp_default_cpu_threads();
+        assert!((4..=24).contains(&default_threads));
+        assert_eq!(cuda_cpp_effective_teacher_threads(&args), default_threads);
+        assert_eq!(cuda_cpp_effective_loader_threads(&args), default_threads);
+        assert_eq!(cuda_cpp_effective_batch_queue_size(&args), 4);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_teacher_cpu_explicit_non_defaults_are_preserved() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--threads",
+            "10",
+            "--loader-threads",
+            "12",
+            "--batch-queue-size",
+            "8",
+        ])
+        .unwrap();
+
+        assert_eq!(cuda_cpp_effective_teacher_threads(&args), 10);
+        assert_eq!(cuda_cpp_effective_loader_threads(&args), 12);
+        assert_eq!(cuda_cpp_effective_batch_queue_size(&args), 8);
     }
 
     #[test]

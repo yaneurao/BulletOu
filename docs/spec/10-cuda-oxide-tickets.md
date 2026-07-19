@@ -969,16 +969,32 @@ the tickets in order and commit each completed slice.
   - speed-only probe: bs65k / `beta1=0.975` / LR `0.024`;
   - balanced loss+speed probe: bs32k / `beta1=0.975` / LR `0.024`;
   - accuracy-biased short probe: bs32k / `beta1=0.9` / LR `0.024`, with the caveat that its held-out loss is worse and needs a longer/full-teacher check before becoming the production recommendation.
+- Adopted C++/CUDA teacher CPU default auto-tuning:
+  - the root CLI keeps the generic `--threads`, `--loader-threads`, and `--batch-queue-size` flags, but the Windows-native `--backend cuda-cpp` path now maps their historical defaults to GPU-feeding defaults before constructing the HalfKP/SFNN teacher batch configs;
+  - default `--threads 4` becomes `available_parallelism() * 2`, clamped to `4..=24`; default `--loader-threads 0` uses the same value; default `--batch-queue-size 32` becomes `4` for HalfKP;
+  - explicit non-default values are preserved, so manual A/B probes such as `--threads 10` or `--batch-queue-size 8` still do exactly what they say.
+- HalfKP 4M CPU-feed sweep after the auto-tune change, same HCPE teacher and WRM settings (`bs65k`, `beta1=0.975`, LR `0.024`, `wd=0`, final-only loss readback):
+  - `threads=10`, loader auto (`12`), queue `2`: `2499720` pos/s;
+  - `threads=16`, `loader_threads=16`, queue `4`: `2589646` pos/s;
+  - `threads=20`, `loader_threads=20`, queue `4`: `2617199` pos/s;
+  - `threads=24`, `loader_threads=24`, queue `4`: best short run `2875248` pos/s;
+  - `threads=32`, `loader_threads=32`, queue `4`: regressed to `2621696` pos/s;
+  - `threads=24`, `loader_threads=24`, queue `8`: `2810461` pos/s; queue `32`: `2767411` pos/s.
+- Default auto-tune validation:
+  - with no explicit `--threads`, `--loader-threads`, or `--batch-queue-size`, the CLI printed `cuda-cpp teacher CPU = prepare_threads=24, loader_threads=24, batch_queue_size=4`;
+  - repeat 4M speed-only run reported `2840476` pos/s;
+  - held-out yamaoka check used only `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 65536 --test-sample sequential --test-batch-size 4096` and reported `2627038` pos/s, `test_loss=0.03545475`, `test_acc=0.6218414`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
+  - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
   - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed, but an existing pack-loader background thread can still print a post-test panic after the harness reports success; this appears unrelated to the HCPE HalfKP C++ direct path.
 - Validation for this partial BO-CUDA-036 increment:
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed;
-  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (37 cuda-cpp tests);
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (39 cuda-cpp tests);
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed.
 - Remaining BO-CUDA-036 work:
-  - pinned-host upload or a safer upload pipeline for HalfKP, because pageable upload/host-side staging still leaves a gap between GPU-stage theoretical throughput and measured 4M throughput;
-  - further sparse L0 backward/update optimisation if the previous cuda-oxide 4M ceiling remains the target.
+  - further sparse L0 backward/update optimisation if the previous cuda-oxide 4M ceiling remains the target;
+  - longer multi-file confirmation of the auto-tuned CPU defaults, because 4M HCPE runs still show noticeable run-to-run variance.
