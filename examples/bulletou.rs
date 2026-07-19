@@ -1363,6 +1363,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     cuda_cpp_profile_steps: usize,
 
+    /// Print CPU teacher batch preparation time for the Windows-native
+    /// C++/CUDA backend. This disables the prepared-batch producer queue
+    /// for clearer per-batch timings, so use it only for diagnosis.
+    #[arg(long)]
+    cuda_cpp_profile_teacher_prepare: bool,
+
     /// Read and print C++/CUDA direct-trainer loss every N steps. This
     /// synchronises the compute stream, so use 0 for throughput probes
     /// where only the final loss is needed.
@@ -1832,6 +1838,9 @@ impl Args {
             }
             if self.cuda_cpp_profile_steps != 0 {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-profile-steps cannot be used together".to_string());
+            }
+            if self.cuda_cpp_profile_teacher_prepare {
+                return Err("--cuda-cpp-smoke and --cuda-cpp-profile-teacher-prepare cannot be used together".to_string());
             }
             return Ok(());
         }
@@ -3228,6 +3237,9 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         "  cuda-cpp teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
         teacher_threads, loader_threads, batch_queue_size
     );
+    if args.cuda_cpp_profile_teacher_prepare {
+        eprintln!("  cuda-cpp teacher prepare profiling = enabled (serial prepared-batch consumer)");
+    }
 
     let config = HalfkpTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3243,7 +3255,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
         ft_factorize: false,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        profile_prepare: false,
+        profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
     if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
@@ -3292,7 +3304,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
                     ft_factorize: false,
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-                    profile_prepare: false,
+                    profile_prepare: args.cuda_cpp_profile_teacher_prepare,
                 };
                 eprintln!(
                     "  cuda-cpp plateau: epoch={}, superbatch={}, lr {}",
@@ -3882,6 +3894,9 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         "  cuda-cpp SFNN teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
         teacher_threads, loader_threads, batch_queue_size
     );
+    if args.cuda_cpp_profile_teacher_prepare {
+        eprintln!("  cuda-cpp SFNN teacher prepare profiling = enabled (serial prepared-batch consumer)");
+    }
 
     let config = SfnnTeacherBatchConfig {
         teacher: &args.teacher,
@@ -3896,7 +3911,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-        profile_prepare: false,
+        profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
     if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
@@ -3944,7 +3959,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
                     scale: args.scale as f32,
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-                    profile_prepare: false,
+                    profile_prepare: args.cuda_cpp_profile_teacher_prepare,
                 };
                 eprintln!(
                     "  cuda-cpp SFNN plateau: epoch={}, superbatch={}, lr {}",
@@ -11712,6 +11727,33 @@ mod tests {
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
             assert_eq!(args.cuda_cpp_profile_steps, 2);
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_teacher_prepare_profile_flag() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "3",
+            "--cuda-cpp-profile-teacher-prepare",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+            assert!(args.cuda_cpp_profile_teacher_prepare);
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
