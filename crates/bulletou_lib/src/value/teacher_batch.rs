@@ -74,6 +74,7 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub buffer_mb: usize,
     pub loader_threads: usize,
     pub threads: usize,
+    pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
     pub nnue_pytorch_wrm_loss: bool,
@@ -710,8 +711,8 @@ fn visit_sfnn_batches<D, P, F, E>(
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
 where
-    D: DataLoader<PackedSfenValue>,
-    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
+    D: DataLoader<PackedSfenValue> + Send,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos> + Send,
     F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
@@ -742,6 +743,88 @@ where
         config.score_drop_abs,
         loader,
     );
+
+    if config.queue_depth > 1 && !config.profile_prepare {
+        let (sender, receiver) = mpsc::sync_channel::<Result<SfnnTeacherBatch, TeacherBatchError>>(config.queue_depth);
+        return std::thread::scope(|scope| {
+            let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
+                let mut produced_batches = 0usize;
+                let mut producer_error = None;
+                dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+                    let batch_index = config.batch_index + produced_batches;
+                    let prepared = match rayon_pool.as_ref() {
+                        Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+                        None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+                    };
+                    let batch = FastBatchHost::from(prepared);
+                    if let Err(err) = batch.validate() {
+                        producer_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+                        return true;
+                    }
+
+                    let source = format!("{format:?} SFNN teacher batch {batch_index}: {}", config.teacher);
+                    let dataloader_pos = dataloader_pos(produced_batches);
+                    if sender.send(Ok(SfnnTeacherBatch { batch, source, dataloader_pos })).is_err() {
+                        return true;
+                    }
+
+                    produced_batches += 1;
+                    produced_batches >= batch_count
+                });
+
+                if let Some(err) = producer_error {
+                    let _ = sender.send(Err(err.clone()));
+                    return Err(err);
+                }
+                if produced_batches != batch_count {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "SFNN teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                        config.batch_index, config.batch_size
+                    )));
+                }
+                Ok(produced_batches)
+            });
+
+            let mut consumed_batches = 0usize;
+            let mut visit_error = None;
+            while consumed_batches < batch_count {
+                match receiver.recv() {
+                    Ok(Ok(batch)) => {
+                        if let Err(err) = visitor(batch) {
+                            visit_error = Some(TeacherBatchError::invalid_input(format!(
+                                "SFNN teacher batch callback failed at batch {}: {err}",
+                                config.batch_index + consumed_batches
+                            )));
+                            break;
+                        }
+                        consumed_batches += 1;
+                    }
+                    Ok(Err(err)) => {
+                        visit_error = Some(err);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(receiver);
+
+            let producer_result = producer
+                .join()
+                .map_err(|_| TeacherBatchError::invalid_input("SFNN teacher producer thread panicked"))?;
+            if let Some(err) = visit_error {
+                return Err(err);
+            }
+            producer_result?;
+            if consumed_batches != batch_count {
+                return Err(TeacherBatchError::invalid_input(format!(
+                    "SFNN teacher did not deliver {batch_count} complete prepared batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                    config.batch_index, config.batch_size
+                )));
+            }
+            Ok(consumed_batches)
+        });
+    }
+
     let mut visited_batches = 0usize;
     let mut visit_error = None;
     dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
@@ -839,6 +922,24 @@ mod tests {
         }
     }
 
+    fn sfnn_config() -> SfnnTeacherBatchConfig<'static> {
+        SfnnTeacherBatchConfig {
+            teacher: "missing.hcpe",
+            batch_size: 2,
+            batch_index: 0,
+            dataloader_resume_pos: None,
+            buffer_mb: 1,
+            loader_threads: 1,
+            threads: 1,
+            queue_depth: 2,
+            lambda: 1.0,
+            scale: 400.0,
+            nnue_pytorch_wrm_loss: false,
+            score_drop_abs: Some(32_000),
+            profile_prepare: false,
+        }
+    }
+
     #[test]
     fn config_rejects_zero_batch_size() {
         let mut config = config();
@@ -858,6 +959,21 @@ mod tests {
     #[test]
     fn zero_batch_count_does_not_touch_missing_teacher() {
         let visited = for_each_halfkp_teacher_fast_batch(&config(), 0, |_| Ok::<(), TeacherBatchError>(())).unwrap();
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn sfnn_config_rejects_zero_batch_size() {
+        let mut config = sfnn_config();
+        config.batch_size = 0;
+        let err = validate_sfnn_config(&config).unwrap_err();
+        assert!(err.to_string().contains("batch-size"));
+    }
+
+    #[test]
+    fn sfnn_zero_batch_count_does_not_touch_missing_teacher() {
+        let visited =
+            for_each_sfnn_halfka2_teacher_fast_batch(&sfnn_config(), 0, |_| Ok::<(), TeacherBatchError>(())).unwrap();
         assert_eq!(visited, 0);
     }
 

@@ -826,6 +826,10 @@ the tickets in order and commit each completed slice.
   - `SfnnTrainStepRunner` owns two `SfnnTrainStepUploadSlot`s containing sparse indices, buckets, targets, entry weights, upload-ready events, and compute-done events;
   - `step_pipelined_no_readback` uploads the next batch on `upload_ctx`, makes the compute stream wait on the upload-ready event, then records compute-done after Ranger update so slot reuse cannot overwrite buffers still read by kernels;
   - `examples/bulletou --backend cuda-cpp --eval-type SFNN_HALFKA2` uses the pipeline for non-profiled direct steps while keeping profiled steps serial for clean stage timings.
+- Added SFNN teacher CPU/GPU overlap parity:
+  - `SfnnTeacherBatchConfig` now has `queue_depth`, matching the HalfKP helper;
+  - when `queue_depth > 1` and `profile_prepare=false`, a producer thread materializes `FastBatchHost` SFNN batches into a bounded queue while the caller continues enqueueing GPU work;
+  - root `--backend cuda-cpp --eval-type SFNN_HALFKA2` passes the same auto-tuned `--batch-queue-size` path as HalfKP, while the cuda-oxide caller keeps `queue_depth=1` to preserve its existing behavior.
 - Reduced direct-loop loss readback synchronization:
   - `--cuda-cpp-loss-readback-interval N` controls how often the direct C++/CUDA trainer synchronizes the compute stream to read/report loss;
   - the default `10` preserves the previous step1/every10/final reporting cadence, while `0` keeps only the final readback for throughput probes.
@@ -885,6 +889,11 @@ the tickets in order and commit each completed slice.
   - Full exported-teacher yamaoka comparison on Windows used `target\full-epoch-sfnn-20260718\teacher-all.psv` for training and only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation:
     `--cuda-cpp-train-steps 4953 --batch-size 131072 --threads 10 --sfnn-factorized-l1 --cuda-cpp-loss-readback-interval 0 --test-positions 65536 --test-sample sequential --test-batch-size 8192` reported `649199616` positions in `489.182s`, `throughput=1327112 pos/s`, `test_value_loss=0.05579023`, `test_value_accuracy=0.6717072`.
   - Auto-resume smoke for SFNN direct wrote `target\cuda-cpp-sfnn-numbered-resume-smoke\0001`, resumed from `0001/state.bin` with `dataloader resume = byte_offset 608, plies 0`, then wrote `0002`; a follow-up resume from `0002/state.bin` printed `initial completed optimizer steps = 2`, ran `optimizer_step=3`, wrote `0003/dataloader_pos.txt = 1824,0`, and the corrected `0003/learn.log` row used cumulative `positions=32`.
+  - After the cuda-cpp teacher CPU auto-tune and SFNN producer queue, a bs131k/128-step HCPE probe with final-only WRM loss readback reported `16777216` positions in `9.180s`, `throughput=1827661 pos/s`.
+  - The same queue-enabled shape with held-out validation fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`, `--test-positions 65536 --test-sample sequential --test-batch-size 8192`, reported `throughput=1816050 pos/s`, `test_value_loss=0.03449630`, `test_value_accuracy=0.6285858`.
+  - A serial-profile control run on the same 128-step shape reported yamaoka `test_value_loss=0.03461872`, `test_value_accuracy=0.6276855`, confirming the queue path preserves the expected quality band.
+- Rejected SFNN upload experiment:
+  - adding pinned staged host buffers to `SfnnTrainStepUploadSlot` did not improve the bs131k/128-step speed materially and corrupted the yamaoka check (`test_value_accuracy=0.6073761`, `test_value_loss=0.05824073`), while the serial upload control stayed healthy, so the pinned SFNN upload change was reverted.
 - BO-CUDA-034 is complete for the tracked tatara speed/quality target and Windows-native auto-resume. Follow-up optimisation and production-schedule ergonomics continue under BO-CUDA-033/035.
 
 ### BO-CUDA-035

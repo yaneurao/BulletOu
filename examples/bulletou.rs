@@ -3877,9 +3877,10 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     }
     let teacher_threads = cuda_cpp_effective_teacher_threads(args);
     let loader_threads = cuda_cpp_effective_loader_threads(args);
+    let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
     eprintln!(
-        "  cuda-cpp SFNN teacher CPU = prepare_threads={}, loader_threads={}",
-        teacher_threads, loader_threads
+        "  cuda-cpp SFNN teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
+        teacher_threads, loader_threads, batch_queue_size
     );
 
     let config = SfnnTeacherBatchConfig {
@@ -3890,6 +3891,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         buffer_mb: args.buffer_mb,
         loader_threads,
         threads: teacher_threads,
+        queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3937,6 +3939,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
                     buffer_mb: args.buffer_mb,
                     loader_threads,
                     threads: teacher_threads,
+                    queue_depth: batch_queue_size,
                     lambda: args.lambda,
                     scale: args.scale as f32,
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
