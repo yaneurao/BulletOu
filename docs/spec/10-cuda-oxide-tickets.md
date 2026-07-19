@@ -1062,6 +1062,7 @@ the tickets in order and commit each completed slice.
   - held-out validation still works in this mode by downloading only the trained weights;
   - a 1-step SFNN smoke wrote only tiny `resume-config.txt`/`tag.txt` files and printed `cuda-cpp SFNN final output skipped`;
   - with the inverse-index L0 + zero skip, bs131k/128-step WRM and yamaoka-fixed validation completed without writing the multi-GB `state.bin`: `2153395` pos/s, `test_loss=0.03670243`, `test_acc=0.6138611`.
+  - the same no-output mode was then used for a full SFNN tatara-parity recheck on the exported `target\full-epoch-sfnn-20260718\teacher-all.psv` with validation fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`; the 4953-step bs131k/factorized-L1 run reported `649199616` positions in `281.652s`, `2304974` pos/s, `test_loss=0.05524588`, `test_acc=0.6734161`, and wrote only `resume-config.txt` plus `tag.txt`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
