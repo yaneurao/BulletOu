@@ -33,9 +33,10 @@ pub use fast_sfnn::{
     SfnnForwardWeights, SfnnForwardWorkspaceLayout,
 };
 pub use teacher_batch::{
-    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, SfnnTeacherBatch,
-    SfnnTeacherBatchConfig, TeacherBatchError, TeacherDataloaderPos, for_each_halfkp_teacher_fast_batch,
-    for_each_kp_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch, load_halfkp_teacher_fast_batch,
+    HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
+    KpptTeacherBatchConfig, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherDataloaderPos,
+    for_each_halfkp_teacher_fast_batch, for_each_kp_teacher_fast_batch, for_each_kppt_teacher_fast_batch,
+    for_each_sfnn_halfka2_teacher_fast_batch, load_halfkp_teacher_fast_batch,
 };
 
 use crate::{

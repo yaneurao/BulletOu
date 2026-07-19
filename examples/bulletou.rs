@@ -1832,20 +1832,25 @@ impl Args {
         }
 
         let eval_type = self.eval_type();
-        if !matches!(eval_type, EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::SfnnHalfka2) {
+        if !matches!(
+            eval_type,
+            EvalType::Kppt | EvalType::KppKkpt | EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::SfnnHalfka2
+        ) {
             return Err(format!(
-                "--backend cuda-cpp currently supports direct NNUE_HALFKP, NNUE_KP, or SFNN_HALFKA2 train steps only; {} is tracked by later tickets",
+                "--backend cuda-cpp currently supports KPPT, KPP_KKPT, NNUE_HALFKP, NNUE_KP, or SFNN_HALFKA2 train steps only; {} is tracked by later tickets",
                 eval_type.cli_name()
             ));
         }
-        let supported_arch = cuda_cpp_supported_arch(eval_type);
-        if self.arch() != supported_arch {
-            return Err(format!(
-                "--backend cuda-cpp currently supports only --arch {} for {}; got {}",
-                supported_arch.cli_name(),
-                eval_type.cli_name(),
-                self.arch().cli_name()
-            ));
+        if eval_type.uses_arch() {
+            let supported_arch = cuda_cpp_supported_arch(eval_type);
+            if self.arch() != supported_arch {
+                return Err(format!(
+                    "--backend cuda-cpp currently supports only --arch {} for {}; got {}",
+                    supported_arch.cli_name(),
+                    eval_type.cli_name(),
+                    self.arch().cli_name()
+                ));
+            }
         }
 
         if let Some(0) = self.cuda_cpp_train_steps {
@@ -1868,6 +1873,16 @@ impl Args {
         if self.cuda_cpp_skip_final_output && self.cuda_cpp_train_steps.is_none() {
             return Err(
                 "--cuda-cpp-skip-final-output is only valid with --cuda-cpp-train-steps direct-step mode".to_string()
+            );
+        }
+        if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) && self.cuda_cpp_skip_final_output {
+            return Err(
+                "--cuda-cpp-skip-final-output is currently supported for NNUE/SFNN direct trainers only".to_string()
+            );
+        }
+        if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) && self.cuda_cpp_profile_steps != 0 {
+            return Err(
+                "--cuda-cpp-profile-steps is currently supported for NNUE/SFNN direct trainers only".to_string()
             );
         }
         if production_schedule && self.max_epochs.is_none() {
@@ -1894,11 +1909,9 @@ impl Args {
                 "--backend cuda-cpp direct trainer does not yet implement per-layer/bias clipping flags".to_string()
             );
         }
-        if self.test_teacher.is_some()
-            && !matches!(eval_type, EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::SfnnHalfka2)
-        {
+        if self.test_teacher.is_some() && matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) {
             return Err(
-                "--backend cuda-cpp direct final validation is currently wired only for NNUE_HALFKP, NNUE_KP, and SFNN_HALFKA2"
+                "--backend cuda-cpp direct final validation is currently wired only for NNUE_HALFKP, NNUE_KP, and SFNN_HALFKA2; KPPT/KPP_KKPT currently skip --test-teacher validation"
                     .to_string(),
             );
         }
@@ -1973,6 +1986,8 @@ const BULLETOU_DEFAULT_ADAMW_CLIP: f32 = 1.98;
 const NNUE_PYTORCH_HIDDEN_CLIP: f32 = 127.0 / 64.0;
 const NNUE_PYTORCH_OUTPUT_CLIP: f32 = 127.0 * 127.0 / (600.0 * 16.0);
 const ADAMW_UNCLIPPED_BIAS_LIMIT: f32 = 1.0e30;
+#[cfg(feature = "cuda-cpp-backend")]
+const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
 
 fn adamw_params(args: &Args, clip: f32) -> optimiser::AdamWParams {
     let mut params = optimiser::AdamWParams {
@@ -2818,6 +2833,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
     {
         if !args.cuda_cpp_smoke {
             return match args.eval_type() {
+                EvalType::Kppt | EvalType::KppKkpt => run_cuda_cpp_kppt_direct_steps(args),
                 EvalType::NnueHalfkp => run_cuda_cpp_halfkp_direct_steps(args),
                 EvalType::NnueKp => run_cuda_cpp_kp_direct_steps(args),
                 EvalType::SfnnHalfka2 => run_cuda_cpp_sfnn_halfka2_direct_steps(args),
@@ -3119,6 +3135,752 @@ where
             .map_err(|e| e.to_string())
         }
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CudaCppKpptComponent {
+    Kk,
+    Kkp,
+    Kpp,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppKpptComponent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Kk => "KK",
+            Self::Kkp => "KKP",
+            Self::Kpp => "KPP",
+        }
+    }
+
+    fn input_label(self) -> &'static str {
+        match self {
+            Self::Kk => "kk",
+            Self::Kkp => "kkp",
+            Self::Kpp => "kpp",
+        }
+    }
+
+    fn table_weight_id(self) -> &'static str {
+        match self {
+            Self::Kk => "kkw",
+            Self::Kkp => "kkpw",
+            Self::Kpp => "kppw",
+        }
+    }
+
+    fn table_bias_id(self) -> &'static str {
+        match self {
+            Self::Kk => "kkb",
+            Self::Kkp => "kkpb",
+            Self::Kpp => "kppb",
+        }
+    }
+
+    fn input_size(self) -> usize {
+        match self {
+            Self::Kk => ShogiKk.num_inputs(),
+            Self::Kkp => ShogiKkp.num_inputs(),
+            Self::Kpp => ShogiKpp.num_inputs(),
+        }
+    }
+
+    fn max_active(self) -> usize {
+        match self {
+            Self::Kk => ShogiKk.max_active(),
+            Self::Kkp => ShogiKkp.max_active(),
+            Self::Kpp => ShogiKpp.max_active(),
+        }
+    }
+
+    fn default_quant_scale(self) -> f32 {
+        match self {
+            Self::Kk => KPPT_KK_DEFAULT_QUANT_SCALE,
+            Self::Kkp => KPPT_KKP_DEFAULT_QUANT_SCALE,
+            Self::Kpp => KPPT_KPP_DEFAULT_QUANT_SCALE,
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+struct CudaCppKpptTeacherBatch {
+    batch: bulletou_lib::value::FastBatchHost,
+    source: String,
+    dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn for_each_cuda_cpp_kppt_teacher_batch<F>(
+    args: &Args,
+    component: CudaCppKpptComponent,
+    options: CudaCppNnueTeacherOptions,
+    batch_count: usize,
+    mut visitor: F,
+) -> Result<usize, String>
+where
+    F: FnMut(CudaCppKpptTeacherBatch) -> Result<(), String>,
+{
+    use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
+
+    let config = KpptTeacherBatchConfig {
+        teacher: &args.teacher,
+        batch_size: options.batch_size,
+        batch_index: options.batch_index,
+        dataloader_resume_pos: options.dataloader_resume_pos,
+        buffer_mb: args.buffer_mb,
+        loader_threads: options.loader_threads,
+        threads: options.teacher_threads,
+        queue_depth: options.queue_depth,
+        lambda: args.lambda,
+        scale: args.scale as f32,
+        nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        profile_prepare: args.cuda_cpp_profile_teacher_prepare,
+    };
+
+    match component {
+        CudaCppKpptComponent::Kk => {
+            for_each_kppt_teacher_fast_batch(ShogiKk, component.input_label(), &config, batch_count, |teacher_batch| {
+                visitor(CudaCppKpptTeacherBatch {
+                    batch: teacher_batch.batch,
+                    source: teacher_batch.source,
+                    dataloader_pos: teacher_batch.dataloader_pos,
+                })
+            })
+        }
+        CudaCppKpptComponent::Kkp => {
+            for_each_kppt_teacher_fast_batch(ShogiKkp, component.input_label(), &config, batch_count, |teacher_batch| {
+                visitor(CudaCppKpptTeacherBatch {
+                    batch: teacher_batch.batch,
+                    source: teacher_batch.source,
+                    dataloader_pos: teacher_batch.dataloader_pos,
+                })
+            })
+        }
+        CudaCppKpptComponent::Kpp => {
+            for_each_kppt_teacher_fast_batch(ShogiKpp, component.input_label(), &config, batch_count, |teacher_batch| {
+                visitor(CudaCppKpptTeacherBatch {
+                    batch: teacher_batch.batch,
+                    source: teacher_batch.source,
+                    dataloader_pos: teacher_batch.dataloader_pos,
+                })
+            })
+        }
+    }
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppKpptInitialWeights {
+    shape: bulletou_cuda_cpp::KpptTableShape,
+    table_w: Vec<f32>,
+    table_b: Vec<f32>,
+    outw: Vec<f32>,
+    outb: Vec<f32>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppKpptInitialWeights {
+    fn validate(&self) -> Result<(), String> {
+        self.as_host().validate().map_err(|e| e.to_string())
+    }
+
+    fn as_host(&self) -> bulletou_cuda_cpp::KpptTableForwardHostWeights<'_> {
+        bulletou_cuda_cpp::KpptTableForwardHostWeights {
+            shape: self.shape,
+            table_w: &self.table_w,
+            table_b: &self.table_b,
+            outw: &self.outw,
+            outb: &self.outb,
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppKpptInitialState {
+    weights: CudaCppKpptInitialWeights,
+    optimizer_states: Option<CudaCppKpptOptimizerState>,
+    completed_steps: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, PartialEq)]
+struct CudaCppKpptOptimizerState {
+    table_w: CudaCppRangerGroupState,
+    table_b: CudaCppRangerGroupState,
+    outw: CudaCppRangerGroupState,
+    outb: CudaCppRangerGroupState,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppKpptOptimizerState {
+    fn as_host(&self) -> bulletou_cuda_cpp::KpptTableRangerOptimizerHostStates<'_> {
+        bulletou_cuda_cpp::KpptTableRangerOptimizerHostStates {
+            table_w: self.table_w.as_host(),
+            table_b: self.table_b.as_host(),
+            outw: self.outw.as_host(),
+            outb: self.outb.as_host(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
+    let schedule = cuda_cpp_run_schedule(args)?;
+    let train_steps = schedule.total_steps;
+    let batch_size = effective_batch_size(args);
+    let device = args.cuda_cpp_device;
+    let output_dir = args.output_dir();
+
+    eprintln!(
+        "  backend = cuda-cpp Windows-native direct {} trainer (KK + KKP + KPP, {train_steps} batch step{} each)",
+        args.eval_type().cli_name(),
+        if train_steps == 1 { "" } else { "s" }
+    );
+    if schedule.production {
+        eprintln!(
+            "  cuda-cpp KPPT schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+            args.max_epochs.unwrap_or(1).max(1),
+            args.superbatches.unwrap_or(1),
+            effective_save_rate(args),
+            effective_save_epoch_end(args),
+            schedule.batches_per_superbatch,
+            args.lr_schedule.cli_name()
+        );
+    } else {
+        eprintln!("  cuda-cpp KPPT schedule = direct train-steps smoke mode");
+    }
+    let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
+    eprintln!("  cuda-cpp device {device}: {name}");
+    eprintln!("  batch size = {batch_size}");
+    eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+
+    for component in [CudaCppKpptComponent::Kk, CudaCppKpptComponent::Kkp, CudaCppKpptComponent::Kpp] {
+        eprintln!("\n=== [cuda-cpp {}] training ===", component.label());
+        run_cuda_cpp_kppt_component_direct_steps(args, component, &schedule)?;
+    }
+
+    let ctx = LogContext::from_args(args, schedule.lr_period);
+    let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
+    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_CUDA_CPP) {
+        Ok((_first_idx, last_idx)) => {
+            append_to_top_level_log(&output_dir, last_idx).map_err(|err| {
+                format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display())
+            })?;
+        }
+        Err(err) => return Err(format!("failed to assemble cuda-cpp KPPT numbered checkpoint dirs: {err}")),
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_kppt_component_direct_steps(
+    args: &Args,
+    component: CudaCppKpptComponent,
+    schedule: &CudaCppRunSchedule,
+) -> Result<(), String> {
+    use bulletou_cuda_cpp::{
+        Context, KpptTableTrainStepHostBatch, KpptTableTrainStepRunner, RAdamUpdateParams, RangerUpdateParams,
+        ScalarLossKind,
+    };
+
+    let train_steps = schedule.total_steps;
+    let batch_size = effective_batch_size(args);
+    let max_active = component.max_active();
+    let input_size = component.input_size();
+    let device = args.cuda_cpp_device;
+    let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
+    let ctx = Context::new(device).map_err(|e| e.to_string())?;
+
+    eprintln!("  cuda-cpp {} input = dims={}, max_active={}", component.label(), input_size, max_active);
+    let (mut runner, completed_step_offset) = {
+        let initial_state = build_cuda_cpp_kppt_initial_state(args, component)?;
+        if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+            let state_kind = if initial_state.optimizer_states.is_some() {
+                "weights + Ranger optimizer state"
+            } else if initial_state.completed_steps > 0 {
+                "weights + step counters"
+            } else {
+                "weights only"
+            };
+            eprintln!("  initial {} state = {} ({state_kind})", component.label(), path.display());
+        } else if let Some(path) = auto_resume_state_bin.as_deref() {
+            eprintln!(
+                "  initial {} state = {} (auto-resume weights + Ranger optimizer state)",
+                component.label(),
+                path.display()
+            );
+        } else {
+            eprintln!("  initial {} weights = zero table, outw=[1,1], outb=0", component.label());
+        }
+        if initial_state.completed_steps > 0 {
+            eprintln!("  initial {} completed optimizer steps = {}", component.label(), initial_state.completed_steps);
+        }
+
+        let initial_host_weights = initial_state.weights.as_host();
+        let runner = match initial_state.optimizer_states.as_ref() {
+            Some(optimizer_states) => KpptTableTrainStepRunner::with_optimizer_states(
+                &ctx,
+                initial_host_weights,
+                optimizer_states.as_host(),
+                batch_size,
+                max_active,
+            ),
+            None => KpptTableTrainStepRunner::new(&ctx, initial_host_weights, batch_size, max_active),
+        }
+        .map_err(|e| e.to_string())?;
+        (runner, initial_state.completed_steps)
+    };
+
+    let loss_kind =
+        if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
+    let output_inv_scale = 1.0_f32;
+    let mut seen_steps = 0usize;
+    let mut reported_loss_sum = 0.0_f64;
+    let mut reported_loss_count = 0usize;
+    let mut last_loss = 0.0_f32;
+    let mut checkpoint_chunk_idx = 0usize;
+    let mut last_dataloader_pos = None;
+    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    if let Some(pos) = dataloader_resume_pos {
+        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+    }
+    let teacher_threads = cuda_cpp_effective_teacher_threads(args);
+    let loader_threads = cuda_cpp_effective_loader_threads(args);
+    let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
+    eprintln!(
+        "  cuda-cpp {} teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
+        component.label(),
+        teacher_threads,
+        loader_threads,
+        batch_queue_size
+    );
+    let started = std::time::Instant::now();
+    let teacher_options = CudaCppNnueTeacherOptions {
+        batch_size,
+        batch_index: 0,
+        dataloader_resume_pos,
+        loader_threads,
+        teacher_threads,
+        queue_depth: batch_queue_size,
+    };
+
+    for_each_cuda_cpp_kppt_teacher_batch(args, component, teacher_options, train_steps, |teacher_batch| {
+        seen_steps += 1;
+        last_dataloader_pos = teacher_batch.dataloader_pos;
+        let optimizer_step = completed_step_offset + seen_steps;
+        let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
+        let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
+        let fast = teacher_batch.batch;
+        let params = {
+            let ranger = ranger_params(args, BULLETOU_DEFAULT_ADAMW_CLIP);
+            let step_index = seen_steps.saturating_sub(1);
+            let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
+            RangerUpdateParams {
+                radam: RAdamUpdateParams {
+                    step: optimizer_step as u64,
+                    learning_rate,
+                    decay: ranger.decay,
+                    beta1: ranger.beta1,
+                    beta2: ranger.beta2,
+                    epsilon: ranger.epsilon,
+                    min_weight: ranger.min_weight,
+                    max_weight: ranger.max_weight,
+                    ..RAdamUpdateParams::default()
+                },
+                lookahead_alpha: ranger.alpha,
+                lookahead_period: ranger.k as u64,
+            }
+        };
+        let batch = KpptTableTrainStepHostBatch {
+            stm_indices: &fast.stm,
+            nstm_indices: &fast.nstm,
+            targets: &fast.targets,
+            entry_weights: &fast.weights,
+            batch_size: fast.layout.batch_size,
+            max_active: fast.layout.max_active,
+        };
+        let should_report = is_checkpoint_step
+            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        runner
+            .step_no_readback_with_loss_finalize(&ctx, params, loss_kind, output_inv_scale, batch, should_report)
+            .map_err(|e| e.to_string())?;
+        if should_report {
+            let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
+            last_loss = loss.mean;
+            reported_loss_sum += f64::from(loss.mean);
+            reported_loss_count += 1;
+            eprintln!(
+                "  cuda-cpp {} step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                component.label(),
+                loss.mean,
+                teacher_batch.source
+            );
+        }
+        if is_checkpoint_step {
+            let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
+            let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+            if chunk.save_checkpoint {
+                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let checkpoint_dir = write_cuda_cpp_kppt_component_checkpoint(
+                    args,
+                    component,
+                    &trained_weights,
+                    &trained_optimizer_states,
+                    completed_step_offset + seen_steps,
+                    last_loss,
+                    &chunk,
+                    schedule.batches_per_superbatch,
+                    dataloader_pos,
+                )?;
+                eprintln!("  cuda-cpp {} component checkpoint = {}", component.label(), checkpoint_dir.display());
+            } else {
+                eprintln!(
+                    "  cuda-cpp {} checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                    component.label(),
+                    chunk.epoch,
+                    chunk.superbatch
+                );
+            }
+            checkpoint_chunk_idx += 1;
+        }
+        Ok::<(), String>(())
+    })?;
+
+    ctx.synchronize().map_err(|e| e.to_string())?;
+    if checkpoint_chunk_idx != schedule.chunks.len() {
+        return Err(format!(
+            "cuda-cpp {} schedule ended after {checkpoint_chunk_idx} checkpoints, expected {}",
+            component.label(),
+            schedule.chunks.len()
+        ));
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let positions = seen_steps.saturating_mul(batch_size);
+    let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
+    eprintln!(
+        "  cuda-cpp {} train = ok: steps={seen_steps}, positions={positions}, elapsed={elapsed:.3}s, \
+         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+        component.label()
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_cuda_cpp_kppt_initial_state(
+    args: &Args,
+    component: CudaCppKpptComponent,
+) -> Result<CudaCppKpptInitialState, String> {
+    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+        return load_cuda_cpp_kppt_initial_state(path, component);
+    }
+    if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
+        return load_cuda_cpp_kppt_initial_state(&path, component);
+    }
+
+    let weights = CudaCppKpptInitialWeights {
+        shape: bulletou_cuda_cpp::KpptTableShape { input_size: component.input_size() },
+        table_w: vec![0.0; component.input_size()],
+        table_b: vec![0.0],
+        outw: vec![1.0, 1.0],
+        outb: vec![0.0],
+    };
+    weights.validate()?;
+    Ok(CudaCppKpptInitialState { weights, optimizer_states: None, completed_steps: 0 })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_initial_state(
+    path: &Path,
+    component: CudaCppKpptComponent,
+) -> Result<CudaCppKpptInitialState, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let records =
+        parse_model_weights_bin(&bytes).map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let component_weights =
+        bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, component.input_label(), "weights");
+    let weights_records = if component_weights.is_empty() { &records } else { &component_weights };
+    let weights = CudaCppKpptInitialWeights {
+        shape: bulletou_cuda_cpp::KpptTableShape { input_size: component.input_size() },
+        table_w: load_cuda_cpp_kppt_weight_record(weights_records, component.table_weight_id())?,
+        table_b: load_cuda_cpp_kppt_weight_record(weights_records, component.table_bias_id())?,
+        outw: load_cuda_cpp_kppt_weight_record(weights_records, "outw")?,
+        outb: load_cuda_cpp_kppt_weight_record(weights_records, "outb")?,
+    };
+    weights.validate().map_err(|err| {
+        format!("failed to load cuda-cpp {} weights from {}: {err}", component.label(), path.display())
+    })?;
+    let optimizer_states = load_cuda_cpp_kppt_optimizer_state(&records, component, &weights)?;
+    let completed_steps = load_cuda_cpp_kppt_completed_steps(&records, component)?;
+    Ok(CudaCppKpptInitialState { weights, optimizer_states, completed_steps })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_weight_record(
+    records: &BTreeMap<String, Vec<f32>>,
+    id: &'static str,
+) -> Result<Vec<f32>, String> {
+    records.get(id).cloned().ok_or_else(|| format!("cuda-cpp KPPT state missing weight `{id}`"))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_optimizer_state(
+    records: &BTreeMap<String, Vec<f32>>,
+    component: CudaCppKpptComponent,
+    weights: &CudaCppKpptInitialWeights,
+) -> Result<Option<CudaCppKpptOptimizerState>, String> {
+    let comp = component.input_label();
+    let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "momentum");
+    let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "velocity");
+    let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "slow");
+    let has_any = !momentum.is_empty() || !velocity.is_empty() || !slow.is_empty();
+    if !has_any {
+        return Ok(None);
+    }
+    if momentum.is_empty() || velocity.is_empty() || slow.is_empty() {
+        return Err(format!(
+            "cuda-cpp {} optimizer state is partial: expected {comp}/{{momentum,velocity,slow}}/* records",
+            component.label()
+        ));
+    }
+
+    Ok(Some(CudaCppKpptOptimizerState {
+        table_w: load_cuda_cpp_kppt_ranger_group_state(
+            component.label(),
+            component.table_weight_id(),
+            weights.table_w.len(),
+            &momentum,
+            &velocity,
+            &slow,
+        )?,
+        table_b: load_cuda_cpp_kppt_ranger_group_state(
+            component.label(),
+            component.table_bias_id(),
+            weights.table_b.len(),
+            &momentum,
+            &velocity,
+            &slow,
+        )?,
+        outw: load_cuda_cpp_kppt_ranger_group_state(
+            component.label(),
+            "outw",
+            weights.outw.len(),
+            &momentum,
+            &velocity,
+            &slow,
+        )?,
+        outb: load_cuda_cpp_kppt_ranger_group_state(
+            component.label(),
+            "outb",
+            weights.outb.len(),
+            &momentum,
+            &velocity,
+            &slow,
+        )?,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_ranger_group_state(
+    label: &'static str,
+    id: &'static str,
+    expected_len: usize,
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
+) -> Result<CudaCppRangerGroupState, String> {
+    Ok(CudaCppRangerGroupState {
+        momentum: load_cuda_cpp_kppt_optimizer_record(label, "momentum", momentum, id, expected_len)?,
+        velocity: load_cuda_cpp_kppt_optimizer_record(label, "velocity", velocity, id, expected_len)?,
+        slow_params: load_cuda_cpp_kppt_optimizer_record(label, "slow", slow, id, expected_len)?,
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_optimizer_record(
+    label: &'static str,
+    section: &'static str,
+    records: &BTreeMap<String, Vec<f32>>,
+    id: &'static str,
+    expected_len: usize,
+) -> Result<Vec<f32>, String> {
+    let values =
+        records.get(id).ok_or_else(|| format!("cuda-cpp KPPT/{label} optimizer state missing {section}/{id}"))?;
+    if values.len() != expected_len {
+        return Err(format!(
+            "cuda-cpp KPPT/{label} optimizer state {section}/{id} has length {}, expected {}",
+            values.len(),
+            expected_len
+        ));
+    }
+    Ok(values.clone())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_kppt_completed_steps(
+    records: &BTreeMap<String, Vec<f32>>,
+    component: CudaCppKpptComponent,
+) -> Result<usize, String> {
+    let steps =
+        bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, component.input_label(), "step_ranger");
+    if steps.is_empty() {
+        return Ok(0);
+    }
+    let ids = [component.table_weight_id(), component.table_bias_id(), "outw", "outb"];
+    let mut completed_steps: Option<usize> = None;
+    for id in ids {
+        let values = steps.get(id).ok_or_else(|| {
+            format!("cuda-cpp {} state missing {}/step_ranger/{id}", component.label(), component.input_label())
+        })?;
+        let value = values.first().copied().ok_or_else(|| {
+            format!("cuda-cpp {} state {}/step_ranger/{id} is empty", component.label(), component.input_label())
+        })?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "cuda-cpp {} state {}/step_ranger/{id} is invalid: {value}",
+                component.label(),
+                component.input_label()
+            ));
+        }
+        let step = value.round() as usize;
+        if let Some(prev) = completed_steps {
+            if prev != step {
+                return Err(format!(
+                    "cuda-cpp {} state has inconsistent step_ranger counters: first={prev}, {id}={step}",
+                    component.label()
+                ));
+            }
+        } else {
+            completed_steps = Some(step);
+        }
+    }
+    Ok(completed_steps.unwrap_or(0))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_kppt_component_checkpoint(
+    args: &Args,
+    component: CudaCppKpptComponent,
+    weights: &bulletou_cuda_cpp::KpptTableTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::KpptTableRangerOptimizerStatesReadback,
+    completed_steps: usize,
+    train_loss: f32,
+    chunk: &CudaCppScheduleChunk,
+    curr_batch: usize,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+) -> Result<std::path::PathBuf, String> {
+    let output_dir = args.output_dir();
+    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let net_id = if args.max_epochs.unwrap_or(1) > 1 || chunk.epoch > 1 {
+        format!("{}-e{}", component.input_label(), chunk.epoch)
+    } else {
+        component.input_label().to_string()
+    };
+    let dir = output_dir.join(format!("{net_id}-{}", chunk.superbatch));
+    if dir.exists() {
+        return Err(format!("refusing to overwrite existing component checkpoint {}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    let optimiser_state_dir = dir.join("optimiser_state");
+    std::fs::create_dir_all(&optimiser_state_dir)
+        .map_err(|err| format!("failed to create {}: {err}", optimiser_state_dir.display()))?;
+
+    write_cuda_cpp_kppt_component_optimizer_files(
+        component,
+        &optimiser_state_dir,
+        weights,
+        optimizer_states,
+        completed_steps,
+    )?;
+    std::fs::write(dir.join("log.txt"), format!("{},{},{:.8}\n", chunk.superbatch, curr_batch, train_loss))
+        .map_err(|err| format!("failed to write {}: {err}", dir.join("log.txt").display()))?;
+    std::fs::write(dir.join("teacher.txt"), format!("{}\n", args.teacher))
+        .map_err(|err| format!("failed to write {}: {err}", dir.join("teacher.txt").display()))?;
+    std::fs::write(
+        dir.join("dataloader_pos.txt"),
+        format!("{},{}\n", dataloader_pos.byte_offset, dataloader_pos.plies),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
+
+    let quant_scale = args.yaneuraou_quant_scale.unwrap_or(component.default_quant_scale());
+    save_yaneuraou_eval(&dir, quant_scale, args.kpp_format())
+        .map_err(|err| format!("failed to write YaneuraOu {} eval in {}: {err}", component.label(), dir.display()))?;
+    Ok(dir)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_kppt_component_optimizer_files(
+    component: CudaCppKpptComponent,
+    optimiser_state_dir: &Path,
+    weights: &bulletou_cuda_cpp::KpptTableTrainWeightsReadback,
+    optimizer_states: &bulletou_cuda_cpp::KpptTableRangerOptimizerStatesReadback,
+    completed_steps: usize,
+) -> Result<(), String> {
+    let table_weight_id = component.table_weight_id();
+    let table_bias_id = component.table_bias_id();
+    let weight_records = [
+        (table_weight_id, weights.table_w.as_slice()),
+        (table_bias_id, weights.table_b.as_slice()),
+        ("outw", weights.outw.as_slice()),
+        ("outb", weights.outb.as_slice()),
+    ];
+    std::fs::write(
+        optimiser_state_dir.join("weights.bin"),
+        bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(weight_records),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", optimiser_state_dir.join("weights.bin").display()))?;
+
+    let momentum_records = [
+        (table_weight_id, optimizer_states.table_w.momentum.as_slice()),
+        (table_bias_id, optimizer_states.table_b.momentum.as_slice()),
+        ("outw", optimizer_states.outw.momentum.as_slice()),
+        ("outb", optimizer_states.outb.momentum.as_slice()),
+    ];
+    std::fs::write(
+        optimiser_state_dir.join("momentum.bin"),
+        bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(momentum_records),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", optimiser_state_dir.join("momentum.bin").display()))?;
+
+    let velocity_records = [
+        (table_weight_id, optimizer_states.table_w.velocity.as_slice()),
+        (table_bias_id, optimizer_states.table_b.velocity.as_slice()),
+        ("outw", optimizer_states.outw.velocity.as_slice()),
+        ("outb", optimizer_states.outb.velocity.as_slice()),
+    ];
+    std::fs::write(
+        optimiser_state_dir.join("velocity.bin"),
+        bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(velocity_records),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", optimiser_state_dir.join("velocity.bin").display()))?;
+
+    let slow_records = [
+        (table_weight_id, optimizer_states.table_w.slow_params.as_slice()),
+        (table_bias_id, optimizer_states.table_b.slow_params.as_slice()),
+        ("outw", optimizer_states.outw.slow_params.as_slice()),
+        ("outb", optimizer_states.outb.slow_params.as_slice()),
+    ];
+    std::fs::write(
+        optimiser_state_dir.join("slow.bin"),
+        bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(slow_records),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", optimiser_state_dir.join("slow.bin").display()))?;
+
+    let step_text = format!(
+        "{},{}\n{},{}\noutw,{}\noutb,{}\n",
+        table_weight_id, completed_steps, table_bias_id, completed_steps, completed_steps, completed_steps
+    );
+    std::fs::write(optimiser_state_dir.join("step_ranger.txt"), step_text)
+        .map_err(|err| format!("failed to write {}: {err}", optimiser_state_dir.join("step_ranger.txt").display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6504,7 +7266,12 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1)
     };
     let prior_positions = if resume_enabled {
-        read_prior_positions(&top_level_log).get("nnue").copied().unwrap_or(0)
+        let positions = read_prior_positions(&top_level_log);
+        if matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt) {
+            ["kk", "kkp", "kpp"].iter().filter_map(|component| positions.get(*component).copied()).min().unwrap_or(0)
+        } else {
+            positions.get("nnue").copied().unwrap_or(0)
+        }
     } else {
         0
     };
@@ -6952,7 +7719,7 @@ fn run_kppt_all(args: &Args) {
     // `kpp-*/` subdirs are removed after assembly.
     let ctx = LogContext::from_args(args, 0);
     let prior_positions = read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME));
-    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions) {
+    match assemble_numbered_dirs(&output_dir, &ctx, &prior_positions, STATE_BACKEND_BULLET) {
         Ok((_first_idx, last_idx)) => {
             // Append the new run's per-sb summary rows to a top-level
             // `<output>/summary-learn.log` so the user has a single
@@ -7671,6 +8438,7 @@ fn assemble_numbered_dirs(
     output_dir: &std::path::Path,
     ctx: &LogContext,
     prior_positions: &std::collections::BTreeMap<String, usize>,
+    state_backend: &str,
 ) -> std::io::Result<(usize, usize)> {
     let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
     let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
@@ -7722,9 +8490,15 @@ fn assemble_numbered_dirs(
         std::fs::copy(kk_dir.join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
         std::fs::copy(kkp_dir.join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
         std::fs::copy(kpp_dir.join("KPP_synthesized.bin"), dst.join("KPP_synthesized.bin"))?;
+        for name in ["teacher.txt", "dataloader_pos.txt"] {
+            let src = kk_dir.join(name);
+            if src.is_file() {
+                std::fs::copy(src, dst.join(name))?;
+            }
+        }
         // bundle the three components' resume state (Adam weights + momentum + velocity)
         // into a single `state.bin` so the dir holds everything needed to resume.
-        let mut state_buf: Vec<u8> = write_state_backend_marker(STATE_BACKEND_BULLET);
+        let mut state_buf: Vec<u8> = write_state_backend_marker(state_backend);
         bundle_component_state(&mut state_buf, "kk", &kk_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kkp", &kkp_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
@@ -10848,6 +11622,112 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_kppt_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_accepts_kpp_kkpt_production_schedule() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPP_KKPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "1",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "1024",
+        ])
+        .unwrap();
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_kppt_validation_teacher() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "KPPT/KPP_KKPT currently skip"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
+    fn cuda_cpp_backend_rejects_kppt_profile_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "KPPT",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--cuda-cpp-profile-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "profile-steps" } else { "cuda-cpp-backend" }));
     }
 
     #[test]

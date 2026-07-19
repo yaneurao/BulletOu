@@ -2438,6 +2438,687 @@ pub struct SfnnRangerOptimizerStatesReadback {
     pub l3b: RangerParamStateReadback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KpptTableShape {
+    pub input_size: usize,
+}
+
+impl KpptTableShape {
+    pub fn table_w_len(self) -> usize {
+        self.input_size
+    }
+
+    pub fn table_b_len(self) -> usize {
+        1
+    }
+
+    pub fn outw_len(self) -> usize {
+        2
+    }
+
+    pub fn outb_len(self) -> usize {
+        1
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KpptTableForwardHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl KpptTableForwardHostBatch<'_> {
+    pub fn validate(self) -> Result<()> {
+        if self.batch_size == 0 {
+            return Err(CudaCppError::message("KPPT table batch_size must be greater than zero"));
+        }
+        if self.max_active == 0 {
+            return Err(CudaCppError::message("KPPT table max_active must be greater than zero"));
+        }
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("KPPT table sparse batch length overflow"))?;
+        expect_len("kppt table stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("kppt table nstm_indices", sparse_len, self.nstm_indices.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KpptTableForwardHostWeights<'a> {
+    pub shape: KpptTableShape,
+    pub table_w: &'a [f32],
+    pub table_b: &'a [f32],
+    pub outw: &'a [f32],
+    pub outb: &'a [f32],
+}
+
+impl KpptTableForwardHostWeights<'_> {
+    pub fn validate(self) -> Result<()> {
+        validate_kppt_table_shape(self.shape)?;
+        expect_len("kppt table_w", self.shape.table_w_len(), self.table_w.len())?;
+        expect_len("kppt table_b", self.shape.table_b_len(), self.table_b.len())?;
+        expect_len("kppt outw", self.shape.outw_len(), self.outw.len())?;
+        expect_len("kppt outb", self.shape.outb_len(), self.outb.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct KpptTableForwardDeviceBatch {
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub stm_indices: I32Buffer,
+    pub nstm_indices: I32Buffer,
+}
+
+impl KpptTableForwardDeviceBatch {
+    pub fn from_host(ctx: &Context, batch: KpptTableForwardHostBatch<'_>) -> Result<Self> {
+        batch.validate()?;
+        Ok(Self {
+            batch_size: batch.batch_size,
+            max_active: batch.max_active,
+            stm_indices: I32Buffer::from_host(ctx, batch.stm_indices)?,
+            nstm_indices: I32Buffer::from_host(ctx, batch.nstm_indices)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.batch_size == 0 {
+            return Err(CudaCppError::message("KPPT table device batch_size must be greater than zero"));
+        }
+        if self.max_active == 0 {
+            return Err(CudaCppError::message("KPPT table device max_active must be greater than zero"));
+        }
+        let sparse_len = self
+            .batch_size
+            .checked_mul(self.max_active)
+            .ok_or_else(|| CudaCppError::message("KPPT table sparse batch length overflow"))?;
+        expect_len("kppt table device stm_indices", sparse_len, self.stm_indices.len())?;
+        expect_len("kppt table device nstm_indices", sparse_len, self.nstm_indices.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct KpptTableForwardDeviceWeights {
+    pub shape: KpptTableShape,
+    pub table_w: F32Buffer,
+    pub table_b: F32Buffer,
+    pub outw: F32Buffer,
+    pub outb: F32Buffer,
+}
+
+impl KpptTableForwardDeviceWeights {
+    pub fn from_host(ctx: &Context, weights: KpptTableForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            shape: weights.shape,
+            table_w: F32Buffer::from_host(ctx, weights.table_w)?,
+            table_b: F32Buffer::from_host(ctx, weights.table_b)?,
+            outw: F32Buffer::from_host(ctx, weights.outw)?,
+            outb: F32Buffer::from_host(ctx, weights.outb)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_kppt_table_shape(self.shape)?;
+        expect_len("kppt device table_w", self.shape.table_w_len(), self.table_w.len())?;
+        expect_len("kppt device table_b", self.shape.table_b_len(), self.table_b.len())?;
+        expect_len("kppt device outw", self.shape.outw_len(), self.outw.len())?;
+        expect_len("kppt device outb", self.shape.outb_len(), self.outb.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KpptTableForwardWorkspaceLayout {
+    pub shape: KpptTableShape,
+    pub batch_size: usize,
+}
+
+impl KpptTableForwardWorkspaceLayout {
+    pub fn new(shape: KpptTableShape, batch_size: usize) -> Self {
+        Self { shape, batch_size }
+    }
+
+    pub fn stm_eval_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn nstm_eval_len(self) -> usize {
+        self.batch_size
+    }
+
+    pub fn output_len(self) -> usize {
+        self.batch_size
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_kppt_table_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("KPPT table workspace batch_size must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct KpptTableForwardWorkspace {
+    pub layout: KpptTableForwardWorkspaceLayout,
+    pub stm_eval: F32Buffer,
+    pub nstm_eval: F32Buffer,
+    pub output: F32Buffer,
+}
+
+impl KpptTableForwardWorkspace {
+    pub fn new(ctx: &Context, layout: KpptTableForwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            stm_eval: F32Buffer::new(ctx, layout.stm_eval_len())?,
+            nstm_eval: F32Buffer::new(ctx, layout.nstm_eval_len())?,
+            output: F32Buffer::new(ctx, layout.output_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len("kppt workspace stm_eval", self.layout.stm_eval_len(), self.stm_eval.len())?;
+        expect_len("kppt workspace nstm_eval", self.layout.nstm_eval_len(), self.nstm_eval.len())?;
+        expect_len("kppt workspace output", self.layout.output_len(), self.output.len())
+    }
+}
+
+pub fn kppt_table_forward_device(
+    ctx: &Context,
+    batch: &KpptTableForwardDeviceBatch,
+    weights: &KpptTableForwardDeviceWeights,
+    workspace: &KpptTableForwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    workspace.validate()?;
+    if workspace.layout.shape != weights.shape {
+        return Err(CudaCppError::message(format!(
+            "KPPT table workspace shape mismatch: workspace={:?} weights={:?}",
+            workspace.layout.shape, weights.shape
+        )));
+    }
+    if workspace.layout.batch_size != batch.batch_size {
+        return Err(CudaCppError::message(format!(
+            "KPPT table workspace batch mismatch: workspace={} batch={}",
+            workspace.layout.batch_size, batch.batch_size
+        )));
+    }
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_kppt_forward_device(
+            ctx.as_ptr(),
+            weights.shape.input_size,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            weights.table_w.as_ptr(),
+            weights.table_b.as_ptr(),
+            weights.outw.as_ptr(),
+            weights.outb.as_ptr(),
+            workspace.stm_eval.as_ptr(),
+            workspace.nstm_eval.as_ptr(),
+            workspace.output.as_ptr(),
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KpptTableBackwardWorkspaceLayout {
+    pub shape: KpptTableShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl KpptTableBackwardWorkspaceLayout {
+    pub fn new(shape: KpptTableShape, batch_size: usize, max_active: usize) -> Self {
+        Self { shape, batch_size, max_active }
+    }
+
+    pub fn table_w_gradients_len(self) -> usize {
+        self.shape.table_w_len()
+    }
+
+    pub fn table_b_gradients_len(self) -> usize {
+        self.shape.table_b_len()
+    }
+
+    pub fn outw_gradients_len(self) -> usize {
+        self.shape.outw_len()
+    }
+
+    pub fn outb_gradients_len(self) -> usize {
+        self.shape.outb_len()
+    }
+
+    fn validate(self) -> Result<()> {
+        validate_kppt_table_shape(self.shape)?;
+        if self.batch_size == 0 {
+            Err(CudaCppError::message("KPPT table backward batch_size must be greater than zero"))
+        } else if self.max_active == 0 {
+            Err(CudaCppError::message("KPPT table backward max_active must be greater than zero"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct KpptTableBackwardWorkspace {
+    pub layout: KpptTableBackwardWorkspaceLayout,
+    pub table_w_gradients: F32Buffer,
+    pub table_b_gradients: F32Buffer,
+    pub outw_gradients: F32Buffer,
+    pub outb_gradients: F32Buffer,
+}
+
+impl KpptTableBackwardWorkspace {
+    pub fn new(ctx: &Context, layout: KpptTableBackwardWorkspaceLayout) -> Result<Self> {
+        layout.validate()?;
+        Ok(Self {
+            layout,
+            table_w_gradients: F32Buffer::new(ctx, layout.table_w_gradients_len())?,
+            table_b_gradients: F32Buffer::new(ctx, layout.table_b_gradients_len())?,
+            outw_gradients: F32Buffer::new(ctx, layout.outw_gradients_len())?,
+            outb_gradients: F32Buffer::new(ctx, layout.outb_gradients_len())?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.layout.validate()?;
+        expect_len(
+            "kppt backward table_w_gradients",
+            self.layout.table_w_gradients_len(),
+            self.table_w_gradients.len(),
+        )?;
+        expect_len(
+            "kppt backward table_b_gradients",
+            self.layout.table_b_gradients_len(),
+            self.table_b_gradients.len(),
+        )?;
+        expect_len("kppt backward outw_gradients", self.layout.outw_gradients_len(), self.outw_gradients.len())?;
+        expect_len("kppt backward outb_gradients", self.layout.outb_gradients_len(), self.outb_gradients.len())
+    }
+}
+
+pub fn kppt_table_backward_device(
+    ctx: &Context,
+    batch: &KpptTableForwardDeviceBatch,
+    weights: &KpptTableForwardDeviceWeights,
+    forward: &KpptTableForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &KpptTableBackwardWorkspace,
+) -> Result<()> {
+    batch.validate()?;
+    weights.validate()?;
+    forward.validate()?;
+    loss.validate()?;
+    backward.validate()?;
+    let shape = weights.shape;
+    if forward.layout.shape != shape || backward.layout.shape != shape {
+        return Err(CudaCppError::message(format!(
+            "KPPT table backward shape mismatch: weights={shape:?} forward={:?} backward={:?}",
+            forward.layout.shape, backward.layout.shape
+        )));
+    }
+    if forward.layout.batch_size != batch.batch_size
+        || loss.layout.batch_size != batch.batch_size
+        || backward.layout.batch_size != batch.batch_size
+    {
+        return Err(CudaCppError::message(format!(
+            "KPPT table backward batch mismatch: batch={} forward={} loss={} backward={}",
+            batch.batch_size, forward.layout.batch_size, loss.layout.batch_size, backward.layout.batch_size
+        )));
+    }
+    if backward.layout.max_active != batch.max_active {
+        return Err(CudaCppError::message(format!(
+            "KPPT table backward max_active mismatch: batch={} backward={}",
+            batch.max_active, backward.layout.max_active
+        )));
+    }
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_kppt_backward_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            forward.stm_eval.as_ptr(),
+            forward.nstm_eval.as_ptr(),
+            weights.outw.as_ptr(),
+            loss.mean_output_gradients.as_ptr(),
+            backward.table_w_gradients.as_ptr(),
+            backward.table_b_gradients.as_ptr(),
+            backward.outw_gradients.as_ptr(),
+            backward.outb_gradients.as_ptr(),
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KpptTableTrainStepHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub targets: &'a [f32],
+    pub entry_weights: &'a [f32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl<'a> KpptTableTrainStepHostBatch<'a> {
+    fn forward_batch(self) -> KpptTableForwardHostBatch<'a> {
+        KpptTableForwardHostBatch {
+            stm_indices: self.stm_indices,
+            nstm_indices: self.nstm_indices,
+            batch_size: self.batch_size,
+            max_active: self.max_active,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        self.forward_batch().validate()?;
+        expect_len("kppt train targets", self.batch_size, self.targets.len())?;
+        expect_len("kppt train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KpptTableTrainWeightsReadback {
+    pub table_w: Vec<f32>,
+    pub table_b: Vec<f32>,
+    pub outw: Vec<f32>,
+    pub outb: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct KpptTableRangerOptimizerStates {
+    pub table_w: RangerParamState,
+    pub table_b: RangerParamState,
+    pub outw: RangerParamState,
+    pub outb: RangerParamState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KpptTableRangerOptimizerHostStates<'a> {
+    pub table_w: RangerParamHostState<'a>,
+    pub table_b: RangerParamHostState<'a>,
+    pub outw: RangerParamHostState<'a>,
+    pub outb: RangerParamHostState<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KpptTableRangerOptimizerStatesReadback {
+    pub table_w: RangerParamStateReadback,
+    pub table_b: RangerParamStateReadback,
+    pub outw: RangerParamStateReadback,
+    pub outb: RangerParamStateReadback,
+}
+
+impl KpptTableRangerOptimizerStates {
+    pub fn from_host_weights(ctx: &Context, weights: KpptTableForwardHostWeights<'_>) -> Result<Self> {
+        weights.validate()?;
+        Ok(Self {
+            table_w: RangerParamState::from_host_weights(ctx, weights.table_w)?,
+            table_b: RangerParamState::from_host_weights(ctx, weights.table_b)?,
+            outw: RangerParamState::from_host_weights(ctx, weights.outw)?,
+            outb: RangerParamState::from_host_weights(ctx, weights.outb)?,
+        })
+    }
+
+    pub fn from_host_states(
+        ctx: &Context,
+        shape: KpptTableShape,
+        states: KpptTableRangerOptimizerHostStates<'_>,
+    ) -> Result<Self> {
+        validate_kppt_table_shape(shape)?;
+        Ok(Self {
+            table_w: RangerParamState::from_host_state(ctx, shape.table_w_len(), states.table_w)?,
+            table_b: RangerParamState::from_host_state(ctx, shape.table_b_len(), states.table_b)?,
+            outw: RangerParamState::from_host_state(ctx, shape.outw_len(), states.outw)?,
+            outb: RangerParamState::from_host_state(ctx, shape.outb_len(), states.outb)?,
+        })
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<KpptTableRangerOptimizerStatesReadback> {
+        Ok(KpptTableRangerOptimizerStatesReadback {
+            table_w: self.table_w.download(ctx)?,
+            table_b: self.table_b.download(ctx)?,
+            outw: self.outw.download(ctx)?,
+            outb: self.outb.download(ctx)?,
+        })
+    }
+
+    fn validate(&self, shape: KpptTableShape) -> Result<()> {
+        self.table_w.validate(shape.table_w_len(), "optimizer kppt table_w")?;
+        self.table_b.validate(shape.table_b_len(), "optimizer kppt table_b")?;
+        self.outw.validate(shape.outw_len(), "optimizer kppt outw")?;
+        self.outb.validate(shape.outb_len(), "optimizer kppt outb")
+    }
+}
+
+#[derive(Debug)]
+pub struct KpptTableTrainStepRunner {
+    pub shape: KpptTableShape,
+    pub batch_size: usize,
+    pub max_active: usize,
+    pub device_batch: KpptTableForwardDeviceBatch,
+    pub targets: F32Buffer,
+    pub entry_weights: F32Buffer,
+    pub weights: KpptTableForwardDeviceWeights,
+    pub optimizer_states: KpptTableRangerOptimizerStates,
+    pub forward_workspace: KpptTableForwardWorkspace,
+    pub loss_workspace: ScalarLossWorkspace,
+    pub backward_workspace: KpptTableBackwardWorkspace,
+}
+
+impl KpptTableTrainStepRunner {
+    pub fn new(
+        ctx: &Context,
+        initial_weights: KpptTableForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        let optimizer_states = KpptTableRangerOptimizerStates::from_host_weights(ctx, initial_weights)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    pub fn with_optimizer_states(
+        ctx: &Context,
+        initial_weights: KpptTableForwardHostWeights<'_>,
+        optimizer_states: KpptTableRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        let optimizer_states =
+            KpptTableRangerOptimizerStates::from_host_states(ctx, initial_weights.shape, optimizer_states)?;
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+    }
+
+    fn with_device_optimizer_states(
+        ctx: &Context,
+        initial_weights: KpptTableForwardHostWeights<'_>,
+        optimizer_states: KpptTableRangerOptimizerStates,
+        batch_size: usize,
+        max_active: usize,
+    ) -> Result<Self> {
+        initial_weights.validate()?;
+        if batch_size == 0 {
+            return Err(CudaCppError::message("KPPT table train-step batch_size must be greater than zero"));
+        }
+        if max_active == 0 {
+            return Err(CudaCppError::message("KPPT table train-step max_active must be greater than zero"));
+        }
+
+        let shape = initial_weights.shape;
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("KPPT table train-step sparse length overflow"))?;
+        Ok(Self {
+            shape,
+            batch_size,
+            max_active,
+            device_batch: KpptTableForwardDeviceBatch {
+                batch_size,
+                max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+            },
+            targets: F32Buffer::new(ctx, batch_size)?,
+            entry_weights: F32Buffer::new(ctx, batch_size)?,
+            weights: KpptTableForwardDeviceWeights::from_host(ctx, initial_weights)?,
+            optimizer_states,
+            forward_workspace: KpptTableForwardWorkspace::new(
+                ctx,
+                KpptTableForwardWorkspaceLayout::new(shape, batch_size),
+            )?,
+            loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
+            backward_workspace: KpptTableBackwardWorkspace::new(
+                ctx,
+                KpptTableBackwardWorkspaceLayout::new(shape, batch_size, max_active),
+            )?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: KpptTableTrainStepHostBatch<'_>,
+    ) -> Result<ScalarLossReadback> {
+        self.step_no_readback(ctx, params, loss_kind, output_inv_scale, batch)?;
+        self.read_loss(ctx)
+    }
+
+    pub fn step_no_readback(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: KpptTableTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize(ctx, params, loss_kind, output_inv_scale, batch, true)
+    }
+
+    pub fn step_no_readback_with_loss_finalize(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: KpptTableTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+    ) -> Result<()> {
+        self.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "KPPT table train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+
+        self.device_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+        self.targets.upload(ctx, batch.targets)?;
+        self.entry_weights.upload(ctx, batch.entry_weights)?;
+
+        kppt_table_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        scalar_loss_device_from_buffers_with_finalize(
+            ctx,
+            loss_kind,
+            output_inv_scale,
+            self.batch_size,
+            &self.forward_workspace.output,
+            &self.targets,
+            &self.entry_weights,
+            &self.loss_workspace,
+            finalize_loss,
+        )?;
+        kppt_table_backward_device(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+        )?;
+        self.update_weights(ctx, params)
+    }
+
+    pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
+        self.loss_workspace.download(ctx)
+    }
+
+    pub fn read_weights(&self, ctx: &Context) -> Result<KpptTableTrainWeightsReadback> {
+        Ok(KpptTableTrainWeightsReadback {
+            table_w: self.weights.table_w.download(ctx)?,
+            table_b: self.weights.table_b.download(ctx)?,
+            outw: self.weights.outw.download(ctx)?,
+            outb: self.weights.outb.download(ctx)?,
+        })
+    }
+
+    pub fn read_optimizer_states(&self, ctx: &Context) -> Result<KpptTableRangerOptimizerStatesReadback> {
+        self.optimizer_states.download(ctx)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_kppt_table_shape(self.shape)?;
+        self.device_batch.validate()?;
+        self.weights.validate()?;
+        self.optimizer_states.validate(self.shape)?;
+        self.forward_workspace.validate()?;
+        self.loss_workspace.validate()?;
+        self.backward_workspace.validate()?;
+        expect_len("kppt train targets", self.batch_size, self.targets.len())?;
+        expect_len("kppt train entry_weights", self.batch_size, self.entry_weights.len())
+    }
+
+    fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.table_w_gradients,
+            &self.weights.table_w,
+            &self.optimizer_states.table_w,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.table_b_gradients,
+            &self.weights.table_b,
+            &self.optimizer_states.table_b,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.outw_gradients,
+            &self.weights.outw,
+            &self.optimizer_states.outw,
+        )?;
+        update_param_group(
+            ctx,
+            params,
+            &self.backward_workspace.outb_gradients,
+            &self.weights.outb,
+            &self.optimizer_states.outb,
+        )
+    }
+}
+
 impl SfnnRangerOptimizerStates {
     pub fn from_host_weights(ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<Self> {
         weights.validate()?;
@@ -3700,6 +4381,14 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
     }
 }
 
+fn validate_kppt_table_shape(shape: KpptTableShape) -> Result<()> {
+    if shape.input_size == 0 {
+        Err(CudaCppError::message(format!("KPPT table shape dimensions must be non-zero: {shape:?}")))
+    } else {
+        Ok(())
+    }
+}
+
 fn checked_product(name: &'static str, values: &[usize]) -> Result<usize> {
     let mut out = 1usize;
     for &value in values {
@@ -4171,6 +4860,37 @@ mod ffi {
             mean_output_gradients: *mut f32,
             weighted_sum: *mut f32,
             mean: *mut f32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_kppt_forward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            table_w: *mut BulletOuCudaCppF32Buffer,
+            table_b: *mut BulletOuCudaCppF32Buffer,
+            outw: *mut BulletOuCudaCppF32Buffer,
+            outb: *mut BulletOuCudaCppF32Buffer,
+            stm_eval: *mut BulletOuCudaCppF32Buffer,
+            nstm_eval: *mut BulletOuCudaCppF32Buffer,
+            outputs: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_kppt_backward_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            stm_eval: *mut BulletOuCudaCppF32Buffer,
+            nstm_eval: *mut BulletOuCudaCppF32Buffer,
+            outw: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            table_w_gradients: *mut BulletOuCudaCppF32Buffer,
+            table_b_gradients: *mut BulletOuCudaCppF32Buffer,
+            outw_gradients: *mut BulletOuCudaCppF32Buffer,
+            outb_gradients: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_nnue_backward_device(
             ctx: *mut BulletOuCudaCppContext,

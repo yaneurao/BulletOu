@@ -3056,6 +3056,178 @@ int launch_scalar_loss_kernels(
     return 0;
 }
 
+__global__ void kppt_table_forward_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* table_w,
+    const float* table_b,
+    const float* outw,
+    const float* outb,
+    float* stm_eval,
+    float* nstm_eval,
+    float* outputs,
+    size_t batch,
+    size_t max_active,
+    size_t input_size) {
+    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= batch) {
+        return;
+    }
+
+    size_t sparse_base = sample * max_active;
+    float stm = table_b[0];
+    float nstm = table_b[0];
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int stm_feature = stm_indices[sparse_base + slot];
+        if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            stm += table_w[static_cast<size_t>(stm_feature)];
+        }
+        int nstm_feature = nstm_indices[sparse_base + slot];
+        if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            nstm += table_w[static_cast<size_t>(nstm_feature)];
+        }
+    }
+    stm_eval[sample] = stm;
+    nstm_eval[sample] = nstm;
+    outputs[sample] = outw[0] * stm + outw[1] * nstm + outb[0];
+}
+
+__global__ void kppt_table_backward_kernel(
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_eval,
+    const float* nstm_eval,
+    const float* outw,
+    const float* mean_output_gradients,
+    float* table_w_gradients,
+    float* table_b_gradients,
+    float* outw_gradients,
+    float* outb_gradients,
+    size_t batch,
+    size_t max_active,
+    size_t input_size) {
+    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= batch) {
+        return;
+    }
+
+    float grad = mean_output_gradients[sample];
+    float stm = stm_eval[sample];
+    float nstm = nstm_eval[sample];
+    atomicAdd(&outw_gradients[0], grad * stm);
+    atomicAdd(&outw_gradients[1], grad * nstm);
+    atomicAdd(&outb_gradients[0], grad);
+
+    float stm_grad = grad * outw[0];
+    float nstm_grad = grad * outw[1];
+    atomicAdd(&table_b_gradients[0], stm_grad + nstm_grad);
+
+    size_t sparse_base = sample * max_active;
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        int stm_feature = stm_indices[sparse_base + slot];
+        if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
+            atomicAdd(&table_w_gradients[static_cast<size_t>(stm_feature)], stm_grad);
+        }
+        int nstm_feature = nstm_indices[sparse_base + slot];
+        if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
+            atomicAdd(&table_w_gradients[static_cast<size_t>(nstm_feature)], nstm_grad);
+        }
+    }
+}
+
+int validate_kppt_table_shape(size_t input_size, size_t batch, size_t max_active) {
+    if (input_size == 0) {
+        return fail_message("KPPT table input_size must be greater than zero");
+    }
+    if (batch == 0) {
+        return fail_message("KPPT table batch size must be greater than zero");
+    }
+    if (max_active == 0) {
+        return fail_message("KPPT table max_active must be greater than zero");
+    }
+    return 0;
+}
+
+int launch_kppt_table_forward(
+    BulletOuCudaCppContext* ctx,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* table_w,
+    const float* table_b,
+    const float* outw,
+    const float* outb,
+    float* stm_eval,
+    float* nstm_eval,
+    float* outputs,
+    size_t input_size,
+    size_t batch,
+    size_t max_active) {
+    if (validate_kppt_table_shape(input_size, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (block_count_1d(batch, threads, &blocks, "kppt_table_forward_kernel") != 0) {
+        return -1;
+    }
+    kppt_table_forward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices, nstm_indices, table_w, table_b, outw, outb, stm_eval, nstm_eval, outputs, batch, max_active, input_size);
+    return check_kernel_launch("kppt_table_forward_kernel launch");
+}
+
+int launch_kppt_table_backward(
+    BulletOuCudaCppContext* ctx,
+    const int* stm_indices,
+    const int* nstm_indices,
+    const float* stm_eval,
+    const float* nstm_eval,
+    const float* outw,
+    const float* mean_output_gradients,
+    float* table_w_gradients,
+    float* table_b_gradients,
+    float* outw_gradients,
+    float* outb_gradients,
+    size_t input_size,
+    size_t batch,
+    size_t max_active) {
+    if (validate_kppt_table_shape(input_size, batch, max_active) != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (launch_fill_f32_raw(ctx, table_w_gradients, input_size, 0.0f, "kppt zero table_w_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, table_b_gradients, 1, 0.0f, "kppt zero table_b_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, outw_gradients, 2, 0.0f, "kppt zero outw_gradients") != 0 ||
+        launch_fill_f32_raw(ctx, outb_gradients, 1, 0.0f, "kppt zero outb_gradients") != 0) {
+        return -1;
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (block_count_1d(batch, threads, &blocks, "kppt_table_backward_kernel") != 0) {
+        return -1;
+    }
+    kppt_table_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices,
+        nstm_indices,
+        stm_eval,
+        nstm_eval,
+        outw,
+        mean_output_gradients,
+        table_w_gradients,
+        table_b_gradients,
+        outw_gradients,
+        outb_gradients,
+        batch,
+        max_active,
+        input_size);
+    return check_kernel_launch("kppt_table_backward_kernel launch");
+}
+
 int launch_nnue_backward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -4352,6 +4524,103 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
         weighted_sum,
         mean,
         1);
+}
+
+extern "C" int bulletou_cuda_cpp_kppt_forward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppF32Buffer* table_w,
+    const BulletOuCudaCppF32Buffer* table_b,
+    const BulletOuCudaCppF32Buffer* outw,
+    const BulletOuCudaCppF32Buffer* outb,
+    BulletOuCudaCppF32Buffer* stm_eval,
+    BulletOuCudaCppF32Buffer* nstm_eval,
+    BulletOuCudaCppF32Buffer* outputs) {
+    size_t sparse_len = batch * max_active;
+    if (validate_kppt_table_shape(input_size, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), sparse_len, "kppt stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), sparse_len, "kppt nstm_indices") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(table_w), input_size, "kppt table_w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(table_b), 1, "kppt table_b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outw), 2, "kppt outw") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outb), 1, "kppt outb") != 0 ||
+        validate_buffer(ctx, stm_eval, batch, "kppt stm_eval") != 0 ||
+        validate_buffer(ctx, nstm_eval, batch, "kppt nstm_eval") != 0 ||
+        validate_buffer(ctx, outputs, batch, "kppt outputs") != 0) {
+        return -1;
+    }
+
+    if (launch_kppt_table_forward(
+            ctx,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            table_w->ptr,
+            table_b->ptr,
+            outw->ptr,
+            outb->ptr,
+            stm_eval->ptr,
+            nstm_eval->ptr,
+            outputs->ptr,
+            input_size,
+            batch,
+            max_active) != 0) {
+        return -1;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_kppt_backward_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppF32Buffer* stm_eval,
+    const BulletOuCudaCppF32Buffer* nstm_eval,
+    const BulletOuCudaCppF32Buffer* outw,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* table_w_gradients,
+    BulletOuCudaCppF32Buffer* table_b_gradients,
+    BulletOuCudaCppF32Buffer* outw_gradients,
+    BulletOuCudaCppF32Buffer* outb_gradients) {
+    size_t sparse_len = batch * max_active;
+    if (validate_kppt_table_shape(input_size, batch, max_active) != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), sparse_len, "kppt stm_indices") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), sparse_len, "kppt nstm_indices") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(stm_eval), batch, "kppt stm_eval") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(nstm_eval), batch, "kppt nstm_eval") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outw), 2, "kppt outw") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(mean_output_gradients), batch, "kppt mean_output_gradients") != 0 ||
+        validate_buffer(ctx, table_w_gradients, input_size, "kppt table_w_gradients") != 0 ||
+        validate_buffer(ctx, table_b_gradients, 1, "kppt table_b_gradients") != 0 ||
+        validate_buffer(ctx, outw_gradients, 2, "kppt outw_gradients") != 0 ||
+        validate_buffer(ctx, outb_gradients, 1, "kppt outb_gradients") != 0) {
+        return -1;
+    }
+
+    if (launch_kppt_table_backward(
+            ctx,
+            stm_indices->ptr,
+            nstm_indices->ptr,
+            stm_eval->ptr,
+            nstm_eval->ptr,
+            outw->ptr,
+            mean_output_gradients->ptr,
+            table_w_gradients->ptr,
+            table_b_gradients->ptr,
+            outw_gradients->ptr,
+            outb_gradients->ptr,
+            input_size,
+            batch,
+            max_active) != 0) {
+        return -1;
+    }
+    return ok();
 }
 
 extern "C" int bulletou_cuda_cpp_scalar_loss_host(
