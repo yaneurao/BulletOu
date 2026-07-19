@@ -1569,11 +1569,14 @@ __global__ void nnue_l0_sparse_backward_kernel(
         size_t base_feature = 0;
         size_t virtual_feature = 0;
         float value = stm_gradients[sample * l1 + row];
-        if (nnue_halfkp_factorized_feature(static_cast<size_t>(stm_feature), input_size, &base_feature, &virtual_feature)) {
-            atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
-            atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
-        } else {
-            atomicAdd(&l0w_gradients[static_cast<size_t>(stm_feature) * l1 + row], value);
+        if (value != 0.0f) {
+            if (nnue_halfkp_factorized_feature(
+                    static_cast<size_t>(stm_feature), input_size, &base_feature, &virtual_feature)) {
+                atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
+                atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
+            } else {
+                atomicAdd(&l0w_gradients[static_cast<size_t>(stm_feature) * l1 + row], value);
+            }
         }
     }
 
@@ -1582,11 +1585,14 @@ __global__ void nnue_l0_sparse_backward_kernel(
         size_t base_feature = 0;
         size_t virtual_feature = 0;
         float value = nstm_gradients[sample * l1 + row];
-        if (nnue_halfkp_factorized_feature(static_cast<size_t>(nstm_feature), input_size, &base_feature, &virtual_feature)) {
-            atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
-            atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
-        } else {
-            atomicAdd(&l0w_gradients[static_cast<size_t>(nstm_feature) * l1 + row], value);
+        if (value != 0.0f) {
+            if (nnue_halfkp_factorized_feature(
+                    static_cast<size_t>(nstm_feature), input_size, &base_feature, &virtual_feature)) {
+                atomicAdd(&l0w_gradients[base_feature * l1 + row], value);
+                atomicAdd(&l0w_gradients[virtual_feature * l1 + row], value);
+            } else {
+                atomicAdd(&l0w_gradients[static_cast<size_t>(nstm_feature) * l1 + row], value);
+            }
         }
     }
 }

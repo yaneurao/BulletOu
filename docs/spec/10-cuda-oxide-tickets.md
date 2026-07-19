@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, and a short 4M speed/quality recipe sweep are in; remaining work is sparse L0/update hot spots plus longer-teacher confirmation against the previous cuda-oxide throughput ceiling |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, sparse L0 zero-gradient atomic skip, and short/16M speed-quality probes are in; remaining work is further sparse L0/update hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
 
 ## Notes
 
@@ -993,6 +993,19 @@ the tickets in order and commit each completed slice.
   - with no explicit `--threads`, `--loader-threads`, or `--batch-queue-size`, the CLI printed `cuda-cpp teacher CPU = prepare_threads=24, loader_threads=24, batch_queue_size=4`;
   - repeat 4M speed-only run reported `2840476` pos/s;
   - held-out yamaoka check used only `C:\shogi\teacher\test\yamaoka-floodgate.psv` with `--test-positions 65536 --test-sample sequential --test-batch-size 4096` and reported `2627038` pos/s, `test_loss=0.03545475`, `test_acc=0.6218414`.
+- Adopted HalfKP sparse L0 zero-gradient atomic skip:
+  - the training-only `nnue_l0_sparse_backward_kernel` now checks each STM/NSTM CReLU pre-gradient before issuing the `atomicAdd` into `l0w_gradients`;
+  - exact zero and `-0.0` gradients skip the atomic, while `NaN != 0.0f` still takes the atomic path, preserving the previous non-finite propagation behavior;
+  - bs65k/6-step profile before the skip, same HCPE teacher and WRM settings: upload `3.261ms`, forward `3.026ms`, loss `1.232ms`, backward `12.744ms`, update `1.297ms`, total `21.561ms`;
+  - after the skip: upload `3.047ms`, forward `2.954ms`, loss `1.177ms`, backward `12.209ms`, update `1.297ms`, total `20.685ms`, a backward-stage improvement of about `4.2%`.
+- HalfKP post-skip short/longer probes, all with validation fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv` when validation was enabled:
+  - 4M yamaoka run (`--test-positions 65536 --test-sample sequential --test-batch-size 4096`) reported `2576342` pos/s, `test_loss=0.03539697`, `test_acc=0.6243286`;
+  - separate 4M speed-only repeat reported `2788019` pos/s;
+  - 16M speed-only run reported `16777216` positions in `5.855s`, `2865226` pos/s;
+  - 16M yamaoka validation summary logged `test_loss=0.034298`, `test_acc=0.631088`, `train_loss=0.046177`.
+- Status against the previous cuda-oxide 4M ceiling:
+  - BO-CUDA-028's clean cuda-oxide 4M recipe mean remains `2978387` pos/s with `test_acc=0.669474`, `test_loss=0.052934`;
+  - the Windows-native cuda-cpp HalfKP path is already above the BO-CUDA-029 tatara idle mean, but this post-skip increment still does not clear that older cuda-oxide short-run speed ceiling on the current bs65k recipe.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
@@ -1001,6 +1014,7 @@ the tickets in order and commit each completed slice.
 - Validation for this partial BO-CUDA-036 increment:
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (39 cuda-cpp tests);
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed.
