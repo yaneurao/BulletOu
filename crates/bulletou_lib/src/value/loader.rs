@@ -19,6 +19,7 @@ pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
 use bulletformat::BulletFormat;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 
@@ -96,6 +97,9 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
         score_drop_abs: Option<u16>,
         loader: D,
     ) -> Self {
+        if use_win_rate_model && !wdl {
+            initialise_win_rate_model_score_table();
+        }
         Self {
             input_getter,
             output_getter,
@@ -357,12 +361,10 @@ where
                                 if wdl {
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
                                 } else {
-                                    let score = f32::from(pos.score());
                                     let score = if use_win_rate_model {
-                                        let p = (score - 270.0) / 380.0;
-                                        let pm = (-score - 270.0) / 380.0;
-                                        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+                                        win_rate_model_score(pos.score())
                                     } else {
+                                        let score = f32::from(pos.score());
                                         sigmoid(rscale * score)
                                     };
                                     let result = f32::from(pos.result() as u8) / 2.0;
@@ -463,12 +465,10 @@ where
                                 if wdl {
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
                                 } else {
-                                    let score = f32::from(pos.score());
                                     let score = if use_win_rate_model {
-                                        let p = (score - 270.0) / 380.0;
-                                        let pm = (-score - 270.0) / 380.0;
-                                        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+                                        win_rate_model_score(pos.score())
                                     } else {
+                                        let score = f32::from(pos.score());
                                         sigmoid(rscale * score)
                                     };
                                     let result = f32::from(pos.result() as u8) / 2.0;
@@ -488,6 +488,27 @@ where
 
 fn sigmoid(x: f32) -> f32 {
     1. / (1. + (-x).exp())
+}
+
+static WIN_RATE_MODEL_SCORE_TABLE: OnceLock<Box<[f32]>> = OnceLock::new();
+
+fn initialise_win_rate_model_score_table() -> &'static [f32] {
+    WIN_RATE_MODEL_SCORE_TABLE.get_or_init(|| {
+        let mut values = Vec::with_capacity(usize::from(u16::MAX) + 1);
+        for raw_score in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+            let score = raw_score as f32;
+            let p = (score - 270.0) / 380.0;
+            let pm = (-score - 270.0) / 380.0;
+            values.push(0.5 * (1.0 + sigmoid(p) - sigmoid(pm)));
+        }
+        values.into_boxed_slice()
+    })
+}
+
+fn win_rate_model_score(score: i16) -> f32 {
+    let table = initialise_win_rate_model_score_table();
+    let index = (i32::from(score) - i32::from(i16::MIN)) as usize;
+    table[index]
 }
 
 #[cfg(test)]

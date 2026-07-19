@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, sparse L0 zero-gradient atomic skip, and short/16M speed-quality probes are in; remaining work is further sparse L0/update hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, sparse L0 zero-gradient atomic skip, WRM score-target lookup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
 
 ## Notes
 
@@ -1006,15 +1006,23 @@ the tickets in order and commit each completed slice.
 - Status against the previous cuda-oxide 4M ceiling:
   - BO-CUDA-028's clean cuda-oxide 4M recipe mean remains `2978387` pos/s with `test_acc=0.669474`, `test_loss=0.052934`;
   - the Windows-native cuda-cpp HalfKP path is already above the BO-CUDA-029 tatara idle mean, but this post-skip increment still does not clear that older cuda-oxide short-run speed ceiling on the current bs65k recipe.
+- Adopted a WRM score-target lookup table in the shared teacher prepare path:
+  - when `use_win_rate_model && !wdl`, `DefaultDataLoader` now warms a static 65536-entry i16 score table before training-time batch preparation;
+  - this removes the two per-position `exp()` calls from the WRM score target calculation while preserving the same f32 formula and the same CPU-prepared targets;
+  - HalfKP bs65k after warmup reported `2795413` pos/s on a 4M speed-only probe and `2805348` pos/s on a 16M speed-only probe;
+  - the yamaoka-fixed 4M validation run (`--test-positions 65536 --test-sample sequential --test-batch-size 4096`) reported `2819074` pos/s, `test_loss=0.03546835`, `test_acc=0.6233521`;
+  - this is a useful feed-side cleanup, but by itself still does not clear the old BO-CUDA-028 cuda-oxide 4M mean.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
+  - a block-shared `l1=256` HalfKP L0 sparse-backward mapping experiment was not kept: the first attempt incorrectly launched only `ceil(entries/256)` blocks and visibly worsened 16M loss, and the corrected launch was slower than the zero-skip kernel (`12.636ms` vs `12.209ms` backward on the bs65k/6-step profile);
   - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed, but an existing pack-loader background thread can still print a post-test panic after the harness reports success; this appears unrelated to the HCPE HalfKP C++ direct path.
 - Validation for this partial BO-CUDA-036 increment:
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed;
+  - `cargo test -p bulletou_lib value::loader -- --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (39 cuda-cpp tests);
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed.
