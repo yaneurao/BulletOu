@@ -54,6 +54,7 @@ Usage:
 #[cfg(feature = "cuda-cpp-backend")]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda-cpp-backend")]
 use bulletou_lib::value::nnue_save_sfnn1536::{
@@ -1218,6 +1219,15 @@ fn colored_pos_s(positions_per_sec: f64) -> String {
     paint(format!("pos/s={}", format_count(rate)), ConsoleColor::BoldGreen)
 }
 
+fn colored_train_time(positions: usize, positions_per_sec: f64) -> String {
+    let seconds = if positions_per_sec.is_finite() && positions_per_sec > 0.0 {
+        positions as f64 / positions_per_sec
+    } else {
+        0.0
+    };
+    paint(format!("train_time={seconds:.1}s"), ConsoleColor::BoldCyan)
+}
+
 fn colored_metric(label: &str, value: f32, precision: usize) -> String {
     paint(format!("{label}={value:.precision$}"), ConsoleColor::Magenta)
 }
@@ -1248,7 +1258,29 @@ fn format_duration_secs(duration: std::time::Duration) -> String {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_checkpoint_timing_text(timing: CudaCppCheckpointTiming) -> String {
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_checkpoint_state_bytes(checkpoint_dir: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(checkpoint_dir.join("state.bin")).ok().map(|metadata| metadata.len())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_checkpoint_timing_text(timing: CudaCppCheckpointTiming, save_bytes: Option<u64>) -> String {
     let mut known = timing.readback;
     let mut parts = vec![paint(format!("readback={}", format_duration_secs(timing.readback)), ConsoleColor::Magenta)];
     if let Some(validation) = timing.validation {
@@ -1259,7 +1291,20 @@ fn cuda_cpp_checkpoint_timing_text(timing: CudaCppCheckpointTiming) -> String {
     }
     if let Some(save) = timing.save {
         known = known.saturating_add(save);
-        parts.push(paint(format!("save={}", format_duration_secs(save)), ConsoleColor::Cyan));
+        let save_detail = match save_bytes {
+            Some(bytes) if save.as_secs_f64() > 0.0 => {
+                let mib_per_sec = bytes as f64 / (1024.0 * 1024.0) / save.as_secs_f64();
+                format!(
+                    "save={} (state.bin {}, {:.0} MiB/s)",
+                    format_duration_secs(save),
+                    format_bytes(bytes),
+                    mib_per_sec
+                )
+            }
+            Some(bytes) => format!("save={} (state.bin {})", format_duration_secs(save), format_bytes(bytes)),
+            None => format!("save={}", format_duration_secs(save)),
+        };
+        parts.push(paint(save_detail, ConsoleColor::Cyan));
     } else {
         parts.push(paint("save=skipped", ConsoleColor::Dim));
     }
@@ -1278,7 +1323,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
     batch_size: usize,
     positions: usize,
     positions_per_sec: f64,
-    _checkpoint_dir: &std::path::Path,
+    checkpoint_dir: &std::path::Path,
     timing: Option<CudaCppCheckpointTiming>,
 ) {
     match progress {
@@ -1307,7 +1352,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
                 )
             };
             eprintln!(
-                "  {} {}  {}  {}  {}  {}  {}",
+                "  {} {}  {}  {}  {}  {}  {}  {}",
                 paint(prefix, ConsoleColor::Dim),
                 paint("[checkpoint]", ConsoleColor::BoldGreen),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
@@ -1317,23 +1362,26 @@ fn print_cuda_cpp_checkpoint_with_timing(
                 ),
                 paint(batch_detail, ConsoleColor::Yellow),
                 paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
+                colored_train_time(positions, positions_per_sec),
                 colored_pos_s(positions_per_sec)
             );
         }
         None => eprintln!(
-            "  {} {}  {}  {}",
+            "  {} {}  {}  {}  {}",
             paint(prefix, ConsoleColor::Dim),
             paint("[checkpoint]", ConsoleColor::BoldGreen),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
+            colored_train_time(positions, positions_per_sec),
             colored_pos_s(positions_per_sec)
         ),
     }
     if let Some(timing) = timing {
+        let save_bytes = if timing.save.is_some() { cuda_cpp_checkpoint_state_bytes(checkpoint_dir) } else { None };
         eprintln!(
             "  {} {}: {}",
             paint(prefix, ConsoleColor::Dim),
             paint("checkpoint overhead", ConsoleColor::BoldYellow),
-            cuda_cpp_checkpoint_timing_text(timing)
+            cuda_cpp_checkpoint_timing_text(timing, save_bytes)
         );
     }
 }
@@ -1901,7 +1949,7 @@ struct Args {
     /// GPU batch size for the validation forward pass. Larger is faster
     /// but uses more VRAM. Independent of `--batch-size` (which
     /// controls training).
-    #[arg(long, default_value = "1024")]
+    #[arg(long, default_value = "8192")]
     test_batch_size: usize,
 
     /// Seed for the random sampler in `--test-teacher`. `0`
@@ -5858,15 +5906,63 @@ fn cuda_cpp_sfnn_optimizer_readback_as_host(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaCppValidationTiming {
+    load_cache: std::time::Duration,
+    weight_fold: std::time::Duration,
+    context: std::time::Duration,
+    weight_upload: std::time::Duration,
+    batches: std::time::Duration,
+    metrics: std::time::Duration,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppValidationTiming {
+    fn total(self) -> std::time::Duration {
+        self.load_cache
+            .saturating_add(self.weight_fold)
+            .saturating_add(self.context)
+            .saturating_add(self.weight_upload)
+            .saturating_add(self.batches)
+            .saturating_add(self.metrics)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_validation_timing(
+    prefix: &str,
+    positions: usize,
+    batch_size: usize,
+    timing: CudaCppValidationTiming,
+) {
+    eprintln!(
+        "  {} {}: positions={}, batch_size={}, load/cache={}, weight_fold={}, context={}, weight_upload={}, batches={}, metrics={}, total={}",
+        paint(prefix, ConsoleColor::Dim),
+        paint("validation detail", ConsoleColor::BoldYellow),
+        format_count(positions),
+        format_count(batch_size),
+        format_duration_secs(timing.load_cache),
+        format_duration_secs(timing.weight_fold),
+        format_duration_secs(timing.context),
+        format_duration_secs(timing.weight_upload),
+        format_duration_secs(timing.batches),
+        format_duration_secs(timing.metrics),
+        format_duration_secs(timing.total()),
+    );
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_nnue_final_validation(
     args: &Args,
     feature_kind: CudaCppNnueFeatureKind,
     shape: bulletou_cuda_cpp::NnueForwardShape,
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
 ) -> Result<Option<TestMetrics>, String> {
+    let load_started = std::time::Instant::now();
     let Some(cache) = TestPositionsCache::try_load(args) else {
         return Ok(None);
     };
+    let load_cache_elapsed = load_started.elapsed();
     if cache.positions.is_empty() {
         eprintln!(
             "  WARN: --test-teacher yielded no positions; cuda-cpp {} final validation skipped",
@@ -5875,14 +5971,19 @@ fn run_cuda_cpp_nnue_final_validation(
         return Ok(None);
     }
 
+    let fold_started = std::time::Instant::now();
     let validation_weights = cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights)?;
+    let weight_fold_elapsed = fold_started.elapsed();
     let validation_shape = bulletou_cuda_cpp::NnueForwardShape {
         input_size: validation_weights.shape.input_size,
         l1: validation_weights.shape.l1,
         l2: validation_weights.shape.l2,
         l3: validation_weights.shape.l3,
     };
+    let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let context_elapsed = context_started.elapsed();
+    let upload_started = std::time::Instant::now();
     let device_weights = bulletou_cuda_cpp::NnueForwardDeviceWeights::from_host(
         &ctx,
         bulletou_cuda_cpp::NnueForwardHostWeights {
@@ -5898,6 +5999,7 @@ fn run_cuda_cpp_nnue_final_validation(
         },
     )
     .map_err(|e| e.to_string())?;
+    let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
@@ -5923,15 +6025,32 @@ fn run_cuda_cpp_nnue_final_validation(
         let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
-    let elapsed = started.elapsed().as_secs_f64();
+    let batches_elapsed = started.elapsed();
     eprintln!(
-        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={}",
         feature_kind.source_label(),
         outputs.len(),
-        batch_size
+        batch_size,
+        format_duration_secs(batches_elapsed)
     );
 
-    Ok(Some(run_one_test_pass(&cache, args, outputs)))
+    let metrics_started = std::time::Instant::now();
+    let metrics = run_one_test_pass(&cache, args, outputs);
+    let metrics_elapsed = metrics_started.elapsed();
+    print_cuda_cpp_validation_timing(
+        &format!("cuda-cpp {}", feature_kind.source_label()),
+        cache.positions.len(),
+        batch_size,
+        CudaCppValidationTiming {
+            load_cache: load_cache_elapsed,
+            weight_fold: weight_fold_elapsed,
+            context: context_elapsed,
+            weight_upload: weight_upload_elapsed,
+            batches: batches_elapsed,
+            metrics: metrics_elapsed,
+        },
+    );
+    Ok(Some(metrics))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5941,9 +6060,11 @@ fn run_cuda_cpp_sfnn_final_validation(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
 ) -> Result<Option<TestMetrics>, String> {
+    let load_started = std::time::Instant::now();
     let Some(cache) = TestPositionsCache::try_load(args) else {
         return Ok(None);
     };
+    let load_cache_elapsed = load_started.elapsed();
     if cache.positions.is_empty() {
         eprintln!(
             "  WARN: --test-teacher yielded no positions; cuda-cpp {} final validation skipped",
@@ -5952,7 +6073,9 @@ fn run_cuda_cpp_sfnn_final_validation(
         return Ok(None);
     }
 
+    let fold_started = std::time::Instant::now();
     let validation_weights = cuda_cpp_sfnn_weights_for_cpu_validation(feature_kind, shape, weights)?;
+    let weight_fold_elapsed = fold_started.elapsed();
     let validation_shape = bulletou_cuda_cpp::SfnnForwardShape {
         input_size: validation_weights.shape.input_size,
         ft_size: validation_weights.shape.ft_size,
@@ -5960,7 +6083,10 @@ fn run_cuda_cpp_sfnn_final_validation(
         l2_size: validation_weights.shape.l2_size,
         num_stacks: validation_weights.shape.num_stacks,
     };
+    let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let context_elapsed = context_started.elapsed();
+    let upload_started = std::time::Instant::now();
     let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(
         &ctx,
         bulletou_cuda_cpp::SfnnForwardHostWeights {
@@ -5978,6 +6104,7 @@ fn run_cuda_cpp_sfnn_final_validation(
         },
     )
     .map_err(|e| e.to_string())?;
+    let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
@@ -6004,15 +6131,32 @@ fn run_cuda_cpp_sfnn_final_validation(
         let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
-    let elapsed = started.elapsed().as_secs_f64();
+    let batches_elapsed = started.elapsed();
     eprintln!(
-        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={elapsed:.3}s",
+        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={}",
         feature_kind.source_label(),
         outputs.len(),
-        batch_size
+        batch_size,
+        format_duration_secs(batches_elapsed)
     );
 
-    Ok(Some(run_one_test_pass(&cache, args, outputs)))
+    let metrics_started = std::time::Instant::now();
+    let metrics = run_one_test_pass(&cache, args, outputs);
+    let metrics_elapsed = metrics_started.elapsed();
+    print_cuda_cpp_validation_timing(
+        &format!("cuda-cpp {}", feature_kind.source_label()),
+        cache.positions.len(),
+        batch_size,
+        CudaCppValidationTiming {
+            load_cache: load_cache_elapsed,
+            weight_fold: weight_fold_elapsed,
+            context: context_elapsed,
+            weight_upload: weight_upload_elapsed,
+            batches: batches_elapsed,
+            metrics: metrics_elapsed,
+        },
+    );
+    Ok(Some(metrics))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9501,10 +9645,25 @@ struct TestPositionsCache {
     teacher_results: Vec<i8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TestPositionsCacheKey {
+    path: String,
+    positions: usize,
+    sample: TestSampleMode,
+    seed: u64,
+}
+
+struct TestPositionsCacheEntry {
+    key: TestPositionsCacheKey,
+    cache: Arc<TestPositionsCache>,
+}
+
+static TEST_POSITIONS_CACHE: OnceLock<Mutex<Option<TestPositionsCacheEntry>>> = OnceLock::new();
+
 impl TestPositionsCache {
     /// `args.test_teacher` is `Some` and we successfully sampled
     /// positions: `Some(cache)`. Otherwise `None` (= no validation).
-    fn try_load(args: &Args) -> Option<Self> {
+    fn try_load(args: &Args) -> Option<Arc<Self>> {
         let test_path = args.test_teacher.as_ref()?;
         let path = match test_path.to_str() {
             Some(s) => s.to_string(),
@@ -9513,10 +9672,24 @@ impl TestPositionsCache {
                 return None;
             }
         };
+        let key = TestPositionsCacheKey {
+            path,
+            positions: args.test_positions,
+            sample: args.test_sample,
+            seed: args.test_seed,
+        };
+        let cache_cell = TEST_POSITIONS_CACHE.get_or_init(|| Mutex::new(None));
+        if let Some(cache) = cache_cell
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().filter(|entry| entry.key == key).map(|entry| Arc::clone(&entry.cache)))
+        {
+            return Some(cache);
+        }
         eprintln!(
             "  loading {} test positions from {} (sample={}, seed={}) for validation...",
             args.test_positions,
-            path,
+            key.path,
             args.test_sample.cli_name(),
             if args.test_sample == TestSampleMode::Random {
                 args.test_seed.to_string()
@@ -9525,18 +9698,25 @@ impl TestPositionsCache {
             }
         );
         let loaded = match args.test_sample {
-            TestSampleMode::Random => read_random_teacher_positions(&path, args.test_positions, args.test_seed),
-            TestSampleMode::Sequential => read_teacher_positions_prefix(&path, args.test_positions),
+            TestSampleMode::Random => read_random_teacher_positions(&key.path, args.test_positions, args.test_seed),
+            TestSampleMode::Sequential => read_teacher_positions_prefix(&key.path, args.test_positions),
         };
         match loaded {
             Ok(positions) => {
                 let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
                 let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
                 eprintln!("  ...{} test positions ready", positions.len());
-                Some(Self { positions, teacher_scores, teacher_results })
+                let cache = Arc::new(Self { positions, teacher_scores, teacher_results });
+                if let Ok(mut guard) = cache_cell.lock() {
+                    *guard = Some(TestPositionsCacheEntry { key, cache: Arc::clone(&cache) });
+                }
+                Some(cache)
             }
             Err(e) => {
-                eprintln!("  WARN: failed to read --test-teacher {path}: {e}; per-superbatch validation disabled");
+                eprintln!(
+                    "  WARN: failed to read --test-teacher {}: {e}; per-superbatch validation disabled",
+                    key.path
+                );
                 None
             }
         }
