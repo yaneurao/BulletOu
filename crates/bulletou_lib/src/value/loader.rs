@@ -125,11 +125,20 @@ where
         &self,
         start_batch: usize,
         batch_size: usize,
+        f: F,
+    ) {
+        self.load_and_map_batches_from_position(start_batch * batch_size, batch_size, f);
+    }
+
+    pub fn load_and_map_batches_from_position<F: FnMut(&[I::RequiredDataType]) -> bool>(
+        &self,
+        start_position: usize,
+        batch_size: usize,
         mut f: F,
     ) {
         let mut incomplete_buf = Vec::new();
 
-        self.loader.map_chunks(start_batch * batch_size, |chunk| {
+        self.loader.map_chunks(start_position, |chunk| {
             let remainder = if !incomplete_buf.is_empty() {
                 let remainder = batch_size - incomplete_buf.len();
 

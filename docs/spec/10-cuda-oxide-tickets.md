@@ -1065,6 +1065,11 @@ current cuda-cpp follow-up queue.
   - a 1-step SFNN smoke wrote only tiny `resume-config.txt`/`tag.txt` files and printed `cuda-cpp SFNN final output skipped`;
   - with the inverse-index L0 + zero skip, bs131k/128-step WRM and yamaoka-fixed validation completed without writing the multi-GB `state.bin`: `2153395` pos/s, `test_loss=0.03670243`, `test_acc=0.6138611`.
   - the same no-output mode was then used for a full SFNN tatara-parity recheck on the exported `target\full-epoch-sfnn-20260718\teacher-all.psv` with validation fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`; the 4953-step bs131k/factorized-L1 run reported `649199616` positions in `281.652s`, `2304974` pos/s, `test_loss=0.05524588`, `test_acc=0.6734161`, and wrote only `resume-config.txt` plus `tag.txt`.
+- Fixed cuda-cpp PSV resume after interrupted long production runs:
+  - the shared fixed-record loader path now supports exact record offsets instead of requiring `dataloader_pos.txt` to be aligned to `batch_size`, so PSV teachers whose total record count is not divisible by the mini-batch size can resume after wrapping around the teacher file;
+  - cuda-cpp auto-resume now prefers the latest complete checkpoint's `learn.log` cumulative `positions` value for PSV and converts it back to an exact byte offset, ignoring stale/wrong `dataloader_pos.txt` values written by older builds;
+  - this specifically fixes the observed `PSV dataloader resume record index ... is not aligned to batch-size 65536` failure from `SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3-test-ranger-tayayan-psv20260719\0019`, where `learn.log` recorded `759562240` positions but `dataloader_pos.txt` contained a triangularly advanced offset;
+  - the checkpoint-save path now carries the initial resume position through the run instead of re-reading the latest checkpoint at every save, removing the triangular accumulation bug when `--save-rate 1` writes many superbatches.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;

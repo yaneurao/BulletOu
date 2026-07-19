@@ -3222,7 +3222,8 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let mut last_loss = 0.0_f32;
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_dataloader_pos = None;
-    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    let dataloader_resume_pos =
+        cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, component.input_label());
     if let Some(pos) = dataloader_resume_pos {
         eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
     }
@@ -3313,7 +3314,13 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
-            let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+            let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                args,
+                seen_steps,
+                batch_size,
+                last_dataloader_pos,
+                dataloader_resume_pos,
+            )?;
             if chunk.save_checkpoint {
                 let checkpoint_started = std::time::Instant::now();
                 let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
@@ -3843,7 +3850,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut last_dataloader_pos = None;
-    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
         eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
     }
@@ -4279,7 +4286,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
-            let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+            let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                args,
+                seen_steps,
+                batch_size,
+                last_dataloader_pos,
+                dataloader_resume_pos,
+            )?;
             if schedule.production {
                 if chunk.save_checkpoint {
                     let checkpoint_started = std::time::Instant::now();
@@ -4634,7 +4647,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut last_dataloader_pos = None;
-    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args);
+    let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
         eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
     }
@@ -5084,7 +5097,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
-            let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
+            let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                args,
+                seen_steps,
+                batch_size,
+                last_dataloader_pos,
+                dataloader_resume_pos,
+            )?;
             if schedule.production {
                 if chunk.save_checkpoint {
                     let checkpoint_started = std::time::Instant::now();
@@ -5423,7 +5442,12 @@ fn cuda_cpp_auto_resume_state_bin(args: &Args) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_auto_resume_dataloader_pos(args: &Args) -> Option<bulletou_lib::value::TeacherDataloaderPos> {
+fn cuda_cpp_auto_resume_dataloader_pos(
+    args: &Args,
+    batch_size: usize,
+    completed_steps: usize,
+    component: &str,
+) -> Option<bulletou_lib::value::TeacherDataloaderPos> {
     if args.cuda_cpp_weights_bin.is_some() {
         return None;
     }
@@ -5434,8 +5458,28 @@ fn cuda_cpp_auto_resume_dataloader_pos(args: &Args) -> Option<bulletou_lib::valu
     if cuda_cpp_resume_teacher_changed(args, &output_dir) {
         return None;
     }
-    read_latest_dataloader_pos(&output_dir)
-        .map(|(byte_offset, plies)| bulletou_lib::value::TeacherDataloaderPos { byte_offset, plies })
+    let saved_pos = read_latest_dataloader_pos(&output_dir)
+        .map(|(byte_offset, plies)| bulletou_lib::value::TeacherDataloaderPos { byte_offset, plies });
+
+    let resume_positions =
+        read_latest_saved_positions(&output_dir, component).or_else(|| completed_steps.checked_mul(batch_size));
+    if let Some(positions) = resume_positions {
+        match cuda_cpp_fixed_record_dataloader_pos_from_positions(args, positions) {
+            Ok(Some(pos)) => {
+                if saved_pos.is_some_and(|saved| saved != pos) {
+                    eprintln!(
+                        "  WARN: cuda-cpp PSV resume ignoring saved dataloader_pos and using learn.log positions={positions} -> byte_offset {}, plies {}",
+                        pos.byte_offset, pos.plies
+                    );
+                }
+                return Some(pos);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("  WARN: cuda-cpp could not derive fixed-record resume position: {err}"),
+        }
+    }
+
+    saved_pos
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5445,19 +5489,38 @@ fn cuda_cpp_resume_teacher_changed(args: &Args, output_dir: &std::path::Path) ->
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_direct_dataloader_pos(
+fn cuda_cpp_fixed_record_dataloader_pos_from_positions(
     args: &Args,
-    seen_steps: usize,
-    batch_size: usize,
-    last_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
-) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
-    cuda_cpp_direct_dataloader_pos_from_base(
-        args,
-        seen_steps,
-        batch_size,
-        last_pos,
-        cuda_cpp_auto_resume_dataloader_pos(args),
-    )
+    positions: usize,
+) -> Result<Option<bulletou_lib::value::TeacherDataloaderPos>, String> {
+    let paths = expand_teacher(&args.teacher)?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format = infer_data_format(&path_refs)?;
+    let record_size = match format {
+        DataFormat::Psv => std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>(),
+        DataFormat::Hcpe | DataFormat::Hcpe3 | DataFormat::Pack => return Ok(None),
+    };
+    if record_size == 0 {
+        return Err("fixed-record teacher record size is zero".to_string());
+    }
+    let mut total_records = 0u64;
+    for path in &paths {
+        let len = std::fs::metadata(path).map_err(|err| format!("failed to stat teacher {path}: {err}"))?.len();
+        if len % record_size as u64 != 0 {
+            return Err(format!("teacher {path} has byte size {len}, not aligned to record size {record_size}"));
+        }
+        total_records = total_records
+            .checked_add(len / record_size as u64)
+            .ok_or_else(|| "fixed-record teacher record count overflow".to_string())?;
+    }
+    if total_records == 0 {
+        return Err("fixed-record teacher contains no records".to_string());
+    }
+    let record_index = (positions as u64) % total_records;
+    let byte_offset = record_index
+        .checked_mul(record_size as u64)
+        .ok_or_else(|| "fixed-record teacher byte offset overflow".to_string())?;
+    Ok(Some(bulletou_lib::value::TeacherDataloaderPos { byte_offset, plies: 0 }))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8320,6 +8383,44 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     max_sb
 }
 
+/// Read the latest cumulative `positions` value from the highest-numbered
+/// complete `<output_dir>/<NNNN>/learn.log` for the requested component.
+///
+/// This is used by cuda-cpp fixed-record PSV resume. `dataloader_pos.txt`
+/// is a convenient exact loader marker, but older cuda-cpp builds inferred
+/// PSV positions incorrectly when saving every superbatch. The `positions`
+/// column is the durable source of truth for "how many training records were
+/// accepted by the optimizer" and can be converted back into an exact PSV
+/// byte offset even when the teacher length is not divisible by batch size.
+fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) -> Option<usize> {
+    let content = numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
+        .map(|(_, dir)| dir.join("learn.log"))
+        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
+    let mut latest: Option<usize> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
+            continue;
+        }
+        // Current per-save schema:
+        // eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,
+        // train_value_loss,lr_start,lr_end,lambda,positions,teacher
+        let parts: Vec<&str> = line.splitn(12, ',').collect();
+        if parts.len() < 11 {
+            continue;
+        }
+        let row_component = parts[0].split_once('/').map(|(_, c)| c).unwrap_or("nnue");
+        if row_component != component {
+            continue;
+        }
+        let Ok(positions) = parts[10].parse::<usize>() else { continue };
+        latest = Some(latest.map_or(positions, |prev| prev.max(positions)));
+    }
+    latest
+}
+
 /// Read the highest-numbered `<output_dir>/<NNNN>/dataloader_pos.txt`
 /// (= the dataloader's "I have processed up to this position" marker,
 /// written at each save). Returns `(byte_offset, plies_within_unit)`.
@@ -10057,7 +10158,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            cuda_cpp_auto_resume_dataloader_pos(&same_teacher).unwrap(),
+            cuda_cpp_auto_resume_dataloader_pos(&same_teacher, effective_batch_size(&same_teacher), 0, "nnue").unwrap(),
             bulletou_lib::value::TeacherDataloaderPos { byte_offset: 76, plies: 0 }
         );
 
@@ -10076,7 +10177,63 @@ mod tests {
             "--resume",
         ])
         .unwrap();
-        assert_eq!(cuda_cpp_auto_resume_dataloader_pos(&changed_teacher), None);
+        assert_eq!(
+            cuda_cpp_auto_resume_dataloader_pos(&changed_teacher, effective_batch_size(&changed_teacher), 0, "nnue"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_psv_resume_prefers_learn_log_positions() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-psv-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = tmp.join("0001");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
+        let teacher = tmp.join("teacher.psv");
+        std::fs::write(&teacher, vec![0u8; record_size * 10]).unwrap();
+        std::fs::write(dir.join("state.bin"), b"state").unwrap();
+        std::fs::write(dir.join("dataloader_pos.txt"), format!("{},0\n", 5 * record_size)).unwrap();
+        std::fs::write(
+            dir.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1,-,-,0.100000,0.000875,0.000875,1.000000,12,{}\n",
+                teacher.display()
+            ),
+        )
+        .unwrap();
+
+        let output = tmp.to_str().unwrap();
+        let teacher_arg = teacher.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            teacher_arg,
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--output",
+            output,
+            "--resume",
+        ])
+        .unwrap();
+
+        assert_eq!(read_latest_saved_positions(&tmp, "nnue"), Some(12));
+        assert_eq!(
+            cuda_cpp_auto_resume_dataloader_pos(&args, effective_batch_size(&args), 0, "nnue").unwrap(),
+            bulletou_lib::value::TeacherDataloaderPos { byte_offset: (2 * record_size) as u64, plies: 0 }
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

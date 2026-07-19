@@ -219,16 +219,11 @@ where
                 }
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
                 (0, pos.byte_offset % total_bytes)
             } else {
-                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
-                    TeacherBatchError::invalid_input(format!(
-                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
-                        config.batch_index, config.batch_size
-                    ))
-                })?;
+                let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
                     .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
                     .ok_or_else(|| {
@@ -243,7 +238,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 move |visited_batches| {
                     hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
@@ -256,18 +251,18 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("HCPE3", config.batch_index, config.batch_size)?
             };
             visit_halfkp_batches(
                 loader,
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -283,18 +278,18 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("Pack", config.batch_index, config.batch_size)?
             };
             visit_halfkp_batches(
                 loader,
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -306,16 +301,35 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            let loader_start_batch = match config.dataloader_resume_pos {
-                Some(pos) => fixed_record_resume_start_batch(
-                    "PSV",
-                    pos,
-                    config.batch_size,
-                    std::mem::size_of::<PackedSfenValue>(),
-                )?,
-                None => config.batch_index,
+            let record_size = std::mem::size_of::<PackedSfenValue>();
+            let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
+            let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
+                Some(pos) => {
+                    let record_index = fixed_record_resume_start_position("PSV", pos, record_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
+                None => {
+                    let record_index = checked_batch_start_position("PSV", config.batch_index, config.batch_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
             };
-            visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
+            visit_halfkp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_position,
+                move |visited_batches| {
+                    fixed_record_dataloader_pos_after_batch(
+                        base_record_index,
+                        total_records,
+                        record_size,
+                        config.batch_size,
+                        visited_batches,
+                    )
+                },
+                visitor,
+            )
         }
     }
 }
@@ -357,16 +371,11 @@ where
                 }
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
                 (0, pos.byte_offset % total_bytes)
             } else {
-                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
-                    TeacherBatchError::invalid_input(format!(
-                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
-                        config.batch_index, config.batch_size
-                    ))
-                })?;
+                let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
                     .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
                     .ok_or_else(|| {
@@ -381,7 +390,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 move |visited_batches| {
                     hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
@@ -394,18 +403,18 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("HCPE3", config.batch_index, config.batch_size)?
             };
             visit_kp_batches(
                 loader,
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -421,18 +430,18 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("Pack", config.batch_index, config.batch_size)?
             };
             visit_kp_batches(
                 loader,
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -444,16 +453,35 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            let loader_start_batch = match config.dataloader_resume_pos {
-                Some(pos) => fixed_record_resume_start_batch(
-                    "PSV",
-                    pos,
-                    config.batch_size,
-                    std::mem::size_of::<PackedSfenValue>(),
-                )?,
-                None => config.batch_index,
+            let record_size = std::mem::size_of::<PackedSfenValue>();
+            let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
+            let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
+                Some(pos) => {
+                    let record_index = fixed_record_resume_start_position("PSV", pos, record_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
+                None => {
+                    let record_index = checked_batch_start_position("PSV", config.batch_index, config.batch_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
             };
-            visit_kp_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
+            visit_kp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_position,
+                move |visited_batches| {
+                    fixed_record_dataloader_pos_after_batch(
+                        base_record_index,
+                        total_records,
+                        record_size,
+                        config.batch_size,
+                        visited_batches,
+                    )
+                },
+                visitor,
+            )
         }
     }
 }
@@ -498,16 +526,11 @@ where
                 }
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
                 (0, pos.byte_offset % total_bytes)
             } else {
-                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
-                    TeacherBatchError::invalid_input(format!(
-                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
-                        config.batch_index, config.batch_size
-                    ))
-                })?;
+                let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
                     .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
                     .ok_or_else(|| {
@@ -524,7 +547,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 move |visited_batches| {
                     hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
@@ -537,11 +560,11 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("HCPE3", config.batch_index, config.batch_size)?
             };
             visit_kppt_batches(
                 input_getter,
@@ -550,7 +573,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -566,11 +589,11 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("Pack", config.batch_index, config.batch_size)?
             };
             visit_kppt_batches(
                 input_getter,
@@ -579,7 +602,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -591,14 +614,17 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            let loader_start_batch = match config.dataloader_resume_pos {
-                Some(pos) => fixed_record_resume_start_batch(
-                    "PSV",
-                    pos,
-                    config.batch_size,
-                    std::mem::size_of::<PackedSfenValue>(),
-                )?,
-                None => config.batch_index,
+            let record_size = std::mem::size_of::<PackedSfenValue>();
+            let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
+            let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
+                Some(pos) => {
+                    let record_index = fixed_record_resume_start_position("PSV", pos, record_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
+                None => {
+                    let record_index = checked_batch_start_position("PSV", config.batch_index, config.batch_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
             };
             visit_kppt_batches(
                 input_getter,
@@ -607,8 +633,16 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
-                |_| None,
+                loader_start_position,
+                move |visited_batches| {
+                    fixed_record_dataloader_pos_after_batch(
+                        base_record_index,
+                        total_records,
+                        record_size,
+                        config.batch_size,
+                        visited_batches,
+                    )
+                },
                 visitor,
             )
         }
@@ -667,16 +701,11 @@ where
                 }
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
-            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+            let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset);
                 (0, pos.byte_offset % total_bytes)
             } else {
-                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
-                    TeacherBatchError::invalid_input(format!(
-                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
-                        config.batch_index, config.batch_size
-                    ))
-                })?;
+                let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
                     .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
                     .ok_or_else(|| {
@@ -693,7 +722,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 move |visited_batches| {
                     hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
                 },
@@ -706,11 +735,11 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("HCPE3", config.batch_index, config.batch_size)?
             };
             visit_sfnn_batches(
                 input_getter,
@@ -719,7 +748,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -735,11 +764,11 @@ where
                 .with_single_epoch(false);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
-            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+            let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
                 loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
                 0
             } else {
-                config.batch_index
+                checked_batch_start_position("Pack", config.batch_index, config.batch_size)?
             };
             visit_sfnn_batches(
                 input_getter,
@@ -748,7 +777,7 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
+                loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
                         byte_offset: offset_handle.load(Ordering::Acquire),
@@ -760,14 +789,17 @@ where
         }
         DataFormat::Psv => {
             let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
-            let loader_start_batch = match config.dataloader_resume_pos {
-                Some(pos) => fixed_record_resume_start_batch(
-                    "PSV",
-                    pos,
-                    config.batch_size,
-                    std::mem::size_of::<PackedSfenValue>(),
-                )?,
-                None => config.batch_index,
+            let record_size = std::mem::size_of::<PackedSfenValue>();
+            let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
+            let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
+                Some(pos) => {
+                    let record_index = fixed_record_resume_start_position("PSV", pos, record_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
+                None => {
+                    let record_index = checked_batch_start_position("PSV", config.batch_index, config.batch_size)?;
+                    (record_index, (record_index as u64) % total_records)
+                }
             };
             visit_sfnn_batches(
                 input_getter,
@@ -776,18 +808,65 @@ where
                 format,
                 config,
                 batch_count,
-                loader_start_batch,
-                |_| None,
+                loader_start_position,
+                move |visited_batches| {
+                    fixed_record_dataloader_pos_after_batch(
+                        base_record_index,
+                        total_records,
+                        record_size,
+                        config.batch_size,
+                        visited_batches,
+                    )
+                },
                 visitor,
             )
         }
     }
 }
 
-fn fixed_record_resume_start_batch(
+fn checked_batch_start_position(
+    label: &'static str,
+    batch_index: usize,
+    batch_size: usize,
+) -> Result<usize, TeacherBatchError> {
+    batch_index.checked_mul(batch_size).ok_or_else(|| {
+        TeacherBatchError::invalid_input(format!(
+            "{label} dataloader resume position overflow: batch_index={batch_index} batch_size={batch_size}"
+        ))
+    })
+}
+
+fn total_fixed_record_teacher_records(
+    label: &'static str,
+    paths: &[String],
+    record_size: usize,
+) -> Result<u64, TeacherBatchError> {
+    if record_size == 0 {
+        return Err(TeacherBatchError::invalid_input(format!("{label} record size must be > 0")));
+    }
+    let mut total = 0u64;
+    for path in paths {
+        let len = std::fs::metadata(path)
+            .map_err(|err| TeacherBatchError::invalid_input(format!("failed to stat {label} teacher {path}: {err}")))?
+            .len();
+        if len % record_size as u64 != 0 {
+            return Err(TeacherBatchError::invalid_input(format!(
+                "{label} teacher file {path} has byte size {len}, not aligned to record size {record_size}"
+            )));
+        }
+        total = total
+            .checked_add(len / record_size as u64)
+            .ok_or_else(|| TeacherBatchError::invalid_input(format!("{label} teacher record count overflow")))?;
+    }
+    if total == 0 {
+        return Err(TeacherBatchError::invalid_input(format!("{label} teacher contains no records")));
+    }
+    Ok(total)
+}
+
+fn fixed_record_resume_start_position(
     label: &'static str,
     pos: TeacherDataloaderPos,
-    batch_size: usize,
     record_size: usize,
 ) -> Result<usize, TeacherBatchError> {
     if pos.plies != 0 {
@@ -806,12 +885,24 @@ fn fixed_record_resume_start_batch(
         )));
     }
     let record_index = (pos.byte_offset / record_size as u64) as usize;
-    if record_index % batch_size != 0 {
-        return Err(TeacherBatchError::invalid_input(format!(
-            "{label} dataloader resume record index {record_index} is not aligned to batch-size {batch_size}"
-        )));
+    Ok(record_index)
+}
+
+fn fixed_record_dataloader_pos_after_batch(
+    base_record_index: u64,
+    total_records: u64,
+    record_size: usize,
+    batch_size: usize,
+    visited_batches: usize,
+) -> Option<TeacherDataloaderPos> {
+    if total_records == 0 {
+        return None;
     }
-    Ok(record_index / batch_size)
+    let completed_batches = visited_batches.checked_add(1)?;
+    let consumed_records = (completed_batches as u64).checked_mul(batch_size as u64)?;
+    let record_index = base_record_index.checked_add(consumed_records)? % total_records;
+    let byte_offset = record_index.checked_mul(record_size as u64)?;
+    Some(TeacherDataloaderPos { byte_offset, plies: 0 })
 }
 
 fn total_hcpe_teacher_bytes(paths: &[String]) -> Result<u64, TeacherBatchError> {
@@ -900,7 +991,7 @@ fn visit_halfkp_batches<D, P, F, E>(
     format: DataFormat,
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     dataloader_pos: P,
     visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -917,12 +1008,12 @@ where
             format,
             config,
             batch_count,
-            loader_start_batch,
+            loader_start_position,
             dataloader_pos,
             visitor,
         )
     } else {
-        visit_halfkp_batches_direct(loader, format, config, batch_count, loader_start_batch, dataloader_pos, visitor)
+        visit_halfkp_batches_direct(loader, format, config, batch_count, loader_start_position, dataloader_pos, visitor)
     }
 }
 
@@ -1112,14 +1203,14 @@ fn prepare_kp_direct_fast_batch(
     batch
 }
 
-fn load_and_map_packed_batches<D, F>(loader: &D, start_batch: usize, batch_size: usize, mut f: F)
+fn load_and_map_packed_batches<D, F>(loader: &D, start_position: usize, batch_size: usize, mut f: F)
 where
     D: DataLoader<PackedSfenValue>,
     F: FnMut(&[PackedSfenValue]) -> bool,
 {
     let mut incomplete_buf = Vec::new();
 
-    loader.map_chunks(start_batch * batch_size, |chunk| {
+    loader.map_chunks(start_position, |chunk| {
         let remainder = if !incomplete_buf.is_empty() {
             let remainder = batch_size - incomplete_buf.len();
 
@@ -1162,7 +1253,7 @@ fn visit_halfkp_batches_direct<D, P, F, E>(
     format: DataFormat,
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -1196,7 +1287,7 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+                load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let batch = prepare_halfkp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
                     if let Err(err) = batch.validate() {
@@ -1269,7 +1360,7 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+    load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let batch = prepare_halfkp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
@@ -1313,7 +1404,7 @@ fn visit_kp_batches<D, P, F, E>(
     format: DataFormat,
     config: &KpTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -1346,7 +1437,7 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+                load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
                     if let Err(err) = batch.validate() {
@@ -1418,7 +1509,7 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+    load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
@@ -1463,7 +1554,7 @@ fn visit_halfkp_batches_with_input<I, D, P, F, E>(
     format: DataFormat,
     config: &HalfkpTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -1509,7 +1600,7 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+                dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let prepared = match rayon_pool.as_ref() {
                         Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
@@ -1586,7 +1677,7 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+    dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let prepared = match rayon_pool.as_ref() {
@@ -1638,7 +1729,7 @@ fn visit_kppt_batches<I, D, P, F, E>(
     format: DataFormat,
     config: &KpptTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -1683,7 +1774,7 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+                dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let prepared = match rayon_pool.as_ref() {
                         Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
@@ -1760,7 +1851,7 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+    dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let prepared = match rayon_pool.as_ref() {
@@ -1812,7 +1903,7 @@ fn visit_sfnn_batches<I, D, P, F, E>(
     format: DataFormat,
     config: &SfnnTeacherBatchConfig<'_>,
     batch_count: usize,
-    loader_start_batch: usize,
+    loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
@@ -1857,7 +1948,7 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+                dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let prepared = match rayon_pool.as_ref() {
                         Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
@@ -1935,7 +2026,7 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+    dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let prepared = match rayon_pool.as_ref() {
@@ -2112,14 +2203,14 @@ mod tests {
     }
 
     #[test]
-    fn psv_resume_offset_maps_to_batch_index() {
+    fn psv_resume_offset_maps_to_record_position() {
         let record_size = std::mem::size_of::<PackedSfenValue>();
         let pos = TeacherDataloaderPos { byte_offset: (6 * record_size) as u64, plies: 0 };
-        assert_eq!(fixed_record_resume_start_batch("PSV", pos, 3, record_size).unwrap(), 2);
+        assert_eq!(fixed_record_resume_start_position("PSV", pos, record_size).unwrap(), 6);
 
         let bad_plies = TeacherDataloaderPos { byte_offset: 0, plies: 1 };
         assert!(
-            fixed_record_resume_start_batch("PSV", bad_plies, 3, record_size)
+            fixed_record_resume_start_position("PSV", bad_plies, record_size)
                 .unwrap_err()
                 .to_string()
                 .contains("plies=0")
@@ -2127,19 +2218,14 @@ mod tests {
 
         let bad_alignment = TeacherDataloaderPos { byte_offset: 1, plies: 0 };
         assert!(
-            fixed_record_resume_start_batch("PSV", bad_alignment, 3, record_size)
+            fixed_record_resume_start_position("PSV", bad_alignment, record_size)
                 .unwrap_err()
                 .to_string()
                 .contains("aligned")
         );
 
-        let bad_batch = TeacherDataloaderPos { byte_offset: (5 * record_size) as u64, plies: 0 };
-        assert!(
-            fixed_record_resume_start_batch("PSV", bad_batch, 3, record_size)
-                .unwrap_err()
-                .to_string()
-                .contains("batch-size")
-        );
+        let wrapped = fixed_record_dataloader_pos_after_batch(8, 10, record_size, 4, 0).expect("wrapped PSV position");
+        assert_eq!(wrapped, TeacherDataloaderPos { byte_offset: (2 * record_size) as u64, plies: 0 });
     }
 
     #[test]
