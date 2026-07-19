@@ -125,9 +125,10 @@ Resume / restart behaviour is identical across every eval-type; see [tutorial 5.
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |
 | `--max-epochs` | Number of epochs to run. With `--superbatches`, an epoch is an LR/validation cycle rather than one teacher pass. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries | 1 |
-| `--save-rate` | Save every N superbatches | 1 |
+| `--save-rate` | Save every N superbatches | 20 |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR scheduler (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
+| `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 

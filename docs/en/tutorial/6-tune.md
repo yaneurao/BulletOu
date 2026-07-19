@@ -12,12 +12,12 @@ Main flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--backend` | Training backend. The usable path today is `bullet`. `cuda-oxide` is reserved for the NNUE/SFNN fast backend and fails fast until wired | `bullet` |
+| `--backend` | Training backend. The default fast path is Windows-native `cuda-cpp` for the NNUE/SFNN evals it supports; pass `bullet` for the generic backend / other eval types | `cuda-cpp` |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 to match tatara | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
 | `--max-epochs` | Maximum number of epochs. `--max-epoch` is also accepted as an alias. For `step` / `geometric` / `cos`, this is the number of LR cycles. For `plateau`, this caps plateau epochs. With `--test-teacher`, every schedule stops before the cap when epoch-final loss and accuracy both fail to improve | omitted = no fixed epoch cap |
-| `--save-rate` | Save a checkpoint every N superbatches | 1 |
+| `--save-rate` | Save a checkpoint every N superbatches. Plateau scheduling still requires `--save-rate 1` | 20 |
 | `--lr` | Starting LR (lr_max; value at the start of each cycle) | 0.000875 |
 | `--optimizer` | Optimizer: `adamw`, `radam`, or `ranger`. `ranger` is BulletOu's existing RAdam+Lookahead implementation, not a full Ranger21 clone | `ranger` |
 | `--lr-schedule` | `step` (= staircase StepLR), `geometric` (= log-linear decay), `cos` (= cosine annealing), or `plateau` (= lower LR only when the validation monitor stops improving) | `step` |
@@ -28,6 +28,7 @@ Main flags:
 | `--lr-plateau-min-delta` | Minimum improvement used by the per-superbatch `plateau` decision | 0.0 |
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
+| `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
 | `--optimizer-epsilon` | Override epsilon for the selected optimizer. If omitted, the optimizer's own default is used | omitted |

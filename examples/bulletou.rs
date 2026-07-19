@@ -1196,16 +1196,19 @@ fn effective_lr_step_positions(args: &Args, batches_per_superbatch: usize) -> u6
 const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
+const DEFAULT_SAVE_RATE: usize = 20;
 
 fn effective_batch_size(args: &Args) -> usize {
     args.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
 }
 
+fn effective_save_rate(args: &Args) -> usize {
+    args.save_rate.unwrap_or(DEFAULT_SAVE_RATE)
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_default_cpu_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_mul(2).clamp(4, 24))
-        .unwrap_or(24)
+    std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).clamp(4, 24)).unwrap_or(24)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1296,7 +1299,7 @@ struct Args {
 
     /// Training backend. `bullet` is the existing generic backend.
     /// `cuda-cpp` is the Windows-native C++/CUDA fixed-layout backend.
-    #[arg(long, value_enum, default_value = "bullet")]
+    #[arg(long, value_enum, default_value = "cuda-cpp")]
     backend: BackendKind,
 
     /// CUDA device index for the Windows-native C++/CUDA backend.
@@ -1531,7 +1534,7 @@ struct Args {
     lambda: f32,
 
     /// Eval-to-score sigmoid scale.
-    #[arg(long, default_value = "400")]
+    #[arg(long, default_value = "290")]
     scale: u32,
 
     /// Use nnue-pytorch's WRM value loss and target conversion for NNUE /
@@ -1582,8 +1585,8 @@ struct Args {
     yaneuraou_quant_scale: Option<f32>,
 
     /// Save every N superbatches (1 = save every superbatch, 5 = every 5th).
-    #[arg(long, default_value = "1")]
-    save_rate: usize,
+    #[arg(long)]
+    save_rate: Option<usize>,
 
     /// Dataloader worker threads (CPU side).
     #[arg(long, default_value = "4")]
@@ -1809,7 +1812,9 @@ impl Args {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-skip-final-output cannot be used together".to_string());
             }
             if self.cuda_cpp_profile_teacher_prepare {
-                return Err("--cuda-cpp-smoke and --cuda-cpp-profile-teacher-prepare cannot be used together".to_string());
+                return Err(
+                    "--cuda-cpp-smoke and --cuda-cpp-profile-teacher-prepare cannot be used together".to_string()
+                );
             }
             return Ok(());
         }
@@ -1849,7 +1854,9 @@ impl Args {
             _ => {}
         }
         if self.cuda_cpp_skip_final_output && self.cuda_cpp_train_steps.is_none() {
-            return Err("--cuda-cpp-skip-final-output is only valid with --cuda-cpp-train-steps direct-step mode".to_string());
+            return Err(
+                "--cuda-cpp-skip-final-output is only valid with --cuda-cpp-train-steps direct-step mode".to_string()
+            );
         }
         if production_schedule && self.max_epochs.is_none() {
             return Err(
@@ -1886,7 +1893,7 @@ impl Args {
                 || self.lr_schedule != LrScheduleKind::Step
                 || self.lr_step_gamma.is_some()
                 || self.lr_step_positions.is_some()
-                || self.save_rate != 1)
+                || self.save_rate.is_some_and(|save_rate| save_rate != 1))
         {
             return Err(
                 "--backend cuda-cpp direct-step mode does not honor production schedule flags; use --superbatches with --max-epochs instead"
@@ -1900,7 +1907,7 @@ impl Args {
                         .to_string(),
                 );
             }
-            if self.save_rate != 1 {
+            if effective_save_rate(self) != 1 {
                 return Err("--backend cuda-cpp --lr-schedule plateau requires --save-rate 1".to_string());
             }
         }
@@ -2668,7 +2675,7 @@ fn main() {
             eprintln!("error: --lr-schedule plateau requires --test-teacher so validation metrics can be monitored.");
             std::process::exit(2);
         }
-        if args.save_rate != 1 {
+        if effective_save_rate(&args) != 1 {
             eprintln!("error: --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions.");
             std::process::exit(2);
         }
@@ -2969,7 +2976,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
-            args.save_rate,
+            effective_save_rate(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
         );
@@ -3677,7 +3684,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
-            args.save_rate,
+            effective_save_rate(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
         );
@@ -6250,7 +6257,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         let mut first_superbatch = if local_epoch == 1 { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let last_superbatch =
-                first_superbatch.saturating_add(args.save_rate.max(1)).saturating_sub(1).min(superbatches);
+                first_superbatch.saturating_add(effective_save_rate(args).max(1)).saturating_sub(1).min(superbatches);
             let superbatch_count = last_superbatch - first_superbatch + 1;
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
@@ -6461,7 +6468,7 @@ fn resume_signature(args: &Args) -> String {
         ),
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
         format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
-        format!("save_rate={}", args.save_rate),
+        format!("save_rate={}", effective_save_rate(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
         format!("sfnn_factorized_l1={}", args.sfnn_factorized_l1),
@@ -7637,7 +7644,7 @@ macro_rules! run_training_inline {
                     }),
                     LrScheduleKind::Plateau => LrSchedulerImpl::Fixed(FixedLR { value: args.lr }),
                 },
-                save_rate: args.save_rate,
+                save_rate: effective_save_rate(args),
             };
 
             let net_id_for_cb = net_id_for_epoch.clone();
@@ -8592,8 +8599,7 @@ macro_rules! run_training_inline_nnue {
         // teacher-single-epoch mode では各 epoch 開始時に新しい loader を
         // spawn し直す。明示 `--superbatches N` では epoch は LR/validation
         // cycle なので、同じ loader を持ち越して教師ストリームを継続する。
-        let hcpe_loader_buffer_records = args
-            .save_rate
+        let hcpe_loader_buffer_records = effective_save_rate(args)
             .max(1)
             .min(end_superbatch)
             .saturating_mul(batches_per_superbatch)
@@ -8703,7 +8709,7 @@ macro_rules! run_training_inline_nnue {
             // `--superbatches N`, the dataloader position continues
             // across the boundary.
             let mut chunk_start = if epoch == 1 { effective_start_superbatch } else { 1 };
-            let chunk_size = args.save_rate.max(1);
+            let chunk_size = effective_save_rate(args).max(1);
             let plateau_rollback_dir = output_dir_buf.join(".bulletou_plateau_rollback");
             'epoch: loop {
                 if chunk_start > end_superbatch {
@@ -8761,7 +8767,7 @@ macro_rules! run_training_inline_nnue {
                     },
                     wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
                     lr_scheduler: lr_scheduler_for_chunk,
-                    save_rate: args.save_rate,
+                    save_rate: effective_save_rate(args),
                 };
 
                 // Per-chunk callback only records that the save happened
@@ -10362,7 +10368,7 @@ mod tests {
         let sig_with = resume_signature(&with_superbatches);
         let sig_without = resume_signature(&without_superbatches);
         assert!(sig_with.contains("schema=bulletou-resume-v2"));
-        assert!(sig_with.contains("backend=bullet"));
+        assert!(sig_with.contains("backend=cuda-cpp"));
         assert!(sig_with.contains("positions_per_superbatch=99942400"));
         assert!(sig_with.contains("superbatches=19"));
         assert!(sig_with.contains("test_sample=random"));
@@ -10405,10 +10411,34 @@ mod tests {
     }
 
     #[test]
-    fn backend_defaults_to_existing_bullet_path() {
+    fn backend_defaults_to_cuda_cpp_path() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+
+        assert_eq!(args.backend, BackendKind::CudaCpp);
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.unwrap_err().contains("--cuda-cpp-train-steps"));
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn explicit_bullet_backend_keeps_generic_path_available() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "bullet",
+        ])
+        .unwrap();
 
         assert_eq!(args.backend, BackendKind::Bullet);
         assert!(args.validate_backend_flags().is_ok());
@@ -10547,6 +10577,8 @@ mod tests {
             "plateau",
             "--test-teacher",
             "yamaoka-floodgate.psv",
+            "--save-rate",
+            "1",
         ])
         .unwrap();
 
@@ -10915,6 +10947,8 @@ mod tests {
             "plateau",
             "--test-teacher",
             "yamaoka-floodgate.psv",
+            "--save-rate",
+            "1",
             "--sfnn-factorized-l1",
         ])
         .unwrap();
@@ -11930,6 +11964,9 @@ mod tests {
         assert!(!auto);
         assert_eq!(args.lr_step_positions, None);
         assert_eq!(args.optimizer_weight_decay, 0.0);
+        assert_eq!(args.scale, 290);
+        assert_eq!(args.save_rate, None);
+        assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);
     }
 
     #[test]

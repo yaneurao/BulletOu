@@ -93,8 +93,9 @@ checkpoints/my-halfkp/
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | superbatch あたりの目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
-| `--save-rate` | N superbatch ごとに save | 1 |
+| `--save-rate` | N superbatch ごとに save | 20 |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
+| `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 
 loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。

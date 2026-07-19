@@ -12,12 +12,12 @@
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--backend` | 学習 backend。現状の実用経路は `bullet`。`cuda-oxide` は NNUE/SFNN 専用高速 backend 用に予約されており、未接続の間は明示エラーになる | `bullet` |
+| `--backend` | 学習 backend。デフォルトの高速経路は Windows-native `cuda-cpp`。対応外の eval type や汎用 backend を使う場合は `bullet` を明示する | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
-| `--save-rate` | N superbatch ごとに checkpoint を保存 | 1 |
+| `--save-rate` | N superbatch ごとに checkpoint を保存。`plateau` では引き続き `--save-rate 1` が必要 | 20 |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
 | `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
 | `--lr-schedule` | `step` (= 階段状 StepLR)、`geometric` (= 対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
@@ -28,6 +28,7 @@
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
+| `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
