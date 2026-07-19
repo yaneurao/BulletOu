@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap/profiling, pinned staged upload, sparse L0 zero-gradient atomic skip, WRM score-target lookup, teacher single-bucket cleanup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap/profiling, pinned staged upload, sparse L0 zero-gradient atomic skip, HalfKP direct teacher preparation, WRM score-target lookup, teacher single-bucket cleanup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
 
 ## Notes
 
@@ -1024,6 +1024,12 @@ the tickets in order and commit each completed slice.
   - new CLI flag: `--cuda-cpp-profile-teacher-prepare`;
   - it passes the existing `profile_prepare` path into HalfKP/SFNN teacher batch configs and disables the prepared-batch producer queue for clearer per-batch CPU timings;
   - HalfKP bs65k/3-step smoke on `shuffled-001.hcpe` printed `profile_teacher` prepare times of `15.400ms`, `18.732ms`, and `14.520ms` per batch.
+- Adopted a non-factorized HalfKP direct teacher preparation path:
+  - `ShogiHalfKP` now exposes `fill_halfkp_feature_indices`, and `HalfkpTeacherBatchConfig::ft_factorize=false` materializes `FastBatchHost` directly instead of routing through generic `PreparedData`;
+  - the factorized HalfKP path still uses the generic `Factorised<ShogiHalfKP, ShogiHalfKPPieceFactorizer>` materializer;
+  - HalfKP bs65k/3-step teacher-prepare profile after the direct path printed `16.119ms`, `14.930ms`, and `14.184ms`;
+  - speed-only probes reported 4M `2824693` pos/s and 16M `2828516` pos/s;
+  - the yamaoka-fixed 4M validation run reported `2693410` pos/s, `test_loss=0.03538197`, `test_acc=0.6238556`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
@@ -1034,6 +1040,7 @@ the tickets in order and commit each completed slice.
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
   - `cargo test -p bulletou-cuda-cpp --lib` passed;
   - `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed;
+  - `cargo test -p bulletou_lib shogi_halfkp -- --nocapture` passed;
   - `cargo test -p bulletou_lib value::loader -- --nocapture` passed;
   - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (39 cuda-cpp tests);

@@ -481,7 +481,7 @@ fn sigmoid(x: f32) -> f32 {
 
 static WIN_RATE_MODEL_SCORE_TABLE: OnceLock<Box<[f32]>> = OnceLock::new();
 
-fn initialise_win_rate_model_score_table() -> &'static [f32] {
+pub(crate) fn initialise_win_rate_model_score_table() -> &'static [f32] {
     WIN_RATE_MODEL_SCORE_TABLE.get_or_init(|| {
         let mut values = Vec::with_capacity(usize::from(u16::MAX) + 1);
         for raw_score in i32::from(i16::MIN)..=i32::from(i16::MAX) {
@@ -494,7 +494,7 @@ fn initialise_win_rate_model_score_table() -> &'static [f32] {
     })
 }
 
-fn win_rate_model_score(score: i16) -> f32 {
+pub(crate) fn win_rate_model_score(score: i16) -> f32 {
     let table = initialise_win_rate_model_score_table();
     let index = (i32::from(score) - i32::from(i16::MIN)) as usize;
     table[index]

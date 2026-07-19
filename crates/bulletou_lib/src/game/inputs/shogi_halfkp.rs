@@ -132,6 +132,31 @@ impl Factorises<ShogiHalfKP> for ShogiHalfKPPieceFactorizer {
 ///
 /// stm (side-to-move) 視点と nstm (not-side-to-move) 視点の両方を返す。
 /// 片玉・詰将棋データ（玉位置が SQ_NB=81）の場合は何もしない。
+/// Fill fixed-size STM/NSTM HalfKP sparse feature buffers for one packed shogi
+/// position, returning the number of features written on each perspective.
+///
+/// Unused slots are intentionally left untouched; callers that pass reused
+/// buffers must clear the tail themselves. Fresh teacher batches allocate the
+/// whole sparse buffer with `-1`, so they can skip per-position tail writes.
+pub fn fill_halfkp_feature_indices(pos: &PackedSfenValue, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
+    debug_assert!(stm.len() >= MAX_ACTIVE_FEATURES);
+    debug_assert!(nstm.len() >= MAX_ACTIVE_FEATURES);
+    let board = ShogiBoard::from_packed_sfen(pos);
+    let mut stm_count = 0usize;
+    let mut nstm_count = 0usize;
+    map_halfkp_features(&board, |stm_idx, nstm_idx| {
+        debug_assert!(stm_count < stm.len());
+        debug_assert!(nstm_count < nstm.len());
+        stm[stm_count] = stm_idx as i32;
+        nstm[nstm_count] = nstm_idx as i32;
+        stm_count += 1;
+        nstm_count += 1;
+    });
+    debug_assert!(stm_count <= MAX_ACTIVE_FEATURES);
+    debug_assert!(nstm_count <= MAX_ACTIVE_FEATURES);
+    (stm_count, nstm_count)
+}
+
 fn map_halfkp_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     // STM と NSTM の視点
     let stm = board.side_to_move;
