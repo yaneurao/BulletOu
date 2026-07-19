@@ -3286,8 +3286,12 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
+            let progress = cuda_cpp_progress_label(schedule, seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let elapsed = started.elapsed().as_secs_f64();
+            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
             eprintln!(
-                "  cuda-cpp {} step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                "  cuda-cpp {} step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
                 component.label(),
                 loss.mean,
                 teacher_batch.source
@@ -4222,15 +4226,19 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
+            let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let elapsed = started.elapsed().as_secs_f64();
+            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
             if completed_step_offset > 0 {
                 eprintln!(
-                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} optimizer_step={optimizer_step} \
-                     loss_mean={:.8} source={}",
+                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} {progress} optimizer_step={optimizer_step} \
+                     positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
                     loss.mean, teacher_batch.source
                 );
             } else {
                 eprintln!(
-                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                    "  cuda-cpp step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
                     loss.mean, teacher_batch.source
                 );
             }
@@ -5000,15 +5008,19 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             last_loss = loss.mean;
             reported_loss_sum += f64::from(loss.mean);
             reported_loss_count += 1;
+            let progress = cuda_cpp_progress_label(&schedule, seen_steps);
+            let positions = seen_steps.saturating_mul(batch_size);
+            let elapsed = started.elapsed().as_secs_f64();
+            let positions_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
             if completed_step_offset > 0 {
                 eprintln!(
-                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} optimizer_step={optimizer_step} \
-                     loss_mean={:.8} source={}",
+                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} {progress} optimizer_step={optimizer_step} \
+                     positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
                     loss.mean, teacher_batch.source
                 );
             } else {
                 eprintln!(
-                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} loss_mean={:.8} source={}",
+                    "  cuda-cpp SFNN step {seen_steps:>6}/{train_steps:<6} {progress} positions={positions} pos/s={positions_per_sec:.0} loss_mean={:.8} source={}",
                     loss.mean, teacher_batch.source
                 );
             }
@@ -7146,6 +7158,7 @@ struct CudaCppRunSchedule {
     production: bool,
     total_steps: usize,
     batches_per_superbatch: usize,
+    superbatches_per_epoch: usize,
     prior_positions: usize,
     lr_period: u64,
     lr_step_gamma: f32,
@@ -7170,6 +7183,62 @@ impl CudaCppRunSchedule {
             args.lr
         }
     }
+
+    fn progress_for_step(&self, seen_steps: usize) -> Option<CudaCppScheduleProgress> {
+        if seen_steps == 0 {
+            return None;
+        }
+        let batches_per_superbatch = self.batches_per_superbatch.max(1);
+        for chunk in &self.chunks {
+            let chunk_start = chunk.cumulative_steps.saturating_sub(chunk.steps);
+            if seen_steps <= chunk_start || seen_steps > chunk.cumulative_steps {
+                continue;
+            }
+            let offset = seen_steps - chunk_start - 1;
+            let superbatch_count = chunk.steps.div_ceil(batches_per_superbatch);
+            let first_superbatch = chunk.superbatch.saturating_sub(superbatch_count).saturating_add(1);
+            return Some(CudaCppScheduleProgress {
+                epoch: chunk.epoch,
+                superbatch: first_superbatch + offset / batches_per_superbatch,
+                superbatches_per_epoch: self.superbatches_per_epoch,
+                batch_in_superbatch: offset % batches_per_superbatch + 1,
+                batches_per_superbatch,
+            });
+        }
+        None
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CudaCppScheduleProgress {
+    epoch: usize,
+    superbatch: usize,
+    superbatches_per_epoch: usize,
+    batch_in_superbatch: usize,
+    batches_per_superbatch: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppScheduleProgress {
+    fn display(self) -> String {
+        format!(
+            "epoch={} sb={}/{} batch={}/{}",
+            self.epoch,
+            self.superbatch,
+            self.superbatches_per_epoch,
+            self.batch_in_superbatch,
+            self.batches_per_superbatch
+        )
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> String {
+    schedule
+        .progress_for_step(seen_steps)
+        .map(CudaCppScheduleProgress::display)
+        .unwrap_or_else(|| "epoch=? sb=? batch=?".to_string())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7182,6 +7251,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             production: false,
             total_steps: train_steps,
             batches_per_superbatch: train_steps,
+            superbatches_per_epoch: 1,
             prior_positions: 0,
             lr_period: 0,
             lr_step_gamma: DEFAULT_LR_STEP_GAMMA,
@@ -7316,6 +7386,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         production: true,
         total_steps,
         batches_per_superbatch,
+        superbatches_per_epoch: superbatches,
         prior_positions,
         lr_period,
         lr_step_gamma,
@@ -9339,6 +9410,60 @@ mod tests {
         assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6);
         assert!(schedule.chunks[0].lr_end < schedule.chunks[0].lr_start);
         assert!((schedule.chunks[2].lr_start - 0.1).abs() < 1e-6, "LR should warm-restart at epoch 2");
+
+        assert_eq!(schedule.progress_for_step(0), None);
+        assert_eq!(
+            schedule.progress_for_step(1),
+            Some(CudaCppScheduleProgress {
+                epoch: 1,
+                superbatch: 1,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 1,
+                batches_per_superbatch: 4,
+            })
+        );
+        assert_eq!(
+            schedule.progress_for_step(8),
+            Some(CudaCppScheduleProgress {
+                epoch: 1,
+                superbatch: 2,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 4,
+                batches_per_superbatch: 4,
+            })
+        );
+        assert_eq!(
+            schedule.progress_for_step(9),
+            Some(CudaCppScheduleProgress {
+                epoch: 1,
+                superbatch: 3,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 1,
+                batches_per_superbatch: 4,
+            })
+        );
+        assert_eq!(
+            schedule.progress_for_step(13),
+            Some(CudaCppScheduleProgress {
+                epoch: 2,
+                superbatch: 1,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 1,
+                batches_per_superbatch: 4,
+            })
+        );
+        assert_eq!(
+            schedule.progress_for_step(24),
+            Some(CudaCppScheduleProgress {
+                epoch: 2,
+                superbatch: 3,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 4,
+                batches_per_superbatch: 4,
+            })
+        );
+        assert_eq!(schedule.progress_for_step(25), None);
+        assert_eq!(cuda_cpp_progress_label(&schedule, 9), "epoch=1 sb=3/3 batch=1/4");
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
