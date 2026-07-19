@@ -1074,11 +1074,101 @@ impl PlateauLrState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ConsoleColor {
+    Dim,
+    Yellow,
+    Magenta,
+    Cyan,
+    BoldCyan,
+    BoldGreen,
+}
+
+fn console_color_enabled() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("BULLETOU_COLOR").is_ok_and(|value| value.eq_ignore_ascii_case("never")) {
+        return false;
+    }
+    if std::env::var("BULLETOU_COLOR").is_ok_and(|value| value.eq_ignore_ascii_case("always")) {
+        return true;
+    }
+    !std::env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"))
+}
+
+fn color_code(color: ConsoleColor) -> &'static str {
+    match color {
+        ConsoleColor::Dim => "\x1b[2m",
+        ConsoleColor::Yellow => "\x1b[33m",
+        ConsoleColor::Magenta => "\x1b[35m",
+        ConsoleColor::Cyan => "\x1b[36m",
+        ConsoleColor::BoldCyan => "\x1b[1;36m",
+        ConsoleColor::BoldGreen => "\x1b[1;32m",
+    }
+}
+
+fn paint(text: impl std::fmt::Display, color: ConsoleColor) -> String {
+    if console_color_enabled() {
+        format!("{}{}\x1b[0m", color_code(color), text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn colored_positions(positions: usize) -> String {
+    paint(format!("positions={positions}"), ConsoleColor::Cyan)
+}
+
+fn colored_pos_s(positions_per_sec: f64) -> String {
+    paint(format!("pos/s={positions_per_sec:.0}"), ConsoleColor::BoldGreen)
+}
+
+fn colored_metric(label: &str, value: f32, precision: usize) -> String {
+    paint(format!("{label}={value:.precision$}"), ConsoleColor::Magenta)
+}
+
+fn print_cuda_cpp_checkpoint(
+    prefix: &str,
+    progress: &str,
+    positions: usize,
+    positions_per_sec: f64,
+    checkpoint_dir: &std::path::Path,
+) {
+    eprintln!(
+        "  {} {}: {progress} {} {} {}",
+        paint(prefix, ConsoleColor::Dim),
+        paint("checkpoint", ConsoleColor::BoldGreen),
+        colored_positions(positions),
+        colored_pos_s(positions_per_sec),
+        paint(format!("dir={}", checkpoint_dir.display()), ConsoleColor::Dim)
+    );
+}
+
+fn print_cuda_cpp_validation_summary(prefix: &str, epoch_superbatch: Option<(usize, usize)>, accuracy: f32, loss: f32) {
+    match epoch_superbatch {
+        Some((epoch, superbatch)) => eprintln!(
+            "  {} {}: epoch={epoch}, superbatch={superbatch}, {}, {}",
+            paint(prefix, ConsoleColor::Dim),
+            paint("validation", ConsoleColor::Yellow),
+            colored_metric("test_value_accuracy", accuracy, 7),
+            colored_metric("test_value_loss", loss, 8)
+        ),
+        None => eprintln!(
+            "  {} {}: {}, {}",
+            paint(prefix, ConsoleColor::Dim),
+            paint("final validation", ConsoleColor::Yellow),
+            colored_metric("test_value_accuracy", accuracy, 7),
+            colored_metric("test_value_loss", loss, 8)
+        ),
+    }
+}
+
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     if max_epochs == usize::MAX {
-        eprintln!("\n=== epoch {epoch} / unlimited ===");
+        eprintln!("\n{}", paint(format!("=== epoch {epoch} / unlimited ==="), ConsoleColor::BoldCyan));
     } else if max_epochs > 1 {
-        eprintln!("\n=== epoch {epoch} / {max_epochs} ===");
+        eprintln!("\n{}", paint(format!("=== epoch {epoch} / {max_epochs} ==="), ConsoleColor::BoldCyan));
     }
 }
 
@@ -3341,14 +3431,17 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 let positions = seen_steps.saturating_mul(batch_size);
                 let (_train_elapsed_sec, positions_per_sec) =
                     cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                eprintln!(
-                    "  cuda-cpp {} checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-                    component.label(),
-                    checkpoint_dir.display()
+                print_cuda_cpp_checkpoint(
+                    &format!("cuda-cpp {}", component.label()),
+                    &progress,
+                    positions,
+                    positions_per_sec,
+                    &checkpoint_dir,
                 );
             } else {
                 eprintln!(
-                    "  cuda-cpp {} checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                    "  {} {} checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                    paint("cuda-cpp", ConsoleColor::Dim),
                     component.label(),
                     chunk.epoch,
                     chunk.superbatch
@@ -3373,9 +3466,13 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp {} train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
-        component.label()
+        "  {} {} train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
+         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+        paint("cuda-cpp", ConsoleColor::Dim),
+        component.label(),
+        paint("ok", ConsoleColor::BoldGreen),
+        colored_positions(positions),
+        colored_pos_s(positions_per_sec)
     );
 
     Ok(())
@@ -4046,10 +4143,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     let positions = accepted_steps_total.saturating_mul(batch_size);
                     let (_train_elapsed_sec, positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                    eprintln!(
-                        "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-                        checkpoint_dir.display()
-                    );
+                    print_cuda_cpp_checkpoint("cuda-cpp", &progress, positions, positions_per_sec, &checkpoint_dir);
                     last_checkpoint_metrics = Some(test_metrics);
                 }
 
@@ -4161,9 +4255,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let reported_avg_loss =
             if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
-            "  cuda-cpp plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
-             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+            "  {} plateau train = {}: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
+             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}, \
+             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+            paint("cuda-cpp", ConsoleColor::Dim),
+            paint("ok", ConsoleColor::BoldGreen),
+            colored_positions(positions),
+            colored_pos_s(positions_per_sec)
         );
         let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
         let final_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
@@ -4178,10 +4276,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         )?;
         eprintln!("  cuda-cpp direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
         if let Some(metrics) = last_checkpoint_metrics {
-            eprintln!(
-                "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-                metrics.accuracy, metrics.loss
-            );
+            print_cuda_cpp_validation_summary("cuda-cpp", None, metrics.accuracy, metrics.loss);
         }
         return Ok(());
     }
@@ -4224,8 +4319,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        let should_report =
-            is_checkpoint_step || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        let should_report = is_checkpoint_step
+            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if seen_steps <= profile_steps {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
@@ -4298,7 +4393,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     let checkpoint_started = std::time::Instant::now();
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
-                    let test_metrics = run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                    let test_metrics =
+                        run_cuda_cpp_nnue_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
                     let checkpoint_dir = write_cuda_cpp_nnue_numbered_checkpoint(
                         args,
                         feature_kind,
@@ -4323,14 +4419,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     let positions = seen_steps.saturating_mul(batch_size);
                     let (_train_elapsed_sec, positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                    eprintln!(
-                        "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-                        checkpoint_dir.display()
-                    );
+                    print_cuda_cpp_checkpoint("cuda-cpp", &progress, positions, positions_per_sec, &checkpoint_dir);
                     if let Some(metrics) = test_metrics {
-                        eprintln!(
-                            "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                            chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        print_cuda_cpp_validation_summary(
+                            "cuda-cpp",
+                            Some((chunk.epoch, chunk.superbatch)),
+                            metrics.accuracy,
+                            metrics.loss,
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
@@ -4355,8 +4450,12 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp direct train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+        "  {} direct train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
+         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+        paint("cuda-cpp", ConsoleColor::Dim),
+        paint("ok", ConsoleColor::BoldGreen),
+        colored_positions(positions),
+        colored_pos_s(positions_per_sec)
     );
     if profile_count > 0 {
         let denom = profile_count as f64;
@@ -4386,9 +4485,11 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     None => None,
                 }
             } {
-                eprintln!(
-                    "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                print_cuda_cpp_validation_summary(
+                    "cuda-cpp",
+                    Some((chunk.epoch, chunk.superbatch)),
+                    metrics.accuracy,
+                    metrics.loss,
                 );
                 last_checkpoint_metrics = Some(metrics);
             }
@@ -4400,10 +4501,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             ));
         }
         if let Some(metrics) = last_checkpoint_metrics {
-            eprintln!(
-                "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-                metrics.accuracy, metrics.loss
-            );
+            print_cuda_cpp_validation_summary("cuda-cpp", None, metrics.accuracy, metrics.loss);
         }
         eprintln!("  cuda-cpp final output skipped (--cuda-cpp-skip-final-output)");
         return Ok(());
@@ -4432,14 +4530,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             },
         )?;
         let progress = cuda_cpp_progress_label(&schedule, seen_steps);
-        eprintln!(
-            "  cuda-cpp checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-            checkpoint_dir.display()
-        );
+        print_cuda_cpp_checkpoint("cuda-cpp", &progress, positions, positions_per_sec, &checkpoint_dir);
         if let Some(metrics) = test_metrics {
-            eprintln!(
-                "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+            print_cuda_cpp_validation_summary(
+                "cuda-cpp",
+                Some((chunk.epoch, chunk.superbatch)),
+                metrics.accuracy,
+                metrics.loss,
             );
         }
         last_checkpoint_metrics = test_metrics;
@@ -4461,10 +4558,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         ));
     }
     if let Some(metrics) = last_checkpoint_metrics {
-        eprintln!(
-            "  cuda-cpp final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-            metrics.accuracy, metrics.loss
-        );
+        print_cuda_cpp_validation_summary("cuda-cpp", None, metrics.accuracy, metrics.loss);
     }
 
     Ok(())
@@ -4841,9 +4935,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let positions = accepted_steps_total.saturating_mul(batch_size);
                     let (_train_elapsed_sec, positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                    eprintln!(
-                        "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-                        checkpoint_dir.display()
+                    print_cuda_cpp_checkpoint(
+                        "cuda-cpp SFNN",
+                        &progress,
+                        positions,
+                        positions_per_sec,
+                        &checkpoint_dir,
                     );
                     last_checkpoint_metrics = Some(test_metrics);
                 }
@@ -4956,9 +5053,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let reported_avg_loss =
             if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
-            "  cuda-cpp SFNN plateau train = ok: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, throughput={positions_per_sec:.0} pos/s, \
-             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+            "  {} plateau train = {}: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
+             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}, \
+             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+            paint("cuda-cpp SFNN", ConsoleColor::Dim),
+            paint("ok", ConsoleColor::BoldGreen),
+            colored_positions(positions),
+            colored_pos_s(positions_per_sec)
         );
         let final_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
         let final_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
@@ -4973,10 +5074,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         )?;
         eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
         if let Some(metrics) = last_checkpoint_metrics {
-            eprintln!(
-                "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-                metrics.accuracy, metrics.loss
-            );
+            print_cuda_cpp_validation_summary("cuda-cpp SFNN", None, metrics.accuracy, metrics.loss);
         }
         return Ok(());
     }
@@ -5020,8 +5118,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        let should_report =
-            is_checkpoint_step || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        let should_report = is_checkpoint_step
+            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if seen_steps <= profile_steps {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
@@ -5108,7 +5206,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 if chunk.save_checkpoint {
                     let checkpoint_started = std::time::Instant::now();
                     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-                    let test_metrics = run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                    let test_metrics =
+                        run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
                     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                     let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
                         args,
@@ -5134,14 +5233,19 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let positions = seen_steps.saturating_mul(batch_size);
                     let (_train_elapsed_sec, positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                    eprintln!(
-                        "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-                        checkpoint_dir.display()
+                    print_cuda_cpp_checkpoint(
+                        "cuda-cpp SFNN",
+                        &progress,
+                        positions,
+                        positions_per_sec,
+                        &checkpoint_dir,
                     );
                     if let Some(metrics) = test_metrics {
-                        eprintln!(
-                            "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                            chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        print_cuda_cpp_validation_summary(
+                            "cuda-cpp SFNN",
+                            Some((chunk.epoch, chunk.superbatch)),
+                            metrics.accuracy,
+                            metrics.loss,
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
@@ -5166,8 +5270,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
     let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
-        "  cuda-cpp SFNN direct train = ok: steps={seen_steps}, positions={positions}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         throughput={positions_per_sec:.0} pos/s, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}"
+        "  {} direct train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
+         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+        paint("cuda-cpp SFNN", ConsoleColor::Dim),
+        paint("ok", ConsoleColor::BoldGreen),
+        colored_positions(positions),
+        colored_pos_s(positions_per_sec)
     );
     if profile_count > 0 {
         let denom = profile_count as f64;
@@ -5207,9 +5315,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     None => None,
                 }
             } {
-                eprintln!(
-                    "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                print_cuda_cpp_validation_summary(
+                    "cuda-cpp SFNN",
+                    Some((chunk.epoch, chunk.superbatch)),
+                    metrics.accuracy,
+                    metrics.loss,
                 );
                 last_checkpoint_metrics = Some(metrics);
             }
@@ -5221,10 +5331,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ));
         }
         if let Some(metrics) = last_checkpoint_metrics {
-            eprintln!(
-                "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-                metrics.accuracy, metrics.loss
-            );
+            print_cuda_cpp_validation_summary("cuda-cpp SFNN", None, metrics.accuracy, metrics.loss);
         }
         eprintln!("  cuda-cpp SFNN final output skipped (--cuda-cpp-skip-final-output)");
         return Ok(());
@@ -5253,14 +5360,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             },
         )?;
         let progress = cuda_cpp_progress_label(&schedule, seen_steps);
-        eprintln!(
-            "  cuda-cpp SFNN checkpoint: {progress} positions={positions} pos/s={positions_per_sec:.0} dir={}",
-            checkpoint_dir.display()
-        );
+        print_cuda_cpp_checkpoint("cuda-cpp SFNN", &progress, positions, positions_per_sec, &checkpoint_dir);
         if let Some(metrics) = test_metrics {
-            eprintln!(
-                "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+            print_cuda_cpp_validation_summary(
+                "cuda-cpp SFNN",
+                Some((chunk.epoch, chunk.superbatch)),
+                metrics.accuracy,
+                metrics.loss,
             );
         }
         last_checkpoint_metrics = test_metrics;
@@ -5282,10 +5388,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ));
     }
     if let Some(metrics) = last_checkpoint_metrics {
-        eprintln!(
-            "  cuda-cpp SFNN final validation summary: test_value_accuracy={:.7}, test_value_loss={:.8}",
-            metrics.accuracy, metrics.loss
-        );
+        print_cuda_cpp_validation_summary("cuda-cpp SFNN", None, metrics.accuracy, metrics.loss);
     }
 
     Ok(())
