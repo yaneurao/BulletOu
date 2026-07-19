@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, and pinned staged upload are in; remaining work is sparse L0/update hot spots and speed/quality recipe selection against the previous cuda-oxide 4M throughput ceiling |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, and a short 4M speed/quality recipe sweep are in; remaining work is sparse L0/update hot spots plus longer-teacher confirmation against the previous cuda-oxide throughput ceiling |
 
 ## Notes
 
@@ -958,6 +958,17 @@ the tickets in order and commit each completed slice.
   - bs65k improved from the overlap-only `~2.51M` pos/s line to `2752872` pos/s, and a validation run reported `2715894` pos/s with yamaoka `test_value_loss=0.05523509`, `test_value_accuracy=0.6442871`;
   - bs131k reported `2670155` pos/s, so the best speed point in this short 4M probe moved to bs65k;
   - bs16k with `--threads 16` reported `2389868` pos/s and yamaoka `test_value_loss=0.05368488`, `test_value_accuracy=0.6662598`, but the bs16k quality probe still needs a larger validation/sample comparison before changing the recommended quality recipe.
+- Short 4M speed/quality recipe sweep with validation fixed to `C:\shogi\teacher\test\yamaoka-floodgate.psv`, `--test-positions 65536 --test-sample sequential --test-batch-size 4096`:
+  - bs16k, `beta1=0.975`, LR `0.024`: `2315240` pos/s, `test_loss=0.03574366`, `test_acc=0.6266327`;
+  - bs32k, `beta1=0.975`, LR `0.024`: `2478123` pos/s, `test_loss=0.03513663`, `test_acc=0.6267548`;
+  - bs49k, `beta1=0.975`, LR `0.024`: `2627500` pos/s, `test_loss=0.03489432`, `test_acc=0.6256714`;
+  - bs65k, `beta1=0.975`, LR `0.024`: `2741555` pos/s, `test_loss=0.03517838`, `test_acc=0.6232605`;
+  - bs32k LR probes: LR `0.032` regressed to `test_loss=0.03571033`, `test_acc=0.6262054`; LR `0.018` regressed to `test_loss=0.03567243`, `test_acc=0.6249542`;
+  - bs32k beta probes at LR `0.024`: `beta1=0.99` gave `test_loss=0.03541317`, `test_acc=0.6266327`; `beta1=0.9` gave the best short-run accuracy, `test_loss=0.03685767`, `test_acc=0.6276093`.
+- Current short 4M guidance after the sweep:
+  - speed-only probe: bs65k / `beta1=0.975` / LR `0.024`;
+  - balanced loss+speed probe: bs32k / `beta1=0.975` / LR `0.024`;
+  - accuracy-biased short probe: bs32k / `beta1=0.9` / LR `0.024`, with the caveat that its held-out loss is worse and needs a longer/full-teacher check before becoming the production recommendation.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;
