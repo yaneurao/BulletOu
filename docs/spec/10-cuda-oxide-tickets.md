@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, sparse L0 zero-gradient atomic skip, WRM score-target lookup, teacher tail-fill cleanup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap, pinned staged upload, sparse L0 zero-gradient atomic skip, WRM score-target lookup, teacher single-bucket cleanup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
 
 ## Notes
 
@@ -1016,6 +1016,10 @@ the tickets in order and commit each completed slice.
   - `stm` and `nstm` sparse buffers are already allocated with `-1` in every slot, so the per-position tail loops that re-wrote unused slots to `-1` were unnecessary;
   - HalfKP bs65k probes remained speed-neutral within run-to-run variance: 4M speed-only `2794386` pos/s and 16M speed-only `2788785` pos/s;
   - the yamaoka-fixed 4M validation run reported `2792950` pos/s, `test_loss=0.03538862`, `test_acc=0.6237640`.
+- Skipped `out.bucket(pos)` calls for single-bucket teacher preparation:
+  - when `OutputBuckets::BUCKETS == 1`, the preallocated `buckets` vector is already all zeros, so the per-position bucket call/write is unnecessary;
+  - HalfKP bs65k probes again stayed speed-neutral: 4M speed-only `2802036` pos/s and 16M speed-only `2783633` pos/s;
+  - the yamaoka-fixed 4M validation run reported `2794712` pos/s, `test_loss=0.03534004`, `test_acc=0.6218414`.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
