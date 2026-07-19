@@ -1,7 +1,11 @@
 //! Teacher-to-`FastBatchHost` helpers shared by fixture exporters and future
 //! fast backend trainers.
 
-use std::{error::Error, fmt, sync::atomic::Ordering};
+use std::{
+    error::Error,
+    fmt,
+    sync::{atomic::Ordering, mpsc},
+};
 
 use crate::{
     game::{
@@ -38,6 +42,8 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub loader_threads: usize,
     /// CPU worker threads used while materialising the prepared batch.
     pub threads: usize,
+    /// Prepared-batch queue depth used to overlap CPU materialisation with GPU consumption.
+    pub queue_depth: usize,
     /// Lambda on teacher eval score when target values are prepared.
     pub lambda: f32,
     /// Eval-to-score sigmoid scale used while preparing teacher targets.
@@ -491,7 +497,7 @@ fn visit_halfkp_batches<D, P, F, E>(
 ) -> Result<usize, TeacherBatchError>
 where
     D: DataLoader<PackedSfenValue>,
-    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos> + Send,
     F: FnMut(HalfkpTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
@@ -531,9 +537,9 @@ fn visit_halfkp_batches_with_input<I, D, P, F, E>(
     mut visitor: F,
 ) -> Result<usize, TeacherBatchError>
 where
-    I: SparseInputType<RequiredDataType = PackedSfenValue>,
-    D: DataLoader<PackedSfenValue>,
-    P: FnMut(usize) -> Option<TeacherDataloaderPos>,
+    I: SparseInputType<RequiredDataType = PackedSfenValue> + Send,
+    D: DataLoader<PackedSfenValue> + Send,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos> + Send,
     F: FnMut(HalfkpTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
@@ -564,6 +570,89 @@ where
         config.score_drop_abs,
         loader,
     );
+
+    if config.queue_depth > 1 && !config.profile_prepare {
+        let (sender, receiver) =
+            mpsc::sync_channel::<Result<HalfkpTeacherBatch, TeacherBatchError>>(config.queue_depth);
+        return std::thread::scope(|scope| {
+            let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
+                let mut produced_batches = 0usize;
+                let mut producer_error = None;
+                dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
+                    let batch_index = config.batch_index + produced_batches;
+                    let prepared = match rayon_pool.as_ref() {
+                        Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+                        None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+                    };
+                    let batch = FastBatchHost::from(prepared);
+                    if let Err(err) = batch.validate() {
+                        producer_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+                        return true;
+                    }
+
+                    let source = format!("{format:?} teacher batch {batch_index}: {}", config.teacher);
+                    let dataloader_pos = dataloader_pos(produced_batches);
+                    if sender.send(Ok(HalfkpTeacherBatch { batch, source, dataloader_pos })).is_err() {
+                        return true;
+                    }
+
+                    produced_batches += 1;
+                    produced_batches >= batch_count
+                });
+
+                if let Some(err) = producer_error {
+                    let _ = sender.send(Err(err.clone()));
+                    return Err(err);
+                }
+                if produced_batches != batch_count {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                        config.batch_index, config.batch_size
+                    )));
+                }
+                Ok(produced_batches)
+            });
+
+            let mut consumed_batches = 0usize;
+            let mut visit_error = None;
+            while consumed_batches < batch_count {
+                match receiver.recv() {
+                    Ok(Ok(batch)) => {
+                        if let Err(err) = visitor(batch) {
+                            visit_error = Some(TeacherBatchError::invalid_input(format!(
+                                "teacher batch callback failed at batch {}: {err}",
+                                config.batch_index + consumed_batches
+                            )));
+                            break;
+                        }
+                        consumed_batches += 1;
+                    }
+                    Ok(Err(err)) => {
+                        visit_error = Some(err);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(receiver);
+
+            let producer_result = producer
+                .join()
+                .map_err(|_| TeacherBatchError::invalid_input("HalfKP teacher producer thread panicked"))?;
+            if let Some(err) = visit_error {
+                return Err(err);
+            }
+            producer_result?;
+            if consumed_batches != batch_count {
+                return Err(TeacherBatchError::invalid_input(format!(
+                    "teacher did not deliver {batch_count} complete prepared batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                    config.batch_index, config.batch_size
+                )));
+            }
+            Ok(consumed_batches)
+        });
+    }
+
     let mut visited_batches = 0usize;
     let mut visit_error = None;
     dataloader.load_and_map_batches(loader_start_batch, config.batch_size, |batch| {
@@ -740,6 +829,7 @@ mod tests {
             buffer_mb: 1,
             loader_threads: 1,
             threads: 1,
+            queue_depth: 1,
             lambda: 1.0,
             scale: 400.0,
             nnue_pytorch_wrm_loss: false,

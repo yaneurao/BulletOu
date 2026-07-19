@@ -43,7 +43,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-033 | done | port fixed-layout NNUE trainer to C++/CUDA | Windows-native C++/CUDA HalfKP direct training streams real teachers, writes/resumes numbered checkpoints, validates only against the held-out yamaoka PSV, and beats the BO-CUDA-029 tatara idle 4M reference in speed and held-out quality |
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
-| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | optimise the remaining HalfKP sparse L0 backward/update hot spots and first-step library warmup so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
+| BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, and CPU/GPU teacher-prepare overlap are in; remaining work is pinned/upload and sparse L0/update hot spots so the C++/CUDA path can target the previous cuda-oxide 4M throughput ceiling, not merely the tatara reference |
 
 ## Notes
 
@@ -921,3 +921,44 @@ the tickets in order and commit each completed slice.
     wrote `0001/{nn.bin,state.bin,learn.log,dataloader_pos.txt}`, logged `test_value_accuracy=0.625000`, `test_value_loss=0.239121`, `positions=8`, `lr_start=lr_end=0.001000`, and wrote `dataloader_pos.txt = 304,0`.
 - Result:
   - BO-CUDA-035 is complete for bounded production-schedule parity on the Windows-native C++/CUDA direct backend. Remaining work now moves to BO-CUDA-036's post-parity HalfKP optimisation.
+
+### BO-CUDA-036
+
+- Adopted first-step warmup for the Windows-native C++/CUDA HalfKP direct trainer:
+  - `Context` creation now performs a tiny CUDA/cuBLAS warmup, and `NnueTrainStepRunner::warmup` additionally launches the actual HalfKP dense-backward GEMM shapes once against scratch workspaces before the training timer starts;
+  - the warmup does not update trainable weights or optimizer state, and it avoids reading sparse feature indices, so it is safe before the first real teacher batch upload.
+- Adopted direct-mode benchmark timing cleanup:
+  - explicit `--cuda-cpp-train-steps` direct mode now defers its final numbered checkpoint and final validation until after `cuda-cpp direct train = ok` has measured elapsed training time;
+  - numbered checkpoints, `summary-learn.log`, validation metrics, and the compatibility `cuda-cpp-direct/{nn.bin,weights.bin}` folder are still written.
+- Adopted HalfKP CPU/GPU teacher-prepare overlap:
+  - `HalfkpTeacherBatchConfig` now has `queue_depth`;
+  - when `queue_depth > 1` and `profile_prepare=false`, a producer thread materializes `FastBatchHost` batches into a bounded queue while the caller consumes the previous batch on the GPU;
+  - `examples/bulletou --backend cuda-cpp` passes the existing `--batch-queue-size` to this queue;
+  - cuda-oxide and fixture-export callers use `queue_depth=1`, preserving their previous serial behavior.
+- HalfKP bs16k profile on RTX 4090 after warmup:
+  - command shape: `--backend cuda-cpp --eval-type NNUE_HALFKP --teacher C:\shogi\teacher\yane-distill-hcpe-20260508shuffled\shuffled-001.hcpe --cuda-cpp-train-steps 4 --batch-size 16384 --threads 10 --cuda-cpp-profile-steps 4 --cuda-cpp-loss-readback-interval 0`;
+  - before runner warmup, step1 backward was about `49.1ms`; after the tiny context warmup it was about `16.4ms`;
+  - after the dense-backward runner warmup, step1 backward dropped to `3.36-3.52ms`, with steady later steps about `3.10ms`;
+  - direct-mode checkpoint deferral moved the final checkpoint write after the measured `elapsed`.
+- HalfKP 4M speed probes on the same HCPE teacher, final-only WRM loss readback, `wd=0`, `beta1=0.975`, `lr=0.024`, `threads=10`:
+  - before CPU/GPU teacher overlap, bs16k reported about `1.95M` pos/s after checkpoint timing cleanup;
+  - after overlap, bs16k improved to `2.21M` then `2.30M` pos/s on repeat runs;
+  - bs32k reported `2.39M` pos/s;
+  - bs65k reported `2.51M` pos/s;
+  - bs131k reported `2.55M` pos/s.
+- Held-out validation check used only `C:\shogi\teacher\test\yamaoka-floodgate.psv`:
+  - bs16k/4M with the same WRM/optimizer settings and `--test-positions 8192 --test-sample sequential --test-batch-size 1024` reported training `throughput=2196263 pos/s`, then post-timer validation `test_value_loss=0.05183934`, `test_value_accuracy=0.6716309`;
+  - the final numbered checkpoint and validation summary were written after the measured training line, confirming the direct-mode timing cleanup.
+- Rejected experiments / cautions:
+  - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
+  - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;
+  - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed, but an existing pack-loader background thread can still print a post-test panic after the harness reports success; this appears unrelated to the HCPE HalfKP C++ direct path.
+- Validation for this partial BO-CUDA-036 increment:
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test -p bulletou-cuda-cpp --lib` passed;
+  - `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp -- --nocapture` passed (37 cuda-cpp tests);
+  - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed.
+- Remaining BO-CUDA-036 work:
+  - pinned-host upload or a safer upload pipeline for HalfKP, because pageable upload/host-side staging still leaves a gap between GPU-stage theoretical throughput and measured 4M throughput;
+  - further sparse L0 backward/update optimisation if the previous cuda-oxide 4M ceiling remains the target.

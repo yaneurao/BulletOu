@@ -160,6 +160,43 @@ struct DeviceFloats {
     }
 };
 
+int warmup_context(BulletOuCudaCppContext* ctx) {
+    DeviceFloats a;
+    DeviceFloats b;
+    DeviceFloats c;
+    if (a.allocate(1, "cudaMalloc warmup a") != 0 || b.allocate(1, "cudaMalloc warmup b") != 0 ||
+        c.allocate(1, "cudaMalloc warmup c") != 0) {
+        return -1;
+    }
+
+    cudaError_t status = cudaMemsetAsync(a.ptr, 0, sizeof(float), ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemsetAsync warmup a", status);
+    }
+    status = cudaMemsetAsync(b.ptr, 0, sizeof(float), ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemsetAsync warmup b", status);
+    }
+    status = cudaMemsetAsync(c.ptr, 0, sizeof(float), ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemsetAsync warmup c", status);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t blas_status =
+        cublasSgemm(ctx->blas, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &alpha, a.ptr, 1, b.ptr, 1, &beta, c.ptr, 1);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        return fail_blas("cublasSgemm warmup", blas_status);
+    }
+
+    status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamSynchronize warmup", status);
+    }
+    return 0;
+}
+
 __global__ void axpy_kernel(size_t len, float a, const float* x, const float* y, float* out) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= len) {
@@ -2516,6 +2553,12 @@ extern "C" int bulletou_cuda_cpp_context_create(int device, BulletOuCudaCppConte
         delete ctx;
         return fail_blas("cublasSetStream", blas_status);
     }
+    if (warmup_context(ctx) != 0) {
+        cublasDestroy(ctx->blas);
+        cudaStreamDestroy(ctx->stream);
+        delete ctx;
+        return -1;
+    }
 
     *out = ctx;
     return ok();
@@ -3627,6 +3670,111 @@ extern "C" int bulletou_cuda_cpp_nnue_backward_device(
         return -1;
     }
 
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_nnue_train_warmup_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t l1,
+    size_t l2,
+    size_t l3,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* hidden1,
+    const BulletOuCudaCppF32Buffer* hidden2,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* outw,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* hidden2_gradients,
+    BulletOuCudaCppF32Buffer* hidden1_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* outw_gradients,
+    BulletOuCudaCppF32Buffer* outb_gradients) {
+    if (validate_nnue_shape(input_size, l1, l2, l3, batch, max_active) != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(combined), batch * l1 * 2, "warmup combined") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(hidden1), batch * l2, "warmup hidden1") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(hidden2), batch * l3, "warmup hidden2") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), l1 * 2 * l2, "warmup l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l2w), l2 * l3, "warmup l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outw), l3, "warmup outw") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(mean_output_gradients), batch, "warmup mean_output_gradients") != 0 ||
+        validate_buffer(ctx, hidden2_gradients, batch * l3, "warmup hidden2_gradients") != 0 ||
+        validate_buffer(ctx, hidden1_gradients, batch * l2, "warmup hidden1_gradients") != 0 ||
+        validate_buffer(ctx, combined_gradients, batch * l1 * 2, "warmup combined_gradients") != 0 ||
+        validate_buffer(ctx, l1w_gradients, l1 * 2 * l2, "warmup l1w_gradients") != 0 ||
+        validate_buffer(ctx, l1b_gradients, l2, "warmup l1b_gradients") != 0 ||
+        validate_buffer(ctx, l2w_gradients, l2 * l3, "warmup l2w_gradients") != 0 ||
+        validate_buffer(ctx, l2b_gradients, l3, "warmup l2b_gradients") != 0 ||
+        validate_buffer(ctx, outw_gradients, l3, "warmup outw_gradients") != 0 ||
+        validate_buffer(ctx, outb_gradients, 1, "warmup outb_gradients") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+    size_t out_threads = std::max(batch * l3, std::max(l3, static_cast<size_t>(1)));
+    if (block_count_1d(out_threads, threads, &blocks, "warmup dense_output_backward_kernel") != 0) {
+        return -1;
+    }
+    dense_output_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        hidden2->ptr,
+        mean_output_gradients->ptr,
+        outw->ptr,
+        hidden2_gradients->ptr,
+        outw_gradients->ptr,
+        outb_gradients->ptr,
+        batch,
+        l3);
+    if (check_kernel_launch("warmup dense_output_backward_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (launch_dense_crelu_backward_gemm(
+            ctx,
+            "warmup dense_l2_crelu_backward_gemm",
+            hidden1->ptr,
+            hidden2->ptr,
+            hidden2_gradients->ptr,
+            l2w->ptr,
+            hidden1_gradients->ptr,
+            l2w_gradients->ptr,
+            l2b_gradients->ptr,
+            batch,
+            l2,
+            l3) != 0) {
+        return -1;
+    }
+
+    if (launch_dense_crelu_backward_gemm(
+            ctx,
+            "warmup dense_l1_crelu_backward_gemm",
+            combined->ptr,
+            hidden1->ptr,
+            hidden1_gradients->ptr,
+            l1w->ptr,
+            combined_gradients->ptr,
+            l1w_gradients->ptr,
+            l1b_gradients->ptr,
+            batch,
+            l1 * 2,
+            l2) != 0) {
+        return -1;
+    }
+
+    cudaError_t status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaStreamSynchronize NNUE train warmup", status);
+    }
     return ok();
 }
 

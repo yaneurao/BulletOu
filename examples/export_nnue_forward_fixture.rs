@@ -313,6 +313,7 @@ fn load_halfkp_teacher_batch(args: &Args) -> Result<(FastBatchHost, String), Box
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
+        queue_depth: 1,
         lambda: args.lambda,
         scale: args.scale,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,

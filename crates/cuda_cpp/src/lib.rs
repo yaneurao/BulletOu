@@ -1578,6 +1578,62 @@ fn nnue_backward_device_with_l0_zero(
     })
 }
 
+pub fn nnue_train_warmup_device(
+    ctx: &Context,
+    weights: &NnueForwardDeviceWeights,
+    forward: &NnueForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &NnueBackwardWorkspace,
+) -> Result<()> {
+    weights.validate()?;
+    forward.validate()?;
+    loss.validate()?;
+    backward.validate()?;
+    let shape = weights.shape;
+    if forward.layout.shape != shape || backward.layout.shape != shape {
+        return Err(CudaCppError::message(format!(
+            "NNUE warmup shape mismatch: weights={shape:?} forward={:?} backward={:?}",
+            forward.layout.shape, backward.layout.shape
+        )));
+    }
+    if loss.layout.batch_size != forward.layout.batch_size || backward.layout.batch_size != forward.layout.batch_size {
+        return Err(CudaCppError::message(format!(
+            "NNUE warmup batch mismatch: forward={} loss={} backward={}",
+            forward.layout.batch_size, loss.layout.batch_size, backward.layout.batch_size
+        )));
+    }
+
+    // SAFETY: all device buffers have been length-validated; the backend only warms dense-backward scratch buffers
+    // and does not update trainable weights or optimizer state.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_nnue_train_warmup_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.l1,
+            shape.l2,
+            shape.l3,
+            forward.layout.batch_size,
+            backward.layout.max_active,
+            forward.combined.as_ptr(),
+            forward.hidden1.as_ptr(),
+            forward.hidden2.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l2w.as_ptr(),
+            weights.outw.as_ptr(),
+            loss.mean_output_gradients.as_ptr(),
+            backward.hidden2_gradients.as_ptr(),
+            backward.hidden1_gradients.as_ptr(),
+            backward.combined_gradients.as_ptr(),
+            backward.l1w_gradients.as_ptr(),
+            backward.l1b_gradients.as_ptr(),
+            backward.l2w_gradients.as_ptr(),
+            backward.l2b_gradients.as_ptr(),
+            backward.outw_gradients.as_ptr(),
+            backward.outb_gradients.as_ptr(),
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SfnnBackwardWorkspaceLayout {
     pub shape: SfnnForwardShape,
@@ -2407,6 +2463,17 @@ impl NnueTrainStepRunner {
         self.read_loss(ctx)
     }
 
+    pub fn warmup(&self, ctx: &Context) -> Result<()> {
+        self.validate()?;
+        nnue_train_warmup_device(
+            ctx,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+        )
+    }
+
     pub fn step_no_readback(
         &mut self,
         ctx: &Context,
@@ -2414,6 +2481,18 @@ impl NnueTrainStepRunner {
         loss_kind: ScalarLossKind,
         output_inv_scale: f32,
         batch: NnueTrainStepHostBatch<'_>,
+    ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize(ctx, params, loss_kind, output_inv_scale, batch, true)
+    }
+
+    pub fn step_no_readback_with_loss_finalize(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: NnueTrainStepHostBatch<'_>,
+        finalize_loss: bool,
     ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
@@ -2430,7 +2509,7 @@ impl NnueTrainStepRunner {
         self.entry_weights.upload(ctx, batch.entry_weights)?;
 
         nnue_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
-        scalar_loss_device_from_buffers(
+        scalar_loss_device_from_buffers_with_finalize(
             ctx,
             loss_kind,
             output_inv_scale,
@@ -2439,6 +2518,7 @@ impl NnueTrainStepRunner {
             &self.targets,
             &self.entry_weights,
             &self.loss_workspace,
+            finalize_loss,
         )?;
         nnue_backward_device_reusing_zeroed_l0_gradients(
             ctx,
@@ -3674,6 +3754,31 @@ mod ffi {
             outw_gradients: *mut BulletOuCudaCppF32Buffer,
             outb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_l0_gradients: i32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_nnue_train_warmup_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            l1: usize,
+            l2: usize,
+            l3: usize,
+            batch: usize,
+            max_active: usize,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            hidden1: *mut BulletOuCudaCppF32Buffer,
+            hidden2: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            outw: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            hidden2_gradients: *mut BulletOuCudaCppF32Buffer,
+            hidden1_gradients: *mut BulletOuCudaCppF32Buffer,
+            combined_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            outw_gradients: *mut BulletOuCudaCppF32Buffer,
+            outb_gradients: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_forward_device(
             ctx: *mut BulletOuCudaCppContext,

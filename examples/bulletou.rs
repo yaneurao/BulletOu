@@ -3171,6 +3171,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         None => NnueTrainStepRunner::new(&ctx, initial_host_weights, batch_size, max_active),
     }
     .map_err(|e| e.to_string())?;
+    runner.warmup(&ctx).map_err(|e| e.to_string())?;
+    eprintln!("  cuda-cpp warmup = done (NNUE dense-backward kernels)");
 
     let loss_kind =
         if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
@@ -3204,6 +3206,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         buffer_mb: args.buffer_mb,
         loader_threads: args.loader_threads,
         threads: args.threads,
+        queue_depth: args.batch_queue_size,
         lambda: args.lambda,
         scale: args.scale as f32,
         nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3252,6 +3255,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                     buffer_mb: args.buffer_mb,
                     loader_threads: args.loader_threads,
                     threads: args.threads,
+                    queue_depth: args.batch_queue_size,
                     lambda: args.lambda,
                     scale: args.scale as f32,
                     nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
@@ -3293,8 +3297,16 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                         batch_size: fast.layout.batch_size,
                         max_active: fast.layout.max_active,
                     };
+                    let finalize_loss = chunk_seen_steps == chunk.steps;
                     runner
-                        .step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
+                        .step_no_readback_with_loss_finalize(
+                            &ctx,
+                            params,
+                            loss_kind,
+                            output_inv_scale,
+                            batch,
+                            finalize_loss,
+                        )
                         .map_err(|e| e.to_string())?;
                     Ok::<(), String>(())
                 })
@@ -3505,6 +3517,7 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
 
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
+    let mut deferred_direct_checkpoint = None;
     for_each_halfkp_teacher_fast_batch(&config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
@@ -3540,6 +3553,8 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
+        let should_report =
+            is_checkpoint_step || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if seen_steps <= profile_steps {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
@@ -3562,10 +3577,10 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
                 profile.total_ms
             );
         } else {
-            runner.step_no_readback(&ctx, params, loss_kind, output_inv_scale, batch).map_err(|e| e.to_string())?;
+            runner
+                .step_no_readback_with_loss_finalize(&ctx, params, loss_kind, output_inv_scale, batch, should_report)
+                .map_err(|e| e.to_string())?;
         }
-        let should_report =
-            is_checkpoint_step || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if should_report {
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
             last_loss = loss.mean;
@@ -3586,36 +3601,40 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
-            let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-            let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
-            let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
-            let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
-                args,
-                cuda_shape,
-                &trained_weights,
-                &trained_optimizer_states,
-                completed_step_offset + seen_steps,
-                CudaCppCheckpointLog {
-                    epoch: chunk.epoch,
-                    superbatch: chunk.superbatch,
-                    curr_batch: if schedule.production { schedule.batches_per_superbatch } else { chunk.steps },
-                    train_steps: chunk.steps,
-                    train_loss: last_loss,
-                    test_metrics,
-                    lr_start: chunk.lr_start,
-                    lr_end: chunk.lr_end,
-                    dataloader_pos,
-                },
-            )?;
-            eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
-            if let Some(metrics) = test_metrics {
-                eprintln!(
-                    "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
-                );
+            if schedule.production {
+                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
+                let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
+                    args,
+                    cuda_shape,
+                    &trained_weights,
+                    &trained_optimizer_states,
+                    completed_step_offset + seen_steps,
+                    CudaCppCheckpointLog {
+                        epoch: chunk.epoch,
+                        superbatch: chunk.superbatch,
+                        curr_batch: schedule.batches_per_superbatch,
+                        train_steps: chunk.steps,
+                        train_loss: last_loss,
+                        test_metrics,
+                        lr_start: chunk.lr_start,
+                        lr_end: chunk.lr_end,
+                        dataloader_pos,
+                    },
+                )?;
+                eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+                if let Some(metrics) = test_metrics {
+                    eprintln!(
+                        "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                        chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                    );
+                }
+                last_checkpoint_metrics = test_metrics;
+            } else {
+                deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
-            last_checkpoint_metrics = test_metrics;
             checkpoint_chunk_idx += 1;
         }
         Ok::<(), String>(())
@@ -3648,6 +3667,35 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+    if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
+        let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
+        let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
+            args,
+            cuda_shape,
+            &trained_weights,
+            &trained_optimizer_states,
+            completed_steps,
+            CudaCppCheckpointLog {
+                epoch: chunk.epoch,
+                superbatch: chunk.superbatch,
+                curr_batch: chunk.steps,
+                train_steps: chunk.steps,
+                train_loss: last_loss,
+                test_metrics,
+                lr_start: chunk.lr_start,
+                lr_end: chunk.lr_end,
+                dataloader_pos,
+            },
+        )?;
+        eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+        if let Some(metrics) = test_metrics {
+            eprintln!(
+                "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+            );
+        }
+        last_checkpoint_metrics = test_metrics;
+    }
     let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
     write_cuda_cpp_halfkp_direct_outputs(
         &direct_output_dir,
@@ -4096,6 +4144,7 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
 
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
+    let mut deferred_direct_checkpoint = None;
     for_each_sfnn_halfka2_teacher_fast_batch(&config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
@@ -4188,36 +4237,40 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
         }
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
-            let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-            let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
-            let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
-            let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
-                args,
-                cuda_shape,
-                &trained_weights,
-                &trained_optimizer_states,
-                completed_step_offset + seen_steps,
-                CudaCppCheckpointLog {
-                    epoch: chunk.epoch,
-                    superbatch: chunk.superbatch,
-                    curr_batch: if schedule.production { schedule.batches_per_superbatch } else { chunk.steps },
-                    train_steps: chunk.steps,
-                    train_loss: last_loss,
-                    test_metrics,
-                    lr_start: chunk.lr_start,
-                    lr_end: chunk.lr_end,
-                    dataloader_pos,
-                },
-            )?;
-            eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
-            if let Some(metrics) = test_metrics {
-                eprintln!(
-                    "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                    chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
-                );
+            if schedule.production {
+                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
+                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
+                    args,
+                    cuda_shape,
+                    &trained_weights,
+                    &trained_optimizer_states,
+                    completed_step_offset + seen_steps,
+                    CudaCppCheckpointLog {
+                        epoch: chunk.epoch,
+                        superbatch: chunk.superbatch,
+                        curr_batch: schedule.batches_per_superbatch,
+                        train_steps: chunk.steps,
+                        train_loss: last_loss,
+                        test_metrics,
+                        lr_start: chunk.lr_start,
+                        lr_end: chunk.lr_end,
+                        dataloader_pos,
+                    },
+                )?;
+                eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+                if let Some(metrics) = test_metrics {
+                    eprintln!(
+                        "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                        chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                    );
+                }
+                last_checkpoint_metrics = test_metrics;
+            } else {
+                deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
-            last_checkpoint_metrics = test_metrics;
             checkpoint_chunk_idx += 1;
         }
         Ok::<(), String>(())
@@ -4249,6 +4302,35 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let completed_steps = completed_step_offset + seen_steps;
     let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
     let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+    if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
+        let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
+        let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
+            args,
+            cuda_shape,
+            &trained_weights,
+            &trained_optimizer_states,
+            completed_steps,
+            CudaCppCheckpointLog {
+                epoch: chunk.epoch,
+                superbatch: chunk.superbatch,
+                curr_batch: chunk.steps,
+                train_steps: chunk.steps,
+                train_loss: last_loss,
+                test_metrics,
+                lr_start: chunk.lr_start,
+                lr_end: chunk.lr_end,
+                dataloader_pos,
+            },
+        )?;
+        eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+        if let Some(metrics) = test_metrics {
+            eprintln!(
+                "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+            );
+        }
+        last_checkpoint_metrics = test_metrics;
+    }
     let direct_output_dir = args.output_dir().join("cuda-cpp-direct");
     write_cuda_cpp_sfnn_halfka2_direct_outputs(
         &direct_output_dir,
