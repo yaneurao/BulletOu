@@ -3,9 +3,7 @@ mod dataloader;
 pub mod fast_batch;
 pub mod fast_loss;
 pub mod fast_nnue;
-pub mod fast_nnue_fixture;
 pub mod fast_sfnn;
-pub mod fast_sfnn_fixture;
 pub mod loader;
 pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
@@ -30,17 +28,9 @@ pub use fast_nnue::{
     FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardTrace,
     NnueForwardWeights, NnueForwardWorkspaceLayout,
 };
-pub use fast_nnue_fixture::{
-    NNUE_FORWARD_FIXTURE_MAGIC, NNUE_TRAIN_BATCH_FIXTURE_MAGIC, NNUE_TRAIN_FIXTURE_MAGIC, NnueForwardFixtureError,
-    write_nnue_forward_fixture, write_nnue_forward_fixture_file, write_nnue_train_batch_fixture,
-    write_nnue_train_batch_fixture_file, write_nnue_train_fixture, write_nnue_train_fixture_file,
-};
 pub use fast_sfnn::{
     FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape, SfnnForwardTrace,
     SfnnForwardWeights, SfnnForwardWorkspaceLayout,
-};
-pub use fast_sfnn_fixture::{
-    SFNN_FORWARD_FIXTURE_MAGIC, SfnnForwardFixtureError, write_sfnn_forward_fixture, write_sfnn_forward_fixture_file,
 };
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError,

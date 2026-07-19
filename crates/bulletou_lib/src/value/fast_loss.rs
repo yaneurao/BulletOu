@@ -1,8 +1,8 @@
 //! Scalar value-loss reference for the fixed-layout fast backend.
 //!
-//! This is intentionally CPU-only. It gives cuda-oxide loss kernels a compact
-//! golden implementation before the training path grows backward/optimizer
-//! kernels.
+//! This is intentionally CPU-only. It gives fixed-layout GPU loss kernels a
+//! compact golden implementation before the training path grows
+//! backward/optimizer kernels.
 
 use std::fmt;
 

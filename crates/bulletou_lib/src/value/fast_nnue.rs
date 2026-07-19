@@ -1,7 +1,7 @@
 //! Scalar NNUE forward reference for the fixed-layout fast backend.
 //!
-//! This is intentionally CPU-only. It gives cuda-oxide kernels a small golden
-//! implementation to compare against before fused GPU training kernels are
+//! This is intentionally CPU-only. It gives fixed-layout GPU kernels a small
+//! golden implementation to compare against before fused training kernels are
 //! introduced.
 
 use std::{collections::BTreeMap, fmt};

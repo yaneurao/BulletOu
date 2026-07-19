@@ -1,8 +1,8 @@
 //! Fixed-layout batch representation for the future shogi NNUE/SFNN fast backend.
 //!
 //! The existing generic trainer feeds batches through `PreparedBatchHost`, which
-//! is a name-keyed tensor map. That is flexible, but the cuda-oxide path should
-//! pass a compact fixed layout directly to fused kernels. This module defines
+//! is a name-keyed tensor map. That is flexible, but the fixed-layout GPU path
+//! should pass compact batches directly to fused kernels. This module defines
 //! that host-side layout without changing the current Bullet backend.
 
 use std::{borrow::Cow, fmt};

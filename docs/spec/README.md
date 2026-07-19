@@ -1,5 +1,9 @@
 # BulletOu Specifications
 
+Note: the cuda-oxide implementation has been retired and removed. Files whose
+names still contain `cuda-oxide` are historical migration notes; the maintained
+fast backend is the Windows-native `cuda-cpp` backend.
+
 このディレクトリは BulletOu (やねうら王対応の Rust ML トレーナー) の **仕様レベルのリファレンス** を集約する場所です。
 
 「やね評価関数を学習する側」「やねうら王エンジンで学習結果を load する側」「BulletOu の coding をする側」の **3 者の契約 (contract)** を明文化することを目的とする。

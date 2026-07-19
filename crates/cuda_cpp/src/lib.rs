@@ -4453,7 +4453,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn radam_step_scale_matches_cuda_oxide_reference_points() {
+    fn radam_step_scale_matches_reference_points() {
         let step1 = RAdamUpdateParams { step: 1, ..Default::default() }.step_scale().unwrap();
         assert!(!step1.use_denom);
         assert!((step1.step_size - 10.0).abs() < 0.00001);

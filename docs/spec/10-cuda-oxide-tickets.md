@@ -2,9 +2,10 @@
 
 This started as the active ticket queue for turning the cuda-oxide smoke/bridge
 work into a production BulletOu training backend. As of BO-CUDA-031 the production
-fast-backend direction is pivoting to a Windows-native C++/CUDA backend while
-keeping cuda-oxide available as a reference/experimental implementation. Work
-the tickets in order and commit each completed slice.
+fast-backend direction pivoted to a Windows-native C++/CUDA backend. As of
+BO-CUDA-037, the cuda-oxide implementation and its user-facing CLI/scripts have
+been removed; this file is retained as historical migration notes plus the
+current cuda-cpp follow-up queue.
 
 | ticket | status | scope | exit criteria |
 |---|---|---|---|
@@ -44,6 +45,7 @@ the tickets in order and commit each completed slice.
 | BO-CUDA-034 | done | port fixed-layout SFNN trainer to C++/CUDA | port the SFNN HalfKA2/factorized-L1 train step to C++/CUDA, use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` for validation, and resume the full-teacher tatara comparison from BO-CUDA-030 |
 | BO-CUDA-035 | done | cuda-cpp production schedule parity | Windows-native C++/CUDA direct mode accepts bounded `--superbatches` / `--max-epochs`, writes `--save-rate` numbered checkpoints, resumes epoch/superbatch/LR state, and supports step/geometric/cos/plateau schedules without requiring manual `--cuda-cpp-train-steps` sizing |
 | BO-CUDA-036 | todo | cuda-cpp HalfKP post-parity optimisation | partial: first-step warmup, direct benchmark timing, CPU/GPU teacher-prepare overlap/profiling, pinned staged upload, sparse L0 zero-gradient atomic skip, HalfKP direct teacher preparation, WRM score-target lookup, teacher single-bucket cleanup, and short/16M speed-quality probes are in; remaining work is further sparse L0/update/feed hot spots plus longer multi-file confirmation against the previous cuda-oxide throughput ceiling |
+| BO-CUDA-037 | done | retire cuda-oxide implementation | remove the nested `cuda-oxide/` workspace, root `--backend cuda-oxide` wrapper, cuda-oxide fixture exporters, and WSL/cuda-oxide smoke scripts now that Windows-native `--backend cuda-cpp` is the maintained fast backend |
 
 ## Notes
 
