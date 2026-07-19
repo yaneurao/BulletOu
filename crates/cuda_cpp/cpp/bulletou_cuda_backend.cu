@@ -28,8 +28,6 @@ struct BulletOuCudaCppContext {
     size_t sfnn_inverse_write_counters_len = 0;
     int* sfnn_inverse_positions = nullptr;
     size_t sfnn_inverse_positions_len = 0;
-    float* nnue_ones = nullptr;
-    size_t nnue_ones_len = 0;
 };
 
 struct BulletOuCudaCppF32Buffer {
@@ -506,36 +504,9 @@ __device__ float crelu(float value) {
 constexpr size_t NNUE_HALFKP_BASE_INPUT_SIZE = 125388;
 constexpr size_t NNUE_HALFKP_PIECE_INPUTS = 1548;
 constexpr size_t NNUE_HALFKP_FACTORIZED_INPUT_SIZE = NNUE_HALFKP_BASE_INPUT_SIZE + NNUE_HALFKP_PIECE_INPUTS;
-constexpr size_t NNUE_SHARDKP_KP_DIMENSIONS = 1710;
-constexpr size_t NNUE_SHARDKP_KP_MAX_ACTIVE = 40;
-constexpr size_t NNUE_SHARDKP_CONNECTIONS_PER_FEATURE = 7;
-constexpr size_t NNUE_SHARDKP_INPUT_SIZE = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-constexpr size_t NNUE_SHARDKP_COMMON_DIMENSIONS = 256;
-constexpr size_t NNUE_SHARDKP_SHARD_DIMENSIONS = 128;
-constexpr size_t NNUE_SHARDKP_SHARD_COUNT = 64;
-constexpr size_t NNUE_SHARDKP_FANOUT = 6;
-constexpr size_t NNUE_SHARDKP_L1 = NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_SHARD_DIMENSIONS * NNUE_SHARDKP_SHARD_COUNT;
-constexpr size_t NNUE_SHARDKP_COMPACT_L0_STRIDE =
-    NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_FANOUT * NNUE_SHARDKP_SHARD_DIMENSIONS;
-constexpr size_t NNUE_SHARDKP_COMPACT_L0W_LEN = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_COMPACT_L0_STRIDE;
-
-__host__ __device__ bool nnue_is_shardkp_shape(size_t input_size, size_t rows) {
-    return input_size == NNUE_SHARDKP_INPUT_SIZE && rows == NNUE_SHARDKP_L1;
-}
 
 __host__ __device__ size_t nnue_l0w_len_for_shape(size_t input_size, size_t rows) {
-    return nnue_is_shardkp_shape(input_size, rows) ? NNUE_SHARDKP_COMPACT_L0W_LEN : input_size * rows;
-}
-
-__host__ __device__ size_t nnue_shardkp_hash(size_t kp_feature, size_t connection) {
-    unsigned long long x = static_cast<unsigned long long>(kp_feature) * 0x9E3779B97F4A7C15ull;
-    x ^= static_cast<unsigned long long>(connection) * 0xBF58476D1CE4E5B9ull;
-    x ^= x >> 30;
-    x *= 0xBF58476D1CE4E5B9ull;
-    x ^= x >> 27;
-    x *= 0x94D049BB133111EBull;
-    x ^= x >> 31;
-    return static_cast<size_t>(x) & (NNUE_SHARDKP_SHARD_COUNT - 1);
+    return input_size * rows;
 }
 
 __device__ bool nnue_halfkp_factorized_feature(size_t feature, size_t input_size, size_t* out_base_feature, size_t* out_virtual_feature) {
@@ -580,105 +551,6 @@ __global__ void nnue_sparse_l0_crelu_kernel(
         }
     }
     output[tid] = crelu(sum);
-}
-
-__global__ void nnue_shardkp_l0_bias_kernel(
-    const float* bias,
-    float* output,
-    size_t batch,
-    size_t rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = batch * rows;
-    if (tid >= total) {
-        return;
-    }
-    size_t row = tid % rows;
-    output[tid] = bias[row];
-}
-
-__global__ void nnue_shardkp_l0_add_kernel(
-    const int* indices,
-    const float* weights,
-    float* output,
-    size_t batch,
-    size_t max_active,
-    size_t input_size,
-    size_t rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = batch * max_active * NNUE_SHARDKP_SHARD_DIMENSIONS;
-    if (tid >= total) {
-        return;
-    }
-
-    size_t local_row = tid % NNUE_SHARDKP_SHARD_DIMENSIONS;
-    size_t sparse_entry = tid / NNUE_SHARDKP_SHARD_DIMENSIONS;
-    size_t sample = sparse_entry / max_active;
-    size_t slot = sparse_entry - sample * max_active;
-    int feature_i32 = indices[sample * max_active + slot];
-    if (feature_i32 < 0 || static_cast<size_t>(feature_i32) >= input_size) {
-        return;
-    }
-
-    size_t feature = static_cast<size_t>(feature_i32);
-    size_t kp_feature = feature / NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-    size_t connection = feature - kp_feature * NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-    if (kp_feature >= NNUE_SHARDKP_KP_DIMENSIONS || connection >= NNUE_SHARDKP_CONNECTIONS_PER_FEATURE) {
-        return;
-    }
-
-    size_t output_base = sample * rows;
-    size_t weight_base = kp_feature * NNUE_SHARDKP_COMPACT_L0_STRIDE;
-    if (connection == 0) {
-        size_t row0 = local_row;
-        size_t row1 = local_row + NNUE_SHARDKP_SHARD_DIMENSIONS;
-        atomicAdd(&output[output_base + row0], weights[weight_base + row0]);
-        atomicAdd(&output[output_base + row1], weights[weight_base + row1]);
-        return;
-    }
-
-    size_t shard = nnue_shardkp_hash(kp_feature, connection);
-    size_t global_row = NNUE_SHARDKP_COMMON_DIMENSIONS + shard * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    size_t weight_idx =
-        weight_base + NNUE_SHARDKP_COMMON_DIMENSIONS + (connection - 1) * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    atomicAdd(&output[output_base + global_row], weights[weight_idx]);
-}
-
-__global__ void nnue_shardkp_base_l0_add_kernel(
-    const int* indices,
-    const float* weights,
-    float* output,
-    size_t batch,
-    size_t max_active,
-    size_t rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = batch * max_active * NNUE_SHARDKP_COMPACT_L0_STRIDE;
-    if (tid >= total) {
-        return;
-    }
-
-    size_t compact_row = tid % NNUE_SHARDKP_COMPACT_L0_STRIDE;
-    size_t sparse_entry = tid / NNUE_SHARDKP_COMPACT_L0_STRIDE;
-    size_t sample = sparse_entry / max_active;
-    size_t slot = sparse_entry - sample * max_active;
-    int feature_i32 = indices[sample * max_active + slot];
-    if (feature_i32 < 0 || static_cast<size_t>(feature_i32) >= NNUE_SHARDKP_KP_DIMENSIONS) {
-        return;
-    }
-
-    size_t kp_feature = static_cast<size_t>(feature_i32);
-    size_t global_row = compact_row;
-    if (compact_row >= NNUE_SHARDKP_COMMON_DIMENSIONS) {
-        size_t shard_row = compact_row - NNUE_SHARDKP_COMMON_DIMENSIONS;
-        size_t connection = 1 + shard_row / NNUE_SHARDKP_SHARD_DIMENSIONS;
-        size_t local_row = shard_row % NNUE_SHARDKP_SHARD_DIMENSIONS;
-        size_t shard = nnue_shardkp_hash(kp_feature, connection);
-        global_row = NNUE_SHARDKP_COMMON_DIMENSIONS + shard * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    }
-    if (global_row < rows) {
-        size_t output_base = sample * rows;
-        size_t weight_idx = kp_feature * NNUE_SHARDKP_COMPACT_L0_STRIDE + compact_row;
-        atomicAdd(&output[output_base + global_row], weights[weight_idx]);
-    }
 }
 
 __global__ void crelu_inplace_kernel(float* values, size_t len) {
@@ -1811,128 +1683,6 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     }
 }
 
-__device__ float nnue_sum_shardkp_pre_gradients(
-    const float* pre_gradients,
-    const int* positions,
-    const int* offsets,
-    size_t feature,
-    size_t row,
-    size_t rows) {
-    size_t off_start = static_cast<size_t>(offsets[feature]);
-    size_t off_end = static_cast<size_t>(offsets[feature + 1]);
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    float sum2 = 0.0f;
-    float sum3 = 0.0f;
-    size_t i = off_start;
-    size_t unroll_end = off_end >= off_start + 3 ? off_end - 3 : off_start;
-    while (i < unroll_end) {
-        size_t sample0 = static_cast<size_t>(positions[i]);
-        size_t sample1 = static_cast<size_t>(positions[i + 1]);
-        size_t sample2 = static_cast<size_t>(positions[i + 2]);
-        size_t sample3 = static_cast<size_t>(positions[i + 3]);
-        sum0 += pre_gradients[sample0 * rows + row];
-        sum1 += pre_gradients[sample1 * rows + row];
-        sum2 += pre_gradients[sample2 * rows + row];
-        sum3 += pre_gradients[sample3 * rows + row];
-        i += 4;
-    }
-    while (i < off_end) {
-        size_t sample = static_cast<size_t>(positions[i]);
-        sum0 += pre_gradients[sample * rows + row];
-        ++i;
-    }
-    return (sum0 + sum1) + (sum2 + sum3);
-}
-
-__global__ void nnue_shardkp_inverse_gather_l0w_gradients_kernel(
-    const float* pre_gradients,
-    const int* positions,
-    const int* offsets,
-    float* l0w_gradients,
-    size_t n_features,
-    size_t rows,
-    int add_to_existing) {
-    size_t feature = blockIdx.x;
-    size_t local_row = threadIdx.x;
-    if (feature >= n_features || local_row >= NNUE_SHARDKP_SHARD_DIMENSIONS) {
-        return;
-    }
-
-    size_t kp_feature = feature / NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-    size_t connection = feature - kp_feature * NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-    if (kp_feature >= NNUE_SHARDKP_KP_DIMENSIONS || connection >= NNUE_SHARDKP_CONNECTIONS_PER_FEATURE) {
-        return;
-    }
-
-    size_t weight_base = kp_feature * NNUE_SHARDKP_COMPACT_L0_STRIDE;
-    if (connection == 0) {
-        size_t row0 = local_row;
-        size_t row1 = local_row + NNUE_SHARDKP_SHARD_DIMENSIONS;
-        float sum0 = nnue_sum_shardkp_pre_gradients(pre_gradients, positions, offsets, feature, row0, rows);
-        float sum1 = nnue_sum_shardkp_pre_gradients(pre_gradients, positions, offsets, feature, row1, rows);
-        if (add_to_existing != 0) {
-            l0w_gradients[weight_base + row0] += sum0;
-            l0w_gradients[weight_base + row1] += sum1;
-        } else {
-            l0w_gradients[weight_base + row0] = sum0;
-            l0w_gradients[weight_base + row1] = sum1;
-        }
-        return;
-    }
-
-    size_t shard = nnue_shardkp_hash(kp_feature, connection);
-    size_t global_row = NNUE_SHARDKP_COMMON_DIMENSIONS + shard * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    size_t weight_idx =
-        weight_base + NNUE_SHARDKP_COMMON_DIMENSIONS + (connection - 1) * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    float sum = nnue_sum_shardkp_pre_gradients(pre_gradients, positions, offsets, feature, global_row, rows);
-    if (add_to_existing != 0) {
-        l0w_gradients[weight_idx] += sum;
-    } else {
-        l0w_gradients[weight_idx] = sum;
-    }
-}
-
-__global__ void nnue_shardkp_base_inverse_gather_l0w_gradients_kernel(
-    const float* pre_gradients,
-    const int* positions,
-    const int* offsets,
-    float* l0w_gradients,
-    size_t rows,
-    int add_to_existing) {
-    size_t kp_feature = blockIdx.x;
-    size_t compact_row = threadIdx.x;
-    if (kp_feature >= NNUE_SHARDKP_KP_DIMENSIONS || compact_row >= NNUE_SHARDKP_COMPACT_L0_STRIDE) {
-        return;
-    }
-
-    size_t global_row = compact_row;
-    if (compact_row >= NNUE_SHARDKP_COMMON_DIMENSIONS) {
-        size_t shard_row = compact_row - NNUE_SHARDKP_COMMON_DIMENSIONS;
-        size_t connection = 1 + shard_row / NNUE_SHARDKP_SHARD_DIMENSIONS;
-        size_t local_row = shard_row % NNUE_SHARDKP_SHARD_DIMENSIONS;
-        size_t shard = nnue_shardkp_hash(kp_feature, connection);
-        global_row = NNUE_SHARDKP_COMMON_DIMENSIONS + shard * NNUE_SHARDKP_SHARD_DIMENSIONS + local_row;
-    }
-    if (global_row >= rows) {
-        return;
-    }
-
-    float sum = nnue_sum_shardkp_pre_gradients(
-        pre_gradients,
-        positions,
-        offsets,
-        kp_feature,
-        global_row,
-        rows);
-    size_t weight_idx = kp_feature * NNUE_SHARDKP_COMPACT_L0_STRIDE + compact_row;
-    if (add_to_existing != 0) {
-        l0w_gradients[weight_idx] += sum;
-    } else {
-        l0w_gradients[weight_idx] = sum;
-    }
-}
-
 __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float* l0w_gradients,
     size_t ft_size) {
@@ -2212,131 +1962,6 @@ int launch_dense_crelu_backward_gemm(
     dense_bias_sum_kernel<<<static_cast<int>(output_dim), threads, 0, ctx->stream>>>(
         output_gradients, bias_gradients, batch, output_dim);
     if (check_kernel_launch("dense_bias_sum_kernel launch") != 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-int launch_shardkp_l1_crelu_backward_split(
-    BulletOuCudaCppContext* ctx,
-    const float* stm_l0,
-    const float* nstm_l0,
-    const float* hidden1,
-    float* hidden1_gradients,
-    const float* l1w,
-    float* stm_l0_gradients,
-    float* nstm_l0_gradients,
-    float* l1w_gradients,
-    float* l1b_gradients,
-    size_t batch,
-    size_t l1,
-    size_t l2) {
-    constexpr int threads = 256;
-    int blocks = 0;
-
-    if (block_count_1d(batch * l2, threads, &blocks, "dense_crelu_pre_gradient_kernel") != 0) {
-        return -1;
-    }
-    dense_crelu_pre_gradient_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, hidden1_gradients, batch, l2);
-    if (check_kernel_launch("dense_crelu_pre_gradient_kernel launch") != 0) {
-        return -1;
-    }
-
-    const float alpha = 1.0f;
-    const float beta_zero = 0.0f;
-
-    cublasStatus_t status = cublasSgemm(
-        ctx->blas,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        static_cast<int>(l2),
-        &alpha,
-        l1w,
-        static_cast<int>(l2),
-        hidden1_gradients,
-        static_cast<int>(l2),
-        &beta_zero,
-        stm_l0_gradients,
-        static_cast<int>(l1));
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l1 backward stm input gradients", status);
-    }
-
-    status = cublasSgemm(
-        ctx->blas,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        static_cast<int>(l2),
-        &alpha,
-        l1w + l1 * l2,
-        static_cast<int>(l2),
-        hidden1_gradients,
-        static_cast<int>(l2),
-        &beta_zero,
-        nstm_l0_gradients,
-        static_cast<int>(l1));
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l1 backward nstm input gradients", status);
-    }
-
-    status = cublasSgemm(
-        ctx->blas,
-        CUBLAS_OP_N,
-        CUBLAS_OP_T,
-        static_cast<int>(l2),
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        &alpha,
-        hidden1_gradients,
-        static_cast<int>(l2),
-        stm_l0,
-        static_cast<int>(l1),
-        &beta_zero,
-        l1w_gradients,
-        static_cast<int>(l2));
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l1 backward stm weight gradients", status);
-    }
-
-    status = cublasSgemm(
-        ctx->blas,
-        CUBLAS_OP_N,
-        CUBLAS_OP_T,
-        static_cast<int>(l2),
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        &alpha,
-        hidden1_gradients,
-        static_cast<int>(l2),
-        nstm_l0,
-        static_cast<int>(l1),
-        &beta_zero,
-        l1w_gradients + l1 * l2,
-        static_cast<int>(l2));
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l1 backward nstm weight gradients", status);
-    }
-
-    dense_bias_sum_kernel<<<static_cast<int>(l2), threads, 0, ctx->stream>>>(
-        hidden1_gradients, l1b_gradients, batch, l2);
-    if (check_kernel_launch("dense_bias_sum_kernel launch") != 0) {
-        return -1;
-    }
-
-    if (block_count_1d(batch * l1, threads, &blocks, "l0_crelu_backward_inplace_kernel") != 0) {
-        return -1;
-    }
-    l0_crelu_backward_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, stm_l0_gradients, batch * l1);
-    if (check_kernel_launch("l0_crelu_backward_inplace_kernel stm launch") != 0) {
-        return -1;
-    }
-    l0_crelu_backward_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_l0, nstm_l0_gradients, batch * l1);
-    if (check_kernel_launch("l0_crelu_backward_inplace_kernel nstm launch") != 0) {
         return -1;
     }
 
@@ -2899,51 +2524,6 @@ int launch_dense_forward_gemm(
     return 0;
 }
 
-int launch_shardkp_l1_forward_gemm_split(
-    BulletOuCudaCppContext* ctx,
-    const float* stm_l0,
-    const float* nstm_l0,
-    const float* l1w,
-    const float* l1b,
-    float* hidden1,
-    size_t batch,
-    size_t l1,
-    size_t l2) {
-    if (launch_dense_forward_gemm_raw(
-            ctx,
-            "nnue shardkp dense_l1_forward_gemm stm",
-            stm_l0,
-            l1w,
-            hidden1,
-            batch,
-            l1,
-            l2,
-            0.0f) != 0 ||
-        launch_dense_forward_gemm_raw(
-            ctx,
-            "nnue shardkp dense_l1_forward_gemm nstm",
-            nstm_l0,
-            l1w + l1 * l2,
-            hidden1,
-            batch,
-            l1,
-            l2,
-            1.0f) != 0) {
-        return -1;
-    }
-
-    constexpr int threads = 256;
-    int blocks = 0;
-    if (block_count_1d(batch * l2, threads, &blocks, "dense_add_bias_kernel") != 0) {
-        return -1;
-    }
-    dense_add_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l1b, batch, l2, 1);
-    if (check_kernel_launch("dense_add_bias_kernel launch") != 0) {
-        return -1;
-    }
-    return 0;
-}
-
 int launch_nnue_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -2977,144 +2557,51 @@ int launch_nnue_forward_kernels(
 
     constexpr int threads = 256;
     int blocks = 0;
-    const bool shardkp_shape = nnue_is_shardkp_shape(input_size, l1);
 
-    if (shardkp_shape) {
-        if (block_count_1d(batch * l1, threads, &blocks, "nnue_shardkp_l0_bias_kernel") != 0) {
-            return -1;
-        }
-        nnue_shardkp_l0_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(l0b, stm_l0, batch, l1);
-        if (check_kernel_launch("nnue_shardkp_l0_bias_kernel stm launch") != 0) {
-            return -1;
-        }
-        nnue_shardkp_l0_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(l0b, nstm_l0, batch, l1);
-        if (check_kernel_launch("nnue_shardkp_l0_bias_kernel nstm launch") != 0) {
-            return -1;
-        }
-
-        if (max_active <= NNUE_SHARDKP_KP_MAX_ACTIVE) {
-            if (block_count_1d(
-                    batch * max_active * NNUE_SHARDKP_COMPACT_L0_STRIDE,
-                    threads,
-                    &blocks,
-                    "nnue_shardkp_base_l0_add_kernel") != 0) {
-                return -1;
-            }
-            nnue_shardkp_base_l0_add_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                stm_indices, l0w, stm_l0, batch, max_active, l1);
-            if (check_kernel_launch("nnue_shardkp_base_l0_add_kernel stm launch") != 0) {
-                return -1;
-            }
-            nnue_shardkp_base_l0_add_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                nstm_indices, l0w, nstm_l0, batch, max_active, l1);
-            if (check_kernel_launch("nnue_shardkp_base_l0_add_kernel nstm launch") != 0) {
-                return -1;
-            }
-        } else {
-            if (block_count_1d(
-                    batch * max_active * NNUE_SHARDKP_SHARD_DIMENSIONS,
-                    threads,
-                    &blocks,
-                    "nnue_shardkp_l0_add_kernel") != 0) {
-                return -1;
-            }
-            nnue_shardkp_l0_add_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                stm_indices, l0w, stm_l0, batch, max_active, input_size, l1);
-            if (check_kernel_launch("nnue_shardkp_l0_add_kernel stm launch") != 0) {
-                return -1;
-            }
-            nnue_shardkp_l0_add_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                nstm_indices, l0w, nstm_l0, batch, max_active, input_size, l1);
-            if (check_kernel_launch("nnue_shardkp_l0_add_kernel nstm launch") != 0) {
-                return -1;
-            }
-        }
-
-        if (block_count_1d(batch * l1, threads, &blocks, "crelu_inplace_kernel") != 0) {
-            return -1;
-        }
-        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, batch * l1);
-        if (check_kernel_launch("crelu_inplace_kernel stm launch") != 0) {
-            return -1;
-        }
-        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_l0, batch * l1);
-        if (check_kernel_launch("crelu_inplace_kernel nstm launch") != 0) {
-            return -1;
-        }
-    } else {
-        if (block_count_1d(batch * l1, threads, &blocks, "nnue_sparse_l0_crelu_kernel") != 0) {
-            return -1;
-        }
-        nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            stm_indices, l0w, l0b, stm_l0, batch, max_active, input_size, l1);
-        if (check_kernel_launch("nnue_sparse_l0_crelu_kernel stm launch") != 0) {
-            return -1;
-        }
-        nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            nstm_indices, l0w, l0b, nstm_l0, batch, max_active, input_size, l1);
-        if (check_kernel_launch("nnue_sparse_l0_crelu_kernel nstm launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch * l1, threads, &blocks, "nnue_sparse_l0_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices, l0w, l0b, stm_l0, batch, max_active, input_size, l1);
+    if (check_kernel_launch("nnue_sparse_l0_crelu_kernel stm launch") != 0) {
+        return -1;
+    }
+    nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        nstm_indices, l0w, l0b, nstm_l0, batch, max_active, input_size, l1);
+    if (check_kernel_launch("nnue_sparse_l0_crelu_kernel nstm launch") != 0) {
+        return -1;
     }
 
-    if (shardkp_shape) {
-        if (launch_shardkp_l1_forward_gemm_split(ctx, stm_l0, nstm_l0, l1w, l1b, hidden1, batch, l1, l2) != 0 ||
-            launch_dense_forward_gemm(
-                ctx,
-                "nnue shardkp dense_l2_forward_gemm",
-                hidden1,
-                l2w,
-                l2b,
-                hidden2,
-                batch,
-                l2,
-                l3,
-                1) != 0 ||
-            launch_dense_forward_gemm(
-                ctx,
-                "nnue shardkp dense_output_forward_gemm",
-                hidden2,
-                outw,
-                outb,
-                output,
-                batch,
-                l3,
-                1,
-                0) != 0) {
-            return -1;
-        }
-    } else {
-        if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_concat_l0_kernel") != 0) {
-            return -1;
-        }
-        nnue_concat_l0_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, nstm_l0, combined, batch, l1);
-        if (check_kernel_launch("nnue_concat_l0_kernel launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_concat_l0_kernel") != 0) {
+        return -1;
+    }
+    nnue_concat_l0_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, nstm_l0, combined, batch, l1);
+    if (check_kernel_launch("nnue_concat_l0_kernel launch") != 0) {
+        return -1;
+    }
 
-        if (block_count_1d(batch * l2, threads, &blocks, "nnue_dense_l1_crelu_kernel") != 0) {
-            return -1;
-        }
-        nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(combined, l1w, l1b, hidden1, batch, l1 * 2, l2);
-        if (check_kernel_launch("nnue_dense_l1_crelu_kernel launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch * l2, threads, &blocks, "nnue_dense_l1_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(combined, l1w, l1b, hidden1, batch, l1 * 2, l2);
+    if (check_kernel_launch("nnue_dense_l1_crelu_kernel launch") != 0) {
+        return -1;
+    }
 
-        if (block_count_1d(batch * l3, threads, &blocks, "nnue_dense_l2_crelu_kernel") != 0) {
-            return -1;
-        }
-        nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l2w, l2b, hidden2, batch, l2, l3);
-        if (check_kernel_launch("nnue_dense_l2_crelu_kernel launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch * l3, threads, &blocks, "nnue_dense_l2_crelu_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l2w, l2b, hidden2, batch, l2, l3);
+    if (check_kernel_launch("nnue_dense_l2_crelu_kernel launch") != 0) {
+        return -1;
+    }
 
-        if (block_count_1d(batch, threads, &blocks, "nnue_dense_output_kernel") != 0) {
-            return -1;
-        }
-        nnue_dense_output_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden2, outw, outb, output, batch, l3);
-        if (check_kernel_launch("nnue_dense_output_kernel launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch, threads, &blocks, "nnue_dense_output_kernel") != 0) {
+        return -1;
+    }
+    nnue_dense_output_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden2, outw, outb, output, batch, l3);
+    if (check_kernel_launch("nnue_dense_output_kernel launch") != 0) {
+        return -1;
     }
 
     return 0;
@@ -3266,67 +2753,6 @@ int launch_fill_f32_raw(BulletOuCudaCppContext* ctx, float* ptr, size_t len, flo
     fill_f32_kernel<<<blocks, threads, 0, ctx->stream>>>(len, value, ptr);
     if (check_kernel_launch(label) != 0) {
         return -1;
-    }
-    return 0;
-}
-
-int ensure_nnue_ones(BulletOuCudaCppContext* ctx, size_t len) {
-    size_t old_capacity = ctx->nnue_ones_len;
-    if (ensure_f32_scratch(&ctx->nnue_ones, &ctx->nnue_ones_len, len, "cudaMalloc nnue ones") != 0) {
-        return -1;
-    }
-    if (ctx->nnue_ones_len != old_capacity) {
-        return launch_fill_f32_raw(ctx, ctx->nnue_ones, ctx->nnue_ones_len, 1.0f, "fill nnue ones");
-    }
-    return 0;
-}
-
-int launch_l0_bias_backward_gemv(
-    BulletOuCudaCppContext* ctx,
-    const float* stm_gradients,
-    const float* nstm_gradients,
-    float* l0b_gradients,
-    size_t batch,
-    size_t l1) {
-    if (ensure_nnue_ones(ctx, batch) != 0) {
-        return -1;
-    }
-
-    const float alpha = 1.0f;
-    const float beta_zero = 0.0f;
-    const float beta_one = 1.0f;
-    cublasStatus_t status = cublasSgemv(
-        ctx->blas,
-        CUBLAS_OP_N,
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        &alpha,
-        stm_gradients,
-        static_cast<int>(l1),
-        ctx->nnue_ones,
-        1,
-        &beta_zero,
-        l0b_gradients,
-        1);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l0 bias backward gemv stm", status);
-    }
-
-    status = cublasSgemv(
-        ctx->blas,
-        CUBLAS_OP_N,
-        static_cast<int>(l1),
-        static_cast<int>(batch),
-        &alpha,
-        nstm_gradients,
-        static_cast<int>(l1),
-        ctx->nnue_ones,
-        1,
-        &beta_one,
-        l0b_gradients,
-        1);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        return fail_blas("shardkp l0 bias backward gemv nstm", status);
     }
     return 0;
 }
@@ -3519,247 +2945,6 @@ int launch_sfnn_inverse_index_for_perspective(
         ft_size,
         add_to_existing);
     if (check_kernel_launch("sfnn_inverse_gather_l0w_gradients_kernel launch") != 0) {
-        return -1;
-    }
-    return 0;
-}
-
-int launch_nnue_shardkp_inverse_index_for_perspective(
-    BulletOuCudaCppContext* ctx,
-    const int* indices,
-    const float* pre_gradients,
-    float* l0w_gradients,
-    size_t batch,
-    size_t max_active,
-    size_t input_size,
-    size_t rows,
-    int add_to_existing) {
-    constexpr int count_threads = 256;
-    constexpr int scan_threads = 1024;
-    constexpr int gather_threads = static_cast<int>(NNUE_SHARDKP_SHARD_DIMENSIONS);
-    const size_t total_entries = batch * max_active;
-    const size_t prefix_blocks = (input_size + scan_threads - 1) / scan_threads;
-    if (ensure_sfnn_inverse_index_scratch(ctx, input_size, total_entries, prefix_blocks) != 0) {
-        return -1;
-    }
-
-    if (memset_i32_async(ctx, ctx->sfnn_inverse_counts, input_size, 0, "cudaMemsetAsync nnue shardkp inverse counts") != 0 ||
-        memset_i32_async(
-            ctx,
-            ctx->sfnn_inverse_write_counters,
-            input_size,
-            0,
-            "cudaMemsetAsync nnue shardkp inverse write counters") != 0) {
-        return -1;
-    }
-
-    int blocks = 0;
-    if (block_count_1d(total_entries, count_threads, &blocks, "nnue_shardkp_inverse_feature_counts_kernel") != 0) {
-        return -1;
-    }
-    sfnn_inverse_feature_counts_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
-        indices,
-        ctx->sfnn_inverse_counts,
-        total_entries,
-        max_active,
-        input_size);
-    if (check_kernel_launch("nnue_shardkp_inverse_feature_counts_kernel launch") != 0) {
-        return -1;
-    }
-
-    sfnn_inverse_prefix_sum_block_local_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_counts,
-        ctx->sfnn_inverse_offsets,
-        ctx->sfnn_inverse_block_sums,
-        input_size);
-    if (check_kernel_launch("nnue_shardkp_inverse_prefix_sum_block_local_kernel launch") != 0) {
-        return -1;
-    }
-    sfnn_inverse_prefix_sum_small_kernel<<<1, scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_block_sums,
-        ctx->sfnn_inverse_block_offsets,
-        prefix_blocks);
-    if (check_kernel_launch("nnue_shardkp_inverse_prefix_sum_small_kernel launch") != 0) {
-        return -1;
-    }
-    sfnn_inverse_prefix_add_block_offsets_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_offsets,
-        ctx->sfnn_inverse_block_offsets,
-        input_size,
-        prefix_blocks);
-    if (check_kernel_launch("nnue_shardkp_inverse_prefix_add_block_offsets_kernel launch") != 0) {
-        return -1;
-    }
-
-    sfnn_inverse_scatter_positions_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
-        indices,
-        ctx->sfnn_inverse_offsets,
-        ctx->sfnn_inverse_write_counters,
-        ctx->sfnn_inverse_positions,
-        total_entries,
-        max_active,
-        input_size);
-    if (check_kernel_launch("nnue_shardkp_inverse_scatter_positions_kernel launch") != 0) {
-        return -1;
-    }
-
-    nnue_shardkp_inverse_gather_l0w_gradients_kernel<<<static_cast<unsigned int>(input_size), gather_threads, 0, ctx->stream>>>(
-        pre_gradients,
-        ctx->sfnn_inverse_positions,
-        ctx->sfnn_inverse_offsets,
-        l0w_gradients,
-        input_size,
-        rows,
-        add_to_existing);
-    if (check_kernel_launch("nnue_shardkp_inverse_gather_l0w_gradients_kernel launch") != 0) {
-        return -1;
-    }
-    return 0;
-}
-
-int launch_nnue_shardkp_base_inverse_index_for_perspective(
-    BulletOuCudaCppContext* ctx,
-    const int* indices,
-    const float* pre_gradients,
-    float* l0w_gradients,
-    size_t batch,
-    size_t max_active,
-    size_t rows,
-    int add_to_existing) {
-    constexpr int count_threads = 256;
-    constexpr int scan_threads = 1024;
-    constexpr int gather_threads = static_cast<int>(NNUE_SHARDKP_COMPACT_L0_STRIDE);
-    const size_t n_features = NNUE_SHARDKP_KP_DIMENSIONS;
-    const size_t total_entries = batch * max_active;
-    const size_t prefix_blocks = (n_features + scan_threads - 1) / scan_threads;
-    if (ensure_sfnn_inverse_index_scratch(ctx, n_features, total_entries, prefix_blocks) != 0) {
-        return -1;
-    }
-
-    if (memset_i32_async(ctx, ctx->sfnn_inverse_counts, n_features, 0, "cudaMemsetAsync nnue shardkp base inverse counts") != 0 ||
-        memset_i32_async(
-            ctx,
-            ctx->sfnn_inverse_write_counters,
-            n_features,
-            0,
-            "cudaMemsetAsync nnue shardkp base inverse write counters") != 0) {
-        return -1;
-    }
-
-    int blocks = 0;
-    if (block_count_1d(total_entries, count_threads, &blocks, "nnue_shardkp_base_inverse_feature_counts_kernel") != 0) {
-        return -1;
-    }
-    sfnn_inverse_feature_counts_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
-        indices,
-        ctx->sfnn_inverse_counts,
-        total_entries,
-        max_active,
-        n_features);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_feature_counts_kernel launch") != 0) {
-        return -1;
-    }
-
-    sfnn_inverse_prefix_sum_block_local_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_counts,
-        ctx->sfnn_inverse_offsets,
-        ctx->sfnn_inverse_block_sums,
-        n_features);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_prefix_sum_block_local_kernel launch") != 0) {
-        return -1;
-    }
-    sfnn_inverse_prefix_sum_small_kernel<<<1, scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_block_sums,
-        ctx->sfnn_inverse_block_offsets,
-        prefix_blocks);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_prefix_sum_small_kernel launch") != 0) {
-        return -1;
-    }
-    sfnn_inverse_prefix_add_block_offsets_kernel<<<static_cast<int>(prefix_blocks), scan_threads, 0, ctx->stream>>>(
-        ctx->sfnn_inverse_offsets,
-        ctx->sfnn_inverse_block_offsets,
-        n_features,
-        prefix_blocks);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_prefix_add_block_offsets_kernel launch") != 0) {
-        return -1;
-    }
-
-    if (block_count_1d(total_entries, count_threads, &blocks, "nnue_shardkp_base_inverse_scatter_positions_kernel") != 0) {
-        return -1;
-    }
-    sfnn_inverse_scatter_positions_kernel<<<blocks, count_threads, 0, ctx->stream>>>(
-        indices, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_write_counters, ctx->sfnn_inverse_positions, total_entries, max_active, n_features);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_scatter_positions_kernel launch") != 0) {
-        return -1;
-    }
-
-    nnue_shardkp_base_inverse_gather_l0w_gradients_kernel<<<static_cast<unsigned int>(n_features), gather_threads, 0, ctx->stream>>>(
-        pre_gradients,
-        ctx->sfnn_inverse_positions,
-        ctx->sfnn_inverse_offsets,
-        l0w_gradients,
-        rows,
-        add_to_existing);
-    if (check_kernel_launch("nnue_shardkp_base_inverse_gather_l0w_gradients_kernel launch") != 0) {
-        return -1;
-    }
-    return 0;
-}
-
-int launch_nnue_shardkp_inverse_index_l0_backward(
-    BulletOuCudaCppContext* ctx,
-    const int* stm_indices,
-    const int* nstm_indices,
-    const float* stm_l0_gradients,
-    const float* nstm_l0_gradients,
-    float* l0w_gradients,
-    size_t batch,
-    size_t max_active,
-    size_t input_size,
-    size_t rows) {
-    if (max_active <= NNUE_SHARDKP_KP_MAX_ACTIVE) {
-        if (launch_nnue_shardkp_base_inverse_index_for_perspective(
-                ctx,
-                stm_indices,
-                stm_l0_gradients,
-                l0w_gradients,
-                batch,
-                max_active,
-                rows,
-                0) != 0) {
-            return -1;
-        }
-        return launch_nnue_shardkp_base_inverse_index_for_perspective(
-            ctx,
-            nstm_indices,
-            nstm_l0_gradients,
-            l0w_gradients,
-            batch,
-            max_active,
-            rows,
-            1);
-    }
-
-    if (launch_nnue_shardkp_inverse_index_for_perspective(
-            ctx,
-            stm_indices,
-            stm_l0_gradients,
-            l0w_gradients,
-            batch,
-            max_active,
-            input_size,
-            rows,
-            0) != 0 ||
-        launch_nnue_shardkp_inverse_index_for_perspective(
-            ctx,
-            nstm_indices,
-            nstm_l0_gradients,
-            l0w_gradients,
-            batch,
-            max_active,
-            input_size,
-            rows,
-            1) != 0) {
         return -1;
     }
     return 0;
@@ -4413,7 +3598,6 @@ int launch_nnue_backward_kernels(
 
     constexpr int threads = 256;
     int blocks = 0;
-    const bool shardkp_shape = nnue_is_shardkp_shape(input_size, l1);
 
     size_t out_threads = std::max(batch * l3, std::max(l3, static_cast<size_t>(1)));
     if (block_count_1d(out_threads, threads, &blocks, "dense_output_backward_kernel") != 0) {
@@ -4448,28 +3632,10 @@ int launch_nnue_backward_kernels(
         return -1;
     }
 
-    if (shardkp_shape) {
-        if (launch_shardkp_l1_crelu_backward_split(
-                ctx,
-                stm_l0,
-                nstm_l0,
-                hidden1,
-                hidden1_gradients,
-                l1w,
-                stm_l0_gradients,
-                nstm_l0_gradients,
-                l1w_gradients,
-                l1b_gradients,
-                batch,
-                l1,
-                l2) != 0) {
-            return -1;
-        }
-    } else {
-        size_t l1_input_dim = l1 * 2;
-        if (launch_dense_crelu_backward_gemm(
-                ctx,
-                "dense_l1_crelu_backward_gemm",
+    size_t l1_input_dim = l1 * 2;
+    if (launch_dense_crelu_backward_gemm(
+            ctx,
+            "dense_l1_crelu_backward_gemm",
             combined,
             hidden1,
             hidden1_gradients,
@@ -4479,24 +3645,23 @@ int launch_nnue_backward_kernels(
             l1b_gradients,
             batch,
             l1_input_dim,
-                l2) != 0) {
-            return -1;
-        }
+            l2) != 0) {
+        return -1;
+    }
 
-        if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_l0_crelu_backward_kernel") != 0) {
-            return -1;
-        }
-        nnue_l0_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            combined_gradients,
-            stm_l0,
-            nstm_l0,
-            stm_l0_gradients,
-            nstm_l0_gradients,
-            batch,
-            l1);
-        if (check_kernel_launch("nnue_l0_crelu_backward_kernel launch") != 0) {
-            return -1;
-        }
+    if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_l0_crelu_backward_kernel") != 0) {
+        return -1;
+    }
+    nnue_l0_crelu_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        combined_gradients,
+        stm_l0,
+        nstm_l0,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        batch,
+        l1);
+    if (check_kernel_launch("nnue_l0_crelu_backward_kernel launch") != 0) {
+        return -1;
     }
 
     if (zero_l0_gradients != 0) {
@@ -4511,50 +3676,28 @@ int launch_nnue_backward_kernels(
         }
     }
 
-    if (shardkp_shape) {
-        if (launch_nnue_shardkp_inverse_index_l0_backward(
-                ctx,
-                stm_indices,
-                nstm_indices,
-                stm_l0_gradients,
-                nstm_l0_gradients,
-                l0w_gradients,
-                batch,
-                max_active,
-                input_size,
-                l1) != 0) {
-            return -1;
-        }
-    } else {
-        size_t l0_scatter_threads = batch * max_active * l1;
-        if (block_count_1d(l0_scatter_threads, threads, &blocks, "nnue_l0_sparse_backward_kernel") != 0) {
-            return -1;
-        }
-        nnue_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            stm_indices,
-            nstm_indices,
-            stm_l0_gradients,
-            nstm_l0_gradients,
-            l0w_gradients,
-            batch,
-            max_active,
-            input_size,
-            l1);
-        if (check_kernel_launch("nnue_l0_sparse_backward_kernel launch") != 0) {
-            return -1;
-        }
+    size_t l0_scatter_threads = batch * max_active * l1;
+    if (block_count_1d(l0_scatter_threads, threads, &blocks, "nnue_l0_sparse_backward_kernel") != 0) {
+        return -1;
+    }
+    nnue_l0_sparse_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        stm_indices,
+        nstm_indices,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        l0w_gradients,
+        batch,
+        max_active,
+        input_size,
+        l1);
+    if (check_kernel_launch("nnue_l0_sparse_backward_kernel launch") != 0) {
+        return -1;
     }
 
-    if (shardkp_shape) {
-        if (launch_l0_bias_backward_gemv(ctx, stm_l0_gradients, nstm_l0_gradients, l0b_gradients, batch, l1) != 0) {
-            return -1;
-        }
-    } else {
-        nnue_l0_bias_backward_kernel<<<static_cast<int>(l1), threads, 0, ctx->stream>>>(
-            stm_l0_gradients, nstm_l0_gradients, l0b_gradients, batch, l1);
-        if (check_kernel_launch("nnue_l0_bias_backward_kernel launch") != 0) {
-            return -1;
-        }
+    nnue_l0_bias_backward_kernel<<<static_cast<int>(l1), threads, 0, ctx->stream>>>(
+        stm_l0_gradients, nstm_l0_gradients, l0b_gradients, batch, l1);
+    if (check_kernel_launch("nnue_l0_bias_backward_kernel launch") != 0) {
+        return -1;
     }
 
     return 0;
@@ -4650,8 +3793,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         free_i32_scratch(ctx->sfnn_inverse_block_sums, ctx->sfnn_inverse_block_sums_len, "cudaFree sfnn inverse block sums") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_block_offsets, ctx->sfnn_inverse_block_offsets_len, "cudaFree sfnn inverse block offsets") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_write_counters, ctx->sfnn_inverse_write_counters_len, "cudaFree sfnn inverse write counters") != 0 ||
-        free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0 ||
-        free_f32_scratch(ctx->nnue_ones, ctx->nnue_ones_len, "cudaFree nnue ones") != 0) {
+        free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0) {
         delete ctx;
         return -1;
     }

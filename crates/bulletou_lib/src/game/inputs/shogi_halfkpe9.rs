@@ -5,8 +5,10 @@
 //! 占めているマスの **利き数情報** を 9 通り (= 3 × 3) ぶん多重化した
 //! バリアント。具体的には:
 //!
-//!     index = fe_end × sq_k + p
-//!           + fe_end × SQ_NB × (effect1 × 3 + effect2)
+//! ```text
+//! index = fe_end × sq_k + p
+//!       + fe_end × SQ_NB × (effect1 × 3 + effect2)
+//! ```
 //!
 //! - `effect1` = perspective から見た **自軍** がそのマスへ与えている利き数
 //!   (0/1/2 にクリップ)

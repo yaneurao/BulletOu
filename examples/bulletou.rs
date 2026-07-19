@@ -18,7 +18,6 @@ save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --eval-type NNUE_KA2 --arch NNUE_ka2_256x2_64_64               K+A2 NNUE
     bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
     bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
-    bulletou --eval-type NNUE_SHARDKP --arch NNUE_shardkp_c256_s128x64_f6_16_16
     bulletou --eval-type SFNN_HALFKA2HM --arch SFNN_halfkahm2_1536_15_32_k3k3
     bulletou --eval-type SFNN_HALFKA2   --arch SFNN_halfka2_1024_7_64_k3k3
 
@@ -62,9 +61,8 @@ use bulletou_lib::value::nnue_save_sfnn1536::{
 };
 use bulletou_lib::{
     game::inputs::{
-        SHARDKP_COMMON_DIMENSIONS, SHARDKP_FANOUT, SHARDKP_SHARD_COUNT, SHARDKP_SHARD_DIMENSIONS, SHARDKP_TOTAL_L1,
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
-        ShogiKkp, ShogiKp, ShogiKpp, ShogiShardKp, SparseInputType,
+        ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
     nn::optimiser,
@@ -135,8 +133,6 @@ enum EvalType {
     /// buckets × 1548 piece inputs). Same 4-layer ClippedReLU network as
     /// the rest of the NNUE family.
     NnueHalfkpvm,
-    /// NNUE ShardKP experimental row-sparse compact-L0 input.
-    NnueShardkp,
     /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
     /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
     /// MLP (FT → fc_0(L1+1 PSQT-shortcut) → CReLU + SqrCReLU concat →
@@ -256,7 +252,6 @@ enum NnueArchFeature {
     Ka2,
     Halfkpe9,
     Halfkpvm,
-    Shardkp,
     Halfka2,
     Halfkahm1,
     Halfkahm2,
@@ -295,15 +290,6 @@ impl NnueArch {
     /// The arch's canonical CLI value.
     fn cli_name(self) -> String {
         match self.family {
-            NnueArchFamily::Nnue if self.feature == NnueArchFeature::Shardkp => format!(
-                "NNUE_shardkp_c{}_s{}x{}_f{}_{}_{}",
-                SHARDKP_COMMON_DIMENSIONS,
-                SHARDKP_SHARD_DIMENSIONS,
-                SHARDKP_SHARD_COUNT,
-                SHARDKP_FANOUT,
-                self.l2,
-                self.l3
-            ),
             NnueArchFamily::Nnue => {
                 format!("NNUE_{}_{}x2_{}_{}", self.feature.arch_suffix(), self.l1, self.l2, self.l3)
             }
@@ -339,9 +325,6 @@ impl NnueArch {
             EvalType::NnueKa2 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Ka2, 256, 32, 32, None),
             EvalType::NnueHalfkpe9 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9, 256, 32, 32, None),
             EvalType::NnueHalfkpvm => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm, 256, 32, 32, None),
-            EvalType::NnueShardkp => {
-                Self::new(NnueArchFamily::Nnue, NnueArchFeature::Shardkp, SHARDKP_TOTAL_L1, 16, 16, None)
-            }
             EvalType::SfnnHalfka1hm => Self::new(
                 NnueArchFamily::Sfnn,
                 NnueArchFeature::Halfkahm1,
@@ -382,7 +365,6 @@ impl NnueArch {
             (NnueArchFamily::Nnue, NnueArchFeature::Ka2) => EvalType::NnueKa2,
             (NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9) => EvalType::NnueHalfkpe9,
             (NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm) => EvalType::NnueHalfkpvm,
-            (NnueArchFamily::Nnue, NnueArchFeature::Shardkp) => EvalType::NnueShardkp,
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm1) => EvalType::SfnnHalfka1hm,
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2) => EvalType::SfnnHalfka2hm,
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2) => EvalType::SfnnHalfka2,
@@ -393,8 +375,7 @@ impl NnueArch {
             | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkp)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Kp)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpe9)
-            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpvm)
-            | (NnueArchFamily::Sfnn, NnueArchFeature::Shardkp) => {
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpvm) => {
                 unreachable!("unsupported parsed architecture combination: {self:?}")
             }
         }
@@ -447,7 +428,6 @@ impl NnueArchFeature {
             "ka2" => NnueArchFeature::Ka2,
             "halfkpe9" => NnueArchFeature::Halfkpe9,
             "halfkpvm" => NnueArchFeature::Halfkpvm,
-            "shardkp" => NnueArchFeature::Shardkp,
             "halfka2" => NnueArchFeature::Halfka2,
             "halfkahm1" => NnueArchFeature::Halfkahm1,
             "halfkahm2" => NnueArchFeature::Halfkahm2,
@@ -461,7 +441,6 @@ impl NnueArchFeature {
                 | (NnueArchFamily::Nnue, NnueArchFeature::Ka2)
                 | (NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9)
                 | (NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm)
-                | (NnueArchFamily::Nnue, NnueArchFeature::Shardkp)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm1)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2)
@@ -485,7 +464,6 @@ impl NnueArchFeature {
             NnueArchFeature::Ka2 => "ka2",
             NnueArchFeature::Halfkpe9 => "halfkpe9",
             NnueArchFeature::Halfkpvm => "halfkpvm",
-            NnueArchFeature::Shardkp => "shardkp",
             NnueArchFeature::Halfka2 => "halfka2",
             NnueArchFeature::Halfkahm1 => "halfkahm1",
             NnueArchFeature::Halfkahm2 => "halfkahm2",
@@ -539,56 +517,6 @@ impl std::str::FromStr for NnueArch {
 
         match family {
             NnueArchFamily::Nnue => {
-                if feature == NnueArchFeature::Shardkp {
-                    if tokens.len() != 7 {
-                        return Err(format!("invalid arch `{s}`: expected `NNUE_shardkp_c256_s128x64_f6_<L2>_<L3>`"));
-                    }
-                    let common = tokens[2]
-                        .strip_prefix('c')
-                        .or_else(|| tokens[2].strip_prefix('C'))
-                        .ok_or_else(|| format!("invalid arch `{s}`: `{}` must start with `c`", tokens[2]))?
-                        .parse::<usize>()
-                        .map_err(|_| {
-                            format!("invalid arch `{s}`: common accumulator `{}` is not an integer", tokens[2])
-                        })?;
-                    let shard_part = tokens[3]
-                        .strip_prefix('s')
-                        .or_else(|| tokens[3].strip_prefix('S'))
-                        .ok_or_else(|| format!("invalid arch `{s}`: `{}` must start with `s`", tokens[3]))?;
-                    let (shard_dim_raw, shard_count_raw) = shard_part
-                        .split_once('x')
-                        .or_else(|| shard_part.split_once('X'))
-                        .ok_or_else(|| format!("invalid arch `{s}`: `{}` must look like `s128x64`", tokens[3]))?;
-                    let shard_dim = shard_dim_raw.parse::<usize>().map_err(|_| {
-                        format!("invalid arch `{s}`: shard dimension `{shard_dim_raw}` is not an integer")
-                    })?;
-                    let shard_count = shard_count_raw.parse::<usize>().map_err(|_| {
-                        format!("invalid arch `{s}`: shard count `{shard_count_raw}` is not an integer")
-                    })?;
-                    let fanout = tokens[4]
-                        .strip_prefix('f')
-                        .or_else(|| tokens[4].strip_prefix('F'))
-                        .ok_or_else(|| format!("invalid arch `{s}`: `{}` must start with `f`", tokens[4]))?
-                        .parse::<usize>()
-                        .map_err(|_| format!("invalid arch `{s}`: fanout `{}` is not an integer", tokens[4]))?;
-                    if common != SHARDKP_COMMON_DIMENSIONS
-                        || shard_dim != SHARDKP_SHARD_DIMENSIONS
-                        || shard_count != SHARDKP_SHARD_COUNT
-                        || fanout != SHARDKP_FANOUT
-                    {
-                        return Err(format!(
-                            "invalid arch `{s}`: only c{}_s{}x{}_f{} is currently supported",
-                            SHARDKP_COMMON_DIMENSIONS, SHARDKP_SHARD_DIMENSIONS, SHARDKP_SHARD_COUNT, SHARDKP_FANOUT
-                        ));
-                    }
-                    let l2: usize = tokens[5]
-                        .parse()
-                        .map_err(|_| format!("invalid arch `{s}`: L2 `{}` is not a positive integer", tokens[5]))?;
-                    let l3: usize = tokens[6]
-                        .parse()
-                        .map_err(|_| format!("invalid arch `{s}`: L3 `{}` is not a positive integer", tokens[6]))?;
-                    return NnueArch::new(family, feature, SHARDKP_TOTAL_L1, l2, l3, None).validate_dims(s);
-                }
                 if tokens.len() != 5 {
                     return Err(format!("invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>`"));
                 }
@@ -803,7 +731,6 @@ impl EvalType {
             EvalType::NnueKa2 => "shogi_nnue_ka2",
             EvalType::NnueHalfkpe9 => "shogi_nnue_halfkpe9",
             EvalType::NnueHalfkpvm => "shogi_nnue_halfkpvm",
-            EvalType::NnueShardkp => "shogi_nnue_shardkp",
             EvalType::SfnnHalfka1hm => "shogi_sfnn_halfka1hm",
             EvalType::SfnnHalfka2hm => "shogi_sfnn_halfka2hm",
             EvalType::SfnnHalfka2 => "shogi_sfnn_halfka2",
@@ -822,7 +749,6 @@ impl EvalType {
             | EvalType::NnueKa2
             | EvalType::NnueHalfkpe9
             | EvalType::NnueHalfkpvm
-            | EvalType::NnueShardkp
             | EvalType::SfnnHalfka1hm
             | EvalType::SfnnHalfka2hm
             | EvalType::SfnnHalfka2
@@ -854,7 +780,6 @@ impl EvalType {
             EvalType::NnueKa2 => "NNUE_KA2",
             EvalType::NnueHalfkpe9 => "NNUE_HALFKPE9",
             EvalType::NnueHalfkpvm => "NNUE_HALFKPVM",
-            EvalType::NnueShardkp => "NNUE_SHARDKP",
             EvalType::SfnnHalfka1hm => "SFNN_HALFKA1HM",
             EvalType::SfnnHalfka2hm => "SFNN_HALFKA2HM",
             EvalType::SfnnHalfka2 => "SFNN_HALFKA2",
@@ -2197,7 +2122,6 @@ impl Args {
                 | EvalType::NnueKa2
                 | EvalType::NnueHalfkpe9
                 | EvalType::NnueHalfkpvm
-                | EvalType::NnueShardkp
                 | EvalType::SfnnHalfka1hm
                 | EvalType::SfnnHalfka2hm
                 | EvalType::SfnnHalfka2
@@ -2865,7 +2789,6 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 EvalType::NnueKa2 => run_cuda_cpp_ka2_direct_steps(args),
                 EvalType::NnueHalfkpe9 => run_cuda_cpp_halfkpe9_direct_steps(args),
                 EvalType::NnueHalfkpvm => run_cuda_cpp_halfkpvm_direct_steps(args),
-                EvalType::NnueShardkp => run_cuda_cpp_shardkp_direct_steps(args),
                 EvalType::SfnnHalfka1hm => run_cuda_cpp_sfnn_halfka1hm_direct_steps(args),
                 EvalType::SfnnHalfka2hm => run_cuda_cpp_sfnn_halfka2hm_direct_steps(args),
                 EvalType::SfnnHalfka2 => run_cuda_cpp_sfnn_halfka2_direct_steps(args),
@@ -3025,7 +2948,6 @@ enum CudaCppNnueFeatureKind {
     Ka2,
     Halfkpe9,
     Halfkpvm,
-    Shardkp,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3037,7 +2959,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => "NNUE_KA2",
             Self::Halfkpe9 => "NNUE_HALFKPE9",
             Self::Halfkpvm => "NNUE_HALFKPVM",
-            Self::Shardkp => "NNUE_SHARDKP",
         }
     }
 
@@ -3048,7 +2969,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => "KA2",
             Self::Halfkpe9 => "HalfKPE9",
             Self::Halfkpvm => "HalfKPvm",
-            Self::Shardkp => "ShardKP",
         }
     }
 
@@ -3059,7 +2979,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => "ka2",
             Self::Halfkpe9 => "halfkpe9",
             Self::Halfkpvm => "halfkpvm",
-            Self::Shardkp => "shardkp",
         }
     }
 
@@ -3070,7 +2989,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => NnueFeatureSet::Ka2,
             Self::Halfkpe9 => NnueFeatureSet::HalfKpe9,
             Self::Halfkpvm => NnueFeatureSet::HalfKpvm,
-            Self::Shardkp => NnueFeatureSet::ShardKp,
         }
     }
 
@@ -3081,7 +2999,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => ShogiKa2.num_inputs(),
             Self::Halfkpe9 => ShogiHalfKpe9.num_inputs(),
             Self::Halfkpvm => ShogiHalfKPvm.num_inputs(),
-            Self::Shardkp => ShogiShardKp.num_inputs(),
         }
     }
 
@@ -3092,7 +3009,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => ShogiKa2.num_inputs(),
             Self::Halfkpe9 => ShogiHalfKpe9.num_inputs(),
             Self::Halfkpvm => ShogiHalfKPvm.num_inputs(),
-            Self::Shardkp => ShogiShardKp.num_inputs(),
         }
     }
 
@@ -3100,7 +3016,7 @@ impl CudaCppNnueFeatureKind {
         match self {
             Self::Halfkp => bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS,
             Self::Kp => 0,
-            Self::Ka2 | Self::Halfkpe9 | Self::Halfkpvm | Self::Shardkp => 0,
+            Self::Ka2 | Self::Halfkpe9 | Self::Halfkpvm => 0,
         }
     }
 
@@ -3111,7 +3027,6 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => ShogiKa2.max_active(),
             Self::Halfkpe9 => ShogiHalfKpe9.max_active(),
             Self::Halfkpvm => ShogiHalfKPvm.max_active(),
-            Self::Shardkp => ShogiKp.max_active(),
         }
     }
 
@@ -3122,20 +3037,13 @@ impl CudaCppNnueFeatureKind {
             Self::Ka2 => "deterministic NNUE_KA2 scratch",
             Self::Halfkpe9 => "deterministic NNUE_HALFKPE9 scratch",
             Self::Halfkpvm => "deterministic NNUE_HALFKPVM scratch",
-            Self::Shardkp => "deterministic NNUE_SHARDKP compact-L0 scratch",
         }
     }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_nnue_l0w_len_for_shape(shape: bulletou_lib::value::NnueForwardShape) -> Result<usize, String> {
-    bulletou_cuda_cpp::nnue_l0w_len(bulletou_cuda_cpp::NnueForwardShape {
-        input_size: shape.input_size,
-        l1: shape.l1,
-        l2: shape.l2,
-        l3: shape.l3,
-    })
-    .map_err(|err| err.to_string())
+    shape.input_size.checked_mul(shape.l1).ok_or_else(|| "NNUE l0w length overflow".to_string())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3409,38 +3317,6 @@ where
             };
             for_each_kppt_teacher_fast_batch(
                 ShogiHalfKPvm,
-                feature_kind.input_label(),
-                &config,
-                batch_count,
-                |teacher_batch| {
-                    visitor(CudaCppNnueTeacherBatch {
-                        batch: teacher_batch.batch,
-                        source: teacher_batch.source,
-                        dataloader_pos: teacher_batch.dataloader_pos,
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())
-        }
-        CudaCppNnueFeatureKind::Shardkp => {
-            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
-            let config = KpptTeacherBatchConfig {
-                teacher: &args.teacher,
-                batch_size: options.batch_size,
-                batch_index: options.batch_index,
-                dataloader_resume_pos: options.dataloader_resume_pos,
-                buffer_mb: args.buffer_mb,
-                loader_threads: options.loader_threads,
-                threads: options.teacher_threads,
-                queue_depth: options.queue_depth,
-                lambda: args.lambda,
-                scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
-                score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
-                profile_prepare: args.cuda_cpp_profile_teacher_prepare,
-            };
-            for_each_kppt_teacher_fast_batch(
-                ShogiKp,
                 feature_kind.input_label(),
                 &config,
                 batch_count,
@@ -4297,11 +4173,6 @@ fn run_cuda_cpp_halfkpvm_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn run_cuda_cpp_shardkp_direct_steps(args: &Args) -> Result<(), String> {
-    run_cuda_cpp_nnue_direct_steps(args, CudaCppNnueFeatureKind::Shardkp)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureKind) -> Result<(), String> {
     use bulletou_cuda_cpp::{
         Context, NnueForwardHostWeights as CudaNnueForwardHostWeights, NnueForwardShape as CudaNnueForwardShape,
@@ -4373,19 +4244,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             feature_kind.source_label()
         );
     }
-    if feature_kind == CudaCppNnueFeatureKind::Shardkp {
-        eprintln!(
-            "  shardkp L0 storage = compact: {} K+P features x {} rows = {} weights ({:.1} MiB)",
-            bulletou_cuda_cpp::NNUE_SHARDKP_KP_DIMENSIONS,
-            bulletou_cuda_cpp::NNUE_SHARDKP_COMPACT_L0_STRIDE,
-            format_count(initial_weights.l0w.len()),
-            (initial_weights.l0w.len() * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0)
-        );
-        eprintln!(
-            "  shardkp feature upload = base KP indices: max_active={} (expanded on GPU to common+6 shards)",
-            max_active
-        );
-    }
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
@@ -4427,12 +4285,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     }
     .map_err(|e| e.to_string())?;
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
-    let l0_layout_label = if feature_kind == CudaCppNnueFeatureKind::Shardkp {
-        "compact ShardKP L0 kernels"
-    } else {
-        "dense-backward kernels"
-    };
-    eprintln!("  cuda-cpp warmup = done (NNUE {l0_layout_label})");
+    eprintln!("  cuda-cpp warmup = done (NNUE dense-backward kernels)");
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
     eprintln!(
         "  cuda-cpp {} upload pipeline = enabled (2 pinned slots; non-profiled steps)",
@@ -6201,51 +6054,14 @@ fn run_cuda_cpp_nnue_final_validation(
     }
 
     let fold_started = std::time::Instant::now();
-    let validation_weights_owned = (feature_kind != CudaCppNnueFeatureKind::Shardkp)
-        .then(|| cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights))
-        .transpose()?;
+    let validation_weights_owned = cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights)?;
     let weight_fold_elapsed = fold_started.elapsed();
-    let validation_shape = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| bulletou_cuda_cpp::NnueForwardShape {
-            input_size: validation_weights.shape.input_size,
-            l1: validation_weights.shape.l1,
-            l2: validation_weights.shape.l2,
-            l3: validation_weights.shape.l3,
-        })
-        .unwrap_or(shape);
-    let validation_l0w = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l0w.as_slice())
-        .unwrap_or(weights.l0w.as_slice());
-    let validation_l0b = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l0b.as_slice())
-        .unwrap_or(weights.l0b.as_slice());
-    let validation_l1w = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l1w.as_slice())
-        .unwrap_or(weights.l1w.as_slice());
-    let validation_l1b = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l1b.as_slice())
-        .unwrap_or(weights.l1b.as_slice());
-    let validation_l2w = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l2w.as_slice())
-        .unwrap_or(weights.l2w.as_slice());
-    let validation_l2b = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.l2b.as_slice())
-        .unwrap_or(weights.l2b.as_slice());
-    let validation_outw = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.outw.as_slice())
-        .unwrap_or(weights.outw.as_slice());
-    let validation_outb = validation_weights_owned
-        .as_ref()
-        .map(|validation_weights| validation_weights.outb.as_slice())
-        .unwrap_or(weights.outb.as_slice());
+    let validation_shape = bulletou_cuda_cpp::NnueForwardShape {
+        input_size: validation_weights_owned.shape.input_size,
+        l1: validation_weights_owned.shape.l1,
+        l2: validation_weights_owned.shape.l2,
+        l3: validation_weights_owned.shape.l3,
+    };
     let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
     let context_elapsed = context_started.elapsed();
@@ -6254,14 +6070,14 @@ fn run_cuda_cpp_nnue_final_validation(
         &ctx,
         bulletou_cuda_cpp::NnueForwardHostWeights {
             shape: validation_shape,
-            l0w: validation_l0w,
-            l0b: validation_l0b,
-            l1w: validation_l1w,
-            l1b: validation_l1b,
-            l2w: validation_l2w,
-            l2b: validation_l2b,
-            outw: validation_outw,
-            outb: validation_outb,
+            l0w: &validation_weights_owned.l0w,
+            l0b: &validation_weights_owned.l0b,
+            l1w: &validation_weights_owned.l1w,
+            l1b: &validation_weights_owned.l1b,
+            l2w: &validation_weights_owned.l2w,
+            l2b: &validation_weights_owned.l2b,
+            outw: &validation_weights_owned.outw,
+            outb: &validation_weights_owned.outb,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -6889,13 +6705,6 @@ fn build_nnue_validation_fast_batch(
             )?,
             CudaCppNnueFeatureKind::Halfkpvm => fill_sparse_validation_features(
                 ShogiHalfKPvm,
-                feature_kind.source_label(),
-                pos,
-                &mut stm[sparse_offset..sparse_offset + max_active],
-                &mut nstm[sparse_offset..sparse_offset + max_active],
-            )?,
-            CudaCppNnueFeatureKind::Shardkp => fill_sparse_validation_features(
-                ShogiKp,
                 feature_kind.source_label(),
                 pos,
                 &mut stm[sparse_offset..sparse_offset + max_active],
@@ -10172,14 +9981,6 @@ mod tests {
     fn nnue_arch_parse_known_presets() {
         assert_eq!(NnueArch::from_str("NNUE_halfkp_256x2_32_32").unwrap().dims(), (256, 32, 32));
         assert_eq!(NnueArch::from_str("NNUE_halfkp_1024x2_8_64").unwrap().dims(), (1024, 8, 64));
-        assert_eq!(
-            NnueArch::from_str("NNUE_shardkp_c256_s128x64_f6_16_16").unwrap().dims(),
-            (SHARDKP_TOTAL_L1, 16, 16)
-        );
-        assert_eq!(
-            NnueArch::from_str("NNUE_SHARDKP_C256_S128X64_F6_16_16").unwrap().cli_name(),
-            "NNUE_shardkp_c256_s128x64_f6_16_16"
-        );
         assert_eq!(NnueArch::from_str("SFNN_halfkahm2_1536_15_32_k3k3").unwrap().dims(), (1536, 15, 32));
         assert_eq!(
             NnueArch::from_str("sfnn_HALFKA2_1024_7_64_K3K3").unwrap().cli_name(),
@@ -10203,7 +10004,6 @@ mod tests {
         for s in [
             "NNUE_halfkp_256x2_32_32",
             "NNUE_ka2_256x2_64_64",
-            "NNUE_shardkp_c256_s128x64_f6_16_16",
             "SFNN_halfka2_1024_7_64_k3k3",
             "SFNN_halfka2_4096_7_64_g4_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
@@ -10222,8 +10022,7 @@ mod tests {
         assert!(NnueArch::from_str("NNUE_halfkp_256x3_32_32").is_err());
         assert!(NnueArch::from_str("NNUE_halfkp_256x2_32").is_err());
         assert!(NnueArch::from_str("NNUE_halfka2_256x2_32_32").is_err());
-        assert!(NnueArch::from_str("NNUE_shardkp_8448x2_16_16").is_err());
-        assert!(NnueArch::from_str("NNUE_shardkp_c256_s128x63_f6_16_16").is_err());
+        assert!(NnueArch::from_str("NNUE_unsupported_256x2_32_32").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_ls9").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g3_k3k3").is_err());
@@ -10248,12 +10047,6 @@ mod tests {
         // Baseline (no --tag, no --output): default name only.
         let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null"]).unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
-
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_SHARDKP", "--teacher", "/dev/null"]).unwrap();
-        assert_eq!(
-            args.output_dir(),
-            std::path::PathBuf::from("checkpoints/NNUE_SHARDKP-NNUE_shardkp_c256_s128x64_f6_16_16"),
-        );
 
         // --tag appends `-<tag>` to the auto-derived name.
         let args =
@@ -10501,32 +10294,6 @@ mod tests {
         ])
         .unwrap();
 
-        let result = args.validate_backend_flags();
-        if cfg!(feature = "cuda-cpp-backend") {
-            assert!(result.is_ok());
-        } else {
-            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
-        }
-    }
-
-    #[test]
-    fn cuda_cpp_backend_accepts_explicit_shardkp_direct_steps() {
-        use clap::Parser as _;
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type",
-            "NNUE_SHARDKP",
-            "--teacher",
-            "/dev/null",
-            "--backend",
-            "cuda-cpp",
-            "--cuda-cpp-train-steps",
-            "1",
-        ])
-        .unwrap();
-
-        assert_eq!(args.arch().cli_name(), "NNUE_shardkp_c256_s128x64_f6_16_16");
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -11973,35 +11740,6 @@ mod tests {
         assert_eq!(weights.l0w.len(), ShogiKp.num_inputs() * weights.shape.l1);
         assert!(weights.l0w.iter().any(|&v| v != 0.0));
         assert!(weights.l0b.iter().any(|&v| v != 0.0));
-    }
-
-    #[cfg(feature = "cuda-cpp-backend")]
-    #[test]
-    fn cuda_cpp_shardkp_initial_weights_use_compact_l0_shape() {
-        use clap::Parser as _;
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--eval-type",
-            "NNUE_SHARDKP",
-            "--arch",
-            "NNUE_shardkp_c256_s128x64_f6_16_16",
-            "--teacher",
-            "/dev/null",
-            "--backend",
-            "cuda-cpp",
-            "--cuda-cpp-train-steps",
-            "1",
-        ])
-        .unwrap();
-
-        let weights = build_nnue_initial_weights_for_cuda_cpp(&args, CudaCppNnueFeatureKind::Shardkp).unwrap();
-        assert_eq!(weights.shape.input_size, ShogiShardKp.num_inputs());
-        assert_eq!(weights.shape.l1, SHARDKP_TOTAL_L1);
-        assert_eq!(weights.l0w.len(), bulletou_cuda_cpp::NNUE_SHARDKP_COMPACT_L0W_LEN);
-        assert!(weights.l0w.len() < weights.shape.input_size * weights.shape.l1);
-        assert!(weights.l0w.iter().any(|&v| v != 0.0));
-        validate_cuda_cpp_nnue_owned_weights(CudaCppNnueFeatureKind::Shardkp, &weights).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

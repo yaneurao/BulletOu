@@ -491,37 +491,13 @@ pub struct NnueForwardShape {
 }
 
 pub const NNUE_HALFKP_256X2_32_32: NnueForwardShape = NnueForwardShape { input_size: 125_388, l1: 256, l2: 32, l3: 32 };
-pub const NNUE_SHARDKP_KP_DIMENSIONS: usize = 1_710;
-pub const NNUE_SHARDKP_CONNECTIONS_PER_FEATURE: usize = 7;
-pub const NNUE_SHARDKP_INPUT_SIZE: usize = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_CONNECTIONS_PER_FEATURE;
-pub const NNUE_SHARDKP_COMMON_DIMENSIONS: usize = 256;
-pub const NNUE_SHARDKP_SHARD_DIMENSIONS: usize = 128;
-pub const NNUE_SHARDKP_SHARD_COUNT: usize = 64;
-pub const NNUE_SHARDKP_FANOUT: usize = 6;
-pub const NNUE_SHARDKP_L1: usize =
-    NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_SHARD_DIMENSIONS * NNUE_SHARDKP_SHARD_COUNT;
-pub const NNUE_SHARDKP_COMPACT_L0_STRIDE: usize =
-    NNUE_SHARDKP_COMMON_DIMENSIONS + NNUE_SHARDKP_FANOUT * NNUE_SHARDKP_SHARD_DIMENSIONS;
-pub const NNUE_SHARDKP_COMPACT_L0W_LEN: usize = NNUE_SHARDKP_KP_DIMENSIONS * NNUE_SHARDKP_COMPACT_L0_STRIDE;
-
-pub fn is_nnue_shardkp_shape(shape: NnueForwardShape) -> bool {
-    shape.input_size == NNUE_SHARDKP_INPUT_SIZE && shape.l1 == NNUE_SHARDKP_L1
-}
 
 pub fn nnue_l0w_len(shape: NnueForwardShape) -> Result<usize> {
-    if is_nnue_shardkp_shape(shape) {
-        Ok(NNUE_SHARDKP_COMPACT_L0W_LEN)
-    } else {
-        checked_product("l0w", &[shape.input_size, shape.l1])
-    }
+    checked_product("l0w", &[shape.input_size, shape.l1])
 }
 
 fn nnue_l0w_len_saturating(shape: NnueForwardShape) -> usize {
-    if is_nnue_shardkp_shape(shape) {
-        NNUE_SHARDKP_COMPACT_L0W_LEN
-    } else {
-        shape.input_size.saturating_mul(shape.l1)
-    }
+    shape.input_size.saturating_mul(shape.l1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5273,18 +5249,6 @@ mod tests {
         let err = weights.validate().unwrap_err();
 
         assert!(err.to_string().contains("l0w length mismatch"));
-    }
-
-    #[test]
-    fn nnue_l0w_len_uses_compact_shardkp_storage() {
-        let shardkp = NnueForwardShape { input_size: NNUE_SHARDKP_INPUT_SIZE, l1: NNUE_SHARDKP_L1, l2: 16, l3: 16 };
-        assert!(is_nnue_shardkp_shape(shardkp));
-        assert_eq!(nnue_l0w_len(shardkp).unwrap(), NNUE_SHARDKP_COMPACT_L0W_LEN);
-        assert!(NNUE_SHARDKP_COMPACT_L0W_LEN < NNUE_SHARDKP_INPUT_SIZE * NNUE_SHARDKP_L1);
-
-        let kp = NnueForwardShape { input_size: NNUE_SHARDKP_KP_DIMENSIONS, l1: 256, l2: 32, l3: 32 };
-        assert!(!is_nnue_shardkp_shape(kp));
-        assert_eq!(nnue_l0w_len(kp).unwrap(), kp.input_size * kp.l1);
     }
 
     #[test]

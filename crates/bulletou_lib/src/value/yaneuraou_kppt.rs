@@ -55,7 +55,9 @@
 //! YaneuraOu's `kk[bk][wk]` uses raw (un-inverted) square coordinates. The
 //! mapping is therefore:
 //!
-//!     bullet_idx(bk, wk) = bk * 81 + (80 - wk)
+//! ```text
+//! bullet_idx(bk, wk) = bk * 81 + (80 - wk)
+//! ```
 //!
 //! for the KK array, and analogously for KKP with the BonaPiece sub-index.
 //!
