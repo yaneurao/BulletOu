@@ -210,7 +210,9 @@ where
                 }
             },
             |trainer, superbatch| {
-                if superbatch % schedule.save_rate == 0 || superbatch == steps.end_superbatch {
+                if superbatch % schedule.save_rate == 0
+                    || (schedule.save_epoch_end && superbatch == steps.end_superbatch)
+                {
                     let name = format!("{}-{superbatch}", schedule.net_id);
                     let path = format!("{}/{name}", settings.output_directory);
                     std::fs::create_dir(path.as_str()).unwrap_or(());

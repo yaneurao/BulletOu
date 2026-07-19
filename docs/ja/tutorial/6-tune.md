@@ -17,7 +17,8 @@
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
-| `--save-rate` | N superbatch ごとに checkpoint を保存。`plateau` では引き続き `--save-rate 1` が必要 | 20 |
+| `--save-rate` | N superbatch ごとに checkpoint を保存。デフォルトでは save-rate 境界でなくても各 epoch の最後の superbatch も保存する。`plateau` では引き続き `--save-rate 1` が必要 | 20 |
+| `--save-epoch-end` / `--no-save-epoch-end` | 各 epoch 最後の superbatch を暗黙に保存するかどうか | on |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
 | `--optimizer` | optimizer。`adamw` / `radam` / `ranger` から選択。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
 | `--lr-schedule` | `step` (= 階段状 StepLR)、`geometric` (= 対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |

@@ -42,6 +42,7 @@ fn main() {
         wdl_scheduler: wdl::ConstantWDL { value: 0.2 },
         lr_scheduler: lr::ConstantLR { value: 0.001 },
         save_rate: 10,
+        save_epoch_end: true,
     };
 
     let settings = LocalSettings {

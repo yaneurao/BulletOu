@@ -36,7 +36,7 @@ The engine refuses to load if any of the three files is missing.
 The first training run uses a small teacher and few superbatches, so don't expect competitive strength. To get something usable in real play:
 - Increase teacher size (100M → 1B+ positions)
 - Run several epochs (e.g. `--max-epochs 3`)
-- Increase `--save-rate` (e.g. 10) and only use the later saves
+- Increase `--save-rate` (e.g. 10) and only use the later saves; epoch-end saves are kept by default
 
 Per-eval-type hyperparameter advice lives in the reference docs ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [halfkpe9.md](../shogi/halfkpe9.md) / [kppt.md](../shogi/kppt.md)).
 

@@ -1090,6 +1090,7 @@ fn main() {
         wdl_scheduler,
         lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
+        save_epoch_end: true,
     };
 
     // resume の場合は experiment_id を引き継ぐ。on_checkpoint_saved closure が

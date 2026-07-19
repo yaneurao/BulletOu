@@ -93,7 +93,7 @@ use bulletou_lib::{
         },
     },
 };
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 // ----- eval-type ---------------------------------------------------------
 
@@ -1206,6 +1206,10 @@ fn effective_save_rate(args: &Args) -> usize {
     args.save_rate.unwrap_or(DEFAULT_SAVE_RATE)
 }
 
+fn effective_save_epoch_end(args: &Args) -> bool {
+    args.save_epoch_end && !args.no_save_epoch_end
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_default_cpu_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).clamp(4, 24)).unwrap_or(24)
@@ -1588,6 +1592,14 @@ struct Args {
     #[arg(long)]
     save_rate: Option<usize>,
 
+    /// Also save the final superbatch of each epoch even when it is not on a save-rate boundary.
+    #[arg(long, default_value_t = true, action = ArgAction::SetTrue)]
+    save_epoch_end: bool,
+
+    /// Disable the implicit checkpoint at the final superbatch of each epoch.
+    #[arg(long = "no-save-epoch-end")]
+    no_save_epoch_end: bool,
+
     /// Dataloader worker threads (CPU side).
     #[arg(long, default_value = "4")]
     threads: usize,
@@ -1893,7 +1905,8 @@ impl Args {
                 || self.lr_schedule != LrScheduleKind::Step
                 || self.lr_step_gamma.is_some()
                 || self.lr_step_positions.is_some()
-                || self.save_rate.is_some_and(|save_rate| save_rate != 1))
+                || self.save_rate.is_some_and(|save_rate| save_rate != 1)
+                || self.no_save_epoch_end)
         {
             return Err(
                 "--backend cuda-cpp direct-step mode does not honor production schedule flags; use --superbatches with --max-epochs instead"
@@ -2973,10 +2986,11 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
     );
     if schedule.production {
         eprintln!(
-            "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, batches_per_superbatch={}, lr={}",
+            "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
             effective_save_rate(args),
+            effective_save_epoch_end(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
         );
@@ -3507,35 +3521,42 @@ fn run_cuda_cpp_halfkp_direct_steps(args: &Args) -> Result<(), String> {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
             if schedule.production {
-                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
-                let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
-                let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
-                    args,
-                    cuda_shape,
-                    &trained_weights,
-                    &trained_optimizer_states,
-                    completed_step_offset + seen_steps,
-                    CudaCppCheckpointLog {
-                        epoch: chunk.epoch,
-                        superbatch: chunk.superbatch,
-                        curr_batch: schedule.batches_per_superbatch,
-                        train_steps: chunk.steps,
-                        train_loss: last_loss,
-                        test_metrics,
-                        lr_start: chunk.lr_start,
-                        lr_end: chunk.lr_end,
-                        dataloader_pos,
-                    },
-                )?;
-                eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
-                if let Some(metrics) = test_metrics {
+                if chunk.save_checkpoint {
+                    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                    let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                    let test_metrics = run_cuda_cpp_halfkp_final_validation(args, cuda_shape, &trained_weights)?;
+                    let checkpoint_dir = write_cuda_cpp_halfkp_numbered_checkpoint(
+                        args,
+                        cuda_shape,
+                        &trained_weights,
+                        &trained_optimizer_states,
+                        completed_step_offset + seen_steps,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics,
+                            lr_start: chunk.lr_start,
+                            lr_end: chunk.lr_end,
+                            dataloader_pos,
+                        },
+                    )?;
+                    eprintln!("  cuda-cpp numbered checkpoint = {}", checkpoint_dir.display());
+                    if let Some(metrics) = test_metrics {
+                        eprintln!(
+                            "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                            chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        );
+                    }
+                    last_checkpoint_metrics = test_metrics;
+                } else {
                     eprintln!(
-                        "  cuda-cpp validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                        chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        "  cuda-cpp checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                        chunk.epoch, chunk.superbatch
                     );
                 }
-                last_checkpoint_metrics = test_metrics;
             } else {
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
@@ -3681,10 +3702,11 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     );
     if schedule.production {
         eprintln!(
-            "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, batches_per_superbatch={}, lr={}",
+            "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
             args.max_epochs.unwrap_or(1).max(1),
             args.superbatches.unwrap_or(1),
             effective_save_rate(args),
+            effective_save_epoch_end(args),
             schedule.batches_per_superbatch,
             args.lr_schedule.cli_name()
         );
@@ -4212,35 +4234,42 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos(args, seen_steps, batch_size, last_dataloader_pos)?;
             if schedule.production {
-                let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-                let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
-                let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
-                let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
-                    args,
-                    cuda_shape,
-                    &trained_weights,
-                    &trained_optimizer_states,
-                    completed_step_offset + seen_steps,
-                    CudaCppCheckpointLog {
-                        epoch: chunk.epoch,
-                        superbatch: chunk.superbatch,
-                        curr_batch: schedule.batches_per_superbatch,
-                        train_steps: chunk.steps,
-                        train_loss: last_loss,
-                        test_metrics,
-                        lr_start: chunk.lr_start,
-                        lr_end: chunk.lr_end,
-                        dataloader_pos,
-                    },
-                )?;
-                eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
-                if let Some(metrics) = test_metrics {
+                if chunk.save_checkpoint {
+                    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                    let test_metrics = run_cuda_cpp_sfnn_halfka2_final_validation(args, cuda_shape, &trained_weights)?;
+                    let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                    let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
+                        args,
+                        cuda_shape,
+                        &trained_weights,
+                        &trained_optimizer_states,
+                        completed_step_offset + seen_steps,
+                        CudaCppCheckpointLog {
+                            epoch: chunk.epoch,
+                            superbatch: chunk.superbatch,
+                            curr_batch: schedule.batches_per_superbatch,
+                            train_steps: chunk.steps,
+                            train_loss: last_loss,
+                            test_metrics,
+                            lr_start: chunk.lr_start,
+                            lr_end: chunk.lr_end,
+                            dataloader_pos,
+                        },
+                    )?;
+                    eprintln!("  cuda-cpp SFNN numbered checkpoint = {}", checkpoint_dir.display());
+                    if let Some(metrics) = test_metrics {
+                        eprintln!(
+                            "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
+                            chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        );
+                    }
+                    last_checkpoint_metrics = test_metrics;
+                } else {
                     eprintln!(
-                        "  cuda-cpp SFNN validation summary: epoch={}, superbatch={}, test_value_accuracy={:.7}, test_value_loss={:.8}",
-                        chunk.epoch, chunk.superbatch, metrics.accuracy, metrics.loss
+                        "  cuda-cpp SFNN checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                        chunk.epoch, chunk.superbatch
                     );
                 }
-                last_checkpoint_metrics = test_metrics;
             } else {
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
             }
@@ -6135,6 +6164,7 @@ struct CudaCppScheduleChunk {
     superbatch: usize,
     steps: usize,
     cumulative_steps: usize,
+    save_checkpoint: bool,
     lr_start: f32,
     lr_end: f32,
 }
@@ -6190,6 +6220,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 superbatch: 1,
                 steps: train_steps,
                 cumulative_steps: train_steps,
+                save_checkpoint: true,
                 lr_start: lr,
                 lr_end: lr,
             }],
@@ -6252,12 +6283,15 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
 
     let mut chunks = Vec::new();
     let mut cumulative_steps = 0usize;
+    let save_rate = effective_save_rate(args).max(1);
+    let save_epoch_end = effective_save_epoch_end(args);
     for local_epoch in 1..=max_epochs {
         let epoch = epoch_offset + local_epoch;
         let mut first_superbatch = if local_epoch == 1 { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
-            let last_superbatch =
-                first_superbatch.saturating_add(effective_save_rate(args).max(1)).saturating_sub(1).min(superbatches);
+            let save_boundary = first_superbatch.saturating_add(save_rate).saturating_sub(1);
+            let (last_superbatch, save_checkpoint) =
+                if save_boundary <= superbatches { (save_boundary, true) } else { (superbatches, save_epoch_end) };
             let superbatch_count = last_superbatch - first_superbatch + 1;
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
@@ -6290,6 +6324,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 superbatch: last_superbatch,
                 steps,
                 cumulative_steps,
+                save_checkpoint,
                 lr_start,
                 lr_end,
             });
@@ -6469,6 +6504,7 @@ fn resume_signature(args: &Args) -> String {
         format!("nnue_pytorch_layer_clip={}", args.nnue_pytorch_layer_clip),
         format!("nnue_pytorch_no_bias_clip={}", args.nnue_pytorch_no_bias_clip),
         format!("save_rate={}", effective_save_rate(args)),
+        format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
         format!("sfnn_factorized_l1={}", args.sfnn_factorized_l1),
@@ -7567,6 +7603,7 @@ macro_rules! run_training_inline {
         // persisted. This is *not* an EOF-triggered save — it fires exactly
         // once per training run and only as a last resort.
         let saved_any = std::cell::Cell::new(false);
+        let trained_without_save = std::cell::Cell::new(false);
         // Remember the last per-epoch net_id we used so the fallback save can
         // reuse the same naming convention (so assembly pairs the dirs by
         // sort order alongside any future numbered checkpoints).
@@ -7645,6 +7682,7 @@ macro_rules! run_training_inline {
                     LrScheduleKind::Plateau => LrSchedulerImpl::Fixed(FixedLR { value: args.lr }),
                 },
                 save_rate: effective_save_rate(args),
+                save_epoch_end: effective_save_epoch_end(args),
             };
 
             let net_id_for_cb = net_id_for_epoch.clone();
@@ -7696,11 +7734,24 @@ macro_rules! run_training_inline {
                     trainer.run(&schedule, &settings, &loader)
                 }
             };
+            if !effective_save_epoch_end(args)
+                && end_superbatch != usize::MAX
+                && !end_superbatch.is_multiple_of(effective_save_rate(args).max(1))
+                && error_record_completed_superbatch(&last_error_record, end_superbatch, batches_per_superbatch)
+            {
+                trained_without_save.set(true);
+                eprintln!(
+                    "  checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                    epoch, end_superbatch
+                );
+            }
         }
 
         // End-of-training fallback save (see the comment on `saved_any`):
-        // executes only when bullet never crossed a superbatch boundary.
-        if !saved_any.get() {
+        // executes only when bullet never crossed a superbatch boundary,
+        // except when the run intentionally ended on a train-only tail via
+        // `--no-save-epoch-end`.
+        if !saved_any.get() && !trained_without_save.get() {
             let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
             eprintln!(
                 "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
@@ -7732,6 +7783,14 @@ fn write_loss_csv(path: &std::path::Path, records: &[(usize, usize, f32)]) -> st
         writeln!(file, "{sb},{b},{loss}")?;
     }
     Ok(())
+}
+
+fn error_record_completed_superbatch(
+    records: &[(usize, usize, f32)],
+    superbatch: usize,
+    batches_per_superbatch: usize,
+) -> bool {
+    records.iter().any(|(sb, batch, _)| *sb == superbatch && *batch == batches_per_superbatch)
 }
 
 // ----- KPPT: KK ---------------------------------------------------------
@@ -8365,6 +8424,7 @@ macro_rules! run_training_inline_nnue {
         }).0;
 
         let saved_any = std::cell::Cell::new(false);
+        let trained_without_save = std::cell::Cell::new(false);
         let mut last_net_id_for_epoch: String = net_id_base.clone();
         let mut last_error_record: Vec<(usize, usize, f32)> = Vec::new();
 
@@ -8768,6 +8828,7 @@ macro_rules! run_training_inline_nnue {
                     wdl_scheduler: wdl::ConstantWDL { value: 1.0 - args.lambda },
                     lr_scheduler: lr_scheduler_for_chunk,
                     save_rate: effective_save_rate(args),
+                    save_epoch_end: effective_save_epoch_end(args),
                 };
 
                 // Per-chunk callback only records that the save happened
@@ -8870,6 +8931,21 @@ macro_rules! run_training_inline_nnue {
 
                 // Closure dropped → its borrow of saved_dir_in_chunk released.
                 let saved_ckpt_dir = saved_dir_in_chunk.into_inner();
+                let planned_train_only_tail = !effective_save_epoch_end(args)
+                    && chunk_end == end_superbatch
+                    && !chunk_end.is_multiple_of(effective_save_rate(args).max(1));
+                if saved_ckpt_dir.is_none()
+                    && planned_train_only_tail
+                    && error_record_completed_superbatch(&last_error_record, chunk_end, batches_per_superbatch)
+                {
+                    trained_without_save.set(true);
+                    eprintln!(
+                        "  checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                        display_epoch, chunk_end
+                    );
+                    chunk_start = chunk_end + 1;
+                    continue 'epoch;
+                }
                 // 教師が sb 境界を跨がず途中で EOF した場合、bullet の save
                 // callback は発火しない (= `saved_ckpt_dir` is None) が、
                 // last_error_record には partial sb のロスが残っている。この
@@ -9136,7 +9212,9 @@ macro_rules! run_training_inline_nnue {
             }
         }
 
-        if !saved_any.get() {
+        // End-of-training fallback save: skip it when `--no-save-epoch-end`
+        // intentionally left a completed train-only tail without checkpoints.
+        if !saved_any.get() && !trained_without_save.get() {
             let ckpt_dir = output_dir_buf.join(format!("{last_net_id_for_epoch}-1"));
             eprintln!(
                 "  WARN: no superbatch completed during training (教師 < 1 superbatch); writing fallback save to {}",
@@ -10673,9 +10751,35 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn cuda_cpp_backend_rejects_no_save_epoch_end_for_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--no-save-epoch-end",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "direct-step mode does not honor production schedule flags"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_run_schedule_chunks_save_rate_and_cos_lr() {
+    fn cuda_cpp_run_schedule_chunks_save_rate_epoch_end_and_cos_lr() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -10711,6 +10815,7 @@ mod tests {
         assert_eq!(schedule.batches_per_superbatch, 4);
         assert_eq!(schedule.total_steps, 24);
         assert_eq!(schedule.chunks.len(), 4);
+        assert!(schedule.chunks.iter().all(|chunk| chunk.save_checkpoint));
         assert_eq!(schedule.chunks[0].epoch, 1);
         assert_eq!(schedule.chunks[0].superbatch, 2);
         assert_eq!(schedule.chunks[0].steps, 8);
@@ -10730,6 +10835,48 @@ mod tests {
         assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6);
         assert!(schedule.chunks[0].lr_end < schedule.chunks[0].lr_start);
         assert!((schedule.chunks[2].lr_start - 0.1).abs() < 1e-6, "LR should warm-restart at epoch 2");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_no_save_epoch_end_trains_tail_without_checkpoint() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "NNUE_HALFKP",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "2",
+            "--no-save-epoch-end",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "4096",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.batches_per_superbatch, 4);
+        assert_eq!(schedule.total_steps, 12);
+        assert_eq!(schedule.chunks.len(), 2);
+        assert_eq!(schedule.chunks[0].superbatch, 2);
+        assert_eq!(schedule.chunks[0].steps, 8);
+        assert!(schedule.chunks[0].save_checkpoint);
+        assert_eq!(schedule.chunks[1].superbatch, 3);
+        assert_eq!(schedule.chunks[1].steps, 4);
+        assert_eq!(schedule.chunks[1].cumulative_steps, 12);
+        assert!(!schedule.chunks[1].save_checkpoint);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -11967,6 +12114,9 @@ mod tests {
         assert_eq!(args.scale, 290);
         assert_eq!(args.save_rate, None);
         assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);
+        assert!(args.save_epoch_end);
+        assert!(!args.no_save_epoch_end);
+        assert!(effective_save_epoch_end(&args));
     }
 
     #[test]

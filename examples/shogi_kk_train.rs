@@ -225,6 +225,7 @@ fn main() {
             wdl_scheduler: wdl::LinearWDL { start: args.start_wdl, end: args.end_wdl },
             lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
             save_rate: args.save_rate,
+            save_epoch_end: true,
         };
 
         match format {

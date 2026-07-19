@@ -21,7 +21,7 @@
     └── learn.log
 ```
 
-番号は **save が走るごとに 1 ずつインクリメント**。デフォルトでは `--save-rate=20` で 20 superbatch ごとに save、`--save-rate=1` なら 1 superbatch ごと。
+番号は **save が走るごとに 1 ずつインクリメント**。デフォルトでは `--save-rate=20` で 20 superbatch ごとに save し、さらに `--save-epoch-end` が ON なので epoch 末尾 superbatch も save する。`--no-save-epoch-end` で epoch 末尾の暗黙 save を無効化できる。`--save-rate=1` なら 1 superbatch ごと。
 
 resume 時は **既存番号の続きから連番**。例えば前回 `0005/` まで存在する dir に対して再実行すると、新規 save は `0006/`, `0007/`, ... となる。
 

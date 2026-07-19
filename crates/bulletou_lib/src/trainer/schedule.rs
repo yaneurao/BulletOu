@@ -16,6 +16,7 @@ pub struct TrainingSchedule<LR: LrScheduler, WDL: WdlScheduler> {
     pub wdl_scheduler: WDL,
     pub lr_scheduler: LR,
     pub save_rate: usize,
+    pub save_epoch_end: bool,
 }
 
 impl<LR: LrScheduler, WDL: WdlScheduler> TrainingSchedule<LR, WDL> {
@@ -24,7 +25,7 @@ impl<LR: LrScheduler, WDL: WdlScheduler> TrainingSchedule<LR, WDL> {
     }
 
     pub fn should_save(&self, superbatch: usize) -> bool {
-        superbatch.is_multiple_of(self.save_rate) || superbatch == self.steps.end_superbatch
+        superbatch.is_multiple_of(self.save_rate) || (self.save_epoch_end && superbatch == self.steps.end_superbatch)
     }
 
     pub fn lr(&self, batch: usize, superbatch: usize) -> f32 {
@@ -40,6 +41,7 @@ impl<LR: LrScheduler, WDL: WdlScheduler> TrainingSchedule<LR, WDL> {
         self.steps.display();
         println!("Eval Scale             : {}", ansi(format!("{:.0}", self.eval_scale), 31));
         println!("Save Rate              : {}", ansi(self.save_rate, 31));
+        println!("Save Epoch End         : {}", ansi(self.save_epoch_end, 31));
         // YaneuraOu convention: target = λ × teacher_eval + (1−λ) × game_result.
         // The underlying scheduler stores 1 − λ (= WDL weight). Probe it at
         // superbatch 1 and the final superbatch — equal values collapse to a

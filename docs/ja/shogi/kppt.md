@@ -125,7 +125,8 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--positions-per-superbatch` | 1 superbatch の目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |
 | `--max-epochs` | epoch を何回実行するか。`--superbatches` 指定時の epoch は教師1周ではなく LR/validation cycle。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る | 1 |
-| `--save-rate` | N superbatch ごとに保存 | 20 |
+| `--save-rate` | N superbatch ごとに保存。デフォルトでは epoch 末尾も保存 | 20 |
+| `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
