@@ -18,6 +18,7 @@
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |
 | `--save-rate` | N superbatch ごとに checkpoint を保存。デフォルトでは save-rate 境界でなくても各 epoch の最後の superbatch も保存する。`plateau` では引き続き `--save-rate 1` が必要 | 20 |
+| `--validation-rate` | `--test-teacher` の accuracy/loss 検証を N superbatch ごとに実行する。checkpoint 保存とは独立。省略時は `--save-rate` と同じ。`--validation-rate 1 --save-rate 20` なら毎 sb 検証しつつ save は 20 sb ごと | `--save-rate` と同じ |
 | `--save-epoch-end` / `--no-save-epoch-end` | 各 epoch 最後の superbatch を暗黙に保存するかどうか | on |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
 | `--optimizer` | optimizer。現行は `ranger` のみ対応。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
@@ -153,6 +154,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 
 - `--test-teacher` 必須。validation 指標がないと判定できない。
 - `--save-rate 1` 必須。1 superbatchごとに検証してLRを更新するため。
+- `--validation-rate 1` も必須。1 superbatch ごとに validation 指標が必要なため。
 - 現状は NNUE/SFNN 系の学習で使用する。
 
 例:

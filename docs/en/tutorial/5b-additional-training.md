@@ -51,6 +51,8 @@ Total effective epochs trained: 3 + 3 = 6.
 | `--lr-schedule` (`step` / `geometric` / `cos` / `plateau`) | Changes the LR trajectory. The bullet-shogi-compatible default is `step`. |
 | `--max-epochs` | How many epochs in this invocation. |
 | `--superbatches` | LR cycle length for `geometric` / `cos`; per-epoch processing cap for `step`. |
+| `--save-rate` | Changes checkpoint frequency only. If reusing an existing checkpoint, pass `--resume` explicitly. |
+| `--validation-rate` | Changes held-out accuracy/loss frequency only. If reusing an existing checkpoint, pass `--resume` explicitly. |
 | `--lambda` | Teacher-target blend. |
 | `--teacher` | Teacher-change detection triggers; dataloader reads new teacher from the start. See the LR note in [§5.5.4](#554-fine-tune-on-a-different-teacher). |
 | `--test-teacher` | Validation set swap. |

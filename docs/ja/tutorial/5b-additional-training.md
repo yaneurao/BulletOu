@@ -53,6 +53,8 @@
 | `--lr-schedule` (`step` / `geometric` / `cos` / `plateau`) | LR の動きが変わる。bullet-shogi 寄せの既定値は `step` |
 | `--max-epochs` | この invocation の epoch 数 |
 | `--superbatches` | `geometric` / `cos` では LR cycle 長、`step` では epoch 内の処理上限 |
+| `--save-rate` | checkpoint 保存頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
+| `--validation-rate` | `--test-teacher` の accuracy/loss 計測頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
 

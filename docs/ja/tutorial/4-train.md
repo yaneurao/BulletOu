@@ -8,7 +8,7 @@
 
 ## 4.1 ビルド (1 回だけ)
 
-まず `bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK:
+まず `bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK。逆に、BulletOu のソースを更新した直後は、既存の `.\target\release\examples\bulletou.exe` は古いままなので必ず再ビルドする:
 
 ```bash
 cargo build --release --features cuda-cpp-backend --example bulletou
