@@ -3879,6 +3879,13 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     let mut profile_backward_ms = 0.0_f64;
     let mut profile_update_ms = 0.0_f64;
     let mut profile_total_ms = 0.0_f64;
+    let mut profile_bwd_zero_ms = 0.0_f64;
+    let mut profile_bwd_l3_ms = 0.0_f64;
+    let mut profile_bwd_l2_ms = 0.0_f64;
+    let mut profile_bwd_l2_input_ms = 0.0_f64;
+    let mut profile_bwd_l1_ms = 0.0_f64;
+    let mut profile_bwd_l0_ms = 0.0_f64;
+    let mut profile_bwd_total_ms = 0.0_f64;
     let mut profile_count = 0usize;
     let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
@@ -4256,16 +4263,31 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             profile_backward_ms += f64::from(profile.backward_ms);
             profile_update_ms += f64::from(profile.update_ms);
             profile_total_ms += f64::from(profile.total_ms);
+            profile_bwd_zero_ms += f64::from(profile.backward_stages.zero_ms);
+            profile_bwd_l3_ms += f64::from(profile.backward_stages.l3_ms);
+            profile_bwd_l2_ms += f64::from(profile.backward_stages.l2_ms);
+            profile_bwd_l2_input_ms += f64::from(profile.backward_stages.l2_input_ms);
+            profile_bwd_l1_ms += f64::from(profile.backward_stages.l1_ms);
+            profile_bwd_l0_ms += f64::from(profile.backward_stages.l0_ms);
+            profile_bwd_total_ms += f64::from(profile.backward_stages.total_ms);
             profile_count += 1;
             eprintln!(
                 "  profile_cuda_cpp_sfnn step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
-                 backward={:.3}ms update={:.3}ms total={:.3}ms",
+                 backward={:.3}ms update={:.3}ms total={:.3}ms \
+                 bwd[zero={:.3} l3={:.3} l2={:.3} l2in={:.3} l1={:.3} l0={:.3} total={:.3}]",
                 profile.upload_ms,
                 profile.forward_ms,
                 profile.loss_ms,
                 profile.backward_ms,
                 profile.update_ms,
-                profile.total_ms
+                profile.total_ms,
+                profile.backward_stages.zero_ms,
+                profile.backward_stages.l3_ms,
+                profile.backward_stages.l2_ms,
+                profile.backward_stages.l2_input_ms,
+                profile.backward_stages.l1_ms,
+                profile.backward_stages.l0_ms,
+                profile.backward_stages.total_ms
             );
         } else {
             runner
@@ -4360,6 +4382,17 @@ fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
             profile_backward_ms / denom,
             profile_update_ms / denom,
             profile_total_ms / denom
+        );
+        eprintln!(
+            "  cuda-cpp SFNN backward profile avg: zero={:.3}ms l3={:.3}ms l2={:.3}ms l2_input={:.3}ms \
+             l1={:.3}ms l0={:.3}ms total={:.3}ms",
+            profile_bwd_zero_ms / denom,
+            profile_bwd_l3_ms / denom,
+            profile_bwd_l2_ms / denom,
+            profile_bwd_l2_input_ms / denom,
+            profile_bwd_l1_ms / denom,
+            profile_bwd_l0_ms / denom,
+            profile_bwd_total_ms / denom
         );
     }
     let completed_steps = completed_step_offset + seen_steps;

@@ -1875,6 +1875,80 @@ int block_count_1d(size_t len, int threads, int* blocks, const char* label) {
     return 0;
 }
 
+constexpr size_t SFNN_BACKWARD_PROFILE_MS_LEN = 7;
+
+struct SfnnBackwardProfileEvents {
+    bool enabled = false;
+    float* out_ms = nullptr;
+    cudaEvent_t events[7] = {};
+
+    ~SfnnBackwardProfileEvents() {
+        for (cudaEvent_t event : events) {
+            if (event != nullptr) {
+                cudaEventDestroy(event);
+            }
+        }
+    }
+
+    int init(BulletOuCudaCppContext* ctx, float* out, size_t out_len) {
+        if (out == nullptr) {
+            return 0;
+        }
+        if (out_len < SFNN_BACKWARD_PROFILE_MS_LEN) {
+            return fail_message("SFNN backward profile output must have at least 7 floats");
+        }
+        enabled = true;
+        out_ms = out;
+        for (size_t i = 0; i < SFNN_BACKWARD_PROFILE_MS_LEN; ++i) {
+            out_ms[i] = 0.0f;
+        }
+        for (size_t i = 0; i < 7; ++i) {
+            cudaError_t status = cudaEventCreate(&events[i]);
+            if (status != cudaSuccess) {
+                return fail("cudaEventCreate SFNN backward profile", status);
+            }
+        }
+        return record(0, ctx, "SFNN backward profile start");
+    }
+
+    int record(size_t idx, BulletOuCudaCppContext* ctx, const char* label) {
+        if (!enabled) {
+            return 0;
+        }
+        cudaError_t status = cudaEventRecord(events[idx], ctx->stream);
+        if (status != cudaSuccess) {
+            return fail(label, status);
+        }
+        return 0;
+    }
+
+    int finish() {
+        if (!enabled) {
+            return 0;
+        }
+        cudaError_t status = cudaEventSynchronize(events[6]);
+        if (status != cudaSuccess) {
+            return fail("cudaEventSynchronize SFNN backward profile", status);
+        }
+        const size_t ranges[SFNN_BACKWARD_PROFILE_MS_LEN][2] = {
+            {0, 1}, // zero parameter gradients
+            {1, 2}, // L3 backward
+            {2, 3}, // L2 backward
+            {3, 4}, // L2-input backward
+            {4, 5}, // L1 backward
+            {5, 6}, // pairwise/L0 backward
+            {0, 6}, // total backward
+        };
+        for (size_t i = 0; i < SFNN_BACKWARD_PROFILE_MS_LEN; ++i) {
+            status = cudaEventElapsedTime(&out_ms[i], events[ranges[i][0]], events[ranges[i][1]]);
+            if (status != cudaSuccess) {
+                return fail("cudaEventElapsedTime SFNN backward profile", status);
+            }
+        }
+        return 0;
+    }
+};
+
 int validate_nnue_shape(size_t input_size, size_t l1, size_t l2, size_t l3, size_t batch, size_t max_active) {
     if (input_size == 0 || l1 == 0 || l2 == 0 || l3 == 0) {
         return fail_message("NNUE shape dimensions must be greater than zero");
@@ -2198,7 +2272,9 @@ int launch_sfnn_backward_kernels(
     float* l3w_gradients,
     float* l3b_gradients,
     int zero_parameter_gradients,
-    int fuse_pairwise_l0) {
+    int fuse_pairwise_l0,
+    float* profile_ms,
+    size_t profile_ms_len) {
     if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0) {
         return -1;
     }
@@ -2210,6 +2286,10 @@ int launch_sfnn_backward_kernels(
     const size_t l2_in = l1_hidden * 2;
     constexpr int threads = 256;
     int blocks = 0;
+    SfnnBackwardProfileEvents profile;
+    if (profile.init(ctx, profile_ms, profile_ms_len) != 0) {
+        return -1;
+    }
 
     if (zero_parameter_gradients != 0) {
         if (launch_zero_sfnn_backward_parameter_gradients(
@@ -2232,6 +2312,9 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
     }
+    if (profile.record(1, ctx, "SFNN backward profile after zero") != 0) {
+        return -1;
+    }
 
     size_t l3_threads = std::max(batch * l2_size, batch * l1_out);
     l3_threads = std::max(l3_threads, batch);
@@ -2252,6 +2335,9 @@ int launch_sfnn_backward_kernels(
         l1_out,
         num_stacks);
     if (check_kernel_launch("sfnn_stacked_l3_backward_kernel launch") != 0) {
+        return -1;
+    }
+    if (profile.record(2, ctx, "SFNN backward profile after L3") != 0) {
         return -1;
     }
 
@@ -2276,6 +2362,9 @@ int launch_sfnn_backward_kernels(
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
         return -1;
     }
+    if (profile.record(3, ctx, "SFNN backward profile after L2") != 0) {
+        return -1;
+    }
 
     if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_l2_input_backward_kernel") != 0) {
         return -1;
@@ -2283,6 +2372,9 @@ int launch_sfnn_backward_kernels(
     sfnn_l2_input_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
         l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden);
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
+        return -1;
+    }
+    if (profile.record(4, ctx, "SFNN backward profile after L2 input") != 0) {
         return -1;
     }
 
@@ -2331,6 +2423,9 @@ int launch_sfnn_backward_kernels(
         if (check_kernel_launch("sfnn_stacked_affine_backward_kernel launch") != 0) {
             return -1;
         }
+    }
+    if (profile.record(5, ctx, "SFNN backward profile after L1") != 0) {
+        return -1;
     }
 
     if (fuse_pairwise_l0 != 0) {
@@ -2383,6 +2478,12 @@ int launch_sfnn_backward_kernels(
         if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
             return -1;
         }
+    }
+    if (profile.record(6, ctx, "SFNN backward profile after L0") != 0) {
+        return -1;
+    }
+    if (profile.finish() != 0) {
+        return -1;
     }
 
     return 0;
@@ -4162,6 +4263,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l3w_gradients->ptr,
             l3b_gradients->ptr,
             1,
+            0,
+            nullptr,
             0) != 0) {
         return -1;
     }
@@ -4169,7 +4272,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     return ok();
 }
 
-extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
+int sfnn_backward_train_device_impl(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
     size_t ft_size,
@@ -4211,7 +4314,9 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     BulletOuCudaCppF32Buffer* l2b_gradients,
     BulletOuCudaCppF32Buffer* l3w_gradients,
     BulletOuCudaCppF32Buffer* l3b_gradients,
-    int zero_parameter_gradients) {
+    int zero_parameter_gradients,
+    float* profile_ms,
+    size_t profile_ms_len) {
     const size_t l1_out = l1_hidden + 1;
     const size_t l2_in = l1_hidden * 2;
     if (validate_sfnn_shape(input_size, ft_size, l1_hidden, l2_size, num_stacks, batch, max_active) != 0 ||
@@ -4299,11 +4404,195 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
             l3w_gradients->ptr,
             l3b_gradients->ptr,
             zero_parameter_gradients,
-            1) != 0) {
+            1,
+            profile_ms,
+            profile_ms_len) != 0) {
         return -1;
     }
 
     return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppI32Buffer* buckets,
+    const BulletOuCudaCppF32Buffer* stm_l0,
+    const BulletOuCudaCppF32Buffer* nstm_l0,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* l1,
+    const BulletOuCudaCppF32Buffer* l2_input,
+    const BulletOuCudaCppF32Buffer* l2,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1fw,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l3w,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* l2_gradients,
+    BulletOuCudaCppF32Buffer* l1_gradients,
+    BulletOuCudaCppF32Buffer* l2_input_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* l0w_gradients,
+    BulletOuCudaCppF32Buffer* l0b_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l1fw_gradients,
+    BulletOuCudaCppF32Buffer* l1fb_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* l3w_gradients,
+    BulletOuCudaCppF32Buffer* l3b_gradients,
+    int zero_parameter_gradients) {
+    return sfnn_backward_train_device_impl(
+        ctx,
+        input_size,
+        ft_size,
+        l1_hidden,
+        l2_size,
+        num_stacks,
+        batch,
+        max_active,
+        stm_indices,
+        nstm_indices,
+        buckets,
+        stm_l0,
+        nstm_l0,
+        combined,
+        l1,
+        l2_input,
+        l2,
+        l1w,
+        l1fw,
+        has_l1f,
+        l2w,
+        l3w,
+        mean_output_gradients,
+        l2_gradients,
+        l1_gradients,
+        l2_input_gradients,
+        combined_gradients,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        stm_l0_pre_gradients,
+        nstm_l0_pre_gradients,
+        l0w_gradients,
+        l0b_gradients,
+        l1w_gradients,
+        l1b_gradients,
+        l1fw_gradients,
+        l1fb_gradients,
+        l2w_gradients,
+        l2b_gradients,
+        l3w_gradients,
+        l3b_gradients,
+        zero_parameter_gradients,
+        nullptr,
+        0);
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
+    BulletOuCudaCppContext* ctx,
+    size_t input_size,
+    size_t ft_size,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t batch,
+    size_t max_active,
+    const BulletOuCudaCppI32Buffer* stm_indices,
+    const BulletOuCudaCppI32Buffer* nstm_indices,
+    const BulletOuCudaCppI32Buffer* buckets,
+    const BulletOuCudaCppF32Buffer* stm_l0,
+    const BulletOuCudaCppF32Buffer* nstm_l0,
+    const BulletOuCudaCppF32Buffer* combined,
+    const BulletOuCudaCppF32Buffer* l1,
+    const BulletOuCudaCppF32Buffer* l2_input,
+    const BulletOuCudaCppF32Buffer* l2,
+    const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* l1fw,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* l2w,
+    const BulletOuCudaCppF32Buffer* l3w,
+    const BulletOuCudaCppF32Buffer* mean_output_gradients,
+    BulletOuCudaCppF32Buffer* l2_gradients,
+    BulletOuCudaCppF32Buffer* l1_gradients,
+    BulletOuCudaCppF32Buffer* l2_input_gradients,
+    BulletOuCudaCppF32Buffer* combined_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_gradients,
+    BulletOuCudaCppF32Buffer* stm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* nstm_l0_pre_gradients,
+    BulletOuCudaCppF32Buffer* l0w_gradients,
+    BulletOuCudaCppF32Buffer* l0b_gradients,
+    BulletOuCudaCppF32Buffer* l1w_gradients,
+    BulletOuCudaCppF32Buffer* l1b_gradients,
+    BulletOuCudaCppF32Buffer* l1fw_gradients,
+    BulletOuCudaCppF32Buffer* l1fb_gradients,
+    BulletOuCudaCppF32Buffer* l2w_gradients,
+    BulletOuCudaCppF32Buffer* l2b_gradients,
+    BulletOuCudaCppF32Buffer* l3w_gradients,
+    BulletOuCudaCppF32Buffer* l3b_gradients,
+    int zero_parameter_gradients,
+    float* profile_ms,
+    size_t profile_ms_len) {
+    return sfnn_backward_train_device_impl(
+        ctx,
+        input_size,
+        ft_size,
+        l1_hidden,
+        l2_size,
+        num_stacks,
+        batch,
+        max_active,
+        stm_indices,
+        nstm_indices,
+        buckets,
+        stm_l0,
+        nstm_l0,
+        combined,
+        l1,
+        l2_input,
+        l2,
+        l1w,
+        l1fw,
+        has_l1f,
+        l2w,
+        l3w,
+        mean_output_gradients,
+        l2_gradients,
+        l1_gradients,
+        l2_input_gradients,
+        combined_gradients,
+        stm_l0_gradients,
+        nstm_l0_gradients,
+        stm_l0_pre_gradients,
+        nstm_l0_pre_gradients,
+        l0w_gradients,
+        l0b_gradients,
+        l1w_gradients,
+        l1b_gradients,
+        l1fw_gradients,
+        l1fb_gradients,
+        l2w_gradients,
+        l2b_gradients,
+        l3w_gradients,
+        l3b_gradients,
+        zero_parameter_gradients,
+        profile_ms,
+        profile_ms_len);
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(

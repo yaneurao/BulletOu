@@ -1996,6 +1996,108 @@ pub fn sfnn_backward_train_device(
     sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true)
 }
 
+pub fn sfnn_backward_train_profile_device(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+) -> Result<SfnnBackwardStageProfile> {
+    batch.validate()?;
+    weights.validate()?;
+    forward.validate()?;
+    loss.validate()?;
+    backward.validate()?;
+    let shape = weights.shape;
+    if forward.layout.shape != shape || backward.layout.shape != shape {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward shape mismatch: weights={shape:?} forward={:?} backward={:?}",
+            forward.layout.shape, backward.layout.shape
+        )));
+    }
+    if forward.layout.batch_size != batch.batch_size
+        || loss.layout.batch_size != batch.batch_size
+        || backward.layout.batch_size != batch.batch_size
+    {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward batch mismatch: batch={} forward={} loss={} backward={}",
+            batch.batch_size, forward.layout.batch_size, loss.layout.batch_size, backward.layout.batch_size
+        )));
+    }
+    if backward.layout.max_active != batch.max_active {
+        return Err(CudaCppError::message(format!(
+            "SFNN backward max_active mismatch: batch={} backward={}",
+            batch.max_active, backward.layout.max_active
+        )));
+    }
+    let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
+        (Some(l1fw), Some(_)) => (l1fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
+    };
+
+    let mut profile_ms = [0.0f32; 7];
+    // SAFETY: all device buffers have been length-validated; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_backward_train_profile_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            shape.ft_size,
+            shape.l1_hidden,
+            shape.l2_size,
+            shape.num_stacks,
+            batch.batch_size,
+            batch.max_active,
+            batch.stm_indices.as_ptr(),
+            batch.nstm_indices.as_ptr(),
+            batch.buckets.as_ptr(),
+            forward.stm_l0.as_ptr(),
+            forward.nstm_l0.as_ptr(),
+            forward.combined.as_ptr(),
+            forward.l1.as_ptr(),
+            forward.l2_input.as_ptr(),
+            forward.l2.as_ptr(),
+            weights.l1w.as_ptr(),
+            l1fw,
+            has_l1f,
+            weights.l2w.as_ptr(),
+            weights.l3w.as_ptr(),
+            loss.mean_output_gradients.as_ptr(),
+            backward.l2_gradients.as_ptr(),
+            backward.l1_gradients.as_ptr(),
+            backward.l2_input_gradients.as_ptr(),
+            backward.combined_gradients.as_ptr(),
+            backward.stm_l0_gradients.as_ptr(),
+            backward.nstm_l0_gradients.as_ptr(),
+            backward.stm_l0_pre_gradients.as_ptr(),
+            backward.nstm_l0_pre_gradients.as_ptr(),
+            backward.l0w_gradients.as_ptr(),
+            backward.l0b_gradients.as_ptr(),
+            backward.l1w_gradients.as_ptr(),
+            backward.l1b_gradients.as_ptr(),
+            backward.l1fw_gradients.as_ptr(),
+            backward.l1fb_gradients.as_ptr(),
+            backward.l2w_gradients.as_ptr(),
+            backward.l2b_gradients.as_ptr(),
+            backward.l3w_gradients.as_ptr(),
+            backward.l3b_gradients.as_ptr(),
+            1,
+            profile_ms.as_mut_ptr(),
+            profile_ms.len(),
+        )
+    })?;
+    Ok(SfnnBackwardStageProfile {
+        zero_ms: profile_ms[0],
+        l3_ms: profile_ms[1],
+        l2_ms: profile_ms[2],
+        l2_input_ms: profile_ms[3],
+        l1_ms: profile_ms[4],
+        l0_ms: profile_ms[5],
+        total_ms: profile_ms[6],
+    })
+}
+
 fn sfnn_backward_device_impl(
     ctx: &Context,
     batch: &SfnnForwardDeviceBatch,
@@ -2479,6 +2581,28 @@ pub struct NnueTrainStepProfile {
     pub backward_ms: f32,
     pub update_ms: f32,
     pub total_ms: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SfnnBackwardStageProfile {
+    pub zero_ms: f32,
+    pub l3_ms: f32,
+    pub l2_ms: f32,
+    pub l2_input_ms: f32,
+    pub l1_ms: f32,
+    pub l0_ms: f32,
+    pub total_ms: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SfnnTrainStepProfile {
+    pub upload_ms: f32,
+    pub forward_ms: f32,
+    pub loss_ms: f32,
+    pub backward_ms: f32,
+    pub update_ms: f32,
+    pub total_ms: f32,
+    pub backward_stages: SfnnBackwardStageProfile,
 }
 
 #[derive(Debug)]
@@ -3345,7 +3469,7 @@ impl SfnnTrainStepRunner {
         loss_kind: ScalarLossKind,
         output_inv_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
-    ) -> Result<NnueTrainStepProfile> {
+    ) -> Result<SfnnTrainStepProfile> {
         self.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
@@ -3383,7 +3507,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
-        sfnn_backward_train_device(
+        let backward_stages = sfnn_backward_train_profile_device(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -3396,13 +3520,14 @@ impl SfnnTrainStepRunner {
         stop.record(ctx)?;
         stop.synchronize()?;
 
-        Ok(NnueTrainStepProfile {
+        Ok(SfnnTrainStepProfile {
             upload_ms: after_upload.elapsed_ms_since(&start)?,
             forward_ms: after_forward.elapsed_ms_since(&after_upload)?,
             loss_ms: after_loss.elapsed_ms_since(&after_forward)?,
             backward_ms: after_backward.elapsed_ms_since(&after_loss)?,
             update_ms: stop.elapsed_ms_since(&after_backward)?,
             total_ms: stop.elapsed_ms_since(&start)?,
+            backward_stages,
         })
     }
 
@@ -4223,6 +4348,52 @@ mod ffi {
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_backward_train_profile_device(
+            ctx: *mut BulletOuCudaCppContext,
+            input_size: usize,
+            ft_size: usize,
+            l1_hidden: usize,
+            l2_size: usize,
+            num_stacks: usize,
+            batch: usize,
+            max_active: usize,
+            stm_indices: *mut BulletOuCudaCppI32Buffer,
+            nstm_indices: *mut BulletOuCudaCppI32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer,
+            stm_l0: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer,
+            l1: *mut BulletOuCudaCppF32Buffer,
+            l2_input: *mut BulletOuCudaCppF32Buffer,
+            l2: *mut BulletOuCudaCppF32Buffer,
+            l1w: *mut BulletOuCudaCppF32Buffer,
+            l1fw: *mut BulletOuCudaCppF32Buffer,
+            has_l1f: i32,
+            l2w: *mut BulletOuCudaCppF32Buffer,
+            l3w: *mut BulletOuCudaCppF32Buffer,
+            mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2_input_gradients: *mut BulletOuCudaCppF32Buffer,
+            combined_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_gradients: *mut BulletOuCudaCppF32Buffer,
+            stm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            nstm_l0_pre_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l0b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3w_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+            zero_parameter_gradients: i32,
+            profile_ms: *mut f32,
+            profile_ms_len: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,

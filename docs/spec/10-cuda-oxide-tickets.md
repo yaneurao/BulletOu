@@ -1040,6 +1040,13 @@ the tickets in order and commit each completed slice.
   - HalfKP bs65k/3-step teacher-prepare profile on `shuffled-001.hcpe` printed `14.056ms`, `15.303ms`, and `18.178ms`, so the short prepare-only profile is mostly noise-neutral;
   - WRM/tatara-style bs65k speed-only probes (`--nnue-pytorch-wrm-loss --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024`, final-only loss readback) reported 4M repeats `2758937` and `2834683` pos/s, and a longer 16M run reported `2920370` pos/s;
   - a yamaoka-fixed 4M validation run using only `C:\shogi\teacher\test\yamaoka-floodgate.psv` reported `2655504` pos/s, `test_loss=0.03627902`, `test_acc=0.6215057`; this short quality point is slightly worse than the preceding best and needs a longer/seed-matched check before treating the mapper change as a quality improvement.
+- Added SFNN C++/CUDA backward stage profiling for the direct train-step runner:
+  - `SfnnTrainStepRunner::step_profiled_no_readback` now returns an SFNN-specific profile that includes C++/CUDA event timings for zero, L3, L2, L2-input, L1, pairwise/L0, and total backward stages;
+  - the normal training FFI entry point remains unchanged, and the profiling-only FFI wrapper records CUDA events only when `--cuda-cpp-profile-steps` uses the profiled SFNN path;
+  - real SFNN WRM profile on RTX 4090, `shuffled-001.hcpe`, `SFNN_halfka2_1024_7_64_k3k3`, factorized L1, bs131k, 6 profiled steps reported `throughput=1050585` pos/s including profile/event synchronization overhead;
+  - average top-level profile: upload `6.747ms`, forward `20.518ms`, loss `2.217ms`, backward `72.677ms`, update `5.360ms`, total `107.520ms`;
+  - average C++/CUDA backward stage profile: zero `0.575ms`, L3 `0.625ms`, L2 `5.305ms`, L2-input `0.041ms`, L1 `7.738ms`, pairwise/L0 `53.644ms`, total `67.928ms`;
+  - the SFNN optimisation target is therefore the fused pairwise/L0 sparse backward kernel first, not the L1 factorized scatter.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
