@@ -1040,6 +1040,7 @@ the tickets in order and commit each completed slice.
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;
   - a block-shared `l1=256` HalfKP L0 sparse-backward mapping experiment was not kept: the first attempt incorrectly launched only `ceil(entries/256)` blocks and visibly worsened 16M loss, and the corrected launch was slower than the zero-skip kernel (`12.636ms` vs `12.209ms` backward on the bs65k/6-step profile);
+  - a HalfKP-factorized-only L0 scatter kernel that removed the generic factorized-feature branch passed the real-data smoke but did not improve the profiled backward stage (`12.351ms` vs the generic kernel's `12.208ms` on the bs65k/6-step WRM profile), so it was reverted;
   - a HalfKP upload-slot pipeline passed build/smoke but regressed the 4M run to about `1.30M` pos/s, so it was reverted;
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture` passed, but an existing pack-loader background thread can still print a post-test panic after the harness reports success; this appears unrelated to the HCPE HalfKP C++ direct path.
 - Validation for this partial BO-CUDA-036 increment:
