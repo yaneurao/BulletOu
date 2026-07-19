@@ -8902,8 +8902,9 @@ const SUMMARY_LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,test_value_accu
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
 /// (= the effective superbatch boundary) and conveys no info. The
-/// rightmost `test_teacher` column records the validation file specified
-/// by `--test-teacher` so the accuracy/loss columns remain attributable.
+/// rightmost `test_teacher` column records the validation filename
+/// specified by `--test-teacher` so the accuracy/loss columns remain
+/// attributable without making the log line as wide as a full path.
 const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
@@ -9062,7 +9063,12 @@ fn csv_escape(s: &str) -> String {
 
 fn resolve_test_teacher_for_summary(args: Option<&Args>) -> String {
     args.and_then(|args| args.test_teacher.as_ref())
-        .map(|path| path.display().to_string())
+        .map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| path.display().to_string())
+        })
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| "-".to_string())
 }
@@ -12437,6 +12443,26 @@ mod tests {
         assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-");
         assert_eq!(lines[2], "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn summary_test_teacher_column_uses_filename_not_full_path() {
+        use clap::Parser as _;
+
+        let validation_path = std::env::temp_dir().join("bulletou-validation-dir").join("validation-set.hcpe");
+        let validation_arg = validation_path.to_string_lossy().into_owned();
+        let args = Args::try_parse_from(vec![
+            "bulletou".to_string(),
+            "--eval-type".to_string(),
+            "NNUE_HALFKP".to_string(),
+            "--teacher".to_string(),
+            "teacher.hcpe".to_string(),
+            "--test-teacher".to_string(),
+            validation_arg,
+        ])
+        .unwrap();
+
+        assert_eq!(resolve_test_teacher_for_summary(Some(&args)), "validation-set.hcpe");
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

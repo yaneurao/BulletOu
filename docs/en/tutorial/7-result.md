@@ -72,7 +72,7 @@ Bullet writes **one row every 32 batches**. With the default (`--positions-per-s
 | `lambda` | the `--lambda` value (constant per run, fixed 6-decimal) | `1.000000` |
 | `positions` | cumulative teacher positions (**carries across resumes**) | `2097152` |
 | `teacher` | the `--teacher` value | `teachers/` |
-| `test_teacher` | top-level `summary-learn.log` only: the `--test-teacher` path used for validation, or `-` when unset | `test.hcpe` |
+| `test_teacher` | top-level `summary-learn.log` only: the `--test-teacher` filename used for validation, or `-` when unset | `test.hcpe` |
 
 NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.
 

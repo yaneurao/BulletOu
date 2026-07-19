@@ -202,7 +202,7 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.00
 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199884800,teachers/,test.hcpe
 ```
 
-`test_teacher` is summary-only: it records the `--test-teacher` path that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
+`test_teacher` is summary-only: it records the filename (basename) of the `--test-teacher` file that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
 
 cuda-cpp batch-level loss progress is not streamed to stdout. It is appended to `<output>/cuda-cpp-progress.log` as CSV:
 
