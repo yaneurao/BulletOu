@@ -77,6 +77,30 @@ impl SparseInputType for ShogiKp {
 
 /// 視点 `perspective` から見た square index (0..80)。
 /// 後手視点では盤を反転させる (YaneuraOu の piece_list_fw と同じ)。
+/// Fill fixed-size STM/NSTM KP sparse feature buffers for one packed shogi
+/// position, returning the number of features written on each perspective.
+///
+/// Unused slots are intentionally left untouched; callers that pass reused
+/// buffers must clear the tail themselves. Fresh teacher batches allocate the
+/// whole sparse buffer with `-1`, so they can skip per-position tail writes.
+pub fn fill_kp_feature_indices(pos: &PackedSfenValue, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
+    debug_assert!(stm.len() >= KP_MAX_ACTIVE);
+    debug_assert!(nstm.len() >= KP_MAX_ACTIVE);
+    let mut stm_count = 0usize;
+    let mut nstm_count = 0usize;
+    ShogiKp.map_features(pos, |stm_idx, nstm_idx| {
+        debug_assert!(stm_count < stm.len());
+        debug_assert!(nstm_count < nstm.len());
+        stm[stm_count] = stm_idx as i32;
+        nstm[nstm_count] = nstm_idx as i32;
+        stm_count += 1;
+        nstm_count += 1;
+    });
+    debug_assert!(stm_count <= KP_MAX_ACTIVE);
+    debug_assert!(nstm_count <= KP_MAX_ACTIVE);
+    (stm_count, nstm_count)
+}
+
 #[inline]
 fn sq_from_perspective(sq: Square, perspective: Color) -> usize {
     if perspective == Color::Black { sq.index() } else { sq.inverse().index() }

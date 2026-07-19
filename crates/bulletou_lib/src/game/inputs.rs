@@ -48,7 +48,7 @@ pub use shogi_halfkpvm::{FEATURE_HASH_HALFKPVM, HALFKPVM_DIMENSIONS, ShogiHalfKP
 pub use shogi_ka2::{FEATURE_HASH_KA2, KA2_DIMENSIONS, KA2_MAX_ACTIVE, ShogiKa2};
 pub use shogi_kk::{KK_INPUTS, KK_MAX_ACTIVE, ShogiKk};
 pub use shogi_kkp::{KKP_FE_END, KKP_INPUTS, KKP_MAX_ACTIVE, ShogiKkp};
-pub use shogi_kp::{FEATURE_HASH_KP, KP_DIMENSIONS, KP_MAX_ACTIVE, ShogiKp};
+pub use shogi_kp::{FEATURE_HASH_KP, KP_DIMENSIONS, KP_MAX_ACTIVE, ShogiKp, fill_kp_feature_indices};
 pub use shogi_kpp::{KPP_FE_END, KPP_INPUTS, KPP_MAX_ACTIVE, ShogiKpp};
 pub use shogi_threat_exclusion::ThreatProfile;
 

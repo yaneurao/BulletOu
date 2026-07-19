@@ -12,8 +12,8 @@ use rayon::prelude::*;
 use crate::{
     game::{
         inputs::{
-            Factorised, HALFKP_MAX_ACTIVE_FEATURES, ShogiHalfKP, ShogiHalfKPPieceFactorizer, ShogiHalfKa2,
-            SparseInputType, fill_halfkp_feature_indices,
+            Factorised, HALFKP_MAX_ACTIVE_FEATURES, KP_MAX_ACTIVE, ShogiHalfKP, ShogiHalfKPPieceFactorizer,
+            ShogiHalfKa2, SparseInputType, fill_halfkp_feature_indices, fill_kp_feature_indices,
         },
         outputs::ShogiLayerStackBucket9,
     },
@@ -66,6 +66,31 @@ pub struct HalfkpTeacherBatchConfig<'a> {
 
 #[derive(Debug, Clone)]
 pub struct HalfkpTeacherBatch {
+    pub batch: FastBatchHost,
+    pub source: String,
+    pub dataloader_pos: Option<TeacherDataloaderPos>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KpTeacherBatchConfig<'a> {
+    pub teacher: &'a str,
+    pub batch_size: usize,
+    pub batch_index: usize,
+    pub dataloader_resume_pos: Option<TeacherDataloaderPos>,
+    pub buffer_mb: usize,
+    pub loader_threads: usize,
+    pub threads: usize,
+    pub queue_depth: usize,
+    pub lambda: f32,
+    pub scale: f32,
+    pub nnue_pytorch_wrm_loss: bool,
+    pub score_drop_abs: Option<u16>,
+    /// Print CPU batch materialisation timing for profiling runs.
+    pub profile_prepare: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KpTeacherBatch {
     pub batch: FastBatchHost,
     pub source: String,
     pub dataloader_pos: Option<TeacherDataloaderPos>,
@@ -266,6 +291,144 @@ where
                 None => config.batch_index,
             };
             visit_halfkp_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
+        }
+    }
+}
+
+pub fn for_each_kp_teacher_fast_batch<F, E>(
+    config: &KpTeacherBatchConfig<'_>,
+    batch_count: usize,
+    visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    F: FnMut(KpTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    validate_kp_config(config)?;
+    if batch_count == 0 {
+        return Ok(0);
+    }
+
+    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
+
+    match format {
+        DataFormat::Hcpe => {
+            let mut loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                config.buffer_mb,
+                (|_| true) as fn(&PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(config.batch_size)
+            .with_loader_threads(config.loader_threads)
+            .with_single_epoch(false);
+            if let Some(pos) = config.dataloader_resume_pos {
+                if pos.plies != 0 {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position must have plies=0, got {}",
+                        pos.plies
+                    )));
+                }
+            }
+            let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
+            let (loader_start_batch, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset);
+                (0, pos.byte_offset % total_bytes)
+            } else {
+                let consumed_records = config.batch_index.checked_mul(config.batch_size).ok_or_else(|| {
+                    TeacherBatchError::invalid_input(format!(
+                        "HCPE dataloader resume position overflow: batch_index={} batch_size={}",
+                        config.batch_index, config.batch_size
+                    ))
+                })?;
+                let base_byte_offset = (consumed_records as u64)
+                    .checked_mul(crate::value::loader::hcpe::HCPE_RECORD_SIZE as u64)
+                    .ok_or_else(|| {
+                        TeacherBatchError::invalid_input(format!(
+                            "HCPE dataloader resume byte offset overflow: consumed_records={consumed_records}"
+                        ))
+                    })?;
+                (config.batch_index, base_byte_offset % total_bytes)
+            };
+            visit_kp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                move |visited_batches| {
+                    hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
+                },
+                visitor,
+            )
+        }
+        DataFormat::Hcpe3 => {
+            let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(false);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_kp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
+        }
+        DataFormat::Pack => {
+            let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.batch_size)
+                .with_single_epoch(false);
+            let offset_handle = loader.consumed_offset_handle();
+            let plies_handle = loader.consumed_plies_handle();
+            let loader_start_batch = if let Some(pos) = config.dataloader_resume_pos {
+                loader = loader.with_exact_resume_offset(pos.byte_offset, pos.plies);
+                0
+            } else {
+                config.batch_index
+            };
+            visit_kp_batches(
+                loader,
+                format,
+                config,
+                batch_count,
+                loader_start_batch,
+                |_| {
+                    Some(TeacherDataloaderPos {
+                        byte_offset: offset_handle.load(Ordering::Acquire),
+                        plies: plies_handle.load(Ordering::Acquire),
+                    })
+                },
+                visitor,
+            )
+        }
+        DataFormat::Psv => {
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
+            let loader_start_batch = match config.dataloader_resume_pos {
+                Some(pos) => fixed_record_resume_start_batch(
+                    "PSV",
+                    pos,
+                    config.batch_size,
+                    std::mem::size_of::<PackedSfenValue>(),
+                )?,
+                None => config.batch_index,
+            };
+            visit_kp_batches(loader, format, config, batch_count, loader_start_batch, |_| None, visitor)
         }
     }
 }
@@ -480,6 +643,19 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     Ok(())
 }
 
+fn validate_kp_config(config: &KpTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
+    if config.batch_size == 0 {
+        return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
+    }
+    if !(0.0..=1.0).contains(&config.lambda) {
+        return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
+    }
+    if !(config.scale.is_finite() && config.scale > 0.0) {
+        return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
+    }
+    Ok(())
+}
+
 fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), TeacherBatchError> {
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
@@ -557,6 +733,99 @@ fn prepare_halfkp_direct_fast_batch(
             let pos = &data_chunk[i];
             let sparse_offset = max_active * i;
             let (stm_count, nstm_count) = fill_halfkp_feature_indices(
+                pos,
+                &mut stm_chunk[sparse_offset..sparse_offset + max_active],
+                &mut nstm_chunk[sparse_offset..sparse_offset + max_active],
+            );
+            assert!(
+                stm_count <= max_active && nstm_count <= max_active,
+                "More inputs provided than the specified maximum!"
+            );
+
+            let mut weight = 1.0;
+            if let Some(cap) = config.score_drop_abs {
+                if pos.score().unsigned_abs() >= cap {
+                    weight = 0.0;
+                }
+            }
+            weights[i] = weight;
+
+            let score = if config.nnue_pytorch_wrm_loss {
+                win_rate_model_score(pos.score())
+            } else {
+                let score = f32::from(pos.score());
+                1.0 / (1.0 + (-rscale * score).exp())
+            };
+            let result = match pos.game_result() {
+                r if r > 0 => 1.0,
+                r if r < 0 => 0.0,
+                _ => 0.5,
+            };
+            targets[i] = result_blend * result + score_blend * score;
+        }
+    };
+
+    if let Some(pool) = rayon_pool
+        && threads > 1
+        && batch_size > 1
+    {
+        pool.install(|| {
+            data.par_chunks(chunk_size)
+                .zip(batch.stm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.nstm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.targets.par_chunks_mut(chunk_size))
+                .zip(batch.weights.par_chunks_mut(chunk_size))
+                .for_each(|((((data_chunk, stm_chunk), nstm_chunk), targets), weights)| {
+                    fill_chunk(data_chunk, stm_chunk, nstm_chunk, targets, weights);
+                });
+        });
+    } else {
+        data.chunks(chunk_size)
+            .zip(batch.stm.chunks_mut(sparse_chunk_size))
+            .zip(batch.nstm.chunks_mut(sparse_chunk_size))
+            .zip(batch.targets.chunks_mut(chunk_size))
+            .zip(batch.weights.chunks_mut(chunk_size))
+            .for_each(|((((data_chunk, stm_chunk), nstm_chunk), targets), weights)| {
+                fill_chunk(data_chunk, stm_chunk, nstm_chunk, targets, weights);
+            });
+    }
+
+    batch
+}
+
+fn prepare_kp_direct_fast_batch(
+    data: &[PackedSfenValue],
+    config: &KpTeacherBatchConfig<'_>,
+    threads: usize,
+    rayon_pool: Option<&rayon::ThreadPool>,
+) -> FastBatchHost {
+    let batch_size = data.len();
+    let max_active = KP_MAX_ACTIVE;
+    let sparse_len = batch_size * max_active;
+    let mut batch = FastBatchHost {
+        layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
+        stm: vec![-1; sparse_len],
+        nstm: vec![-1; sparse_len],
+        buckets: vec![0; batch_size],
+        targets: vec![0.0; batch_size],
+        weights: vec![0.0; batch_size],
+        hand_count: None,
+    };
+
+    let chunk_size = batch_size.div_ceil(threads.max(1));
+    let sparse_chunk_size = max_active * chunk_size;
+    let result_blend = 1.0 - config.lambda;
+    let score_blend = config.lambda;
+    let rscale = 1.0 / config.scale;
+    let fill_chunk = |data_chunk: &[PackedSfenValue],
+                      stm_chunk: &mut [i32],
+                      nstm_chunk: &mut [i32],
+                      targets: &mut [f32],
+                      weights: &mut [f32]| {
+        for i in 0..data_chunk.len() {
+            let pos = &data_chunk[i];
+            let sparse_offset = max_active * i;
+            let (stm_count, nstm_count) = fill_kp_feature_indices(
                 pos,
                 &mut stm_chunk[sparse_offset..sparse_offset + max_active],
                 &mut nstm_chunk[sparse_offset..sparse_offset + max_active],
@@ -807,6 +1076,155 @@ where
     if visited_batches != batch_count {
         return Err(TeacherBatchError::invalid_input(format!(
             "teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+            config.batch_index, config.batch_size
+        )));
+    }
+    Ok(visited_batches)
+}
+
+fn visit_kp_batches<D, P, F, E>(
+    loader: D,
+    format: DataFormat,
+    config: &KpTeacherBatchConfig<'_>,
+    batch_count: usize,
+    loader_start_batch: usize,
+    mut dataloader_pos: P,
+    mut visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    D: DataLoader<PackedSfenValue> + Send,
+    P: FnMut(usize) -> Option<TeacherDataloaderPos> + Send,
+    F: FnMut(KpTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    let threads = config.threads.max(1);
+    let rayon_pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("bulletou-kp-direct-prepare-{index}"))
+                .build()
+                .map_err(|err| {
+                    TeacherBatchError::invalid_input(format!(
+                        "failed to create KP direct teacher prepare thread pool with {threads} threads: {err}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    if config.queue_depth > 1 && !config.profile_prepare {
+        let (sender, receiver) = mpsc::sync_channel::<Result<KpTeacherBatch, TeacherBatchError>>(config.queue_depth);
+        return std::thread::scope(|scope| {
+            let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
+                let mut produced_batches = 0usize;
+                let mut producer_error = None;
+                load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+                    let batch_index = config.batch_index + produced_batches;
+                    let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
+                    if let Err(err) = batch.validate() {
+                        producer_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+                        return true;
+                    }
+
+                    let source = format!("{format:?} KP teacher batch {batch_index}: {}", config.teacher);
+                    let dataloader_pos = dataloader_pos(produced_batches);
+                    if sender.send(Ok(KpTeacherBatch { batch, source, dataloader_pos })).is_err() {
+                        return true;
+                    }
+
+                    produced_batches += 1;
+                    produced_batches >= batch_count
+                });
+
+                if let Some(err) = producer_error {
+                    let _ = sender.send(Err(err.clone()));
+                    return Err(err);
+                }
+                if produced_batches != batch_count {
+                    return Err(TeacherBatchError::invalid_input(format!(
+                        "teacher did not yield {batch_count} complete KP batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                        config.batch_index, config.batch_size
+                    )));
+                }
+                Ok(produced_batches)
+            });
+
+            let mut consumed_batches = 0usize;
+            let mut visit_error = None;
+            while consumed_batches < batch_count {
+                match receiver.recv() {
+                    Ok(Ok(batch)) => {
+                        if let Err(err) = visitor(batch) {
+                            visit_error = Some(TeacherBatchError::invalid_input(format!(
+                                "teacher batch callback failed at KP batch {}: {err}",
+                                config.batch_index + consumed_batches
+                            )));
+                            break;
+                        }
+                        consumed_batches += 1;
+                    }
+                    Ok(Err(err)) => {
+                        visit_error = Some(err);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(receiver);
+
+            let producer_result =
+                producer.join().map_err(|_| TeacherBatchError::invalid_input("KP teacher producer thread panicked"))?;
+            if let Some(err) = visit_error {
+                return Err(err);
+            }
+            producer_result?;
+            if consumed_batches != batch_count {
+                return Err(TeacherBatchError::invalid_input(format!(
+                    "teacher did not deliver {batch_count} complete prepared KP batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
+                    config.batch_index, config.batch_size
+                )));
+            }
+            Ok(consumed_batches)
+        });
+    }
+
+    let mut visited_batches = 0usize;
+    let mut visit_error = None;
+    load_and_map_packed_batches(&loader, loader_start_batch, config.batch_size, |raw_batch| {
+        let batch_index = config.batch_index + visited_batches;
+        let prepare_started = config.profile_prepare.then(std::time::Instant::now);
+        let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
+        if let Some(started) = prepare_started {
+            println!(
+                "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if let Err(err) = batch.validate() {
+            visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+            return true;
+        }
+
+        let source = format!("{format:?} KP teacher batch {batch_index}: {}", config.teacher);
+        let dataloader_pos = dataloader_pos(visited_batches);
+        if let Err(err) = visitor(KpTeacherBatch { batch, source, dataloader_pos }) {
+            visit_error = Some(TeacherBatchError::invalid_input(format!(
+                "teacher batch callback failed at KP batch {batch_index}: {err}"
+            )));
+            return true;
+        }
+
+        visited_batches += 1;
+        visited_batches >= batch_count
+    });
+    if let Some(err) = visit_error {
+        return Err(err);
+    }
+    if visited_batches != batch_count {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "teacher did not yield {batch_count} complete KP batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
             config.batch_index, config.batch_size
         )));
     }
