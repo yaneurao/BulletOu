@@ -6674,7 +6674,7 @@ fn write_cuda_cpp_halfkp_weights_bin(
         ("nnue/step_ranger/outb", completed_steps.as_slice()),
     ]);
     bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(records));
-    std::fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    write_bytes_atomic(path, &bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6762,7 +6762,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
     }
 
     bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(records));
-    std::fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    write_bytes_atomic(path, &bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7614,6 +7614,27 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     Ok(())
 }
 
+fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return std::fs::write(path, bytes);
+    };
+    std::fs::create_dir_all(parent)?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("out");
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    if let Err(err) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Count numbered subdirectories under `output_dir` whose names parse as
 /// `usize`. Used so a resumed run extends the numbering rather than
 /// overwriting the previous run's checkpoint dirs.
@@ -7705,12 +7726,9 @@ fn resume_config_matches(output_dir: &std::path::Path, args: &Args) -> Result<bo
     Ok(stored.trim_end() == resume_signature(args).trim_end())
 }
 
-/// Find the latest numbered subdirectory under `output_dir` (4-or-more-digit
-/// name parsable as `usize`) whose `state.bin` exists. Returns `None` if no
-/// resumable checkpoint is found.
-fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut latest: Option<(usize, std::path::PathBuf)> = None;
-    let rd = std::fs::read_dir(output_dir).ok()?;
+fn numbered_checkpoint_dirs_desc(output_dir: &std::path::Path) -> Vec<(usize, std::path::PathBuf)> {
+    let mut dirs = Vec::new();
+    let Ok(rd) = std::fs::read_dir(output_dir) else { return dirs };
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -7718,21 +7736,37 @@ fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::
         }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
         let Ok(n) = name.parse::<usize>() else { continue };
-        let state_bin = path.join("state.bin");
-        if !state_bin.is_file() {
-            continue;
-        }
-        match &latest {
-            None => latest = Some((n, state_bin)),
-            Some((m, _)) if n > *m => latest = Some((n, state_bin)),
-            _ => {}
-        }
+        dirs.push((n, path));
     }
-    latest.map(|(_, p)| p)
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs
+}
+
+fn is_complete_checkpoint_dir(dir: &std::path::Path) -> bool {
+    dir.join("state.bin").is_file() && dir.join("learn.log").is_file() && dir.join("dataloader_pos.txt").is_file()
+}
+
+/// Find the latest complete numbered checkpoint under `output_dir`.
+///
+/// A failed checkpoint save can leave a partial directory behind (for example
+/// `state.bin` truncated by `ERROR_DISK_FULL`). Such directories are not
+/// resumable, so auto-resume requires the checkpoint payload plus the metadata
+/// files written after a successful save.
+fn latest_complete_checkpoint_dir_raw(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| is_complete_checkpoint_dir(path))
+}
+
+/// Find the latest complete numbered subdirectory under `output_dir` and return
+/// its `state.bin`. Returns `None` if no resumable checkpoint is found.
+fn find_latest_state_bin_raw(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    latest_complete_checkpoint_dir_raw(output_dir).map(|dir| dir.join("state.bin"))
 }
 
 fn latest_checkpoint_dir(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    find_latest_state_bin_raw(output_dir).and_then(|p| p.parent().map(|dir| dir.to_path_buf()))
+    latest_complete_checkpoint_dir_raw(output_dir)
 }
 
 fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
@@ -8258,18 +8292,11 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
 /// parseable sb column — which collapses to "treat as a fresh run" by
 /// the caller.
 fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
-    let mut latest_idx: Option<usize> = None;
-    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else { continue };
-        let Ok(n) = name.parse::<usize>() else { continue };
-        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
-    }
-    let n = latest_idx?;
-    let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
-    let content = std::fs::read_to_string(&learn_log).ok()?;
+    let content = numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
+        .map(|(_, dir)| dir.join("learn.log"))
+        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
     // 12-column rows: eval, epoch, sb, batch, test_value_accuracy,
     // test_value_loss, train_value_loss, lr_start, lr_end, lambda,
     // positions, teacher.
@@ -8308,18 +8335,11 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
 /// Backward-compatible with the legacy single-number format (= just
 /// `<byte_offset>` on the line, plies inferred 0).
 fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usize)> {
-    let mut latest_idx: Option<usize> = None;
-    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else { continue };
-        let Ok(n) = name.parse::<usize>() else { continue };
-        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
-    }
-    let n = latest_idx?;
-    let pos_file = output_dir.join(format!("{n:04}")).join("dataloader_pos.txt");
-    let content = std::fs::read_to_string(&pos_file).ok()?;
+    let content = numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
+        .map(|(_, dir)| dir.join("dataloader_pos.txt"))
+        .find_map(|pos_file| std::fs::read_to_string(pos_file).ok())?;
     let line = content.trim();
     if let Some((off, plies)) = line.split_once(',') {
         let off = off.trim().parse::<u64>().ok()?;
@@ -8346,18 +8366,11 @@ fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usiz
 /// in the latest dir's learn.log (which is the most recent `--teacher`
 /// arg used for that save). Returns `None` if no row could be parsed.
 fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
-    let mut latest_idx: Option<usize> = None;
-    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else { continue };
-        let Ok(n) = name.parse::<usize>() else { continue };
-        latest_idx = Some(latest_idx.map_or(n, |m| m.max(n)));
-    }
-    let n = latest_idx?;
-    let learn_log = output_dir.join(format!("{n:04}")).join("learn.log");
-    let content = std::fs::read_to_string(&learn_log).ok()?;
+    let content = numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
+        .map(|(_, dir)| dir.join("learn.log"))
+        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
     // Same 12-column layout as read_latest_saved_superbatch. teacher
     // is the trailing field (index 11). splitn(12, ',') keeps any
     // commas inside teacher (= comma-separated `--teacher` list)
@@ -8746,7 +8759,7 @@ fn assemble_numbered_dirs(
         bundle_component_state(&mut state_buf, "kk", &kk_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kkp", &kkp_dir.join("optimiser_state"))?;
         bundle_component_state(&mut state_buf, "kpp", &kpp_dir.join("optimiser_state"))?;
-        std::fs::write(dst.join("state.bin"), &state_buf)?;
+        write_bytes_atomic(&dst.join("state.bin"), &state_buf)?;
         let test_metrics = match (validation_args, validation_cache.as_ref()) {
             (Some(args), Some(cache)) => {
                 run_kppt_component_dirs_final_validation(args, cache, kk_dir, kkp_dir, kpp_dir)?
@@ -9741,6 +9754,7 @@ mod tests {
         .unwrap();
         write_resume_config(&tmp, &args).unwrap();
         std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("dataloader_pos.txt"), "64,0\n").unwrap();
         std::fs::write(
             tmp.join("0001").join("learn.log"),
             format!(
@@ -9808,6 +9822,7 @@ mod tests {
         .unwrap();
         write_resume_config(&tmp, &args).unwrap();
         std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("dataloader_pos.txt"), "192,0\n").unwrap();
         std::fs::write(
             tmp.join("0001").join("learn.log"),
             format!(
@@ -11756,6 +11771,8 @@ mod tests {
         // 0001/ exists but learn.log is missing -> None.
         let d1 = tmp.join("0001");
         std::fs::create_dir(&d1).unwrap();
+        std::fs::write(d1.join("state.bin"), b"state").unwrap();
+        std::fs::write(d1.join("dataloader_pos.txt"), "1048576,0\n").unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), None);
 
         // 0001/learn.log has sb=1 -> returns 1.
@@ -11772,6 +11789,8 @@ mod tests {
         // Add 0004/ with sb=4 -> the highest-numbered dir wins.
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
+        std::fs::write(d4.join("state.bin"), b"state").unwrap();
+        std::fs::write(d4.join("dataloader_pos.txt"), "2097152,0\n").unwrap();
         std::fs::write(
             d4.join("learn.log"),
             format!("{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.06,0.001,1.000,2097152,t.hcpe\n"),
@@ -11782,6 +11801,42 @@ mod tests {
         // Non-numbered dirs are ignored.
         std::fs::create_dir(tmp.join("foo")).unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(4));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn auto_resume_skips_incomplete_latest_checkpoint_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-resume-incomplete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let d19 = tmp.join("0019");
+        std::fs::create_dir(&d19).unwrap();
+        std::fs::write(d19.join("state.bin"), b"complete").unwrap();
+        std::fs::write(d19.join("dataloader_pos.txt"), "1900,0\n").unwrap();
+        std::fs::write(
+            d19.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,19,610,0.6,0.05,0.06,0.001,0.0008,1.000,1900,teacher.psv\n"
+            ),
+        )
+        .unwrap();
+
+        // Simulate ERROR_DISK_FULL during the next save: the numbered dir and
+        // a truncated state.bin exist, but metadata was never written.
+        let d20 = tmp.join("0020");
+        std::fs::create_dir(&d20).unwrap();
+        std::fs::write(d20.join("state.bin"), b"partial").unwrap();
+
+        assert_eq!(find_latest_state_bin_raw(&tmp), Some(d19.join("state.bin")));
+        assert_eq!(read_latest_saved_superbatch(&tmp), Some(19));
+        assert_eq!(read_latest_dataloader_pos(&tmp), Some((1900, 0)));
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("teacher.psv".to_string()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -11804,6 +11859,8 @@ mod tests {
         // 0001/ exists but learn.log is missing -> None.
         let d1 = tmp.join("0001");
         std::fs::create_dir(&d1).unwrap();
+        std::fs::write(d1.join("state.bin"), b"state").unwrap();
+        std::fs::write(d1.join("dataloader_pos.txt"), "524288,0\n").unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), None);
 
         // A single 12-column row is enough to read the teacher.
@@ -11819,6 +11876,8 @@ mod tests {
         // 0004 を追加して bar.hcpe にしたら、最新 dir の teacher が返る
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
+        std::fs::write(d4.join("state.bin"), b"state").unwrap();
+        std::fs::write(d4.join("dataloader_pos.txt"), "2097152,0\n").unwrap();
         std::fs::write(
             d4.join("learn.log"),
             format!(
@@ -11831,6 +11890,8 @@ mod tests {
         // 9-column legacy rows are ignored (parts.len() < 11).
         let d5 = tmp.join("0005");
         std::fs::create_dir(&d5).unwrap();
+        std::fs::write(d5.join("state.bin"), b"state").unwrap();
+        std::fs::write(d5.join("dataloader_pos.txt"), "3000,0\n").unwrap();
         std::fs::write(
             d5.join("learn.log"),
             format!("{LEARN_LOG_HEADER}\nNNUE_KP,1,5,32,0.5,0.001,1.000,3000,legacy.hcpe\n"),
