@@ -1,4 +1,4 @@
-# 3. Prepare training data — choosing the eval type and pre-processing
+# 3. Prepare training data — choosing the architecture and pre-processing
 
 <a href="../../ja/tutorial/3-data.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
@@ -6,24 +6,26 @@ Goal: decide what to train and prepare the teacher data you'll feed to `bulletou
 
 This page assumes you have already completed [1. Quick Start](1-quickstart.md) — your toolchain works and a smoke-test training succeeded.
 
-We use **NNUE HalfKP as the running example** in this tutorial, but the same command shape applies to the other targets (NNUE K-P / NNUE HalfKPE9 / KPPT / KPP_KKPT) by switching `--eval-type`.
+We use **NNUE HalfKP as the running example** in this tutorial, but the same command shape applies to the other targets (NNUE K-P / NNUE HalfKPE9 / KPPT / KPP_KKPT) by switching `--arch`.
 
 ## 3.1 Choosing what to train
 
-`bulletou --eval-type <X>` selects which evaluation function to train. The currently public choices:
+`bulletou --arch <X>` selects which evaluation function to train. For KPPT-family evals, `<X>` is `KPPT` or `KPP_KKPT`; for NNUE / SFNN evals, `<X>` is the YaneuraOu architecture name without the `YANEURAOU_ENGINE_` prefix. Common choices:
 
-| `--eval-type` | What it trains | Output (per save) | `--arch` used? |
-|---|---|---|---|
-| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` | yes |
-| `NNUE_KP` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` | yes |
-| `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2, 9 combos). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` | yes |
-| `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4). Input dim is ~half of HalfKP. | `nn.bin` | yes |
-| `SFNN_HALFKA2HM` | LayerStacks evaluation for YaneuraOu's `YANEURAOU_ENGINE_SFNN1536` build. Usage in [§9 LayerStack](9-layerstack.md); full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md). | `nn.bin` | yes (`SFNN_halfkahm2_1536_15_32_k3k3`) |
-| `SFNN_HALFKA1HM` | v1 ablation of the above. | `nn.bin` | yes (`SFNN_halfkahm1_1536_15_32_k3k3`) |
-| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | no |
-| `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs | no |
+| `--arch` value | What it trains | Output (per save) |
+|---|---|---|
+| **`NNUE_halfkp_256x2_32_32`** — start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
+| `NNUE_kp_256x2_32_32` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
+| `NNUE_ka2_256x2_32_32` | Same network as K-P, but with K+A2 input. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
+| `NNUE_halfkpe9_256x2_32_32` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2, 9 combos). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4). Input dim is ~half of HalfKP. | `nn.bin` |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | LayerStacks evaluation for YaneuraOu's `YANEURAOU_ENGINE_SFNN1536` build. Usage in [§9 LayerStack](9-layerstack.md); full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md). | `nn.bin` |
+| `SFNN_halfkahm1_1536_15_32_k3k3` | v1 ablation of the above. | `nn.bin` |
+| `SFNN_ka2_1536_15_32_k3k3` | Same SFNN-1536 topology, but with lightweight K+A2 input. | `nn.bin` |
+| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs |
 
-Coming later: HalfKA, SFNN + ls9 (NNUEwoSQPT1536), and other variants.
+Architecture size variants such as `NNUE_halfkp_1024x2_8_64` or `SFNN_ka2_8192_7_15_g8_k3k3` are accepted for experiments when the matching YaneuraOu architecture exists.
 
 ## 3.2 Get training data
 

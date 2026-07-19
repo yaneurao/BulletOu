@@ -47,11 +47,11 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 ### KPPT (elmo-compatible)
 
-`--eval-type KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles each save into numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
+`--arch KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles each save into numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
 ```
@@ -80,7 +80,7 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` is a CSV with a header row, using the same schema as other eval-types:
+`learn.log` is a CSV with a header row, using the same schema as other targets:
 
 ```
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
@@ -93,21 +93,21 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 ...
 ```
 
-The `eval` column uses the **`<eval-type>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows. KPPT-family eval types ignore `--arch`, so no arch suffix appears here (unlike NNUE rows, which embed it as `NNUE_HALFKP-NNUE_halfkp_256x2_32_32`).
+The `eval` column uses the **`<target>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows. KPPT-family rows have no NNUE/SFNN architecture suffix (unlike NNUE rows, which embed it as `NNUE_HALFKP-NNUE_halfkp_256x2_32_32`).
 
 Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.log` have different granularities but the same column meanings. `summary-learn.log` keeps only sb-boundary rows and omits `curr_batch`. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md).
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-Resume / restart behaviour is identical across every eval-type; see [tutorial 5. Stop and resume](../tutorial/5-resume.md) for details.
+Resume / restart behaviour is identical across every target; see [tutorial 5. Stop and resume](../tutorial/5-resume.md) for details.
 
 ### KPP_KKPT (factorised)
 
-`--eval-type KPP_KKPT` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
+`--arch KPP_KKPT` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPP_KKPT \
+    --arch KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
@@ -117,10 +117,10 @@ Resume / restart behaviour is identical across every eval-type; see [tutorial 5.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
+| `--arch` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
-| `--net-id` | Prefix of the saved checkpoint subdirectory name | per-eval-type default |
+| `--output` | Checkpoint parent directory | `checkpoints/<target>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
+| `--net-id` | Prefix of the saved checkpoint subdirectory name | per-target default |
 | `--batch-size` | Positions per gradient step | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--superbatches` | Cap on superbatches per epoch. Omit for no cap (run until dataloader EOF) | (no cap) |

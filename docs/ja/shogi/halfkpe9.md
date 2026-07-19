@@ -4,7 +4,7 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_HALFKPE9` は、やねうら王の `halfkpe9_*` 評価関数を学習する。HalfKP の `(自玉位置, 駒の BonaPiece)` ペアに加えて、**その駒が占めているマスへの利き数情報** を 9 通り (= 自軍利き 0/1/2 × 敵軍利き 0/1/2) ぶん多重化したもの。ネットワーク本体 (4 層 ClippedReLU dual-perspective) は HalfKP / K-P と同じ。
+`--arch NNUE_halfkpe9_256x2_32_32` は、やねうら王の `halfkpe9_*` 評価関数を学習する。HalfKP の `(自玉位置, 駒の BonaPiece)` ペアに加えて、**その駒が占めているマスへの利き数情報** を 9 通り (= 自軍利き 0/1/2 × 敵軍利き 0/1/2) ぶん多重化したもの。ネットワーク本体 (4 層 ClippedReLU dual-perspective) は HalfKP / K-P と同じ。
 
 ネットワーク構造は HalfKP / K-P と同じだが、入力次元が **HalfKP の 9 倍** (125,388 → 1,128,492) になるため L0 weight matrix が 9 倍に膨らむ。GPU メモリと学習時間の見積もりは halfkp に比例して増える。
 
@@ -92,7 +92,7 @@ cargo build --release --features cuda-cpp-backend --example bulletou
 
 # Run
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKPE9 \
+    --arch NNUE_halfkpe9_256x2_32_32 \
     --teacher teachers/
 ```
 
@@ -129,10 +129,9 @@ L1 / L2 / Out 層は `--arch` が同じなら HalfKP と byte-identical。
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `NNUE_HALFKPE9` | (必須) |
-| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | `NNUE_halfkpe9_256x2_32_32` |
+| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | (required; target `NNUE_HALFKPE9` is inferred) |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 | 1.0 |
 
 その他フラグは [HalfKP 学習](halfkp.md) を参照 (NNUE 系 4 つで共通)。

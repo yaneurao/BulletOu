@@ -47,11 +47,11 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ### KPPT (elmo 互換)
 
-`--eval-type KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、各 save を `<output>/0001/`, `<output>/0002/`, ... の番号付き checkpoint directory に集約する。
+`--arch KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、各 save を `<output>/0001/`, `<output>/0002/`, ... の番号付き checkpoint directory に集約する。
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kppt
 ```
@@ -80,7 +80,7 @@ checkpoints/my-kppt/
     └── learn.log
 ```
 
-`learn.log` はヘッダ行つき CSV で、すべての eval-type で同じフォーマット:
+`learn.log` はヘッダ行つき CSV で、すべての target で同じフォーマット:
 
 ```
 eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
@@ -93,21 +93,21 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 ...
 ```
 
-`eval` 列は **`<eval-type>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。KPPT 系は `--arch` を使わないので arch 接尾辞は付かない (NNUE 系では `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように arch も結合される)。
+`eval` 列は **`<target>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。KPPT 系の行には NNUE/SFNN architecture 接尾辞は付かない (NNUE 系では `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように arch も結合される)。
 
 各 save の `0NNN/learn.log` snapshot とトップレベル `<output>/summary-learn.log` は列数が違うが、列の意味は同じ。`summary-learn.log` は `curr_batch` を除いた sb 境界行だけを保持する。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md) を参照。
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 
-中断・再開の挙動は eval-type 横断で同じなので、[チュートリアル 5. 中断・再開](../tutorial/5-resume.md) を参照。
+中断・再開の挙動は target 横断で同じなので、[チュートリアル 5. 中断・再開](../tutorial/5-resume.md) を参照。
 
 ### KPP_KKPT (factorised)
 
-`--eval-type KPP_KKPT` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
+`--arch KPP_KKPT` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPP_KKPT \
+    --arch KPP_KKPT \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-kpp-kkpt \
     --superbatches 20
@@ -117,10 +117,10 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `KPPT` (3 component 連続学習) / `KPP_KKPT` (factorised 版) | (必須) |
+| `--arch` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
-| `--net-id` | チェックポイント subdir 名のプレフィクス | eval-type 別自動 |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
+| `--net-id` | チェックポイント subdir 名のプレフィクス | target 別自動 |
 | `--batch-size` | 1 gradient step あたりの局面数 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch の目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--superbatches` | 1 epoch あたりの superbatch 上限。省略時は上限なし (dataloader EOF まで) | (上限なし) |

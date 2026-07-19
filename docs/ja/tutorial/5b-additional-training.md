@@ -17,13 +17,13 @@
 ```powershell
 # 1 回目: 3 epoch 学習
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # 2 回目: 追加で 3 epoch
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 ```
@@ -66,8 +66,7 @@
 
 | フラグ | 理由 |
 |---|---|
-| `--eval-type` | NN の topology が変わる = state.bin の tensor shape が合わない |
-| `--arch` | 同上 (FT/L1/L2 のサイズが変わる) |
+| `--arch` | target family や NN topology (feature set / FT / L1 / L2 dims) が変わる = state.bin の tensor shape が合わない |
 | `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
@@ -78,7 +77,7 @@
 ```powershell
 # 続きの 3 epoch を 32768 で
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
     --resume `
@@ -108,14 +107,14 @@ batch_size を 2 倍にすると gradient の noise が ~√2 倍小さくなり
 ```powershell
 # 大量の弱教師で 3 epoch 学習
 .\bulletou.exe --teacher c:\shogi\teacher\bulk\ `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # 小規模・高品質教師で fine-tune (= LR を小さめに)
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 2 --superbatches 4 `
     --resume `

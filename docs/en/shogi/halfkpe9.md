@@ -4,7 +4,7 @@
 
 [Back to Reference index](../README.md)
 
-`--eval-type NNUE_HALFKPE9` trains YaneuraOu's `halfkpe9_*` evaluation function. HalfKP's `(own_king_sq, piece_bonapiece)` pair is augmented with the **per-square attacker counts (own / opponent, 0/1/2-clipped, 9 combinations)** for that piece's square. The 4-layer ClippedReLU dual-perspective network is the same as HalfKP / K-P.
+`--arch NNUE_halfkpe9_256x2_32_32` trains YaneuraOu's `halfkpe9_*` evaluation function. HalfKP's `(own_king_sq, piece_bonapiece)` pair is augmented with the **per-square attacker counts (own / opponent, 0/1/2-clipped, 9 combinations)** for that piece's square. The 4-layer ClippedReLU dual-perspective network is the same as HalfKP / K-P.
 
 Network structure is identical to HalfKP / K-P, but the input dimension is **9× HalfKP** (125,388 → 1,128,492), so the L0 weight matrix grows 9×. GPU memory and training time scale accordingly.
 
@@ -92,7 +92,7 @@ cargo build --release --features cuda-cpp-backend --example bulletou
 
 # Run
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKPE9 \
+    --arch NNUE_halfkpe9_256x2_32_32 \
     --teacher teachers/
 ```
 
@@ -129,13 +129,12 @@ L1 / L2 / Out layers are byte-identical to HalfKP for the same `--arch`.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `NNUE_HALFKPE9` | (required) |
-| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | `NNUE_halfkpe9_256x2_32_32` |
+| `--arch` | `NNUE_halfkpe9_256x2_32_32`<br>`NNUE_halfkpe9_384x2_8_96`<br>`NNUE_halfkpe9_512x2_8_64`<br>`NNUE_halfkpe9_768x2_16_64`<br>`NNUE_halfkpe9_1024x2_8_32`<br>`NNUE_halfkpe9_1024x2_8_64` | (required; target `NNUE_HALFKPE9` is inferred) |
 | `--teacher` | Teacher file / directory / comma-separated | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` |
+| `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` |
 | `--lambda` | Blend between teacher eval and W/D/L | 1.0 |
 
-Full flag list: see [HalfKP Training](halfkp.md) (all four NNUE eval types share the same flags).
+Full flag list: see [HalfKP Training](halfkp.md) (all four NNUE targets share the same flags).
 
 ## Caveats
 

@@ -24,7 +24,6 @@
 cargo run -p bulletou_lib --release --example bulletou -- nerf \
   --input nn.bin \
   --output nn-nerf.bin \
-  --eval-type SFNN_HALFKA2 \
   --arch SFNN_halfka2_1024_7_64_k3k3 \
   --layers fc2,fc1 \
   --count 1000 \
@@ -37,7 +36,6 @@ cargo run -p bulletou_lib --release --example bulletou -- nerf \
 |---|---|
 | `--input` | 入力 `nn.bin` |
 | `--output` | 出力 `nn.bin`。`--input` と同じパスは指定不可 |
-| `--eval-type` | 入力ファイルの評価関数種別。現時点では SFNN 系のみ |
 | `--arch` | `YANEURAOU_ENGINE_` prefix を除いた、やねうら王 architecture 名。例: `SFNN_halfka2_1024_7_64_k3k3` |
 | `--layers` | 変更対象。`fc0` / `fc1` / `fc2` / `all` をカンマ区切りで指定 |
 | `--count` | ランダムな `+1` / `-1` 摂動の試行回数。同じ重みが複数回選ばれることがある |

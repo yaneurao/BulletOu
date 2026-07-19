@@ -8,7 +8,7 @@ A standard NNUE uses a single MLP to evaluate any position. **LayerStack-family*
 - So the model keeps 9 independent small sub-networks, and at inference time picks just one based on the position.
 - The **bucket selection logic** has to agree between the engine and bulletou, and is encoded in the `--arch` suffix.
 
-In bulletou, LayerStack is currently used **only** for **YaneuraOu SFNNwoP1536-build training** (= `--eval-type SFNN_HALFKA1HM` / `SFNN_HALFKA2HM`). For the full spec see the [SFNN-1536 training reference](../shogi/sfnn-1536.md).
+In bulletou, LayerStack is currently used **only** for **YaneuraOu SFNNwoP1536-build training** (= `--arch SFNN_halfkahm1_1536_15_32_k3k3` / `SFNN_halfkahm2_1536_15_32_k3k3`). For the full spec see the [SFNN-1536 training reference](../shogi/sfnn-1536.md).
 
 ## 9.1 Choosing the LayerStack Suffix
 
@@ -32,17 +32,16 @@ Each bucket owns its own set of `fc_0 + fc_1 + fc_2` weights; during training, t
 
 ## 9.2 When it kicks in
 
-LayerStack is **only meaningful for the SFNN family**. The other eval-types (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` family) use a single MLP.
+LayerStack is **only meaningful for the SFNN family**. The other target families (`NNUE_halfkp_*` / `NNUE_kp_*` / `NNUE_halfkpe9_*` / `NNUE_halfkpvm_*` / `KPPT` family) use a single MLP.
 
 ```bash
 # Train SFNN-1536 with k3k3(king3-by-king3) = 9 buckets
 ./target/release/examples/bulletou \
-    --eval-type SFNN_HALFKA2HM \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` (= the eval-type and arch values joined into the directory name).
+Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` (= the inferred target and arch values joined into the directory name).
 
 Schedule flags (`--lr`, `--superbatches`, etc.) and the loss-log format are identical to the rest of the tutorial — see [§6 Tune the training](6-tune.md) and [§7 Inspect the result](7-result.md).
 
@@ -61,7 +60,7 @@ Because LayerStack stores 9× the per-bucket weights, both training and inferenc
 
 Practical guidance:
 - **Need a YaneuraOu SFNNwoP1536-compatible eval** → use `SFNN_HALFKA2HM` + LayerStack.
-- **Otherwise** → a single-MLP NNUE eval-type is enough.
+- **Otherwise** → a single-MLP NNUE architecture is enough.
 
 ## 9.5 Related
 

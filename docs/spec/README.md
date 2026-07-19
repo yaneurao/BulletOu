@@ -21,7 +21,7 @@ fast backend is the Windows-native `cuda-cpp` backend.
 
 ## ドキュメント一覧
 
-- [01-eval-types.md](01-eval-types.md) — `--eval-type` の公開バリアントと出力ファイル組合せ
+- [01-eval-types.md](01-eval-types.md) — `--arch` から学習 target を推定する現行 CLI 仕様
 - [02-nnue-binary.md](02-nnue-binary.md) — `nn.bin` (NNUE binary) のヘッダー / 重みレイアウト / 量子化スケール / hash 計算式
 - [03-feature-sets.md](03-feature-sets.md) — HalfKP / K / P / FeatureSet 合成規則と発火 index 配置
 - [04-checkpoint-layout.md](04-checkpoint-layout.md) — 番号付き save dir / `state.bin` / `learn.log` / resume プロトコル

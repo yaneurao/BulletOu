@@ -60,7 +60,7 @@ bullet は **32 batch ごとに 1 行** loss を記録する。デフォルト (
 
 | 列 | 意味 | 例 |
 |---|---|---|
-| `eval` | 出力ディレクトリ名と同じ `<eval-type>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | 出力ディレクトリ名と同じ `<target>[-<arch>]` 形式 + マルチ component (KPPT 系) ではさらに `/<component>` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | run 内 epoch (1 始まり) | `1` |
 | `superbatch` | epoch 内 superbatch (1 始まり)。`--positions-per-superbatch` の実効局面数ごとに +1 | `1`, `2`, ... |
 | `curr_batch` | superbatch 内 batch (1 始まり)。bullet は 32 batch ごとに 1 行記録 | `32`, `64`, ..., `1525` |
@@ -166,7 +166,7 @@ resume すると新 run の行が学習ログにそのまま追記される。�
 - [リファレンス: NNUE K-P 学習](../shogi/kp.md) — HalfKP との比較、入力 feature の構造
 - [リファレンス: NNUE HalfKPE9 学習](../shogi/halfkpe9.md) — 利き数情報拡張版
 - [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習
-- [仕様: spec/](../../spec/) — eval-type 一覧 / バイナリレイアウト / hash 計算式 / `learn.log` フォーマット
+- [仕様: spec/](../../spec/) — target 一覧 / バイナリレイアウト / hash 計算式 / `learn.log` フォーマット
 
 ---
 

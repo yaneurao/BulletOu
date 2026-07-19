@@ -4,7 +4,7 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_HALFKP` は、やねうら王が長年採用している古典的な HalfKP NNUE を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。
+`--arch NNUE_halfkp_256x2_32_32` は、やねうら王が長年採用している古典的な HalfKP NNUE を学習する。dual-perspective HalfKP feature transformer + 全層 ClippedReLU の 4 層構成。
 
 活性化関数の歴史的経緯 (なぜ SCReLU ではなく ClippedReLU か) は [`spec/05-activation-history.md`](../../spec/05-activation-history.md) を参照。
 
@@ -39,7 +39,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-halfkp
 ```
@@ -85,10 +85,9 @@ checkpoints/my-halfkp/
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `NNUE_HALFKP` | (必須) |
-| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
+| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | (required; target `NNUE_HALFKP` is inferred) |
 | `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | epoch を最大何回実行するか。省略時は固定上限なし | 省略 |
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |

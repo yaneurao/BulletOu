@@ -38,7 +38,7 @@ bench
 - `--max-epochs 3` 程度で複数周回す
 - `--save-rate` を大きく (例: 10) して、後半の save だけを使う。epoch 末尾 save はデフォルトで残る
 
-詳細なハイパーパラメータ調整は各 eval-type のリファレンス ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [halfkpe9.md](../shogi/halfkpe9.md) / [kppt.md](../shogi/kppt.md)) を参照。
+詳細なハイパーパラメータ調整は各 architecture family のリファレンス ([halfkp.md](../shogi/halfkp.md) / [kp.md](../shogi/kp.md) / [halfkpe9.md](../shogi/halfkpe9.md) / [kppt.md](../shogi/kppt.md)) を参照。
 
 ---
 

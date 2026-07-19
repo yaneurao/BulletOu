@@ -4,7 +4,7 @@
 
 [Back to Reference index](../README.md)
 
-`--eval-type NNUE_KP` trains the YaneuraOu `kp_256x2-32-32` NNUE — the same 4-layer ClippedReLU network as [HalfKP](halfkp.md), but with a different input feature set.
+`--arch NNUE_kp_256x2_32_32` trains the YaneuraOu `kp_256x2-32-32` NNUE — the same 4-layer ClippedReLU network as [HalfKP](halfkp.md), but with a different input feature set.
 
 The architecture file in YaneuraOu source is `source/eval/nnue/architectures/kp_256x2-32-32.h`, declaring `RawFeatures = FeatureSet<Features::K, Features::P>`.
 
@@ -72,12 +72,12 @@ KP was introduced alongside HalfKP in the same architecture family, with the sam
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_KP \
+    --arch NNUE_kp_256x2_32_32 \
     --teacher teachers/ \
     --output checkpoints/my-kp
 ```
 
-Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--eval-type` differs.
+Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--arch` differs.
 
 ### Save layout
 
@@ -110,9 +110,8 @@ L1 / L2 / Output layers are byte-identical between HalfKP and KP for the same `-
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `NNUE_KP` | (required) |
-| `--arch` | `NNUE_kp_256x2_32_32`, `NNUE_kp_384x2_8_96`, `NNUE_kp_512x2_8_64`, `NNUE_kp_768x2_16_64`, `NNUE_kp_1024x2_8_32`, `NNUE_kp_1024x2_8_64` | `NNUE_kp_256x2_32_32` |
+| `--arch` | `NNUE_kp_256x2_32_32`, `NNUE_kp_384x2_8_96`, `NNUE_kp_512x2_8_64`, `NNUE_kp_768x2_16_64`, `NNUE_kp_1024x2_8_32`, `NNUE_kp_1024x2_8_64` | (required; target `NNUE_KP` is inferred) |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32`) |
+| `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` (e.g. `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32`) |
 
 See [HalfKP Training](halfkp.md) for the full flag list (it is identical between NNUE_HALFKP and NNUE_KP).

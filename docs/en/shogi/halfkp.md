@@ -4,7 +4,7 @@
 
 [Back to Reference index](../README.md)
 
-`--eval-type NNUE_HALFKP` trains the classic YaneuraOu HalfKP NNUE — dual-perspective HalfKP feature transformer + 4 ClippedReLU layers. This is the evaluation function family YaneuraOu has supported the longest.
+`--arch NNUE_halfkp_256x2_32_32` trains the classic YaneuraOu HalfKP NNUE — dual-perspective HalfKP feature transformer + 4 ClippedReLU layers. This is the evaluation function family YaneuraOu has supported the longest.
 
 The activation-function history (why ClippedReLU and not SCReLU) is documented in [`spec/05-activation-history.md`](../../spec/05-activation-history.md).
 
@@ -39,7 +39,7 @@ HalfKP sparse input (125,388 dims, per perspective)
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher /path/to/train.hcpe \
     --output checkpoints/my-halfkp
 ```
@@ -85,10 +85,9 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--eval-type` | `NNUE_HALFKP` | (required) |
-| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | `NNUE_halfkp_256x2_32_32` |
+| `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | (required; target `NNUE_HALFKP` is inferred) |
 | `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
-| `--output` | Checkpoint parent directory | `checkpoints/<eval-type>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
+| `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | Maximum number of epochs. If omitted: no fixed epoch cap | omitted |
 | `--superbatches` | Cap superbatches per epoch | unlimited |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses the tatara-aligned default | 65536 |

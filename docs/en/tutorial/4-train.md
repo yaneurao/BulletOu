@@ -20,15 +20,15 @@ On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run co
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher teachers/
 ```
 
-That's it — no further flags needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` (auto-derived from `--eval-type` and `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
+That's it — no further target flag is needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` (auto-derived from `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
 
 ## 4.3 Specifying `--arch`
 
-For NNUE / SFNN eval types, pass the YaneuraOu Makefile edition name after removing the `YANEURAOU_ENGINE_` prefix. For example, HalfKP 256x2-32-32 is `NNUE_halfkp_256x2_32_32`, K-P 256x2-32-32 is `NNUE_kp_256x2_32_32`, and SFNN looks like `SFNN_halfka2_1024_7_64_k3k3`. The old shorthand `256x2-32-32` is not accepted.
+Pass the training target through `--arch`. For KPPT-family evals, use `KPPT` or `KPP_KKPT`. For NNUE / SFNN evals, use the YaneuraOu Makefile edition name after removing the `YANEURAOU_ENGINE_` prefix. For example, HalfKP 256x2-32-32 is `NNUE_halfkp_256x2_32_32`, K-P 256x2-32-32 is `NNUE_kp_256x2_32_32`, and SFNN looks like `SFNN_halfka2_1024_7_64_k3k3`. The old shorthand `256x2-32-32` is not accepted.
 
 For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective accumulator size) must be a positive multiple of 32 (FT SIMD-padding requirement); `L2` and `L3` (hidden-layer sizes) must be positive integers. Common sizes:
 
@@ -42,26 +42,24 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | SFNN-1536 with k3k3(king3-by-king3) LayerStacks |
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
-| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input (`--eval-type SFNN_KA2`) |
+| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input |
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
     --arch NNUE_halfkp_1024x2_8_64 \
     --teacher teachers/
 ```
 
-Omitting `--arch` uses the per-eval-type default. For example, `NNUE_HALFKP` defaults to `NNUE_halfkp_256x2_32_32`, and `NNUE_KP` defaults to `NNUE_kp_256x2_32_32`. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
+`--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
-Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_15_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=15`, and L1 is split into 8 groups. KA2 variants must be paired with `--eval-type SFNN_KA2`; HalfKA2 variants must be paired with `--eval-type SFNN_HALFKA2`.
+Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_15_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=15`, and L1 is split into 8 groups. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
-If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE_SFNN1536` build**, use its dedicated `--eval-type`:
+If you need an evaluation function that loads in YaneuraOu's **`YANEURAOU_ENGINE_SFNN1536` build**, pass its architecture name:
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type SFNN_HALFKA2HM \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
@@ -70,15 +68,15 @@ The difference from the rest of the NNUE family is that the network uses 9 sub-n
 
 ## 4.5 Training a KPPT eval
 
-For KPPT-family eval types the architecture is fixed and `--arch` is ignored:
+For KPPT-family evals, use the fixed target name as `--arch`:
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher teachers/
 ```
 
-The default output dir is `checkpoints/KPPT/`. To get the factorised variant, swap to `--eval-type KPP_KKPT`.
+The default output dir is `checkpoints/KPPT/`. To get the factorised variant, swap to `--arch KPP_KKPT`.
 
 ## 4.6 Passing teacher data
 

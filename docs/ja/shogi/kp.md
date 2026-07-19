@@ -4,7 +4,7 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_KP` は、やねうら王の `kp_256x2-32-32` NNUE を学習する。ネットワーク本体 (4 層 ClippedReLU) は [HalfKP](halfkp.md) と完全に同一で、**入力特徴量だけが違う**。
+`--arch NNUE_kp_256x2_32_32` は、やねうら王の `kp_256x2-32-32` NNUE を学習する。ネットワーク本体 (4 層 ClippedReLU) は [HalfKP](halfkp.md) と完全に同一で、**入力特徴量だけが違う**。
 
 やねうら王側の architecture ファイルは `source/eval/nnue/architectures/kp_256x2-32-32.h` で、`RawFeatures = FeatureSet<Features::K, Features::P>` と宣言されている。
 
@@ -72,12 +72,12 @@ K-P は HalfKP と並んで NNUE 系評価関数の最初期に追加された (
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_KP \
+    --arch NNUE_kp_256x2_32_32 \
     --teacher teachers/ \
     --output checkpoints/my-kp
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` だけが違う。
 
 ### 保存レイアウト
 
@@ -110,9 +110,8 @@ L1 / L2 / Output 層は同じ `--arch` preset の下で HalfKP と byte-identica
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `NNUE_KP` | (必須) |
-| `--arch` | `NNUE_kp_256x2_32_32`、`NNUE_kp_384x2_8_96`、`NNUE_kp_512x2_8_64`、`NNUE_kp_768x2_16_64`、`NNUE_kp_1024x2_8_32`、`NNUE_kp_1024x2_8_64` | `NNUE_kp_256x2_32_32` |
+| `--arch` | `NNUE_kp_256x2_32_32`、`NNUE_kp_384x2_8_96`、`NNUE_kp_512x2_8_64`、`NNUE_kp_768x2_16_64`、`NNUE_kp_1024x2_8_32`、`NNUE_kp_1024x2_8_64` | (required; target `NNUE_KP` is inferred) |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32`) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32`) |
 
 全フラグ一覧は [HalfKP 学習](halfkp.md) を参照 (NNUE_HALFKP と NNUE_KP で同じ)。

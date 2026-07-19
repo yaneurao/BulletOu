@@ -4,9 +4,9 @@
 
 [リファレンス目次へ戻る](../README.md)
 
-`--eval-type NNUE_KA2` は、入力特徴量に `FeatureSet<Features::K, Features::A2>` を使うやねうら王 NNUE を学習する (architecture ファイルは `source/eval/nnue/architectures/ka2_*.h`、`nnue_arch_gen.py` で自動生成される)。ネットワーク本体は [HalfKP](halfkp.md) / [K-P](kp.md) と同じ 4 層 ClippedReLU で、入力特徴量だけが違う。
+`--arch NNUE_ka2_256x2_32_32` は、入力特徴量に `FeatureSet<Features::K, Features::A2>` を使うやねうら王 NNUE を学習する (architecture ファイルは `source/eval/nnue/architectures/ka2_*.h`、`nnue_arch_gen.py` で自動生成される)。ネットワーク本体は [HalfKP](halfkp.md) / [K-P](kp.md) と同じ 4 層 ClippedReLU で、入力特徴量だけが違う。
 
-関連: `--eval-type SFNN_KA2` は同じ KA2 入力を SFNN-1536 architecture (LayerStacks=9) で学習する版 ([§4.4](../tutorial/4-train.md) と [SFNN-1536](sfnn-1536.md))。
+関連: `--arch SFNN_ka2_1536_15_32_k3k3` は同じ KA2 入力を SFNN-1536 architecture (LayerStacks=9) で学習する版 ([§4.4](../tutorial/4-train.md) と [SFNN-1536](sfnn-1536.md))。
 
 ## アーキテクチャ
 
@@ -75,7 +75,7 @@ K-A2 は表現力的に K-P と HalfKA_hm2 の中間: 駒特徴量側にも両�
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_KA2 \
+    --arch NNUE_ka2_256x2_32_32 \
     --teacher teachers/ \
     --output checkpoints/my-ka2
 ```
@@ -84,7 +84,6 @@ hidden を厚くする (256x2 FT、64 次元 hidden):
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_KA2 \
     --arch NNUE_ka2_256x2_64_64 \
     --teacher teachers/
 ```
@@ -93,12 +92,11 @@ SFNN-1536 architecture を KA2 入力で:
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type SFNN_KA2 \
     --arch SFNN_ka2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--eval-type` (および入力次元) だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` (および入力次元) だけが違う。
 
 ### 保存レイアウト
 
@@ -148,9 +146,8 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--eval-type` | `NNUE_KA2` (4 層) または `SFNN_KA2` (LayerStacks-1536) | (必須) |
-| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` (`L1` は 32 の倍数) | `NNUE_ka2_256x2_32_32` |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN]_k3k3` | (required; target is inferred) |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
-| `--output` | チェックポイント親ディレクトリ | `checkpoints/<eval-type>-<arch>` (例: `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
+| `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 
 全フラグ一覧は [HalfKP 学習](halfkp.md) を参照 (NNUE family 全体で同じ)。

@@ -41,7 +41,7 @@
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher teachers/ \
     --superbatches 40
 ```
@@ -99,7 +99,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
     --lr 0.000875 \
     --lr-schedule step \
     --lr-step-gamma 0.992 \
@@ -114,7 +114,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
     --positions-per-superbatch 40000000 \
     --superbatches 15 \
     --max-epochs 3 \
@@ -162,7 +162,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
     --lr-plateau-factor 0.5 \
@@ -179,14 +179,14 @@ factor を緩めたい場合は `--lr-plateau-factor 0.7` のようにする。`
 # geometric decay
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
+    --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --superbatches 4 --tag 5G-geometric \
     --lr-schedule geometric --lr-min 0.00001
 
 # cosine (epoch ごとに 1 cycle)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
+    --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --tag 5G-cos --superbatches 4 \
     --lr-schedule cos --lr-min 0.00001
 ```
@@ -285,7 +285,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
     --nnue-pytorch-wrm-loss
 ```
@@ -297,7 +297,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger \
     --optimizer ranger
 ```
@@ -307,7 +307,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-decay0 \
     --optimizer ranger \
     --optimizer-weight-decay 0.0 \
@@ -325,7 +325,7 @@ BulletOu の標準設定は、tatara の SFNN-1536 reference run に寄せて `-
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-decay001 \
     --optimizer-weight-decay 0.01
 ```
@@ -339,7 +339,7 @@ BulletOu の optimizer epsilon は省略時に選択中 optimizer の既定値�
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-eps1e-7 \
     --optimizer-epsilon 0.0000001
 ```
@@ -355,7 +355,7 @@ optimizer の momentum 条件だけを動かして切り分けたい場合は、
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-optimizer-beta-test \
     --optimizer-beta1 0.85 \
     --optimizer-beta2 0.995
@@ -366,7 +366,7 @@ optimizer の momentum 条件だけを動かして切り分けたい場合は、
 ```bash
 # elmo 式の 50:50 ブレンドで KPPT 学習
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher teachers/ \
     --lambda 0.5
 ```

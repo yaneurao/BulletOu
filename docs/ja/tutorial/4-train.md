@@ -20,15 +20,15 @@ Windows の場合、生成されるバイナリは `.\target\release\examples\bu
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher teachers/
 ```
 
-これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる (`--eval-type` と `--arch` の値から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
+これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる (`--arch` から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
 
 ## 4.3 `--arch` を指定する
 
-NNUE / SFNN 系 eval-type では `--arch` に **やねうら王の Makefile edition 名から `YANEURAOU_ENGINE_` を取り除いた名前**を指定する。たとえば HalfKP の 256x2-32-32 なら `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 なら `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。古い短縮形 `256x2-32-32` は受け付けない。
+学習対象は `--arch` だけで指定する。KPPT 系なら `KPPT` / `KPP_KKPT`、NNUE / SFNN 系なら **やねうら王の Makefile edition 名から `YANEURAOU_ENGINE_` を取り除いた名前**を指定する。たとえば HalfKP の 256x2-32-32 なら `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 なら `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。古い短縮形 `256x2-32-32` は受け付けない。
 
 NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。よく使われるサイズは以下:
 
@@ -42,26 +42,24 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3(king3-by-king3) LayerStacks の SFNN-1536 |
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
-| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN (`--eval-type SFNN_KA2`) |
+| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN |
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
     --arch NNUE_halfkp_1024x2_8_64 \
     --teacher teachers/
 ```
 
-`--arch` を省略すると eval-type ごとのデフォルトが適用される。たとえば `NNUE_HALFKP` は `NNUE_halfkp_256x2_32_32`、`NNUE_KP` は `NNUE_kp_256x2_32_32`。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
+`--arch` は学習対象と architecture の唯一の指定なので、通常の学習では必須。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
 
-grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。たとえば `SFNN_ka2_8192_7_15_g8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=15`, `L1 を 8 group に分割` という意味。KA2 版は必ず `--eval-type SFNN_KA2`、HalfKA2 版は `--eval-type SFNN_HALFKA2` と組み合わせる。
+grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。たとえば `SFNN_ka2_8192_7_15_g8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=15`, `L1 を 8 group に分割` という意味。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 
-やねうら王の **`YANEURAOU_ENGINE_SFNN1536` ビルド** に load させる評価関数を学習したい場合は、専用の `--eval-type` を使う:
+やねうら王の **`YANEURAOU_ENGINE_SFNN1536` ビルド** に load させる評価関数を学習したい場合は、対応する architecture 名を指定する:
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type SFNN_HALFKA2HM \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
@@ -70,15 +68,15 @@ grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。�
 
 ## 4.5 KPPT を学習する
 
-KPPT 系では `--arch` 不要 (architecture は固定):
+KPPT 系では固定 target 名を `--arch` に指定する:
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher teachers/
 ```
 
-デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--eval-type KPP_KKPT` に変えるだけ。
+デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--arch KPP_KKPT` に変えるだけ。
 
 ## 4.6 教師データの渡し方
 

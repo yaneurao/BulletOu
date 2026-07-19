@@ -17,13 +17,13 @@ Continued training works with the same auto-resume mechanism as §5: **same `--t
 ```powershell
 # Round 1: train 3 epochs
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # Round 2: 3 more epochs
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 ```
@@ -61,8 +61,7 @@ Total effective epochs trained: 3 + 3 = 6.
 
 | Flag | Why |
 |---|---|
-| `--eval-type` | Changes the NN topology → state.bin tensor shapes mismatch. |
-| `--arch` | Same reason (FT / L1 / L2 dims differ). |
+| `--arch` | Changes the target family or NN topology (feature set / FT / L1 / L2 dims) → state.bin tensor shapes mismatch. |
 | `--arch` LayerStack suffix (SFNN family) | Number of LayerStacks affects the final layer dim. |
 | `--tag` | Changing this lands you in a different output dir = fresh training. (Useful only when starting a new experiment.) |
 
@@ -73,7 +72,7 @@ To change any of these, pass a different `--tag` and run as a separate experimen
 ```powershell
 # Continue with 3 more epochs at the larger batch size
 .\bulletou.exe --teacher c:\shogi\teacher\... `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag round1 --max-epochs 3 --superbatches 6 `
     --batch-size 32768 `
     --lr-schedule step --lr-min 0.00001
@@ -102,14 +101,14 @@ A common workflow: distill on a large weaker corpus, then fine-tune on a small s
 ```powershell
 # Distill on bulk teacher for 3 epochs
 .\bulletou.exe --teacher c:\shogi\teacher\bulk\ `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
 # Fine-tune on strong teacher with a smaller LR
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 `
+    --arch NNUE_kp_256x2_32_32 `
     --tag distill `
     --max-epochs 2 --superbatches 4 `
     --lr 0.0001 --lr-min 0.000001 `

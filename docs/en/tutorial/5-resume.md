@@ -19,7 +19,7 @@ How it works:
 - New saves continue numbering from one past the existing maximum (`0004/` here).
 - The cumulative `summary-learn.log` keeps appending CSV rows for the resumed run. The superbatch counter resets to 1, but the `positions` column continues from the previous run's max (read off the existing `summary-learn.log` at startup). For `step` / `geometric` / `cos`, the LR cycle restarts from `--lr` at epoch boundaries.
 
-This behaviour is identical for every eval-type (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 — all share the same mechanism). To start fresh, point `--output` at a different directory or delete the existing one.
+This behaviour is identical for every target family (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 — all share the same mechanism). To start fresh, point `--output` at a different directory or delete the existing one.
 
 ---
 

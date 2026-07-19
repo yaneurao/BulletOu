@@ -6,24 +6,26 @@
 
 この章は [1. クイックスタート](1-quickstart.md) を完了している前提 — ツールチェーンが動き、smoke test の学習が成功した状態。
 
-本チュートリアルでは **NNUE HalfKP を例に** 解説するが、`--eval-type` を切り替えるだけで他のターゲット (NNUE K-P / NNUE HalfKPE9 / KPPT / KPP_KKPT) も同じコマンド形式で学習できる。
+本チュートリアルでは **NNUE HalfKP を例に** 解説するが、`--arch` を切り替えるだけで他のターゲット (NNUE K-P / NNUE HalfKPE9 / KPPT / KPP_KKPT) も同じコマンド形式で学習できる。
 
 ## 3.1 学習対象を選ぶ
 
-`bulletou --eval-type <X>` で学習する評価関数を選ぶ。現在公開されている `<X>`:
+`bulletou --arch <X>` で学習する評価関数を選ぶ。KPPT 系は `KPPT` / `KPP_KKPT`、NNUE / SFNN 系は `YANEURAOU_ENGINE_` prefix を取り除いた architecture 名を指定する。代表的な `<X>`:
 
-| `--eval-type` | 何を学習するか | 出力ファイル (per save) | `--arch` を使うか |
-|---|---|---|---|
-| **`NNUE_HALFKP`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` | 使う |
-| `NNUE_KP` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` | 使う |
-| `NNUE_HALFKPE9` | HalfKP に利き数情報 (自軍/敵軍 0/1/2 の 9 通り) を多重化した拡張版。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` | 使う |
-| `NNUE_HALFKPVM` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー)。入力次元は HalfKP の約 1/2 | `nn.bin` | 使う |
-| `SFNN_HALFKA2HM` | やねうら王 `YANEURAOU_ENGINE_SFNN1536` ビルド用の LayerStacks 系。使い方は [§9 LayerStack](9-layerstack.md)、仕様詳細は [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) | `nn.bin` | 使う (`SFNN_halfkahm2_1536_15_32_k3k3`) |
-| `SFNN_HALFKA1HM` | ↑ の v1 アブレーション版 | `nn.bin` | 使う (`SFNN_halfkahm1_1536_15_32_k3k3`) |
-| `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` | 使わない |
-| `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) | 使わない |
+| `--arch` の値 | 何を学習するか | 出力ファイル (per save) |
+|---|---|---|
+| **`NNUE_halfkp_256x2_32_32`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` |
+| `NNUE_kp_256x2_32_32` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
+| `NNUE_ka2_256x2_32_32` | K+A2 入力の NNUE。詳細は [NNUE K-A2 学習](../shogi/ka2.md) | `nn.bin` |
+| `NNUE_halfkpe9_256x2_32_32` | HalfKP に利き数情報 (自軍/敵軍 0/1/2 の 9 通り) を多重化した拡張版。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー)。入力次元は HalfKP の約 1/2 | `nn.bin` |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | やねうら王 `YANEURAOU_ENGINE_SFNN1536` ビルド用の LayerStacks 系。使い方は [§9 LayerStack](9-layerstack.md)、仕様詳細は [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) | `nn.bin` |
+| `SFNN_halfkahm1_1536_15_32_k3k3` | ↑ の v1 アブレーション版 | `nn.bin` |
+| `SFNN_ka2_1536_15_32_k3k3` | 軽量な K+A2 入力の SFNN | `nn.bin` |
+| `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) |
 
-将来 `--eval-type` に追加予定: HalfKA / SFNN + ls9 (NNUEwoSQPT1536) など。
+`NNUE_halfkp_1024x2_8_64` や `SFNN_ka2_8192_7_15_g8_k3k3` のようなサイズ違いも、対応するやねうら王 architecture があれば実験用途で受け付ける。
 
 ## 3.2 学習データを用意する
 

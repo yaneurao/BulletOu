@@ -41,7 +41,7 @@ Example (100M positions × 40 superbatches = 4 billion positions total):
 
 ```bash
 ./target/release/examples/bulletou \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --teacher teachers/ \
     --superbatches 40
 ```
@@ -99,7 +99,7 @@ To force the same fixed `gamma=0.992` condition as tatara / bullet-shogi, spell 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
     --lr 0.000875 \
     --lr-schedule step \
     --lr-step-gamma 0.992 \
@@ -114,7 +114,7 @@ If instead you want BulletOu to choose `gamma` from the epoch length, leave `--l
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
     --positions-per-superbatch 40000000 \
     --superbatches 15 \
     --max-epochs 3 \
@@ -147,7 +147,7 @@ If `--max-epochs` is omitted with `plateau`, there is no fixed epoch limit. Afte
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_HALFKP \
+    --arch NNUE_halfkp_256x2_32_32 \
     --lr 0.001 --lr-min 0.00001 \
     --lr-schedule plateau \
     --lr-plateau-factor 0.5 \
@@ -169,14 +169,14 @@ Run twice on the same teacher / same architecture and overlay the `summary-learn
 # geometric decay
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
+    --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --superbatches 4 --tag 5G-geometric \
     --lr-schedule geometric --lr-min 0.00001
 
 # cosine (one cycle per epoch)
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type NNUE_KP --arch NNUE_kp_256x2_32_32 \
+    --arch NNUE_kp_256x2_32_32 \
     --max-epochs 10 --tag 5G-cos --superbatches 4 \
     --lr-schedule cos --lr-min 0.00001
 ```
@@ -275,7 +275,7 @@ Example:
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
     --nnue-pytorch-wrm-loss
 ```
@@ -287,7 +287,7 @@ Example:
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger \
     --optimizer ranger
 ```
@@ -297,7 +297,7 @@ Example:
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-decay0 \
     --optimizer ranger \
     --optimizer-weight-decay 0.0 \
@@ -315,7 +315,7 @@ BulletOu's default setting uses `--optimizer-weight-decay 0.0`, matching the tat
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-decay001 \
     --optimizer-weight-decay 0.01
 ```
@@ -329,7 +329,7 @@ If omitted, BulletOu uses the selected optimizer's own epsilon default. nodchip 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-ranger-eps1e-7 \
     --optimizer-epsilon 0.0000001
 ```
@@ -345,7 +345,7 @@ If you want to isolate only the optimizer momentum time constants, pass `--optim
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
-    --eval-type SFNN_HALFKA2 \
+    --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-optimizer-beta-test \
     --optimizer-beta1 0.85 \
     --optimizer-beta2 0.995
@@ -356,7 +356,7 @@ This is not a Ranger21 compatibility mode by itself. Compare it by itself before
 ```bash
 # elmo-style 50/50 blend on KPPT
 ./target/release/examples/bulletou \
-    --eval-type KPPT \
+    --arch KPPT \
     --teacher teachers/ \
     --lambda 0.5
 ```

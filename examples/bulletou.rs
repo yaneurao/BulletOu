@@ -1,34 +1,32 @@
 /*!
 bulletou — BulletOu trainer entry point.
 
-Dispatches to the appropriate training routine via `--eval-type`. The
-"family" eval-types train all three KPPT components (KK + KKP + KPP)
-sequentially in a single invocation and assemble the result into
-numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
+Dispatches to the appropriate training routine via `--arch`. The KPPT-family
+architecture values train all three KPPT components (KK + KKP + KPP)
+sequentially in a single invocation and assemble the result into numbered
+checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
-    bulletou --eval-type KPPT            (KPPT family, KPP int16 × 2)
-    bulletou --eval-type KPP_KKPT        (KPP_KKPT factorised, KPP int16)
+    bulletou --arch KPPT                 (KPPT family, KPP int16 × 2)
+    bulletou --arch KPP_KKPT             (KPP_KKPT factorised, KPP int16)
 
-For NNUE eval types, the architecture is selected with `--arch`. Each
-save produces a YaneuraOu / Stockfish nnue-pytorch-compatible `nn.bin`:
+For NNUE / SFNN targets, `--arch` is the YaneuraOu Makefile architecture name
+with the `YANEURAOU_ENGINE_` prefix removed. Each save produces a YaneuraOu /
+Stockfish nnue-pytorch-compatible `nn.bin`:
 
-    bulletou --eval-type NNUE_HALFKP                                        classic HalfKP NNUE
-    bulletou --eval-type NNUE_HALFKP --arch NNUE_halfkp_1024x2_8_64         larger HalfKP NNUE
-    bulletou --eval-type NNUE_KP                                            K+P NNUE
-    bulletou --eval-type NNUE_KA2 --arch NNUE_ka2_256x2_64_64               K+A2 NNUE
-    bulletou --eval-type NNUE_HALFKPE9                  HalfKP with per-square effect-count buckets
-    bulletou --eval-type NNUE_HALFKPVM                  HalfKP with file-mirror (~half input dims of HalfKP)
-    bulletou --eval-type SFNN_HALFKA2HM --arch SFNN_halfkahm2_1536_15_32_k3k3
-    bulletou --eval-type SFNN_HALFKA2   --arch SFNN_halfka2_1024_7_64_k3k3
-    bulletou --eval-type SFNN_KA2       --arch SFNN_ka2_4096_15_64_g16_k3k3
-
-`--arch` uses the YaneuraOu Makefile architecture name with the
-`YANEURAOU_ENGINE_` prefix removed.
+    bulletou --arch NNUE_halfkp_256x2_32_32                  classic HalfKP NNUE
+    bulletou --arch NNUE_halfkp_1024x2_8_64                  larger HalfKP NNUE
+    bulletou --arch NNUE_kp_256x2_32_32                      K+P NNUE
+    bulletou --arch NNUE_ka2_256x2_64_64                     K+A2 NNUE
+    bulletou --arch NNUE_halfkpe9_256x2_32_32                HalfKP with per-square effect-count buckets
+    bulletou --arch NNUE_halfkpvm_256x2_32_32                HalfKP with file-mirror (~half input dims of HalfKP)
+    bulletou --arch SFNN_halfkahm2_1536_15_32_k3k3
+    bulletou --arch SFNN_halfka2_1024_7_64_k3k3
+    bulletou --arch SFNN_ka2_4096_15_64_g16_k3k3
 
 (YaneuraOu's KPPT engine requires all three of `KK_synthesized.bin` /
 `KKP_synthesized.bin` / `KPP_synthesized.bin` to load an eval, so the
-single-component trainers are internal helpers driven by `KPPT` /
-`KPP_KKPT` rather than CLI options.)
+single-component trainers are internal helpers driven by `--arch KPPT` /
+`--arch KPP_KKPT` rather than CLI options.)
 
 Teacher data is given via `--teacher`. The argument is either a single
 file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
@@ -43,7 +41,7 @@ Usage:
 
     # Then run
     ./target/release/examples/bulletou \
-        --eval-type KPPT \
+        --arch KPPT \
         --teacher /data/shogi/train_set/ \
         --output checkpoints/my-kppt \
         --superbatches 20
@@ -323,46 +321,6 @@ impl NnueArch {
         }
     }
 
-    fn default_for_eval_type(eval_type: EvalType) -> Self {
-        match eval_type {
-            EvalType::NnueHalfkp => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkp, 256, 32, 32, None),
-            EvalType::NnueKp => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Kp, 256, 32, 32, None),
-            EvalType::NnueKa2 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Ka2, 256, 32, 32, None),
-            EvalType::NnueHalfkpe9 => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpe9, 256, 32, 32, None),
-            EvalType::NnueHalfkpvm => Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkpvm, 256, 32, 32, None),
-            EvalType::SfnnHalfka1hm => Self::new(
-                NnueArchFamily::Sfnn,
-                NnueArchFeature::Halfkahm1,
-                1536,
-                15,
-                32,
-                Some(LayerStackMode::Kingrank3by3),
-            ),
-            EvalType::SfnnHalfka2hm => Self::new(
-                NnueArchFamily::Sfnn,
-                NnueArchFeature::Halfkahm2,
-                1536,
-                15,
-                32,
-                Some(LayerStackMode::Kingrank3by3),
-            ),
-            EvalType::SfnnHalfka2 => Self::new(
-                NnueArchFamily::Sfnn,
-                NnueArchFeature::Halfka2,
-                1536,
-                15,
-                32,
-                Some(LayerStackMode::Kingrank3by3),
-            ),
-            EvalType::SfnnKa2 => {
-                Self::new(NnueArchFamily::Sfnn, NnueArchFeature::Ka2, 1536, 15, 32, Some(LayerStackMode::Kingrank3by3))
-            }
-            EvalType::Kppt | EvalType::KppKkpt => {
-                Self::new(NnueArchFamily::Nnue, NnueArchFeature::Halfkp, 256, 32, 32, None)
-            }
-        }
-    }
-
     fn expected_eval_type(self) -> EvalType {
         match (self.family, self.feature) {
             (NnueArchFamily::Nnue, NnueArchFeature::Halfkp) => EvalType::NnueHalfkp,
@@ -582,26 +540,55 @@ impl std::str::FromStr for NnueArch {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "SCREAMING_SNAKE_CASE")]
-enum NerfEvalType {
-    /// Generic SFNN layout. The concrete input feature does not affect
-    /// nerf offsets because this command leaves the FeatureTransformer intact.
-    Sfnn,
-    /// SFNN with HalfKA_hm1 input.
-    SfnnHalfka1hm,
-    /// SFNN with HalfKA_hm2 input.
-    SfnnHalfka2hm,
-    /// SFNN with HalfKA2 input, used by dynamic YaneuraOu
-    /// `SFNN_halfka2_*` builds.
-    SfnnHalfka2,
-    /// SFNN with K+A2 input.
-    SfnnKa2,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrainArch {
+    Kppt,
+    KppKkpt,
+    Nnue(NnueArch),
 }
 
-impl Default for NerfEvalType {
-    fn default() -> Self {
-        NerfEvalType::Sfnn
+impl TrainArch {
+    fn eval_type(self) -> EvalType {
+        match self {
+            Self::Kppt => EvalType::Kppt,
+            Self::KppKkpt => EvalType::KppKkpt,
+            Self::Nnue(arch) => arch.expected_eval_type(),
+        }
+    }
+
+    fn nnue_arch(self) -> Option<NnueArch> {
+        match self {
+            Self::Kppt | Self::KppKkpt => None,
+            Self::Nnue(arch) => Some(arch),
+        }
+    }
+
+    fn cli_name(self) -> String {
+        match self {
+            Self::Kppt => "KPPT".to_string(),
+            Self::KppKkpt => "KPP_KKPT".to_string(),
+            Self::Nnue(arch) => arch.cli_name(),
+        }
+    }
+}
+
+impl std::fmt::Display for TrainArch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.cli_name())
+    }
+}
+
+impl std::str::FromStr for TrainArch {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("KPPT") {
+            return Ok(Self::Kppt);
+        }
+        if s.eq_ignore_ascii_case("KPP_KKPT") || s.eq_ignore_ascii_case("KPP-KKPT") {
+            return Ok(Self::KppKkpt);
+        }
+        NnueArch::from_str(s).map(Self::Nnue)
     }
 }
 
@@ -677,11 +664,6 @@ struct NerfArgs {
     #[arg(long)]
     output: PathBuf,
 
-    /// Evaluation file layout. Currently only SFNN-style layouts are
-    /// supported; standard NNUE layouts can be added later.
-    #[arg(long, value_enum, default_value = "SFNN")]
-    eval_type: NerfEvalType,
-
     /// Network architecture in YaneuraOu Makefile form with the
     /// `YANEURAOU_ENGINE_` prefix removed, e.g.
     /// `SFNN_halfka2_1024_7_64_k3k3`.
@@ -736,9 +718,10 @@ impl EvalType {
         }
     }
 
-    /// Does this eval type actually consume `--arch`? KPPT family eval
-    /// types have a fixed architecture and ignore `--arch`; NNUE / SFNN
-    /// eval types use it.
+    /// Does this internal target have a separate NNUE/SFNN architecture
+    /// segment? KPPT-family targets are selected directly as `--arch KPPT`
+    /// / `--arch KPP_KKPT`; NNUE / SFNN targets are inferred from a full
+    /// YaneuraOu architecture string.
     fn uses_arch(self) -> bool {
         match self {
             EvalType::Kppt | EvalType::KppKkpt => false,
@@ -765,10 +748,9 @@ impl EvalType {
         matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2)
     }
 
-    /// The eval-type's CLI value as the user typed it (e.g. `NNUE_HALFKP`).
-    /// Used to derive the default `--output` directory name. Must stay in
-    /// sync with the `#[clap(rename_all = "SCREAMING_SNAKE_CASE")]`
-    /// attribute on [`EvalType`].
+    /// Stable internal target name used in output directories, logs, and
+    /// resume signatures. This is inferred from `--arch`; it is no longer a
+    /// public `--eval-type` CLI value.
     fn cli_name(self) -> &'static str {
         match self {
             EvalType::Kppt => "KPPT",
@@ -1626,11 +1608,6 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
     after_help = "Subcommands:\n  nerf    Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n\nRun `bulletou nerf --help` for nerf-specific options."
 )]
 struct Args {
-    /// Evaluation function type to train. Required for training; not
-    /// needed (and ignored) when `--count-teacher` is used.
-    #[arg(long, value_enum, required_unless_present = "count_teacher")]
-    eval_type: Option<EvalType>,
-
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
     /// this option remains for explicit scripts and currently accepts only `cuda-cpp`.
     #[arg(long, value_enum, default_value = "cuda-cpp")]
@@ -1698,7 +1675,7 @@ struct Args {
     #[arg(long)]
     count_teacher: bool,
 
-    /// Checkpoint output directory. Defaults to a per-eval-type path.
+    /// Checkpoint output directory. Defaults to an auto-derived per-target path.
     #[arg(long)]
     output: Option<PathBuf>,
 
@@ -1706,14 +1683,15 @@ struct Args {
     /// for running multiple experiments with the same network /
     /// architecture but different hyperparameters: each run lands in
     /// its own directory like
-    /// `checkpoints/<eval-type>-<arch>[-<tag>]`.
+    /// `checkpoints/<target>-<arch>[-<tag>]` for NNUE/SFNN or
+    /// `checkpoints/<target>[-<tag>]` for KPPT-family targets.
     /// Ignored when `--output` is set explicitly (the user-provided
     /// path wins).
     #[arg(long)]
     tag: Option<String>,
 
     /// Net identifier (prefix of the saved checkpoint subdirectory).
-    /// Defaults to a per-eval-type name.
+    /// Defaults to a per-target name.
     #[arg(long)]
     net_id: Option<String>,
 
@@ -1953,13 +1931,13 @@ struct Args {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
-    /// Network architecture for NNUE / SFNN eval types. Use the YaneuraOu
-    /// Makefile architecture name after removing `YANEURAOU_ENGINE_`, e.g.
-    /// `NNUE_halfkp_256x2_32_32` or `SFNN_halfka2_1024_7_64_k3k3`.
-    /// If omitted, a per-eval-type default is used. Ignored for KPPT /
-    /// KPP_KKPT eval types.
+    /// Training target architecture. Use `KPPT` / `KPP_KKPT` for
+    /// KPPT-family targets, or the YaneuraOu Makefile architecture name after
+    /// removing `YANEURAOU_ENGINE_`, e.g. `NNUE_halfkp_256x2_32_32` or
+    /// `SFNN_halfka2_1024_7_64_k3k3`. Required for training unless using
+    /// `--count-teacher` or `--cuda-cpp-smoke`.
     #[arg(long)]
-    arch: Option<NnueArch>,
+    arch: Option<TrainArch>,
 
     /// Scale multiplier for nnue-pytorch-compatible initialisation used by
     /// SFNN / LayerStack networks. The actual bound is
@@ -2021,13 +1999,11 @@ impl Args {
     /// Resolve the checkpoint output directory.
     ///
     /// - `--output PATH` honours the user's choice as-is.
-    /// - Otherwise the default is `checkpoints/<eval-type>-<arch>` for eval
-    ///   types that consume `--arch` (the NNUE family), and
-    ///   `checkpoints/<eval-type>` for the KPPT family (which doesn't).
+    /// - Otherwise the default is `checkpoints/<target>-<arch>` for NNUE/SFNN
+    ///   targets, and `checkpoints/<target>` for the KPPT family.
     ///
-    /// `<eval-type>` and `<arch>` are the canonical CLI values the user
-    /// would type (e.g. `NNUE_HALFKP`, `NNUE_halfkp_256x2_32_32`) so the
-    /// dir name stays in sync with the flags.
+    /// `<target>` is the internal target inferred from `--arch`, so directory
+    /// names stay compatible with previous BulletOu checkpoints.
     fn output_dir(&self) -> PathBuf {
         if let Some(p) = &self.output {
             // Explicit --output wins; --tag is ignored to keep the
@@ -2058,8 +2034,20 @@ impl Args {
         self.eval_type().kpp_format()
     }
 
+    fn train_arch(&self) -> Option<TrainArch> {
+        self.arch
+    }
+
+    fn resolved_eval_type(&self) -> Option<EvalType> {
+        self.train_arch().map(TrainArch::eval_type)
+    }
+
     fn arch(&self) -> NnueArch {
-        self.arch.unwrap_or_else(|| NnueArch::default_for_eval_type(self.eval_type()))
+        if let Some(arch) = self.train_arch().and_then(TrainArch::nnue_arch) {
+            arch
+        } else {
+            panic!("NNUE/SFNN architecture required (validation should have reported this)")
+        }
     }
 
     fn effective_layerstack(&self) -> Option<LayerStackMode> {
@@ -2070,12 +2058,22 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
-        let eval_type = self.eval_type();
+        if self.count_teacher || self.cuda_cpp_smoke {
+            return Ok(());
+        }
+
+        let Some(eval_type) = self.resolved_eval_type() else {
+            return Err(
+                "missing training target: pass --arch KPPT, --arch KPP_KKPT, or a NNUE/SFNN architecture such as \
+                 --arch SFNN_ka2_8192_7_15_g8_k3k3"
+                    .to_string(),
+            );
+        };
 
         if !eval_type.uses_arch() {
-            if self.arch.is_some() {
+            if self.train_arch().and_then(TrainArch::nnue_arch).is_some() {
                 return Err(format!(
-                    "--arch is only valid with NNUE / SFNN eval types; --eval-type {} has a fixed KPPT layout",
+                    "--arch is only valid with NNUE / SFNN targets or KPPT-family target names; target {} has a fixed KPPT layout",
                     eval_type.cli_name()
                 ));
             }
@@ -2086,7 +2084,7 @@ impl Args {
         let expected = arch.expected_eval_type();
         if expected != eval_type {
             return Err(format!(
-                "--arch {} implies --eval-type {}, but --eval-type {} was selected",
+                "--arch {} implies target {}, but target {} was selected",
                 arch.cli_name(),
                 expected.cli_name(),
                 eval_type.cli_name()
@@ -2102,6 +2100,7 @@ impl Args {
     }
 
     fn validate_backend_flags(&self) -> Result<(), String> {
+        self.validate_arch_flags()?;
         self.validate_cuda_cpp_backend_options()
     }
 
@@ -2240,11 +2239,9 @@ impl Args {
         Ok(())
     }
 
-    /// Unwrap `eval_type`. clap's `required_unless_present = "count_teacher"`
-    /// guarantees it's `Some` whenever training (= non-count_teacher) is
-    /// taking place; if it isn't, there is a clap-side bug, not user error.
+    /// Resolve the internal training target from `--arch`.
     fn eval_type(&self) -> EvalType {
-        self.eval_type.expect("--eval-type required (clap should have validated)")
+        self.resolved_eval_type().expect("training target required: pass --arch (validation should have reported this)")
     }
 }
 
@@ -2621,7 +2618,6 @@ fn main() {
                 println!("nerf complete:");
                 println!("  input              = {}", args.input.display());
                 println!("  output             = {}", args.output.display());
-                println!("  eval_type          = {:?}", args.eval_type);
                 println!("  arch               = {}", args.arch);
                 println!("  layerstack         = {}", args.effective_layerstack().cli_name());
                 println!("  layers             = {}", args.layers);
@@ -2657,6 +2653,10 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     });
+    if let Err(e) = args.validate_arch_flags() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
         eprintln!("error: --optimizer-weight-decay must be finite and >= 0.");
         std::process::exit(2);
@@ -2784,10 +2784,6 @@ fn main() {
             eprintln!("error: --lr-schedule plateau is currently supported for NNUE/SFNN eval types only.");
             std::process::exit(2);
         }
-    }
-    if let Err(e) = args.validate_arch_flags() {
-        eprintln!("error: {e}");
-        std::process::exit(2);
     }
     if let Err(e) = args.validate_backend_flags() {
         eprintln!("error: {e}");
@@ -10388,20 +10384,26 @@ mod tests {
         use clap::Parser as _;
 
         // Baseline (no --tag, no --output): default name only.
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null"]).unwrap();
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_kp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
 
         // --tag appends `-<tag>` to the auto-derived name.
-        let args =
-            Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null", "--tag", "lr0.001"])
-                .unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_kp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--tag",
+            "lr0.001",
+        ])
+        .unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-lr0.001"),);
 
         // --tag with SFNN: applied after the architecture segment.
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_KA2",
             "--arch",
             "SFNN_ka2_1536_15_32_k3k3",
             "--teacher",
@@ -10415,8 +10417,8 @@ mod tests {
         // Explicit --output wins; --tag is ignored.
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_KP",
+            "--arch",
+            "NNUE_kp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--output",
@@ -10428,9 +10430,54 @@ mod tests {
         assert_eq!(args.output_dir(), std::path::PathBuf::from("/custom/path"));
 
         // Empty --tag is treated as no tag (no trailing dash).
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_KP", "--teacher", "/dev/null", "--tag", ""])
-            .unwrap();
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_kp_256x2_32_32", "--teacher", "/dev/null", "--tag", ""])
+                .unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/NNUE_KP-NNUE_kp_256x2_32_32"),);
+    }
+
+    #[test]
+    fn arch_alone_selects_training_target() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from(["bulletou", "--arch", "SFNN_ka2_8192_7_15_g8_k3k3", "--teacher", "/dev/null"])
+            .unwrap();
+        args.validate_arch_flags().unwrap();
+        assert_eq!(args.eval_type(), EvalType::SfnnKa2);
+        assert_eq!(args.arch().cli_name(), "SFNN_ka2_8192_7_15_g8_k3k3");
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_8192_7_15_g8_k3k3"));
+
+        let kppt = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
+        kppt.validate_arch_flags().unwrap();
+        assert_eq!(kppt.eval_type(), EvalType::Kppt);
+        assert_eq!(kppt.output_dir(), std::path::PathBuf::from("checkpoints/KPPT"));
+    }
+
+    #[test]
+    fn arch_is_required_for_new_training_commands() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null"]).unwrap();
+        let err = args.validate_arch_flags().unwrap_err();
+        assert!(err.contains("missing training target"));
+        assert!(err.contains("--arch"));
+    }
+
+    #[test]
+    fn eval_type_cli_option_is_removed() {
+        use clap::Parser as _;
+
+        let err = Args::try_parse_from([
+            "bulletou",
+            "--eval-type",
+            "SFNN_KA2",
+            "--arch",
+            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected argument"));
     }
 
     #[test]
@@ -10439,8 +10486,8 @@ mod tests {
 
         let with_superbatches = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--tag",
@@ -10455,8 +10502,8 @@ mod tests {
         .unwrap();
         let without_superbatches = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--tag",
@@ -10485,8 +10532,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--batch-size",
@@ -10501,12 +10548,15 @@ mod tests {
     }
 
     #[test]
-    fn omitted_batch_size_uses_tatara_sized_default_for_all_eval_types() {
+    fn omitted_batch_size_uses_tatara_sized_default_for_all_targets() {
         use clap::Parser as _;
 
-        let nnue = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
-        let sfnn = Args::try_parse_from(["bulletou", "--eval-type", "SFNN_HALFKA2", "--teacher", "/dev/null"]).unwrap();
-        let kppt = Args::try_parse_from(["bulletou", "--eval-type", "KPPT", "--teacher", "/dev/null"]).unwrap();
+        let nnue =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
+        let sfnn =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1536_15_32_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        let kppt = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(effective_batch_size(&nnue), DEFAULT_BATCH_SIZE);
         assert_eq!(effective_batch_size(&sfnn), DEFAULT_BATCH_SIZE);
@@ -10517,7 +10567,8 @@ mod tests {
     fn backend_defaults_to_cuda_cpp_path() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.backend, BackendKind::CudaCpp);
         let result = args.validate_backend_flags();
@@ -10534,8 +10585,8 @@ mod tests {
 
         let err = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10552,8 +10603,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10578,8 +10629,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10601,8 +10652,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10626,8 +10677,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_KP",
+            "--arch",
+            "NNUE_kp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10649,15 +10700,9 @@ mod tests {
     fn cuda_cpp_backend_accepts_remaining_nnue_direct_steps() {
         use clap::Parser as _;
 
-        for (eval_type, arch) in [
-            ("NNUE_KA2", "NNUE_ka2_32x2_1_1"),
-            ("NNUE_HALFKPE9", "NNUE_halfkpe9_32x2_1_1"),
-            ("NNUE_HALFKPVM", "NNUE_halfkpvm_32x2_1_1"),
-        ] {
+        for arch in ["NNUE_ka2_32x2_1_1", "NNUE_halfkpe9_32x2_1_1", "NNUE_halfkpvm_32x2_1_1"] {
             let args = Args::try_parse_from([
                 "bulletou",
-                "--eval-type",
-                eval_type,
                 "--arch",
                 arch,
                 "--teacher",
@@ -10671,7 +10716,7 @@ mod tests {
 
             let result = args.validate_backend_flags();
             if cfg!(feature = "cuda-cpp-backend") {
-                assert!(result.is_ok(), "{eval_type} should be accepted by cuda-cpp");
+                assert!(result.is_ok(), "{arch} should be accepted by cuda-cpp");
             } else {
                 assert!(result.unwrap_err().contains("cuda-cpp-backend"));
             }
@@ -10684,7 +10729,7 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
+            "--arch",
             "KPPT",
             "--teacher",
             "/dev/null",
@@ -10709,7 +10754,7 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
+            "--arch",
             "KPP_KKPT",
             "--teacher",
             "/dev/null",
@@ -10740,7 +10785,7 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
+            "--arch",
             "KPPT",
             "--teacher",
             "/dev/null",
@@ -10767,7 +10812,7 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
+            "--arch",
             "KPPT",
             "--teacher",
             "/dev/null",
@@ -10790,8 +10835,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10825,8 +10870,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10862,8 +10907,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10887,7 +10932,7 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
+            "--arch",
             "KPPT",
             "--teacher",
             "/dev/null",
@@ -10916,8 +10961,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10945,8 +10990,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -10980,8 +11025,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11009,8 +11054,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11038,8 +11083,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11065,8 +11110,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11180,8 +11225,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11225,8 +11270,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11274,8 +11319,8 @@ mod tests {
         let output = tmp.to_str().unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "teacher.hcpe",
             "--backend",
@@ -11342,8 +11387,8 @@ mod tests {
         let output = tmp.to_str().unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "teacher.hcpe",
             "--backend",
@@ -11410,8 +11455,8 @@ mod tests {
         let output = tmp.to_str().unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "teacher.hcpe",
             "--backend",
@@ -11465,8 +11510,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11487,18 +11530,38 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_accepts_arch_only_sfnn_direct_steps() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        assert_eq!(args.eval_type(), EvalType::SfnnKa2);
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
     fn cuda_cpp_backend_accepts_remaining_sfnn_direct_steps() {
         use clap::Parser as _;
 
-        for (eval_type, arch) in [
-            ("SFNN_HALFKA1HM", "SFNN_halfkahm1_32_1_2_k3k3"),
-            ("SFNN_HALFKA2HM", "SFNN_halfkahm2_32_1_2_k3k3"),
-            ("SFNN_KA2", "SFNN_ka2_32_1_2_k3k3"),
-        ] {
+        for arch in ["SFNN_halfkahm1_32_1_2_k3k3", "SFNN_halfkahm2_32_1_2_k3k3", "SFNN_ka2_32_1_2_k3k3"] {
             let args = Args::try_parse_from([
                 "bulletou",
-                "--eval-type",
-                eval_type,
                 "--arch",
                 arch,
                 "--teacher",
@@ -11512,7 +11575,7 @@ mod tests {
 
             let result = args.validate_backend_flags();
             if cfg!(feature = "cuda-cpp-backend") {
-                assert!(result.is_ok(), "{eval_type} should be accepted by cuda-cpp");
+                assert!(result.is_ok(), "{arch} should be accepted by cuda-cpp");
             } else {
                 assert!(result.unwrap_err().contains("cuda-cpp-backend"));
             }
@@ -11525,8 +11588,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11559,8 +11620,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11599,8 +11658,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11652,8 +11709,8 @@ mod tests {
 
         let same_teacher = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "old.hcpe",
             "--backend",
@@ -11672,8 +11729,8 @@ mod tests {
 
         let changed_teacher = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "new.hcpe",
             "--backend",
@@ -11722,8 +11779,8 @@ mod tests {
         let teacher_arg = teacher.to_str().unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             teacher_arg,
             "--backend",
@@ -11751,8 +11808,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11777,8 +11834,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11805,8 +11862,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11832,8 +11889,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
+            "--arch",
+            "SFNN_halfka2_1536_15_32_k3k3",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11858,8 +11915,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11887,8 +11942,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11915,8 +11970,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -11942,8 +11997,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -11972,8 +12025,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -12001,8 +12052,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12043,8 +12094,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12068,8 +12119,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12096,8 +12147,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12123,8 +12174,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12150,8 +12201,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12177,8 +12228,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_KP",
+            "--arch",
+            "NNUE_kp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12202,8 +12253,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -12247,8 +12296,6 @@ mod tests {
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
-                "--eval-type",
-                "SFNN_HALFKA2",
                 "--arch",
                 arch,
                 "--teacher",
@@ -12284,8 +12331,6 @@ mod tests {
 
         let err = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_4096_7_64_g4_k3k3",
             "--teacher",
@@ -12321,8 +12366,6 @@ mod tests {
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
-                "--eval-type",
-                "SFNN_KA2",
                 "--arch",
                 arch,
                 "--teacher",
@@ -12367,8 +12410,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2HM",
             "--arch",
             "SFNN_halfkahm2_1536_15_32_k3k3",
             "--teacher",
@@ -12705,8 +12746,8 @@ mod tests {
 
         let parsed = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12722,8 +12763,8 @@ mod tests {
 
         let parsed = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--batches-per-superbatch",
@@ -12739,8 +12780,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--optimizer-weight-decay",
@@ -12777,8 +12818,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--save-rate",
@@ -12791,8 +12832,8 @@ mod tests {
 
         let changed = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--save-rate",
@@ -12808,7 +12849,8 @@ mod tests {
     fn default_optimizer_matches_bullet_shogi_ranger_defaults() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
         let ranger = ranger_params(&args, BULLETOU_DEFAULT_RANGER_CLIP);
@@ -12823,8 +12865,8 @@ mod tests {
         for optimizer in ["adamw", "radam"] {
             let err = Args::try_parse_from([
                 "bulletou",
-                "--eval-type",
-                "NNUE_HALFKP",
+                "--arch",
+                "NNUE_halfkp_256x2_32_32",
                 "--teacher",
                 "/dev/null",
                 "--optimizer",
@@ -12839,7 +12881,8 @@ mod tests {
     fn default_lr_and_step_schedule_match_tatara_recipe() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--eval-type", "NNUE_HALFKP", "--teacher", "/dev/null"]).unwrap();
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.lr, 0.000875);
         assert_eq!(args.lr_schedule, LrScheduleKind::Step);
@@ -12866,8 +12909,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--superbatches",
@@ -12894,8 +12937,8 @@ mod tests {
 
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--max-epoch",
@@ -12912,8 +12955,8 @@ mod tests {
 
         let parsed = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--lr-schedule",
@@ -13002,8 +13045,8 @@ mod tests {
         .unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "new-teacher.hcpe",
             "--test-teacher",
@@ -13028,8 +13071,8 @@ mod tests {
         let validation_arg = validation_path.to_string_lossy().into_owned();
         let args = Args::try_parse_from(vec![
             "bulletou".to_string(),
-            "--eval-type".to_string(),
-            "NNUE_HALFKP".to_string(),
+            "--arch".to_string(),
+            "NNUE_halfkp_256x2_32_32".to_string(),
             "--teacher".to_string(),
             "teacher.hcpe".to_string(),
             "--test-teacher".to_string(),
@@ -13052,8 +13095,8 @@ mod tests {
         ));
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "NNUE_HALFKP",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "teacher.psv",
             "--test-teacher",
@@ -13142,8 +13185,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let args = Args::try_parse_from([
             "bulletou",
-            "--eval-type",
-            "SFNN_HALFKA2",
             "--arch",
             "SFNN_halfka2_1024_7_64_k3k3",
             "--teacher",
@@ -13928,7 +13969,6 @@ mod tests {
         let args = NerfArgs {
             input: PathBuf::from("in.nn"),
             output: PathBuf::from("out.nn"),
-            eval_type: NerfEvalType::Sfnn,
             arch,
             layers: "fc2".parse().unwrap(),
             count: 50,

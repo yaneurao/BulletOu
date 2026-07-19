@@ -20,16 +20,16 @@ BulletOu does **not** play shogi itself. It is the part of the pipeline that **l
 |---|---|
 Currently `bulletou` can train these four targets:
 
-| `--eval-type` | What it is | Output |
+| Typical `--arch` value | What it is | Output |
 |---|---|---|
-| **`NNUE_HALFKP`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
-| `NNUE_KP` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
-| `NNUE_KA2` | Same 4-layer ClippedReLU network as NNUE_KP but with A2 (kings included, v2 collapse) instead of P. Both kings appear inside the piece feature too. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
-| `NNUE_HALFKPE9` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
-| `NNUE_HALFKPVM` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
-| `SFNN_HALFKA2HM` | YaneuraOu NNUEwoSQPT1536-build LayerStacks evaluation (HalfKA_hm2 input). Full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md); user-level usage in [§9 LayerStack](9-layerstack.md). | `nn.bin` |
-| `SFNN_HALFKA1HM` | Same as above but with HalfKA_hm1 (v1) for ablation. | `nn.bin` |
-| `SFNN_KA2` | Same SFNN-1536 LayerStacks topology as the others, but input is `K + A2` (1791 dims). Lightweight ablation; loss plateaus higher than HalfKA_hm2 because the input layer no longer encodes king × piece interactions. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
+| **`NNUE_halfkp_256x2_32_32`** ★ start here | Classic HalfKP NNUE — YaneuraOu's longest-standing evaluation function family. See [NNUE HalfKP Training](../shogi/halfkp.md). | `nn.bin` |
+| `NNUE_kp_256x2_32_32` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
+| `NNUE_ka2_256x2_32_32` | Same 4-layer ClippedReLU network as K-P but with A2 (kings included, v2 collapse) instead of P. Both kings appear inside the piece feature too. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
+| `NNUE_halfkpe9_256x2_32_32` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | YaneuraOu NNUEwoSQPT1536-build LayerStacks evaluation (HalfKA_hm2 input). Full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md); user-level usage in [§9 LayerStack](9-layerstack.md). | `nn.bin` |
+| `SFNN_halfkahm1_1536_15_32_k3k3` | Same as above but with HalfKA_hm1 (v1) for ablation. | `nn.bin` |
+| `SFNN_ka2_1536_15_32_k3k3` | Same SFNN-1536 LayerStacks topology as the others, but input is `K + A2` (1791 dims). Lightweight ablation; loss plateaus higher than HalfKA_hm2 because the input layer no longer encodes king × piece interactions. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
 
@@ -63,7 +63,7 @@ How the engine consumes the file depends on the engine; see its documentation.
         ▼
 [ BulletOu training ]            ← this tutorial walks you through this part
         │
-        │  ./target/release/examples/bulletou --eval-type ... --teacher ... --output ...
+        │  ./target/release/examples/bulletou --arch ... --teacher ... --output ...
         ▼
 [ Output ]                       ← consumed by the engine at play time
         nn.bin (NNUE family)
@@ -74,7 +74,7 @@ The rest of the tutorial:
 
 - [1. Quick Start](1-quickstart.md) — get the toolchain working and run a smoke-test training
 - [2. Using `bulletou_lib` from your own code](2-bullet-lib.md) — developer notes (optional)
-- [3. Prepare training data](3-data.md) — choosing the eval type, plus pre-shuffling the teacher file
+- [3. Prepare training data](3-data.md) — choosing the architecture, plus pre-shuffling the teacher file
 - [4. Run the training](4-train.md) — invoking `bulletou`
 - [5. Stop and resume](5-resume.md) — auto-resume by re-running with the same `--output`
 - [5.5 Continued training](5b-additional-training.md) — add more epochs to a finished run, swap batch_size or teacher

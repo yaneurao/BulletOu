@@ -18,16 +18,16 @@ BulletOu 自体は将棋を **指さない**。パイプラインの中の「学
 
 現状 `bulletou` で学習できるのは以下の 4 種類:
 
-| `--eval-type` | 概要 | 出力 |
+| 代表的な `--arch` の値 | 概要 | 出力 |
 |---|---|---|
-| **`NNUE_HALFKP`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` |
-| `NNUE_KP` | HalfKP と同じ 4 層 ClippedReLU だが入力を K + P に分割した軽量版。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
-| `NNUE_KA2` | NNUE_KP と同じ 4 層 ClippedReLU で、入力の P (玉以外) を A2 (玉含む全駒、v2 collapse) に置き換えた版。両玉が駒特徴量側にも現れる。詳細は [NNUE K-A2 学習](../shogi/ka2.md) | `nn.bin` |
-| `NNUE_HALFKPE9` | HalfKP に「駒のマスに対する自軍/敵軍の利き数 (0/1/2 にクリップ、9 通り)」を多重化した拡張版 (1,128,492 次元、HalfKP × 9)。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
-| `NNUE_HALFKPVM` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー、69,660 次元、HalfKP の約 1/2) | `nn.bin` |
-| `SFNN_HALFKA2HM` | やねうら王 NNUEwoSQPT1536 ビルド用の LayerStacks 系評価関数 (HalfKA_hm2 入力)。詳細は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md)、使い方は [§9 LayerStack](9-layerstack.md) | `nn.bin` |
-| `SFNN_HALFKA1HM` | ↑ の HalfKA_hm1 (v1) を使ったアブレーション用 | `nn.bin` |
-| `SFNN_KA2` | SFNN-1536 LayerStacks の topology はそのままで、入力を `K + A2` (1791 次元) に置き換えた版。軽量アブレーション用。入力層に玉×駒の相互作用が無いため HalfKA_hm2 より loss plateau が高い。詳細は [NNUE K-A2 学習](../shogi/ka2.md) | `nn.bin` |
+| **`NNUE_halfkp_256x2_32_32`** ★初心者はここから | 古典的な HalfKP NNUE。やねうら王がもっとも長く採用している評価関数形式。詳細は [NNUE HalfKP 学習](../shogi/halfkp.md) | `nn.bin` |
+| `NNUE_kp_256x2_32_32` | HalfKP と同じ 4 層 ClippedReLU だが入力を K + P に分割した軽量版。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
+| `NNUE_ka2_256x2_32_32` | K+A2 入力の NNUE。詳細は [NNUE K-A2 学習](../shogi/ka2.md) | `nn.bin` |
+| `NNUE_halfkpe9_256x2_32_32` | HalfKP に「駒のマスに対する自軍/敵軍の利き数 (0/1/2 にクリップ、9 通り)」を多重化した拡張版 (1,128,492 次元、HalfKP × 9)。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー、69,660 次元、HalfKP の約 1/2) | `nn.bin` |
+| `SFNN_halfkahm2_1536_15_32_k3k3` | やねうら王 NNUEwoSQPT1536 ビルド用の LayerStacks 系評価関数 (HalfKA_hm2 入力)。詳細は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md)、使い方は [§9 LayerStack](9-layerstack.md) | `nn.bin` |
+| `SFNN_halfkahm1_1536_15_32_k3k3` | ↑ の HalfKA_hm1 (v1) を使ったアブレーション用 | `nn.bin` |
+| `SFNN_ka2_1536_15_32_k3k3` | SFNN-1536 LayerStacks の topology はそのままで、入力を `K + A2` (1791 次元) に置き換えた版。軽量アブレーション用。 | `nn.bin` |
 | `KPPT` | 旧来の KK + KKP + KPP の 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなしでサイズ半減) | 同上 (KPP の layout だけ違う) |
 
@@ -61,7 +61,7 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
         ▼
 [ BulletOu で学習 ]              ← このチュートリアルの対象
         │
-        │  ./target/release/examples/bulletou --eval-type ... --teacher ... --output ...
+        │  ./target/release/examples/bulletou --arch ... --teacher ... --output ...
         ▼
 [ 出力ファイル ]                  ← エンジンが対局時に読み込む
         nn.bin (NNUE 系)
@@ -72,7 +72,7 @@ BulletOu は以下のいずれかのフォーマットで学習データを読�
 
 - [1. クイックスタート](1-quickstart.md) — ツールチェーンを整えて、smoke test 用の最小学習を動かす
 - [2. `bulletou_lib` を自分のコードから使う](2-bullet-lib.md) — 開発者向け補足 (任意)
-- [3. 教師データを用意する](3-data.md) — eval-type の選択と教師データの前処理 (シャッフル)
+- [3. 教師データを用意する](3-data.md) — architecture の選択と教師データの前処理 (シャッフル)
 - [4. 学習を走らせる](4-train.md) — `bulletou` コマンドの実行
 - [5. 中断・再開](5-resume.md) — `--output` と学習設定が同じなら自動 resume
 - [5.5 追加学習の仕方](5b-additional-training.md) — 完走後にさらに epoch を積む / batch_size や教師を変えて続行

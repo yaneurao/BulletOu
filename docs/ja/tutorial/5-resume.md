@@ -24,7 +24,7 @@ checkpoints/.../
 
 意図して古い checkpoint を引き継ぎたい場合だけ `--resume` を付ける。逆に、checkpoint がある出力先を誤って使っていないか確認したい場合は `--no-resume` を付けると、既存 checkpoint がある時点で停止する。
 
-この挙動は eval-type 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 すべて同じ仕組み)。新規学習にしたい場合は `--tag` / `--output` を別の dir にするか、既存 dir を削除する。
+この挙動は target family 横断 (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 すべて同じ仕組み)。新規学習にしたい場合は `--tag` / `--output` を別の dir にするか、既存 dir を削除する。
 
 ---
 

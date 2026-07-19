@@ -62,7 +62,7 @@ Bullet writes **one row every 32 batches**. With the default (`--positions-per-s
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval` | mirror of the output-dir name (`<eval-type>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | mirror of the output-dir name (`<target>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every effective `--positions-per-superbatch` positions | `1`, `2`, ... |
 | `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `1525` |
@@ -76,7 +76,7 @@ Bullet writes **one row every 32 batches**. With the default (`--positions-per-s
 | `teacher` | the `--teacher` value | `teachers/` |
 | `test_teacher` | top-level `summary-learn.log` only: the `--test-teacher` filename used for validation, or `-` when unset | `test.hcpe` |
 
-NNUE eval types embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family eval types don't consume `--arch`, so the column is just `<eval-type>/<component>`.
+NNUE/SFNN targets embed `--arch` in the `eval` column (matching the output-dir name). KPPT-family targets use the fixed `KPPT` / `KPP_KKPT` names, so the column is just `<target>/<component>`.
 
 Full spec: [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md#learnlog-フォーマット).
 
@@ -169,7 +169,7 @@ Using `positions` as the time axis gives you a continuous loss curve across resu
 - [Reference: NNUE K-P Training](../shogi/kp.md) — comparison vs HalfKP, input feature structure
 - [Reference: NNUE HalfKPE9 Training](../shogi/halfkpe9.md) — HalfKP with attacker-count buckets
 - [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — legacy YaneuraOu evals
-- [Specifications: spec/](../../spec/) — eval-type matrix, binary layout, hash derivations, `learn.log` format
+- [Specifications: spec/](../../spec/) — target matrix, binary layout, hash derivations, `learn.log` format
 
 ---
 

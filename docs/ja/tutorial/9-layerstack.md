@@ -8,7 +8,7 @@
 - そこで「9 個の独立した小さな NN」を持っておき、局面ごとに 1 個だけを選んで評価値を出す
 - どのサブネットを使うかの **バケット選択ロジック** をやねうら王エンジンと bulletou で揃える必要がある (= `--arch` の suffix で指定)
 
-bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビルド向けの学習** (= `--eval-type SFNN_HALFKA1HM` / `SFNN_HALFKA2HM`) のみ。詳細仕様は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) を参照。
+bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビルド向けの学習** (= `--arch SFNN_halfkahm1_1536_15_32_k3k3` / `SFNN_halfkahm2_1536_15_32_k3k3`) のみ。詳細仕様は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) を参照。
 
 ## 9.1 LayerStack suffix の選択
 
@@ -32,17 +32,16 @@ bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビ�
 
 ## 9.2 使う場面
 
-LayerStack は **SFNN ファミリ専用** で、他の eval-type (`NNUE_HALFKP` / `NNUE_KP` / `NNUE_HALFKPE9` / `NNUE_HALFKPVM` / `KPPT` 系) は単一 NN 構造のため LayerStack 不要。
+LayerStack は **SFNN ファミリ専用** で、他の target family (`NNUE_halfkp_*` / `NNUE_kp_*` / `NNUE_halfkpe9_*` / `NNUE_halfkpvm_*` / `KPPT` 系) は単一 NN 構造のため LayerStack 不要。
 
 ```bash
 # SFNN-1536 を k3k3(king3-by-king3) = 9 バケットで学習
 ./target/release/examples/bulletou \
-    --eval-type SFNN_HALFKA2HM \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 ```
 
-`--output` を省略すると `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` に書かれる (= `--eval-type` + `--arch` を連結した命名)。
+`--output` を省略すると `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` に書かれる (= 推論された target + `--arch` を連結した命名)。
 
 学習自体のスケジューリング (`--lr` / `--superbatches` 等) は [§6 学習をチューニング](6-tune.md) と共通。結果の確認も [§7 結果を確認する](7-result.md) と同じ。
 

@@ -24,7 +24,6 @@ Example for weakening an `SFNN-HalfKA2-1024-7-64` `nn.bin`:
 cargo run -p bulletou_lib --release --example bulletou -- nerf \
   --input nn.bin \
   --output nn-nerf.bin \
-  --eval-type SFNN_HALFKA2 \
   --arch SFNN_halfka2_1024_7_64_k3k3 \
   --layers fc2,fc1 \
   --count 1000 \
@@ -37,7 +36,6 @@ cargo run -p bulletou_lib --release --example bulletou -- nerf \
 |---|---|
 | `--input` | Input `nn.bin` |
 | `--output` | Output `nn.bin`; it must differ from `--input` |
-| `--eval-type` | Evaluation-function type of the input file. Currently SFNN only |
 | `--arch` | YaneuraOu architecture name without the `YANEURAOU_ENGINE_` prefix, for example `SFNN_halfka2_1024_7_64_k3k3` |
 | `--layers` | Target layers: comma-separated `fc0` / `fc1` / `fc2` / `all` |
 | `--count` | Number of random `+1` / `-1` mutation attempts. The same weight may be selected multiple times |
