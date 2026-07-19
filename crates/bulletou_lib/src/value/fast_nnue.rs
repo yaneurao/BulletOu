@@ -10,7 +10,7 @@ use bullet_compiler::tensor::TValue;
 use bullet_gpu::runtime::Gpu;
 use bullet_trainer::model::Model;
 
-use crate::value::{fast_batch::active_feature_indices, FastBatchHost};
+use crate::value::{FastBatchHost, fast_batch::active_feature_indices};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {

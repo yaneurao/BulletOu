@@ -12,7 +12,7 @@ Main flags:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--backend` | Training backend. The default fast path is Windows-native `cuda-cpp` for the NNUE/SFNN evals it supports; pass `bullet` for the generic backend / other eval types | `cuda-cpp` |
+| `--backend` | Training backend. The default fast path is Windows-native `cuda-cpp`; all public BulletOu eval types can train through it. Pass `bullet` only when you intentionally want the legacy generic backend for debugging/comparison | `cuda-cpp` |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 to match tatara | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |

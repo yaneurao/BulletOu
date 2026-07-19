@@ -648,8 +648,16 @@ mod tests {
     fn test_loss_can_use_nnue_pytorch_wrm() {
         let m = [0.0, 0.0];
         let t = [400i16, -400];
-        let r =
-            compute_sign_accuracy_with_loss(&m, &t, &[1, -1], None, 1.0, 400.0, 1.0, ValidationLossKind::NnuePytorchWrm);
+        let r = compute_sign_accuracy_with_loss(
+            &m,
+            &t,
+            &[1, -1],
+            None,
+            1.0,
+            400.0,
+            1.0,
+            ValidationLossKind::NnuePytorchWrm,
+        );
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");
         assert!(loss.is_finite());

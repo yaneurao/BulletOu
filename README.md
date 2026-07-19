@@ -19,10 +19,13 @@ Target evaluation functions:
 - KPP_KKPT
 - NNUE_HALFKP
 - NNUE_KP
+- NNUE_KA2
 - NNUE_HALFKPE9
 - NNUE_HALFKPVM
 - SFNN_HALFKA1HM
 - SFNN_HALFKA2HM
+- SFNN_HALFKA2
+- SFNN_KA2
 
 Target LayerStacks:
 
