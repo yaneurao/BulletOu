@@ -337,13 +337,6 @@ where
                                     }
                                 });
 
-                                for j in j_stm..max_active {
-                                    stm_chunk[sparse_offset + j] = -1;
-                                }
-                                for j in j_nstm..max_active {
-                                    nstm_chunk[sparse_offset + j] = -1;
-                                }
-
                                 assert!(
                                     j_stm <= max_active && j_nstm <= max_active,
                                     "More inputs provided than the specified maximum!"
@@ -439,14 +432,6 @@ where
                                         j_nstm += 1;
                                     }
                                 });
-
-                                // STM / NSTM の未使用スロットを -1 で埋める (独立)
-                                for j in j_stm..max_active {
-                                    stm_chunk[sparse_offset + j] = -1;
-                                }
-                                for j in j_nstm..max_active {
-                                    nstm_chunk[sparse_offset + j] = -1;
-                                }
 
                                 assert!(
                                     j_stm <= max_active && j_nstm <= max_active,
