@@ -1030,6 +1030,12 @@ the tickets in order and commit each completed slice.
   - HalfKP bs65k/3-step teacher-prepare profile after the direct path printed `16.119ms`, `14.930ms`, and `14.184ms`;
   - speed-only probes reported 4M `2824693` pos/s and 16M `2828516` pos/s;
   - the yamaoka-fixed 4M validation run reported `2693410` pos/s, `test_loss=0.03538197`, `test_acc=0.6238556`.
+- Adopted direct PackedSfen-to-HalfKP sparse-index mapping:
+  - `ShogiHalfKP::map_features` and the non-factorized `fill_halfkp_feature_indices` path now decode the `PackedSfenValue` bitstream directly instead of constructing a temporary `ShogiBoard`;
+  - the old board-based mapper remains test-only, and a synthetic PackedSfen unit test covers board pieces, promoted pieces, hands, and both STM colours to assert exact sparse-index order parity;
+  - HalfKP bs65k/3-step teacher-prepare profile on `shuffled-001.hcpe` printed `14.056ms`, `15.303ms`, and `18.178ms`, so the short prepare-only profile is mostly noise-neutral;
+  - WRM/tatara-style bs65k speed-only probes (`--nnue-pytorch-wrm-loss --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024`, final-only loss readback) reported 4M repeats `2758937` and `2834683` pos/s, and a longer 16M run reported `2920370` pos/s;
+  - a yamaoka-fixed 4M validation run using only `C:\shogi\teacher\test\yamaoka-floodgate.psv` reported `2655504` pos/s, `test_loss=0.03627902`, `test_acc=0.6215057`; this short quality point is slightly worse than the preceding best and needs a longer/seed-matched check before treating the mapper change as a quality improvement.
 - Rejected experiments / cautions:
   - an entry-per-sparse-feature HalfKP L0 scatter kernel passed correctness but did not improve steady backward (`~3.10ms` remained unchanged), so it was not kept;
   - a fused HalfKP L0 CReLU+sparse-backward kernel reduced thread count on paper but regressed bs65k profiled backward from about `12.36ms` to `14.19ms`, so it was reverted;

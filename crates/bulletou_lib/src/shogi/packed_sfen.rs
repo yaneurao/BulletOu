@@ -349,7 +349,7 @@ fn huffman_index_to_piece_type(idx: usize) -> PieceType {
 ///
 /// YaneuraOu sfen_packer.cpp の read_board_piece_from_stream() に準拠。
 /// 形式: Huffman符号 + 成りbit(金以外) + 先後bit
-fn decode_board_piece(stream: &mut BitStream) -> Piece {
+pub(crate) fn decode_board_piece(stream: &mut BitStream) -> Piece {
     // Huffman 符号をデコードして駒種を取得
     let mut code = 0u32;
     let mut bits = 0u8;
@@ -393,7 +393,7 @@ fn decode_board_piece(stream: &mut BitStream) -> Piece {
 ///
 /// 戻り値: (駒, 駒箱フラグ)
 /// - 駒箱フラグが true の場合、その駒は持ち駒ではなく駒箱の駒
-fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
+pub(crate) fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
     // 手駒の Huffman 符号は盤上より1ビット少ない（bit0 を省略）
     let mut code = 0u32;
     let mut bits = 0u8;

@@ -8,9 +8,12 @@
 //! - 最大アクティブ特徴: 38 (王2枚を除く)
 
 use super::{Factorises, SparseInputType};
+#[cfg(test)]
+use crate::shogi::ShogiBoard;
 use crate::shogi::{
-    BonaPiece, PackedSfenValue, ShogiBoard,
+    BonaPiece, PackedSfenValue,
     bona_piece::FE_OLD_END,
+    packed_sfen::{BitStream, decode_board_piece, decode_hand_piece},
     types::{Color, HAND_PIECE_TYPES, PieceType, Square},
 };
 
@@ -69,8 +72,7 @@ impl SparseInputType for ShogiHalfKP {
     /// PackedSfenValue をデコードして ShogiBoard を作成し、
     /// 各駒について (stm_index, nstm_index) を生成。
     fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, f: F) {
-        let board = ShogiBoard::from_packed_sfen(pos);
-        map_halfkp_features(&board, f);
+        map_halfkp_features_from_packed(pos, f);
     }
 
     /// 短縮名
@@ -141,10 +143,9 @@ impl Factorises<ShogiHalfKP> for ShogiHalfKPPieceFactorizer {
 pub fn fill_halfkp_feature_indices(pos: &PackedSfenValue, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
     debug_assert!(stm.len() >= MAX_ACTIVE_FEATURES);
     debug_assert!(nstm.len() >= MAX_ACTIVE_FEATURES);
-    let board = ShogiBoard::from_packed_sfen(pos);
     let mut stm_count = 0usize;
     let mut nstm_count = 0usize;
-    map_halfkp_features(&board, |stm_idx, nstm_idx| {
+    map_halfkp_features_from_packed(pos, |stm_idx, nstm_idx| {
         debug_assert!(stm_count < stm.len());
         debug_assert!(nstm_count < nstm.len());
         stm[stm_count] = stm_idx as i32;
@@ -157,6 +158,77 @@ pub fn fill_halfkp_feature_indices(pos: &PackedSfenValue, stm: &mut [i32], nstm:
     (stm_count, nstm_count)
 }
 
+fn map_halfkp_features_from_packed<F: FnMut(usize, usize)>(pos: &PackedSfenValue, mut f: F) {
+    let mut stream = BitStream::new(&pos.sfen().data);
+
+    let stm = if stream.read_bit() { Color::White } else { Color::Black };
+    let nstm = stm.opponent();
+
+    let black_king_sq = Square(stream.read_bits(7) as u8);
+    let white_king_sq = Square(stream.read_bits(7) as u8);
+
+    let stm_king_sq = match stm {
+        Color::Black => black_king_sq,
+        Color::White => white_king_sq,
+    };
+    let nstm_king_sq = match nstm {
+        Color::Black => black_king_sq,
+        Color::White => white_king_sq,
+    };
+    if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
+        return;
+    }
+
+    let stm_ksq = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
+    let nstm_ksq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
+
+    for sq_idx in 0..81u8 {
+        if sq_idx == black_king_sq.0 || sq_idx == white_king_sq.0 {
+            continue;
+        }
+
+        let piece = decode_board_piece(&mut stream);
+        if piece.is_none() || piece.piece_type == PieceType::King {
+            continue;
+        }
+
+        let sq = Square(sq_idx);
+        let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+        if stm_bp == BonaPiece::ZERO {
+            continue;
+        }
+        let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+        f(halfkp_index(stm_ksq, stm_bp.value() as usize), halfkp_index(nstm_ksq, nstm_bp.value() as usize));
+    }
+
+    let mut hand_counts = [[0u8; HAND_PIECE_TYPES.len()]; 2];
+    while stream.cursor() < 256 {
+        let (piece, is_piecebox) = decode_hand_piece(&mut stream);
+        if is_piecebox || piece.is_none() {
+            continue;
+        }
+        if let Some(piece_index) = hand_piece_index(piece.piece_type) {
+            let owner_index = color_index(piece.color);
+            hand_counts[owner_index][piece_index] = hand_counts[owner_index][piece_index].saturating_add(1);
+        }
+    }
+
+    for owner in [Color::Black, Color::White] {
+        for (piece_index, &pt) in HAND_PIECE_TYPES.iter().enumerate() {
+            let count = hand_counts[color_index(owner)][piece_index];
+            for i in 1..=count {
+                let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                if stm_bp == BonaPiece::ZERO {
+                    continue;
+                }
+                let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                f(halfkp_index(stm_ksq, stm_bp.value() as usize), halfkp_index(nstm_ksq, nstm_bp.value() as usize));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn map_halfkp_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     // STM と NSTM の視点
     let stm = board.side_to_move;
@@ -229,6 +301,28 @@ fn map_halfkp_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 /// HalfKP の特徴インデックスを計算
 ///
 /// feature_index = king_sq * FE_END + bonapiece
+#[inline]
+fn color_index(color: Color) -> usize {
+    match color {
+        Color::Black => 0,
+        Color::White => 1,
+    }
+}
+
+#[inline]
+fn hand_piece_index(pt: PieceType) -> Option<usize> {
+    match pt {
+        PieceType::Pawn => Some(0),
+        PieceType::Lance => Some(1),
+        PieceType::Knight => Some(2),
+        PieceType::Silver => Some(3),
+        PieceType::Gold => Some(4),
+        PieceType::Bishop => Some(5),
+        PieceType::Rook => Some(6),
+        _ => None,
+    }
+}
+
 #[inline]
 fn halfkp_index(king_sq: usize, bonapiece: usize) -> usize {
     king_sq * FE_END + bonapiece
@@ -305,6 +399,155 @@ mod tests {
         let other_start = same_piece_other_king * layer_size;
         assert_eq!(merged[other_start], 0.75);
         assert_eq!(merged[other_start + 1], 0.5);
+    }
+
+    #[derive(Default)]
+    struct TestPackedSfenWriter {
+        bytes: [u8; 32],
+        cursor: usize,
+    }
+
+    impl TestPackedSfenWriter {
+        fn write_bit(&mut self, bit: bool) {
+            assert!(self.cursor < 256);
+            if bit {
+                self.bytes[self.cursor / 8] |= 1 << (self.cursor % 8);
+            }
+            self.cursor += 1;
+        }
+
+        fn write_bits(&mut self, value: u32, len: u8) {
+            for i in 0..len {
+                self.write_bit(((value >> i) & 1) != 0);
+            }
+        }
+
+        fn write_board_piece(&mut self, piece: Piece) {
+            if piece.is_none() {
+                self.write_bit(false);
+                return;
+            }
+
+            let (pattern, len, promoted) = board_piece_code(piece.piece_type);
+            self.write_bits(pattern, len);
+            if piece.piece_type.unpromote() != PieceType::Gold {
+                self.write_bit(promoted);
+            }
+            self.write_bit(piece.color == Color::White);
+        }
+
+        fn write_hand_piece(&mut self, piece: Piece) {
+            let (pattern, len, _) = board_piece_code(piece.piece_type);
+            self.write_bits(pattern >> 1, len - 1);
+            if piece.piece_type != PieceType::Gold {
+                self.write_bit(false);
+            }
+            self.write_bit(piece.color == Color::White);
+        }
+
+        fn write_piecebox_pawn(&mut self) {
+            self.write_bit(false);
+            self.write_bit(true);
+            self.write_bit(false);
+        }
+
+        fn write_piecebox_lance_prefix(&mut self, bits: usize) {
+            // Lance hand code is 001 (LSB-first value 1, len 3), followed by the
+            // piecebox bit. The final colour bit may be omitted at the 256-bit
+            // boundary because the decoder treats OOB reads as false.
+            let seq = [true, false, false, true, false];
+            for &bit in seq.iter().take(bits) {
+                self.write_bit(bit);
+            }
+        }
+
+        fn finish_with_piecebox_padding(&mut self) {
+            while self.cursor < 256 {
+                let remaining = 256 - self.cursor;
+                match remaining {
+                    1 => self.write_bit(true),
+                    2 => {
+                        self.write_bit(false);
+                        self.write_bit(true);
+                    }
+                    4 => self.write_piecebox_lance_prefix(4),
+                    5 => self.write_piecebox_lance_prefix(5),
+                    _ => self.write_piecebox_pawn(),
+                }
+            }
+        }
+    }
+
+    fn board_piece_code(pt: PieceType) -> (u32, u8, bool) {
+        match pt {
+            PieceType::Pawn => (0x01, 2, false),
+            PieceType::Lance => (0x03, 4, false),
+            PieceType::Knight => (0x0b, 4, false),
+            PieceType::Silver => (0x07, 4, false),
+            PieceType::Bishop => (0x1f, 6, false),
+            PieceType::Rook => (0x3f, 6, false),
+            PieceType::Gold => (0x0f, 5, false),
+            PieceType::ProPawn => (0x01, 2, true),
+            PieceType::ProLance => (0x03, 4, true),
+            PieceType::ProKnight => (0x0b, 4, true),
+            PieceType::ProSilver => (0x07, 4, true),
+            PieceType::Horse => (0x1f, 6, true),
+            PieceType::Dragon => (0x3f, 6, true),
+            _ => panic!("unsupported test piece type: {pt:?}"),
+        }
+    }
+
+    fn packed_halfkp_test_position(side_to_move: Color) -> PackedSfenValue {
+        let black_king = Square::new(4, 8);
+        let white_king = Square::new(4, 0);
+        let mut board = [Piece::NONE; 81];
+        board[Square::new(0, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+        board[Square::new(8, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        board[Square::new(2, 4).index()] = Piece::new(Color::Black, PieceType::ProSilver);
+        board[Square::new(6, 4).index()] = Piece::new(Color::White, PieceType::Dragon);
+
+        let mut writer = TestPackedSfenWriter::default();
+        writer.write_bit(side_to_move == Color::White);
+        writer.write_bits(black_king.0 as u32, 7);
+        writer.write_bits(white_king.0 as u32, 7);
+        for sq_idx in 0..81u8 {
+            if sq_idx == black_king.0 || sq_idx == white_king.0 {
+                continue;
+            }
+            writer.write_board_piece(board[sq_idx as usize]);
+        }
+        writer.write_hand_piece(Piece::new(Color::Black, PieceType::Pawn));
+        writer.write_hand_piece(Piece::new(Color::Black, PieceType::Pawn));
+        writer.write_hand_piece(Piece::new(Color::White, PieceType::Rook));
+        writer.write_hand_piece(Piece::new(Color::White, PieceType::Gold));
+        writer.finish_with_piecebox_padding();
+
+        let mut pos = PackedSfenValue::default();
+        pos.as_bytes_mut()[..32].copy_from_slice(&writer.bytes);
+        pos
+    }
+
+    #[test]
+    fn test_direct_packed_mapper_matches_board_mapper() {
+        for side_to_move in [Color::Black, Color::White] {
+            let pos = packed_halfkp_test_position(side_to_move);
+            let board = ShogiBoard::from_packed_sfen(&pos);
+
+            let mut board_features = Vec::new();
+            map_halfkp_features(&board, |stm, nstm| board_features.push((stm, nstm)));
+
+            let mut direct_features = Vec::new();
+            map_halfkp_features_from_packed(&pos, |stm, nstm| direct_features.push((stm, nstm)));
+            assert_eq!(direct_features, board_features);
+
+            let mut stm = [-1; MAX_ACTIVE_FEATURES];
+            let mut nstm = [-1; MAX_ACTIVE_FEATURES];
+            let (stm_count, nstm_count) = fill_halfkp_feature_indices(&pos, &mut stm, &mut nstm);
+            assert_eq!(stm_count, board_features.len());
+            assert_eq!(nstm_count, board_features.len());
+            let filled_features: Vec<_> = (0..stm_count).map(|i| (stm[i] as usize, nstm[i] as usize)).collect();
+            assert_eq!(filled_features, board_features);
+        }
     }
 
     #[test]
