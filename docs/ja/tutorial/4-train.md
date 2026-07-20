@@ -41,6 +41,8 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 | `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3(king3-by-king3) LayerStacks の SFNN-1536 |
+| `SFNN_halfka2_4096_3_64_g4_k3k3` | 4096 | 3 | 64 | grouped SFNN L1。4096 を 4 group に分け、各 group は 1024 -> 1 |
+| `SFNN_halfka2_8192_3_64_g4_k3k3` | 8192 | 3 | 64 | grouped SFNN L1。8192 を 4 group に分け、各 group は 2048 -> 1 |
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
 | `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN |
 

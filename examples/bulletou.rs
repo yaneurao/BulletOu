@@ -225,6 +225,7 @@ impl LayerStackMode {
 /// - `NNUE_halfkp_256x2_32_32`
 /// - `NNUE_ka2_256x2_64_64`
 /// - `SFNN_halfka2_1024_7_64_k3k3`
+/// - `SFNN_halfka2_4096_3_64_g4_k3k3`
 /// - `SFNN_halfka2_4096_7_64_g4_k3k3`
 /// - `SFNN_halfka2_8192_7_64_g8_k3k3`
 /// - `SFNN_halfka2_8192_15_64_g16_k3k3`
@@ -10300,6 +10301,10 @@ mod tests {
         assert_eq!(g4.dims(), (4096, 7, 64));
         assert_eq!(g4.sfnn_l1_group_count(), 4);
         assert_eq!(g4.cli_name(), "SFNN_halfka2_4096_7_64_g4_k3k3");
+        let g4_h1_3 = NnueArch::from_str("SFNN_halfka2_4096_3_64_g4_k3k3").unwrap();
+        assert_eq!(g4_h1_3.dims(), (4096, 3, 64));
+        assert_eq!(g4_h1_3.sfnn_l1_group_count(), 4);
+        assert_eq!(g4_h1_3.cli_name(), "SFNN_halfka2_4096_3_64_g4_k3k3");
         let g16 = NnueArch::from_str("SFNN_halfka2_8192_15_64_g16_k3k3").unwrap();
         assert_eq!(g16.dims(), (8192, 15, 64));
         assert_eq!(g16.sfnn_l1_group_count(), 16);
@@ -10328,6 +10333,8 @@ mod tests {
             "NNUE_halfkp_256x2_32_32",
             "NNUE_ka2_256x2_64_64",
             "SFNN_halfka2_1024_7_64_k3k3",
+            "SFNN_halfka2_4096_3_64_g4_k3k3",
+            "SFNN_halfka2_8192_3_64_g4_k3k3",
             "SFNN_halfka2_4096_7_64_g4_k3k3",
             "SFNN_halfka2_8192_7_64_g8_k3k3",
             "SFNN_halfka2_4096_7_64_g8_k3k3",
@@ -12286,6 +12293,8 @@ mod tests {
         use clap::Parser as _;
 
         for (arch, ft_size, l1_out, group_count, group_input, group_output) in [
+            ("SFNN_halfka2_4096_3_64_g4_k3k3", 4096, 4, 4, 1024, 1),
+            ("SFNN_halfka2_8192_3_64_g4_k3k3", 8192, 4, 4, 2048, 1),
             ("SFNN_halfka2_4096_7_64_g4_k3k3", 4096, 8, 4, 1024, 2),
             ("SFNN_halfka2_8192_7_64_g8_k3k3", 8192, 8, 8, 1024, 1),
             ("SFNN_halfka2_4096_7_64_g8_k3k3", 4096, 8, 8, 512, 1),

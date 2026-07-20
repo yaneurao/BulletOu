@@ -41,6 +41,8 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | SFNN-1536 with k3k3(king3-by-king3) LayerStacks |
+| `SFNN_halfka2_4096_3_64_g4_k3k3` | 4096 | 3 | 64 | Grouped SFNN L1: 4096 is split into 4 groups, so each group maps 1024 -> 1 |
+| `SFNN_halfka2_8192_3_64_g4_k3k3` | 8192 | 3 | 64 | Grouped SFNN L1: 8192 is split into 4 groups, so each group maps 2048 -> 1 |
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
 | `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input |
 

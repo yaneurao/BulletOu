@@ -93,6 +93,8 @@ divisible by `N`. The `+1` is the PSQT shortcut neuron added after H1.
 Examples currently used for experiments:
 
 - `SFNN_halfka2_4096_7_64_g4_k3k3`
+- `SFNN_halfka2_4096_3_64_g4_k3k3`
+- `SFNN_halfka2_8192_3_64_g4_k3k3`
 - `SFNN_halfka2_8192_7_64_g8_k3k3`
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
