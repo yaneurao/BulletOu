@@ -52,7 +52,7 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 
 `--arch` は学習対象と architecture の唯一の指定なので、通常の学習では必須。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
 
-grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。たとえば `SFNN_ka2_8192_7_15_g8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=15`, `L1 を 8 group に分割` という意味。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
+grouped SFNN の実験では LayerStack suffix の前に `_gN_` を付ける。たとえば `SFNN_ka2_8192_7_64_g8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 8 group に分割` という意味。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 

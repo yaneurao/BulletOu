@@ -52,7 +52,7 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 
 `--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
-Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_15_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=15`, and L1 is split into 8 groups. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
+Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_64_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 groups. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 

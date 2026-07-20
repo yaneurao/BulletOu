@@ -41,7 +41,7 @@ information that matter:
 - the input feature module (`halfkp`, `kp`, `ka2`, `halfkpe9`,
   `halfkpvm`, `halfka2`, `halfkahm1`, `halfkahm2`).
 
-Therefore `--arch SFNN_ka2_8192_7_15_g8_k3k3` unambiguously means target
+Therefore `--arch SFNN_ka2_8192_7_64_g8_k3k3` unambiguously means target
 `SFNN_KA2`. Requiring a second `--eval-type SFNN_KA2` flag made the CLI more
 error-prone without adding information.
 
@@ -95,8 +95,8 @@ Examples currently used for experiments:
 - `SFNN_halfka2_4096_7_64_g4_k3k3`
 - `SFNN_halfka2_8192_7_64_g8_k3k3`
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
-- `SFNN_ka2_8192_7_15_g8_k3k3`
-- `SFNN_ka2_32768_15_15_g16_k3k3`
+- `SFNN_ka2_8192_7_64_g8_k3k3`
+- `SFNN_ka2_32768_15_64_g16_k3k3`
 
 ## Default output directory
 
@@ -110,7 +110,7 @@ inferred internal target and the arch value:
 | `--arch NNUE_halfkp_256x2_32_32` | `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32` |
 | `--arch NNUE_kp_256x2_32_32` | `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32` |
 | `--arch SFNN_halfka2_1024_7_64_k3k3` | `checkpoints/SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3` |
-| `--arch SFNN_ka2_8192_7_15_g8_k3k3` | `checkpoints/SFNN_KA2-SFNN_ka2_8192_7_15_g8_k3k3` |
+| `--arch SFNN_ka2_8192_7_64_g8_k3k3` | `checkpoints/SFNN_KA2-SFNN_ka2_8192_7_64_g8_k3k3` |
 
 `--tag TAG` appends `-TAG` to this auto-derived name. Explicit `--output`
 always wins.

@@ -2065,7 +2065,7 @@ impl Args {
         let Some(eval_type) = self.resolved_eval_type() else {
             return Err(
                 "missing training target: pass --arch KPPT, --arch KPP_KKPT, or a NNUE/SFNN architecture such as \
-                 --arch SFNN_ka2_8192_7_15_g8_k3k3"
+                 --arch SFNN_ka2_8192_7_64_g8_k3k3"
                     .to_string(),
             );
         };
@@ -10339,12 +10339,12 @@ mod tests {
             "SFNN_ka2_2048_15_64_g16_k3k3",
             "SFNN_ka2_4096_7_64_g8_k3k3",
             "SFNN_ka2_4096_15_64_g16_k3k3",
-            "SFNN_ka2_8192_7_15_g8_k3k3",
-            "SFNN_ka2_8192_15_15_g16_k3k3",
-            "SFNN_ka2_16384_7_15_g8_k3k3",
-            "SFNN_ka2_16384_15_15_g16_k3k3",
-            "SFNN_ka2_32768_7_15_g8_k3k3",
-            "SFNN_ka2_32768_15_15_g16_k3k3",
+            "SFNN_ka2_8192_7_64_g8_k3k3",
+            "SFNN_ka2_8192_15_64_g16_k3k3",
+            "SFNN_ka2_16384_7_64_g8_k3k3",
+            "SFNN_ka2_16384_15_64_g16_k3k3",
+            "SFNN_ka2_32768_7_64_g8_k3k3",
+            "SFNN_ka2_32768_15_64_g16_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -10440,12 +10440,12 @@ mod tests {
     fn arch_alone_selects_training_target() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--arch", "SFNN_ka2_8192_7_15_g8_k3k3", "--teacher", "/dev/null"])
+        let args = Args::try_parse_from(["bulletou", "--arch", "SFNN_ka2_8192_7_64_g8_k3k3", "--teacher", "/dev/null"])
             .unwrap();
         args.validate_arch_flags().unwrap();
         assert_eq!(args.eval_type(), EvalType::SfnnKa2);
-        assert_eq!(args.arch().cli_name(), "SFNN_ka2_8192_7_15_g8_k3k3");
-        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_8192_7_15_g8_k3k3"));
+        assert_eq!(args.arch().cli_name(), "SFNN_ka2_8192_7_64_g8_k3k3");
+        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_8192_7_64_g8_k3k3"));
 
         let kppt = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
         kppt.validate_arch_flags().unwrap();
@@ -12357,12 +12357,12 @@ mod tests {
             ("SFNN_ka2_2048_15_64_g16_k3k3", 2048, 16, 64, 16, 128, 1),
             ("SFNN_ka2_4096_7_64_g8_k3k3", 4096, 8, 64, 8, 512, 1),
             ("SFNN_ka2_4096_15_64_g16_k3k3", 4096, 16, 64, 16, 256, 1),
-            ("SFNN_ka2_8192_7_15_g8_k3k3", 8192, 8, 15, 8, 1024, 1),
-            ("SFNN_ka2_8192_15_15_g16_k3k3", 8192, 16, 15, 16, 512, 1),
-            ("SFNN_ka2_16384_7_15_g8_k3k3", 16384, 8, 15, 8, 2048, 1),
-            ("SFNN_ka2_16384_15_15_g16_k3k3", 16384, 16, 15, 16, 1024, 1),
-            ("SFNN_ka2_32768_7_15_g8_k3k3", 32768, 8, 15, 8, 4096, 1),
-            ("SFNN_ka2_32768_15_15_g16_k3k3", 32768, 16, 15, 16, 2048, 1),
+            ("SFNN_ka2_8192_7_64_g8_k3k3", 8192, 8, 64, 8, 1024, 1),
+            ("SFNN_ka2_8192_15_64_g16_k3k3", 8192, 16, 64, 16, 512, 1),
+            ("SFNN_ka2_16384_7_64_g8_k3k3", 16384, 8, 64, 8, 2048, 1),
+            ("SFNN_ka2_16384_15_64_g16_k3k3", 16384, 16, 64, 16, 1024, 1),
+            ("SFNN_ka2_32768_7_64_g8_k3k3", 32768, 8, 64, 8, 4096, 1),
+            ("SFNN_ka2_32768_15_64_g16_k3k3", 32768, 16, 64, 16, 2048, 1),
         ] {
             let args = Args::try_parse_from([
                 "bulletou",

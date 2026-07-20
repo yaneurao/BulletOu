@@ -25,7 +25,7 @@ We use **NNUE HalfKP as the running example** in this tutorial, but the same com
 | `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs |
 
-Architecture size variants such as `NNUE_halfkp_1024x2_8_64` or `SFNN_ka2_8192_7_15_g8_k3k3` are accepted for experiments when the matching YaneuraOu architecture exists.
+Architecture size variants such as `NNUE_halfkp_1024x2_8_64` or `SFNN_ka2_8192_7_64_g8_k3k3` are accepted for experiments when the matching YaneuraOu architecture exists.
 
 ## 3.2 Get training data
 
