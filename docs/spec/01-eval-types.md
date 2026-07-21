@@ -6,7 +6,7 @@ training selector is `--arch`:
 - `--arch KPPT`
 - `--arch KPP_KKPT`
 - `--arch NNUE_<feature>_<L1>x2_<L2>_<L3>`
-- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3`
+- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_k3k3`
 
 The old eval-type names still exist internally as checkpoint/log target
 identifiers so existing output directory names and resume signatures remain
@@ -23,10 +23,10 @@ stable, but users do not pass them on the command line.
 | `NNUE_ka2_<L1>x2_<L2>_<L3>` | `NNUE_KA2` | NNUE | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_NNUE_ka2_*` build |
 | `NNUE_halfkpe9_<L1>x2_<L2>_<L3>` | `NNUE_HALFKPE9` | NNUE | `nn.bin` | yes |
 | `NNUE_halfkpvm_<L1>x2_<L2>_<L3>` | `NNUE_HALFKPVM` | NNUE | `nn.bin` | yes |
-| `SFNN_halfkahm1_<FT>_<H1>_<H2>[_gN]_k3k3` | `SFNN_HALFKA1HM` | SFNN LayerStacks=9 | `nn.bin` | ablation / experimental |
-| `SFNN_halfkahm2_<FT>_<H1>_<H2>[_gN]_k3k3` | `SFNN_HALFKA2HM` | SFNN LayerStacks=9 | `nn.bin` | yes |
-| `SFNN_halfka2_<FT>_<H1>_<H2>[_gN]_k3k3` | `SFNN_HALFKA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_halfka2_*_k3k3` build |
-| `SFNN_ka2_<FT>_<H1>_<H2>[_gN]_k3k3` | `SFNN_KA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_ka2_*_k3k3` build |
+| `SFNN_halfkahm1_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA1HM` | SFNN LayerStacks=9 | `nn.bin` | ablation / experimental |
+| `SFNN_halfkahm2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA2HM` | SFNN LayerStacks=9 | `nn.bin` | yes |
+| `SFNN_halfka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_halfka2_*_k3k3` build |
+| `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_KA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_ka2_*_k3k3` build |
 
 Every target writes `state.bin` for resume and `learn.log` for the per-save
 loss/validation snapshot. Details are in
@@ -76,7 +76,7 @@ Supported NNUE features:
 ### SFNN
 
 ```text
-SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3
+SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_k3k3
 ```
 
 Supported SFNN features:
@@ -88,7 +88,15 @@ Supported SFNN features:
 
 `k3k3` selects the YaneuraOu-compatible 9-bucket LayerStack mode. `gN` enables
 the grouped L1 variants, where the FT dimension and `H1 + 1` must both be
-divisible by `N`. The `+1` is the PSQT shortcut neuron added after H1.
+divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
+channels are common to every L1 output group, then `G` shard blocks of `M`
+channels follow. It requires `N + M * G == FT`, `(H1 + 1) % G == 0`, and
+both `N` and `M` to be multiples of 64. The `+1` is the PSQT shortcut neuron
+added after H1.
+
+For `_gN_` and `_cN_sMxG_`, BulletOu keeps `l1w` compact in `state.bin` and
+optimizer state, then expands the L1 matrix to the dense YaneuraOu `fc_0`
+layout when writing `nn.bin`.
 
 Examples currently used for experiments:
 
@@ -99,6 +107,7 @@ Examples currently used for experiments:
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
 - `SFNN_ka2_32768_15_64_g16_k3k3`
+- `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3`
 
 ## Default output directory
 

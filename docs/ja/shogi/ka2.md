@@ -138,6 +138,9 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
 # SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3 の場合
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
+
+# SFNN_KA2 common+shard L1 --arch SFNN_ka2_3072_7_64_c1024_s256x8_k3k3 の場合
+make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
 ```
 
 やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [§8 Engine](../tutorial/8-engine.md) を参照。
@@ -146,7 +149,7 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN]_k3k3` | (required; target is inferred) |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | (required; target is inferred) |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 

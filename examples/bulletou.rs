@@ -241,6 +241,8 @@ struct NnueArch {
     l3: usize,
     layerstack: Option<LayerStackMode>,
     sfnn_l1_group_count: Option<usize>,
+    sfnn_l1_common_size: Option<usize>,
+    sfnn_l1_shard_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +272,17 @@ impl NnueArch {
         l3: usize,
         layerstack: Option<LayerStackMode>,
     ) -> Self {
-        Self { family, feature, l1, l2, l3, layerstack, sfnn_l1_group_count: None }
+        Self {
+            family,
+            feature,
+            l1,
+            l2,
+            l3,
+            layerstack,
+            sfnn_l1_group_count: None,
+            sfnn_l1_common_size: None,
+            sfnn_l1_shard_size: None,
+        }
     }
 
     /// `(l1, l2, l3)` triple.
@@ -283,12 +295,35 @@ impl NnueArch {
         self
     }
 
+    fn with_sfnn_l1_common_shard(mut self, common_size: usize, shard_size: usize, group_count: usize) -> Self {
+        self.sfnn_l1_common_size = Some(common_size);
+        self.sfnn_l1_shard_size = Some(shard_size);
+        self.sfnn_l1_group_count = Some(group_count);
+        self
+    }
+
     fn sfnn_l1_group_count(self) -> usize {
         self.sfnn_l1_group_count.unwrap_or(1)
     }
 
+    fn sfnn_l1_common_size(self) -> usize {
+        self.sfnn_l1_common_size.unwrap_or(0)
+    }
+
+    fn sfnn_l1_shard_size(self) -> usize {
+        self.sfnn_l1_shard_size.unwrap_or(0)
+    }
+
     fn has_grouped_sfnn_l1(self) -> bool {
-        self.sfnn_l1_group_count().saturating_sub(1) > 0
+        self.sfnn_l1_group_count().saturating_sub(1) > 0 && !self.has_common_shard_sfnn_l1()
+    }
+
+    fn has_common_shard_sfnn_l1(self) -> bool {
+        self.sfnn_l1_common_size().saturating_add(self.sfnn_l1_shard_size()) > 0
+    }
+
+    fn has_compact_sfnn_l1(self) -> bool {
+        self.has_grouped_sfnn_l1() || self.has_common_shard_sfnn_l1()
     }
 
     /// The arch's canonical CLI value.
@@ -299,24 +334,38 @@ impl NnueArch {
             }
             NnueArchFamily::Sfnn => {
                 let layerstack = self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
-                match self.sfnn_l1_group_count {
-                    Some(group_count) => format!(
-                        "SFNN_{}_{}_{}_{}_g{}_{}",
+                if self.has_common_shard_sfnn_l1() {
+                    format!(
+                        "SFNN_{}_{}_{}_{}_c{}_s{}x{}_{}",
                         self.feature.arch_suffix(),
                         self.l1,
                         self.l2,
                         self.l3,
-                        group_count,
+                        self.sfnn_l1_common_size(),
+                        self.sfnn_l1_shard_size(),
+                        self.sfnn_l1_group_count(),
                         layerstack.arch_suffix()
-                    ),
-                    None => format!(
-                        "SFNN_{}_{}_{}_{}_{}",
-                        self.feature.arch_suffix(),
-                        self.l1,
-                        self.l2,
-                        self.l3,
-                        layerstack.arch_suffix()
-                    ),
+                    )
+                } else {
+                    match self.sfnn_l1_group_count {
+                        Some(group_count) => format!(
+                            "SFNN_{}_{}_{}_{}_g{}_{}",
+                            self.feature.arch_suffix(),
+                            self.l1,
+                            self.l2,
+                            self.l3,
+                            group_count,
+                            layerstack.arch_suffix()
+                        ),
+                        None => format!(
+                            "SFNN_{}_{}_{}_{}_{}",
+                            self.feature.arch_suffix(),
+                            self.l1,
+                            self.l2,
+                            self.l3,
+                            layerstack.arch_suffix()
+                        ),
+                    }
                 }
             }
         }
@@ -355,7 +404,40 @@ impl NnueArch {
                 self.l1
             ));
         }
-        if let Some(group_count) = self.sfnn_l1_group_count {
+        if self.has_common_shard_sfnn_l1() {
+            let group_count = self.sfnn_l1_group_count();
+            let common_size = self.sfnn_l1_common_size();
+            let shard_size = self.sfnn_l1_shard_size();
+            if self.family != NnueArchFamily::Sfnn {
+                return Err(format!("invalid arch `{original}`: common+shard L1 is only valid for SFNN"));
+            }
+            if group_count <= 1 || common_size == 0 || shard_size == 0 {
+                return Err(format!(
+                    "invalid arch `{original}`: common+shard SFNN L1 requires cN and sMxG with N,M>0 and G>1"
+                ));
+            }
+            if self.layerstack != Some(LayerStackMode::Kingrank3by3) {
+                return Err(format!(
+                    "invalid arch `{original}`: common+shard SFNN L1 currently requires k3k3 LayerStack"
+                ));
+            }
+            let l1_out = self.l2 + 1;
+            if common_size + shard_size * group_count != self.l1 {
+                return Err(format!(
+                    "invalid arch `{original}`: common+shard SFNN L1 requires common + shard * group == FT"
+                ));
+            }
+            if l1_out % group_count != 0 {
+                return Err(format!(
+                    "invalid arch `{original}`: common+shard SFNN L1 requires H1+1 to be divisible by group count"
+                ));
+            }
+            if common_size % 64 != 0 || shard_size % 64 != 0 {
+                return Err(format!(
+                    "invalid arch `{original}`: common+shard SFNN L1 requires common and shard dimensions to be multiples of 64"
+                ));
+            }
+        } else if let Some(group_count) = self.sfnn_l1_group_count {
             if self.family != NnueArchFamily::Sfnn {
                 return Err(format!("invalid arch `{original}`: grouped L1 is only valid for SFNN"));
             }
@@ -507,7 +589,35 @@ impl std::str::FromStr for NnueArch {
                     .map_err(|_| format!("invalid arch `{s}`: H2 `{}` is not a positive integer", tokens[4]))?;
                 let mut layerstack_start = 5usize;
                 let mut sfnn_l1_group_count = None;
-                if let Some(group_raw) = tokens[5].strip_prefix('g').or_else(|| tokens[5].strip_prefix('G')) {
+                let mut sfnn_l1_common_shard = None;
+                if let Some(common_raw) = tokens[5].strip_prefix('c').or_else(|| tokens[5].strip_prefix('C')) {
+                    if common_raw.is_empty() {
+                        return Err(format!("invalid arch `{s}`: SFNN common token `{}` must look like cN", tokens[5]));
+                    }
+                    let common_size = common_raw.parse::<usize>().map_err(|_| {
+                        format!("invalid arch `{s}`: SFNN common size `{common_raw}` is not an integer")
+                    })?;
+                    let shard_token = tokens.get(6).ok_or_else(|| {
+                        format!("invalid arch `{s}`: common+shard SFNN L1 requires shard token like s256x8")
+                    })?;
+                    let shard_raw =
+                        shard_token.strip_prefix('s').or_else(|| shard_token.strip_prefix('S')).ok_or_else(|| {
+                            format!("invalid arch `{s}`: SFNN shard token `{shard_token}` must look like sMxG")
+                        })?;
+                    let (shard_size_raw, group_count_raw) =
+                        shard_raw.split_once('x').or_else(|| shard_raw.split_once('X')).ok_or_else(|| {
+                            format!("invalid arch `{s}`: SFNN shard token `{shard_token}` must look like sMxG")
+                        })?;
+                    let shard_size = shard_size_raw.parse::<usize>().map_err(|_| {
+                        format!("invalid arch `{s}`: SFNN shard size `{shard_size_raw}` is not an integer")
+                    })?;
+                    let group_count = group_count_raw.parse::<usize>().map_err(|_| {
+                        format!("invalid arch `{s}`: SFNN shard group count `{group_count_raw}` is not an integer")
+                    })?;
+                    sfnn_l1_group_count = Some(group_count);
+                    sfnn_l1_common_shard = Some((common_size, shard_size, group_count));
+                    layerstack_start = 7;
+                } else if let Some(group_raw) = tokens[5].strip_prefix('g').or_else(|| tokens[5].strip_prefix('G')) {
                     if group_raw.is_empty() {
                         return Err(format!("invalid arch `{s}`: SFNN group token `{}` must look like gN", tokens[5]));
                     }
@@ -533,9 +643,14 @@ impl std::str::FromStr for NnueArch {
                         ));
                     }
                 };
-                NnueArch::new(family, feature, l1, l2, l3, Some(layerstack))
-                    .with_sfnn_l1_group_count(sfnn_l1_group_count)
-                    .validate_dims(s)
+                let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack))
+                    .with_sfnn_l1_group_count(sfnn_l1_group_count);
+                let arch = if let Some((common_size, shard_size, group_count)) = sfnn_l1_common_shard {
+                    arch.with_sfnn_l1_common_shard(common_size, shard_size, group_count)
+                } else {
+                    arch
+                };
+                arch.validate_dims(s)
             }
         }
     }
@@ -2091,9 +2206,10 @@ impl Args {
                 eval_type.cli_name()
             ));
         }
-        if arch.has_grouped_sfnn_l1() && self.sfnn_factorized_l1 {
+        if arch.has_compact_sfnn_l1() && self.sfnn_factorized_l1 {
             return Err(
-                "--sfnn-factorized-l1 is not supported with grouped SFNN L1 architectures such as g8/g16".to_string()
+                "--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures such as g8/g16 or c1024_s256x8"
+                    .to_string()
             );
         }
 
@@ -5217,7 +5333,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     eprintln!("  l1 factorized shared term = {}", if initial_weights.l1fw.is_some() { "enabled" } else { "disabled" });
-    if args.arch().has_grouped_sfnn_l1() {
+    if args.arch().has_common_shard_sfnn_l1() {
+        eprintln!(
+            "  l1 common+shard = c{}_s{}x{} (row fan-in {}; {} output(s) per shard group; compact state)",
+            initial_weights.shape.l1_common_size,
+            initial_weights.shape.l1_shard_size,
+            initial_weights.shape.l1_group_count(),
+            initial_weights.shape.l1_common_shard_input(),
+            initial_weights.shape.l1_group_output()
+        );
+    } else if args.arch().has_grouped_sfnn_l1() {
         eprintln!(
             "  l1 grouped = g{} ({} inputs -> {} outputs per group; compact state)",
             initial_weights.shape.l1_group_count(),
@@ -6311,6 +6436,8 @@ fn run_cuda_cpp_sfnn_final_validation(
         l2_size: validation_weights.shape.l2_size,
         num_stacks: validation_weights.shape.num_stacks,
         l1_group_count: validation_weights.shape.l1_group_count,
+        l1_common_size: 0,
+        l1_shard_size: 0,
     };
     let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
@@ -6771,14 +6898,6 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
             factorized_input_size
         ));
     };
-    let cpu_shape = CpuSfnnForwardShape {
-        input_size: base_input_size,
-        ft_size: shape.ft_size,
-        l1_hidden: shape.l1_hidden,
-        l2_size: shape.l2_size,
-        num_stacks: shape.num_stacks,
-        l1_group_count: shape.l1_group_count,
-    };
     let mut l1w = weights.l1w.clone();
     let mut l1b = weights.l1b.clone();
     fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
@@ -6788,6 +6907,20 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
         weights.l1fw.as_deref(),
         weights.l1fb.as_deref(),
     )?;
+    let cpu_l1_group_count = if cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
+        l1w = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &l1w)?;
+        1
+    } else {
+        shape.l1_group_count
+    };
+    let cpu_shape = CpuSfnnForwardShape {
+        input_size: base_input_size,
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+        l1_group_count: cpu_l1_group_count,
+    };
 
     let cpu_weights = CpuSfnnForwardOwnedWeights {
         shape: cpu_shape,
@@ -6823,8 +6956,8 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     }
     match (l1fw, l1fb) {
         (Some(shared_w), Some(shared_b)) => {
-            if cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
-                return Err("SFNN grouped L1 does not support factorized shared L1 weights".to_string());
+            if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
+                return Err("SFNN compact L1 does not support factorized shared L1 weights".to_string());
             }
             let expected_l1fw = shape.ft_size * l1_out;
             if shared_w.len() != expected_l1fw {
@@ -7196,6 +7329,16 @@ fn cuda_cpp_sfnn_is_grouped_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_is_common_shard_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
+    shape.has_common_shard_l1()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_is_compact_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
+    shape.has_compact_l1()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_l1w_len_for_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
     shape.l1w_len().map_err(|err| err.to_string())
 }
@@ -7214,8 +7357,52 @@ fn expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     compact: &[f32],
 ) -> Result<Vec<f32>, String> {
-    if !cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+    if !cuda_cpp_sfnn_is_compact_l1_shape(shape) {
         return Ok(compact.to_vec());
+    }
+    if cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
+        if shape.l1_common_size == 0
+            || shape.l1_shard_size == 0
+            || shape.l1_common_size + shape.l1_shard_size * shape.l1_group_count() != shape.ft_size
+            || shape.l1_out() % shape.l1_group_count() != 0
+        {
+            return Err(format!("SFNN common+shard-L1 shape dimensions are invalid: {shape:?}"));
+        }
+        let expected_compact = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
+        if compact.len() != expected_compact {
+            return Err(format!(
+                "SFNN common+shard l1w length mismatch: got {}, expected {expected_compact}",
+                compact.len()
+            ));
+        }
+        let dense_len = cuda_cpp_sfnn_dense_l1w_len_for_shape(shape)?;
+        let mut dense = vec![0.0_f32; dense_len];
+        let group_count = shape.l1_group_count();
+        let group_output = shape.l1_group_output();
+        let common_size = shape.l1_common_size;
+        let shard_size = shape.l1_shard_size;
+        let compact_row = common_size + shard_size;
+        let compact_stack_stride = group_count * group_output * compact_row;
+        let dense_stack_stride = shape.l1_out() * shape.ft_size;
+        for stack in 0..shape.num_stacks {
+            let compact_stack_base = stack * compact_stack_stride;
+            let dense_stack_base = stack * dense_stack_stride;
+            for group in 0..group_count {
+                for local_out in 0..group_output {
+                    let out_col = group * group_output + local_out;
+                    let compact_base =
+                        compact_stack_base + group * group_output * compact_row + local_out * compact_row;
+                    let dense_base = dense_stack_base + out_col * shape.ft_size;
+                    dense[dense_base..dense_base + common_size]
+                        .copy_from_slice(&compact[compact_base..compact_base + common_size]);
+                    let dense_shard_base = dense_base + common_size + group * shard_size;
+                    let compact_shard_base = compact_base + common_size;
+                    dense[dense_shard_base..dense_shard_base + shard_size]
+                        .copy_from_slice(&compact[compact_shard_base..compact_shard_base + shard_size]);
+                }
+            }
+        }
+        return Ok(dense);
     }
     if shape.ft_size % shape.l1_group_count() != 0 || shape.l1_out() % shape.l1_group_count() != 0 {
         return Err(format!("SFNN grouped-L1 shape dimensions are invalid: {shape:?}"));
@@ -7265,15 +7452,26 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         l2_size,
         num_stacks,
         l1_group_count: args.arch().sfnn_l1_group_count(),
+        l1_common_size: args.arch().sfnn_l1_common_size(),
+        l1_shard_size: args.arch().sfnn_l1_shard_size(),
     };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
     let grouped_l1 = args.arch().has_grouped_sfnn_l1();
+    let common_shard_l1 = args.arch().has_common_shard_sfnn_l1();
     if grouped_l1 != cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
         return Err(format!(
             "SFNN grouped-L1 arch/shape mismatch for {}: arch_group_count={}, shape={shape:?}",
             args.arch().cli_name(),
             args.arch().sfnn_l1_group_count()
+        ));
+    }
+    if common_shard_l1 != cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
+        return Err(format!(
+            "SFNN common+shard-L1 arch/shape mismatch for {}: common={}, shard={}, shape={shape:?}",
+            args.arch().cli_name(),
+            args.arch().sfnn_l1_common_size(),
+            args.arch().sfnn_l1_shard_size()
         ));
     }
 
@@ -7284,11 +7482,25 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     }
     let l0b = cuda_cpp_tatara_uniform_fan_in_init(ft_size, 0x5f11_e002, base_input_size, init_scale);
 
-    let l1_fan_in = if grouped_l1 { shape.l1_group_input() } else { ft_size };
+    let l1_fan_in = if common_shard_l1 {
+        shape.l1_common_shard_input()
+    } else if grouped_l1 {
+        shape.l1_group_input()
+    } else {
+        ft_size
+    };
     let l1_bound = init_scale * (1.0 / l1_fan_in.max(1) as f32).sqrt();
     let l2_bound = init_scale * (1.0 / l2_in.max(1) as f32).sqrt();
     let l3_bound = init_scale * (1.0 / l2_size.max(1) as f32).sqrt();
-    let l1w = if grouped_l1 {
+    let l1w = if common_shard_l1 {
+        cuda_cpp_tatara_stacked_row_major_bucket0_init(
+            shape.l1_common_shard_input(),
+            l1_out,
+            num_stacks,
+            0x5f11_e003,
+            l1_bound,
+        )
+    } else if grouped_l1 {
         cuda_cpp_tatara_stacked_row_major_bucket0_init(
             shape.l1_group_input(),
             l1_out,
@@ -7305,8 +7517,8 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
     let (l1fw, l1fb) = if args.sfnn_factorized_l1 {
-        if grouped_l1 {
-            return Err("--sfnn-factorized-l1 is not supported with grouped SFNN L1 architectures".to_string());
+        if grouped_l1 || common_shard_l1 {
+            return Err("--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures".to_string());
         }
         (Some(vec![0.0; ft_size * l1_out]), Some(vec![0.0; l1_out]))
     } else {
@@ -7339,6 +7551,8 @@ fn load_cuda_cpp_sfnn_initial_state(
         l2_size,
         num_stacks: layerstack.num_stacks(),
         l1_group_count: args.arch().sfnn_l1_group_count(),
+        l1_common_size: args.arch().sfnn_l1_common_size(),
+        l1_shard_size: args.arch().sfnn_l1_shard_size(),
     };
     let weights = load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, weights).map_err(|err| {
         format!(
@@ -8017,9 +8231,9 @@ fn write_cuda_cpp_sfnn_nn_bin(
         return Err("cuda-cpp SFNN weights have partial l1f state".to_string());
     }
     let dense_l1w_for_export;
-    let l1w_for_export: &[f32] = if cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
+    let l1w_for_export: &[f32] = if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
         if l1fw.is_some() {
-            return Err("SFNN grouped L1 cannot be exported with factorized shared L1 weights".to_string());
+            return Err("SFNN compact L1 cannot be exported with factorized shared L1 weights".to_string());
         }
         dense_l1w_for_export = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &weights.l1w)?;
         &dense_l1w_for_export
@@ -10318,6 +10532,14 @@ mod tests {
         assert_eq!(ka2_g16.expected_eval_type(), EvalType::SfnnKa2);
         assert_eq!(ka2_g16.sfnn_l1_group_count(), 16);
         assert_eq!(ka2_g16.cli_name(), "SFNN_ka2_2048_15_64_g16_k3k3");
+        let ka2_cs = NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_s256x8_k3k3").unwrap();
+        assert_eq!(ka2_cs.dims(), (3072, 7, 64));
+        assert_eq!(ka2_cs.expected_eval_type(), EvalType::SfnnKa2);
+        assert!(ka2_cs.has_common_shard_sfnn_l1());
+        assert_eq!(ka2_cs.sfnn_l1_common_size(), 1024);
+        assert_eq!(ka2_cs.sfnn_l1_shard_size(), 256);
+        assert_eq!(ka2_cs.sfnn_l1_group_count(), 8);
+        assert_eq!(ka2_cs.cli_name(), "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10352,6 +10574,7 @@ mod tests {
             "SFNN_ka2_16384_15_64_g16_k3k3",
             "SFNN_ka2_32768_7_64_g8_k3k3",
             "SFNN_ka2_32768_15_64_g16_k3k3",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -10372,6 +10595,9 @@ mod tests {
         assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_ls9").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g3_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g0_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_s256x8_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_s256_k3k3").is_err());
     }
 
     #[test]
@@ -10381,6 +10607,8 @@ mod tests {
         assert!(NnueArch::from_str("NNUE_halfkp_256x2_32_0").is_err());
         assert!(NnueArch::from_str("NNUE_halfkp_100x2_32_32").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_100_7_64_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_ka2_3000_7_64_c1024_s256x8_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1000_s259x8_k3k3").is_err());
     }
 
     /// Verify that `--tag` appends `-<tag>` to the auto-generated output
@@ -12323,6 +12551,8 @@ mod tests {
                 l2_size: 64,
                 num_stacks: 9,
                 l1_group_count: args.arch().sfnn_l1_group_count(),
+                l1_common_size: args.arch().sfnn_l1_common_size(),
+                l1_shard_size: args.arch().sfnn_l1_shard_size(),
             };
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
             assert_eq!(shape.l1_group_input(), group_input, "{arch}");
@@ -12354,6 +12584,46 @@ mod tests {
         .validate_arch_flags()
         .unwrap_err();
         assert!(err.contains("factorized"));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_common_shard_arch_uses_compact_l1_shape() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+        args.validate_arch_flags().unwrap();
+        args.validate_backend_flags().unwrap();
+
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
+            ft_size: 3072,
+            l1_hidden: 7,
+            l2_size: 64,
+            num_stacks: 9,
+            l1_group_count: args.arch().sfnn_l1_group_count(),
+            l1_common_size: args.arch().sfnn_l1_common_size(),
+            l1_shard_size: args.arch().sfnn_l1_shard_size(),
+        };
+        assert!(shape.has_common_shard_l1());
+        assert_eq!(shape.l1_group_count(), 8);
+        assert_eq!(shape.l1_common_size, 1024);
+        assert_eq!(shape.l1_shard_size, 256);
+        assert_eq!(shape.l1_common_shard_input(), 1280);
+        assert_eq!(shape.l1_group_output(), 1);
+        assert_eq!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(), 9 * 8 * 1280);
+        assert!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -12395,6 +12665,8 @@ mod tests {
                 l2_size,
                 num_stacks: 9,
                 l1_group_count: args.arch().sfnn_l1_group_count(),
+                l1_common_size: args.arch().sfnn_l1_common_size(),
+                l1_shard_size: args.arch().sfnn_l1_shard_size(),
             };
             assert_eq!(shape.input_size, ShogiKa2.num_inputs(), "{arch}");
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
@@ -12588,6 +12860,8 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
         };
         let weights = CudaCppSfnnInitialWeights {
             shape,
@@ -12721,6 +12995,8 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
         };
         let l1_out = shape.l1_out();
         let mut l1w = vec![

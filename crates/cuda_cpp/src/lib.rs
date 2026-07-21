@@ -800,10 +800,20 @@ pub struct SfnnForwardShape {
     pub l1_hidden: usize,
     pub l2_size: usize,
     pub num_stacks: usize,
-    /// `1` means normal dense stacked L1. Values greater than one mean
-    /// grouped L1: `ft_size / l1_group_count` inputs connect to
+    /// `1` means normal dense stacked L1 unless the common+shard fields
+    /// below are non-zero. Values greater than one mean grouped L1:
+    /// `ft_size / l1_group_count` inputs connect to
     /// `l1_out / l1_group_count` outputs in each group.
+    ///
+    /// For common+shard L1 this is the shard group count: each output
+    /// group sees the common prefix plus its own shard.
     pub l1_group_count: usize,
+    /// Common input prefix size for common+shard SFNN L1. `0` disables
+    /// common+shard mode.
+    pub l1_common_size: usize,
+    /// Per-shard input size for common+shard SFNN L1. `0` disables
+    /// common+shard mode.
+    pub l1_shard_size: usize,
 }
 
 impl SfnnForwardShape {
@@ -824,7 +834,15 @@ impl SfnnForwardShape {
     }
 
     pub fn has_grouped_l1(self) -> bool {
-        self.l1_group_count > 1
+        self.l1_group_count > 1 && !self.has_common_shard_l1()
+    }
+
+    pub fn has_common_shard_l1(self) -> bool {
+        self.l1_common_size != 0 || self.l1_shard_size != 0
+    }
+
+    pub fn has_compact_l1(self) -> bool {
+        self.has_grouped_l1() || self.has_common_shard_l1()
     }
 
     pub fn l1_group_input(self) -> usize {
@@ -835,8 +853,24 @@ impl SfnnForwardShape {
         self.l1_out() / self.l1_group_count
     }
 
+    pub fn l1_common_shard_input(self) -> usize {
+        self.l1_common_size + self.l1_shard_size
+    }
+
     pub fn l1w_len(self) -> Result<usize> {
-        if self.has_grouped_l1() {
+        if self.has_common_shard_l1() {
+            if self.l1_group_count == 0
+                || self.l1_common_size == 0
+                || self.l1_shard_size == 0
+                || self.l1_common_size + self.l1_shard_size * self.l1_group_count != self.ft_size
+                || self.l1_out() % self.l1_group_count != 0
+            {
+                return Err(CudaCppError::message(format!(
+                    "SFNN common+shard L1 shape dimensions are invalid: {self:?}"
+                )));
+            }
+            checked_product("sfnn common+shard l1w", &[self.num_stacks, self.l1_out(), self.l1_common_shard_input()])
+        } else if self.has_grouped_l1() {
             if self.l1_group_count == 0
                 || self.ft_size % self.l1_group_count != 0
                 || self.l1_out() % self.l1_group_count != 0
@@ -853,7 +887,9 @@ impl SfnnForwardShape {
     }
 
     pub fn l1w_len_saturating(self) -> usize {
-        if self.has_grouped_l1() {
+        if self.has_common_shard_l1() {
+            self.num_stacks.saturating_mul(self.l1_out()).saturating_mul(self.l1_common_shard_input())
+        } else if self.has_grouped_l1() {
             self.num_stacks
                 .saturating_mul(self.l1_group_count)
                 .saturating_mul(self.l1_group_output())
@@ -916,8 +952,8 @@ impl SfnnForwardHostWeights<'_> {
         expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
         match (self.l1fw, self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_grouped_l1() {
-                    return Err(CudaCppError::message("SFNN grouped L1 does not support factorized L1 weights"));
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message("SFNN compact L1 does not support factorized L1 weights"));
                 }
                 expect_len("sfnn l1fw", checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, l1fw.len())?;
                 expect_len("sfnn l1fb", shape.l1_out(), l1fb.len())?;
@@ -1019,8 +1055,8 @@ impl SfnnForwardDeviceWeights {
         )?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_grouped_l1() {
-                    return Err(CudaCppError::message("device SFNN grouped L1 does not support factorized L1 weights"));
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message("device SFNN compact L1 does not support factorized L1 weights"));
                 }
                 expect_len(
                     "device sfnn l1fw",
@@ -1177,6 +1213,8 @@ pub fn sfnn_forward_device(
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
+            shape.l1_common_size,
+            shape.l1_shard_size,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2103,6 +2141,8 @@ pub fn sfnn_backward_train_profile_device(
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
+            shape.l1_common_size,
+            shape.l1_shard_size,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2207,6 +2247,8 @@ fn sfnn_backward_device_impl(
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
+                shape.l1_common_size,
+                shape.l1_shard_size,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -2253,6 +2295,8 @@ fn sfnn_backward_device_impl(
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
+                shape.l1_common_size,
+                shape.l1_shard_size,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -3207,9 +3251,9 @@ impl SfnnRangerOptimizerStates {
         let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
             (Some(l1fw), Some(l1fb)) => (
                 {
-                    if shape.has_grouped_l1() {
+                    if shape.has_compact_l1() {
                         return Err(CudaCppError::message(
-                            "SFNN grouped L1 does not support factorized optimizer state",
+                            "SFNN compact L1 does not support factorized optimizer state",
                         ));
                     }
                     Some(RangerParamState::from_host_state(
@@ -3260,8 +3304,8 @@ impl SfnnRangerOptimizerStates {
         self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_grouped_l1() {
-                    return Err(CudaCppError::message("SFNN grouped L1 does not support factorized optimizer state"));
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message("SFNN compact L1 does not support factorized optimizer state"));
                 }
                 l1fw.validate(checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, "optimizer sfnn l1fw")?;
                 l1fb.validate(shape.l1_out(), "optimizer sfnn l1fb")?;
@@ -4433,6 +4477,7 @@ fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
 }
 
 fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
+    let has_common_shard_marker = shape.l1_common_size != 0 || shape.l1_shard_size != 0;
     if shape.input_size == 0
         || shape.ft_size == 0
         || shape.l1_hidden == 0
@@ -4442,6 +4487,16 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         || shape.ft_size % 2 != 0
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
+    } else if has_common_shard_marker
+        && (shape.l1_common_size == 0
+            || shape.l1_shard_size == 0
+            || shape.l1_group_count <= 1
+            || shape.l1_common_size + shape.l1_shard_size * shape.l1_group_count != shape.ft_size
+            || shape.l1_out() % shape.l1_group_count != 0
+            || shape.l1_common_size % 64 != 0
+            || shape.l1_shard_size % 64 != 0)
+    {
+        Err(CudaCppError::message(format!("SFNN common+shard-L1 shape dimensions are invalid: {shape:?}")))
     } else if shape.has_grouped_l1()
         && (shape.ft_size % shape.l1_group_count != 0 || shape.l1_out() % shape.l1_group_count != 0)
     {
@@ -5029,6 +5084,8 @@ mod ffi {
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
+            l1_common_size: usize,
+            l1_shard_size: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5061,6 +5118,8 @@ mod ffi {
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
+            l1_common_size: usize,
+            l1_shard_size: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5105,6 +5164,8 @@ mod ffi {
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
+            l1_common_size: usize,
+            l1_shard_size: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5150,6 +5211,8 @@ mod ffi {
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
+            l1_common_size: usize,
+            l1_shard_size: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5291,8 +5354,16 @@ mod tests {
 
     #[test]
     fn sfnn_workspace_layout_counts_forward_activations() {
-        let shape =
-            SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 3,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+        };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
         assert_eq!(shape.l1_out(), 3);
@@ -5307,8 +5378,16 @@ mod tests {
 
     #[test]
     fn sfnn_backward_workspace_layout_counts_gradients() {
-        let shape =
-            SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 3,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+        };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
         assert_eq!(layout.l2_gradients_len(), 15);
@@ -5337,6 +5416,8 @@ mod tests {
             l2_size: 64,
             num_stacks: 9,
             l1_group_count: 16,
+            l1_common_size: 0,
+            l1_shard_size: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -5346,6 +5427,29 @@ mod tests {
         assert_eq!(shape.l1_group_output(), 1);
         assert_eq!(shape.l1w_len().unwrap(), 9 * 16 * 1 * 512);
         assert_eq!(layout.l1w_gradients_len(), 9 * 16 * 1 * 512);
+        assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
+    }
+
+    #[test]
+    fn sfnn_common_shard_l1w_layout_is_compact() {
+        let shape = SfnnForwardShape {
+            input_size: 1791,
+            ft_size: 3072,
+            l1_hidden: 7,
+            l2_size: 64,
+            num_stacks: 9,
+            l1_group_count: 8,
+            l1_common_size: 1024,
+            l1_shard_size: 256,
+        };
+        let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
+
+        assert!(shape.has_common_shard_l1());
+        assert_eq!(shape.l1_out(), 8);
+        assert_eq!(shape.l1_common_shard_input(), 1280);
+        assert_eq!(shape.l1_group_output(), 1);
+        assert_eq!(shape.l1w_len().unwrap(), 9 * 8 * 1280);
+        assert_eq!(layout.l1w_gradients_len(), 9 * 8 * 1280);
         assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
     }
 
@@ -5724,7 +5828,16 @@ mod tests {
     }
 
     fn tiny_sfnn_shape() -> SfnnForwardShape {
-        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 }
+        SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+        }
     }
 
     fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {

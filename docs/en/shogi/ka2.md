@@ -138,6 +138,9 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_ka2_256x2_64_64
 
 # For SFNN_KA2 --arch SFNN_ka2_1536_15_32_k3k3
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
+
+# For SFNN_KA2 common+shard L1 --arch SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
+make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
 ```
 
 YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the matching architecture header is generated on the fly. Use **underscores** (not hyphens) in the dimension part of the edition name to avoid a `clang -Wc99-extensions` warning. See [§8 Engine](../tutorial/8-engine.md) for the load procedure.
@@ -146,7 +149,7 @@ YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN]_k3k3` | (required; target is inferred) |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | (required; target is inferred) |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` (e.g. `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 
