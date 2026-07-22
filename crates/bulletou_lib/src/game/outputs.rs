@@ -92,18 +92,19 @@ impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
     }
 }
 
-/// YaneuraOu SFNN `hand64` bucket for one side's hand.
+/// SFNN `hand64` bucket for one side's hand.
 ///
-/// This mirrors `hand64_single_bucket()` in YaneuraOu:
-/// pawn=1, lance/knight=2, silver/gold=3, bishop/rook=5, then `(score+4)/5`
-/// clamped to `0..=7`.
+/// This formula must match the engine-side `hand64_single_bucket()`:
+/// pawn=1, lance/knight=2, silver/gold=3, bishop/rook=5, then `(score+3)/4`
+/// clamped to `0..=7`. Dividing by 4 keeps a single bishop/rook out of the
+/// same bucket as a single pawn.
 #[inline]
 pub fn shogi_hand64_single_bucket(hand: Hand) -> usize {
     let score = usize::from(hand.pawn())
         + usize::from(hand.lance() + hand.knight()) * 2
         + usize::from(hand.silver() + hand.gold()) * 3
         + usize::from(hand.bishop() + hand.rook()) * 5;
-    ((score + 4) / 5).min(7)
+    ((score + 3) / 4).min(7)
 }
 
 /// YaneuraOu SFNN `hand64` LayerStack bucket.
@@ -733,7 +734,7 @@ mod tests {
 
         hand = Hand::EMPTY;
         hand.set_pawn(5);
-        assert_eq!(shogi_hand64_single_bucket(hand), 1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 2);
 
         hand = Hand::EMPTY;
         hand.set_lance(1);
@@ -747,8 +748,12 @@ mod tests {
 
         hand = Hand::EMPTY;
         hand.set_bishop(1);
-        hand.set_rook(1);
         assert_eq!(shogi_hand64_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        hand.set_rook(1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 3);
 
         hand = Hand::EMPTY;
         hand.set_pawn(18);
