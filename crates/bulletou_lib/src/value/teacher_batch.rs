@@ -15,7 +15,7 @@ use crate::{
             Factorised, HALFKP_MAX_ACTIVE_FEATURES, KP_MAX_ACTIVE, ShogiHalfKP, ShogiHalfKPPieceFactorizer,
             ShogiHalfKa2, SparseInputType, fill_halfkp_feature_indices, fill_kp_feature_indices,
         },
-        outputs::ShogiLayerStackBucket9,
+        outputs::{ShogiSfnnLayerStackBucket, ShogiSfnnLayerStackBucketKind},
     },
     shogi::PackedSfenValue,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
@@ -127,6 +127,7 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub batch_size: usize,
     pub batch_index: usize,
     pub dataloader_resume_pos: Option<TeacherDataloaderPos>,
+    pub layerstack_bucket: ShogiSfnnLayerStackBucketKind,
     pub buffer_mb: usize,
     pub loader_threads: usize,
     pub threads: usize,
@@ -1932,7 +1933,7 @@ where
     };
     let dataloader = DefaultDataLoader::new(
         input_getter,
-        ShogiLayerStackBucket9::KingRank9,
+        ShogiSfnnLayerStackBucket::new(config.layerstack_bucket),
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
         config.nnue_pytorch_wrm_loss,
@@ -2127,6 +2128,7 @@ mod tests {
             batch_size: 2,
             batch_index: 0,
             dataloader_resume_pos: None,
+            layerstack_bucket: ShogiSfnnLayerStackBucketKind::KingRank9,
             buffer_mb: 1,
             loader_threads: 1,
             threads: 1,

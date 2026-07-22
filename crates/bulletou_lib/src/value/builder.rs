@@ -218,7 +218,7 @@ impl Bucket for NoOutputBuckets {
 impl<T: 'static> OutputBuckets<T> for NoOutputBuckets {
     const BUCKETS: usize = 1;
 
-    fn bucket(&self, _: &T) -> u8 {
+    fn bucket(&self, _: &T) -> usize {
         0
     }
 }

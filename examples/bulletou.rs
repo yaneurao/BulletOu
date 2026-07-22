@@ -63,7 +63,7 @@ use bulletou_lib::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
-    game::outputs::{OutputBuckets, ShogiLayerStackBucket9},
+    game::outputs::ShogiSfnnLayerStackBucketKind,
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
@@ -180,19 +180,19 @@ impl BackendKind {
 /// from the LayerStacks array, and implicitly determines the **stack
 /// count** (the network model uses one bucket per stack).
 ///
-/// Currently `k3k3(king3-by-king3)` is the only choice — it matches YaneuraOu's
-/// `stack_index_for_nnue` so the trained `nn.bin` is engine-loadable
-/// and evaluation matches between training and inference. Other
-/// schemes implemented in `bulletou_lib::game::outputs::ShogiLayerStackBucket9`
-/// (e.g. `Ply9`, `Progress8*`) are intentionally not exposed here
-/// because they cannot be used with YaneuraOu's engine; they remain
-/// available to `examples/shogi_layerstack.rs` for rshogi-style research.
+/// Supported choices mirror YaneuraOu's `stack_index_for_nnue`, so the trained
+/// `nn.bin` is engine-loadable and evaluation matches between training and
+/// inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LayerStackMode {
     /// 3 × 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
     /// Matches YaneuraOu `stack_index_for_nnue` byte-for-byte.
     #[default]
     Kingrank3by3,
+    /// 8 x 8 = 64 stacks, indexed by side-to-move / non-side hand-score bucket.
+    Hand64,
+    /// 64 hand buckets x 9 king-rank buckets = 576 stacks.
+    Hand64Kingrank3by3,
 }
 
 impl LayerStackMode {
@@ -200,6 +200,8 @@ impl LayerStackMode {
     fn cli_name(self) -> &'static str {
         match self {
             LayerStackMode::Kingrank3by3 => "k3k3(king3-by-king3)",
+            LayerStackMode::Hand64 => "hand64",
+            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3",
         }
     }
 
@@ -207,14 +209,26 @@ impl LayerStackMode {
     fn arch_suffix(self) -> &'static str {
         match self {
             LayerStackMode::Kingrank3by3 => "k3k3",
+            LayerStackMode::Hand64 => "hand64",
+            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3",
         }
     }
 
     /// Number of LayerStacks this bucketing scheme produces.
     fn num_stacks(self) -> usize {
+        self.bucket_kind().num_stacks()
+    }
+
+    fn bucket_kind(self) -> ShogiSfnnLayerStackBucketKind {
         match self {
-            LayerStackMode::Kingrank3by3 => 9,
+            LayerStackMode::Kingrank3by3 => ShogiSfnnLayerStackBucketKind::KingRank9,
+            LayerStackMode::Hand64 => ShogiSfnnLayerStackBucketKind::Hand64,
+            LayerStackMode::Hand64Kingrank3by3 => ShogiSfnnLayerStackBucketKind::Hand64KingRank9,
         }
+    }
+
+    fn bucket_index(self, pos: &bulletou_lib::shogi::PackedSfenValue) -> usize {
+        self.bucket_kind().bucket(pos)
     }
 }
 
@@ -225,6 +239,8 @@ impl LayerStackMode {
 /// - `NNUE_halfkp_256x2_32_32`
 /// - `NNUE_ka2_256x2_64_64`
 /// - `SFNN_halfka2_1024_7_64_k3k3`
+/// - `SFNN_halfka2_1024_7_64_hand64`
+/// - `SFNN_halfka2_1024_7_64_hand64_k3k3`
 /// - `SFNN_halfka2_4096_3_64_g4_k3k3`
 /// - `SFNN_halfka2_4096_7_64_g4_k3k3`
 /// - `SFNN_halfka2_8192_7_64_g8_k3k3`
@@ -416,11 +432,6 @@ impl NnueArch {
                     "invalid arch `{original}`: common+shard SFNN L1 requires cN and sMxG with N>=0, M>0, and G>1"
                 ));
             }
-            if self.layerstack != Some(LayerStackMode::Kingrank3by3) {
-                return Err(format!(
-                    "invalid arch `{original}`: common+shard SFNN L1 currently requires k3k3 LayerStack"
-                ));
-            }
             let l1_out = self.l2 + 1;
             if common_size + shard_size * group_count != self.l1 {
                 return Err(format!(
@@ -443,9 +454,6 @@ impl NnueArch {
             }
             if group_count <= 1 {
                 return Err(format!("invalid arch `{original}`: grouped SFNN L1 requires group count > 1"));
-            }
-            if self.layerstack != Some(LayerStackMode::Kingrank3by3) {
-                return Err(format!("invalid arch `{original}`: grouped SFNN L1 currently requires k3k3 LayerStack"));
             }
             let l1_out = self.l2 + 1;
             if self.l1 % group_count != 0 || l1_out % group_count != 0 {
@@ -541,7 +549,7 @@ impl std::str::FromStr for NnueArch {
         let tokens: Vec<&str> = s.split('_').collect();
         if tokens.len() < 5 {
             return Err(format!(
-                "invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>` or `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3`"
+                "invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>` or `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_<k3k3|hand64|hand64_k3k3>`"
             ));
         }
 
@@ -576,7 +584,9 @@ impl std::str::FromStr for NnueArch {
             }
             NnueArchFamily::Sfnn => {
                 if tokens.len() < 6 {
-                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3`"));
+                    return Err(format!(
+                        "invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_<k3k3|hand64|hand64_k3k3>`"
+                    ));
                 }
                 let l1: usize = tokens[2]
                     .parse()
@@ -628,18 +638,22 @@ impl std::str::FromStr for NnueArch {
                     layerstack_start = 6;
                 }
                 if tokens.len() <= layerstack_start {
-                    return Err(format!("invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_k3k3`"));
+                    return Err(format!(
+                        "invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN]_<k3k3|hand64|hand64_k3k3>`"
+                    ));
                 }
                 let layerstack = match tokens[layerstack_start..].join("_").to_ascii_lowercase().as_str() {
                     "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
+                    "hand64" => LayerStackMode::Hand64,
+                    "hand64_k3k3" | "hand64_king3_by_king3" => LayerStackMode::Hand64Kingrank3by3,
                     "ls9" => {
                         return Err(format!(
-                            "invalid arch `{s}`: ls9 is no longer supported; use k3k3 or king3_by_king3"
+                            "invalid arch `{s}`: ls9 is no longer supported; use k3k3, hand64, or hand64_k3k3"
                         ));
                     }
                     other => {
                         return Err(format!(
-                            "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected k3k3 or king3_by_king3"
+                            "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected k3k3, king3_by_king3, hand64, hand64_k3k3, or hand64_king3_by_king3"
                         ));
                     }
                 };
@@ -5426,6 +5440,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         batch_size,
         batch_index: 0,
         dataloader_resume_pos,
+        layerstack_bucket: layerstack.bucket_kind(),
         buffer_mb: args.buffer_mb,
         loader_threads,
         threads: teacher_threads,
@@ -5474,6 +5489,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     batch_size,
                     batch_index: 0,
                     dataloader_resume_pos: chunk_resume_pos,
+                    layerstack_bucket: layerstack.bucket_kind(),
                     buffer_mb: args.buffer_mb,
                     loader_threads,
                     threads: teacher_threads,
@@ -6462,10 +6478,11 @@ fn run_cuda_cpp_sfnn_final_validation(
     .map_err(|e| e.to_string())?;
     let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
-        let batch = build_sfnn_validation_fast_batch(feature_kind, positions)?;
+        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
         let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
             &ctx,
             bulletou_cuda_cpp::SfnnForwardHostBatch {
@@ -7131,6 +7148,7 @@ where
 #[cfg(feature = "cuda-cpp-backend")]
 fn build_sfnn_validation_fast_batch(
     feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
     positions: &[bulletou_lib::shogi::PackedSfenValue],
 ) -> Result<bulletou_lib::value::FastBatchHost, String> {
     use bulletou_lib::value::{FastBatchHost, FastBatchLayout};
@@ -7195,7 +7213,7 @@ fn build_sfnn_validation_fast_batch(
                 ));
             }
         }
-        buckets[sample] = i32::from(ShogiLayerStackBucket9::KingRank9.bucket(pos));
+        buckets[sample] = layerstack.bucket_index(pos) as i32;
     }
 
     let batch = FastBatchHost {
@@ -10548,6 +10566,16 @@ mod tests {
         assert_eq!(halfka2_c0.sfnn_l1_shard_size(), 1024);
         assert_eq!(halfka2_c0.sfnn_l1_group_count(), 8);
         assert_eq!(halfka2_c0.cli_name(), "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3");
+        let hand64 = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand64").unwrap();
+        assert_eq!(hand64.dims(), (1024, 7, 64));
+        assert_eq!(hand64.expected_eval_type(), EvalType::SfnnHalfka2);
+        assert_eq!(hand64.layerstack.unwrap().num_stacks(), 64);
+        assert_eq!(hand64.cli_name(), "SFNN_halfka2_1024_7_64_hand64");
+        let hand64_k3k3 = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand64_k3k3").unwrap();
+        assert_eq!(hand64_k3k3.layerstack.unwrap().num_stacks(), 576);
+        assert_eq!(hand64_k3k3.cli_name(), "SFNN_halfka2_1024_7_64_hand64_k3k3");
+        let hand64_king_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand64_king3_by_king3").unwrap();
+        assert_eq!(hand64_king_alias.cli_name(), "SFNN_halfka2_1024_7_64_hand64_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10584,6 +10612,9 @@ mod tests {
             "SFNN_ka2_32768_15_64_g16_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
             "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3",
+            "SFNN_halfka2_1024_7_64_hand64",
+            "SFNN_halfka2_1024_7_64_hand64_k3k3",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();

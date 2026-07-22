@@ -6,7 +6,7 @@ training selector is `--arch`:
 - `--arch KPPT`
 - `--arch KPP_KKPT`
 - `--arch NNUE_<feature>_<L1>x2_<L2>_<L3>`
-- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_k3k3`
+- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|hand64|hand64_k3k3>`
 
 The old eval-type names still exist internally as checkpoint/log target
 identifiers so existing output directory names and resume signatures remain
@@ -23,10 +23,10 @@ stable, but users do not pass them on the command line.
 | `NNUE_ka2_<L1>x2_<L2>_<L3>` | `NNUE_KA2` | NNUE | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_NNUE_ka2_*` build |
 | `NNUE_halfkpe9_<L1>x2_<L2>_<L3>` | `NNUE_HALFKPE9` | NNUE | `nn.bin` | yes |
 | `NNUE_halfkpvm_<L1>x2_<L2>_<L3>` | `NNUE_HALFKPVM` | NNUE | `nn.bin` | yes |
-| `SFNN_halfkahm1_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA1HM` | SFNN LayerStacks=9 | `nn.bin` | ablation / experimental |
-| `SFNN_halfkahm2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA2HM` | SFNN LayerStacks=9 | `nn.bin` | yes |
-| `SFNN_halfka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_HALFKA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_halfka2_*_k3k3` build |
-| `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | `SFNN_KA2` | SFNN LayerStacks=9 | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_ka2_*_k3k3` build |
+| `SFNN_halfkahm1_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | `SFNN_HALFKA1HM` | SFNN LayerStacks | `nn.bin` | ablation / experimental |
+| `SFNN_halfkahm2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | `SFNN_HALFKA2HM` | SFNN LayerStacks | `nn.bin` | yes, with matching YaneuraOu SFNN build |
+| `SFNN_halfka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | `SFNN_HALFKA2` | SFNN LayerStacks | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_halfka2_*` build |
+| `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | `SFNN_KA2` | SFNN LayerStacks | `nn.bin` | yes, with matching `YANEURAOU_ENGINE_SFNN_ka2_*` build |
 
 Every target writes `state.bin` for resume and `learn.log` for the per-save
 loss/validation snapshot. Details are in
@@ -76,7 +76,7 @@ Supported NNUE features:
 ### SFNN
 
 ```text
-SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_k3k3
+SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<stack>
 ```
 
 Supported SFNN features:
@@ -86,9 +86,14 @@ Supported SFNN features:
 - `halfka2`
 - `ka2`
 
-`k3k3` selects the YaneuraOu-compatible 9-bucket LayerStack mode. `gN` enables
-the grouped L1 variants, where the FT dimension and `H1 + 1` must both be
-divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
+`<stack>` selects the YaneuraOu-compatible LayerStack bucket algorithm:
+
+- `k3k3` / `king3_by_king3`: 9 buckets by friend/enemy king ranks.
+- `hand64`: 64 buckets by side-to-move / non-side hand-score buckets.
+- `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets × 9 king buckets = 576 stacks.
+
+`gN` enables the grouped L1 variants, where the FT dimension and `H1 + 1` must
+both be divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
 channels are common to every L1 output group, then `G` shard blocks of `M`
 channels follow. `N` may be `0`; for example `c0_s1024x8` is equivalent to a
 pure 8-way grouped L1. It requires `N + M * G == FT`, `(H1 + 1) % G == 0`,
@@ -107,6 +112,8 @@ Examples currently used for experiments:
 - `SFNN_halfka2_8192_7_64_g8_k3k3`
 - `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
+- `SFNN_halfka2_1024_7_64_hand64`
+- `SFNN_halfka2_1024_7_64_hand64_k3k3`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
 - `SFNN_ka2_32768_15_64_g16_k3k3`
 - `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3`

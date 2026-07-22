@@ -30,6 +30,8 @@ Target evaluation functions:
 Target LayerStacks:
 
 - k3k3(king3-by-king3)
+- hand64
+- hand64_k3k3
 
 
 ### Usage

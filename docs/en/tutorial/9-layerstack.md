@@ -5,18 +5,20 @@
 A standard NNUE uses a single MLP to evaluate any position. **LayerStack-family** evaluation functions instead keep **several sub-networks** and pick one per position:
 
 - The right "shape" of evaluation can differ between opening / middlegame / endgame, or between different king-position relationships.
-- So the model keeps 9 independent small sub-networks, and at inference time picks just one based on the position.
+- So the model keeps several independent small sub-networks, and at inference time picks just one based on the position.
 - The **bucket selection logic** has to agree between the engine and bulletou, and is encoded in the `--arch` suffix.
 
-In bulletou, LayerStack is currently used **only** for **YaneuraOu SFNNwoP1536-build training** (= `--arch SFNN_halfkahm1_1536_15_32_k3k3` / `SFNN_halfkahm2_1536_15_32_k3k3`). For the full spec see the [SFNN-1536 training reference](../shogi/sfnn-1536.md).
+In bulletou, LayerStack is used by the **SFNN family**. The suffix at the end of `--arch` selects the same bucket algorithm that the matching YaneuraOu build uses.
 
 ## 9.1 Choosing the LayerStack Suffix
 
 | `--arch` suffix | Buckets | YaneuraOu-loadable | Description |
 |---|---|---|---|
+| **`hand64`** | 64 | yes | Side-to-move hand-score bucket (8 levels) × non-side hand-score bucket (8 levels). |
+| **`hand64_k3k3`** | 576 | yes | `hand64` bucket × `k3k3` bucket. This is much larger on GPU/disk because every stack has its own MLP weights. |
 | **`k3k3(king3-by-king3)`** (default) | 9 | yes | Friend king's rank in 3 groups (1-3 / 4-6 / 7-9) × enemy king's rank in 3 groups = 9 combos. Matches YaneuraOu's `stack_index_for_nnue` exactly. |
 
-This is currently the only supported suffix. If YaneuraOu adds a new bucket scheme in the future we'll add the matching suffix here.
+`hand64_king3_by_king3` is accepted as an alias for `hand64_k3k3`.
 
 ### The k3k3(king3-by-king3) bucket table
 
@@ -39,6 +41,11 @@ LayerStack is **only meaningful for the SFNN family**. The other target families
 ./target/release/examples/bulletou \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
+
+# Train HalfKA2 SFNN with the YaneuraOu hand64 bucket split
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_hand64 \
+    --teacher teachers/
 ```
 
 Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` (= the inferred target and arch values joined into the directory name).
@@ -53,7 +60,7 @@ Loading procedure is the same as in [§8 Load into an engine](8-engine.md). See 
 
 ## 9.4 When you might want to skip LayerStack
 
-Because LayerStack stores 9× the per-bucket weights, both training and inference are heavier than a single MLP.
+Because LayerStack stores per-bucket weights, both training and inference are heavier than a single MLP. `hand64_k3k3` has 576 stacks, so start with a small FT/H1 size or use `hand64` alone when testing the idea.
 
 - If you only have a small teacher (e.g. < 100M positions), the per-bucket position count drops and each bucket trains less effectively.
 - If you don't need YaneuraOu's SFNNwoP1536 build, sticking with `NNUE_HALFKP` / `NNUE_HALFKPVM` etc. is simpler.

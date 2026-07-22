@@ -8,15 +8,17 @@
 - そこで「9 個の独立した小さな NN」を持っておき、局面ごとに 1 個だけを選んで評価値を出す
 - どのサブネットを使うかの **バケット選択ロジック** をやねうら王エンジンと bulletou で揃える必要がある (= `--arch` の suffix で指定)
 
-bulletou で LayerStack を使うのは現状 **やねうら王 SFNNwoP1536 ビルド向けの学習** (= `--arch SFNN_halfkahm1_1536_15_32_k3k3` / `SFNN_halfkahm2_1536_15_32_k3k3`) のみ。詳細仕様は [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) を参照。
+bulletou で LayerStack を使うのは **SFNN ファミリ**。`--arch` の末尾 suffix で、対応するやねうら王ビルドと同じバケット選択アルゴリズムを指定する。
 
 ## 9.1 LayerStack suffix の選択
 
 | `--arch` suffix | バケット数 | やねうら王 load 可 | 説明 |
 |---|---|---|---|
 | **`k3k3(king3-by-king3)`** (デフォルト) | 9 | ○ | 自玉段を 3 区分 (1-3 / 4-6 / 7-9 段) × 敵玉段も 3 区分 = 9 通り。やねうら王の `stack_index_for_nnue` と完全一致 |
+| **`hand64`** | 64 | ○ | 手番側の手駒スコア8段階 × 非手番側の手駒スコア8段階 = 64 通り |
+| **`hand64_k3k3`** | 576 | ○ | `hand64` bucket × `k3k3` bucket。各bucketが独立したMLP重みを持つので、GPUメモリ・保存サイズはかなり大きくなる |
 
-現状サポートしている suffix はこれ 1 つだけ。将来やねうら王側で別のバケット選択スキームが追加されれば、それに対応した suffix をここに足す。
+`hand64_king3_by_king3` は `hand64_k3k3` の別名として受け付ける。
 
 ### k3k3(king3-by-king3) のバケット表
 
@@ -39,6 +41,11 @@ LayerStack は **SFNN ファミリ専用** で、他の target family (`NNUE_hal
 ./target/release/examples/bulletou \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
+
+# やねうら王 hand64 bucket split で HalfKA2 SFNN を学習
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_hand64 \
+    --teacher teachers/
 ```
 
 `--output` を省略すると `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` に書かれる (= 推論された target + `--arch` を連結した命名)。
@@ -53,7 +60,7 @@ LayerStack の学習結果は通常の NNUE と同じく `nn.bin` として書�
 
 ## 9.4 「LayerStack を使わない方が良い」場合
 
-LayerStack は 9 倍のサブネット重みを持つため、学習も推論も単一 NN より重い。
+LayerStack は bucket ごとにサブネット重みを持つため、学習も推論も単一 NN より重い。特に `hand64_k3k3` は 576 stacks なので、最初は小さめの FT/H1 サイズか `hand64` 単体から試すのが安全。
 
 - 教師データが小さい (1 億局面未満など) 場合、9 バケットに分かれる局面数も少なくなり、各バケットの学習効率が落ちる
 - やねうら王に投入する目的でなければ、`NNUE_HALFKP` / `NNUE_HALFKPVM` 等の単一 NN を使った方が手軽

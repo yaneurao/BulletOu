@@ -3,7 +3,7 @@ use std::{path::Path, sync::OnceLock};
 use bulletformat::{ChessBoard, chess::MarlinFormat};
 
 use crate::shogi::{
-    BonaPiece, Color, PackedSfenValue, Piece,
+    BonaPiece, Color, Hand, PackedSfenValue, Piece,
     bona_piece::FE_OLD_END,
     types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
 };
@@ -11,7 +11,7 @@ use crate::shogi::{
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
     const BUCKETS: usize;
 
-    fn bucket(&self, pos: &T) -> u8;
+    fn bucket(&self, pos: &T) -> usize;
 }
 
 #[deprecated(note = "You do not need to specify this anymore, it is the default!")]
@@ -22,7 +22,7 @@ pub struct Single;
 impl<T: 'static> OutputBuckets<T> for Single {
     const BUCKETS: usize = 1;
 
-    fn bucket(&self, _: &T) -> u8 {
+    fn bucket(&self, _: &T) -> usize {
         0
     }
 }
@@ -32,18 +32,18 @@ pub struct MaterialCount<const N: usize>;
 impl<const N: usize> OutputBuckets<ChessBoard> for MaterialCount<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &ChessBoard) -> u8 {
+    fn bucket(&self, pos: &ChessBoard) -> usize {
         let divisor = 32usize.div_ceil(N);
-        (pos.occ().count_ones() as u8 - 2) / divisor as u8
+        (pos.occ().count_ones() as usize - 2) / divisor
     }
 }
 
 impl<const N: usize> OutputBuckets<MarlinFormat> for MaterialCount<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &MarlinFormat) -> u8 {
+    fn bucket(&self, pos: &MarlinFormat) -> usize {
         let divisor = 32usize.div_ceil(N);
-        (pos.occ().count_ones() as u8 - 2) / divisor as u8
+        (pos.occ().count_ones() as usize - 2) / divisor
     }
 }
 
@@ -65,7 +65,7 @@ pub struct ShogiKingRankBucket<const N: usize>;
 impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
     const BUCKETS: usize = N;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         let board = pos.decode();
 
         let side_to_move = board.side_to_move;
@@ -88,7 +88,117 @@ impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
         const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
 
         let bucket = F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)];
-        bucket.min(N - 1) as u8
+        bucket.min(N - 1)
+    }
+}
+
+/// YaneuraOu SFNN `hand64` bucket for one side's hand.
+///
+/// This mirrors `hand64_single_bucket()` in YaneuraOu:
+/// pawn=1, lance/knight=2, silver/gold=3, bishop/rook=5, then `(score+4)/5`
+/// clamped to `0..=7`.
+#[inline]
+pub fn shogi_hand64_single_bucket(hand: Hand) -> usize {
+    let score = usize::from(hand.pawn())
+        + usize::from(hand.lance() + hand.knight()) * 2
+        + usize::from(hand.silver() + hand.gold()) * 3
+        + usize::from(hand.bishop() + hand.rook()) * 5;
+    ((score + 4) / 5).min(7)
+}
+
+/// YaneuraOu SFNN `hand64` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 8 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand64Bucket;
+
+impl ShogiHand64Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand64_single_bucket(stm_hand) * 8 + shogi_hand64_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand64Bucket {
+    const BUCKETS: usize = 64;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand64_k3k3` LayerStack bucket.
+///
+/// YaneuraOu computes `hand64_bucket * 9 + king3_by_king3_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand64KingRankBucket;
+
+impl ShogiHand64KingRankBucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand64Bucket::bucket_index(pos) * 9 + ShogiKingRankBucket::<9>.bucket(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand64KingRankBucket {
+    const BUCKETS: usize = 64 * 9;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// Runtime-selectable YaneuraOu-compatible SFNN LayerStack bucket.
+///
+/// The associated `OutputBuckets::BUCKETS` for the wrapper below is the maximum
+/// supported count; CUDA direct training uses the actual architecture stack
+/// count separately and validates each per-sample bucket against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShogiSfnnLayerStackBucketKind {
+    #[default]
+    KingRank9,
+    Hand64,
+    Hand64KingRank9,
+}
+
+impl ShogiSfnnLayerStackBucketKind {
+    pub const fn num_stacks(self) -> usize {
+        match self {
+            Self::KingRank9 => 9,
+            Self::Hand64 => 64,
+            Self::Hand64KingRank9 => 64 * 9,
+        }
+    }
+
+    pub fn bucket(self, pos: &PackedSfenValue) -> usize {
+        match self {
+            Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
+            Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
+            Self::Hand64KingRank9 => ShogiHand64KingRankBucket::bucket_index(pos),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ShogiSfnnLayerStackBucket {
+    kind: ShogiSfnnLayerStackBucketKind,
+}
+
+impl ShogiSfnnLayerStackBucket {
+    pub const fn new(kind: ShogiSfnnLayerStackBucketKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiSfnnLayerStackBucket {
+    const BUCKETS: usize = 64 * 9;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        self.kind.bucket(pos)
     }
 }
 
@@ -224,10 +334,10 @@ impl Default for ShogiProgressBucket8 {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressBucket8 {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as usize
     }
 }
 
@@ -333,10 +443,10 @@ impl ShogiProgressKPAbs {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressKPAbs {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as usize
     }
 }
 
@@ -517,10 +627,10 @@ impl Default for ShogiProgressBucket8GikouLite {
 impl OutputBuckets<PackedSfenValue> for ShogiProgressBucket8GikouLite {
     const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         let p = self.progress(pos);
         let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        raw.clamp(0, 7) as usize
     }
 }
 
@@ -545,11 +655,11 @@ impl Default for ShogiPlyBucket9 {
 impl OutputBuckets<PackedSfenValue> for ShogiPlyBucket9 {
     const BUCKETS: usize = 9;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         let ply = pos.game_ply();
         for (i, &bound) in self.bounds.iter().enumerate() {
             if ply <= bound {
-                return i as u8;
+                return i;
             }
         }
         8
@@ -574,14 +684,14 @@ pub enum ShogiLayerStackBucket9 {
 impl OutputBuckets<PackedSfenValue> for ShogiLayerStackBucket9 {
     const BUCKETS: usize = 9;
 
-    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
         match self {
             Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
             Self::Ply9(bounds) => {
                 let ply = pos.game_ply();
                 for (i, &bound) in bounds.iter().enumerate() {
                     if ply <= bound {
-                        return i as u8;
+                        return i;
                     }
                 }
                 8
@@ -610,6 +720,52 @@ mod tests {
         bytes[36] = le[0];
         bytes[37] = le[1];
         psv
+    }
+
+    #[test]
+    fn test_shogi_hand64_single_bucket_formula() {
+        let empty = Hand::EMPTY;
+        assert_eq!(shogi_hand64_single_bucket(empty), 0);
+
+        let mut hand = Hand::EMPTY;
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(5);
+        assert_eq!(shogi_hand64_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_lance(1);
+        hand.set_knight(1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_silver(1);
+        hand.set_gold(1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        hand.set_rook(1);
+        assert_eq!(shogi_hand64_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(18);
+        hand.set_lance(4);
+        hand.set_knight(4);
+        hand.set_silver(4);
+        hand.set_gold(4);
+        hand.set_bishop(2);
+        hand.set_rook(2);
+        assert_eq!(shogi_hand64_single_bucket(hand), 7);
+    }
+
+    #[test]
+    fn test_shogi_sfnn_layerstack_bucket_counts() {
+        assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank9.num_stacks(), 9);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64.num_stacks(), 64);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank9.num_stacks(), 576);
     }
 
     #[test]

@@ -352,7 +352,7 @@ where
                                 );
 
                                 if O::BUCKETS > 1 {
-                                    buckets_chunk[i] = i32::from(out.bucket(pos));
+                                    buckets_chunk[i] = out.bucket(pos) as i32;
                                 }
                                 let mut weight = weight_getter.map_or(1.0, |w| w(pos));
                                 if let Some(cap) = score_drop_abs {
@@ -450,7 +450,7 @@ where
                                 );
 
                                 if O::BUCKETS > 1 {
-                                    buckets_chunk[i] = i32::from(out.bucket(pos));
+                                    buckets_chunk[i] = out.bucket(pos) as i32;
                                 }
                                 let mut weight = weight_getter.map_or(1.0, |w| w(pos));
                                 if let Some(cap) = score_drop_abs {
@@ -568,8 +568,8 @@ mod tests {
     impl OutputBuckets<TinyPos> for TinyBuckets {
         const BUCKETS: usize = 3;
 
-        fn bucket(&self, pos: &TinyPos) -> u8 {
-            (pos.a % 3) as u8
+        fn bucket(&self, pos: &TinyPos) -> usize {
+            pos.a % 3
         }
     }
 
