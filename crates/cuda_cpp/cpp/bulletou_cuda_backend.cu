@@ -2616,11 +2616,11 @@ int validate_sfnn_shape(
     }
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     if (common_shard_l1 &&
-        (l1_common_size == 0 || l1_shard_size == 0 || l1_group_count <= 1 ||
+        (l1_shard_size == 0 || l1_group_count <= 1 ||
             l1_common_size + l1_shard_size * l1_group_count != ft_size ||
             ((l1_hidden + 1) % l1_group_count) != 0 ||
             (l1_common_size % 64) != 0 || (l1_shard_size % 64) != 0)) {
-        return fail_message("SFNN common+shard L1 requires common + shard * group == ft_size, H1+1 divisible by group, and common/shard multiples of 64");
+        return fail_message("SFNN common+shard L1 requires common + shard * group == ft_size, H1+1 divisible by group, shard > 0, and common/shard multiples of 64");
     }
     if (!common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count) && (ft_size % l1_group_count != 0 || ((l1_hidden + 1) % l1_group_count) != 0)) {
         return fail_message("SFNN grouped L1 requires ft_size and l1_hidden+1 to be divisible by l1_group_count");

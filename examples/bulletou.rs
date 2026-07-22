@@ -411,9 +411,9 @@ impl NnueArch {
             if self.family != NnueArchFamily::Sfnn {
                 return Err(format!("invalid arch `{original}`: common+shard L1 is only valid for SFNN"));
             }
-            if group_count <= 1 || common_size == 0 || shard_size == 0 {
+            if group_count <= 1 || shard_size == 0 {
                 return Err(format!(
-                    "invalid arch `{original}`: common+shard SFNN L1 requires cN and sMxG with N,M>0 and G>1"
+                    "invalid arch `{original}`: common+shard SFNN L1 requires cN and sMxG with N>=0, M>0, and G>1"
                 ));
             }
             if self.layerstack != Some(LayerStackMode::Kingrank3by3) {
@@ -2208,7 +2208,7 @@ impl Args {
         }
         if arch.has_compact_sfnn_l1() && self.sfnn_factorized_l1 {
             return Err(
-                "--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures such as g8/g16 or c1024_s256x8"
+                "--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures such as c0_s1024x8 or c1024_s256x8"
                     .to_string()
             );
         }
@@ -7361,8 +7361,7 @@ fn expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(
         return Ok(compact.to_vec());
     }
     if cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
-        if shape.l1_common_size == 0
-            || shape.l1_shard_size == 0
+        if shape.l1_shard_size == 0
             || shape.l1_common_size + shape.l1_shard_size * shape.l1_group_count() != shape.ft_size
             || shape.l1_out() % shape.l1_group_count() != 0
         {
@@ -10540,6 +10539,15 @@ mod tests {
         assert_eq!(ka2_cs.sfnn_l1_shard_size(), 256);
         assert_eq!(ka2_cs.sfnn_l1_group_count(), 8);
         assert_eq!(ka2_cs.cli_name(), "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3");
+        let halfka2_c0 = NnueArch::from_str("SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3").unwrap();
+        assert_eq!(halfka2_c0.dims(), (8192, 7, 64));
+        assert_eq!(halfka2_c0.expected_eval_type(), EvalType::SfnnHalfka2);
+        assert!(halfka2_c0.has_common_shard_sfnn_l1());
+        assert!(!halfka2_c0.has_grouped_sfnn_l1());
+        assert_eq!(halfka2_c0.sfnn_l1_common_size(), 0);
+        assert_eq!(halfka2_c0.sfnn_l1_shard_size(), 1024);
+        assert_eq!(halfka2_c0.sfnn_l1_group_count(), 8);
+        assert_eq!(halfka2_c0.cli_name(), "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -10575,6 +10583,7 @@ mod tests {
             "SFNN_ka2_32768_7_64_g8_k3k3",
             "SFNN_ka2_32768_15_64_g16_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
+            "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -12588,42 +12597,50 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_sfnn_common_shard_arch_uses_compact_l1_shape() {
+    fn cuda_cpp_sfnn_common_shard_arches_use_compact_l1_shape() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
-            "--teacher",
-            "/dev/null",
-            "--backend",
-            "cuda-cpp",
-            "--cuda-cpp-train-steps",
-            "1",
-        ])
-        .unwrap();
-        args.validate_arch_flags().unwrap();
-        args.validate_backend_flags().unwrap();
+        for (arch, feature_kind, ft_size, common_size, shard_size, group_count, row_input) in [
+            ("SFNN_ka2_3072_7_64_c1024_s256x8_k3k3", CudaCppSfnnFeatureKind::Ka2, 3072, 1024, 256, 8, 1280),
+            ("SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3", CudaCppSfnnFeatureKind::Halfka2, 8192, 0, 1024, 8, 1024),
+        ] {
+            let args = Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                arch,
+                "--teacher",
+                "/dev/null",
+                "--backend",
+                "cuda-cpp",
+                "--cuda-cpp-train-steps",
+                "1",
+            ])
+            .unwrap();
+            args.validate_arch_flags().unwrap();
+            args.validate_backend_flags().unwrap();
 
-        let shape = bulletou_cuda_cpp::SfnnForwardShape {
-            input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
-            ft_size: 3072,
-            l1_hidden: 7,
-            l2_size: 64,
-            num_stacks: 9,
-            l1_group_count: args.arch().sfnn_l1_group_count(),
-            l1_common_size: args.arch().sfnn_l1_common_size(),
-            l1_shard_size: args.arch().sfnn_l1_shard_size(),
-        };
-        assert!(shape.has_common_shard_l1());
-        assert_eq!(shape.l1_group_count(), 8);
-        assert_eq!(shape.l1_common_size, 1024);
-        assert_eq!(shape.l1_shard_size, 256);
-        assert_eq!(shape.l1_common_shard_input(), 1280);
-        assert_eq!(shape.l1_group_output(), 1);
-        assert_eq!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(), 9 * 8 * 1280);
-        assert!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
+            let shape = bulletou_cuda_cpp::SfnnForwardShape {
+                input_size: feature_kind.training_input_size(),
+                ft_size,
+                l1_hidden: 7,
+                l2_size: 64,
+                num_stacks: 9,
+                l1_group_count: args.arch().sfnn_l1_group_count(),
+                l1_common_size: args.arch().sfnn_l1_common_size(),
+                l1_shard_size: args.arch().sfnn_l1_shard_size(),
+            };
+            assert!(shape.has_common_shard_l1(), "{arch}");
+            assert_eq!(shape.l1_group_count(), group_count, "{arch}");
+            assert_eq!(shape.l1_common_size, common_size, "{arch}");
+            assert_eq!(shape.l1_shard_size, shard_size, "{arch}");
+            assert_eq!(shape.l1_common_shard_input(), row_input, "{arch}");
+            assert_eq!(shape.l1_group_output(), 1, "{arch}");
+            assert_eq!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(), 9 * 8 * row_input, "{arch}");
+            assert!(
+                cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size,
+                "{arch}"
+            );
+        }
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

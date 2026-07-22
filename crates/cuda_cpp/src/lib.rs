@@ -808,11 +808,12 @@ pub struct SfnnForwardShape {
     /// For common+shard L1 this is the shard group count: each output
     /// group sees the common prefix plus its own shard.
     pub l1_group_count: usize,
-    /// Common input prefix size for common+shard SFNN L1. `0` disables
-    /// common+shard mode.
+    /// Common input prefix size for common+shard SFNN L1. This may be `0`
+    /// for pure grouped L1 expressed as `c0_sMxG`.
     pub l1_common_size: usize,
     /// Per-shard input size for common+shard SFNN L1. `0` disables
-    /// common+shard mode.
+    /// common+shard mode unless `l1_common_size` is also non-zero, which is
+    /// rejected as an invalid partial common+shard shape.
     pub l1_shard_size: usize,
 }
 
@@ -860,7 +861,6 @@ impl SfnnForwardShape {
     pub fn l1w_len(self) -> Result<usize> {
         if self.has_common_shard_l1() {
             if self.l1_group_count == 0
-                || self.l1_common_size == 0
                 || self.l1_shard_size == 0
                 || self.l1_common_size + self.l1_shard_size * self.l1_group_count != self.ft_size
                 || self.l1_out() % self.l1_group_count != 0
@@ -4488,8 +4488,7 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
     } else if has_common_shard_marker
-        && (shape.l1_common_size == 0
-            || shape.l1_shard_size == 0
+        && (shape.l1_shard_size == 0
             || shape.l1_group_count <= 1
             || shape.l1_common_size + shape.l1_shard_size * shape.l1_group_count != shape.ft_size
             || shape.l1_out() % shape.l1_group_count != 0
@@ -5451,6 +5450,27 @@ mod tests {
         assert_eq!(shape.l1w_len().unwrap(), 9 * 8 * 1280);
         assert_eq!(layout.l1w_gradients_len(), 9 * 8 * 1280);
         assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
+
+        let c0_shape = SfnnForwardShape {
+            input_size: 133578,
+            ft_size: 8192,
+            l1_hidden: 7,
+            l2_size: 64,
+            num_stacks: 9,
+            l1_group_count: 8,
+            l1_common_size: 0,
+            l1_shard_size: 1024,
+        };
+        let c0_layout = SfnnBackwardWorkspaceLayout::new(c0_shape, 5, 40);
+
+        assert!(c0_shape.has_common_shard_l1());
+        assert!(!c0_shape.has_grouped_l1());
+        assert_eq!(c0_shape.l1_out(), 8);
+        assert_eq!(c0_shape.l1_common_shard_input(), 1024);
+        assert_eq!(c0_shape.l1_group_output(), 1);
+        assert_eq!(c0_shape.l1w_len().unwrap(), 9 * 8 * 1024);
+        assert_eq!(c0_layout.l1w_gradients_len(), 9 * 8 * 1024);
+        assert_eq!(c0_shape.l1w_len().unwrap(), c0_shape.num_stacks * c0_shape.l1_out() * 1024);
     }
 
     #[test]

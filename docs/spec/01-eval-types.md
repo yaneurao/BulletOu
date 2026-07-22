@@ -90,9 +90,10 @@ Supported SFNN features:
 the grouped L1 variants, where the FT dimension and `H1 + 1` must both be
 divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
 channels are common to every L1 output group, then `G` shard blocks of `M`
-channels follow. It requires `N + M * G == FT`, `(H1 + 1) % G == 0`, and
-both `N` and `M` to be multiples of 64. The `+1` is the PSQT shortcut neuron
-added after H1.
+channels follow. `N` may be `0`; for example `c0_s1024x8` is equivalent to a
+pure 8-way grouped L1. It requires `N + M * G == FT`, `(H1 + 1) % G == 0`,
+and both `N` and `M` to be multiples of 64. The `+1` is the PSQT shortcut
+neuron added after H1.
 
 For `_gN_` and `_cN_sMxG_`, BulletOu keeps `l1w` compact in `state.bin` and
 optimizer state, then expands the L1 matrix to the dense YaneuraOu `fc_0`
@@ -104,6 +105,7 @@ Examples currently used for experiments:
 - `SFNN_halfka2_4096_3_64_g4_k3k3`
 - `SFNN_halfka2_8192_3_64_g4_k3k3`
 - `SFNN_halfka2_8192_7_64_g8_k3k3`
+- `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
 - `SFNN_ka2_32768_15_64_g16_k3k3`

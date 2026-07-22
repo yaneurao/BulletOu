@@ -45,6 +45,7 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `SFNN_halfka2_8192_3_64_g4_k3k3` | 8192 | 3 | 64 | Grouped SFNN L1: 8192 is split into 4 groups, so each group maps 2048 -> 1 |
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
 | `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input |
+| `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` | 8192 | 7 | 64 | Common+shard notation for pure grouped L1: 0 common + 1024 x 8 shards |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` | 3072 | 7 | 64 | Common+shard SFNN L1: 1024 common channels plus 8 shards of 256 channels |
 
 ```bash
@@ -55,7 +56,7 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 
 `--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
-Grouped SFNN experiments use an extra `_gN_` field before the LayerStack suffix. For example, `SFNN_ka2_8192_7_64_g8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 groups. Common+shard L1 uses `_cN_sMxG_`; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
+Grouped SFNN experiments can be written with `_c0_sMxG_` before the LayerStack suffix. For example, `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 shards of 1024 channels. Non-zero common+shard L1 uses the same form; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
