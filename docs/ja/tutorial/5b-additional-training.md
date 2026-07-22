@@ -68,6 +68,7 @@
 |---|---|
 | `--arch` | target family や NN topology (feature set / FT / L1 / L2 dims) が変わる = state.bin の tensor shape が合わない |
 | `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
+| `--sfnn-factorized-l1` / `--no-sfnn-factorized-l1` | SFNN state に `l1fw/l1fb` が含まれるかが変わる。新規の非compact SFNNではデフォルトON。古い非factorized SFNN runを再開するときだけ `--no-sfnn-factorized-l1` を使う |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
 これらを変えるなら **`--tag` を変えて別 run として起動** してください。`--resume` を付けても tensor shape が合わないので復元できない。

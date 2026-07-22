@@ -32,6 +32,7 @@
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
+| `--sfnn-factorized-l1` / `--no-sfnn-factorized-l1` | SFNN の shared factorized L1 term を有効/無効にする。非compactな SFNN LayerStack arch ではデフォルトON、compact L1 (`gN` / `cN_sMxG`) arch では自動OFF。古い非factorized SFNN checkpointを再開するときは `--no-sfnn-factorized-l1` を付ける。 | 対応archでは on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |

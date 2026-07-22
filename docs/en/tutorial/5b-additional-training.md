@@ -63,6 +63,7 @@ Total effective epochs trained: 3 + 3 = 6.
 |---|---|
 | `--arch` | Changes the target family or NN topology (feature set / FT / L1 / L2 dims) → state.bin tensor shapes mismatch. |
 | `--arch` LayerStack suffix (SFNN family) | Number of LayerStacks affects the final layer dim. |
+| `--sfnn-factorized-l1` / `--no-sfnn-factorized-l1` | Changes whether SFNN state contains `l1fw/l1fb`. New non-compact SFNN runs enable it by default; use `--no-sfnn-factorized-l1` only to resume older non-factorized SFNN runs. |
 | `--tag` | Changing this lands you in a different output dir = fresh training. (Useful only when starting a new experiment.) |
 
 To change any of these, pass a different `--tag` and run as a separate experiment.

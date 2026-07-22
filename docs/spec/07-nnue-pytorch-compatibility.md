@@ -233,7 +233,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 2. L1 factorized shared term (`l1f`) を BulletOu の SFNN 経路に追加する
    - 初期値はゼロ
    - save 時には bucket weight に fold できる
-   - 実装済み: `--sfnn-factorized-l1` で opt-in
+   - 実装済み: 非compact SFNNではデフォルトON。`--no-sfnn-factorized-l1` で無効化
 
 3. loss を nnue-pytorch WRM 互換にする
    - `nnue2score=600`
