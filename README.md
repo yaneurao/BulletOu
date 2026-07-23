@@ -31,15 +31,19 @@ Target LayerStacks:
 
 - k3k3(king3-by-king3)
 - k9k9(king9-by-king9)
+- k29k29(king29-by-king29)
 - hand64
 - hand64_k3k3
 - hand64_k9k9
+- hand64_k29k29
 - hand256
 - hand256_k3k3
 - hand256_k9k9
+- hand256_k29k29
 - hand1024
 - hand1024_k3k3
 - hand1024_k9k9
+- hand1024_k29k29
 
 
 ### Usage

@@ -6,7 +6,7 @@ training selector is `--arch`:
 - `--arch KPPT`
 - `--arch KPP_KKPT`
 - `--arch NNUE_<feature>_<L1>x2_<L2>_<L3>`
-- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|hand64|hand64_k3k3|hand64_k9k9|hand256|hand256_k3k3|hand256_k9k9|hand1024|hand1024_k3k3|hand1024_k9k9>`
+- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>`
 
 The old eval-type names still exist internally as checkpoint/log target
 identifiers so existing output directory names and resume signatures remain
@@ -90,15 +90,19 @@ Supported SFNN features:
 
 - `k3k3` / `king3_by_king3`: 9 buckets by friend/enemy king ranks.
 - `k9k9` / `king9_by_king9`: 81 buckets by exact friend/enemy king ranks.
+- `k29k29` / `king29_by_king29`: 841 buckets by 29-way friend/enemy king-square buckets.
 - `hand64`: 64 buckets by side-to-move / non-side hand-score buckets.
 - `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets × 9 king buckets = 576 stacks.
 - `hand64_k9k9` / `hand64_king9_by_king9`: 64 hand buckets × 81 king buckets = 5184 stacks.
+- `hand64_k29k29` / `hand64_king29_by_king29`: 64 hand buckets × 841 king buckets = 53824 stacks.
 - `hand256`: 256 buckets by side-to-move / non-side 4-bit hand-presence buckets.
 - `hand256_k3k3` / `hand256_king3_by_king3`: 256 hand buckets × 9 king buckets = 2304 stacks.
 - `hand256_k9k9` / `hand256_king9_by_king9`: 256 hand buckets × 81 king buckets = 20736 stacks.
+- `hand256_k29k29` / `hand256_king29_by_king29`: 256 hand buckets × 841 king buckets = 215296 stacks.
 - `hand1024`: 1024 buckets by side-to-move / non-side 5-bit hand-presence buckets.
 - `hand1024_k3k3` / `hand1024_king3_by_king3`: 1024 hand buckets × 9 king buckets = 9216 stacks.
 - `hand1024_k9k9` / `hand1024_king9_by_king9`: 1024 hand buckets × 81 king buckets = 82944 stacks.
+- `hand1024_k29k29` / `hand1024_king29_by_king29`: 1024 hand buckets × 841 king buckets = 861184 stacks.
 
 `gN` enables the grouped L1 variants, where the FT dimension and `H1 + 1` must
 both be divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
@@ -123,13 +127,17 @@ Examples currently used for experiments:
 - `SFNN_halfka2_1024_7_64_hand64`
 - `SFNN_halfka2_1024_7_64_hand64_k3k3`
 - `SFNN_halfka2_1024_7_64_k9k9`
+- `SFNN_halfka2_1024_7_64_k29k29`
 - `SFNN_halfka2_1024_7_64_hand64_k9k9`
+- `SFNN_halfka2_1024_7_64_hand64_k29k29`
 - `SFNN_halfka2_1024_7_64_hand256`
 - `SFNN_halfka2_1024_7_64_hand256_k3k3`
 - `SFNN_halfka2_1024_7_64_hand256_k9k9`
+- `SFNN_halfka2_1024_7_64_hand256_k29k29`
 - `SFNN_halfka2_1024_7_64_hand1024`
 - `SFNN_halfka2_1024_7_64_hand1024_k3k3`
 - `SFNN_halfka2_1024_7_64_hand1024_k9k9`
+- `SFNN_halfka2_1024_7_64_hand1024_k29k29`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
 - `SFNN_ka2_32768_15_64_g16_k3k3`
 - `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3`

@@ -5,7 +5,7 @@ use bulletformat::{ChessBoard, chess::MarlinFormat};
 use crate::shogi::{
     BonaPiece, Color, Hand, PackedSfenValue, Piece,
     bona_piece::FE_OLD_END,
-    types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
+    types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES, Square},
 };
 
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
@@ -92,6 +92,52 @@ impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
             9 => F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)],
             _ => (F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)]).min(N.saturating_sub(1)),
         }
+    }
+}
+
+/// SFNN `k29k29` bucket for one king square after perspective normalization.
+///
+/// This formula must match the engine-side `king29_single_bucket()`:
+/// ranks 1-3 -> bucket 0, ranks 4-6 -> bucket 1, ranks 7-9 keep full 3x9
+/// square detail and map to buckets 2..=28.
+#[inline]
+pub fn shogi_king29_single_bucket(sq: Square) -> usize {
+    let rank = sq.rank().min(8) as usize;
+    let file = sq.file().min(8) as usize;
+    if rank < 3 {
+        0
+    } else if rank < 6 {
+        1
+    } else {
+        2 + (rank - 6) * 9 + file
+    }
+}
+
+/// YaneuraOu SFNN `k29k29` LayerStack bucket.
+///
+/// YaneuraOu normalizes each king square to the side's perspective, then
+/// computes `stm_king29 * 29 + non_stm_king29`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiKing29ByKing29Bucket;
+
+impl ShogiKing29ByKing29Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let f_king = board.king_square(stm);
+        let e_king = board.king_square(stm.opponent());
+        let f_sq = if stm == Color::Black { f_king } else { f_king.inverse() };
+        let e_sq = if stm == Color::Black { e_king.inverse() } else { e_king };
+        shogi_king29_single_bucket(f_sq) * 29 + shogi_king29_single_bucket(e_sq)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiKing29ByKing29Bucket {
+    const BUCKETS: usize = 29 * 29;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
     }
 }
 
@@ -360,6 +406,69 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand1024KingRank81Bucket {
     }
 }
 
+/// YaneuraOu SFNN `hand64_k29k29` LayerStack bucket.
+///
+/// YaneuraOu computes `hand64_bucket * 841 + king29_by_king29_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand64King29ByKing29Bucket;
+
+impl ShogiHand64King29ByKing29Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand64Bucket::bucket_index(pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand64King29ByKing29Bucket {
+    const BUCKETS: usize = 64 * 841;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand256_k29k29` LayerStack bucket.
+///
+/// YaneuraOu computes `hand256_bucket * 841 + king29_by_king29_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand256King29ByKing29Bucket;
+
+impl ShogiHand256King29ByKing29Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand256Bucket::bucket_index(pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand256King29ByKing29Bucket {
+    const BUCKETS: usize = 256 * 841;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand1024_k29k29` LayerStack bucket.
+///
+/// YaneuraOu computes `hand1024_bucket * 841 + king29_by_king29_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand1024King29ByKing29Bucket;
+
+impl ShogiHand1024King29ByKing29Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand1024Bucket::bucket_index(pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand1024King29ByKing29Bucket {
+    const BUCKETS: usize = 1024 * 841;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
 /// Runtime-selectable YaneuraOu-compatible SFNN LayerStack bucket.
 ///
 /// The associated `OutputBuckets::BUCKETS` for the wrapper below is the maximum
@@ -370,15 +479,19 @@ pub enum ShogiSfnnLayerStackBucketKind {
     #[default]
     KingRank9,
     KingRank81,
+    King29ByKing29,
     Hand64,
     Hand64KingRank9,
     Hand64KingRank81,
+    Hand64King29ByKing29,
     Hand256,
     Hand256KingRank9,
     Hand256KingRank81,
+    Hand256King29ByKing29,
     Hand1024,
     Hand1024KingRank9,
     Hand1024KingRank81,
+    Hand1024King29ByKing29,
 }
 
 impl ShogiSfnnLayerStackBucketKind {
@@ -386,15 +499,19 @@ impl ShogiSfnnLayerStackBucketKind {
         match self {
             Self::KingRank9 => 9,
             Self::KingRank81 => 81,
+            Self::King29ByKing29 => 841,
             Self::Hand64 => 64,
             Self::Hand64KingRank9 => 64 * 9,
             Self::Hand64KingRank81 => 64 * 81,
+            Self::Hand64King29ByKing29 => 64 * 841,
             Self::Hand256 => 256,
             Self::Hand256KingRank9 => 256 * 9,
             Self::Hand256KingRank81 => 256 * 81,
+            Self::Hand256King29ByKing29 => 256 * 841,
             Self::Hand1024 => 1024,
             Self::Hand1024KingRank9 => 1024 * 9,
             Self::Hand1024KingRank81 => 1024 * 81,
+            Self::Hand1024King29ByKing29 => 1024 * 841,
         }
     }
 
@@ -402,15 +519,19 @@ impl ShogiSfnnLayerStackBucketKind {
         match self {
             Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
             Self::KingRank81 => ShogiKingRankBucket::<81>.bucket(pos),
+            Self::King29ByKing29 => ShogiKing29ByKing29Bucket::bucket_index(pos),
             Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
             Self::Hand64KingRank9 => ShogiHand64KingRankBucket::bucket_index(pos),
             Self::Hand64KingRank81 => ShogiHand64KingRank81Bucket::bucket_index(pos),
+            Self::Hand64King29ByKing29 => ShogiHand64King29ByKing29Bucket::bucket_index(pos),
             Self::Hand256 => ShogiHand256Bucket::bucket_index(pos),
             Self::Hand256KingRank9 => ShogiHand256KingRankBucket::bucket_index(pos),
             Self::Hand256KingRank81 => ShogiHand256KingRank81Bucket::bucket_index(pos),
+            Self::Hand256King29ByKing29 => ShogiHand256King29ByKing29Bucket::bucket_index(pos),
             Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
             Self::Hand1024KingRank9 => ShogiHand1024KingRankBucket::bucket_index(pos),
             Self::Hand1024KingRank81 => ShogiHand1024KingRank81Bucket::bucket_index(pos),
+            Self::Hand1024King29ByKing29 => ShogiHand1024King29ByKing29Bucket::bucket_index(pos),
         }
     }
 }
@@ -427,7 +548,7 @@ impl ShogiSfnnLayerStackBucket {
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiSfnnLayerStackBucket {
-    const BUCKETS: usize = 1024 * 81;
+    const BUCKETS: usize = 1024 * 841;
 
     fn bucket(&self, pos: &PackedSfenValue) -> usize {
         self.kind.bucket(pos)
@@ -1110,20 +1231,28 @@ mod tests {
     fn test_shogi_sfnn_layerstack_bucket_counts() {
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank9.num_stacks(), 9);
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank81.num_stacks(), 81);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::King29ByKing29.num_stacks(), 841);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64.num_stacks(), 64);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank9.num_stacks(), 576);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank81.num_stacks(), 5184);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64King29ByKing29.num_stacks(), 53824);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256.num_stacks(), 256);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256KingRank9.num_stacks(), 2304);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256KingRank81.num_stacks(), 20736);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256King29ByKing29.num_stacks(), 215296);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024.num_stacks(), 1024);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024KingRank9.num_stacks(), 9216);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024KingRank81.num_stacks(), 82944);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024King29ByKing29.num_stacks(), 861184);
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiSfnnLayerStackBucket::default().bucket(&startpos_like), 8);
         assert_eq!(
             ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::KingRank81).bucket(&startpos_like),
             80
+        );
+        assert_eq!(
+            ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::King29ByKing29).bucket(&startpos_like),
+            720
         );
     }
 
@@ -1140,6 +1269,30 @@ mod tests {
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiKingRankBucket::<81>.bucket(&startpos_like), 80);
         assert_eq!(ShogiKingRankBucket::<9>.bucket(&startpos_like), 8);
+    }
+
+    #[test]
+    fn test_shogi_king29_by_king29_bucket_formula() {
+        assert_eq!(shogi_king29_single_bucket(Square::new(0, 0)), 0);
+        assert_eq!(shogi_king29_single_bucket(Square::new(8, 2)), 0);
+        assert_eq!(shogi_king29_single_bucket(Square::new(0, 3)), 1);
+        assert_eq!(shogi_king29_single_bucket(Square::new(8, 5)), 1);
+        assert_eq!(shogi_king29_single_bucket(Square::new(0, 6)), 2);
+        assert_eq!(shogi_king29_single_bucket(Square::new(8, 6)), 10);
+        assert_eq!(shogi_king29_single_bucket(Square::new(0, 7)), 11);
+        assert_eq!(shogi_king29_single_bucket(Square::new(8, 8)), 28);
+
+        let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
+        assert_eq!(ShogiKing29ByKing29Bucket::bucket_index(&startpos_like), 24 * 29 + 24);
+
+        let startpos_like_white = psv_with_kings(Color::White, Square::new(4, 8), Square::new(4, 0));
+        assert_eq!(ShogiKing29ByKing29Bucket::bucket_index(&startpos_like_white), 24 * 29 + 24);
+
+        let pos = psv_with_kings(Color::Black, Square::new(0, 6), Square::new(8, 2));
+        assert_eq!(
+            ShogiKing29ByKing29Bucket::bucket_index(&pos),
+            shogi_king29_single_bucket(Square::new(0, 6)) * 29 + shogi_king29_single_bucket(Square::new(0, 6))
+        );
     }
 
     #[test]
@@ -1175,6 +1328,23 @@ mod tests {
         assert_eq!(
             ShogiHand1024KingRank81Bucket::bucket_index(&pos),
             ShogiHand1024Bucket::bucket_index(&pos) * 81 + ShogiKingRankBucket::<81>.bucket(&pos)
+        );
+    }
+
+    #[test]
+    fn test_shogi_hand_king29_bucket_formulas() {
+        let pos = psv_with_kings(Color::White, Square::new(2, 6), Square::new(6, 0));
+        assert_eq!(
+            ShogiHand64King29ByKing29Bucket::bucket_index(&pos),
+            ShogiHand64Bucket::bucket_index(&pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(&pos)
+        );
+        assert_eq!(
+            ShogiHand256King29ByKing29Bucket::bucket_index(&pos),
+            ShogiHand256Bucket::bucket_index(&pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(&pos)
+        );
+        assert_eq!(
+            ShogiHand1024King29ByKing29Bucket::bucket_index(&pos),
+            ShogiHand1024Bucket::bucket_index(&pos) * 841 + ShogiKing29ByKing29Bucket::bucket_index(&pos)
         );
     }
 

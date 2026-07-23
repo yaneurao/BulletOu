@@ -16,15 +16,19 @@ BulletOu では、LayerStack は SFNN family で使います。`--arch` の末�
 |---|---:|---|---|
 | **`k3k3` / `king3_by_king3`** (default) | 9 | ○ | 自玉段を3区分 × 敵玉段を3区分 |
 | **`k9k9` / `king9_by_king9`** | 81 | ○ | 自玉段そのもの × 敵玉段そのもの |
+| **`k29k29` / `king29_by_king29`** | 841 | ○ | 玉1つを29 bucketに分け、自玉 × 敵玉で組み合わせる |
 | **`hand64`** | 64 | ○ | 手番側/非手番側の手駒スコア8段階 |
 | **`hand64_k3k3` / `hand64_king3_by_king3`** | 576 | ○ | `hand64` × `k3k3` |
 | **`hand64_k9k9` / `hand64_king9_by_king9`** | 5184 | ○ | `hand64` × `k9k9` |
+| **`hand64_k29k29` / `hand64_king29_by_king29`** | 53824 | ○ | `hand64` × `k29k29` |
 | **`hand256`** | 256 | ○ | 手番側/非手番側の4bit手駒有無 bucket |
 | **`hand256_k3k3` / `hand256_king3_by_king3`** | 2304 | ○ | `hand256` × `k3k3` |
 | **`hand256_k9k9` / `hand256_king9_by_king9`** | 20736 | ○ | `hand256` × `k9k9` |
+| **`hand256_k29k29` / `hand256_king29_by_king29`** | 215296 | ○ | `hand256` × `k29k29` |
 | **`hand1024`** | 1024 | ○ | 手番側/非手番側の5bit手駒有無 bucket |
 | **`hand1024_k3k3` / `hand1024_king3_by_king3`** | 9216 | ○ | `hand1024` × `k3k3` |
 | **`hand1024_k9k9` / `hand1024_king9_by_king9`** | 82944 | ○ | `hand1024` × `k9k9`。VRAM と checkpoint サイズが非常に大きい |
+| **`hand1024_k29k29` / `hand1024_king29_by_king29`** | 861184 | ○ | `hand1024` × `k29k29`。非常に巨大なので小さい構成から試すこと |
 
 ### k3k3 bucket
 
@@ -39,6 +43,28 @@ BulletOu では、LayerStack は SFNN family で使います。`--arch` の末�
 ### k9k9 bucket
 
 手番側から見た自玉段と敵玉段をそのまま使い、`self_rank * 9 + enemy_rank` で 81 通りにします。
+
+### k29k29 bucket
+
+手番側から見た玉座標に正規化したあと、玉1つを 29 bucket に分けます。
+
+```text
+1段目から3段目: 0
+4段目から6段目: 1
+7段目から9段目: 2..28
+```
+
+7段目から9段目は、3段 × 9筋 = 27マスをそのまま区別します。
+
+```text
+if rank < 3: single = 0
+else if rank < 6: single = 1
+else: single = 2 + (rank - 6) * 9 + file
+
+bucket = self_single * 29 + enemy_single
+```
+
+自陣付近の玉位置を細かく見て、敵陣側・中央側は粗くまとめる bucket です。
 
 ### hand64 bucket
 
@@ -97,7 +123,7 @@ BulletOu では、LayerStack は SFNN family で使います。`--arch` の末�
 
 ## 9.3 注意点
 
-LayerStack は bucket ごとにサブネット重みを持つため、単一 MLP より学習・推論・保存が重くなります。特に `hand1024_k9k9` は 82,944 stacks なので、まずは小さめの FT/H1 サイズ、または `hand256` / `hand1024` 単体から試すのが安全です。
+LayerStack は bucket ごとにサブネット重みを持つため、単一 MLP より学習・推論・保存が重くなります。特に `hand1024_k29k29` は 861,184 stacks なので、まずは小さめの FT/H1 サイズ、または `k29k29` / `hand256` / `hand1024` 単体から試すのが安全です。
 
 - 教師局面が少ないと、1 bucket あたりの学習密度が落ちます。
 - bucket 数が増えるほど checkpoint サイズと VRAM 使用量が増えます。
