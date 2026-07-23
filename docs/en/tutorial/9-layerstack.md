@@ -14,13 +14,19 @@ In bulletou, LayerStack is used by the **SFNN family**. The suffix at the end of
 
 | `--arch` suffix | Buckets | YaneuraOu-loadable | Description |
 |---|---|---|---|
+| **`hand256`** | 256 | yes | Side-to-move / non-side 4-bit hand-presence buckets. |
+| **`hand256_k3k3`** | 2304 | yes | `hand256` bucket × `k3k3` bucket. Very large. |
+| **`hand256_k9k9`** | 20736 | yes | `hand256` bucket × `k9k9` bucket. Huge. |
+| **`hand1024`** | 1024 | yes | Side-to-move / non-side 5-bit hand-presence buckets. |
+| **`hand1024_k3k3`** | 9216 | yes | `hand1024` bucket × `k3k3` bucket. Huge. |
+| **`hand1024_k9k9`** | 82944 | yes | `hand1024` bucket × `k9k9` bucket. Extreme; expect very large VRAM and checkpoint sizes. |
 | **`hand64`** | 64 | yes | Side-to-move hand-score bucket (8 levels) × non-side hand-score bucket (8 levels). |
 | **`hand64_k3k3`** | 576 | yes | `hand64` bucket × `k3k3` bucket. This is much larger on GPU/disk because every stack has its own MLP weights. |
 | **`hand64_k9k9`** | 5184 | yes | `hand64` bucket × `k9k9` bucket. This is very large; use small FT/H1 sizes when experimenting. |
 | **`k3k3(king3-by-king3)`** (default) | 9 | yes | Friend king's rank in 3 groups (1-3 / 4-6 / 7-9) × enemy king's rank in 3 groups = 9 combos. Matches YaneuraOu's `stack_index_for_nnue` exactly. |
 | **`k9k9(king9-by-king9)`** | 81 | yes | Exact friend king rank × exact enemy king rank = 81 combos. |
 
-`king9_by_king9`, `hand64_king3_by_king3`, and `hand64_king9_by_king9` are accepted as aliases for `k9k9`, `hand64_k3k3`, and `hand64_k9k9`.
+`king9_by_king9`, `hand64_king3_by_king3`, `hand64_king9_by_king9`, `hand256_king3_by_king3`, `hand256_king9_by_king9`, `hand1024_king3_by_king3`, and `hand1024_king9_by_king9` are accepted as aliases for the corresponding short suffixes.
 
 ### The k3k3(king3-by-king3) bucket table
 
@@ -62,7 +68,7 @@ Loading procedure is the same as in [§8 Load into an engine](8-engine.md). See 
 
 ## 9.4 When you might want to skip LayerStack
 
-Because LayerStack stores per-bucket weights, both training and inference are heavier than a single MLP. `hand64_k3k3` has 576 stacks and `hand64_k9k9` has 5184 stacks, so start with a small FT/H1 size or use `hand64` alone when testing the idea.
+Because LayerStack stores per-bucket weights, both training and inference are heavier than a single MLP. The hand-combined variants range from 576 stacks (`hand64_k3k3`) to 82944 stacks (`hand1024_k9k9`), so start with a small FT/H1 size or a hand-only suffix when testing the idea.
 
 - If you only have a small teacher (e.g. < 100M positions), the per-bucket position count drops and each bucket trains less effectively.
 - If you don't need YaneuraOu's SFNNwoP1536 build, sticking with `NNUE_HALFKP` / `NNUE_HALFKPVM` etc. is simpler.

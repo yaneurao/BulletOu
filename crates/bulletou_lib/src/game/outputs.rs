@@ -110,6 +110,55 @@ pub fn shogi_hand64_single_bucket(hand: Hand) -> usize {
     ((score + 3) / 4).min(7)
 }
 
+/// SFNN `hand256` bucket for one side's hand.
+///
+/// This formula must match the engine-side `hand256_single_bucket()`:
+/// bit0 = pawn/lance/knight exists, bit1 = silver/gold exists,
+/// bit2 = bishop exists, bit3 = rook exists.
+#[inline]
+pub fn shogi_hand256_single_bucket(hand: Hand) -> usize {
+    let mut bucket = 0usize;
+    if hand.pawn() + hand.lance() + hand.knight() > 0 {
+        bucket |= 1;
+    }
+    if hand.silver() + hand.gold() > 0 {
+        bucket |= 2;
+    }
+    if hand.bishop() > 0 {
+        bucket |= 4;
+    }
+    if hand.rook() > 0 {
+        bucket |= 8;
+    }
+    bucket
+}
+
+/// SFNN `hand1024` bucket for one side's hand.
+///
+/// This formula must match the engine-side `hand1024_single_bucket()`:
+/// bit0 = pawn exists, bit1 = lance/knight exists, bit2 = silver/gold exists,
+/// bit3 = bishop exists, bit4 = rook exists.
+#[inline]
+pub fn shogi_hand1024_single_bucket(hand: Hand) -> usize {
+    let mut bucket = 0usize;
+    if hand.pawn() > 0 {
+        bucket |= 1;
+    }
+    if hand.lance() + hand.knight() > 0 {
+        bucket |= 2;
+    }
+    if hand.silver() + hand.gold() > 0 {
+        bucket |= 4;
+    }
+    if hand.bishop() > 0 {
+        bucket |= 8;
+    }
+    if hand.rook() > 0 {
+        bucket |= 16;
+    }
+    bucket
+}
+
 /// YaneuraOu SFNN `hand64` LayerStack bucket.
 ///
 /// Bucket index is `stm_hand_bucket * 8 + non_stm_hand_bucket`.
@@ -129,6 +178,56 @@ impl ShogiHand64Bucket {
 
 impl OutputBuckets<PackedSfenValue> for ShogiHand64Bucket {
     const BUCKETS: usize = 64;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand256` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 16 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand256Bucket;
+
+impl ShogiHand256Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand256_single_bucket(stm_hand) * 16 + shogi_hand256_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand256Bucket {
+    const BUCKETS: usize = 256;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand1024` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 32 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand1024Bucket;
+
+impl ShogiHand1024Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand1024_single_bucket(stm_hand) * 32 + shogi_hand1024_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand1024Bucket {
+    const BUCKETS: usize = 1024;
 
     fn bucket(&self, pos: &PackedSfenValue) -> usize {
         Self::bucket_index(pos)
@@ -156,6 +255,48 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand64KingRankBucket {
     }
 }
 
+/// YaneuraOu SFNN `hand256_k3k3` LayerStack bucket.
+///
+/// YaneuraOu computes `hand256_bucket * 9 + king3_by_king3_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand256KingRankBucket;
+
+impl ShogiHand256KingRankBucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand256Bucket::bucket_index(pos) * 9 + ShogiKingRankBucket::<9>.bucket(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand256KingRankBucket {
+    const BUCKETS: usize = 256 * 9;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand1024_k3k3` LayerStack bucket.
+///
+/// YaneuraOu computes `hand1024_bucket * 9 + king3_by_king3_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand1024KingRankBucket;
+
+impl ShogiHand1024KingRankBucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand1024Bucket::bucket_index(pos) * 9 + ShogiKingRankBucket::<9>.bucket(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand1024KingRankBucket {
+    const BUCKETS: usize = 1024 * 9;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
 /// YaneuraOu SFNN `hand64_k9k9` LayerStack bucket.
 ///
 /// YaneuraOu computes `hand64_bucket * 81 + king9_by_king9_bucket`.
@@ -177,6 +318,48 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand64KingRank81Bucket {
     }
 }
 
+/// YaneuraOu SFNN `hand256_k9k9` LayerStack bucket.
+///
+/// YaneuraOu computes `hand256_bucket * 81 + king9_by_king9_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand256KingRank81Bucket;
+
+impl ShogiHand256KingRank81Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand256Bucket::bucket_index(pos) * 81 + ShogiKingRankBucket::<81>.bucket(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand256KingRank81Bucket {
+    const BUCKETS: usize = 256 * 81;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand1024_k9k9` LayerStack bucket.
+///
+/// YaneuraOu computes `hand1024_bucket * 81 + king9_by_king9_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand1024KingRank81Bucket;
+
+impl ShogiHand1024KingRank81Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        ShogiHand1024Bucket::bucket_index(pos) * 81 + ShogiKingRankBucket::<81>.bucket(pos)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand1024KingRank81Bucket {
+    const BUCKETS: usize = 1024 * 81;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
 /// Runtime-selectable YaneuraOu-compatible SFNN LayerStack bucket.
 ///
 /// The associated `OutputBuckets::BUCKETS` for the wrapper below is the maximum
@@ -190,6 +373,12 @@ pub enum ShogiSfnnLayerStackBucketKind {
     Hand64,
     Hand64KingRank9,
     Hand64KingRank81,
+    Hand256,
+    Hand256KingRank9,
+    Hand256KingRank81,
+    Hand1024,
+    Hand1024KingRank9,
+    Hand1024KingRank81,
 }
 
 impl ShogiSfnnLayerStackBucketKind {
@@ -200,6 +389,12 @@ impl ShogiSfnnLayerStackBucketKind {
             Self::Hand64 => 64,
             Self::Hand64KingRank9 => 64 * 9,
             Self::Hand64KingRank81 => 64 * 81,
+            Self::Hand256 => 256,
+            Self::Hand256KingRank9 => 256 * 9,
+            Self::Hand256KingRank81 => 256 * 81,
+            Self::Hand1024 => 1024,
+            Self::Hand1024KingRank9 => 1024 * 9,
+            Self::Hand1024KingRank81 => 1024 * 81,
         }
     }
 
@@ -210,6 +405,12 @@ impl ShogiSfnnLayerStackBucketKind {
             Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
             Self::Hand64KingRank9 => ShogiHand64KingRankBucket::bucket_index(pos),
             Self::Hand64KingRank81 => ShogiHand64KingRank81Bucket::bucket_index(pos),
+            Self::Hand256 => ShogiHand256Bucket::bucket_index(pos),
+            Self::Hand256KingRank9 => ShogiHand256KingRankBucket::bucket_index(pos),
+            Self::Hand256KingRank81 => ShogiHand256KingRank81Bucket::bucket_index(pos),
+            Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
+            Self::Hand1024KingRank9 => ShogiHand1024KingRankBucket::bucket_index(pos),
+            Self::Hand1024KingRank81 => ShogiHand1024KingRank81Bucket::bucket_index(pos),
         }
     }
 }
@@ -226,7 +427,7 @@ impl ShogiSfnnLayerStackBucket {
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiSfnnLayerStackBucket {
-    const BUCKETS: usize = 64 * 81;
+    const BUCKETS: usize = 1024 * 81;
 
     fn bucket(&self, pos: &PackedSfenValue) -> usize {
         self.kind.bucket(pos)
@@ -818,12 +1019,106 @@ mod tests {
     }
 
     #[test]
+    fn test_shogi_hand256_single_bucket_formula() {
+        let empty = Hand::EMPTY;
+        assert_eq!(shogi_hand256_single_bucket(empty), 0);
+
+        let mut hand = Hand::EMPTY;
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_lance(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_knight(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_silver(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_gold(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 4);
+
+        hand = Hand::EMPTY;
+        hand.set_rook(1);
+        assert_eq!(shogi_hand256_single_bucket(hand), 8);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(18);
+        hand.set_lance(4);
+        hand.set_knight(4);
+        hand.set_silver(4);
+        hand.set_gold(4);
+        hand.set_bishop(2);
+        hand.set_rook(2);
+        assert_eq!(shogi_hand256_single_bucket(hand), 15);
+    }
+
+    #[test]
+    fn test_shogi_hand1024_single_bucket_formula() {
+        let empty = Hand::EMPTY;
+        assert_eq!(shogi_hand1024_single_bucket(empty), 0);
+
+        let mut hand = Hand::EMPTY;
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_lance(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_knight(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_silver(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 4);
+
+        hand = Hand::EMPTY;
+        hand.set_gold(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 4);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 8);
+
+        hand = Hand::EMPTY;
+        hand.set_rook(1);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 16);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(18);
+        hand.set_lance(4);
+        hand.set_knight(4);
+        hand.set_silver(4);
+        hand.set_gold(4);
+        hand.set_bishop(2);
+        hand.set_rook(2);
+        assert_eq!(shogi_hand1024_single_bucket(hand), 31);
+    }
+
+    #[test]
     fn test_shogi_sfnn_layerstack_bucket_counts() {
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank9.num_stacks(), 9);
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank81.num_stacks(), 81);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64.num_stacks(), 64);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank9.num_stacks(), 576);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank81.num_stacks(), 5184);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256.num_stacks(), 256);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256KingRank9.num_stacks(), 2304);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand256KingRank81.num_stacks(), 20736);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024.num_stacks(), 1024);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024KingRank9.num_stacks(), 9216);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024KingRank81.num_stacks(), 82944);
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiSfnnLayerStackBucket::default().bucket(&startpos_like), 8);
         assert_eq!(
@@ -859,6 +1154,27 @@ mod tests {
         assert_eq!(
             ShogiHand64KingRank81Bucket::bucket_index(&startpos_like),
             ShogiHand64Bucket::bucket_index(&startpos_like) * 81 + 80
+        );
+    }
+
+    #[test]
+    fn test_shogi_hand256_and_hand1024_king_bucket_formulas() {
+        let pos = psv_with_kings(Color::White, Square::new(4, 1), Square::new(4, 8));
+        assert_eq!(
+            ShogiHand256KingRankBucket::bucket_index(&pos),
+            ShogiHand256Bucket::bucket_index(&pos) * 9 + ShogiKingRankBucket::<9>.bucket(&pos)
+        );
+        assert_eq!(
+            ShogiHand256KingRank81Bucket::bucket_index(&pos),
+            ShogiHand256Bucket::bucket_index(&pos) * 81 + ShogiKingRankBucket::<81>.bucket(&pos)
+        );
+        assert_eq!(
+            ShogiHand1024KingRankBucket::bucket_index(&pos),
+            ShogiHand1024Bucket::bucket_index(&pos) * 9 + ShogiKingRankBucket::<9>.bucket(&pos)
+        );
+        assert_eq!(
+            ShogiHand1024KingRank81Bucket::bucket_index(&pos),
+            ShogiHand1024Bucket::bucket_index(&pos) * 81 + ShogiKingRankBucket::<81>.bucket(&pos)
         );
     }
 

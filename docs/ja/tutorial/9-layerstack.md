@@ -1,80 +1,107 @@
-# 9. LayerStack — 局面ごとに別の評価関数を使い分ける
+# 9. LayerStack — 局面ごとに別のサブネットを使う
 
 <a href="../../en/tutorial/9-layerstack.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-通常の NNUE は局面に関係なく 1 つの NN で評価値を出す。これに対して **LayerStack 系評価関数** は、局面に応じて **複数のサブネットワークを使い分ける**:
+通常の NNUE は、局面に関係なく 1 つの MLP で評価値を出します。これに対して **LayerStack 系の評価関数** は、複数の小さなサブネットを持ち、局面ごとに 1 つを選んで使います。
 
-- 序盤 / 中盤 / 終盤、あるいは玉の位置関係などで、評価関数の傾向は実は異なるはず
-- そこで「9 個の独立した小さな NN」を持っておき、局面ごとに 1 個だけを選んで評価値を出す
-- どのサブネットを使うかの **バケット選択ロジック** をやねうら王エンジンと bulletou で揃える必要がある (= `--arch` の suffix で指定)
+- 序盤・中盤・終盤、あるいは玉位置や手駒状態によって、評価関数に欲しい形が変わることがあります。
+- そこで bucket ごとに独立した `fc_0 + fc_1 + fc_2` 重みを持ち、推論時に局面から bucket を選びます。
+- bucket 選択ロジックは、やねうら王側と BulletOu 側で完全に一致している必要があります。
 
-bulletou で LayerStack を使うのは **SFNN ファミリ**。`--arch` の末尾 suffix で、対応するやねうら王ビルドと同じバケット選択アルゴリズムを指定する。
+BulletOu では、LayerStack は SFNN family で使います。`--arch` の末尾 suffix が、やねうら王 build 側の bucket 選択アルゴリズムに対応します。
 
 ## 9.1 LayerStack suffix の選択
 
-| `--arch` suffix | バケット数 | やねうら王 load 可 | 説明 |
-|---|---|---|---|
-| **`k3k3(king3-by-king3)`** (デフォルト) | 9 | ○ | 自玉段を 3 区分 (1-3 / 4-6 / 7-9 段) × 敵玉段も 3 区分 = 9 通り。やねうら王の `stack_index_for_nnue` と完全一致 |
-| **`k9k9(king9-by-king9)`** | 81 | ○ | 自玉段そのもの × 敵玉段そのもの = 81 通り |
-| **`hand64`** | 64 | ○ | 手番側の手駒スコア8段階 × 非手番側の手駒スコア8段階 = 64 通り |
-| **`hand64_k3k3`** | 576 | ○ | `hand64` bucket × `k3k3` bucket。各bucketが独立したMLP重みを持つので、GPUメモリ・保存サイズはかなり大きくなる |
-| **`hand64_k9k9`** | 5184 | ○ | `hand64` bucket × `k9k9` bucket。非常に大きいので、実験時は小さめの FT/H1 から始めるのが安全 |
+| `--arch` suffix | buckets | やねうら王でload可 | 説明 |
+|---|---:|---|---|
+| **`k3k3` / `king3_by_king3`** (default) | 9 | ○ | 自玉段を3区分 × 敵玉段を3区分 |
+| **`k9k9` / `king9_by_king9`** | 81 | ○ | 自玉段そのもの × 敵玉段そのもの |
+| **`hand64`** | 64 | ○ | 手番側/非手番側の手駒スコア8段階 |
+| **`hand64_k3k3` / `hand64_king3_by_king3`** | 576 | ○ | `hand64` × `k3k3` |
+| **`hand64_k9k9` / `hand64_king9_by_king9`** | 5184 | ○ | `hand64` × `k9k9` |
+| **`hand256`** | 256 | ○ | 手番側/非手番側の4bit手駒有無 bucket |
+| **`hand256_k3k3` / `hand256_king3_by_king3`** | 2304 | ○ | `hand256` × `k3k3` |
+| **`hand256_k9k9` / `hand256_king9_by_king9`** | 20736 | ○ | `hand256` × `k9k9` |
+| **`hand1024`** | 1024 | ○ | 手番側/非手番側の5bit手駒有無 bucket |
+| **`hand1024_k3k3` / `hand1024_king3_by_king3`** | 9216 | ○ | `hand1024` × `k3k3` |
+| **`hand1024_k9k9` / `hand1024_king9_by_king9`** | 82944 | ○ | `hand1024` × `k9k9`。VRAM と checkpoint サイズが非常に大きい |
 
-`king9_by_king9`, `hand64_king3_by_king3`, `hand64_king9_by_king9` は、それぞれ `k9k9`, `hand64_k3k3`, `hand64_k9k9` の別名として受け付ける。
+### k3k3 bucket
 
-### k3k3(king3-by-king3) のバケット表
+手番側から見た自玉段・敵玉段をそれぞれ 3 区分に丸め、9 通りにします。
 
-両玉の段 (perspective 反転後) を 3 区分にしてから組み合わせる:
+|  | 敵玉 1-3段 | 敵玉 4-6段 | 敵玉 7-9段 |
+|---|---:|---:|---:|
+| **自玉 1-3段** | 0 | 1 | 2 |
+| **自玉 4-6段** | 3 | 4 | 5 |
+| **自玉 7-9段** | 6 | 7 | 8 |
 
-|  | 敵玉 1-3 段 | 敵玉 4-6 段 | 敵玉 7-9 段 |
-|---|---|---|---|
-| **自玉 1-3 段** | bucket 0 | bucket 1 | bucket 2 |
-| **自玉 4-6 段** | bucket 3 | bucket 4 | bucket 5 |
-| **自玉 7-9 段** | bucket 6 | bucket 7 | bucket 8 |
+### k9k9 bucket
 
-各 bucket は独立した「fc_0 + fc_1 + fc_2」のセットを持ち、学習中はその bucket に分類された局面だけからその bucket の重みを更新する。
+手番側から見た自玉段と敵玉段をそのまま使い、`self_rank * 9 + enemy_rank` で 81 通りにします。
 
-## 9.2 使う場面
+### hand64 bucket
 
-LayerStack は **SFNN ファミリ専用** で、他の target family (`NNUE_halfkp_*` / `NNUE_kp_*` / `NNUE_halfkpe9_*` / `NNUE_halfkpvm_*` / `KPPT` 系) は単一 NN 構造のため LayerStack 不要。
+片側の手駒を次のスコアに変換し、`bucket = min((score + 3) / 4, 7)` とします。
+
+- 歩: 1
+- 香/桂: 2
+- 銀/金: 3
+- 角/飛: 5
+
+最終 bucket は `手番側 bucket * 8 + 非手番側 bucket` です。
+
+### hand256 bucket
+
+片側の手駒を 4bit の有無に変換します。
+
+- bit0: 歩/香/桂 のいずれかを持つ
+- bit1: 銀/金 のいずれかを持つ
+- bit2: 角を持つ
+- bit3: 飛を持つ
+
+最終 bucket は `手番側 bucket * 16 + 非手番側 bucket` です。
+
+### hand1024 bucket
+
+片側の手駒を 5bit の有無に変換します。
+
+- bit0: 歩を持つ
+- bit1: 香/桂 のいずれかを持つ
+- bit2: 銀/金 のいずれかを持つ
+- bit3: 角を持つ
+- bit4: 飛を持つ
+
+最終 bucket は `手番側 bucket * 32 + 非手番側 bucket` です。
+
+手駒 bucket と king bucket を組み合わせる場合、やねうら王と同じく `hand_bucket * king_bucket_count + king_bucket` の順で index を作ります。
+
+## 9.2 使い方
 
 ```bash
-# SFNN-1536 を k3k3(king3-by-king3) = 9 バケットで学習
+# k3k3 = 9 stacks
 ./target/release/examples/bulletou \
     --arch SFNN_halfkahm2_1536_15_32_k3k3 \
     --teacher teachers/
 
-# やねうら王 hand64 bucket split で HalfKA2 SFNN を学習
+# hand256 bucket split
 ./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand64 \
+    --arch SFNN_halfka2_1024_7_64_hand256 \
+    --teacher teachers/
+
+# common+shard L1 と hand256_k3k3 の組み合わせ
+./target/release/examples/bulletou \
+    --arch SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3 \
     --teacher teachers/
 ```
 
-`--output` を省略すると `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` に書かれる (= 推論された target + `--arch` を連結した命名)。
+## 9.3 注意点
 
-学習自体のスケジューリング (`--lr` / `--superbatches` 等) は [§6 学習をチューニング](6-tune.md) と共通。結果の確認も [§7 結果を確認する](7-result.md) と同じ。
+LayerStack は bucket ごとにサブネット重みを持つため、単一 MLP より学習・推論・保存が重くなります。特に `hand1024_k9k9` は 82,944 stacks なので、まずは小さめの FT/H1 サイズ、または `hand256` / `hand1024` 単体から試すのが安全です。
 
-## 9.3 実機での load 確認
-
-LayerStack の学習結果は通常の NNUE と同じく `nn.bin` として書かれ、やねうら王の **SFNNwoP1536 ビルド** で `setoption EvalDir → isready → bench` で動作確認する。`isready` 時に `info string Warning: NNUE hash mismatch` が出るが、これは想定動作 (load は続行される)。
-
-詳細手順は [§8 エンジンに組み込む](8-engine.md) を参照。やねうら王の SFNN ビルドのビルド方法・USI オプションは [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) も合わせて見ること。
-
-## 9.4 「LayerStack を使わない方が良い」場合
-
-LayerStack は bucket ごとにサブネット重みを持つため、学習も推論も単一 NN より重い。特に `hand64_k3k3` は 576 stacks、`hand64_k9k9` は 5184 stacks なので、最初は小さめの FT/H1 サイズか `hand64` 単体から試すのが安全。
-
-- 教師データが小さい (1 億局面未満など) 場合、9 バケットに分かれる局面数も少なくなり、各バケットの学習効率が落ちる
-- やねうら王に投入する目的でなければ、`NNUE_HALFKP` / `NNUE_HALFKPVM` 等の単一 NN を使った方が手軽
-
-実用的には:
-- **やねうら王 SFNNwoP1536 互換の評価関数が欲しい** → SFNN_HALFKA2HM + LayerStack を使う
-- それ以外 → 通常の NNUE 系で十分
-
-## 9.5 関連
-
-- [SFNN-1536 学習リファレンス](../shogi/sfnn-1536.md) — アーキ・binary layout・量子化スケール
-- 既存実装: `examples/shogi_layerstack.rs` — 9 バケット以外の (実験的) bucketing モードあり (rshogi 互換出力、bulletou と並行存続)
+- 教師局面が少ないと、1 bucket あたりの学習密度が落ちます。
+- bucket 数が増えるほど checkpoint サイズと VRAM 使用量が増えます。
+- やねうら王側も同じ architecture suffix で build してください。
 
 ---
 

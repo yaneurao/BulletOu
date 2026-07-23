@@ -34,6 +34,12 @@ Target LayerStacks:
 - hand64
 - hand64_k3k3
 - hand64_k9k9
+- hand256
+- hand256_k3k3
+- hand256_k9k9
+- hand1024
+- hand1024_k3k3
+- hand1024_k9k9
 
 
 ### Usage
