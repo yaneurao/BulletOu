@@ -233,7 +233,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
 2. L1 factorized shared term (`l1f`) を BulletOu の SFNN 経路に追加する
    - 初期値はゼロ
    - save 時には bucket weight に fold できる
-   - 実装済み: 非compact SFNNではデフォルトON。`--no-sfnn-factorized-l1` で無効化
+   - 実装済み: 非compact SFNNではデフォルトON。`--no-sfnn-factorized` で無効化
 
 3. loss を nnue-pytorch WRM 互換にする
    - `nnue2score=600`
@@ -303,5 +303,5 @@ BulletOu cuda-cpp SFNN now uses stack shared factorizer terms beyond L1:
 
 - dense L1 architectures: `l1fw/l1fb`, `l2fw/l2fb`, and `l3fw/l3fb` are enabled by default
 - compact L1 architectures (`gN` / `cN_sMxG`): L1 shared term is not used, but `l2fw/l2fb` and `l3fw/l3fb` are enabled by default
-- `--no-sfnn-factorized-l1` is kept as the compatibility flag and disables all SFNN shared stack factorizer terms
+- `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms
 - `state.bin` preserves the shared tensors and their Ranger optimizer states; `nn.bin` folds the shared tensors into each bucket's stacked weights before export

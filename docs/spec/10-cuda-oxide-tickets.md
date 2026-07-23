@@ -1101,7 +1101,7 @@ current cuda-cpp follow-up queue.
 - Defaults:
   - dense-L1 SFNN LayerStack: L1/L2/L3 shared terms are enabled;
   - compact-L1 SFNN LayerStack (`gN`, `cN_sMxG`): L1 shared term remains disabled, but L2/L3 shared terms are enabled;
-  - `--no-sfnn-factorized-l1` remains the compatibility switch and disables all SFNN shared stack factorizer terms.
+  - `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms.
 - Export/validation:
   - validation weights and `nn.bin` fold L1/L2/L3 shared terms into each bucket's stacked weights;
   - full `state.bin` preserves the unfused shared tensors and their optimizer state for resume.

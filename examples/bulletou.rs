@@ -1653,7 +1653,7 @@ fn effective_save_epoch_end(args: &Args) -> bool {
 }
 
 fn effective_sfnn_factorized_stack(args: &Args) -> bool {
-    !args.no_sfnn_factorized_l1 && args.resolved_eval_type().is_some_and(EvalType::uses_layerstack)
+    !args.no_sfnn_factorized && args.resolved_eval_type().is_some_and(EvalType::uses_layerstack)
 }
 
 fn effective_sfnn_factorized_l1(args: &Args) -> bool {
@@ -2096,13 +2096,13 @@ struct Args {
     /// to every bucket during training, then folded into each bucket when
     /// saving `nn.bin`. L1 is used for dense L1 architectures; L2/L3 are used
     /// for all SFNN LayerStack architectures. This is enabled by default.
-    #[arg(long, conflicts_with = "no_sfnn_factorized_l1")]
-    sfnn_factorized_l1: bool,
+    #[arg(long = "sfnn-factorized", alias = "sfnn-factorized-l1", conflicts_with = "no_sfnn_factorized")]
+    sfnn_factorized: bool,
 
     /// Disable the default SFNN factorized shared stack terms. Use this when
     /// resuming an older non-factorized SFNN experiment.
-    #[arg(long = "no-sfnn-factorized-l1")]
-    no_sfnn_factorized_l1: bool,
+    #[arg(long = "no-sfnn-factorized")]
+    no_sfnn_factorized: bool,
 
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
@@ -2831,8 +2831,8 @@ fn main() {
         eprintln!("error: --nnue-pytorch-init-scale currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
-    if args.sfnn_factorized_l1 && !args.eval_type().uses_layerstack() {
-        eprintln!("error: --sfnn-factorized-l1 currently applies to SFNN / LayerStack eval types only.");
+    if args.sfnn_factorized && !args.eval_type().uses_layerstack() {
+        eprintln!("error: --sfnn-factorized currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
     // `geometric` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
@@ -7754,19 +7754,19 @@ fn load_cuda_cpp_sfnn_initial_state(
             wants_l1f,
             weights.l1fw.is_some(),
             "l1fw/l1fb factorized-L1 weights",
-            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+            "Pass --no-sfnn-factorized to resume/use this state unchanged, or start a new experiment.",
         ),
         (
             wants_l2_l3f,
             weights.l2fw.is_some(),
             "l2fw/l2fb factorized-L2 weights",
-            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+            "Pass --no-sfnn-factorized to resume/use this state unchanged, or start a new experiment.",
         ),
         (
             wants_l2_l3f,
             weights.l3fw.is_some(),
             "l3fw/l3fb factorized-L3 weights",
-            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+            "Pass --no-sfnn-factorized to resume/use this state unchanged, or start a new experiment.",
         ),
     ] {
         match (wants, has) {
@@ -7778,8 +7778,8 @@ fn load_cuda_cpp_sfnn_initial_state(
             }
             (false, true) => {
                 return Err(format!(
-                    "loaded SFNN state {} contains {label}, but --no-sfnn-factorized-l1 disabled shared stack terms. \
-                     Remove --no-sfnn-factorized-l1 to resume this state.",
+                    "loaded SFNN state {} contains {label}, but --no-sfnn-factorized disabled shared stack terms. \
+                     Remove --no-sfnn-factorized to resume this state.",
                     path.display()
                 ));
             }
@@ -12198,7 +12198,7 @@ mod tests {
     }
 
     #[test]
-    fn sfnn_factorized_l1_can_be_disabled() {
+    fn sfnn_factorized_can_be_disabled() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -12211,7 +12211,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--no-sfnn-factorized-l1",
+            "--no-sfnn-factorized",
         ])
         .unwrap();
 
@@ -12223,6 +12223,26 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn old_no_sfnn_factorized_l1_flag_is_rejected() {
+        use clap::Parser as _;
+
+        let result = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--no-sfnn-factorized-l1",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -12325,7 +12345,7 @@ mod tests {
             "1024",
             "--positions-per-superbatch",
             "1024",
-            "--sfnn-factorized-l1",
+            "--sfnn-factorized",
         ])
         .unwrap();
 
@@ -12363,7 +12383,7 @@ mod tests {
             "yamaoka-floodgate.psv",
             "--save-rate",
             "1",
-            "--sfnn-factorized-l1",
+            "--sfnn-factorized",
         ])
         .unwrap();
 
@@ -13008,7 +13028,7 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_sfnn_initial_weights_can_disable_factorized_l1() {
+    fn cuda_cpp_sfnn_initial_weights_can_disable_factorized() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -13021,7 +13041,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--no-sfnn-factorized-l1",
+            "--no-sfnn-factorized",
         ])
         .unwrap();
 
@@ -13097,7 +13117,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--sfnn-factorized-l1",
+            "--sfnn-factorized",
         ])
         .unwrap();
         assert!(!effective_sfnn_factorized_l1(&args));
