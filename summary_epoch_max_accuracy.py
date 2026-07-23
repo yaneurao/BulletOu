@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
         "log",
         nargs="?",
         default="summary-learn.log",
-        help="summary-learn.log path. Defaults to ./summary-learn.log",
+        help="summary-learn.log path. Defaults to summary-learn.log in the current working directory",
     )
     parser.add_argument(
         "--column",
