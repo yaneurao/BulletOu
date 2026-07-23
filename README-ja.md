@@ -30,8 +30,10 @@
 対応するLayerStack:
 
 - k3k3(king3-by-king3)
+- k9k9(king9-by-king9)
 - hand64
 - hand64_k3k3
+- hand64_k9k9
 
 
 ### 使い方

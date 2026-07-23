@@ -149,7 +149,7 @@ YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | (required; target is inferred) |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | (required; target is inferred) |
 | `--teacher` | Teacher file / directory / comma-separated list | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` (e.g. `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 

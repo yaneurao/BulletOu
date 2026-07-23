@@ -46,6 +46,8 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 | `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
 | `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | やねうら王 hand64 LayerStack bucket (64 stacks) |
 | `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 × k3k3 LayerStack bucket (576 stacks、かなり大きい) |
+| `SFNN_halfka2_1024_7_64_k9k9` | 1024 | 7 | 64 | king9-by-king9 LayerStack bucket (81 stacks) |
+| `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 × k9k9 LayerStack bucket (5184 stacks、非常に大きい) |
 | `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN |
 | `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` | 8192 | 7 | 64 | common+shard 表記の pure grouped L1。0 common + 1024 x 8 shards |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` | 3072 | 7 | 64 | common+shard SFNN L1。1024 common + 256 x 8 shards |
@@ -58,7 +60,7 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
 
 `--arch` は学習対象と architecture の唯一の指定なので、通常の学習では必須。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
 
-grouped SFNN の実験は LayerStack suffix の前に `_c0_sMxG_` で書ける。たとえば `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 1024 x 8 shards に分割` という意味。common が非ゼロの common+shard L1 も同じ `_cN_sMxG_` を使う。例: `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は 1024 common + 256 x 8 shards。suffix は `k3k3`, `hand64`, `hand64_k3k3` を指定できる。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
+grouped SFNN の実験は LayerStack suffix の前に `_c0_sMxG_` で書ける。たとえば `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 1024 x 8 shards に分割` という意味。common が非ゼロの common+shard L1 も同じ `_cN_sMxG_` を使う。例: `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は 1024 common + 256 x 8 shards。suffix は `k3k3`, `k9k9`, `hand64`, `hand64_k3k3`, `hand64_k9k9` を指定できる。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 

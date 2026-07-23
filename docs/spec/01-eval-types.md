@@ -6,7 +6,7 @@ training selector is `--arch`:
 - `--arch KPPT`
 - `--arch KPP_KKPT`
 - `--arch NNUE_<feature>_<L1>x2_<L2>_<L3>`
-- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|hand64|hand64_k3k3>`
+- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|hand64|hand64_k3k3|hand64_k9k9>`
 
 The old eval-type names still exist internally as checkpoint/log target
 identifiers so existing output directory names and resume signatures remain
@@ -89,8 +89,10 @@ Supported SFNN features:
 `<stack>` selects the YaneuraOu-compatible LayerStack bucket algorithm:
 
 - `k3k3` / `king3_by_king3`: 9 buckets by friend/enemy king ranks.
+- `k9k9` / `king9_by_king9`: 81 buckets by exact friend/enemy king ranks.
 - `hand64`: 64 buckets by side-to-move / non-side hand-score buckets.
 - `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets × 9 king buckets = 576 stacks.
+- `hand64_k9k9` / `hand64_king9_by_king9`: 64 hand buckets × 81 king buckets = 5184 stacks.
 
 `gN` enables the grouped L1 variants, where the FT dimension and `H1 + 1` must
 both be divisible by `N`. `_cN_sMxG` enables common+shard L1: the first `N` FT
@@ -114,6 +116,8 @@ Examples currently used for experiments:
 - `SFNN_halfka2_4096_15_64_g16_k3k3`
 - `SFNN_halfka2_1024_7_64_hand64`
 - `SFNN_halfka2_1024_7_64_hand64_k3k3`
+- `SFNN_halfka2_1024_7_64_k9k9`
+- `SFNN_halfka2_1024_7_64_hand64_k9k9`
 - `SFNN_ka2_8192_7_64_g8_k3k3`
 - `SFNN_ka2_32768_15_64_g16_k3k3`
 - `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3`

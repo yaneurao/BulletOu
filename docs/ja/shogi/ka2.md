@@ -149,7 +149,7 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_k3k3` | (required; target is inferred) |
+| `--arch` | `NNUE_ka2_<L1>x2_<L2>_<L3>` or `SFNN_ka2_<FT>_<H1>_<H2>[_gN\|_cN_sMxG]_<stack>` | (required; target is inferred) |
 | `--teacher` | 教師ファイル / ディレクトリ / カンマ区切り | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_KA2-NNUE_ka2_256x2_32_32`) |
 

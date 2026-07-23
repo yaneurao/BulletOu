@@ -454,7 +454,7 @@ fn read_samples(
         psv.as_bytes_mut().copy_from_slice(&buf);
 
         let board = psv.decode();
-        let kingrank_bucket = ShogiKingRankBucket::<9>.bucket(&psv);
+        let kingrank_bucket = ShogiKingRankBucket::<9>.bucket(&psv) as u8;
         out.push(SampleMeta {
             psv,
             pack_index,

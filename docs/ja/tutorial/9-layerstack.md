@@ -15,10 +15,12 @@ bulletou で LayerStack を使うのは **SFNN ファミリ**。`--arch` の末�
 | `--arch` suffix | バケット数 | やねうら王 load 可 | 説明 |
 |---|---|---|---|
 | **`k3k3(king3-by-king3)`** (デフォルト) | 9 | ○ | 自玉段を 3 区分 (1-3 / 4-6 / 7-9 段) × 敵玉段も 3 区分 = 9 通り。やねうら王の `stack_index_for_nnue` と完全一致 |
+| **`k9k9(king9-by-king9)`** | 81 | ○ | 自玉段そのもの × 敵玉段そのもの = 81 通り |
 | **`hand64`** | 64 | ○ | 手番側の手駒スコア8段階 × 非手番側の手駒スコア8段階 = 64 通り |
 | **`hand64_k3k3`** | 576 | ○ | `hand64` bucket × `k3k3` bucket。各bucketが独立したMLP重みを持つので、GPUメモリ・保存サイズはかなり大きくなる |
+| **`hand64_k9k9`** | 5184 | ○ | `hand64` bucket × `k9k9` bucket。非常に大きいので、実験時は小さめの FT/H1 から始めるのが安全 |
 
-`hand64_king3_by_king3` は `hand64_k3k3` の別名として受け付ける。
+`king9_by_king9`, `hand64_king3_by_king3`, `hand64_king9_by_king9` は、それぞれ `k9k9`, `hand64_k3k3`, `hand64_k9k9` の別名として受け付ける。
 
 ### k3k3(king3-by-king3) のバケット表
 
@@ -60,7 +62,7 @@ LayerStack の学習結果は通常の NNUE と同じく `nn.bin` として書�
 
 ## 9.4 「LayerStack を使わない方が良い」場合
 
-LayerStack は bucket ごとにサブネット重みを持つため、学習も推論も単一 NN より重い。特に `hand64_k3k3` は 576 stacks なので、最初は小さめの FT/H1 サイズか `hand64` 単体から試すのが安全。
+LayerStack は bucket ごとにサブネット重みを持つため、学習も推論も単一 NN より重い。特に `hand64_k3k3` は 576 stacks、`hand64_k9k9` は 5184 stacks なので、最初は小さめの FT/H1 サイズか `hand64` 単体から試すのが安全。
 
 - 教師データが小さい (1 億局面未満など) 場合、9 バケットに分かれる局面数も少なくなり、各バケットの学習効率が落ちる
 - やねうら王に投入する目的でなければ、`NNUE_HALFKP` / `NNUE_HALFKPVM` 等の単一 NN を使った方が手軽
