@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "log",
         nargs="?",
-        default="summary-learn.log",
+        default=None,
         help="summary-learn.log path. Defaults to summary-learn.log in the current working directory",
     )
     parser.add_argument(
@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
         help="print one epoch per line as: epoch<TAB>max_accuracy",
     )
     return parser.parse_args()
+
+
+def resolve_log_path(log: str | None) -> Path:
+    if log is None:
+        return Path.cwd() / "summary-learn.log"
+
+    path = Path(log)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
 
 
 def format_accuracy(value: float, *, percent: bool, digits: int) -> str:
@@ -103,7 +113,7 @@ def load_epoch_max_accuracy(path: Path, column: str) -> dict[int, float]:
 
 def main() -> int:
     args = parse_args()
-    path = Path(args.log)
+    path = resolve_log_path(args.log)
 
     try:
         best_by_epoch = load_epoch_max_accuracy(path, args.column)
