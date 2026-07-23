@@ -1091,3 +1091,22 @@ current cuda-cpp follow-up queue.
 - Remaining BO-CUDA-036 work:
   - further sparse L0 backward/update optimisation if the previous cuda-oxide 4M ceiling remains the target;
   - longer multi-file confirmation of the auto-tuned CPU defaults, because 4M HCPE runs still show noticeable run-to-run variance.
+
+## 2026-07-23 cuda-cpp SFNN stack factorizer expansion
+
+- Extended the cuda-cpp SFNN shared factorizer from L1-only to L1/L2/L3:
+  - forward uses `stacked + shared` for L2 CReLU and L3 output;
+  - backward accumulates gradients into both bucket-specific and shared L2/L3 tensors;
+  - Ranger state/readback/save/load now carries optional `l2fw/l2fb` and `l3fw/l3fb` groups.
+- Defaults:
+  - dense-L1 SFNN LayerStack: L1/L2/L3 shared terms are enabled;
+  - compact-L1 SFNN LayerStack (`gN`, `cN_sMxG`): L1 shared term remains disabled, but L2/L3 shared terms are enabled;
+  - `--no-sfnn-factorized-l1` remains the compatibility switch and disables all SFNN shared stack factorizer terms.
+- Export/validation:
+  - validation weights and `nn.bin` fold L1/L2/L3 shared terms into each bucket's stacked weights;
+  - full `state.bin` preserves the unfused shared tensors and their optimizer state for resume.
+- Validation run:
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test -p bulletou-cuda-cpp` passed;
+  - `cargo test -p bulletou-cuda-cpp sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp_sfnn_validation -- --nocapture` passed.

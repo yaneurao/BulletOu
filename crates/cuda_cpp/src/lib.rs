@@ -938,8 +938,12 @@ pub struct SfnnForwardHostWeights<'a> {
     pub l1fb: Option<&'a [f32]>,
     pub l2w: &'a [f32],
     pub l2b: &'a [f32],
+    pub l2fw: Option<&'a [f32]>,
+    pub l2fb: Option<&'a [f32]>,
     pub l3w: &'a [f32],
     pub l3b: &'a [f32],
+    pub l3fw: Option<&'a [f32]>,
+    pub l3fb: Option<&'a [f32]>,
 }
 
 impl SfnnForwardHostWeights<'_> {
@@ -968,8 +972,27 @@ impl SfnnForwardHostWeights<'_> {
             self.l2w.len(),
         )?;
         expect_len("sfnn l2b", checked_product("sfnn l2b", &[shape.num_stacks, shape.l2_size])?, self.l2b.len())?;
+        match (self.l2fw, self.l2fb) {
+            (Some(l2fw), Some(l2fb)) => {
+                expect_len("sfnn l2fw", checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?, l2fw.len())?;
+                expect_len("sfnn l2fb", shape.l2_size, l2fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l2fw requires l2fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l2fb requires l2fw")),
+        }
         expect_len("sfnn l3w", checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, self.l3w.len())?;
-        expect_len("sfnn l3b", shape.num_stacks, self.l3b.len())
+        expect_len("sfnn l3b", shape.num_stacks, self.l3b.len())?;
+        match (self.l3fw, self.l3fb) {
+            (Some(l3fw), Some(l3fb)) => {
+                expect_len("sfnn l3fw", shape.l2_size, l3fw.len())?;
+                expect_len("sfnn l3fb", 1, l3fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l3fw requires l3fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l3fb requires l3fw")),
+        }
+        Ok(())
     }
 }
 
@@ -1016,8 +1039,12 @@ pub struct SfnnForwardDeviceWeights {
     pub l1fb: Option<F32Buffer>,
     pub l2w: F32Buffer,
     pub l2b: F32Buffer,
+    pub l2fw: Option<F32Buffer>,
+    pub l2fb: Option<F32Buffer>,
     pub l3w: F32Buffer,
     pub l3b: F32Buffer,
+    pub l3fw: Option<F32Buffer>,
+    pub l3fb: Option<F32Buffer>,
 }
 
 impl SfnnForwardDeviceWeights {
@@ -1033,8 +1060,12 @@ impl SfnnForwardDeviceWeights {
             l1fb: weights.l1fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l2w: F32Buffer::from_host(ctx, weights.l2w)?,
             l2b: F32Buffer::from_host(ctx, weights.l2b)?,
+            l2fw: weights.l2fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l2fb: weights.l2fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3w: F32Buffer::from_host(ctx, weights.l3w)?,
             l3b: F32Buffer::from_host(ctx, weights.l3b)?,
+            l3fw: weights.l3fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l3fb: weights.l3fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
         })
     }
 
@@ -1079,12 +1110,35 @@ impl SfnnForwardDeviceWeights {
             checked_product("sfnn l2b", &[shape.num_stacks, shape.l2_size])?,
             self.l2b.len(),
         )?;
+        match (&self.l2fw, &self.l2fb) {
+            (Some(l2fw), Some(l2fb)) => {
+                expect_len(
+                    "device sfnn l2fw",
+                    checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?,
+                    l2fw.len(),
+                )?;
+                expect_len("device sfnn l2fb", shape.l2_size, l2fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l2fw requires l2fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l2fb requires l2fw")),
+        }
         expect_len(
             "device sfnn l3w",
             checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?,
             self.l3w.len(),
         )?;
-        expect_len("device sfnn l3b", shape.num_stacks, self.l3b.len())
+        expect_len("device sfnn l3b", shape.num_stacks, self.l3b.len())?;
+        match (&self.l3fw, &self.l3fb) {
+            (Some(l3fw), Some(l3fb)) => {
+                expect_len("device sfnn l3fw", shape.l2_size, l3fw.len())?;
+                expect_len("device sfnn l3fb", 1, l3fb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l3fw requires l3fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l3fb requires l3fw")),
+        }
+        Ok(())
     }
 }
 
@@ -1203,6 +1257,16 @@ pub fn sfnn_forward_device(
         (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    let (l2fw, l2fb, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(l2fb)) => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
+    };
+    let (l3fw, l3fb, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(l3fb)) => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
         ffi::bulletou_cuda_cpp_sfnn_forward_device(
@@ -1229,8 +1293,14 @@ pub fn sfnn_forward_device(
             has_l1f,
             weights.l2w.as_ptr(),
             weights.l2b.as_ptr(),
+            l2fw,
+            l2fb,
+            has_l2f,
             weights.l3w.as_ptr(),
             weights.l3b.as_ptr(),
+            l3fw,
+            l3fb,
+            has_l3f,
             workspace.stm_l0.as_ptr(),
             workspace.nstm_l0.as_ptr(),
             workspace.combined.as_ptr(),
@@ -1901,12 +1971,28 @@ impl SfnnBackwardWorkspaceLayout {
         self.shape.num_stacks.saturating_mul(self.shape.l2_size)
     }
 
+    pub fn l2fw_gradients_len(self) -> usize {
+        self.shape.l2_size.saturating_mul(self.shape.l2_in())
+    }
+
+    pub fn l2fb_gradients_len(self) -> usize {
+        self.shape.l2_size
+    }
+
     pub fn l3w_gradients_len(self) -> usize {
         self.shape.num_stacks.saturating_mul(self.shape.l2_size)
     }
 
     pub fn l3b_gradients_len(self) -> usize {
         self.shape.num_stacks
+    }
+
+    pub fn l3fw_gradients_len(self) -> usize {
+        self.shape.l2_size
+    }
+
+    pub fn l3fb_gradients_len(self) -> usize {
+        1
     }
 
     fn validate(self) -> Result<()> {
@@ -1940,8 +2026,12 @@ pub struct SfnnBackwardWorkspace {
     pub l1fb_gradients: F32Buffer,
     pub l2w_gradients: F32Buffer,
     pub l2b_gradients: F32Buffer,
+    pub l2fw_gradients: F32Buffer,
+    pub l2fb_gradients: F32Buffer,
     pub l3w_gradients: F32Buffer,
     pub l3b_gradients: F32Buffer,
+    pub l3fw_gradients: F32Buffer,
+    pub l3fb_gradients: F32Buffer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1962,8 +2052,12 @@ pub struct SfnnBackwardReadback {
     pub l1fb_gradients: Vec<f32>,
     pub l2w_gradients: Vec<f32>,
     pub l2b_gradients: Vec<f32>,
+    pub l2fw_gradients: Vec<f32>,
+    pub l2fb_gradients: Vec<f32>,
     pub l3w_gradients: Vec<f32>,
     pub l3b_gradients: Vec<f32>,
+    pub l3fw_gradients: Vec<f32>,
+    pub l3fb_gradients: Vec<f32>,
 }
 
 impl SfnnBackwardWorkspace {
@@ -1987,8 +2081,12 @@ impl SfnnBackwardWorkspace {
             l1fb_gradients: F32Buffer::new(ctx, layout.l1fb_gradients_len())?,
             l2w_gradients: F32Buffer::new(ctx, layout.l2w_gradients_len())?,
             l2b_gradients: F32Buffer::new(ctx, layout.l2b_gradients_len())?,
+            l2fw_gradients: F32Buffer::new(ctx, layout.l2fw_gradients_len())?,
+            l2fb_gradients: F32Buffer::new(ctx, layout.l2fb_gradients_len())?,
             l3w_gradients: F32Buffer::new(ctx, layout.l3w_gradients_len())?,
             l3b_gradients: F32Buffer::new(ctx, layout.l3b_gradients_len())?,
+            l3fw_gradients: F32Buffer::new(ctx, layout.l3fw_gradients_len())?,
+            l3fb_gradients: F32Buffer::new(ctx, layout.l3fb_gradients_len())?,
         })
     }
 
@@ -2026,8 +2124,12 @@ impl SfnnBackwardWorkspace {
         expect_len("sfnn backward l1fb_gradients", self.layout.l1fb_gradients_len(), self.l1fb_gradients.len())?;
         expect_len("sfnn backward l2w_gradients", self.layout.l2w_gradients_len(), self.l2w_gradients.len())?;
         expect_len("sfnn backward l2b_gradients", self.layout.l2b_gradients_len(), self.l2b_gradients.len())?;
+        expect_len("sfnn backward l2fw_gradients", self.layout.l2fw_gradients_len(), self.l2fw_gradients.len())?;
+        expect_len("sfnn backward l2fb_gradients", self.layout.l2fb_gradients_len(), self.l2fb_gradients.len())?;
         expect_len("sfnn backward l3w_gradients", self.layout.l3w_gradients_len(), self.l3w_gradients.len())?;
-        expect_len("sfnn backward l3b_gradients", self.layout.l3b_gradients_len(), self.l3b_gradients.len())
+        expect_len("sfnn backward l3b_gradients", self.layout.l3b_gradients_len(), self.l3b_gradients.len())?;
+        expect_len("sfnn backward l3fw_gradients", self.layout.l3fw_gradients_len(), self.l3fw_gradients.len())?;
+        expect_len("sfnn backward l3fb_gradients", self.layout.l3fb_gradients_len(), self.l3fb_gradients.len())
     }
 
     pub fn download(&self, ctx: &Context) -> Result<SfnnBackwardReadback> {
@@ -2048,8 +2150,12 @@ impl SfnnBackwardWorkspace {
             l1fb_gradients: self.l1fb_gradients.download(ctx)?,
             l2w_gradients: self.l2w_gradients.download(ctx)?,
             l2b_gradients: self.l2b_gradients.download(ctx)?,
+            l2fw_gradients: self.l2fw_gradients.download(ctx)?,
+            l2fb_gradients: self.l2fb_gradients.download(ctx)?,
             l3w_gradients: self.l3w_gradients.download(ctx)?,
             l3b_gradients: self.l3b_gradients.download(ctx)?,
+            l3fw_gradients: self.l3fw_gradients.download(ctx)?,
+            l3fb_gradients: self.l3fb_gradients.download(ctx)?,
         })
     }
 
@@ -2062,8 +2168,12 @@ impl SfnnBackwardWorkspace {
         self.l1fb_gradients.fill(ctx, 0.0)?;
         self.l2w_gradients.fill(ctx, 0.0)?;
         self.l2b_gradients.fill(ctx, 0.0)?;
+        self.l2fw_gradients.fill(ctx, 0.0)?;
+        self.l2fb_gradients.fill(ctx, 0.0)?;
         self.l3w_gradients.fill(ctx, 0.0)?;
-        self.l3b_gradients.fill(ctx, 0.0)
+        self.l3b_gradients.fill(ctx, 0.0)?;
+        self.l3fw_gradients.fill(ctx, 0.0)?;
+        self.l3fb_gradients.fill(ctx, 0.0)
     }
 }
 
@@ -2129,6 +2239,16 @@ pub fn sfnn_backward_train_profile_device(
         (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(_)) => (l2fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
+    };
+    let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(_)) => (l3fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
 
     let mut profile_ms = [0.0f32; 7];
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
@@ -2158,7 +2278,11 @@ pub fn sfnn_backward_train_profile_device(
             l1fw,
             has_l1f,
             weights.l2w.as_ptr(),
+            l2fw,
+            has_l2f,
             weights.l3w.as_ptr(),
+            l3fw,
+            has_l3f,
             loss.mean_output_gradients.as_ptr(),
             backward.l2_gradients.as_ptr(),
             backward.l1_gradients.as_ptr(),
@@ -2176,8 +2300,12 @@ pub fn sfnn_backward_train_profile_device(
             backward.l1fb_gradients.as_ptr(),
             backward.l2w_gradients.as_ptr(),
             backward.l2b_gradients.as_ptr(),
+            backward.l2fw_gradients.as_ptr(),
+            backward.l2fb_gradients.as_ptr(),
             backward.l3w_gradients.as_ptr(),
             backward.l3b_gradients.as_ptr(),
+            backward.l3fw_gradients.as_ptr(),
+            backward.l3fb_gradients.as_ptr(),
             1,
             profile_ms.as_mut_ptr(),
             profile_ms.len(),
@@ -2235,6 +2363,16 @@ fn sfnn_backward_device_impl(
         (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(_)) => (l2fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
+    };
+    let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(_)) => (l3fw.as_ptr(), 1),
+        (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
 
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     let rc = unsafe {
@@ -2264,7 +2402,11 @@ fn sfnn_backward_device_impl(
                 l1fw,
                 has_l1f,
                 weights.l2w.as_ptr(),
+                l2fw,
+                has_l2f,
                 weights.l3w.as_ptr(),
+                l3fw,
+                has_l3f,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -2282,8 +2424,12 @@ fn sfnn_backward_device_impl(
                 backward.l1fb_gradients.as_ptr(),
                 backward.l2w_gradients.as_ptr(),
                 backward.l2b_gradients.as_ptr(),
+                backward.l2fw_gradients.as_ptr(),
+                backward.l2fb_gradients.as_ptr(),
                 backward.l3w_gradients.as_ptr(),
                 backward.l3b_gradients.as_ptr(),
+                backward.l3fw_gradients.as_ptr(),
+                backward.l3fb_gradients.as_ptr(),
                 0,
             )
         } else {
@@ -2312,7 +2458,11 @@ fn sfnn_backward_device_impl(
                 l1fw,
                 has_l1f,
                 weights.l2w.as_ptr(),
+                l2fw,
+                has_l2f,
                 weights.l3w.as_ptr(),
+                l3fw,
+                has_l3f,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -2330,8 +2480,12 @@ fn sfnn_backward_device_impl(
                 backward.l1fb_gradients.as_ptr(),
                 backward.l2w_gradients.as_ptr(),
                 backward.l2b_gradients.as_ptr(),
+                backward.l2fw_gradients.as_ptr(),
+                backward.l2fb_gradients.as_ptr(),
                 backward.l3w_gradients.as_ptr(),
                 backward.l3b_gradients.as_ptr(),
+                backward.l3fw_gradients.as_ptr(),
+                backward.l3fb_gradients.as_ptr(),
             )
         }
     };
@@ -2508,8 +2662,12 @@ pub struct SfnnRangerOptimizerStates {
     pub l1fb: Option<RangerParamState>,
     pub l2w: RangerParamState,
     pub l2b: RangerParamState,
+    pub l2fw: Option<RangerParamState>,
+    pub l2fb: Option<RangerParamState>,
     pub l3w: RangerParamState,
     pub l3b: RangerParamState,
+    pub l3fw: Option<RangerParamState>,
+    pub l3fb: Option<RangerParamState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2522,8 +2680,12 @@ pub struct SfnnRangerOptimizerHostStates<'a> {
     pub l1fb: Option<RangerParamHostState<'a>>,
     pub l2w: RangerParamHostState<'a>,
     pub l2b: RangerParamHostState<'a>,
+    pub l2fw: Option<RangerParamHostState<'a>>,
+    pub l2fb: Option<RangerParamHostState<'a>>,
     pub l3w: RangerParamHostState<'a>,
     pub l3b: RangerParamHostState<'a>,
+    pub l3fw: Option<RangerParamHostState<'a>>,
+    pub l3fb: Option<RangerParamHostState<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2536,8 +2698,12 @@ pub struct SfnnRangerOptimizerStatesReadback {
     pub l1fb: Option<RangerParamStateReadback>,
     pub l2w: RangerParamStateReadback,
     pub l2b: RangerParamStateReadback,
+    pub l2fw: Option<RangerParamStateReadback>,
+    pub l2fb: Option<RangerParamStateReadback>,
     pub l3w: RangerParamStateReadback,
     pub l3b: RangerParamStateReadback,
+    pub l3fw: Option<RangerParamStateReadback>,
+    pub l3fb: Option<RangerParamStateReadback>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3233,8 +3399,12 @@ impl SfnnRangerOptimizerStates {
             l1fb: weights.l1fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l2w: RangerParamState::from_host_weights(ctx, weights.l2w)?,
             l2b: RangerParamState::from_host_weights(ctx, weights.l2b)?,
+            l2fw: weights.l2fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l2fb: weights.l2fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l3w: RangerParamState::from_host_weights(ctx, weights.l3w)?,
             l3b: RangerParamState::from_host_weights(ctx, weights.l3b)?,
+            l3fw: weights.l3fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l3fb: weights.l3fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
         })
     }
 
@@ -3248,6 +3418,7 @@ impl SfnnRangerOptimizerStates {
         let l1w_len = shape.l1w_len()?;
         let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
         let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
+        let l2fw_len = checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?;
         let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
             (Some(l1fw), Some(l1fb)) => (
                 {
@@ -3268,6 +3439,24 @@ impl SfnnRangerOptimizerStates {
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1fw requires l1fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1fb requires l1fw")),
         };
+        let (l2fw, l2fb) = match (states.l2fw, states.l2fb) {
+            (Some(l2fw), Some(l2fb)) => (
+                Some(RangerParamState::from_host_state(ctx, l2fw_len, l2fw)?),
+                Some(RangerParamState::from_host_state(ctx, shape.l2_size, l2fb)?),
+            ),
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2fw requires l2fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2fb requires l2fw")),
+        };
+        let (l3fw, l3fb) = match (states.l3fw, states.l3fb) {
+            (Some(l3fw), Some(l3fb)) => (
+                Some(RangerParamState::from_host_state(ctx, shape.l2_size, l3fw)?),
+                Some(RangerParamState::from_host_state(ctx, 1, l3fb)?),
+            ),
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3fw requires l3fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3fb requires l3fw")),
+        };
         Ok(Self {
             l0w: RangerParamState::from_host_state(ctx, l0w_len, states.l0w)?,
             l0b: RangerParamState::from_host_state(ctx, shape.ft_size, states.l0b)?,
@@ -3277,8 +3466,12 @@ impl SfnnRangerOptimizerStates {
             l1fb,
             l2w: RangerParamState::from_host_state(ctx, l2w_len, states.l2w)?,
             l2b: RangerParamState::from_host_state(ctx, shape.num_stacks * shape.l2_size, states.l2b)?,
+            l2fw,
+            l2fb,
             l3w: RangerParamState::from_host_state(ctx, l3w_len, states.l3w)?,
             l3b: RangerParamState::from_host_state(ctx, shape.num_stacks, states.l3b)?,
+            l3fw,
+            l3fb,
         })
     }
 
@@ -3292,8 +3485,12 @@ impl SfnnRangerOptimizerStates {
             l1fb: self.l1fb.as_ref().map(|state| state.download(ctx)).transpose()?,
             l2w: self.l2w.download(ctx)?,
             l2b: self.l2b.download(ctx)?,
+            l2fw: self.l2fw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l2fb: self.l2fb.as_ref().map(|state| state.download(ctx)).transpose()?,
             l3w: self.l3w.download(ctx)?,
             l3b: self.l3b.download(ctx)?,
+            l3fw: self.l3fw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l3fb: self.l3fb.as_ref().map(|state| state.download(ctx)).transpose()?,
         })
     }
 
@@ -3319,8 +3516,27 @@ impl SfnnRangerOptimizerStates {
             "optimizer sfnn l2w",
         )?;
         self.l2b.validate(shape.num_stacks * shape.l2_size, "optimizer sfnn l2b")?;
+        match (&self.l2fw, &self.l2fb) {
+            (Some(l2fw), Some(l2fb)) => {
+                l2fw.validate(checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?, "optimizer sfnn l2fw")?;
+                l2fb.validate(shape.l2_size, "optimizer sfnn l2fb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2fw requires l2fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2fb requires l2fw")),
+        }
         self.l3w.validate(checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, "optimizer sfnn l3w")?;
-        self.l3b.validate(shape.num_stacks, "optimizer sfnn l3b")
+        self.l3b.validate(shape.num_stacks, "optimizer sfnn l3b")?;
+        match (&self.l3fw, &self.l3fb) {
+            (Some(l3fw), Some(l3fb)) => {
+                l3fw.validate(shape.l2_size, "optimizer sfnn l3fw")?;
+                l3fb.validate(1, "optimizer sfnn l3fb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3fw requires l3fb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3fb requires l3fw")),
+        }
+        Ok(())
     }
 }
 
@@ -3934,8 +4150,12 @@ pub struct SfnnTrainWeightsReadback {
     pub l1fb: Option<Vec<f32>>,
     pub l2w: Vec<f32>,
     pub l2b: Vec<f32>,
+    pub l2fw: Option<Vec<f32>>,
+    pub l2fb: Option<Vec<f32>>,
     pub l3w: Vec<f32>,
     pub l3b: Vec<f32>,
+    pub l3fw: Option<Vec<f32>>,
+    pub l3fb: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -4335,8 +4555,12 @@ impl SfnnTrainStepRunner {
             l1fb: self.weights.l1fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l2w: self.weights.l2w.download(ctx)?,
             l2b: self.weights.l2b.download(ctx)?,
+            l2fw: self.weights.l2fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l2fb: self.weights.l2fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l3w: self.weights.l3w.download(ctx)?,
             l3b: self.weights.l3b.download(ctx)?,
+            l3fw: self.weights.l3fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l3fb: self.weights.l3fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
         })
     }
 
@@ -4349,7 +4573,7 @@ impl SfnnTrainStepRunner {
         self.device_batch.validate()?;
         self.weights.validate()?;
         self.optimizer_states.validate(self.shape)?;
-        self.validate_optional_l1f_state_matches_weights()?;
+        self.validate_optional_factorized_state_matches_weights()?;
         self.forward_workspace.validate()?;
         self.loss_workspace.validate()?;
         self.backward_workspace.validate()?;
@@ -4368,16 +4592,38 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
-    fn validate_optional_l1f_state_matches_weights(&self) -> Result<()> {
-        match (
-            self.weights.l1fw.is_some(),
-            self.weights.l1fb.is_some(),
-            self.optimizer_states.l1fw.is_some(),
-            self.optimizer_states.l1fb.is_some(),
-        ) {
-            (true, true, true, true) | (false, false, false, false) => Ok(()),
-            _ => Err(CudaCppError::message("SFNN weight/state l1fw/l1fb optional groups mismatch")),
+    fn validate_optional_factorized_state_matches_weights(&self) -> Result<()> {
+        for (name, weight_w, weight_b, state_w, state_b) in [
+            (
+                "l1fw/l1fb",
+                self.weights.l1fw.is_some(),
+                self.weights.l1fb.is_some(),
+                self.optimizer_states.l1fw.is_some(),
+                self.optimizer_states.l1fb.is_some(),
+            ),
+            (
+                "l2fw/l2fb",
+                self.weights.l2fw.is_some(),
+                self.weights.l2fb.is_some(),
+                self.optimizer_states.l2fw.is_some(),
+                self.optimizer_states.l2fb.is_some(),
+            ),
+            (
+                "l3fw/l3fb",
+                self.weights.l3fw.is_some(),
+                self.weights.l3fb.is_some(),
+                self.optimizer_states.l3fw.is_some(),
+                self.optimizer_states.l3fb.is_some(),
+            ),
+        ] {
+            match (weight_w, weight_b, state_w, state_b) {
+                (true, true, true, true) | (false, false, false, false) => {}
+                _ => {
+                    return Err(CudaCppError::message(format!("SFNN weight/state {name} optional groups mismatch")));
+                }
+            }
         }
+        Ok(())
     }
 
     fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
@@ -4431,6 +4677,14 @@ impl SfnnTrainStepRunner {
             &self.weights.l2b,
             &self.optimizer_states.l2b,
         )?;
+        match (&self.weights.l2fw, &self.weights.l2fb, &self.optimizer_states.l2fw, &self.optimizer_states.l2fb) {
+            (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) => {
+                update_param_group(ctx, params, &self.backward_workspace.l2fw_gradients, l2fw, l2fw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l2fb_gradients, l2fb, l2fb_state)?;
+            }
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l2fw/l2fb optional groups mismatch")),
+        }
         update_param_group(
             ctx,
             params,
@@ -4444,7 +4698,16 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
-        )
+        )?;
+        match (&self.weights.l3fw, &self.weights.l3fb, &self.optimizer_states.l3fw, &self.optimizer_states.l3fb) {
+            (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) => {
+                update_param_group(ctx, params, &self.backward_workspace.l3fw_gradients, l3fw, l3fw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l3fb_gradients, l3fb, l3fb_state)?;
+            }
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l3fw/l3fb optional groups mismatch")),
+        }
+        Ok(())
     }
 }
 
@@ -5099,8 +5362,14 @@ mod ffi {
             has_l1f: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
             l2b: *mut BulletOuCudaCppF32Buffer,
+            l2fw: *mut BulletOuCudaCppF32Buffer,
+            l2fb: *mut BulletOuCudaCppF32Buffer,
+            has_l2f: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
             l3b: *mut BulletOuCudaCppF32Buffer,
+            l3fw: *mut BulletOuCudaCppF32Buffer,
+            l3fb: *mut BulletOuCudaCppF32Buffer,
+            has_l3f: i32,
             stm_l0: *mut BulletOuCudaCppF32Buffer,
             nstm_l0: *mut BulletOuCudaCppF32Buffer,
             combined: *mut BulletOuCudaCppF32Buffer,
@@ -5134,7 +5403,11 @@ mod ffi {
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
+            l2fw: *mut BulletOuCudaCppF32Buffer,
+            has_l2f: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
+            l3fw: *mut BulletOuCudaCppF32Buffer,
+            has_l3f: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5152,8 +5425,12 @@ mod ffi {
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_train_device(
             ctx: *mut BulletOuCudaCppContext,
@@ -5180,7 +5457,11 @@ mod ffi {
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
+            l2fw: *mut BulletOuCudaCppF32Buffer,
+            has_l2f: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
+            l3fw: *mut BulletOuCudaCppF32Buffer,
+            has_l3f: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5198,8 +5479,12 @@ mod ffi {
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_train_profile_device(
@@ -5227,7 +5512,11 @@ mod ffi {
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
+            l2fw: *mut BulletOuCudaCppF32Buffer,
+            has_l2f: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
+            l3fw: *mut BulletOuCudaCppF32Buffer,
+            has_l3f: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5245,8 +5534,12 @@ mod ffi {
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
             profile_ms: *mut f32,
             profile_ms_len: usize,
@@ -5402,8 +5695,12 @@ mod tests {
         assert_eq!(layout.l1fb_gradients_len(), 3);
         assert_eq!(layout.l2w_gradients_len(), 24);
         assert_eq!(layout.l2b_gradients_len(), 6);
+        assert_eq!(layout.l2fw_gradients_len(), 12);
+        assert_eq!(layout.l2fb_gradients_len(), 3);
         assert_eq!(layout.l3w_gradients_len(), 6);
         assert_eq!(layout.l3b_gradients_len(), 2);
+        assert_eq!(layout.l3fw_gradients_len(), 3);
+        assert_eq!(layout.l3fb_gradients_len(), 1);
     }
 
     #[test]
@@ -5640,8 +5937,12 @@ mod tests {
         assert_close_slice("sfnn l1fb_grad", &actual.l1fb_gradients, &expected.l1fb_gradients, 1.0e-6);
         assert_close_slice("sfnn l2w_grad", &actual.l2w_gradients, &expected.l2w_gradients, 1.0e-6);
         assert_close_slice("sfnn l2b_grad", &actual.l2b_gradients, &expected.l2b_gradients, 1.0e-6);
+        assert_close_slice("sfnn l2fw_grad", &actual.l2fw_gradients, &expected.l2fw_gradients, 1.0e-6);
+        assert_close_slice("sfnn l2fb_grad", &actual.l2fb_gradients, &expected.l2fb_gradients, 1.0e-6);
         assert_close_slice("sfnn l3w_grad", &actual.l3w_gradients, &expected.l3w_gradients, 1.0e-6);
         assert_close_slice("sfnn l3b_grad", &actual.l3b_gradients, &expected.l3b_gradients, 1.0e-6);
+        assert_close_slice("sfnn l3fw_grad", &actual.l3fw_gradients, &expected.l3fw_gradients, 1.0e-6);
+        assert_close_slice("sfnn l3fb_grad", &actual.l3fb_gradients, &expected.l3fb_gradients, 1.0e-6);
     }
 
     #[test]
@@ -5714,8 +6015,32 @@ mod tests {
         );
         assert_close_slice("train sfnn l2w", &actual.l2w, &expected.l2w, 1.0e-6);
         assert_close_slice("train sfnn l2b", &actual.l2b, &expected.l2b, 1.0e-6);
+        assert_close_slice(
+            "train sfnn l2fw",
+            actual.l2fw.as_deref().unwrap(),
+            expected.l2fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "train sfnn l2fb",
+            actual.l2fb.as_deref().unwrap(),
+            expected.l2fb.as_deref().unwrap(),
+            1.0e-6,
+        );
         assert_close_slice("train sfnn l3w", &actual.l3w, &expected.l3w, 1.0e-6);
         assert_close_slice("train sfnn l3b", &actual.l3b, &expected.l3b, 1.0e-6);
+        assert_close_slice(
+            "train sfnn l3fw",
+            actual.l3fw.as_deref().unwrap(),
+            expected.l3fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "train sfnn l3fb",
+            actual.l3fb.as_deref().unwrap(),
+            expected.l3fb.as_deref().unwrap(),
+            1.0e-6,
+        );
 
         let upload_ctx = Context::new(0).unwrap();
         let mut pipelined_runner = SfnnTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active).unwrap();
@@ -5758,8 +6083,32 @@ mod tests {
         );
         assert_close_slice("pipelined train sfnn l2w", &pipelined.l2w, &expected.l2w, 1.0e-6);
         assert_close_slice("pipelined train sfnn l2b", &pipelined.l2b, &expected.l2b, 1.0e-6);
+        assert_close_slice(
+            "pipelined train sfnn l2fw",
+            pipelined.l2fw.as_deref().unwrap(),
+            expected.l2fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "pipelined train sfnn l2fb",
+            pipelined.l2fb.as_deref().unwrap(),
+            expected.l2fb.as_deref().unwrap(),
+            1.0e-6,
+        );
         assert_close_slice("pipelined train sfnn l3w", &pipelined.l3w, &expected.l3w, 1.0e-6);
         assert_close_slice("pipelined train sfnn l3b", &pipelined.l3b, &expected.l3b, 1.0e-6);
+        assert_close_slice(
+            "pipelined train sfnn l3fw",
+            pipelined.l3fw.as_deref().unwrap(),
+            expected.l3fw.as_deref().unwrap(),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "pipelined train sfnn l3fb",
+            pipelined.l3fb.as_deref().unwrap(),
+            expected.l3fb.as_deref().unwrap(),
+            1.0e-6,
+        );
     }
 
     #[test]
@@ -5894,8 +6243,15 @@ mod tests {
                 0.4, -0.2, 0.3, 0.1, // stack 1, row 1
             ],
             l2b: &[0.02, -0.03, 0.01, 0.04],
+            l2fw: Some(&[
+                0.01, -0.02, 0.03, -0.04, // shared row 0
+                -0.03, 0.02, -0.01, 0.04, // shared row 1
+            ]),
+            l2fb: Some(&[0.006, -0.008]),
             l3w: &[0.6, -0.4, 0.5, 0.2],
             l3b: &[0.05, -0.02],
+            l3fw: Some(&[0.03, -0.02]),
+            l3fb: Some(&[0.004]),
         }
     }
 
@@ -5967,10 +6323,25 @@ mod tests {
                 shape.num_stacks,
                 stack,
             );
+            if let (Some(l2fw), Some(l2fb)) = (weights.l2fw, weights.l2fb) {
+                for row in 0..shape.l2_size {
+                    l2[row] += l2fb[row];
+                    for input in 0..shape.l2_in() {
+                        l2[row] += l2_input[input] * l2fw[row * shape.l2_in() + input];
+                    }
+                }
+            }
             l2.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
             let mut value = weights.l3b[stack] + psqt;
+            if let Some(l3fb) = weights.l3fb {
+                value += l3fb[0];
+            }
             for input in 0..shape.l2_size {
-                value += l2[input] * weights.l3w[stack * shape.l2_size + input];
+                let mut weight = weights.l3w[stack * shape.l2_size + input];
+                if let Some(l3fw) = weights.l3fw {
+                    weight += l3fw[input];
+                }
+                value += l2[input] * weight;
             }
             *out_sample = value;
         }
@@ -6004,8 +6375,12 @@ mod tests {
         l1fb_gradients: Vec<f32>,
         l2w_gradients: Vec<f32>,
         l2b_gradients: Vec<f32>,
+        l2fw_gradients: Vec<f32>,
+        l2fb_gradients: Vec<f32>,
         l3w_gradients: Vec<f32>,
         l3b_gradients: Vec<f32>,
+        l3fw_gradients: Vec<f32>,
+        l3fb_gradients: Vec<f32>,
     }
 
     struct SfnnTinyWeightsOwned {
@@ -6017,8 +6392,12 @@ mod tests {
         l1fb: Option<Vec<f32>>,
         l2w: Vec<f32>,
         l2b: Vec<f32>,
+        l2fw: Option<Vec<f32>>,
+        l2fb: Option<Vec<f32>>,
         l3w: Vec<f32>,
         l3b: Vec<f32>,
+        l3fw: Option<Vec<f32>>,
+        l3fb: Option<Vec<f32>>,
     }
 
     fn tiny_sfnn_forward_trace_cpu(
@@ -6109,12 +6488,27 @@ mod tests {
                 shape.num_stacks,
                 stack,
             );
+            if let (Some(l2fw), Some(l2fb)) = (weights.l2fw, weights.l2fb) {
+                for row in 0..shape.l2_size {
+                    l2[row] += l2fb[row];
+                    for input in 0..shape.l2_in() {
+                        l2[row] += trace.l2_input[l2_input_base + input] * l2fw[row * shape.l2_in() + input];
+                    }
+                }
+            }
             l2.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
             let l2_base = sample * shape.l2_size;
             trace.l2[l2_base..l2_base + shape.l2_size].copy_from_slice(&l2);
             let mut value = weights.l3b[stack] + trace.l1[l1_base + shape.l1_hidden];
+            if let Some(l3fb) = weights.l3fb {
+                value += l3fb[0];
+            }
             for input in 0..shape.l2_size {
-                value += trace.l2[l2_base + input] * weights.l3w[stack * shape.l2_size + input];
+                let mut weight = weights.l3w[stack * shape.l2_size + input];
+                if let Some(l3fw) = weights.l3fw {
+                    weight += l3fw[input];
+                }
+                value += trace.l2[l2_base + input] * weight;
             }
             trace.outputs[sample] = value;
         }
@@ -6142,13 +6536,23 @@ mod tests {
         let mut l1_gradients = vec![0.0; batch.batch_size * shape.l1_out()];
         let mut l3w_gradients = vec![0.0; shape.num_stacks * shape.l2_size];
         let mut l3b_gradients = vec![0.0; shape.num_stacks];
+        let mut l3fw_gradients = vec![0.0; shape.l2_size];
+        let mut l3fb_gradients = vec![0.0; 1];
         for sample in 0..batch.batch_size {
             let stack = batch.buckets[sample] as usize;
             let output_gradient = output_gradients[sample];
             l3b_gradients[stack] += output_gradient;
+            if weights.l3fb.is_some() {
+                l3fb_gradients[0] += output_gradient;
+            }
             l1_gradients[sample * shape.l1_out() + shape.l1_hidden] = output_gradient;
             for row in 0..shape.l2_size {
-                l2_gradients[sample * shape.l2_size + row] = output_gradient * weights.l3w[stack * shape.l2_size + row];
+                let mut weight = weights.l3w[stack * shape.l2_size + row];
+                if let Some(l3fw) = weights.l3fw {
+                    weight += l3fw[row];
+                    l3fw_gradients[row] += output_gradient * trace.l2[sample * shape.l2_size + row];
+                }
+                l2_gradients[sample * shape.l2_size + row] = output_gradient * weight;
                 l3w_gradients[stack * shape.l2_size + row] += output_gradient * trace.l2[sample * shape.l2_size + row];
             }
         }
@@ -6156,16 +6560,27 @@ mod tests {
         let mut l2_input_gradients = vec![0.0; batch.batch_size * shape.l2_in()];
         let mut l2w_gradients = vec![0.0; shape.num_stacks * shape.l2_size * shape.l2_in()];
         let mut l2b_gradients = vec![0.0; shape.num_stacks * shape.l2_size];
+        let mut l2fw_gradients = vec![0.0; shape.l2_size * shape.l2_in()];
+        let mut l2fb_gradients = vec![0.0; shape.l2_size];
         for sample in 0..batch.batch_size {
             let stack = batch.buckets[sample] as usize;
             for out_col in 0..shape.l2_size {
                 let out_idx = sample * shape.l2_size + out_col;
                 let grad = crelu_pre_gradient_cpu(trace.l2[out_idx], l2_gradients[out_idx]);
                 l2b_gradients[stack * shape.l2_size + out_col] += grad;
+                if weights.l2fb.is_some() {
+                    l2fb_gradients[out_col] += grad;
+                }
                 for in_col in 0..shape.l2_in() {
                     let input_idx = sample * shape.l2_in() + in_col;
                     let weight_idx = stack * shape.l2_size * shape.l2_in() + out_col * shape.l2_in() + in_col;
-                    l2_input_gradients[input_idx] += grad * weights.l2w[weight_idx];
+                    let mut weight = weights.l2w[weight_idx];
+                    if let Some(l2fw) = weights.l2fw {
+                        let shared_idx = out_col * shape.l2_in() + in_col;
+                        weight += l2fw[shared_idx];
+                        l2fw_gradients[shared_idx] += grad * trace.l2_input[input_idx];
+                    }
+                    l2_input_gradients[input_idx] += grad * weight;
                     l2w_gradients[weight_idx] += grad * trace.l2_input[input_idx];
                 }
             }
@@ -6286,8 +6701,12 @@ mod tests {
             l1fb_gradients,
             l2w_gradients,
             l2b_gradients,
+            l2fw_gradients,
+            l2fb_gradients,
             l3w_gradients,
             l3b_gradients,
+            l3fw_gradients,
+            l3fb_gradients,
         }
     }
 
@@ -6306,8 +6725,12 @@ mod tests {
             l1fb: weights.l1fb.map(|values| values.to_vec()),
             l2w: weights.l2w.to_vec(),
             l2b: weights.l2b.to_vec(),
+            l2fw: weights.l2fw.map(|values| values.to_vec()),
+            l2fb: weights.l2fb.map(|values| values.to_vec()),
             l3w: weights.l3w.to_vec(),
             l3b: weights.l3b.to_vec(),
+            l3fw: weights.l3fw.map(|values| values.to_vec()),
+            l3fb: weights.l3fb.map(|values| values.to_vec()),
         };
         apply_host_ranger_to_group(device, params, &gradients.l0w_gradients, &mut out.l0w);
         apply_host_ranger_to_group(device, params, &gradients.l0b_gradients, &mut out.l0b);
@@ -6321,8 +6744,20 @@ mod tests {
         }
         apply_host_ranger_to_group(device, params, &gradients.l2w_gradients, &mut out.l2w);
         apply_host_ranger_to_group(device, params, &gradients.l2b_gradients, &mut out.l2b);
+        if let Some(l2fw) = &mut out.l2fw {
+            apply_host_ranger_to_group(device, params, &gradients.l2fw_gradients, l2fw);
+        }
+        if let Some(l2fb) = &mut out.l2fb {
+            apply_host_ranger_to_group(device, params, &gradients.l2fb_gradients, l2fb);
+        }
         apply_host_ranger_to_group(device, params, &gradients.l3w_gradients, &mut out.l3w);
         apply_host_ranger_to_group(device, params, &gradients.l3b_gradients, &mut out.l3b);
+        if let Some(l3fw) = &mut out.l3fw {
+            apply_host_ranger_to_group(device, params, &gradients.l3fw_gradients, l3fw);
+        }
+        if let Some(l3fb) = &mut out.l3fb {
+            apply_host_ranger_to_group(device, params, &gradients.l3fb_gradients, l3fb);
+        }
         out
     }
 

@@ -1652,14 +1652,19 @@ fn effective_save_epoch_end(args: &Args) -> bool {
     args.save_epoch_end && !args.no_save_epoch_end
 }
 
+fn effective_sfnn_factorized_stack(args: &Args) -> bool {
+    !args.no_sfnn_factorized_l1 && args.resolved_eval_type().is_some_and(EvalType::uses_layerstack)
+}
+
 fn effective_sfnn_factorized_l1(args: &Args) -> bool {
-    if args.no_sfnn_factorized_l1 {
-        return false;
-    }
     let Some(arch) = args.train_arch().and_then(TrainArch::nnue_arch) else {
         return false;
     };
-    args.resolved_eval_type().is_some_and(EvalType::uses_layerstack) && !arch.has_compact_sfnn_l1()
+    effective_sfnn_factorized_stack(args) && !arch.has_compact_sfnn_l1()
+}
+
+fn effective_sfnn_factorized_l2_l3(args: &Args) -> bool {
+    effective_sfnn_factorized_stack(args)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -2086,15 +2091,15 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     nnue_pytorch_init_scale: f32,
 
-    /// Add nnue-pytorch-style factorized shared L1 weights to SFNN /
-    /// LayerStack networks. The shared term is zero-initialised and added to
-    /// every bucket's L1 output during training, then folded into each bucket
-    /// when saving `nn.bin`. This is enabled by default for non-compact SFNN
-    /// LayerStack architectures.
+    /// Add nnue-pytorch-style factorized shared stack weights to SFNN /
+    /// LayerStack networks. The shared terms are zero-initialised and added
+    /// to every bucket during training, then folded into each bucket when
+    /// saving `nn.bin`. L1 is used for dense L1 architectures; L2/L3 are used
+    /// for all SFNN LayerStack architectures. This is enabled by default.
     #[arg(long, conflicts_with = "no_sfnn_factorized_l1")]
     sfnn_factorized_l1: bool,
 
-    /// Disable the default SFNN factorized shared L1 term. Use this when
+    /// Disable the default SFNN factorized shared stack terms. Use this when
     /// resuming an older non-factorized SFNN experiment.
     #[arg(long = "no-sfnn-factorized-l1")]
     no_sfnn_factorized_l1: bool,
@@ -2235,13 +2240,6 @@ impl Args {
                 eval_type.cli_name()
             ));
         }
-        if arch.has_compact_sfnn_l1() && self.sfnn_factorized_l1 {
-            return Err(
-                "--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures such as c0_s1024x8 or c1024_s256x8"
-                    .to_string()
-            );
-        }
-
         Ok(())
     }
 
@@ -5361,7 +5359,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_weights.shape.input_size
         );
     }
-    eprintln!("  l1 factorized shared term = {}", if initial_weights.l1fw.is_some() { "enabled" } else { "disabled" });
+    eprintln!(
+        "  stack factorized shared terms = L1 {}, L2 {}, L3 {}",
+        if initial_weights.l1fw.is_some() { "enabled" } else { "disabled" },
+        if initial_weights.l2fw.is_some() { "enabled" } else { "disabled" },
+        if initial_weights.l3fw.is_some() { "enabled" } else { "disabled" },
+    );
     if args.arch().has_common_shard_sfnn_l1() {
         eprintln!(
             "  l1 common+shard = c{}_s{}x{} (row fan-in {}; {} output(s) per shard group; compact state)",
@@ -6266,8 +6269,12 @@ fn cuda_cpp_sfnn_weights_readback_as_host(
         l1fb: weights.l1fb.as_deref(),
         l2w: &weights.l2w,
         l2b: &weights.l2b,
+        l2fw: weights.l2fw.as_deref(),
+        l2fb: weights.l2fb.as_deref(),
         l3w: &weights.l3w,
         l3b: &weights.l3b,
+        l3fw: weights.l3fw.as_deref(),
+        l3fb: weights.l3fb.as_deref(),
     }
 }
 
@@ -6284,8 +6291,12 @@ fn cuda_cpp_sfnn_optimizer_readback_as_host(
         l1fb: states.l1fb.as_ref().map(cuda_cpp_ranger_readback_as_host),
         l2w: cuda_cpp_ranger_readback_as_host(&states.l2w),
         l2b: cuda_cpp_ranger_readback_as_host(&states.l2b),
+        l2fw: states.l2fw.as_ref().map(cuda_cpp_ranger_readback_as_host),
+        l2fb: states.l2fb.as_ref().map(cuda_cpp_ranger_readback_as_host),
         l3w: cuda_cpp_ranger_readback_as_host(&states.l3w),
         l3b: cuda_cpp_ranger_readback_as_host(&states.l3b),
+        l3fw: states.l3fw.as_ref().map(cuda_cpp_ranger_readback_as_host),
+        l3fb: states.l3fb.as_ref().map(cuda_cpp_ranger_readback_as_host),
     }
 }
 
@@ -6486,8 +6497,12 @@ fn run_cuda_cpp_sfnn_final_validation(
             l1fb: None,
             l2w: &validation_weights.l2w,
             l2b: &validation_weights.l2b,
+            l2fw: None,
+            l2fb: None,
             l3w: &validation_weights.l3w,
             l3b: &validation_weights.l3b,
+            l3fw: None,
+            l3fb: None,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -6932,12 +6947,30 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
     };
     let mut l1w = weights.l1w.clone();
     let mut l1b = weights.l1b.clone();
+    let mut l2w = weights.l2w.clone();
+    let mut l2b = weights.l2b.clone();
+    let mut l3w = weights.l3w.clone();
+    let mut l3b = weights.l3b.clone();
     fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
         shape,
         &mut l1w,
         &mut l1b,
         weights.l1fw.as_deref(),
         weights.l1fb.as_deref(),
+    )?;
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w,
+        &mut l2b,
+        weights.l2fw.as_deref(),
+        weights.l2fb.as_deref(),
+    )?;
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w,
+        &mut l3b,
+        weights.l3fw.as_deref(),
+        weights.l3fb.as_deref(),
     )?;
     let cpu_l1_group_count = if cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
         l1w = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &l1w)?;
@@ -6954,17 +6987,8 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
         l1_group_count: cpu_l1_group_count,
     };
 
-    let cpu_weights = CpuSfnnForwardOwnedWeights {
-        shape: cpu_shape,
-        l0w,
-        l0b: weights.l0b.clone(),
-        l1w,
-        l1b,
-        l2w: weights.l2w.clone(),
-        l2b: weights.l2b.clone(),
-        l3w: weights.l3w.clone(),
-        l3b: weights.l3b.clone(),
-    };
+    let cpu_weights =
+        CpuSfnnForwardOwnedWeights { shape: cpu_shape, l0w, l0b: weights.l0b.clone(), l1w, l1b, l2w, l2b, l3w, l3b };
     cpu_weights.validate().map_err(|e| e.to_string())?;
     Ok(cpu_weights)
 }
@@ -7017,6 +7041,96 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => {
             return Err("cuda-cpp SFNN weights have partial l1f state".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l2w: &mut [f32],
+    l2b: &mut [f32],
+    l2fw: Option<&[f32]>,
+    l2fb: Option<&[f32]>,
+) -> Result<(), String> {
+    let l2_in = shape.l2_in();
+    let expected_l2w = shape.num_stacks * shape.l2_size * l2_in;
+    let expected_l2b = shape.num_stacks * shape.l2_size;
+    if l2w.len() != expected_l2w {
+        return Err(format!("SFNN l2w length mismatch: got {}, expected {expected_l2w}", l2w.len()));
+    }
+    if l2b.len() != expected_l2b {
+        return Err(format!("SFNN l2b length mismatch: got {}, expected {expected_l2b}", l2b.len()));
+    }
+    match (l2fw, l2fb) {
+        (Some(shared_w), Some(shared_b)) => {
+            let expected_l2fw = shape.l2_size * l2_in;
+            if shared_w.len() != expected_l2fw {
+                return Err(format!("SFNN l2fw length mismatch: got {}, expected {expected_l2fw}", shared_w.len()));
+            }
+            if shared_b.len() != shape.l2_size {
+                return Err(format!("SFNN l2fb length mismatch: got {}, expected {}", shared_b.len(), shape.l2_size));
+            }
+            let stack_stride = shape.l2_size * l2_in;
+            for stack in 0..shape.num_stacks {
+                let bias_base = stack * shape.l2_size;
+                for out_col in 0..shape.l2_size {
+                    l2b[bias_base + out_col] += shared_b[out_col];
+                }
+
+                let weight_base = stack * stack_stride;
+                for out_col in 0..shape.l2_size {
+                    let row_base = weight_base + out_col * l2_in;
+                    let shared_row_base = out_col * l2_in;
+                    for in_col in 0..l2_in {
+                        l2w[row_base + in_col] += shared_w[shared_row_base + in_col];
+                    }
+                }
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("cuda-cpp SFNN weights have partial l2f state".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l3w: &mut [f32],
+    l3b: &mut [f32],
+    l3fw: Option<&[f32]>,
+    l3fb: Option<&[f32]>,
+) -> Result<(), String> {
+    let expected_l3w = shape.num_stacks * shape.l2_size;
+    if l3w.len() != expected_l3w {
+        return Err(format!("SFNN l3w length mismatch: got {}, expected {expected_l3w}", l3w.len()));
+    }
+    if l3b.len() != shape.num_stacks {
+        return Err(format!("SFNN l3b length mismatch: got {}, expected {}", l3b.len(), shape.num_stacks));
+    }
+    match (l3fw, l3fb) {
+        (Some(shared_w), Some(shared_b)) => {
+            if shared_w.len() != shape.l2_size {
+                return Err(format!("SFNN l3fw length mismatch: got {}, expected {}", shared_w.len(), shape.l2_size));
+            }
+            if shared_b.len() != 1 {
+                return Err(format!("SFNN l3fb length mismatch: got {}, expected 1", shared_b.len()));
+            }
+            for stack in 0..shape.num_stacks {
+                l3b[stack] += shared_b[0];
+                let weight_base = stack * shape.l2_size;
+                for in_col in 0..shape.l2_size {
+                    l3w[weight_base + in_col] += shared_w[in_col];
+                }
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("cuda-cpp SFNN weights have partial l3f state".to_string());
         }
     }
     Ok(())
@@ -7256,8 +7370,12 @@ struct CudaCppSfnnInitialWeights {
     l1fb: Option<Vec<f32>>,
     l2w: Vec<f32>,
     l2b: Vec<f32>,
+    l2fw: Option<Vec<f32>>,
+    l2fb: Option<Vec<f32>>,
     l3w: Vec<f32>,
     l3b: Vec<f32>,
+    l3fw: Option<Vec<f32>>,
+    l3fb: Option<Vec<f32>>,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7273,8 +7391,12 @@ impl CudaCppSfnnInitialWeights {
             l1fb: self.l1fb.as_deref(),
             l2w: &self.l2w,
             l2b: &self.l2b,
+            l2fw: self.l2fw.as_deref(),
+            l2fb: self.l2fb.as_deref(),
             l3w: &self.l3w,
             l3b: &self.l3b,
+            l3fw: self.l3fw.as_deref(),
+            l3fb: self.l3fb.as_deref(),
         };
         weights.validate().map_err(|e| e.to_string())
     }
@@ -7290,8 +7412,12 @@ impl CudaCppSfnnInitialWeights {
             l1fb: self.l1fb.as_deref(),
             l2w: &self.l2w,
             l2b: &self.l2b,
+            l2fw: self.l2fw.as_deref(),
+            l2fb: self.l2fb.as_deref(),
             l3w: &self.l3w,
             l3b: &self.l3b,
+            l3fw: self.l3fw.as_deref(),
+            l3fb: self.l3fb.as_deref(),
         }
     }
 }
@@ -7315,8 +7441,12 @@ struct CudaCppSfnnOptimizerState {
     l1fb: Option<CudaCppRangerGroupState>,
     l2w: CudaCppRangerGroupState,
     l2b: CudaCppRangerGroupState,
+    l2fw: Option<CudaCppRangerGroupState>,
+    l2fb: Option<CudaCppRangerGroupState>,
     l3w: CudaCppRangerGroupState,
     l3b: CudaCppRangerGroupState,
+    l3fw: Option<CudaCppRangerGroupState>,
+    l3fb: Option<CudaCppRangerGroupState>,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7331,8 +7461,12 @@ impl CudaCppSfnnOptimizerState {
             l1fb: self.l1fb.as_ref().map(CudaCppRangerGroupState::as_host),
             l2w: self.l2w.as_host(),
             l2b: self.l2b.as_host(),
+            l2fw: self.l2fw.as_ref().map(CudaCppRangerGroupState::as_host),
+            l2fb: self.l2fb.as_ref().map(CudaCppRangerGroupState::as_host),
             l3w: self.l3w.as_host(),
             l3b: self.l3b.as_host(),
+            l3fw: self.l3fw.as_ref().map(CudaCppRangerGroupState::as_host),
+            l3fb: self.l3fb.as_ref().map(CudaCppRangerGroupState::as_host),
         }
     }
 }
@@ -7549,15 +7683,18 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
     let (l1fw, l1fb) = if effective_sfnn_factorized_l1(args) {
-        if grouped_l1 || common_shard_l1 {
-            return Err("--sfnn-factorized-l1 is not supported with compact SFNN L1 architectures".to_string());
-        }
         (Some(vec![0.0; ft_size * l1_out]), Some(vec![0.0; l1_out]))
     } else {
         (None, None)
     };
+    let (l2fw, l2fb, l3fw, l3fb) = if effective_sfnn_factorized_l2_l3(args) {
+        (Some(vec![0.0; l2_size * l2_in]), Some(vec![0.0; l2_size]), Some(vec![0.0; l2_size]), Some(vec![0.0; 1]))
+    } else {
+        (None, None, None, None)
+    };
 
-    let weights = CudaCppSfnnInitialWeights { shape, l0w, l0b, l1w, l1b, l1fw, l1fb, l2w, l2b, l3w, l3b };
+    let weights =
+        CudaCppSfnnInitialWeights { shape, l0w, l0b, l1w, l1b, l1fw, l1fb, l2w, l2b, l2fw, l2fb, l3w, l3b, l3fw, l3fb };
     weights.validate()?;
     Ok(weights)
 }
@@ -7586,7 +7723,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         l1_common_size: args.arch().sfnn_l1_common_size(),
         l1_shard_size: args.arch().sfnn_l1_shard_size(),
     };
-    let weights = load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, weights).map_err(|err| {
+    let mut weights = load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, weights).map_err(|err| {
         format!(
             "failed to load cuda-cpp SFNN {} weights from {} for arch {}: {err}",
             feature_kind.source_label(),
@@ -7595,22 +7732,65 @@ fn load_cuda_cpp_sfnn_initial_state(
         )
     })?;
     let wants_l1f = effective_sfnn_factorized_l1(args);
-    match (wants_l1f, weights.l1fw.is_some()) {
-        (true, false) => {
-            return Err(format!(
-                "loaded SFNN state {} has no l1f/l1fb factorized-L1 weights, but this arch now enables them by default. \
-                 Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
-                path.display()
-            ));
+    let wants_l2_l3f = effective_sfnn_factorized_l2_l3(args);
+    if weights.l2fw.is_some() != weights.l3fw.is_some() {
+        return Err(format!(
+            "loaded SFNN state {} has only one of factorized L2/L3 shared terms; expected both or neither",
+            path.display()
+        ));
+    }
+    if wants_l2_l3f && weights.l2fw.is_none() {
+        eprintln!(
+            "  WARN: loaded SFNN state {} has no L2/L3 shared stack factorizer tensors; adding zero-initialized l2f/l3f terms for compatibility",
+            path.display()
+        );
+        weights.l2fw = Some(vec![0.0; weights.shape.l2_size * weights.shape.l2_in()]);
+        weights.l2fb = Some(vec![0.0; weights.shape.l2_size]);
+        weights.l3fw = Some(vec![0.0; weights.shape.l2_size]);
+        weights.l3fb = Some(vec![0.0; 1]);
+    }
+    for (wants, has, label, resume_hint) in [
+        (
+            wants_l1f,
+            weights.l1fw.is_some(),
+            "l1fw/l1fb factorized-L1 weights",
+            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+        ),
+        (
+            wants_l2_l3f,
+            weights.l2fw.is_some(),
+            "l2fw/l2fb factorized-L2 weights",
+            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+        ),
+        (
+            wants_l2_l3f,
+            weights.l3fw.is_some(),
+            "l3fw/l3fb factorized-L3 weights",
+            "Pass --no-sfnn-factorized-l1 to resume/use this state unchanged, or start a new experiment.",
+        ),
+    ] {
+        match (wants, has) {
+            (true, false) => {
+                return Err(format!(
+                    "loaded SFNN state {} has no {label}, but this arch now enables it by default. {resume_hint}",
+                    path.display()
+                ));
+            }
+            (false, true) => {
+                return Err(format!(
+                    "loaded SFNN state {} contains {label}, but --no-sfnn-factorized-l1 disabled shared stack terms. \
+                     Remove --no-sfnn-factorized-l1 to resume this state.",
+                    path.display()
+                ));
+            }
+            _ => {}
         }
-        (false, true) => {
-            return Err(format!(
-                "loaded SFNN state {} contains l1f/l1fb factorized-L1 weights, but --no-sfnn-factorized-l1 or compact L1 disabled them. \
-                 Remove --no-sfnn-factorized-l1 and use a non-compact SFNN arch to resume this state.",
-                path.display()
-            ));
-        }
-        _ => {}
+    }
+    if weights.l1fw.is_some() && weights.shape.has_compact_l1() {
+        return Err(format!(
+            "loaded SFNN state {} contains l1fw/l1fb factorized-L1 weights, but compact L1 architectures cannot use them",
+            path.display()
+        ));
     }
     let optimizer_states = load_cuda_cpp_sfnn_optimizer_state(&records, &weights)?;
     let completed_steps = load_cuda_cpp_sfnn_completed_steps(&records, &weights)?;
@@ -7656,6 +7836,8 @@ fn load_cuda_cpp_sfnn_weights_from_records(
         (None, Some(_)) => return Err("SFNN weights contain l1fb without l1fw".to_string()),
     };
     let l1fb = if l1fw.is_some() { Some(load_cuda_cpp_weight_record(records, "l1fb")?) } else { None };
+    let (l2fw, l2fb) = load_cuda_cpp_optional_weight_pair(records, "l2fw", "l2fb", "SFNN")?;
+    let (l3fw, l3fb) = load_cuda_cpp_optional_weight_pair(records, "l3fw", "l3fb", "SFNN")?;
 
     let weights = CudaCppSfnnInitialWeights {
         shape,
@@ -7667,8 +7849,12 @@ fn load_cuda_cpp_sfnn_weights_from_records(
         l1fb,
         l2w: load_cuda_cpp_weight_record(records, "l2w")?,
         l2b: load_cuda_cpp_weight_record(records, "l2b")?,
+        l2fw,
+        l2fb,
         l3w: load_cuda_cpp_weight_record(records, "l3w")?,
         l3b: load_cuda_cpp_weight_record(records, "l3b")?,
+        l3fw,
+        l3fb,
     };
     weights.validate()?;
     Ok(weights)
@@ -7677,6 +7863,24 @@ fn load_cuda_cpp_sfnn_weights_from_records(
 #[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_weight_record(records: &BTreeMap<String, Vec<f32>>, id: &'static str) -> Result<Vec<f32>, String> {
     records.get(id).cloned().ok_or_else(|| format!("cuda-cpp state missing weight `{id}`"))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_optional_weight_pair(
+    records: &BTreeMap<String, Vec<f32>>,
+    weight_id: &'static str,
+    bias_id: &'static str,
+    label: &'static str,
+) -> Result<(Option<Vec<f32>>, Option<Vec<f32>>), String> {
+    match (records.get(weight_id), records.get(bias_id)) {
+        (Some(_), Some(_)) => Ok((
+            Some(load_cuda_cpp_weight_record(records, weight_id)?),
+            Some(load_cuda_cpp_weight_record(records, bias_id)?),
+        )),
+        (None, None) => Ok((None, None)),
+        (Some(_), None) => Err(format!("{label} weights contain {weight_id} without {bias_id}")),
+        (None, Some(_)) => Err(format!("{label} weights contain {bias_id} without {weight_id}")),
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7705,6 +7909,22 @@ fn load_cuda_cpp_sfnn_optimizer_state(
         (None, None) => (None, None),
         _ => return Err("cuda-cpp SFNN l1f weights are partial".to_string()),
     };
+    let (l2fw, l2fb) = match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(l2fb)) => (
+            Some(load_or_zero_cuda_cpp_ranger_group_state_for("SFNN", "l2fw", l2fw, &momentum, &velocity, &slow)?),
+            Some(load_or_zero_cuda_cpp_ranger_group_state_for("SFNN", "l2fb", l2fb, &momentum, &velocity, &slow)?),
+        ),
+        (None, None) => (None, None),
+        _ => return Err("cuda-cpp SFNN l2f weights are partial".to_string()),
+    };
+    let (l3fw, l3fb) = match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(l3fb)) => (
+            Some(load_or_zero_cuda_cpp_ranger_group_state_for("SFNN", "l3fw", l3fw, &momentum, &velocity, &slow)?),
+            Some(load_or_zero_cuda_cpp_ranger_group_state_for("SFNN", "l3fb", l3fb, &momentum, &velocity, &slow)?),
+        ),
+        (None, None) => (None, None),
+        _ => return Err("cuda-cpp SFNN l3f weights are partial".to_string()),
+    };
 
     Ok(Some(CudaCppSfnnOptimizerState {
         l0w: load_cuda_cpp_ranger_group_state_for("SFNN", "l0w", weights.l0w.len(), &momentum, &velocity, &slow)?,
@@ -7715,8 +7935,12 @@ fn load_cuda_cpp_sfnn_optimizer_state(
         l1fb,
         l2w: load_cuda_cpp_ranger_group_state_for("SFNN", "l2w", weights.l2w.len(), &momentum, &velocity, &slow)?,
         l2b: load_cuda_cpp_ranger_group_state_for("SFNN", "l2b", weights.l2b.len(), &momentum, &velocity, &slow)?,
+        l2fw,
+        l2fb,
         l3w: load_cuda_cpp_ranger_group_state_for("SFNN", "l3w", weights.l3w.len(), &momentum, &velocity, &slow)?,
         l3b: load_cuda_cpp_ranger_group_state_for("SFNN", "l3b", weights.l3b.len(), &momentum, &velocity, &slow)?,
+        l3fw,
+        l3fb,
     }))
 }
 
@@ -7726,11 +7950,35 @@ fn load_cuda_cpp_sfnn_completed_steps(
     weights: &CudaCppSfnnInitialWeights,
 ) -> Result<usize, String> {
     let mut ids = vec!["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"];
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
     if weights.l1fw.is_some() {
         ids.push("l1fw");
         ids.push("l1fb");
     }
+    if weights.l2fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l2fw", "l2fb")? {
+        ids.push("l2fw");
+        ids.push("l2fb");
+    }
+    if weights.l3fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l3fw", "l3fb")? {
+        ids.push("l3fw");
+        ids.push("l3fb");
+    }
     load_cuda_cpp_completed_steps_for("SFNN", records, &ids)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_optional_step_pair_present(
+    label: &'static str,
+    steps: &BTreeMap<String, Vec<f32>>,
+    weight_id: &'static str,
+    bias_id: &'static str,
+) -> Result<bool, String> {
+    match (steps.contains_key(weight_id), steps.contains_key(bias_id)) {
+        (true, true) => Ok(true),
+        (false, false) => Ok(false),
+        (true, false) => Err(format!("cuda-cpp {label} state has nnue/step_ranger/{weight_id} without {bias_id}")),
+        (false, true) => Err(format!("cuda-cpp {label} state has nnue/step_ranger/{bias_id} without {weight_id}")),
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7823,6 +8071,10 @@ impl CudaCppRangerGroupState {
             velocity: &self.velocity,
             slow_params: &self.slow_params,
         }
+    }
+
+    fn zero_from_weights(weights: &[f32]) -> Self {
+        Self { momentum: vec![0.0; weights.len()], velocity: vec![0.0; weights.len()], slow_params: weights.to_vec() }
     }
 }
 
@@ -8004,6 +8256,23 @@ fn load_cuda_cpp_ranger_group_state_for(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn load_or_zero_cuda_cpp_ranger_group_state_for(
+    label: &'static str,
+    id: &'static str,
+    weights: &[f32],
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
+) -> Result<CudaCppRangerGroupState, String> {
+    let present = momentum.contains_key(id) || velocity.contains_key(id) || slow.contains_key(id);
+    if present {
+        load_cuda_cpp_ranger_group_state_for(label, id, weights.len(), momentum, velocity, slow)
+    } else {
+        Ok(CudaCppRangerGroupState::zero_from_weights(weights))
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_optimizer_record_for(
     label: &'static str,
     section: &'static str,
@@ -8166,6 +8435,22 @@ fn write_cuda_cpp_sfnn_weights_bin(
         (None, None) => {}
         _ => return Err("cuda-cpp SFNN weights have partial l1f state".to_string()),
     }
+    match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(l2fb)) => {
+            records.push(("nnue/weights/l2fw", l2fw.as_slice()));
+            records.push(("nnue/weights/l2fb", l2fb.as_slice()));
+        }
+        (None, None) => {}
+        _ => return Err("cuda-cpp SFNN weights have partial l2f state".to_string()),
+    }
+    match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(l3fb)) => {
+            records.push(("nnue/weights/l3fw", l3fw.as_slice()));
+            records.push(("nnue/weights/l3fb", l3fb.as_slice()));
+        }
+        (None, None) => {}
+        _ => return Err("cuda-cpp SFNN weights have partial l3f state".to_string()),
+    }
 
     macro_rules! push_group_state {
         ($id:literal, $state:expr) => {{
@@ -8189,8 +8474,24 @@ fn write_cuda_cpp_sfnn_weights_bin(
     }
     push_group_state!("l2w", &optimizer_states.l2w);
     push_group_state!("l2b", &optimizer_states.l2b);
+    match (&optimizer_states.l2fw, &optimizer_states.l2fb) {
+        (Some(l2fw), Some(l2fb)) => {
+            push_group_state!("l2fw", l2fw);
+            push_group_state!("l2fb", l2fb);
+        }
+        (None, None) => {}
+        _ => return Err("cuda-cpp SFNN optimizer states have partial l2f state".to_string()),
+    }
     push_group_state!("l3w", &optimizer_states.l3w);
     push_group_state!("l3b", &optimizer_states.l3b);
+    match (&optimizer_states.l3fw, &optimizer_states.l3fb) {
+        (Some(l3fw), Some(l3fb)) => {
+            push_group_state!("l3fw", l3fw);
+            push_group_state!("l3fb", l3fb);
+        }
+        (None, None) => {}
+        _ => return Err("cuda-cpp SFNN optimizer states have partial l3f state".to_string()),
+    }
 
     records.extend([
         ("nnue/step_ranger/l0w", completed_steps.as_slice()),
@@ -8206,6 +8507,18 @@ fn write_cuda_cpp_sfnn_weights_bin(
         records.extend([
             ("nnue/step_ranger/l1fw", completed_steps.as_slice()),
             ("nnue/step_ranger/l1fb", completed_steps.as_slice()),
+        ]);
+    }
+    if weights.l2fw.is_some() {
+        records.extend([
+            ("nnue/step_ranger/l2fw", completed_steps.as_slice()),
+            ("nnue/step_ranger/l2fb", completed_steps.as_slice()),
+        ]);
+    }
+    if weights.l3fw.is_some() {
+        records.extend([
+            ("nnue/step_ranger/l3fw", completed_steps.as_slice()),
+            ("nnue/step_ranger/l3fb", completed_steps.as_slice()),
         ]);
     }
 
@@ -8280,6 +8593,24 @@ fn write_cuda_cpp_sfnn_nn_bin(
     if l1fw.is_some() != l1fb.is_some() {
         return Err("cuda-cpp SFNN weights have partial l1f state".to_string());
     }
+    let mut l2w_for_export = weights.l2w.clone();
+    let mut l2b_for_export = weights.l2b.clone();
+    let mut l3w_for_export = weights.l3w.clone();
+    let mut l3b_for_export = weights.l3b.clone();
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w_for_export,
+        &mut l2b_for_export,
+        weights.l2fw.as_deref(),
+        weights.l2fb.as_deref(),
+    )?;
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w_for_export,
+        &mut l3b_for_export,
+        weights.l3fw.as_deref(),
+        weights.l3fb.as_deref(),
+    )?;
     let dense_l1w_for_export;
     let l1w_for_export: &[f32] = if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
         if l1fw.is_some() {
@@ -8326,7 +8657,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
         let mut l2b_bytes = Vec::with_capacity(shape.l2_size * std::mem::size_of::<i32>());
         for out_col in 0..shape.l2_size {
-            let value = weights.l2b[stack * shape.l2_size + out_col];
+            let value = l2b_for_export[stack * shape.l2_size + out_col];
             l2b_bytes.extend_from_slice(&sfnn_quantise_i32(value, fc_bias_scale).to_le_bytes());
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l2b", &l2b_bytes)?;
@@ -8336,7 +8667,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         for out_col in 0..shape.l2_size {
             for in_col in 0..l2_pad_in {
                 let q = if in_col < l2_in {
-                    let value = weights.l2w[stack * shape.l2_size * l2_in + out_col * l2_in + in_col];
+                    let value = l2w_for_export[stack * shape.l2_size * l2_in + out_col * l2_in + in_col];
                     sfnn_quantise_i8(value, fc_weight_scale)
                 } else {
                     0
@@ -8346,14 +8677,14 @@ fn write_cuda_cpp_sfnn_nn_bin(
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l2w", &l2w_bytes)?;
 
-        let l3b_bytes = sfnn_quantise_i32(weights.l3b[stack], fc_bias_scale).to_le_bytes();
+        let l3b_bytes = sfnn_quantise_i32(l3b_for_export[stack], fc_bias_scale).to_le_bytes();
         write_nnue_bin_chunk(&mut writer, path, "sfnn l3b", &l3b_bytes)?;
 
         let l3_pad_in = nnue_pad32(shape.l2_size);
         let mut l3w_bytes = Vec::with_capacity(l3_pad_in);
         for in_col in 0..l3_pad_in {
             let q = if in_col < shape.l2_size {
-                sfnn_quantise_i8(weights.l3w[stack * shape.l2_size + in_col], fc_weight_scale)
+                sfnn_quantise_i8(l3w_for_export[stack * shape.l2_size + in_col], fc_weight_scale)
             } else {
                 0
             };
@@ -9150,7 +9481,7 @@ fn resume_signature(args: &Args) -> String {
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
 
     [
-        "schema=bulletou-resume-v2".to_string(),
+        "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
         format!("eval_type={}", args.eval_type().cli_name()),
         format!("arch={arch}"),
@@ -9191,7 +9522,9 @@ fn resume_signature(args: &Args) -> String {
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
+        format!("sfnn_factorized_stack={}", effective_sfnn_factorized_stack(args)),
         format!("sfnn_factorized_l1={}", effective_sfnn_factorized_l1(args)),
+        format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -10825,7 +11158,7 @@ mod tests {
 
         let sig_with = resume_signature(&with_superbatches);
         let sig_without = resume_signature(&without_superbatches);
-        assert!(sig_with.contains("schema=bulletou-resume-v2"));
+        assert!(sig_with.contains("schema=bulletou-resume-v3"));
         assert!(sig_with.contains("backend=cuda-cpp"));
         assert!(sig_with.contains("positions_per_superbatch=99942400"));
         assert!(sig_with.contains("superbatches=19"));
@@ -11855,6 +12188,7 @@ mod tests {
         .unwrap();
 
         assert!(effective_sfnn_factorized_l1(&args));
+        assert!(effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -11882,6 +12216,7 @@ mod tests {
         .unwrap();
 
         assert!(!effective_sfnn_factorized_l1(&args));
+        assert!(!effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -11908,6 +12243,7 @@ mod tests {
         .unwrap();
 
         assert!(!effective_sfnn_factorized_l1(&args));
+        assert!(effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -12660,6 +12996,10 @@ mod tests {
         assert!(weights.l0w[base_input_size * weights.shape.ft_size..].iter().all(|&v| v == 0.0));
         assert!(weights.l1fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
         assert!(weights.l1fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l2fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l2fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l3fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l3fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
 
         let stack_stride = l1_out * weights.shape.ft_size;
         assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
@@ -12688,6 +13028,10 @@ mod tests {
         let weights = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Halfka2).unwrap();
         assert!(weights.l1fw.is_none());
         assert!(weights.l1fb.is_none());
+        assert!(weights.l2fw.is_none());
+        assert!(weights.l2fb.is_none());
+        assert!(weights.l3fw.is_none());
+        assert!(weights.l3fb.is_none());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -12743,7 +13087,7 @@ mod tests {
             );
         }
 
-        let err = Args::try_parse_from([
+        let args = Args::try_parse_from([
             "bulletou",
             "--arch",
             "SFNN_halfka2_4096_7_64_g4_k3k3",
@@ -12755,10 +13099,10 @@ mod tests {
             "1",
             "--sfnn-factorized-l1",
         ])
-        .unwrap()
-        .validate_arch_flags()
-        .unwrap_err();
-        assert!(err.contains("factorized"));
+        .unwrap();
+        assert!(!effective_sfnn_factorized_l1(&args));
+        assert!(effective_sfnn_factorized_l2_l3(&args));
+        assert!(args.validate_arch_flags().is_ok());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -13000,8 +13344,12 @@ mod tests {
             l1fb: Some(vec![15.0]),
             l2w: vec![16.0],
             l2b: vec![17.0],
-            l3w: vec![18.0],
-            l3b: vec![19.0],
+            l2fw: Some(vec![18.0]),
+            l2fb: Some(vec![19.0]),
+            l3w: vec![20.0],
+            l3b: vec![21.0],
+            l3fw: Some(vec![22.0]),
+            l3fb: Some(vec![23.0]),
         };
         let optimizer = bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback {
             l0w: group_state(1.0),
@@ -13012,8 +13360,12 @@ mod tests {
             l1fb: Some(group_state(6.0)),
             l2w: group_state(7.0),
             l2b: group_state(8.0),
-            l3w: group_state(9.0),
-            l3b: group_state(10.0),
+            l2fw: Some(group_state(9.0)),
+            l2fb: Some(group_state(10.0)),
+            l3w: group_state(11.0),
+            l3b: group_state(12.0),
+            l3fw: Some(group_state(13.0)),
+            l3fb: Some(group_state(14.0)),
         };
         let path = std::env::temp_dir().join(format!(
             "bulletou-test-cuda-cpp-sfnn-state-{}-{}.bin",
@@ -13027,10 +13379,15 @@ mod tests {
         let records = parse_model_weights_bin(&bytes).unwrap();
 
         assert_eq!(records["nnue/weights/l1fw"], vec![14.0]);
+        assert_eq!(records["nnue/weights/l2fw"], vec![18.0]);
+        assert_eq!(records["nnue/weights/l3fb"], vec![23.0]);
         assert_eq!(records["nnue/momentum/l1fw"], vec![5.0]);
-        assert_eq!(records["nnue/velocity/l3b"], vec![10.25]);
+        assert_eq!(records["nnue/velocity/l3b"], vec![12.25]);
         assert_eq!(records["nnue/slow/l2w"], vec![7.5]);
+        assert_eq!(records["nnue/momentum/l3fw"], vec![13.0]);
         assert_eq!(records["nnue/step_ranger/l1fb"], vec![11.0]);
+        assert_eq!(records["nnue/step_ranger/l2fb"], vec![11.0]);
+        assert_eq!(records["nnue/step_ranger/l3fw"], vec![11.0]);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -13056,8 +13413,12 @@ mod tests {
             l1fb: Some(vec![0.0; shape.l1_out()]),
             l2w: vec![0.0; shape.num_stacks * shape.l2_size * shape.l2_in()],
             l2b: vec![0.0; shape.num_stacks * shape.l2_size],
+            l2fw: Some(vec![0.0; shape.l2_size * shape.l2_in()]),
+            l2fb: Some(vec![0.0; shape.l2_size]),
             l3w: vec![0.0; shape.num_stacks * shape.l2_size],
             l3b: vec![0.0; shape.num_stacks],
+            l3fw: Some(vec![0.0; shape.l2_size]),
+            l3fb: Some(vec![0.0; 1]),
         };
         let mut records: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         for (id, len) in [
@@ -13069,8 +13430,12 @@ mod tests {
             ("l1fb", weights.l1fb.as_ref().unwrap().len()),
             ("l2w", weights.l2w.len()),
             ("l2b", weights.l2b.len()),
+            ("l2fw", weights.l2fw.as_ref().unwrap().len()),
+            ("l2fb", weights.l2fb.as_ref().unwrap().len()),
             ("l3w", weights.l3w.len()),
             ("l3b", weights.l3b.len()),
+            ("l3fw", weights.l3fw.as_ref().unwrap().len()),
+            ("l3fb", weights.l3fb.as_ref().unwrap().len()),
         ] {
             records.insert(format!("nnue/momentum/{id}"), vec![1.0; len]);
             records.insert(format!("nnue/velocity/{id}"), vec![2.0; len]);
@@ -13081,8 +13446,26 @@ mod tests {
         let state = load_cuda_cpp_sfnn_optimizer_state(&records, &weights).unwrap().unwrap();
         assert_eq!(state.l0w.momentum, vec![1.0; shape.input_size * shape.ft_size]);
         assert_eq!(state.l1fw.as_ref().unwrap().velocity, vec![2.0; shape.ft_size * shape.l1_out()]);
+        assert_eq!(state.l2fw.as_ref().unwrap().velocity, vec![2.0; shape.l2_size * shape.l2_in()]);
+        assert_eq!(state.l3fb.as_ref().unwrap().momentum, vec![1.0]);
         assert_eq!(state.l3b.slow_params, vec![3.0; shape.num_stacks]);
         assert_eq!(load_cuda_cpp_sfnn_completed_steps(&records, &weights).unwrap(), 42);
+
+        let mut legacy_records = records.clone();
+        for section in ["momentum", "velocity", "slow"] {
+            for id in ["l2fw", "l2fb", "l3fw", "l3fb"] {
+                legacy_records.remove(&format!("nnue/{section}/{id}"));
+            }
+        }
+        for id in ["l2fw", "l2fb", "l3fw", "l3fb"] {
+            legacy_records.remove(&format!("nnue/step_ranger/{id}"));
+        }
+
+        let legacy_state = load_cuda_cpp_sfnn_optimizer_state(&legacy_records, &weights).unwrap().unwrap();
+        assert_eq!(legacy_state.l2fw.as_ref().unwrap().momentum, vec![0.0; shape.l2_size * shape.l2_in()]);
+        assert_eq!(legacy_state.l2fw.as_ref().unwrap().slow_params, vec![0.0; shape.l2_size * shape.l2_in()]);
+        assert_eq!(legacy_state.l3fb.as_ref().unwrap().velocity, vec![0.0]);
+        assert_eq!(load_cuda_cpp_sfnn_completed_steps(&legacy_records, &weights).unwrap(), 42);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -13206,6 +13589,56 @@ mod tests {
                 10.2, 13.0, 32.0, // stack1 out1
             ]
         );
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_validation_l2_l3_fold_adds_shared_terms_to_each_stack() {
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 3,
+            l1_hidden: 2,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+        };
+        let l2_in = shape.l2_in();
+        let mut l2w = vec![
+            1.0, 2.0, 3.0, 4.0, // stack0 out0
+            5.0, 6.0, 7.0, 8.0, // stack0 out1
+            10.0, 20.0, 30.0, 40.0, // stack1 out0
+            50.0, 60.0, 70.0, 80.0, // stack1 out1
+        ];
+        let mut l2b = vec![0.5, 1.5, 2.5, 3.5];
+        let l2fw = vec![
+            0.1, 0.2, 0.3, 0.4, // shared out0
+            1.0, 2.0, 3.0, 4.0, // shared out1
+        ];
+        let l2fb = vec![100.0, 200.0];
+        fold_cuda_cpp_sfnn_l2f_into_stacked_l2(shape, &mut l2w, &mut l2b, Some(&l2fw), Some(&l2fb)).unwrap();
+
+        assert_eq!(l2_in, 4);
+        assert_eq!(l2b, vec![100.5, 201.5, 102.5, 203.5]);
+        assert_eq!(
+            l2w,
+            vec![
+                1.1, 2.2, 3.3, 4.4, //
+                6.0, 8.0, 10.0, 12.0, //
+                10.1, 20.2, 30.3, 40.4, //
+                51.0, 62.0, 73.0, 84.0,
+            ]
+        );
+
+        let mut l3w = vec![1.0, 2.0, 10.0, 20.0];
+        let mut l3b = vec![0.5, 1.5];
+        let l3fw = vec![0.25, 0.75];
+        let l3fb = vec![10.0];
+        fold_cuda_cpp_sfnn_l3f_into_stacked_l3(shape, &mut l3w, &mut l3b, Some(&l3fw), Some(&l3fb)).unwrap();
+
+        assert_eq!(l3b, vec![10.5, 11.5]);
+        assert_eq!(l3w, vec![1.25, 2.75, 10.25, 20.75]);
     }
 
     #[test]

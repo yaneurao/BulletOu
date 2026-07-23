@@ -363,8 +363,15 @@ fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static>
             0.4, -0.2, 0.3, 0.1, // stack 1, row 1
         ],
         l2b: &[0.02, -0.03, 0.01, 0.04],
+        l2fw: Some(&[
+            0.01, -0.02, 0.03, -0.04, // shared row 0
+            -0.03, 0.02, -0.01, 0.04, // shared row 1
+        ]),
+        l2fb: Some(&[0.006, -0.008]),
         l3w: &[0.6, -0.4, 0.5, 0.2],
         l3b: &[0.05, -0.02],
+        l3fw: Some(&[0.03, -0.02]),
+        l3fb: Some(&[0.004]),
     }
 }
 
@@ -422,11 +429,26 @@ fn cpu_tiny_sfnn_forward(batch: SfnnForwardHostBatch<'_>, weights: SfnnForwardHo
         }
 
         let mut l2 = stacked_affine_sfnn_cpu(&l2_input, weights.l2w, weights.l2b, shape.l2_in(), shape.l2_size, stack);
+        if let (Some(l2fw), Some(l2fb)) = (weights.l2fw, weights.l2fb) {
+            for row in 0..shape.l2_size {
+                l2[row] += l2fb[row];
+                for input in 0..shape.l2_in() {
+                    l2[row] += l2_input[input] * l2fw[row * shape.l2_in() + input];
+                }
+            }
+        }
         l2.iter_mut().for_each(|value| *value = value.clamp(0.0, 1.0));
 
         let mut value = weights.l3b[stack] + psqt;
+        if let Some(l3fb) = weights.l3fb {
+            value += l3fb[0];
+        }
         for input in 0..shape.l2_size {
-            value += l2[input] * weights.l3w[stack * shape.l2_size + input];
+            let mut weight = weights.l3w[stack * shape.l2_size + input];
+            if let Some(l3fw) = weights.l3fw {
+                weight += l3fw[input];
+            }
+            value += l2[input] * weight;
         }
         *out_sample = value;
     }

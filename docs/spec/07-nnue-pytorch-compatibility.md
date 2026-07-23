@@ -296,3 +296,12 @@ BulletOu 側:
 - `crates/bulletou_lib/src/value/loader.rs`
 - `crates/bulletou_lib/src/validate.rs`
 - `crates/bulletou_lib/src/game/outputs.rs`
+
+## 2026-07-23 update: SFNN stack factorizer scope
+
+BulletOu cuda-cpp SFNN now uses stack shared factorizer terms beyond L1:
+
+- dense L1 architectures: `l1fw/l1fb`, `l2fw/l2fb`, and `l3fw/l3fb` are enabled by default
+- compact L1 architectures (`gN` / `cN_sMxG`): L1 shared term is not used, but `l2fw/l2fb` and `l3fw/l3fb` are enabled by default
+- `--no-sfnn-factorized-l1` is kept as the compatibility flag and disables all SFNN shared stack factorizer terms
+- `state.bin` preserves the shared tensors and their Ranger optimizer states; `nn.bin` folds the shared tensors into each bucket's stacked weights before export
