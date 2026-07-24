@@ -1,22 +1,21 @@
-# 4. 学習を走らせる — `bulletou` コマンドの実行
+# 4. 学習を走らせめE E`bulletou` コマンド�E実衁E
 
 <a href="../../en/tutorial/4-train.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-ゴール: 用意した教師データから、やねうら王互換エンジンが読み込める評価関数バイナリを学習する。
+ゴール: 用意した教師チE�Eタから、やねぁE��王互換エンジンが読み込める評価関数バイナリを学習する、E
 
-この章は [3. 教師データを用意する](3-data.md) を完了している前提 — 教師ファイル (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) が用意され、事前にシャッフルされている状態。
+こ�E章は [3. 教師チE�Eタを用意する](3-data.md) を完亁E��てぁE��前提  E教師ファイル (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) が用意され、事前にシャチE��ルされてぁE��状態、E
 
-## 4.1 ビルド (1 回だけ)
+## 4.1 ビルチE(1 回だぁE
 
-まず `bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK。逆に、BulletOu のソースを更新した直後は、既存の `.\target\release\examples\bulletou.exe` は古いままなので必ず再ビルドする:
+まぁE`bulletou` をビルドする。ソースに変更が無ければ初回 1 回だけで OK。送E��、BulletOu のソースを更新した直後�E、既存�E `.\target\release\examples\bulletou.exe` は古ぁE��まなので忁E��再ビルドすめE
 
 ```bash
 cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-Windows の場合、生成されるバイナリは `.\target\release\examples\bulletou.exe`。以下のコマンド例は Unix 形式で書くので適宜読み替え。
-
-## 4.2 最小コマンド (NNUE HalfKP)
+Windows の場合、生成されるバイナリは `.\target\release\examples\bulletou.exe`。以下�Eコマンド例�E Unix 形式で書く�Eで適宜読み替え、E
+## 4.2 最小コマンチE(NNUE HalfKP)
 
 ```bash
 ./target/release/examples/bulletou \
@@ -24,39 +23,37 @@ Windows の場合、生成されるバイナリは `.\target\release\examples\bu
     --teacher teachers/
 ```
 
-これだけで動く。`--output` を省略しているので、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる (`--arch` から自動命名)。別の場所に書きたい場合は `--output checkpoints/my-halfkp` のように明示する。
+これだけで動く。`--output` を省略してぁE��ので、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれめE(`--arch` から自動命吁E。別の場所に書きたぁE��合�E `--output checkpoints/my-halfkp` のように明示する、E
+## 4.3 `--arch` を指定すめE
 
-## 4.3 `--arch` を指定する
+学習対象は `--arch` だけで持E��する、EPPT 系なめE`KPPT` / `KPP_KKPT`、NNUE / SFNN 系なめE**めE�EぁE��王�E Makefile edition 名かめE`YANEURAOU_ENGINE_` を取り除ぁE��名前**を指定する。たとえ�E HalfKP の 256x2-32-32 なめE`NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 なめE`NNUE_kp_256x2_32_32`、SFNN なめE`SFNN_halfka2_1024_7_64_k3k3` のように書く。古ぁE��縮形 `256x2-32-32` は受け付けなぁE��E
+NNUE 系のサイズ部刁E�E `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。よく使われるサイズは以丁E
 
-学習対象は `--arch` だけで指定する。KPPT 系なら `KPPT` / `KPP_KKPT`、NNUE / SFNN 系なら **やねうら王の Makefile edition 名から `YANEURAOU_ENGINE_` を取り除いた名前**を指定する。たとえば HalfKP の 256x2-32-32 なら `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 なら `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。古い短縮形 `256x2-32-32` は受け付けない。
-
-NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごとの accumulator サイズ) は **32 の倍数** (FT SIMD パディング要件) で正の整数、`L2` / `L3` は正の整数なら何でも受け付ける。よく使われるサイズは以下:
-
-| サイズサフィックス | L1 (accumulator) | L2 | L3 | 用途の目安 |
+| サイズサフィチE��ス | L1 (accumulator) | L2 | L3 | 用途�E目宁E|
 |---|---|---|---|---|
-| `256x2-32-32` (デフォルト) | 256 | 32 | 32 | 古典的な小型 NNUE。学習時間が短く挙動確認向き |
+| `256x2-32-32` (チE��ォルチE | 256 | 32 | 32 | 古典皁E��小型 NNUE。学習時間が短く挙動確認向ぁE|
 | `384x2-8-96` | 384 | 8 | 96 | |
-| `512x2-8-64` | 512 | 8 | 64 | 中型 |
+| `512x2-8-64` | 512 | 8 | 64 | 中垁E|
 | `768x2-16-64` | 768 | 16 | 64 | |
-| `1024x2-8-32` | 1024 | 8 | 32 | 大型 (推論コストは増える) |
-| `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
+| `1024x2-8-32` | 1024 | 8 | 32 | 大垁E(推論コスト�E増えめE |
+| `1024x2-8-64` | 1024 | 8 | 64 | 大垁E|
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3(king3-by-king3) LayerStacks の SFNN-1536 |
-| `SFNN_halfka2_4096_3_64_g4_k3k3` | 4096 | 3 | 64 | grouped SFNN L1。4096 を 4 group に分け、各 group は 1024 -> 1 |
-| `SFNN_halfka2_8192_3_64_g4_k3k3` | 8192 | 3 | 64 | grouped SFNN L1。8192 を 4 group に分け、各 group は 2048 -> 1 |
-| `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
-| `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | やねうら王 hand64 LayerStack bucket (64 stacks) |
-| `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 × k3k3 LayerStack bucket (576 stacks、かなり大きい) |
+| `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3` | 4096 | 3 | 64 | grouped SFNN L1、E096 めE4 group に刁E��、各 group は 1024 -> 1 |
+| `SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3` | 8192 | 3 | 64 | grouped SFNN L1、E192 めE4 group に刁E��、各 group は 2048 -> 1 |
+| `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1、E096 めE4 group に刁E��めE|
+| `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | めE�EぁE��玁Ehand64 LayerStack bucket (64 stacks) |
+| `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 ÁEk3k3 LayerStack bucket (576 stacks、かなり大きい) |
 | `SFNN_halfka2_1024_7_64_k9k9` | 1024 | 7 | 64 | king9-by-king9 LayerStack bucket (81 stacks) |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1024 | 7 | 64 | king29-by-king29 LayerStack bucket (841 stacks) |
-| `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 × k9k9 LayerStack bucket (5184 stacks、非常に大きい) |
-| `SFNN_halfka2_1024_7_64_hand64_k29k29` | 1024 | 7 | 64 | hand64 × k29k29 LayerStack bucket (53824 stacks、巨大) |
+| `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 ÁEk9k9 LayerStack bucket (5184 stacks、E��常に大きい) |
+| `SFNN_halfka2_1024_7_64_hand64_k29k29` | 1024 | 7 | 64 | hand64 ÁEk29k29 LayerStack bucket (53824 stacks、巨大) |
 | `SFNN_halfka2_1024_7_64_hand256` | 1024 | 7 | 64 | hand256 手駒有無 LayerStack bucket (256 stacks) |
-| `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 × k3k3 LayerStack bucket (2304 stacks、非常に大きい) |
+| `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 ÁEk3k3 LayerStack bucket (2304 stacks、E��常に大きい) |
 | `SFNN_halfka2_1024_7_64_hand1024` | 1024 | 7 | 64 | hand1024 手駒有無 LayerStack bucket (1024 stacks) |
-| `SFNN_halfka2_1024_7_64_hand1024_k3k3` | 1024 | 7 | 64 | hand1024 × k3k3 LayerStack bucket (9216 stacks、巨大) |
-| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力の grouped SFNN |
-| `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` | 8192 | 7 | 64 | common+shard 表記の pure grouped L1。0 common + 1024 x 8 shards |
-| `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` | 3072 | 7 | 64 | common+shard SFNN L1。1024 common + 256 x 8 shards |
+| `SFNN_halfka2_1024_7_64_hand1024_k3k3` | 1024 | 7 | 64 | hand1024 ÁEk3k3 LayerStack bucket (9216 stacks、巨大) |
+| `SFNN_ka2_4096_15_64_c0_s256x16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力�E grouped SFNN |
+| `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` | 8192 | 7 | 64 | common+shard 表記�E pure grouped L1、E common + 1024 x 8 shards |
+| `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` | 3072 | 7 | 64 | common+shard SFNN L1、E024 common + 256 x 8 shards |
 
 ```bash
 ./target/release/examples/bulletou \
@@ -64,13 +61,11 @@ NNUE 系のサイズ部分は `<L1>x2_<L2>_<L3>` で、`L1` (perspective ごと�
     --teacher teachers/
 ```
 
-`--arch` は学習対象と architecture の唯一の指定なので、通常の学習では必須。上記の表に無いサイズも実験用途で受け付けるが、学習結果の `nn.bin` を load できるのは「同じ architecture ヘッダで build したやねうら王」だけ。`make` に対応する edition 名を渡してビルドする必要がある (詳細は [§8 Engine](8-engine.md))。
+`--arch` は学習対象と architecture の唯一の持E��なので、E��常の学習では忁E��。上記�E表に無ぁE��イズも実験用途で受け付けるが、学習結果の `nn.bin` めEload できるのは「同ぁEarchitecture ヘッダで build しためE�EぁE��王」だけ。`make` に対応すめEedition 名を渡してビルドする忁E��がある (詳細は [§8 Engine](8-engine.md))、E
+grouped SFNN の実験�E LayerStack suffix の前に `_c0_sMxG_` で書ける。たとえ�E `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=64`, `L1 めE1024 x 8 shards に刁E��` とぁE��意味。common が非ゼロの common+shard L1 も同ぁE`_cN_sMxG_` を使ぁE��侁E `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は 1024 common + 256 x 8 shards。suffix は `k3k3`, `k9k9`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, `hand1024_k29k29` を指定できる。`ka2` / `halfka2` などの feature 名から�E部 target は自動的に決まる、E
+## 4.4 SFNN-1536 (めE�EぁE��玁ENNUEwoSQPT1536) を学習すめE
 
-grouped SFNN の実験は LayerStack suffix の前に `_c0_sMxG_` で書ける。たとえば `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は `FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 1024 x 8 shards に分割` という意味。common が非ゼロの common+shard L1 も同じ `_cN_sMxG_` を使う。例: `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は 1024 common + 256 x 8 shards。suffix は `k3k3`, `k9k9`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, `hand1024_k29k29` を指定できる。`ka2` / `halfka2` などの feature 名から内部 target は自動的に決まる。
-
-## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
-
-やねうら王の **`YANEURAOU_ENGINE_SFNN1536` ビルド** に load させる評価関数を学習したい場合は、対応する architecture 名を指定する:
+めE�EぁE��王�E **`YANEURAOU_ENGINE_SFNN1536` ビルチE* に load させる評価関数を学習したい場合�E、対応すめEarchitecture 名を持E��すめE
 
 ```bash
 ./target/release/examples/bulletou \
@@ -78,11 +73,11 @@ grouped SFNN の実験は LayerStack suffix の前に `_c0_sMxG_` で書ける�
     --teacher teachers/
 ```
 
-通常の NNUE と違って **9 個のサブネットを局面ごとに使い分ける** (LayerStacks=9)。`--arch` の `k3k3` suffix がやねうら王互換の LayerStack 方式を選ぶ。使い方の説明は [§9 LayerStack](9-layerstack.md)、アーキテクチャ / 量子化 / `nn.bin` レイアウトの仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)。
+通常の NNUE と違って **9 個�EサブネチE��を局面ごとに使ぁE�Eける** (LayerStacks=9)。`--arch` の `k3k3` suffix がやねぁE��王互換の LayerStack 方式を選ぶ。使ぁE��の説明�E [§9 LayerStack](9-layerstack.md)、アーキチE��チャ / 量子化 / `nn.bin` レイアウト�E仕様�E [リファレンス: SFNN-1536](../shogi/sfnn-1536.md)、E
 
-## 4.5 KPPT を学習する
+## 4.5 KPPT を学習すめE
 
-KPPT 系では固定 target 名を `--arch` に指定する:
+KPPT 系では固宁Etarget 名を `--arch` に持E��すめE
 
 ```bash
 ./target/release/examples/bulletou \
@@ -90,33 +85,32 @@ KPPT 系では固定 target 名を `--arch` に指定する:
     --teacher teachers/
 ```
 
-デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--arch KPP_KKPT` に変えるだけ。
-
-## 4.6 教師データの渡し方
+チE��ォルト�E力�Eは `checkpoints/KPPT/`。factorised 版にしたければ `--arch KPP_KKPT` に変えるだけ、E
+## 4.6 教師チE�Eタの渡し方
 
 `--teacher` には:
 - 1 つのファイル (`teachers/teacher.pack` のようなフルパス)
-- ディレクトリ (上記例。中の同一拡張子ファイルがすべて連結される)
-- カンマ区切り複数指定
+- チE��レクトリ (上記例。中の同一拡張子ファイルがすべて連結される)
+- カンマ区刁E��褁E��持E��E
 
-のいずれも渡せる。
+のぁE��れも渡せる、E
 
-## 4.7 学習がどこまで進むか
+## 4.7 学習がどこまで進むぁE
 
-`--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--superbatches` で epoch 長を決めたうえで `--max-epochs 3` のように指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
+`--superbatches` めE`--max-epochs` も省略してぁE��ので、教師チE�EタめE1 周 (dataloader ぁEEOF を返すまで) で学習が終亁E��る。褁E�� epoch 回したい場合�E `--superbatches` で epoch 長を決めたぁE��で `--max-epochs 3` のように持E��する。`step` / `geometric` / `cos` は epoch 墁E��で `--lr` に戻る、E
 
-教師サイズが事前にわかっていると `--superbatches N` で「1 epoch = N sb」を明示できる ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参照)。教師の総局面数を一瞬で数える `--count-teacher` フラグがある:
+教師サイズが事前にわかってぁE��と `--superbatches N` で、E epoch = N sb」を明示できる ([§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) 参�E)。教師の総局面数を一瞬で数える `--count-teacher` フラグがあめE
 
 ```bash
 ./target/release/examples/bulletou --count-teacher --teacher teachers/
-# → "Total: 461373440 positions, suggested --superbatches 4"
+# ↁE"Total: 461373440 positions, suggested --superbatches 4"
 ```
 
-cosine annealing (`--lr-schedule cos`) を使うときは特に重要 — 1 cycle が 1 epoch とぴったり合うように `--superbatches` を選ぶと、各 epoch 末で lr_min に着地、次 epoch 頭で lr_max に warm restart、というきれいなサイクルになる。この場合、教師データ自体は epoch 境界で先頭へ戻らない。教師EOFに到達したときだけ先頭へ戻る cyclic stream として扱われる。
+cosine annealing (`--lr-schedule cos`) を使ぁE��き�E特に重要E E1 cycle ぁE1 epoch とぴったり合うように `--superbatches` を選ぶと、各 epoch 末で lr_min に着地、次 epoch 頭で lr_max に warm restart、とぁE��きれぁE��サイクルになる。この場合、教師チE�Eタ自体�E epoch 墁E��で先頭へ戻らなぁE��教師EOFに到達したときだけ�E頭へ戻めEcyclic stream として扱われる、E
 
-## 4.8 期待される出力
+## 4.8 期征E��れる出劁E
 
-動いていれば以下のような出力が流れる:
+動いてぁE��ば以下�Eような出力が流れめE
 
 ```
 === bulletou: running NNUE_HALFKP (256x2-32-32 ClippedReLU, dual-perspective) ===
@@ -132,15 +126,14 @@ Positions / Superbatch : 99942400
   cuda-cpp SFNN direct train = ok: steps=..., positions=..., train_elapsed=...s, elapsed=...s, throughput=... pos/s, ...
 ```
 
-cuda-cpp backend の stdout `pos/s` は checkpoint file save / validation / loss readback / progress-log write の時間を除外した純粋な学習 throughput。batch 別 loss は stdout に流さず、`<output>/cuda-cpp-progress.log` に CSV で追記される。
-
-`pos/s` (1 秒あたり処理局面数) が学習速度の目安。RTX 4090 1 枚で数千万 pos/s 出る。下位 GPU では比例して低下。
+cuda-cpp backend の stdout `pos/s` は checkpoint file save / validation / loss readback / progress-log write の時間を除外した純粋な学翁Ethroughput。batch 別 loss は stdout に流さず、`<output>/cuda-cpp-progress.log` に CSV で追記される、E
+`pos/s` (1 秒あたり処琁E��面数) が学習速度の目安。RTX 4090 1 枚で数十E��Epos/s 出る。下佁EGPU では比例して低下、E
 
 ---
 
 次へ:
-- 学習を中断したり再開したい場合は [5. 中断・再開](5-resume.md)
-- 学習のスケジュールや教師ターゲットを調整したい場合は [6. 学習をチューニング](6-tune.md)
-- 学習結果がもう手元にあるなら [7. 結果を確認](7-result.md) へ
+- 学習を中断したり�E開したい場合�E [5. 中断・再開](5-resume.md)
+- 学習�EスケジュールめE��師ターゲチE��を調整したぁE��合�E [6. 学習をチューニング](6-tune.md)
+- 学習結果がもぁE��允E��あるなめE[7. 結果を確認](7-result.md) へ
 
-前へ: [3. 教師データを用意する](3-data.md)
+前へ: [3. 教師チE�Eタを用意する](3-data.md)

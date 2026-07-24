@@ -302,6 +302,6 @@ BulletOu 側:
 BulletOu cuda-cpp SFNN now uses stack shared factorizer terms beyond L1:
 
 - dense L1 architectures: `l1fw/l1fb`, `l2fw/l2fb`, and `l3fw/l3fb` are enabled by default
-- compact L1 architectures (`gN` / `cN_sMxG`): L1 shared term is not used, but `l2fw/l2fb` and `l3fw/l3fb` are enabled by default
+- compact L1 architectures (`cN_sMxG`): L1 shared term is not used, but `l2fw/l2fb` and `l3fw/l3fb` are enabled by default
 - `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms
 - `state.bin` preserves the shared tensors and their Ranger optimizer states; `nn.bin` folds the shared tensors into each bucket's stacked weights before export

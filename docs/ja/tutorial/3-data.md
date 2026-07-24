@@ -25,7 +25,7 @@
 | `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) |
 
-`NNUE_halfkp_1024x2_8_64` や `SFNN_ka2_8192_7_64_g8_k3k3` のようなサイズ違いも、対応するやねうら王 architecture があれば実験用途で受け付ける。
+`NNUE_halfkp_1024x2_8_64` や `SFNN_ka2_8192_7_64_c0_s1024x8_k3k3` のようなサイズ違いも、対応するやねうら王 architecture があれば実験用途で受け付ける。
 
 ## 3.2 学習データを用意する
 

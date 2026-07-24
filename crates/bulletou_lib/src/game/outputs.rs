@@ -476,6 +476,7 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand1024King29ByKing29Bucket {
 /// count separately and validates each per-sample bucket against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShogiSfnnLayerStackBucketKind {
+    Single,
     #[default]
     KingRank9,
     KingRank81,
@@ -497,6 +498,7 @@ pub enum ShogiSfnnLayerStackBucketKind {
 impl ShogiSfnnLayerStackBucketKind {
     pub const fn num_stacks(self) -> usize {
         match self {
+            Self::Single => 1,
             Self::KingRank9 => 9,
             Self::KingRank81 => 81,
             Self::King29ByKing29 => 841,
@@ -517,6 +519,7 @@ impl ShogiSfnnLayerStackBucketKind {
 
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
         match self {
+            Self::Single => 0,
             Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
             Self::KingRank81 => ShogiKingRankBucket::<81>.bucket(pos),
             Self::King29ByKing29 => ShogiKing29ByKing29Bucket::bucket_index(pos),
@@ -1229,6 +1232,7 @@ mod tests {
 
     #[test]
     fn test_shogi_sfnn_layerstack_bucket_counts() {
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Single.num_stacks(), 1);
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank9.num_stacks(), 9);
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank81.num_stacks(), 81);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King29ByKing29.num_stacks(), 841);
@@ -1246,6 +1250,7 @@ mod tests {
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024King29ByKing29.num_stacks(), 861184);
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiSfnnLayerStackBucket::default().bucket(&startpos_like), 8);
+        assert_eq!(ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::Single).bucket(&startpos_like), 0);
         assert_eq!(
             ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::KingRank81).bucket(&startpos_like),
             80

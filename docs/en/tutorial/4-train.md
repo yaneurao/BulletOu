@@ -1,10 +1,10 @@
-# 4. Run the training — invoking `bulletou`
+# 4. Run the training  Einvoking `bulletou`
 
-<a href="../../ja/tutorial/4-train.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/4-train.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本誁EDC2626?style=flat-square"></a>
 
 Goal: produce a YaneuraOu-loadable evaluation function from the teacher data you prepared.
 
-This page assumes you have already completed [3. Prepare training data](3-data.md) — the teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready and pre-shuffled.
+This page assumes you have already completed [3. Prepare training data](3-data.md)  Ethe teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready and pre-shuffled.
 
 ## 4.1 Build (one-off)
 
@@ -14,7 +14,7 @@ Build `bulletou` first. You only need this once, until the source changes:
 cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run commands below use Unix-style paths — translate as needed.
+On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run commands below use Unix-style paths  Etranslate as needed.
 
 ## 4.2 Minimal command (NNUE HalfKP)
 
@@ -24,7 +24,7 @@ On Windows the binary is at `.\target\release\examples\bulletou.exe`; the run co
     --teacher teachers/
 ```
 
-That's it — no further target flag is needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` (auto-derived from `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
+That's it  Eno further target flag is needed. With `--output` omitted, checkpoints land under `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` (auto-derived from `--arch`). Pass `--output checkpoints/my-halfkp` (or any other path) to override.
 
 ## 4.3 Specifying `--arch`
 
@@ -41,20 +41,21 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `1024x2-8-32` | 1024 | 8 | 32 | Larger (inference cost grows) |
 | `1024x2-8-64` | 1024 | 8 | 64 | Larger |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | SFNN-1536 with k3k3(king3-by-king3) LayerStacks |
-| `SFNN_halfka2_4096_3_64_g4_k3k3` | 4096 | 3 | 64 | Grouped SFNN L1: 4096 is split into 4 groups, so each group maps 1024 -> 1 |
-| `SFNN_halfka2_8192_3_64_g4_k3k3` | 8192 | 3 | 64 | Grouped SFNN L1: 8192 is split into 4 groups, so each group maps 2048 -> 1 |
-| `SFNN_halfka2_4096_7_64_g4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
+| `SFNN_halfka2_1024_7_64` | 1024 | 7 | 64 | SFNN single stack (`LayerStacks = 1`, no bucket suffix) |
+| `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3` | 4096 | 3 | 64 | Grouped SFNN L1: 4096 is split into 4 groups, so each group maps 1024 -> 1 |
+| `SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3` | 8192 | 3 | 64 | Grouped SFNN L1: 8192 is split into 4 groups, so each group maps 2048 -> 1 |
+| `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3` | 4096 | 7 | 64 | Grouped SFNN L1: 4096 is split into 4 groups |
 | `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | SFNN with YaneuraOu hand64 LayerStack buckets (64 stacks) |
-| `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 × k3k3 LayerStack buckets (576 stacks; much larger) |
+| `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 ÁEk3k3 LayerStack buckets (576 stacks; much larger) |
 | `SFNN_halfka2_1024_7_64_k9k9` | 1024 | 7 | 64 | king9-by-king9 LayerStack buckets (81 stacks) |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1024 | 7 | 64 | king29-by-king29 LayerStack buckets (841 stacks) |
-| `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 × k9k9 LayerStack buckets (5184 stacks; very large) |
-| `SFNN_halfka2_1024_7_64_hand64_k29k29` | 1024 | 7 | 64 | hand64 × k29k29 LayerStack buckets (53824 stacks; huge) |
+| `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 ÁEk9k9 LayerStack buckets (5184 stacks; very large) |
+| `SFNN_halfka2_1024_7_64_hand64_k29k29` | 1024 | 7 | 64 | hand64 ÁEk29k29 LayerStack buckets (53824 stacks; huge) |
 | `SFNN_halfka2_1024_7_64_hand256` | 1024 | 7 | 64 | hand256 hand-presence LayerStack buckets (256 stacks) |
-| `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 × k3k3 LayerStack buckets (2304 stacks; very large) |
+| `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 ÁEk3k3 LayerStack buckets (2304 stacks; very large) |
 | `SFNN_halfka2_1024_7_64_hand1024` | 1024 | 7 | 64 | hand1024 hand-presence LayerStack buckets (1024 stacks) |
-| `SFNN_halfka2_1024_7_64_hand1024_k3k3` | 1024 | 7 | 64 | hand1024 × k3k3 LayerStack buckets (9216 stacks; huge) |
-| `SFNN_ka2_4096_15_64_g16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input |
+| `SFNN_halfka2_1024_7_64_hand1024_k3k3` | 1024 | 7 | 64 | hand1024 ÁEk3k3 LayerStack buckets (9216 stacks; huge) |
+| `SFNN_ka2_4096_15_64_c0_s256x16_k3k3` | 4096 | 15 | 64 | Same grouped SFNN form, but with lightweight KA2 input |
 | `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` | 8192 | 7 | 64 | Common+shard notation for pure grouped L1: 0 common + 1024 x 8 shards |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` | 3072 | 7 | 64 | Common+shard SFNN L1: 1024 common channels plus 8 shards of 256 channels |
 
@@ -64,9 +65,9 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
     --teacher teachers/
 ```
 
-`--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture — generate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
+`--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture  Egenerate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
-Grouped SFNN experiments can be written with `_c0_sMxG_` before the LayerStack suffix. For example, `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 shards of 1024 channels. Non-zero common+shard L1 uses the same form; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. The suffix may be `k3k3`, `k9k9`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, or `hand1024_k29k29`. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
+Grouped SFNN experiments can be written with `_c0_sMxG` before the optional LayerStack suffix. For example, `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 shards of 1024 channels. Non-zero common+shard L1 uses the same form; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. If the suffix is omitted, the model uses a single stack (`LayerStacks = 1`). Otherwise the suffix may be `k3k3`, `k9k9`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, or `hand1024_k29k29`. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
@@ -107,7 +108,7 @@ If you know the teacher size you can pin "1 epoch = N sb" explicitly with `--sup
 
 ```bash
 ./target/release/examples/bulletou --count-teacher --teacher teachers/
-# → "Total: 461373440 positions, suggested --superbatches 4"
+# ↁE"Total: 461373440 positions, suggested --superbatches 4"
 ```
 
 This matters especially for `--lr-schedule cos`: pick `--superbatches` so one cosine cycle equals one epoch, and `lr_min` lands at each epoch's last batch with a clean warm restart back to `lr_max` at the next epoch. In this mode, the teacher itself does not rewind at epoch boundaries. It is treated as a cyclic stream and rewinds only when it reaches EOF.

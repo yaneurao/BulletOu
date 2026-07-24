@@ -1100,7 +1100,7 @@ current cuda-cpp follow-up queue.
   - Ranger state/readback/save/load now carries optional `l2fw/l2fb` and `l3fw/l3fb` groups.
 - Defaults:
   - dense-L1 SFNN LayerStack: L1/L2/L3 shared terms are enabled;
-  - compact-L1 SFNN LayerStack (`gN`, `cN_sMxG`): L1 shared term remains disabled, but L2/L3 shared terms are enabled;
+  - compact-L1 SFNN LayerStack (`cN_sMxG`): L1 shared term remains disabled, but L2/L3 shared terms are enabled;
   - `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms.
 - Export/validation:
   - validation weights and `nn.bin` fold L1/L2/L3 shared terms into each bucket's stacked weights;

@@ -1,12 +1,12 @@
 /*!
-bulletou — BulletOu trainer entry point.
+bulletou  EBulletOu trainer entry point.
 
 Dispatches to the appropriate training routine via `--arch`. The KPPT-family
 architecture values train all three KPPT components (KK + KKP + KPP)
 sequentially in a single invocation and assemble the result into numbered
 checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
-    bulletou --arch KPPT                 (KPPT family, KPP int16 × 2)
+    bulletou --arch KPPT                 (KPPT family, KPP int16 ÁE2)
     bulletou --arch KPP_KKPT             (KPP_KKPT factorised, KPP int16)
 
 For NNUE / SFNN targets, `--arch` is the YaneuraOu Makefile architecture name
@@ -19,9 +19,10 @@ Stockfish nnue-pytorch-compatible `nn.bin`:
     bulletou --arch NNUE_ka2_256x2_64_64                     K+A2 NNUE
     bulletou --arch NNUE_halfkpe9_256x2_32_32                HalfKP with per-square effect-count buckets
     bulletou --arch NNUE_halfkpvm_256x2_32_32                HalfKP with file-mirror (~half input dims of HalfKP)
+    bulletou --arch SFNN_halfka2_1024_7_64                   SFNN single stack
     bulletou --arch SFNN_halfkahm2_1536_15_32_k3k3
     bulletou --arch SFNN_halfka2_1024_7_64_k3k3
-    bulletou --arch SFNN_ka2_4096_15_64_g16_k3k3
+    bulletou --arch SFNN_ka2_4096_15_64_c0_s256x16_k3k3
 
 (YaneuraOu's KPPT engine requires all three of `KK_synthesized.bin` /
 `KKP_synthesized.bin` / `KPP_synthesized.bin` to load an eval, so the
@@ -104,13 +105,13 @@ enum EvalType {
     /// compatible `nn.bin` per save. Architecture is selected via `--arch`
     /// (default `NNUE_halfkp_256x2_32_32`).
     NnueHalfkp,
-    /// NNUE K-P. YaneuraOu kp_256x2-32-32 — same 4-layer ClippedReLU network
+    /// NNUE K-P. YaneuraOu kp_256x2-32-32  Esame 4-layer ClippedReLU network
     /// as halfkp_256x2-32-32, but the input is `FeatureSet<K, P>` (K = 162
     /// king features, P = 1548 piece features per perspective; 1710 total)
-    /// instead of HalfKP's (king × piece) cross product. Architecture is
+    /// instead of HalfKP's (king ÁEpiece) cross product. Architecture is
     /// selected via `--arch` (default `NNUE_kp_256x2_32_32`).
     NnueKp,
-    /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>` — same 4-layer ClippedReLU
+    /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>`  Esame 4-layer ClippedReLU
     /// network as kp_256x2-32-32, but the piece feature is A2 (1629 dims,
     /// kings collapsed onto friend plane via v2 encoding) so both kings
     /// participate in the piece feature in addition to K (162 dims). Input
@@ -119,23 +120,21 @@ enum EvalType {
     /// `YANEURAOU_ENGINE_NNUE_ka2_*` build (single LayerStack, no SFNN
     /// post-FT structure).
     NnueKa2,
-    /// NNUE HalfKPE9. YaneuraOu halfkpe9_* — HalfKP × 9 effect-count buckets
-    /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3×3=9
-    /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP ×
-    /// 9). Same 4-layer ClippedReLU network as halfkp / kp. Requires
+    /// NNUE HalfKPE9. YaneuraOu halfkpe9_*  EHalfKP ÁE9 effect-count buckets
+    /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3ÁE=9
+    /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP ÁE    /// 9). Same 4-layer ClippedReLU network as halfkp / kp. Requires
     /// piece-effect computation, which BulletOu's threat module already
     /// provides.
     NnueHalfkpe9,
-    /// NNUE HalfKP_vm. YaneuraOu halfkpvm_* — HalfKP with file-mirror
+    /// NNUE HalfKP_vm. YaneuraOu halfkpvm_*  EHalfKP with file-mirror
     /// folding: king positions on files 6-9 are mirrored to files 1-4,
     /// halving the input dimension to 69,660 per perspective (= 45 king
-    /// buckets × 1548 piece inputs). Same 4-layer ClippedReLU network as
+    /// buckets ÁE1548 piece inputs). Same 4-layer ClippedReLU network as
     /// the rest of the NNUE family.
     NnueHalfkpvm,
     /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
-    /// separate planes, 76,950 dim). LayerStacks family — uses a 9-stack
-    /// MLP (FT → fc_0(L1+1 PSQT-shortcut) → CReLU + SqrCReLU concat →
-    /// fc_1 → fc_2 → +PSQT bypass). Bucketing is selected by the `--arch`
+    /// separate planes, 76,950 dim). LayerStacks family  Euses a 9-stack
+    /// MLP (FT ↁEfc_0(L1+1 PSQT-shortcut) ↁECReLU + SqrCReLU concat ↁE    /// fc_1 ↁEfc_2 ↁE+PSQT bypass). Bucketing is selected by the `--arch`
     /// LayerStack suffix.
     /// `--arch SFNN_halfkahm1_1536_15_32_k3k3` matches the corresponding
     /// YaneuraOu SFNN dynamic build.
@@ -185,7 +184,9 @@ impl BackendKind {
 /// inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LayerStackMode {
-    /// 3 × 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
+    /// Single stack, no position-dependent LayerStack bucketing.
+    Single,
+    /// 3 ÁE3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
     /// Matches YaneuraOu `stack_index_for_nnue` byte-for-byte.
     #[default]
     Kingrank3by3,
@@ -223,6 +224,7 @@ impl LayerStackMode {
     /// Human-facing display name.
     fn cli_name(self) -> &'static str {
         match self {
+            LayerStackMode::Single => "none(single-stack)",
             LayerStackMode::Kingrank3by3 => "k3k3(king3-by-king3)",
             LayerStackMode::Kingrank9by9 => "k9k9(king9-by-king9)",
             LayerStackMode::Kingrank29by29 => "k29k29(king29-by-king29)",
@@ -244,6 +246,7 @@ impl LayerStackMode {
     /// Short YaneuraOu architecture suffix.
     fn arch_suffix(self) -> &'static str {
         match self {
+            LayerStackMode::Single => "",
             LayerStackMode::Kingrank3by3 => "k3k3",
             LayerStackMode::Kingrank9by9 => "k9k9",
             LayerStackMode::Kingrank29by29 => "k29k29",
@@ -269,6 +272,7 @@ impl LayerStackMode {
 
     fn bucket_kind(self) -> ShogiSfnnLayerStackBucketKind {
         match self {
+            LayerStackMode::Single => ShogiSfnnLayerStackBucketKind::Single,
             LayerStackMode::Kingrank3by3 => ShogiSfnnLayerStackBucketKind::KingRank9,
             LayerStackMode::Kingrank9by9 => ShogiSfnnLayerStackBucketKind::KingRank81,
             LayerStackMode::Kingrank29by29 => ShogiSfnnLayerStackBucketKind::King29ByKing29,
@@ -298,6 +302,8 @@ impl LayerStackMode {
 /// Examples:
 /// - `NNUE_halfkp_256x2_32_32`
 /// - `NNUE_ka2_256x2_64_64`
+/// - `SFNN_halfka2_1024_7_64`
+/// - `SFNN_halfka2_1024_7_64_c0_s256x4`
 /// - `SFNN_halfka2_1024_7_64_k3k3`
 /// - `SFNN_halfka2_1024_7_64_k9k9`
 /// - `SFNN_halfka2_1024_7_64_k29k29`
@@ -313,12 +319,12 @@ impl LayerStackMode {
 /// - `SFNN_halfka2_1024_7_64_hand1024_k3k3`
 /// - `SFNN_halfka2_1024_7_64_hand1024_k9k9`
 /// - `SFNN_halfka2_1024_7_64_hand1024_k29k29`
-/// - `SFNN_halfka2_4096_3_64_g4_k3k3`
-/// - `SFNN_halfka2_4096_7_64_g4_k3k3`
-/// - `SFNN_halfka2_8192_7_64_g8_k3k3`
-/// - `SFNN_halfka2_8192_15_64_g16_k3k3`
-/// - `SFNN_halfka2_4096_31_64_g32_k3k3`
-/// - `SFNN_ka2_4096_15_64_g16_k3k3`
+/// - `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3`
+/// - `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3`
+/// - `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
+/// - `SFNN_halfka2_8192_15_64_c0_s512x16_k3k3`
+/// - `SFNN_halfka2_4096_31_64_c0_s128x32_k3k3`
+/// - `SFNN_ka2_4096_15_64_c0_s256x16_k3k3`
 /// - `SFNN_halfkahm2_1536_15_32_king3_by_king3`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NnueArch {
@@ -378,11 +384,6 @@ impl NnueArch {
         (self.l1, self.l2, self.l3)
     }
 
-    fn with_sfnn_l1_group_count(mut self, group_count: Option<usize>) -> Self {
-        self.sfnn_l1_group_count = group_count;
-        self
-    }
-
     fn with_sfnn_l1_common_shard(mut self, common_size: usize, shard_size: usize, group_count: usize) -> Self {
         self.sfnn_l1_common_size = Some(common_size);
         self.sfnn_l1_shard_size = Some(shard_size);
@@ -402,16 +403,12 @@ impl NnueArch {
         self.sfnn_l1_shard_size.unwrap_or(0)
     }
 
-    fn has_grouped_sfnn_l1(self) -> bool {
-        self.sfnn_l1_group_count().saturating_sub(1) > 0 && !self.has_common_shard_sfnn_l1()
-    }
-
     fn has_common_shard_sfnn_l1(self) -> bool {
         self.sfnn_l1_common_size().saturating_add(self.sfnn_l1_shard_size()) > 0
     }
 
     fn has_compact_sfnn_l1(self) -> bool {
-        self.has_grouped_sfnn_l1() || self.has_common_shard_sfnn_l1()
+        self.has_common_shard_sfnn_l1()
     }
 
     /// The arch's canonical CLI value.
@@ -423,36 +420,27 @@ impl NnueArch {
             NnueArchFamily::Sfnn => {
                 let layerstack = self.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
                 if self.has_common_shard_sfnn_l1() {
-                    format!(
-                        "SFNN_{}_{}_{}_{}_c{}_s{}x{}_{}",
+                    let base = format!(
+                        "SFNN_{}_{}_{}_{}_c{}_s{}x{}",
                         self.feature.arch_suffix(),
                         self.l1,
                         self.l2,
                         self.l3,
                         self.sfnn_l1_common_size(),
                         self.sfnn_l1_shard_size(),
-                        self.sfnn_l1_group_count(),
-                        layerstack.arch_suffix()
-                    )
+                        self.sfnn_l1_group_count()
+                    );
+                    if layerstack == LayerStackMode::Single {
+                        base
+                    } else {
+                        format!("{base}_{}", layerstack.arch_suffix())
+                    }
                 } else {
-                    match self.sfnn_l1_group_count {
-                        Some(group_count) => format!(
-                            "SFNN_{}_{}_{}_{}_g{}_{}",
-                            self.feature.arch_suffix(),
-                            self.l1,
-                            self.l2,
-                            self.l3,
-                            group_count,
-                            layerstack.arch_suffix()
-                        ),
-                        None => format!(
-                            "SFNN_{}_{}_{}_{}_{}",
-                            self.feature.arch_suffix(),
-                            self.l1,
-                            self.l2,
-                            self.l3,
-                            layerstack.arch_suffix()
-                        ),
+                    let base = format!("SFNN_{}_{}_{}_{}", self.feature.arch_suffix(), self.l1, self.l2, self.l3);
+                    if layerstack == LayerStackMode::Single {
+                        base
+                    } else {
+                        format!("{base}_{}", layerstack.arch_suffix())
                     }
                 }
             }
@@ -520,19 +508,6 @@ impl NnueArch {
                     "invalid arch `{original}`: common+shard SFNN L1 requires common and shard dimensions to be multiples of 64"
                 ));
             }
-        } else if let Some(group_count) = self.sfnn_l1_group_count {
-            if self.family != NnueArchFamily::Sfnn {
-                return Err(format!("invalid arch `{original}`: grouped L1 is only valid for SFNN"));
-            }
-            if group_count <= 1 {
-                return Err(format!("invalid arch `{original}`: grouped SFNN L1 requires group count > 1"));
-            }
-            let l1_out = self.l2 + 1;
-            if self.l1 % group_count != 0 || l1_out % group_count != 0 {
-                return Err(format!(
-                    "invalid arch `{original}`: grouped SFNN L1 requires FT and H1+1 to be divisible by group count"
-                ));
-            }
         }
         Ok(self)
     }
@@ -596,6 +571,9 @@ impl std::fmt::Display for NnueArch {
     }
 }
 
+const SFNN_LAYERSTACK_EXPECTED: &str = "k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29";
+const SFNN_ARCH_EXPECTED: &str = "SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>]";
+
 impl std::str::FromStr for NnueArch {
     type Err = String;
 
@@ -621,7 +599,7 @@ impl std::str::FromStr for NnueArch {
         let tokens: Vec<&str> = s.split('_').collect();
         if tokens.len() < 5 {
             return Err(format!(
-                "invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>` or `SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>`"
+                "invalid arch `{s}`: expected `NNUE_<feature>_<L1>x2_<L2>_<L3>` or `{SFNN_ARCH_EXPECTED}`"
             ));
         }
 
@@ -655,10 +633,8 @@ impl std::str::FromStr for NnueArch {
                 NnueArch::new(family, feature, l1, l2, l3, None).validate_dims(s)
             }
             NnueArchFamily::Sfnn => {
-                if tokens.len() < 6 {
-                    return Err(format!(
-                        "invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>`"
-                    ));
+                if tokens.len() < 5 {
+                    return Err(format!("invalid arch `{s}`: expected `{SFNN_ARCH_EXPECTED}`"));
                 }
                 let l1: usize = tokens[2]
                     .parse()
@@ -669,8 +645,12 @@ impl std::str::FromStr for NnueArch {
                 let l3: usize = tokens[4]
                     .parse()
                     .map_err(|_| format!("invalid arch `{s}`: H2 `{}` is not a positive integer", tokens[4]))?;
+
+                if tokens.len() == 5 {
+                    return NnueArch::new(family, feature, l1, l2, l3, Some(LayerStackMode::Single)).validate_dims(s);
+                }
+
                 let mut layerstack_start = 5usize;
-                let mut sfnn_l1_group_count = None;
                 let mut sfnn_l1_common_shard = None;
                 if let Some(common_raw) = tokens[5].strip_prefix('c').or_else(|| tokens[5].strip_prefix('C')) {
                     if common_raw.is_empty() {
@@ -696,53 +676,55 @@ impl std::str::FromStr for NnueArch {
                     let group_count = group_count_raw.parse::<usize>().map_err(|_| {
                         format!("invalid arch `{s}`: SFNN shard group count `{group_count_raw}` is not an integer")
                     })?;
-                    sfnn_l1_group_count = Some(group_count);
                     sfnn_l1_common_shard = Some((common_size, shard_size, group_count));
                     layerstack_start = 7;
                 } else if let Some(group_raw) = tokens[5].strip_prefix('g').or_else(|| tokens[5].strip_prefix('G')) {
-                    if group_raw.is_empty() {
-                        return Err(format!("invalid arch `{s}`: SFNN group token `{}` must look like gN", tokens[5]));
-                    }
-                    let group_count = group_raw
-                        .parse::<usize>()
-                        .map_err(|_| format!("invalid arch `{s}`: SFNN group count `{group_raw}` is not an integer"))?;
-                    sfnn_l1_group_count = Some(group_count);
-                    layerstack_start = 6;
-                }
-                if tokens.len() <= layerstack_start {
+                    let replacement = if let Ok(group_count) = group_raw.parse::<usize>() {
+                        if group_count > 0 && l1 % group_count == 0 {
+                            format!("c0_s{}x{group_count}", l1 / group_count)
+                        } else {
+                            "c0_sMxG".to_string()
+                        }
+                    } else {
+                        "c0_sMxG".to_string()
+                    };
                     return Err(format!(
-                        "invalid arch `{s}`: expected `SFNN_<feature>_<FT>_<H1>_<H2>[_gN|_cN_sMxG]_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>`"
+                        "invalid arch `{s}`: `_gN` shorthand is no longer supported; use `_{replacement}` instead"
                     ));
                 }
-                let layerstack = match tokens[layerstack_start..].join("_").to_ascii_lowercase().as_str() {
-                    "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
-                    "k9k9" | "king9_by_king9" => LayerStackMode::Kingrank9by9,
-                    "k29k29" | "king29_by_king29" => LayerStackMode::Kingrank29by29,
-                    "hand64" => LayerStackMode::Hand64,
-                    "hand64_k3k3" | "hand64_king3_by_king3" => LayerStackMode::Hand64Kingrank3by3,
-                    "hand64_k9k9" | "hand64_king9_by_king9" => LayerStackMode::Hand64Kingrank9by9,
-                    "hand64_k29k29" | "hand64_king29_by_king29" => LayerStackMode::Hand64Kingrank29by29,
-                    "hand256" => LayerStackMode::Hand256,
-                    "hand256_k3k3" | "hand256_king3_by_king3" => LayerStackMode::Hand256Kingrank3by3,
-                    "hand256_k9k9" | "hand256_king9_by_king9" => LayerStackMode::Hand256Kingrank9by9,
-                    "hand256_k29k29" | "hand256_king29_by_king29" => LayerStackMode::Hand256Kingrank29by29,
-                    "hand1024" => LayerStackMode::Hand1024,
-                    "hand1024_k3k3" | "hand1024_king3_by_king3" => LayerStackMode::Hand1024Kingrank3by3,
-                    "hand1024_k9k9" | "hand1024_king9_by_king9" => LayerStackMode::Hand1024Kingrank9by9,
-                    "hand1024_k29k29" | "hand1024_king29_by_king29" => LayerStackMode::Hand1024Kingrank29by29,
-                    "ls9" => {
-                        return Err(format!(
-                            "invalid arch `{s}`: ls9 is no longer supported; use k3k3, k9k9, k29k29, hand64, hand64_k3k3, hand64_k9k9, hand64_k29k29, hand256, hand256_k3k3, hand256_k9k9, hand256_k29k29, hand1024, hand1024_k3k3, hand1024_k9k9, or hand1024_k29k29"
-                        ));
-                    }
-                    other => {
-                        return Err(format!(
-                            "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected k3k3, king3_by_king3, k9k9, king9_by_king9, k29k29, king29_by_king29, hand64, hand64_k3k3, hand64_king3_by_king3, hand64_k9k9, hand64_king9_by_king9, hand64_k29k29, hand64_king29_by_king29, hand256, hand256_k3k3, hand256_king3_by_king3, hand256_k9k9, hand256_king9_by_king9, hand256_k29k29, hand256_king29_by_king29, hand1024, hand1024_k3k3, hand1024_king3_by_king3, hand1024_k9k9, hand1024_king9_by_king9, hand1024_k29k29, or hand1024_king29_by_king29"
-                        ));
+                let layerstack_spec = tokens[layerstack_start..].join("_").to_ascii_lowercase();
+                let layerstack = if layerstack_spec.is_empty() {
+                    LayerStackMode::Single
+                } else {
+                    match layerstack_spec.as_str() {
+                        "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
+                        "k9k9" | "king9_by_king9" => LayerStackMode::Kingrank9by9,
+                        "k29k29" | "king29_by_king29" => LayerStackMode::Kingrank29by29,
+                        "hand64" => LayerStackMode::Hand64,
+                        "hand64_k3k3" | "hand64_king3_by_king3" => LayerStackMode::Hand64Kingrank3by3,
+                        "hand64_k9k9" | "hand64_king9_by_king9" => LayerStackMode::Hand64Kingrank9by9,
+                        "hand64_k29k29" | "hand64_king29_by_king29" => LayerStackMode::Hand64Kingrank29by29,
+                        "hand256" => LayerStackMode::Hand256,
+                        "hand256_k3k3" | "hand256_king3_by_king3" => LayerStackMode::Hand256Kingrank3by3,
+                        "hand256_k9k9" | "hand256_king9_by_king9" => LayerStackMode::Hand256Kingrank9by9,
+                        "hand256_k29k29" | "hand256_king29_by_king29" => LayerStackMode::Hand256Kingrank29by29,
+                        "hand1024" => LayerStackMode::Hand1024,
+                        "hand1024_k3k3" | "hand1024_king3_by_king3" => LayerStackMode::Hand1024Kingrank3by3,
+                        "hand1024_k9k9" | "hand1024_king9_by_king9" => LayerStackMode::Hand1024Kingrank9by9,
+                        "hand1024_k29k29" | "hand1024_king29_by_king29" => LayerStackMode::Hand1024Kingrank29by29,
+                        "ls9" => {
+                            return Err(format!(
+                                "invalid arch `{s}`: ls9 is no longer supported; use one of {SFNN_LAYERSTACK_EXPECTED}"
+                            ));
+                        }
+                        other => {
+                            return Err(format!(
+                                "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected {SFNN_LAYERSTACK_EXPECTED} or the corresponding king*_by_king* long names"
+                            ));
+                        }
                     }
                 };
-                let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack))
-                    .with_sfnn_l1_group_count(sfnn_l1_group_count);
+                let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack));
                 let arch = if let Some((common_size, shard_size, group_count)) = sfnn_l1_common_shard {
                     arch.with_sfnn_l1_common_shard(common_size, shard_size, group_count)
                 } else {
@@ -1034,8 +1016,8 @@ impl GeometricLR {
     /// so the trainer's LR and the logged LR always agree.
     ///
     /// `lr(t) = start * (min/start)^t` where `t = (total % period) /
-    /// period`. Geometric interpolation in log space: at t=0 → start
-    /// (lr_max), t=1 → min (lr_min). Warm restart at cycle boundary
+    /// period`. Geometric interpolation in log space: at t=0 ↁEstart
+    /// (lr_max), t=1 ↁEmin (lr_min). Warm restart at cycle boundary
     /// (= each `period_positions`), mirroring `CosineLR`.
     fn lr_at_positions(start: f32, min: f32, period: u64, total: u64) -> f32 {
         if period == 0 {
@@ -1122,12 +1104,12 @@ impl LrScheduler for StepLR {
 ///
 /// Mirrors [`GeometricLR`] structurally so the two schedules can be
 /// dropped into the same training run as alternatives. Within each
-/// `period_positions`-long cycle the LR sweeps `start` → `min`
+/// `period_positions`-long cycle the LR sweeps `start` ↁE`min`
 /// following the half-cosine curve; at cycle boundaries it snaps back
 /// to `start` (warm restart). Bullet's `sb`-reset at each epoch lines
 /// up with `in_run = 0` and the cycle index reset, so when
 /// `period_positions == one epoch`, each epoch is exactly one full
-/// cosine cycle — apples-to-apples with the stepwise schedule which
+/// cosine cycle  Eapples-to-apples with the stepwise schedule which
 /// also resets at epoch boundaries.
 #[derive(Clone, Debug)]
 struct CosineLR {
@@ -1899,7 +1881,7 @@ struct Args {
     /// walk every game; not yet supported by this flag.
     ///
     /// Use the printed total to pick `--superbatches N` for `geometric` / `cos`
-    /// runs such that one epoch ≈ (or ≤) the teacher size. With cosine
+    /// runs such that one epoch ≁E(or ≤) the teacher size. With cosine
     /// annealing, period auto-aligns to `--superbatches`.
     #[arg(long)]
     count_teacher: bool,
@@ -1983,7 +1965,7 @@ struct Args {
 
     /// LR schedule kind. `step` applies fixed gamma drops within one epoch
     /// and warm-restarts to `--lr` at epoch boundaries. `geometric` and `cos` sweep
-    /// `--lr` (lr_max) → `--lr-min` over **one epoch**, warm-restarting to
+    /// `--lr` (lr_max) ↁE`--lr-min` over **one epoch**, warm-restarting to
     /// `--lr` at each epoch boundary. `plateau` keeps LR fixed during one
     /// superbatch, then reduces it when the validation monitor does not
     /// improve:
@@ -1993,7 +1975,7 @@ struct Args {
     ///   If `--lr-step-positions` is omitted, this is one gamma drop per
     ///   superbatch.
     /// - `geometric` = exponential interpolation in log space:
-    ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∈[0,1] is
+    ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∁E0,1] is
     ///   "fraction of one epoch completed". Constant multiplicative
     ///   decay per batch.
     /// - `cos` = cosine annealing (SGDR-style):
@@ -2055,7 +2037,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "loss_or_accuracy")]
     lr_plateau_monitor: PlateauMonitor,
 
-    /// Lambda — weight on the teacher's evaluation score (vs the actual
+    /// Lambda  Eweight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
     /// trainer convention:
     ///
@@ -2299,7 +2281,7 @@ impl Args {
         let Some(eval_type) = self.resolved_eval_type() else {
             return Err(
                 "missing training target: pass --arch KPPT, --arch KPP_KKPT, or a NNUE/SFNN architecture such as \
-                 --arch SFNN_ka2_8192_7_64_g8_k3k3"
+                 --arch SFNN_ka2_8192_7_64_c0_s1024x8_k3k3"
                     .to_string(),
             );
         };
@@ -5458,13 +5440,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_weights.shape.l1_common_shard_input(),
             initial_weights.shape.l1_group_output()
         );
-    } else if args.arch().has_grouped_sfnn_l1() {
-        eprintln!(
-            "  l1 grouped = g{} ({} inputs -> {} outputs per group; compact state)",
-            initial_weights.shape.l1_group_count(),
-            initial_weights.shape.l1_group_input(),
-            initial_weights.shape.l1_group_output()
-        );
     }
     eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
@@ -7575,11 +7550,6 @@ fn build_sfnn_initial_state_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_sfnn_is_grouped_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
-    shape.has_grouped_l1()
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_is_common_shard_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
     shape.has_common_shard_l1()
 }
@@ -7707,15 +7677,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
-    let grouped_l1 = args.arch().has_grouped_sfnn_l1();
     let common_shard_l1 = args.arch().has_common_shard_sfnn_l1();
-    if grouped_l1 != cuda_cpp_sfnn_is_grouped_l1_shape(shape) {
-        return Err(format!(
-            "SFNN grouped-L1 arch/shape mismatch for {}: arch_group_count={}, shape={shape:?}",
-            args.arch().cli_name(),
-            args.arch().sfnn_l1_group_count()
-        ));
-    }
     if common_shard_l1 != cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
         return Err(format!(
             "SFNN common+shard-L1 arch/shape mismatch for {}: common={}, shard={}, shape={shape:?}",
@@ -7732,27 +7694,13 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     }
     let l0b = cuda_cpp_tatara_uniform_fan_in_init(ft_size, 0x5f11_e002, base_input_size, init_scale);
 
-    let l1_fan_in = if common_shard_l1 {
-        shape.l1_common_shard_input()
-    } else if grouped_l1 {
-        shape.l1_group_input()
-    } else {
-        ft_size
-    };
+    let l1_fan_in = if common_shard_l1 { shape.l1_common_shard_input() } else { ft_size };
     let l1_bound = init_scale * (1.0 / l1_fan_in.max(1) as f32).sqrt();
     let l2_bound = init_scale * (1.0 / l2_in.max(1) as f32).sqrt();
     let l3_bound = init_scale * (1.0 / l2_size.max(1) as f32).sqrt();
     let l1w = if common_shard_l1 {
         cuda_cpp_tatara_stacked_row_major_bucket0_init(
             shape.l1_common_shard_input(),
-            l1_out,
-            num_stacks,
-            0x5f11_e003,
-            l1_bound,
-        )
-    } else if grouped_l1 {
-        cuda_cpp_tatara_stacked_row_major_bucket0_init(
-            shape.l1_group_input(),
             l1_out,
             num_stacks,
             0x5f11_e003,
@@ -9492,7 +9440,7 @@ impl CudaCppTataraXorShift {
 /// checkpoint directory. Always appends; one line per invocation
 /// `<unix_ts>\t<arg0> <arg1> ...`. Resumes accumulate a history.
 ///
-/// Failures are non-fatal — if we can't even create the output dir
+/// Failures are non-fatal  Eif we can't even create the output dir
 /// here (permissions, broken path, …), the training step itself will
 /// likely report the same problem in a clearer context, so we just
 /// log a warning and let the run continue.
@@ -9503,7 +9451,7 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     let tag_path = output_dir.join("tag.txt");
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // argv joined with single spaces; quoting/escaping is intentionally
-    // not applied — the line is for human eyeballing, not for re-execution.
+    // not applied  Ethe line is for human eyeballing, not for re-execution.
     // (clap-parsed values are mostly path/identifier strings without
     // spaces; if the user did pass a quoted path, the original quoting
     // is lost by the time we see std::env::args, so reconstructing it is
@@ -10133,7 +10081,7 @@ fn enrich_bullet_log_to_csv(
         // continued-training rows display monotonically.
         let absolute_epoch = epoch + ctx.epoch_offset;
         // `positions` keeps using bullet's local sb because position_offset
-        // already carries the cumulative count from prior runs — the
+        // already carries the cumulative count from prior runs  Ethe
         // formula then adds (local_sb-1)*sb_size + b*batch_size to the
         // carry-over to give an honest cumulative position count.
         let positions = ctx.positions_at(local_sb, display_b, position_offset);
@@ -10238,7 +10186,7 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
 /// resetting to 1 each bulletou invocation.
 ///
 /// Returns `None` if the file does not exist or no row has a parseable
-/// epoch — which collapses to "no previous epochs to carry forward" at
+/// epoch  Ewhich collapses to "no previous epochs to carry forward" at
 /// the call site.
 fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option<usize> {
     let content = std::fs::read_to_string(top_level_log).ok()?;
@@ -10291,7 +10239,7 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
 /// after Ctrl+C.
 ///
 /// Returns `None` if there is no numbered dir, no `learn.log`, or no
-/// parseable sb column — which collapses to "treat as a fresh run" by
+/// parseable sb column  Ewhich collapses to "treat as a fresh run" by
 /// the caller.
 fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     let content = numbered_checkpoint_dirs_desc(output_dir)
@@ -10368,7 +10316,7 @@ fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) ->
 /// over fixed-length records (HCPE / PSV) the `plies` part is always
 /// 0. For game-structured loaders (HCPE3 / pack), the pair points to
 /// the start of a game header at `byte_offset` and the ply index
-/// within that game where the next position to be expanded sits — so
+/// within that game where the next position to be expanded sits  Eso
 /// resume seeks to the header, parses it, then fast-skips `plies`
 /// MoveInfo entries before re-entering the normal expansion loop.
 ///
@@ -10456,12 +10404,12 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 12-column CSV from cuda-cpp checkpoint writing / `assemble_numbered_dirs`) onto
 /// the top-level `<output>/summary-learn.log`, writing the CSV header on first
-/// file creation. The result is a single pure CSV — no section headers,
-/// no separators — that pandas / Excel can load directly.
+/// file creation. The result is a single pure CSV  Eno section headers,
+/// no separators  Ethat pandas / Excel can load directly.
 ///
 /// To keep the top-level file readable as a sb-level summary (rather
 /// than a per-batch dump), only the **last row** of each (eval, sb)
-/// group from the per-dir log is appended — exactly one row per
+/// group from the per-dir log is appended  Eexactly one row per
 /// superbatch save per component. The `curr_batch` column is also
 /// dropped (the summary file uses [`SUMMARY_LEARN_LOG_HEADER`]) because
 /// for sb-boundary rows it conveys no info (always the last batch
@@ -10810,7 +10758,7 @@ fn assemble_numbered_dirs(
         // Each component's bullet `log.txt` is the raw
         // `superbatch,curr_batch,loss` CSV. Enrich each into the current
         // `learn.log` format (header + data rows for kk, then kkp, then
-        // kpp). Pure CSV, no separator between components — the
+        // kpp). Pure CSV, no separator between components  Ethe
         // `eval` column's `<eval-type>/<component>` suffix distinguishes them.
         let mut log_buf = String::new();
         log_buf.push_str(LEARN_LOG_HEADER);
@@ -10842,7 +10790,7 @@ fn assemble_numbered_dirs(
 
 /// Cache of test-set positions used for validation events. Loaded
 /// once at the start of training (when `--test-teacher` is set) and
-/// reused for every subsequent validation forward pass — the random
+/// reused for every subsequent validation forward pass  Ethe random
 /// sampling happens once at load time, not on each save.
 struct TestPositionsCache {
     positions: Vec<bulletou_lib::shogi::PackedSfenValue>,
@@ -10978,27 +10926,32 @@ mod tests {
             NnueArch::from_str("sfnn_HALFKA2_1024_7_64_K3K3").unwrap().cli_name(),
             "SFNN_halfka2_1024_7_64_k3k3"
         );
-        let g4 = NnueArch::from_str("SFNN_halfka2_4096_7_64_g4_k3k3").unwrap();
-        assert_eq!(g4.dims(), (4096, 7, 64));
-        assert_eq!(g4.sfnn_l1_group_count(), 4);
-        assert_eq!(g4.cli_name(), "SFNN_halfka2_4096_7_64_g4_k3k3");
-        let g4_h1_3 = NnueArch::from_str("SFNN_halfka2_4096_3_64_g4_k3k3").unwrap();
-        assert_eq!(g4_h1_3.dims(), (4096, 3, 64));
-        assert_eq!(g4_h1_3.sfnn_l1_group_count(), 4);
-        assert_eq!(g4_h1_3.cli_name(), "SFNN_halfka2_4096_3_64_g4_k3k3");
-        let g16 = NnueArch::from_str("SFNN_halfka2_8192_15_64_g16_k3k3").unwrap();
-        assert_eq!(g16.dims(), (8192, 15, 64));
-        assert_eq!(g16.sfnn_l1_group_count(), 16);
-        assert_eq!(g16.cli_name(), "SFNN_halfka2_8192_15_64_g16_k3k3");
-        let g32 = NnueArch::from_str("SFNN_halfka2_4096_31_64_g32_k3k3").unwrap();
-        assert_eq!(g32.dims(), (4096, 31, 64));
-        assert_eq!(g32.sfnn_l1_group_count(), 32);
-        assert_eq!(g32.cli_name(), "SFNN_halfka2_4096_31_64_g32_k3k3");
-        let ka2_g16 = NnueArch::from_str("SFNN_ka2_2048_15_64_g16_k3k3").unwrap();
-        assert_eq!(ka2_g16.dims(), (2048, 15, 64));
-        assert_eq!(ka2_g16.expected_eval_type(), EvalType::SfnnKa2);
-        assert_eq!(ka2_g16.sfnn_l1_group_count(), 16);
-        assert_eq!(ka2_g16.cli_name(), "SFNN_ka2_2048_15_64_g16_k3k3");
+        let single = NnueArch::from_str("SFNN_halfka2_1024_7_64").unwrap();
+        assert_eq!(single.dims(), (1024, 7, 64));
+        assert_eq!(single.expected_eval_type(), EvalType::SfnnHalfka2);
+        assert_eq!(single.layerstack.unwrap().num_stacks(), 1);
+        assert_eq!(single.cli_name(), "SFNN_halfka2_1024_7_64");
+        let c0_x4 = NnueArch::from_str("SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3").unwrap();
+        assert_eq!(c0_x4.dims(), (4096, 7, 64));
+        assert_eq!(c0_x4.sfnn_l1_group_count(), 4);
+        assert_eq!(c0_x4.cli_name(), "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3");
+        let c0_x4_h1_3 = NnueArch::from_str("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3").unwrap();
+        assert_eq!(c0_x4_h1_3.dims(), (4096, 3, 64));
+        assert_eq!(c0_x4_h1_3.sfnn_l1_group_count(), 4);
+        assert_eq!(c0_x4_h1_3.cli_name(), "SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3");
+        let c0_x16 = NnueArch::from_str("SFNN_halfka2_8192_15_64_c0_s512x16_k3k3").unwrap();
+        assert_eq!(c0_x16.dims(), (8192, 15, 64));
+        assert_eq!(c0_x16.sfnn_l1_group_count(), 16);
+        assert_eq!(c0_x16.cli_name(), "SFNN_halfka2_8192_15_64_c0_s512x16_k3k3");
+        let c0_x32 = NnueArch::from_str("SFNN_halfka2_4096_31_64_c0_s128x32_k3k3").unwrap();
+        assert_eq!(c0_x32.dims(), (4096, 31, 64));
+        assert_eq!(c0_x32.sfnn_l1_group_count(), 32);
+        assert_eq!(c0_x32.cli_name(), "SFNN_halfka2_4096_31_64_c0_s128x32_k3k3");
+        let ka2_c0_x16 = NnueArch::from_str("SFNN_ka2_2048_15_64_c0_s128x16_k3k3").unwrap();
+        assert_eq!(ka2_c0_x16.dims(), (2048, 15, 64));
+        assert_eq!(ka2_c0_x16.expected_eval_type(), EvalType::SfnnKa2);
+        assert_eq!(ka2_c0_x16.sfnn_l1_group_count(), 16);
+        assert_eq!(ka2_c0_x16.cli_name(), "SFNN_ka2_2048_15_64_c0_s128x16_k3k3");
         let ka2_cs = NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_s256x8_k3k3").unwrap();
         assert_eq!(ka2_cs.dims(), (3072, 7, 64));
         assert_eq!(ka2_cs.expected_eval_type(), EvalType::SfnnKa2);
@@ -11011,11 +10964,13 @@ mod tests {
         assert_eq!(halfka2_c0.dims(), (8192, 7, 64));
         assert_eq!(halfka2_c0.expected_eval_type(), EvalType::SfnnHalfka2);
         assert!(halfka2_c0.has_common_shard_sfnn_l1());
-        assert!(!halfka2_c0.has_grouped_sfnn_l1());
         assert_eq!(halfka2_c0.sfnn_l1_common_size(), 0);
         assert_eq!(halfka2_c0.sfnn_l1_shard_size(), 1024);
         assert_eq!(halfka2_c0.sfnn_l1_group_count(), 8);
         assert_eq!(halfka2_c0.cli_name(), "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3");
+        let halfka2_c0_single = NnueArch::from_str("SFNN_halfka2_8192_7_64_c0_s1024x8").unwrap();
+        assert_eq!(halfka2_c0_single.layerstack.unwrap().num_stacks(), 1);
+        assert_eq!(halfka2_c0_single.cli_name(), "SFNN_halfka2_8192_7_64_c0_s1024x8");
         let k9k9 = NnueArch::from_str("SFNN_halfka2_1024_7_64_k9k9").unwrap();
         assert_eq!(k9k9.dims(), (1024, 7, 64));
         assert_eq!(k9k9.expected_eval_type(), EvalType::SfnnHalfka2);
@@ -11100,28 +11055,29 @@ mod tests {
         for s in [
             "NNUE_halfkp_256x2_32_32",
             "NNUE_ka2_256x2_64_64",
+            "SFNN_halfka2_1024_7_64",
             "SFNN_halfka2_1024_7_64_k3k3",
             "SFNN_halfka2_1024_7_64_k9k9",
             "SFNN_halfka2_1024_7_64_k29k29",
-            "SFNN_halfka2_4096_3_64_g4_k3k3",
-            "SFNN_halfka2_8192_3_64_g4_k3k3",
-            "SFNN_halfka2_4096_7_64_g4_k3k3",
-            "SFNN_halfka2_8192_7_64_g8_k3k3",
-            "SFNN_halfka2_4096_7_64_g8_k3k3",
-            "SFNN_halfka2_4096_15_64_g16_k3k3",
-            "SFNN_halfka2_8192_15_64_g16_k3k3",
-            "SFNN_halfka2_4096_31_64_g32_k3k3",
-            "SFNN_halfka2_2048_31_64_g16_k3k3",
-            "SFNN_ka2_2048_7_64_g8_k3k3",
-            "SFNN_ka2_2048_15_64_g16_k3k3",
-            "SFNN_ka2_4096_7_64_g8_k3k3",
-            "SFNN_ka2_4096_15_64_g16_k3k3",
-            "SFNN_ka2_8192_7_64_g8_k3k3",
-            "SFNN_ka2_8192_15_64_g16_k3k3",
-            "SFNN_ka2_16384_7_64_g8_k3k3",
-            "SFNN_ka2_16384_15_64_g16_k3k3",
-            "SFNN_ka2_32768_7_64_g8_k3k3",
-            "SFNN_ka2_32768_15_64_g16_k3k3",
+            "SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3",
+            "SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3",
+            "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3",
+            "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3",
+            "SFNN_halfka2_4096_7_64_c0_s512x8_k3k3",
+            "SFNN_halfka2_4096_15_64_c0_s256x16_k3k3",
+            "SFNN_halfka2_8192_15_64_c0_s512x16_k3k3",
+            "SFNN_halfka2_4096_31_64_c0_s128x32_k3k3",
+            "SFNN_halfka2_2048_31_64_c0_s128x16_k3k3",
+            "SFNN_ka2_2048_7_64_c0_s256x8_k3k3",
+            "SFNN_ka2_2048_15_64_c0_s128x16_k3k3",
+            "SFNN_ka2_4096_7_64_c0_s512x8_k3k3",
+            "SFNN_ka2_4096_15_64_c0_s256x16_k3k3",
+            "SFNN_ka2_8192_7_64_c0_s1024x8_k3k3",
+            "SFNN_ka2_8192_15_64_c0_s512x16_k3k3",
+            "SFNN_ka2_16384_7_64_c0_s2048x8_k3k3",
+            "SFNN_ka2_16384_15_64_c0_s1024x16_k3k3",
+            "SFNN_ka2_32768_7_64_c0_s4096x8_k3k3",
+            "SFNN_ka2_32768_15_64_c0_s2048x16_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_k3k3",
             "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3",
             "SFNN_halfka2_1024_7_64_hand64",
@@ -11163,8 +11119,9 @@ mod tests {
         assert!(NnueArch::from_str("NNUE_halfka2_256x2_32_32").is_err());
         assert!(NnueArch::from_str("NNUE_unsupported_256x2_32_32").is_err());
         assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_ls9").is_err());
-        assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g3_k3k3").is_err());
-        assert!(NnueArch::from_str("SFNN_halfka2_4096_7_64_g0_k3k3").is_err());
+        let old_g = NnueArch::from_str("SFNN_halfka2_4096_7_64_g4_k3k3").unwrap_err();
+        assert!(old_g.contains("_gN"));
+        assert!(old_g.contains("c0_s1024x4"));
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_s256x8_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_s256_k3k3").is_err());
@@ -11245,12 +11202,21 @@ mod tests {
     fn arch_alone_selects_training_target() {
         use clap::Parser as _;
 
-        let args = Args::try_parse_from(["bulletou", "--arch", "SFNN_ka2_8192_7_64_g8_k3k3", "--teacher", "/dev/null"])
-            .unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_ka2_8192_7_64_c0_s1024x8_k3k3",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap();
         args.validate_arch_flags().unwrap();
         assert_eq!(args.eval_type(), EvalType::SfnnKa2);
-        assert_eq!(args.arch().cli_name(), "SFNN_ka2_8192_7_64_g8_k3k3");
-        assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_8192_7_64_g8_k3k3"));
+        assert_eq!(args.arch().cli_name(), "SFNN_ka2_8192_7_64_c0_s1024x8_k3k3");
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_8192_7_64_c0_s1024x8_k3k3")
+        );
 
         let kppt = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
         kppt.validate_arch_flags().unwrap();
@@ -11277,7 +11243,7 @@ mod tests {
             "--eval-type",
             "SFNN_KA2",
             "--arch",
-            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "SFNN_ka2_2048_15_64_c0_s128x16_k3k3",
             "--teacher",
             "/dev/null",
         ])
@@ -12416,7 +12382,7 @@ mod tests {
         let args = Args::try_parse_from([
             "bulletou",
             "--arch",
-            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "SFNN_ka2_2048_15_64_c0_s128x16_k3k3",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -12443,7 +12409,7 @@ mod tests {
         let args = Args::try_parse_from([
             "bulletou",
             "--arch",
-            "SFNN_ka2_2048_15_64_g16_k3k3",
+            "SFNN_ka2_2048_15_64_c0_s128x16_k3k3",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -13224,15 +13190,15 @@ mod tests {
         use clap::Parser as _;
 
         for (arch, ft_size, l1_out, group_count, group_input, group_output) in [
-            ("SFNN_halfka2_4096_3_64_g4_k3k3", 4096, 4, 4, 1024, 1),
-            ("SFNN_halfka2_8192_3_64_g4_k3k3", 8192, 4, 4, 2048, 1),
-            ("SFNN_halfka2_4096_7_64_g4_k3k3", 4096, 8, 4, 1024, 2),
-            ("SFNN_halfka2_8192_7_64_g8_k3k3", 8192, 8, 8, 1024, 1),
-            ("SFNN_halfka2_4096_7_64_g8_k3k3", 4096, 8, 8, 512, 1),
-            ("SFNN_halfka2_4096_15_64_g16_k3k3", 4096, 16, 16, 256, 1),
-            ("SFNN_halfka2_8192_15_64_g16_k3k3", 8192, 16, 16, 512, 1),
-            ("SFNN_halfka2_4096_31_64_g32_k3k3", 4096, 32, 32, 128, 1),
-            ("SFNN_halfka2_2048_31_64_g16_k3k3", 2048, 32, 16, 128, 2),
+            ("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3", 4096, 4, 4, 1024, 1),
+            ("SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3", 8192, 4, 4, 2048, 1),
+            ("SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3", 4096, 8, 4, 1024, 2),
+            ("SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3", 8192, 8, 8, 1024, 1),
+            ("SFNN_halfka2_4096_7_64_c0_s512x8_k3k3", 4096, 8, 8, 512, 1),
+            ("SFNN_halfka2_4096_15_64_c0_s256x16_k3k3", 4096, 16, 16, 256, 1),
+            ("SFNN_halfka2_8192_15_64_c0_s512x16_k3k3", 8192, 16, 16, 512, 1),
+            ("SFNN_halfka2_4096_31_64_c0_s128x32_k3k3", 4096, 32, 32, 128, 1),
+            ("SFNN_halfka2_2048_31_64_c0_s128x16_k3k3", 2048, 32, 16, 128, 2),
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
@@ -13274,7 +13240,7 @@ mod tests {
         let args = Args::try_parse_from([
             "bulletou",
             "--arch",
-            "SFNN_halfka2_4096_7_64_g4_k3k3",
+            "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3",
             "--teacher",
             "/dev/null",
             "--backend",
@@ -13343,16 +13309,16 @@ mod tests {
         use clap::Parser as _;
 
         for (arch, ft_size, l1_out, l2_size, group_count, group_input, group_output) in [
-            ("SFNN_ka2_2048_7_64_g8_k3k3", 2048, 8, 64, 8, 256, 1),
-            ("SFNN_ka2_2048_15_64_g16_k3k3", 2048, 16, 64, 16, 128, 1),
-            ("SFNN_ka2_4096_7_64_g8_k3k3", 4096, 8, 64, 8, 512, 1),
-            ("SFNN_ka2_4096_15_64_g16_k3k3", 4096, 16, 64, 16, 256, 1),
-            ("SFNN_ka2_8192_7_64_g8_k3k3", 8192, 8, 64, 8, 1024, 1),
-            ("SFNN_ka2_8192_15_64_g16_k3k3", 8192, 16, 64, 16, 512, 1),
-            ("SFNN_ka2_16384_7_64_g8_k3k3", 16384, 8, 64, 8, 2048, 1),
-            ("SFNN_ka2_16384_15_64_g16_k3k3", 16384, 16, 64, 16, 1024, 1),
-            ("SFNN_ka2_32768_7_64_g8_k3k3", 32768, 8, 64, 8, 4096, 1),
-            ("SFNN_ka2_32768_15_64_g16_k3k3", 32768, 16, 64, 16, 2048, 1),
+            ("SFNN_ka2_2048_7_64_c0_s256x8_k3k3", 2048, 8, 64, 8, 256, 1),
+            ("SFNN_ka2_2048_15_64_c0_s128x16_k3k3", 2048, 16, 64, 16, 128, 1),
+            ("SFNN_ka2_4096_7_64_c0_s512x8_k3k3", 4096, 8, 64, 8, 512, 1),
+            ("SFNN_ka2_4096_15_64_c0_s256x16_k3k3", 4096, 16, 64, 16, 256, 1),
+            ("SFNN_ka2_8192_7_64_c0_s1024x8_k3k3", 8192, 8, 64, 8, 1024, 1),
+            ("SFNN_ka2_8192_15_64_c0_s512x16_k3k3", 8192, 16, 64, 16, 512, 1),
+            ("SFNN_ka2_16384_7_64_c0_s2048x8_k3k3", 16384, 8, 64, 8, 2048, 1),
+            ("SFNN_ka2_16384_15_64_c0_s1024x16_k3k3", 16384, 16, 64, 16, 1024, 1),
+            ("SFNN_ka2_32768_7_64_c0_s4096x8_k3k3", 32768, 8, 64, 8, 4096, 1),
+            ("SFNN_ka2_32768_15_64_c0_s2048x16_k3k3", 32768, 16, 64, 16, 2048, 1),
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
@@ -14725,7 +14691,7 @@ mod tests {
             lr_override: None,
         };
         // bullet's local sb in raw log is 1; enrich displays the local sb
-        // verbatim (no cross-run shift — sb is per-epoch by design).
+        // verbatim (no cross-run shift  Esb is per-epoch by design).
         let raw = "1,32,0.07\n1,64,0.06\n";
         let body =
             enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None, false);
