@@ -57,6 +57,7 @@
 | `--validation-rate` | `--test-teacher` の accuracy/loss 計測頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
+| `--sfnn-factorizer` | SFNN residual factorizer の有効項を変える。`shared` / `none` / `axis`、または `king=axis,hand=shared` のような混合指定が可能。既存 checkpoint を引き継ぐなら `--resume` を明示する。`state.bin` は利用可能なfactorizer tensorを保持し、validation と `nn.bin` export では現在の invocation で有効な項だけをfoldする |
 
 これらはモデル構造とは無関係なので、重みと Ranger optimizer state 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
 
@@ -68,7 +69,7 @@
 |---|---|
 | `--arch` | target family や NN topology (feature set / FT / L1 / L2 dims) が変わる = state.bin の tensor shape が合わない |
 | `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | SFNN state に stack 共有 factorizer tensor（dense L1 で使う `l1fw/l1fb`、および `l2fw/l2fb`・`l3fw/l3fb`）が含まれるかが変わる。新規 SFNN run では L2/L3 共有項がデフォルトON。古い非factorized SFNN runを再開するときだけ `--no-sfnn-factorized` を使う |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
 これらを変えるなら **`--tag` を変えて別 run として起動** してください。`--resume` を付けても tensor shape が合わないので復元できない。

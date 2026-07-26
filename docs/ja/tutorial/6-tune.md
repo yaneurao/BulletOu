@@ -32,7 +32,8 @@
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 | `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | SFNN の stack 共有 factorizer を有効/無効にする。新規 SFNN LayerStack run では L2/L3 共有項がデフォルトON。dense L1 arch では L1 共有項もON。compact L1 (`cN_sMxG`) arch では L1 は共有せず、L2/L3 だけ共有する。古い非factorized SFNN checkpointを再開するときは `--no-sfnn-factorized` を付ける。 | on |
+| `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて利用可能な bucket axis factorizer を有効化する。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |
