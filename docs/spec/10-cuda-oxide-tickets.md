@@ -1110,3 +1110,22 @@ current cuda-cpp follow-up queue.
   - `cargo test -p bulletou-cuda-cpp` passed;
   - `cargo test -p bulletou-cuda-cpp sfnn_tiny_train_step_runner_smoke -- --ignored --nocapture` passed;
   - `cargo test --features cuda-cpp-backend --example bulletou cuda_cpp_sfnn_validation -- --nocapture` passed.
+
+## 2026-07-26 cuda-cpp SFNN selectable residual factorizer
+
+- Added static `--sfnn-factorizer` selection for SFNN LayerStack experiments:
+  - `shared` is the default and matches the previous shared stack-factorizer behavior;
+  - `none` disables all SFNN residual factorizer terms (`--no-sfnn-factorized` remains a compatibility alias);
+  - `axis` enables shared plus all available bucket-axis residual terms;
+  - mixed forms such as `king=axis,hand=shared` enable king-axis residuals while keeping hand bucket effects in the global shared residual only.
+- `factorizer-schedule` was intentionally not implemented. To change factorizer usage between epochs, stop at an epoch boundary and restart with explicit `--resume --sfnn-factorizer ...`.
+- State/export semantics:
+  - `state.bin` keeps all available factorizer tensors and Ranger state so experiments can switch active terms later;
+  - validation and `nn.bin` fold only the factorizer terms active for the current invocation;
+  - auto-resume now records `sfnn_factorizer=...` in `resume-config.txt`; old shared/none configs without the field remain compatible, but axis changes require explicit `--resume`.
+- Implemented C++/CUDA forward/backward support for axis residual tensors on L1/L2/L3. Axis layout is `king friend`, `king enemy`, `hand stm`, `hand non-stm`, with the corresponding rank/file or hand-axis entries added as residuals for each stack.
+- Validation run:
+  - `cargo check --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test --features cuda-cpp-backend --example bulletou` passed;
+  - `cargo test -p bulletou-cuda-cpp` passed;
+  - `cargo test -p bulletou-cuda-cpp -- --ignored --test-threads=1` passed. Parallel ignored GPU tests can still interfere through the existing CUDA graph-capture smoke, so serial execution is required for that set.

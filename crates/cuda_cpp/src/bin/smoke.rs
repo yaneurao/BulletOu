@@ -316,6 +316,8 @@ fn tiny_sfnn_shape() -> SfnnForwardShape {
         l1_group_count: 1,
         l1_common_size: 0,
         l1_shard_size: 0,
+        factorizer_king_axis_dim: 0,
+        factorizer_hand_axis_dim: 0,
     }
 }
 
@@ -356,6 +358,8 @@ fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static>
             0.02, -0.04, 0.01, // input 3
         ]),
         l1fb: Some(&[0.005, -0.006, 0.007]),
+        l1axw: None,
+        l1axb: None,
         l2w: &[
             0.3, -0.1, 0.2, 0.4, // stack 0, row 0
             -0.2, 0.5, 0.1, -0.3, // stack 0, row 1
@@ -368,10 +372,14 @@ fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static>
             -0.03, 0.02, -0.01, 0.04, // shared row 1
         ]),
         l2fb: Some(&[0.006, -0.008]),
+        l2axw: None,
+        l2axb: None,
         l3w: &[0.6, -0.4, 0.5, 0.2],
         l3b: &[0.05, -0.02],
         l3fw: Some(&[0.03, -0.02]),
         l3fb: Some(&[0.004]),
+        l3axw: None,
+        l3axb: None,
     }
 }
 

@@ -305,3 +305,14 @@ BulletOu cuda-cpp SFNN now uses stack shared factorizer terms beyond L1:
 - compact L1 architectures (`cN_sMxG`): L1 shared term is not used, but `l2fw/l2fb` and `l3fw/l3fb` are enabled by default
 - `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms
 - `state.bin` preserves the shared tensors and their Ranger optimizer states; `nn.bin` folds the shared tensors into each bucket's stacked weights before export
+
+## 2026-07-26 update: selectable SFNN residual factorizer
+
+`--sfnn-factorizer` is now the preferred option:
+
+- `shared` (default): use the shared residual stack factorizer described above
+- `none`: disable all SFNN factorizer terms
+- `axis`: use shared plus bucket-axis residuals when the LayerStack suffix has king and/or hand axes
+- mixed form, for example `king=axis,hand=shared`: use the king bucket axes as residuals while leaving hand buckets represented only by the global shared residual
+
+`factorizer-schedule` is intentionally not implemented. To change the active factorizer by epoch, stop at an epoch boundary and restart with explicit `--resume --sfnn-factorizer ...`. Full `state.bin` preserves available tensors, while validation and `nn.bin` fold only the active terms for that invocation.

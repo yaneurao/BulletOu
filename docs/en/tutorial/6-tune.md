@@ -32,7 +32,8 @@ Main flags:
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 | `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | Enable or disable SFNN shared stack factorizer terms. New SFNN LayerStack runs enable shared L2/L3 by default; dense-L1 architectures also enable shared L1. Compact L1 (`cN_sMxG`) architectures keep L1 unshared but still use shared L2/L3. Use `--no-sfnn-factorized` when resuming older non-factorized SFNN checkpoints. | on |
+| `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus all available bucket-axis factorizer terms; combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for enabling shared factorizer or disabling all SFNN factorizer terms. Prefer `--sfnn-factorizer shared` or `--sfnn-factorizer none` in new commands. | on |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
 | `--optimizer-epsilon` | Override epsilon for the selected optimizer. If omitted, the optimizer's own default is used | omitted |
 | `--optimizer-beta1` | Override beta1 for the selected optimizer. If omitted, the optimizer's own default is used | omitted |

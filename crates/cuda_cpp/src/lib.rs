@@ -815,6 +815,14 @@ pub struct SfnnForwardShape {
     /// common+shard mode unless `l1_common_size` is also non-zero, which is
     /// rejected as an invalid partial common+shard shape.
     pub l1_shard_size: usize,
+    /// Per-axis factorizer dimension for king-bucketed LayerStacks. A value of
+    /// 29 means buckets can be decomposed as `king_friend * 29 + king_enemy`.
+    /// `0` means there is no king axis.
+    pub factorizer_king_axis_dim: usize,
+    /// Per-axis factorizer dimension for hand-bucketed LayerStacks. A value of
+    /// 32 means buckets can be decomposed as `hand_stm * 32 + hand_non_stm`.
+    /// `0` means there is no hand axis.
+    pub factorizer_hand_axis_dim: usize,
 }
 
 impl SfnnForwardShape {
@@ -898,6 +906,85 @@ impl SfnnForwardShape {
             self.num_stacks.saturating_mul(self.l1_out()).saturating_mul(self.ft_size)
         }
     }
+
+    pub fn factorizer_axis_count(self) -> usize {
+        self.factorizer_king_axis_dim.saturating_mul(2).saturating_add(self.factorizer_hand_axis_dim.saturating_mul(2))
+    }
+
+    pub fn factorizer_king_bucket_count(self) -> usize {
+        if self.factorizer_king_axis_dim == 0 {
+            1
+        } else {
+            self.factorizer_king_axis_dim.saturating_mul(self.factorizer_king_axis_dim)
+        }
+    }
+
+    pub fn factorizer_hand_bucket_count(self) -> usize {
+        if self.factorizer_hand_axis_dim == 0 {
+            1
+        } else {
+            self.factorizer_hand_axis_dim.saturating_mul(self.factorizer_hand_axis_dim)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfnnFactorizerActive {
+    pub shared: bool,
+    pub king_axis: bool,
+    pub hand_axis: bool,
+}
+
+impl SfnnFactorizerActive {
+    pub const NONE: Self = Self { shared: false, king_axis: false, hand_axis: false };
+    pub const SHARED: Self = Self { shared: true, king_axis: false, hand_axis: false };
+
+    pub fn any(self) -> bool {
+        self.shared || self.king_axis || self.hand_axis
+    }
+
+    pub fn any_axis(self) -> bool {
+        self.king_axis || self.hand_axis
+    }
+
+    pub fn active_axis_count(self, shape: SfnnForwardShape) -> usize {
+        let king = if self.king_axis { shape.factorizer_king_axis_dim.saturating_mul(2) } else { 0 };
+        let hand = if self.hand_axis { shape.factorizer_hand_axis_dim.saturating_mul(2) } else { 0 };
+        king.saturating_add(hand)
+    }
+
+    fn from_available(weights: &SfnnForwardDeviceWeights) -> Self {
+        Self {
+            shared: weights.l2fw.is_some() || weights.l3fw.is_some() || weights.l1fw.is_some(),
+            king_axis: weights.shape.factorizer_king_axis_dim > 0
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            hand_axis: weights.shape.factorizer_hand_axis_dim > 0
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+        }
+    }
+
+    fn from_host(weights: SfnnForwardHostWeights<'_>) -> Self {
+        Self {
+            shared: weights.l2fw.is_some() || weights.l3fw.is_some() || weights.l1fw.is_some(),
+            king_axis: weights.shape.factorizer_king_axis_dim > 0
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            hand_axis: weights.shape.factorizer_hand_axis_dim > 0
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+        }
+    }
+
+    fn validate_for_shape(self, shape: SfnnForwardShape) -> Result<()> {
+        if self.king_axis && shape.factorizer_king_axis_dim == 0 {
+            return Err(CudaCppError::message("SFNN king-axis factorizer is active but the shape has no king axis"));
+        }
+        if self.hand_axis && shape.factorizer_hand_axis_dim == 0 {
+            return Err(CudaCppError::message("SFNN hand-axis factorizer is active but the shape has no hand axis"));
+        }
+        if self.any_axis() && shape.factorizer_axis_count() == 0 {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but the shape has no factorizer axes"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -936,14 +1023,20 @@ pub struct SfnnForwardHostWeights<'a> {
     pub l1b: &'a [f32],
     pub l1fw: Option<&'a [f32]>,
     pub l1fb: Option<&'a [f32]>,
+    pub l1axw: Option<&'a [f32]>,
+    pub l1axb: Option<&'a [f32]>,
     pub l2w: &'a [f32],
     pub l2b: &'a [f32],
     pub l2fw: Option<&'a [f32]>,
     pub l2fb: Option<&'a [f32]>,
+    pub l2axw: Option<&'a [f32]>,
+    pub l2axb: Option<&'a [f32]>,
     pub l3w: &'a [f32],
     pub l3b: &'a [f32],
     pub l3fw: Option<&'a [f32]>,
     pub l3fb: Option<&'a [f32]>,
+    pub l3axw: Option<&'a [f32]>,
+    pub l3axb: Option<&'a [f32]>,
 }
 
 impl SfnnForwardHostWeights<'_> {
@@ -966,6 +1059,26 @@ impl SfnnForwardHostWeights<'_> {
             (Some(_), None) => return Err(CudaCppError::message("SFNN l1fw requires l1fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN l1fb requires l1fw")),
         }
+        match (self.l1axw, self.l1axb) {
+            (Some(l1axw), Some(l1axb)) => {
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message("SFNN compact L1 does not support axis-factorized L1 weights"));
+                }
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message("SFNN axis-factorized L1 weights require at least one axis"));
+                }
+                expect_len(
+                    "sfnn l1axw",
+                    checked_product("sfnn l1axw", &[axes, shape.ft_size, shape.l1_out()])?,
+                    l1axw.len(),
+                )?;
+                expect_len("sfnn l1axb", checked_product("sfnn l1axb", &[axes, shape.l1_out()])?, l1axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l1axw requires l1axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l1axb requires l1axw")),
+        }
         expect_len(
             "sfnn l2w",
             checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
@@ -981,6 +1094,23 @@ impl SfnnForwardHostWeights<'_> {
             (Some(_), None) => return Err(CudaCppError::message("SFNN l2fw requires l2fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN l2fb requires l2fw")),
         }
+        match (self.l2axw, self.l2axb) {
+            (Some(l2axw), Some(l2axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message("SFNN axis-factorized L2 weights require at least one axis"));
+                }
+                expect_len(
+                    "sfnn l2axw",
+                    checked_product("sfnn l2axw", &[axes, shape.l2_size, shape.l2_in()])?,
+                    l2axw.len(),
+                )?;
+                expect_len("sfnn l2axb", checked_product("sfnn l2axb", &[axes, shape.l2_size])?, l2axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l2axw requires l2axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l2axb requires l2axw")),
+        }
         expect_len("sfnn l3w", checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, self.l3w.len())?;
         expect_len("sfnn l3b", shape.num_stacks, self.l3b.len())?;
         match (self.l3fw, self.l3fb) {
@@ -991,6 +1121,19 @@ impl SfnnForwardHostWeights<'_> {
             (None, None) => {}
             (Some(_), None) => return Err(CudaCppError::message("SFNN l3fw requires l3fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN l3fb requires l3fw")),
+        }
+        match (self.l3axw, self.l3axb) {
+            (Some(l3axw), Some(l3axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message("SFNN axis-factorized L3 weights require at least one axis"));
+                }
+                expect_len("sfnn l3axw", checked_product("sfnn l3axw", &[axes, shape.l2_size])?, l3axw.len())?;
+                expect_len("sfnn l3axb", axes, l3axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN l3axw requires l3axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN l3axb requires l3axw")),
         }
         Ok(())
     }
@@ -1037,14 +1180,20 @@ pub struct SfnnForwardDeviceWeights {
     pub l1b: F32Buffer,
     pub l1fw: Option<F32Buffer>,
     pub l1fb: Option<F32Buffer>,
+    pub l1axw: Option<F32Buffer>,
+    pub l1axb: Option<F32Buffer>,
     pub l2w: F32Buffer,
     pub l2b: F32Buffer,
     pub l2fw: Option<F32Buffer>,
     pub l2fb: Option<F32Buffer>,
+    pub l2axw: Option<F32Buffer>,
+    pub l2axb: Option<F32Buffer>,
     pub l3w: F32Buffer,
     pub l3b: F32Buffer,
     pub l3fw: Option<F32Buffer>,
     pub l3fb: Option<F32Buffer>,
+    pub l3axw: Option<F32Buffer>,
+    pub l3axb: Option<F32Buffer>,
 }
 
 impl SfnnForwardDeviceWeights {
@@ -1058,14 +1207,20 @@ impl SfnnForwardDeviceWeights {
             l1b: F32Buffer::from_host(ctx, weights.l1b)?,
             l1fw: weights.l1fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l1fb: weights.l1fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l1axw: weights.l1axw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l1axb: weights.l1axb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l2w: F32Buffer::from_host(ctx, weights.l2w)?,
             l2b: F32Buffer::from_host(ctx, weights.l2b)?,
             l2fw: weights.l2fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l2fb: weights.l2fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l2axw: weights.l2axw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l2axb: weights.l2axb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3w: F32Buffer::from_host(ctx, weights.l3w)?,
             l3b: F32Buffer::from_host(ctx, weights.l3b)?,
             l3fw: weights.l3fw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3fb: weights.l3fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l3axw: weights.l3axw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            l3axb: weights.l3axb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
         })
     }
 
@@ -1100,6 +1255,30 @@ impl SfnnForwardDeviceWeights {
             (Some(_), None) => return Err(CudaCppError::message("device SFNN l1fw requires l1fb")),
             (None, Some(_)) => return Err(CudaCppError::message("device SFNN l1fb requires l1fw")),
         }
+        match (&self.l1axw, &self.l1axb) {
+            (Some(l1axw), Some(l1axb)) => {
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message(
+                        "device SFNN compact L1 does not support axis-factorized L1 weights",
+                    ));
+                }
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "device SFNN axis-factorized L1 weights require at least one axis",
+                    ));
+                }
+                expect_len(
+                    "device sfnn l1axw",
+                    checked_product("sfnn l1axw", &[axes, shape.ft_size, shape.l1_out()])?,
+                    l1axw.len(),
+                )?;
+                expect_len("device sfnn l1axb", checked_product("sfnn l1axb", &[axes, shape.l1_out()])?, l1axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l1axw requires l1axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l1axb requires l1axw")),
+        }
         expect_len(
             "device sfnn l2w",
             checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
@@ -1123,6 +1302,25 @@ impl SfnnForwardDeviceWeights {
             (Some(_), None) => return Err(CudaCppError::message("device SFNN l2fw requires l2fb")),
             (None, Some(_)) => return Err(CudaCppError::message("device SFNN l2fb requires l2fw")),
         }
+        match (&self.l2axw, &self.l2axb) {
+            (Some(l2axw), Some(l2axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "device SFNN axis-factorized L2 weights require at least one axis",
+                    ));
+                }
+                expect_len(
+                    "device sfnn l2axw",
+                    checked_product("sfnn l2axw", &[axes, shape.l2_size, shape.l2_in()])?,
+                    l2axw.len(),
+                )?;
+                expect_len("device sfnn l2axb", checked_product("sfnn l2axb", &[axes, shape.l2_size])?, l2axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l2axw requires l2axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l2axb requires l2axw")),
+        }
         expect_len(
             "device sfnn l3w",
             checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?,
@@ -1137,6 +1335,21 @@ impl SfnnForwardDeviceWeights {
             (None, None) => {}
             (Some(_), None) => return Err(CudaCppError::message("device SFNN l3fw requires l3fb")),
             (None, Some(_)) => return Err(CudaCppError::message("device SFNN l3fb requires l3fw")),
+        }
+        match (&self.l3axw, &self.l3axb) {
+            (Some(l3axw), Some(l3axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "device SFNN axis-factorized L3 weights require at least one axis",
+                    ));
+                }
+                expect_len("device sfnn l3axw", checked_product("sfnn l3axw", &[axes, shape.l2_size])?, l3axw.len())?;
+                expect_len("device sfnn l3axb", axes, l3axb.len())?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("device SFNN l3axw requires l3axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("device SFNN l3axb requires l3axw")),
         }
         Ok(())
     }
@@ -1236,9 +1449,20 @@ pub fn sfnn_forward_device(
     weights: &SfnnForwardDeviceWeights,
     workspace: &SfnnForwardWorkspace,
 ) -> Result<()> {
+    sfnn_forward_device_with_factorizer(ctx, batch, weights, workspace, SfnnFactorizerActive::from_available(weights))
+}
+
+pub fn sfnn_forward_device_with_factorizer(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &SfnnForwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
     workspace.validate()?;
+    factorizer.validate_for_shape(weights.shape)?;
     if workspace.layout.batch_size != batch.batch_size {
         return Err(CudaCppError::message(format!(
             "SFNN workspace batch mismatch: workspace={} batch={}",
@@ -1252,20 +1476,60 @@ pub fn sfnn_forward_device(
         )));
     }
     let shape = weights.shape;
-    let (l1fw, l1fb, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
-        (Some(l1fw), Some(l1fb)) => (l1fw.as_ptr(), l1fb.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
-        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
+    let (l1axw, l1axb, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
+        (Some(l1axw), Some(l1axb)) if factorizer.king_axis || factorizer.hand_axis => {
+            (l1axw.as_ptr(), l1axb.as_ptr(), 1)
+        }
+        (None, None) if (factorizer.king_axis || factorizer.hand_axis) && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L1 state is partial")),
     };
     let (l2fw, l2fb, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
-        (Some(l2fw), Some(l2fb)) => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        (Some(l2fw), Some(l2fb)) if factorizer.shared => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
+    let (l2axw, l2axb, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
+        (Some(l2axw), Some(l2axb)) if factorizer.king_axis || factorizer.hand_axis => {
+            (l2axw.as_ptr(), l2axb.as_ptr(), 1)
+        }
+        (None, None) if factorizer.king_axis || factorizer.hand_axis => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
+    };
     let (l3fw, l3fb, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
-        (Some(l3fw), Some(l3fb)) => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
+        (Some(l3fw), Some(l3fb)) if factorizer.shared => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
+        }
         (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        (Some(_), Some(_)) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
+    let (l3axw, l3axb, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
+        (Some(l3axw), Some(l3axb)) if factorizer.king_axis || factorizer.hand_axis => {
+            (l3axw.as_ptr(), l3axb.as_ptr(), 1)
+        }
+        (None, None) if factorizer.king_axis || factorizer.hand_axis => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
+    };
+    let (l1fw, l1fb, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
+        (Some(l1fw), Some(l1fb)) if factorizer.shared => (l1fw.as_ptr(), l1fb.as_ptr(), 1),
+        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
@@ -1279,6 +1543,8 @@ pub fn sfnn_forward_device(
             shape.l1_group_count,
             shape.l1_common_size,
             shape.l1_shard_size,
+            shape.factorizer_king_axis_dim,
+            shape.factorizer_hand_axis_dim,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -1291,16 +1557,27 @@ pub fn sfnn_forward_device(
             l1fw,
             l1fb,
             has_l1f,
+            l1axw,
+            l1axb,
+            has_l1ax,
             weights.l2w.as_ptr(),
             weights.l2b.as_ptr(),
             l2fw,
             l2fb,
             has_l2f,
+            l2axw,
+            l2axb,
+            has_l2ax,
             weights.l3w.as_ptr(),
             weights.l3b.as_ptr(),
             l3fw,
             l3fb,
             has_l3f,
+            l3axw,
+            l3axb,
+            has_l3ax,
+            i32::from(factorizer.king_axis),
+            i32::from(factorizer.hand_axis),
             workspace.stm_l0.as_ptr(),
             workspace.nstm_l0.as_ptr(),
             workspace.combined.as_ptr(),
@@ -1963,6 +2240,14 @@ impl SfnnBackwardWorkspaceLayout {
         self.shape.l1_out()
     }
 
+    pub fn l1axw_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count().saturating_mul(self.shape.ft_size).saturating_mul(self.shape.l1_out())
+    }
+
+    pub fn l1axb_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count().saturating_mul(self.shape.l1_out())
+    }
+
     pub fn l2w_gradients_len(self) -> usize {
         self.shape.num_stacks.saturating_mul(self.shape.l2_size).saturating_mul(self.shape.l2_in())
     }
@@ -1979,6 +2264,14 @@ impl SfnnBackwardWorkspaceLayout {
         self.shape.l2_size
     }
 
+    pub fn l2axw_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count().saturating_mul(self.shape.l2_size).saturating_mul(self.shape.l2_in())
+    }
+
+    pub fn l2axb_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count().saturating_mul(self.shape.l2_size)
+    }
+
     pub fn l3w_gradients_len(self) -> usize {
         self.shape.num_stacks.saturating_mul(self.shape.l2_size)
     }
@@ -1993,6 +2286,14 @@ impl SfnnBackwardWorkspaceLayout {
 
     pub fn l3fb_gradients_len(self) -> usize {
         1
+    }
+
+    pub fn l3axw_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count().saturating_mul(self.shape.l2_size)
+    }
+
+    pub fn l3axb_gradients_len(self) -> usize {
+        self.shape.factorizer_axis_count()
     }
 
     fn validate(self) -> Result<()> {
@@ -2024,14 +2325,20 @@ pub struct SfnnBackwardWorkspace {
     pub l1b_gradients: F32Buffer,
     pub l1fw_gradients: F32Buffer,
     pub l1fb_gradients: F32Buffer,
+    pub l1axw_gradients: F32Buffer,
+    pub l1axb_gradients: F32Buffer,
     pub l2w_gradients: F32Buffer,
     pub l2b_gradients: F32Buffer,
     pub l2fw_gradients: F32Buffer,
     pub l2fb_gradients: F32Buffer,
+    pub l2axw_gradients: F32Buffer,
+    pub l2axb_gradients: F32Buffer,
     pub l3w_gradients: F32Buffer,
     pub l3b_gradients: F32Buffer,
     pub l3fw_gradients: F32Buffer,
     pub l3fb_gradients: F32Buffer,
+    pub l3axw_gradients: F32Buffer,
+    pub l3axb_gradients: F32Buffer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2050,14 +2357,20 @@ pub struct SfnnBackwardReadback {
     pub l1b_gradients: Vec<f32>,
     pub l1fw_gradients: Vec<f32>,
     pub l1fb_gradients: Vec<f32>,
+    pub l1axw_gradients: Vec<f32>,
+    pub l1axb_gradients: Vec<f32>,
     pub l2w_gradients: Vec<f32>,
     pub l2b_gradients: Vec<f32>,
     pub l2fw_gradients: Vec<f32>,
     pub l2fb_gradients: Vec<f32>,
+    pub l2axw_gradients: Vec<f32>,
+    pub l2axb_gradients: Vec<f32>,
     pub l3w_gradients: Vec<f32>,
     pub l3b_gradients: Vec<f32>,
     pub l3fw_gradients: Vec<f32>,
     pub l3fb_gradients: Vec<f32>,
+    pub l3axw_gradients: Vec<f32>,
+    pub l3axb_gradients: Vec<f32>,
 }
 
 impl SfnnBackwardWorkspace {
@@ -2079,14 +2392,20 @@ impl SfnnBackwardWorkspace {
             l1b_gradients: F32Buffer::new(ctx, layout.l1b_gradients_len())?,
             l1fw_gradients: F32Buffer::new(ctx, layout.l1fw_gradients_len())?,
             l1fb_gradients: F32Buffer::new(ctx, layout.l1fb_gradients_len())?,
+            l1axw_gradients: F32Buffer::new(ctx, layout.l1axw_gradients_len())?,
+            l1axb_gradients: F32Buffer::new(ctx, layout.l1axb_gradients_len())?,
             l2w_gradients: F32Buffer::new(ctx, layout.l2w_gradients_len())?,
             l2b_gradients: F32Buffer::new(ctx, layout.l2b_gradients_len())?,
             l2fw_gradients: F32Buffer::new(ctx, layout.l2fw_gradients_len())?,
             l2fb_gradients: F32Buffer::new(ctx, layout.l2fb_gradients_len())?,
+            l2axw_gradients: F32Buffer::new(ctx, layout.l2axw_gradients_len())?,
+            l2axb_gradients: F32Buffer::new(ctx, layout.l2axb_gradients_len())?,
             l3w_gradients: F32Buffer::new(ctx, layout.l3w_gradients_len())?,
             l3b_gradients: F32Buffer::new(ctx, layout.l3b_gradients_len())?,
             l3fw_gradients: F32Buffer::new(ctx, layout.l3fw_gradients_len())?,
             l3fb_gradients: F32Buffer::new(ctx, layout.l3fb_gradients_len())?,
+            l3axw_gradients: F32Buffer::new(ctx, layout.l3axw_gradients_len())?,
+            l3axb_gradients: F32Buffer::new(ctx, layout.l3axb_gradients_len())?,
         })
     }
 
@@ -2122,14 +2441,20 @@ impl SfnnBackwardWorkspace {
         expect_len("sfnn backward l1b_gradients", self.layout.l1b_gradients_len(), self.l1b_gradients.len())?;
         expect_len("sfnn backward l1fw_gradients", self.layout.l1fw_gradients_len(), self.l1fw_gradients.len())?;
         expect_len("sfnn backward l1fb_gradients", self.layout.l1fb_gradients_len(), self.l1fb_gradients.len())?;
+        expect_len("sfnn backward l1axw_gradients", self.layout.l1axw_gradients_len(), self.l1axw_gradients.len())?;
+        expect_len("sfnn backward l1axb_gradients", self.layout.l1axb_gradients_len(), self.l1axb_gradients.len())?;
         expect_len("sfnn backward l2w_gradients", self.layout.l2w_gradients_len(), self.l2w_gradients.len())?;
         expect_len("sfnn backward l2b_gradients", self.layout.l2b_gradients_len(), self.l2b_gradients.len())?;
         expect_len("sfnn backward l2fw_gradients", self.layout.l2fw_gradients_len(), self.l2fw_gradients.len())?;
         expect_len("sfnn backward l2fb_gradients", self.layout.l2fb_gradients_len(), self.l2fb_gradients.len())?;
+        expect_len("sfnn backward l2axw_gradients", self.layout.l2axw_gradients_len(), self.l2axw_gradients.len())?;
+        expect_len("sfnn backward l2axb_gradients", self.layout.l2axb_gradients_len(), self.l2axb_gradients.len())?;
         expect_len("sfnn backward l3w_gradients", self.layout.l3w_gradients_len(), self.l3w_gradients.len())?;
         expect_len("sfnn backward l3b_gradients", self.layout.l3b_gradients_len(), self.l3b_gradients.len())?;
         expect_len("sfnn backward l3fw_gradients", self.layout.l3fw_gradients_len(), self.l3fw_gradients.len())?;
-        expect_len("sfnn backward l3fb_gradients", self.layout.l3fb_gradients_len(), self.l3fb_gradients.len())
+        expect_len("sfnn backward l3fb_gradients", self.layout.l3fb_gradients_len(), self.l3fb_gradients.len())?;
+        expect_len("sfnn backward l3axw_gradients", self.layout.l3axw_gradients_len(), self.l3axw_gradients.len())?;
+        expect_len("sfnn backward l3axb_gradients", self.layout.l3axb_gradients_len(), self.l3axb_gradients.len())
     }
 
     pub fn download(&self, ctx: &Context) -> Result<SfnnBackwardReadback> {
@@ -2148,14 +2473,20 @@ impl SfnnBackwardWorkspace {
             l1b_gradients: self.l1b_gradients.download(ctx)?,
             l1fw_gradients: self.l1fw_gradients.download(ctx)?,
             l1fb_gradients: self.l1fb_gradients.download(ctx)?,
+            l1axw_gradients: self.l1axw_gradients.download(ctx)?,
+            l1axb_gradients: self.l1axb_gradients.download(ctx)?,
             l2w_gradients: self.l2w_gradients.download(ctx)?,
             l2b_gradients: self.l2b_gradients.download(ctx)?,
             l2fw_gradients: self.l2fw_gradients.download(ctx)?,
             l2fb_gradients: self.l2fb_gradients.download(ctx)?,
+            l2axw_gradients: self.l2axw_gradients.download(ctx)?,
+            l2axb_gradients: self.l2axb_gradients.download(ctx)?,
             l3w_gradients: self.l3w_gradients.download(ctx)?,
             l3b_gradients: self.l3b_gradients.download(ctx)?,
             l3fw_gradients: self.l3fw_gradients.download(ctx)?,
             l3fb_gradients: self.l3fb_gradients.download(ctx)?,
+            l3axw_gradients: self.l3axw_gradients.download(ctx)?,
+            l3axb_gradients: self.l3axb_gradients.download(ctx)?,
         })
     }
 
@@ -2166,14 +2497,20 @@ impl SfnnBackwardWorkspace {
         self.l1b_gradients.fill(ctx, 0.0)?;
         self.l1fw_gradients.fill(ctx, 0.0)?;
         self.l1fb_gradients.fill(ctx, 0.0)?;
+        self.l1axw_gradients.fill(ctx, 0.0)?;
+        self.l1axb_gradients.fill(ctx, 0.0)?;
         self.l2w_gradients.fill(ctx, 0.0)?;
         self.l2b_gradients.fill(ctx, 0.0)?;
         self.l2fw_gradients.fill(ctx, 0.0)?;
         self.l2fb_gradients.fill(ctx, 0.0)?;
+        self.l2axw_gradients.fill(ctx, 0.0)?;
+        self.l2axb_gradients.fill(ctx, 0.0)?;
         self.l3w_gradients.fill(ctx, 0.0)?;
         self.l3b_gradients.fill(ctx, 0.0)?;
         self.l3fw_gradients.fill(ctx, 0.0)?;
-        self.l3fb_gradients.fill(ctx, 0.0)
+        self.l3fb_gradients.fill(ctx, 0.0)?;
+        self.l3axw_gradients.fill(ctx, 0.0)?;
+        self.l3axb_gradients.fill(ctx, 0.0)
     }
 }
 
@@ -2185,7 +2522,27 @@ pub fn sfnn_backward_device(
     loss: &ScalarLossWorkspace,
     backward: &SfnnBackwardWorkspace,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false)
+    sfnn_backward_device_with_factorizer(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        SfnnFactorizerActive::from_available(weights),
+    )
+}
+
+pub fn sfnn_backward_device_with_factorizer(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false, factorizer)
 }
 
 pub fn sfnn_backward_train_device(
@@ -2196,7 +2553,27 @@ pub fn sfnn_backward_train_device(
     loss: &ScalarLossWorkspace,
     backward: &SfnnBackwardWorkspace,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true)
+    sfnn_backward_train_device_with_factorizer(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        SfnnFactorizerActive::from_available(weights),
+    )
+}
+
+pub fn sfnn_backward_train_device_with_factorizer(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true, factorizer)
 }
 
 pub fn sfnn_backward_train_profile_device(
@@ -2207,11 +2584,32 @@ pub fn sfnn_backward_train_profile_device(
     loss: &ScalarLossWorkspace,
     backward: &SfnnBackwardWorkspace,
 ) -> Result<SfnnBackwardStageProfile> {
+    sfnn_backward_train_profile_device_with_factorizer(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        SfnnFactorizerActive::from_available(weights),
+    )
+}
+
+pub fn sfnn_backward_train_profile_device_with_factorizer(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+) -> Result<SfnnBackwardStageProfile> {
     batch.validate()?;
     weights.validate()?;
     forward.validate()?;
     loss.validate()?;
     backward.validate()?;
+    factorizer.validate_for_shape(weights.shape)?;
     let shape = weights.shape;
     if forward.layout.shape != shape || backward.layout.shape != shape {
         return Err(CudaCppError::message(format!(
@@ -2235,19 +2633,52 @@ pub fn sfnn_backward_train_profile_device(
         )));
     }
     let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
-        (Some(l1fw), Some(_)) => (l1fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l1fw), Some(_)) if factorizer.shared => (l1fw.as_ptr(), 1),
+        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    let (l1axw, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
+        (Some(l1axw), Some(_)) if factorizer.any_axis() => (l1axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L1 state is partial")),
+    };
     let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
-        (Some(l2fw), Some(_)) => (l2fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l2fw), Some(_)) if factorizer.shared => (l2fw.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
+    let (l2axw, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
+        (Some(l2axw), Some(_)) if factorizer.any_axis() => (l2axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
+    };
     let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
-        (Some(l3fw), Some(_)) => (l3fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l3fw), Some(_)) if factorizer.shared => (l3fw.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
+    let (l3axw, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
+        (Some(l3axw), Some(_)) if factorizer.any_axis() => (l3axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
 
     let mut profile_ms = [0.0f32; 7];
@@ -2263,6 +2694,8 @@ pub fn sfnn_backward_train_profile_device(
             shape.l1_group_count,
             shape.l1_common_size,
             shape.l1_shard_size,
+            shape.factorizer_king_axis_dim,
+            shape.factorizer_hand_axis_dim,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2277,12 +2710,20 @@ pub fn sfnn_backward_train_profile_device(
             weights.l1w.as_ptr(),
             l1fw,
             has_l1f,
+            l1axw,
+            has_l1ax,
             weights.l2w.as_ptr(),
             l2fw,
             has_l2f,
+            l2axw,
+            has_l2ax,
             weights.l3w.as_ptr(),
             l3fw,
             has_l3f,
+            l3axw,
+            has_l3ax,
+            i32::from(factorizer.king_axis),
+            i32::from(factorizer.hand_axis),
             loss.mean_output_gradients.as_ptr(),
             backward.l2_gradients.as_ptr(),
             backward.l1_gradients.as_ptr(),
@@ -2298,14 +2739,20 @@ pub fn sfnn_backward_train_profile_device(
             backward.l1b_gradients.as_ptr(),
             backward.l1fw_gradients.as_ptr(),
             backward.l1fb_gradients.as_ptr(),
+            backward.l1axw_gradients.as_ptr(),
+            backward.l1axb_gradients.as_ptr(),
             backward.l2w_gradients.as_ptr(),
             backward.l2b_gradients.as_ptr(),
             backward.l2fw_gradients.as_ptr(),
             backward.l2fb_gradients.as_ptr(),
+            backward.l2axw_gradients.as_ptr(),
+            backward.l2axb_gradients.as_ptr(),
             backward.l3w_gradients.as_ptr(),
             backward.l3b_gradients.as_ptr(),
             backward.l3fw_gradients.as_ptr(),
             backward.l3fb_gradients.as_ptr(),
+            backward.l3axw_gradients.as_ptr(),
+            backward.l3axb_gradients.as_ptr(),
             1,
             profile_ms.as_mut_ptr(),
             profile_ms.len(),
@@ -2330,12 +2777,14 @@ fn sfnn_backward_device_impl(
     loss: &ScalarLossWorkspace,
     backward: &SfnnBackwardWorkspace,
     use_train_entry: bool,
+    factorizer: SfnnFactorizerActive,
 ) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
     forward.validate()?;
     loss.validate()?;
     backward.validate()?;
+    factorizer.validate_for_shape(weights.shape)?;
     let shape = weights.shape;
     if forward.layout.shape != shape || backward.layout.shape != shape {
         return Err(CudaCppError::message(format!(
@@ -2359,19 +2808,52 @@ fn sfnn_backward_device_impl(
         )));
     }
     let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
-        (Some(l1fw), Some(_)) => (l1fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l1fw), Some(_)) if factorizer.shared => (l1fw.as_ptr(), 1),
+        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    let (l1axw, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
+        (Some(l1axw), Some(_)) if factorizer.any_axis() => (l1axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L1 state is partial")),
+    };
     let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
-        (Some(l2fw), Some(_)) => (l2fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l2fw), Some(_)) if factorizer.shared => (l2fw.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
+    let (l2axw, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
+        (Some(l2axw), Some(_)) if factorizer.any_axis() => (l2axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
+    };
     let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
-        (Some(l3fw), Some(_)) => (l3fw.as_ptr(), 1),
-        (None, None) => (std::ptr::null_mut(), 0),
+        (Some(l3fw), Some(_)) if factorizer.shared => (l3fw.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
+    let (l3axw, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
+        (Some(l3axw), Some(_)) if factorizer.any_axis() => (l3axw.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
 
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
@@ -2387,6 +2869,8 @@ fn sfnn_backward_device_impl(
                 shape.l1_group_count,
                 shape.l1_common_size,
                 shape.l1_shard_size,
+                shape.factorizer_king_axis_dim,
+                shape.factorizer_hand_axis_dim,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -2401,12 +2885,20 @@ fn sfnn_backward_device_impl(
                 weights.l1w.as_ptr(),
                 l1fw,
                 has_l1f,
+                l1axw,
+                has_l1ax,
                 weights.l2w.as_ptr(),
                 l2fw,
                 has_l2f,
+                l2axw,
+                has_l2ax,
                 weights.l3w.as_ptr(),
                 l3fw,
                 has_l3f,
+                l3axw,
+                has_l3ax,
+                i32::from(factorizer.king_axis),
+                i32::from(factorizer.hand_axis),
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -2422,14 +2914,20 @@ fn sfnn_backward_device_impl(
                 backward.l1b_gradients.as_ptr(),
                 backward.l1fw_gradients.as_ptr(),
                 backward.l1fb_gradients.as_ptr(),
+                backward.l1axw_gradients.as_ptr(),
+                backward.l1axb_gradients.as_ptr(),
                 backward.l2w_gradients.as_ptr(),
                 backward.l2b_gradients.as_ptr(),
                 backward.l2fw_gradients.as_ptr(),
                 backward.l2fb_gradients.as_ptr(),
+                backward.l2axw_gradients.as_ptr(),
+                backward.l2axb_gradients.as_ptr(),
                 backward.l3w_gradients.as_ptr(),
                 backward.l3b_gradients.as_ptr(),
                 backward.l3fw_gradients.as_ptr(),
                 backward.l3fb_gradients.as_ptr(),
+                backward.l3axw_gradients.as_ptr(),
+                backward.l3axb_gradients.as_ptr(),
                 0,
             )
         } else {
@@ -2443,6 +2941,8 @@ fn sfnn_backward_device_impl(
                 shape.l1_group_count,
                 shape.l1_common_size,
                 shape.l1_shard_size,
+                shape.factorizer_king_axis_dim,
+                shape.factorizer_hand_axis_dim,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -2457,12 +2957,20 @@ fn sfnn_backward_device_impl(
                 weights.l1w.as_ptr(),
                 l1fw,
                 has_l1f,
+                l1axw,
+                has_l1ax,
                 weights.l2w.as_ptr(),
                 l2fw,
                 has_l2f,
+                l2axw,
+                has_l2ax,
                 weights.l3w.as_ptr(),
                 l3fw,
                 has_l3f,
+                l3axw,
+                has_l3ax,
+                i32::from(factorizer.king_axis),
+                i32::from(factorizer.hand_axis),
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -2478,14 +2986,20 @@ fn sfnn_backward_device_impl(
                 backward.l1b_gradients.as_ptr(),
                 backward.l1fw_gradients.as_ptr(),
                 backward.l1fb_gradients.as_ptr(),
+                backward.l1axw_gradients.as_ptr(),
+                backward.l1axb_gradients.as_ptr(),
                 backward.l2w_gradients.as_ptr(),
                 backward.l2b_gradients.as_ptr(),
                 backward.l2fw_gradients.as_ptr(),
                 backward.l2fb_gradients.as_ptr(),
+                backward.l2axw_gradients.as_ptr(),
+                backward.l2axb_gradients.as_ptr(),
                 backward.l3w_gradients.as_ptr(),
                 backward.l3b_gradients.as_ptr(),
                 backward.l3fw_gradients.as_ptr(),
                 backward.l3fb_gradients.as_ptr(),
+                backward.l3axw_gradients.as_ptr(),
+                backward.l3axb_gradients.as_ptr(),
             )
         }
     };
@@ -2660,14 +3174,20 @@ pub struct SfnnRangerOptimizerStates {
     pub l1b: RangerParamState,
     pub l1fw: Option<RangerParamState>,
     pub l1fb: Option<RangerParamState>,
+    pub l1axw: Option<RangerParamState>,
+    pub l1axb: Option<RangerParamState>,
     pub l2w: RangerParamState,
     pub l2b: RangerParamState,
     pub l2fw: Option<RangerParamState>,
     pub l2fb: Option<RangerParamState>,
+    pub l2axw: Option<RangerParamState>,
+    pub l2axb: Option<RangerParamState>,
     pub l3w: RangerParamState,
     pub l3b: RangerParamState,
     pub l3fw: Option<RangerParamState>,
     pub l3fb: Option<RangerParamState>,
+    pub l3axw: Option<RangerParamState>,
+    pub l3axb: Option<RangerParamState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2678,14 +3198,20 @@ pub struct SfnnRangerOptimizerHostStates<'a> {
     pub l1b: RangerParamHostState<'a>,
     pub l1fw: Option<RangerParamHostState<'a>>,
     pub l1fb: Option<RangerParamHostState<'a>>,
+    pub l1axw: Option<RangerParamHostState<'a>>,
+    pub l1axb: Option<RangerParamHostState<'a>>,
     pub l2w: RangerParamHostState<'a>,
     pub l2b: RangerParamHostState<'a>,
     pub l2fw: Option<RangerParamHostState<'a>>,
     pub l2fb: Option<RangerParamHostState<'a>>,
+    pub l2axw: Option<RangerParamHostState<'a>>,
+    pub l2axb: Option<RangerParamHostState<'a>>,
     pub l3w: RangerParamHostState<'a>,
     pub l3b: RangerParamHostState<'a>,
     pub l3fw: Option<RangerParamHostState<'a>>,
     pub l3fb: Option<RangerParamHostState<'a>>,
+    pub l3axw: Option<RangerParamHostState<'a>>,
+    pub l3axb: Option<RangerParamHostState<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2696,14 +3222,20 @@ pub struct SfnnRangerOptimizerStatesReadback {
     pub l1b: RangerParamStateReadback,
     pub l1fw: Option<RangerParamStateReadback>,
     pub l1fb: Option<RangerParamStateReadback>,
+    pub l1axw: Option<RangerParamStateReadback>,
+    pub l1axb: Option<RangerParamStateReadback>,
     pub l2w: RangerParamStateReadback,
     pub l2b: RangerParamStateReadback,
     pub l2fw: Option<RangerParamStateReadback>,
     pub l2fb: Option<RangerParamStateReadback>,
+    pub l2axw: Option<RangerParamStateReadback>,
+    pub l2axb: Option<RangerParamStateReadback>,
     pub l3w: RangerParamStateReadback,
     pub l3b: RangerParamStateReadback,
     pub l3fw: Option<RangerParamStateReadback>,
     pub l3fb: Option<RangerParamStateReadback>,
+    pub l3axw: Option<RangerParamStateReadback>,
+    pub l3axb: Option<RangerParamStateReadback>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3397,14 +3929,20 @@ impl SfnnRangerOptimizerStates {
             l1b: RangerParamState::from_host_weights(ctx, weights.l1b)?,
             l1fw: weights.l1fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l1fb: weights.l1fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l1axw: weights.l1axw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l1axb: weights.l1axb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l2w: RangerParamState::from_host_weights(ctx, weights.l2w)?,
             l2b: RangerParamState::from_host_weights(ctx, weights.l2b)?,
             l2fw: weights.l2fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l2fb: weights.l2fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l2axw: weights.l2axw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l2axb: weights.l2axb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l3w: RangerParamState::from_host_weights(ctx, weights.l3w)?,
             l3b: RangerParamState::from_host_weights(ctx, weights.l3b)?,
             l3fw: weights.l3fw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
             l3fb: weights.l3fb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l3axw: weights.l3axw.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
+            l3axb: weights.l3axb.map(|values| RangerParamState::from_host_weights(ctx, values)).transpose()?,
         })
     }
 
@@ -3418,7 +3956,13 @@ impl SfnnRangerOptimizerStates {
         let l1w_len = shape.l1w_len()?;
         let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
         let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
+        let axis_count = shape.factorizer_axis_count();
+        let l1axw_len = checked_product("sfnn l1axw", &[axis_count, shape.ft_size, shape.l1_out()])?;
+        let l1axb_len = checked_product("sfnn l1axb", &[axis_count, shape.l1_out()])?;
         let l2fw_len = checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?;
+        let l2axw_len = checked_product("sfnn l2axw", &[axis_count, shape.l2_size, shape.l2_in()])?;
+        let l2axb_len = checked_product("sfnn l2axb", &[axis_count, shape.l2_size])?;
+        let l3axw_len = checked_product("sfnn l3axw", &[axis_count, shape.l2_size])?;
         let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
             (Some(l1fw), Some(l1fb)) => (
                 {
@@ -3439,6 +3983,27 @@ impl SfnnRangerOptimizerStates {
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1fw requires l1fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1fb requires l1fw")),
         };
+        let (l1axw, l1axb) = match (states.l1axw, states.l1axb) {
+            (Some(l1axw), Some(l1axb)) => {
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message(
+                        "SFNN compact L1 does not support axis-factorized optimizer state",
+                    ));
+                }
+                if axis_count == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                (
+                    Some(RangerParamState::from_host_state(ctx, l1axw_len, l1axw)?),
+                    Some(RangerParamState::from_host_state(ctx, l1axb_len, l1axb)?),
+                )
+            }
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1axw requires l1axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1axb requires l1axw")),
+        };
         let (l2fw, l2fb) = match (states.l2fw, states.l2fb) {
             (Some(l2fw), Some(l2fb)) => (
                 Some(RangerParamState::from_host_state(ctx, l2fw_len, l2fw)?),
@@ -3447,6 +4012,22 @@ impl SfnnRangerOptimizerStates {
             (None, None) => (None, None),
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2fw requires l2fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2fb requires l2fw")),
+        };
+        let (l2axw, l2axb) = match (states.l2axw, states.l2axb) {
+            (Some(l2axw), Some(l2axb)) => {
+                if axis_count == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                (
+                    Some(RangerParamState::from_host_state(ctx, l2axw_len, l2axw)?),
+                    Some(RangerParamState::from_host_state(ctx, l2axb_len, l2axb)?),
+                )
+            }
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2axw requires l2axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2axb requires l2axw")),
         };
         let (l3fw, l3fb) = match (states.l3fw, states.l3fb) {
             (Some(l3fw), Some(l3fb)) => (
@@ -3457,6 +4038,22 @@ impl SfnnRangerOptimizerStates {
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3fw requires l3fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3fb requires l3fw")),
         };
+        let (l3axw, l3axb) = match (states.l3axw, states.l3axb) {
+            (Some(l3axw), Some(l3axb)) => {
+                if axis_count == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                (
+                    Some(RangerParamState::from_host_state(ctx, l3axw_len, l3axw)?),
+                    Some(RangerParamState::from_host_state(ctx, axis_count, l3axb)?),
+                )
+            }
+            (None, None) => (None, None),
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3axw requires l3axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3axb requires l3axw")),
+        };
         Ok(Self {
             l0w: RangerParamState::from_host_state(ctx, l0w_len, states.l0w)?,
             l0b: RangerParamState::from_host_state(ctx, shape.ft_size, states.l0b)?,
@@ -3464,14 +4061,20 @@ impl SfnnRangerOptimizerStates {
             l1b: RangerParamState::from_host_state(ctx, shape.num_stacks * shape.l1_out(), states.l1b)?,
             l1fw,
             l1fb,
+            l1axw,
+            l1axb,
             l2w: RangerParamState::from_host_state(ctx, l2w_len, states.l2w)?,
             l2b: RangerParamState::from_host_state(ctx, shape.num_stacks * shape.l2_size, states.l2b)?,
             l2fw,
             l2fb,
+            l2axw,
+            l2axb,
             l3w: RangerParamState::from_host_state(ctx, l3w_len, states.l3w)?,
             l3b: RangerParamState::from_host_state(ctx, shape.num_stacks, states.l3b)?,
             l3fw,
             l3fb,
+            l3axw,
+            l3axb,
         })
     }
 
@@ -3483,14 +4086,20 @@ impl SfnnRangerOptimizerStates {
             l1b: self.l1b.download(ctx)?,
             l1fw: self.l1fw.as_ref().map(|state| state.download(ctx)).transpose()?,
             l1fb: self.l1fb.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l1axw: self.l1axw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l1axb: self.l1axb.as_ref().map(|state| state.download(ctx)).transpose()?,
             l2w: self.l2w.download(ctx)?,
             l2b: self.l2b.download(ctx)?,
             l2fw: self.l2fw.as_ref().map(|state| state.download(ctx)).transpose()?,
             l2fb: self.l2fb.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l2axw: self.l2axw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l2axb: self.l2axb.as_ref().map(|state| state.download(ctx)).transpose()?,
             l3w: self.l3w.download(ctx)?,
             l3b: self.l3b.download(ctx)?,
             l3fw: self.l3fw.as_ref().map(|state| state.download(ctx)).transpose()?,
             l3fb: self.l3fb.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l3axw: self.l3axw.as_ref().map(|state| state.download(ctx)).transpose()?,
+            l3axb: self.l3axb.as_ref().map(|state| state.download(ctx)).transpose()?,
         })
     }
 
@@ -3511,6 +4120,29 @@ impl SfnnRangerOptimizerStates {
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1fw requires l1fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1fb requires l1fw")),
         }
+        match (&self.l1axw, &self.l1axb) {
+            (Some(l1axw), Some(l1axb)) => {
+                if shape.has_compact_l1() {
+                    return Err(CudaCppError::message(
+                        "SFNN compact L1 does not support axis-factorized optimizer state",
+                    ));
+                }
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                l1axw.validate(
+                    checked_product("sfnn l1axw", &[axes, shape.ft_size, shape.l1_out()])?,
+                    "optimizer sfnn l1axw",
+                )?;
+                l1axb.validate(checked_product("sfnn l1axb", &[axes, shape.l1_out()])?, "optimizer sfnn l1axb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l1axw requires l1axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l1axb requires l1axw")),
+        }
         self.l2w.validate(
             checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?,
             "optimizer sfnn l2w",
@@ -3525,6 +4157,24 @@ impl SfnnRangerOptimizerStates {
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2fw requires l2fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2fb requires l2fw")),
         }
+        match (&self.l2axw, &self.l2axb) {
+            (Some(l2axw), Some(l2axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                l2axw.validate(
+                    checked_product("sfnn l2axw", &[axes, shape.l2_size, shape.l2_in()])?,
+                    "optimizer sfnn l2axw",
+                )?;
+                l2axb.validate(checked_product("sfnn l2axb", &[axes, shape.l2_size])?, "optimizer sfnn l2axb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l2axw requires l2axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l2axb requires l2axw")),
+        }
         self.l3w.validate(checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?, "optimizer sfnn l3w")?;
         self.l3b.validate(shape.num_stacks, "optimizer sfnn l3b")?;
         match (&self.l3fw, &self.l3fb) {
@@ -3535,6 +4185,21 @@ impl SfnnRangerOptimizerStates {
             (None, None) => {}
             (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3fw requires l3fb")),
             (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3fb requires l3fw")),
+        }
+        match (&self.l3axw, &self.l3axb) {
+            (Some(l3axw), Some(l3axb)) => {
+                let axes = shape.factorizer_axis_count();
+                if axes == 0 {
+                    return Err(CudaCppError::message(
+                        "SFNN axis-factorized optimizer state requires at least one axis",
+                    ));
+                }
+                l3axw.validate(checked_product("sfnn l3axw", &[axes, shape.l2_size])?, "optimizer sfnn l3axw")?;
+                l3axb.validate(axes, "optimizer sfnn l3axb")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => return Err(CudaCppError::message("SFNN optimizer l3axw requires l3axb")),
+            (None, Some(_)) => return Err(CudaCppError::message("SFNN optimizer l3axb requires l3axw")),
         }
         Ok(())
     }
@@ -4148,14 +4813,20 @@ pub struct SfnnTrainWeightsReadback {
     pub l1b: Vec<f32>,
     pub l1fw: Option<Vec<f32>>,
     pub l1fb: Option<Vec<f32>>,
+    pub l1axw: Option<Vec<f32>>,
+    pub l1axb: Option<Vec<f32>>,
     pub l2w: Vec<f32>,
     pub l2b: Vec<f32>,
     pub l2fw: Option<Vec<f32>>,
     pub l2fb: Option<Vec<f32>>,
+    pub l2axw: Option<Vec<f32>>,
+    pub l2axb: Option<Vec<f32>>,
     pub l3w: Vec<f32>,
     pub l3b: Vec<f32>,
     pub l3fw: Option<Vec<f32>>,
     pub l3fb: Option<Vec<f32>>,
+    pub l3axw: Option<Vec<f32>>,
+    pub l3axb: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -4247,6 +4918,7 @@ pub struct SfnnTrainStepRunner {
     pub entry_weights: F32Buffer,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
+    pub factorizer: SfnnFactorizerActive,
     pub forward_workspace: SfnnForwardWorkspace,
     pub loss_workspace: ScalarLossWorkspace,
     pub backward_workspace: SfnnBackwardWorkspace,
@@ -4261,8 +4933,19 @@ impl SfnnTrainStepRunner {
         batch_size: usize,
         max_active: usize,
     ) -> Result<Self> {
+        let factorizer = SfnnFactorizerActive::from_host(initial_weights);
+        Self::new_with_factorizer(ctx, initial_weights, batch_size, max_active, factorizer)
+    }
+
+    pub fn new_with_factorizer(
+        ctx: &Context,
+        initial_weights: SfnnForwardHostWeights<'_>,
+        batch_size: usize,
+        max_active: usize,
+        factorizer: SfnnFactorizerActive,
+    ) -> Result<Self> {
         let optimizer_states = SfnnRangerOptimizerStates::from_host_weights(ctx, initial_weights)?;
-        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active, factorizer)
     }
 
     pub fn with_optimizer_states(
@@ -4272,9 +4955,28 @@ impl SfnnTrainStepRunner {
         batch_size: usize,
         max_active: usize,
     ) -> Result<Self> {
+        let factorizer = SfnnFactorizerActive::from_host(initial_weights);
+        Self::with_optimizer_states_and_factorizer(
+            ctx,
+            initial_weights,
+            optimizer_states,
+            batch_size,
+            max_active,
+            factorizer,
+        )
+    }
+
+    pub fn with_optimizer_states_and_factorizer(
+        ctx: &Context,
+        initial_weights: SfnnForwardHostWeights<'_>,
+        optimizer_states: SfnnRangerOptimizerHostStates<'_>,
+        batch_size: usize,
+        max_active: usize,
+        factorizer: SfnnFactorizerActive,
+    ) -> Result<Self> {
         let optimizer_states =
             SfnnRangerOptimizerStates::from_host_states(ctx, initial_weights.shape, optimizer_states)?;
-        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active)
+        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active, factorizer)
     }
 
     fn with_device_optimizer_states(
@@ -4283,8 +4985,10 @@ impl SfnnTrainStepRunner {
         optimizer_states: SfnnRangerOptimizerStates,
         batch_size: usize,
         max_active: usize,
+        factorizer: SfnnFactorizerActive,
     ) -> Result<Self> {
         initial_weights.validate()?;
+        factorizer.validate_for_shape(initial_weights.shape)?;
         if batch_size == 0 {
             return Err(CudaCppError::message("SFNN train-step batch_size must be greater than zero"));
         }
@@ -4300,6 +5004,7 @@ impl SfnnTrainStepRunner {
         for _ in 0..2 {
             upload_slots.push(SfnnTrainStepUploadSlot::new(ctx, batch_size, max_active)?);
         }
+        let weights = SfnnForwardDeviceWeights::from_host(ctx, initial_weights)?;
         let backward_workspace =
             SfnnBackwardWorkspace::new(ctx, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
         backward_workspace.zero_parameter_gradients(ctx)?;
@@ -4316,8 +5021,9 @@ impl SfnnTrainStepRunner {
             },
             targets: F32Buffer::new(ctx, batch_size)?,
             entry_weights: F32Buffer::new(ctx, batch_size)?,
-            weights: SfnnForwardDeviceWeights::from_host(ctx, initial_weights)?,
+            weights,
             optimizer_states,
+            factorizer,
             forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
             loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
             backward_workspace,
@@ -4373,7 +5079,13 @@ impl SfnnTrainStepRunner {
         self.targets.upload(ctx, batch.targets)?;
         self.entry_weights.upload(ctx, batch.entry_weights)?;
 
-        sfnn_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        sfnn_forward_device_with_factorizer(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            self.factorizer,
+        )?;
         scalar_loss_device_from_buffers_with_finalize(
             ctx,
             loss_kind,
@@ -4385,13 +5097,14 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
             finalize_loss,
         )?;
-        sfnn_backward_train_device(
+        sfnn_backward_train_device_with_factorizer(
             ctx,
             &self.device_batch,
             &self.weights,
             &self.forward_workspace,
             &self.loss_workspace,
             &self.backward_workspace,
+            self.factorizer,
         )?;
         self.update_weights(ctx, params)
     }
@@ -4447,7 +5160,13 @@ impl SfnnTrainStepRunner {
         {
             let slot = &self.upload_slots[slot_idx];
             slot.wait_upload_on(ctx)?;
-            sfnn_forward_device(ctx, &slot.device_batch, &self.weights, &self.forward_workspace)?;
+            sfnn_forward_device_with_factorizer(
+                ctx,
+                &slot.device_batch,
+                &self.weights,
+                &self.forward_workspace,
+                self.factorizer,
+            )?;
             scalar_loss_device_from_buffers_with_finalize(
                 ctx,
                 loss_kind,
@@ -4459,13 +5178,14 @@ impl SfnnTrainStepRunner {
                 &self.loss_workspace,
                 finalize_loss,
             )?;
-            sfnn_backward_train_device(
+            sfnn_backward_train_device_with_factorizer(
                 ctx,
                 &slot.device_batch,
                 &self.weights,
                 &self.forward_workspace,
                 &self.loss_workspace,
                 &self.backward_workspace,
+                self.factorizer,
             )?;
         }
         self.update_weights(ctx, params)?;
@@ -4504,7 +5224,13 @@ impl SfnnTrainStepRunner {
         self.entry_weights.upload(ctx, batch.entry_weights)?;
         after_upload.record(ctx)?;
 
-        sfnn_forward_device(ctx, &self.device_batch, &self.weights, &self.forward_workspace)?;
+        sfnn_forward_device_with_factorizer(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            self.factorizer,
+        )?;
         after_forward.record(ctx)?;
         scalar_loss_device_from_buffers(
             ctx,
@@ -4517,13 +5243,14 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
-        let backward_stages = sfnn_backward_train_profile_device(
+        let backward_stages = sfnn_backward_train_profile_device_with_factorizer(
             ctx,
             &self.device_batch,
             &self.weights,
             &self.forward_workspace,
             &self.loss_workspace,
             &self.backward_workspace,
+            self.factorizer,
         )?;
         after_backward.record(ctx)?;
         self.update_weights(ctx, params)?;
@@ -4553,14 +5280,20 @@ impl SfnnTrainStepRunner {
             l1b: self.weights.l1b.download(ctx)?,
             l1fw: self.weights.l1fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l1fb: self.weights.l1fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l1axw: self.weights.l1axw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l1axb: self.weights.l1axb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l2w: self.weights.l2w.download(ctx)?,
             l2b: self.weights.l2b.download(ctx)?,
             l2fw: self.weights.l2fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l2fb: self.weights.l2fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l2axw: self.weights.l2axw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l2axb: self.weights.l2axb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l3w: self.weights.l3w.download(ctx)?,
             l3b: self.weights.l3b.download(ctx)?,
             l3fw: self.weights.l3fw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
             l3fb: self.weights.l3fb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l3axw: self.weights.l3axw.as_ref().map(|weights| weights.download(ctx)).transpose()?,
+            l3axb: self.weights.l3axb.as_ref().map(|weights| weights.download(ctx)).transpose()?,
         })
     }
 
@@ -4602,6 +5335,13 @@ impl SfnnTrainStepRunner {
                 self.optimizer_states.l1fb.is_some(),
             ),
             (
+                "l1axw/l1axb",
+                self.weights.l1axw.is_some(),
+                self.weights.l1axb.is_some(),
+                self.optimizer_states.l1axw.is_some(),
+                self.optimizer_states.l1axb.is_some(),
+            ),
+            (
                 "l2fw/l2fb",
                 self.weights.l2fw.is_some(),
                 self.weights.l2fb.is_some(),
@@ -4609,11 +5349,25 @@ impl SfnnTrainStepRunner {
                 self.optimizer_states.l2fb.is_some(),
             ),
             (
+                "l2axw/l2axb",
+                self.weights.l2axw.is_some(),
+                self.weights.l2axb.is_some(),
+                self.optimizer_states.l2axw.is_some(),
+                self.optimizer_states.l2axb.is_some(),
+            ),
+            (
                 "l3fw/l3fb",
                 self.weights.l3fw.is_some(),
                 self.weights.l3fb.is_some(),
                 self.optimizer_states.l3fw.is_some(),
                 self.optimizer_states.l3fb.is_some(),
+            ),
+            (
+                "l3axw/l3axb",
+                self.weights.l3axw.is_some(),
+                self.weights.l3axb.is_some(),
+                self.optimizer_states.l3axw.is_some(),
+                self.optimizer_states.l3axb.is_some(),
             ),
         ] {
             match (weight_w, weight_b, state_w, state_b) {
@@ -4656,12 +5410,22 @@ impl SfnnTrainStepRunner {
             &self.optimizer_states.l1b,
         )?;
         match (&self.weights.l1fw, &self.weights.l1fb, &self.optimizer_states.l1fw, &self.optimizer_states.l1fb) {
-            (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) => {
+            (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
                 update_param_group(ctx, params, &self.backward_workspace.l1fw_gradients, l1fw, l1fw_state)?;
                 update_param_group(ctx, params, &self.backward_workspace.l1fb_gradients, l1fb, l1fb_state)?;
             }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l1fw/l1fb optional groups mismatch")),
+        }
+        match (&self.weights.l1axw, &self.weights.l1axb, &self.optimizer_states.l1axw, &self.optimizer_states.l1axb) {
+            (Some(l1axw), Some(l1axb), Some(l1axw_state), Some(l1axb_state)) if self.factorizer.any_axis() => {
+                update_param_group(ctx, params, &self.backward_workspace.l1axw_gradients, l1axw, l1axw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l1axb_gradients, l1axb, l1axb_state)?;
+            }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l1axw/l1axb optional groups mismatch")),
         }
         update_param_group(
             ctx,
@@ -4678,12 +5442,22 @@ impl SfnnTrainStepRunner {
             &self.optimizer_states.l2b,
         )?;
         match (&self.weights.l2fw, &self.weights.l2fb, &self.optimizer_states.l2fw, &self.optimizer_states.l2fb) {
-            (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) => {
+            (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) if self.factorizer.shared => {
                 update_param_group(ctx, params, &self.backward_workspace.l2fw_gradients, l2fw, l2fw_state)?;
                 update_param_group(ctx, params, &self.backward_workspace.l2fb_gradients, l2fb, l2fb_state)?;
             }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l2fw/l2fb optional groups mismatch")),
+        }
+        match (&self.weights.l2axw, &self.weights.l2axb, &self.optimizer_states.l2axw, &self.optimizer_states.l2axb) {
+            (Some(l2axw), Some(l2axb), Some(l2axw_state), Some(l2axb_state)) if self.factorizer.any_axis() => {
+                update_param_group(ctx, params, &self.backward_workspace.l2axw_gradients, l2axw, l2axw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l2axb_gradients, l2axb, l2axb_state)?;
+            }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l2axw/l2axb optional groups mismatch")),
         }
         update_param_group(
             ctx,
@@ -4700,12 +5474,22 @@ impl SfnnTrainStepRunner {
             &self.optimizer_states.l3b,
         )?;
         match (&self.weights.l3fw, &self.weights.l3fb, &self.optimizer_states.l3fw, &self.optimizer_states.l3fb) {
-            (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) => {
+            (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) if self.factorizer.shared => {
                 update_param_group(ctx, params, &self.backward_workspace.l3fw_gradients, l3fw, l3fw_state)?;
                 update_param_group(ctx, params, &self.backward_workspace.l3fb_gradients, l3fb, l3fb_state)?;
             }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l3fw/l3fb optional groups mismatch")),
+        }
+        match (&self.weights.l3axw, &self.weights.l3axb, &self.optimizer_states.l3axw, &self.optimizer_states.l3axb) {
+            (Some(l3axw), Some(l3axb), Some(l3axw_state), Some(l3axb_state)) if self.factorizer.any_axis() => {
+                update_param_group(ctx, params, &self.backward_workspace.l3axw_gradients, l3axw, l3axw_state)?;
+                update_param_group(ctx, params, &self.backward_workspace.l3axb_gradients, l3axb, l3axb_state)?;
+            }
+            (Some(_), Some(_), Some(_), Some(_)) => {}
+            (None, None, None, None) => {}
+            _ => return Err(CudaCppError::message("SFNN weight/state l3axw/l3axb optional groups mismatch")),
         }
         Ok(())
     }
@@ -4741,6 +5525,11 @@ fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
 
 fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
     let has_common_shard_marker = shape.l1_common_size != 0 || shape.l1_shard_size != 0;
+    let expected_axis_stacks =
+        shape
+            .factorizer_king_bucket_count()
+            .checked_mul(shape.factorizer_hand_bucket_count())
+            .ok_or_else(|| CudaCppError::message(format!("SFNN factorizer bucket count overflow: {shape:?}")))?;
     if shape.input_size == 0
         || shape.ft_size == 0
         || shape.l1_hidden == 0
@@ -4763,6 +5552,13 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         && (shape.ft_size % shape.l1_group_count != 0 || shape.l1_out() % shape.l1_group_count != 0)
     {
         Err(CudaCppError::message(format!("SFNN grouped-L1 shape dimensions are invalid: {shape:?}")))
+    } else if (shape.factorizer_king_axis_dim != 0 || shape.factorizer_hand_axis_dim != 0)
+        && expected_axis_stacks != shape.num_stacks
+    {
+        Err(CudaCppError::message(format!(
+            "SFNN factorizer axis dimensions do not match num_stacks: expected {expected_axis_stacks}, got {} ({shape:?})",
+            shape.num_stacks
+        )))
     } else {
         Ok(())
     }
@@ -5348,6 +6144,8 @@ mod ffi {
             l1_group_count: usize,
             l1_common_size: usize,
             l1_shard_size: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5360,16 +6158,27 @@ mod ffi {
             l1fw: *mut BulletOuCudaCppF32Buffer,
             l1fb: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
+            l1axw: *mut BulletOuCudaCppF32Buffer,
+            l1axb: *mut BulletOuCudaCppF32Buffer,
+            has_l1ax: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
             l2b: *mut BulletOuCudaCppF32Buffer,
             l2fw: *mut BulletOuCudaCppF32Buffer,
             l2fb: *mut BulletOuCudaCppF32Buffer,
             has_l2f: i32,
+            l2axw: *mut BulletOuCudaCppF32Buffer,
+            l2axb: *mut BulletOuCudaCppF32Buffer,
+            has_l2ax: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
             l3b: *mut BulletOuCudaCppF32Buffer,
             l3fw: *mut BulletOuCudaCppF32Buffer,
             l3fb: *mut BulletOuCudaCppF32Buffer,
             has_l3f: i32,
+            l3axw: *mut BulletOuCudaCppF32Buffer,
+            l3axb: *mut BulletOuCudaCppF32Buffer,
+            has_l3ax: i32,
+            use_king_axis: i32,
+            use_hand_axis: i32,
             stm_l0: *mut BulletOuCudaCppF32Buffer,
             nstm_l0: *mut BulletOuCudaCppF32Buffer,
             combined: *mut BulletOuCudaCppF32Buffer,
@@ -5388,6 +6197,8 @@ mod ffi {
             l1_group_count: usize,
             l1_common_size: usize,
             l1_shard_size: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5402,12 +6213,20 @@ mod ffi {
             l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
+            l1axw: *mut BulletOuCudaCppF32Buffer,
+            has_l1ax: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
             l2fw: *mut BulletOuCudaCppF32Buffer,
             has_l2f: i32,
+            l2axw: *mut BulletOuCudaCppF32Buffer,
+            has_l2ax: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
             l3fw: *mut BulletOuCudaCppF32Buffer,
             has_l3f: i32,
+            l3axw: *mut BulletOuCudaCppF32Buffer,
+            has_l3ax: i32,
+            use_king_axis: i32,
+            use_hand_axis: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5423,14 +6242,20 @@ mod ffi {
             l1b_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axb_gradients: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_train_device(
             ctx: *mut BulletOuCudaCppContext,
@@ -5442,6 +6267,8 @@ mod ffi {
             l1_group_count: usize,
             l1_common_size: usize,
             l1_shard_size: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5456,12 +6283,20 @@ mod ffi {
             l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
+            l1axw: *mut BulletOuCudaCppF32Buffer,
+            has_l1ax: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
             l2fw: *mut BulletOuCudaCppF32Buffer,
             has_l2f: i32,
+            l2axw: *mut BulletOuCudaCppF32Buffer,
+            has_l2ax: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
             l3fw: *mut BulletOuCudaCppF32Buffer,
             has_l3f: i32,
+            l3axw: *mut BulletOuCudaCppF32Buffer,
+            has_l3ax: i32,
+            use_king_axis: i32,
+            use_hand_axis: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5477,14 +6312,20 @@ mod ffi {
             l1b_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_train_profile_device(
@@ -5497,6 +6338,8 @@ mod ffi {
             l1_group_count: usize,
             l1_common_size: usize,
             l1_shard_size: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -5511,12 +6354,20 @@ mod ffi {
             l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
+            l1axw: *mut BulletOuCudaCppF32Buffer,
+            has_l1ax: i32,
             l2w: *mut BulletOuCudaCppF32Buffer,
             l2fw: *mut BulletOuCudaCppF32Buffer,
             has_l2f: i32,
+            l2axw: *mut BulletOuCudaCppF32Buffer,
+            has_l2ax: i32,
             l3w: *mut BulletOuCudaCppF32Buffer,
             l3fw: *mut BulletOuCudaCppF32Buffer,
             has_l3f: i32,
+            l3axw: *mut BulletOuCudaCppF32Buffer,
+            has_l3ax: i32,
+            use_king_axis: i32,
+            use_hand_axis: i32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -5532,14 +6383,20 @@ mod ffi {
             l1b_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l1fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l1axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l2w_gradients: *mut BulletOuCudaCppF32Buffer,
             l2b_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l2fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l2axb_gradients: *mut BulletOuCudaCppF32Buffer,
             l3w_gradients: *mut BulletOuCudaCppF32Buffer,
             l3b_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fw_gradients: *mut BulletOuCudaCppF32Buffer,
             l3fb_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axw_gradients: *mut BulletOuCudaCppF32Buffer,
+            l3axb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
             profile_ms: *mut f32,
             profile_ms_len: usize,
@@ -5655,6 +6512,8 @@ mod tests {
             l1_group_count: 1,
             l1_common_size: 0,
             l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -5679,6 +6538,8 @@ mod tests {
             l1_group_count: 1,
             l1_common_size: 0,
             l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
@@ -5714,6 +6575,8 @@ mod tests {
             l1_group_count: 16,
             l1_common_size: 0,
             l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -5737,6 +6600,8 @@ mod tests {
             l1_group_count: 8,
             l1_common_size: 1024,
             l1_shard_size: 256,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -5757,6 +6622,8 @@ mod tests {
             l1_group_count: 8,
             l1_common_size: 0,
             l1_shard_size: 1024,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         };
         let c0_layout = SfnnBackwardWorkspaceLayout::new(c0_shape, 5, 40);
 
@@ -6206,6 +7073,8 @@ mod tests {
             l1_group_count: 1,
             l1_common_size: 0,
             l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
         }
     }
 
@@ -6236,6 +7105,8 @@ mod tests {
                 0.02, -0.04, 0.01, // input 3
             ]),
             l1fb: Some(&[0.005, -0.006, 0.007]),
+            l1axw: None,
+            l1axb: None,
             l2w: &[
                 0.3, -0.1, 0.2, 0.4, // stack 0, row 0
                 -0.2, 0.5, 0.1, -0.3, // stack 0, row 1
@@ -6248,10 +7119,14 @@ mod tests {
                 -0.03, 0.02, -0.01, 0.04, // shared row 1
             ]),
             l2fb: Some(&[0.006, -0.008]),
+            l2axw: None,
+            l2axb: None,
             l3w: &[0.6, -0.4, 0.5, 0.2],
             l3b: &[0.05, -0.02],
             l3fw: Some(&[0.03, -0.02]),
             l3fb: Some(&[0.004]),
+            l3axw: None,
+            l3axb: None,
         }
     }
 
