@@ -33,7 +33,9 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 ## 7.2 学習ログ (`learn.log`) の読み方
 
-学習中・終了後の loss 推移は `<output>/summary-learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。列数は違い、`summary-learn.log` は superbatch 境界だけ、各 `0NNN/learn.log` は per-batch snapshot。
+学習中・終了後の loss 推移は `<output>/summary-learn.log` (累積) と各 `<output>/0NNN/learn.log` (各 save 時点の snapshot) に記録される。粒度は違い、`summary-learn.log` は検証または保存された superbatch ごとに 1 行、各 `0NNN/learn.log` は保存 checkpoint 用の per-batch snapshot。
+
+`--validation-rate` は held-out accuracy/loss を何 superbatch ごとに計算するかを制御する。デフォルトは `--save-rate` と同じだが、たとえば `--validation-rate 1 --save-rate 20` のように指定すると、checkpoint 保存は 20 sb ごとのまま、検証だけを毎 sb 実行できる。検証だけの summary 行には対応する番号付き checkpoint ディレクトリがない。学習を中断して resume した場合、最新の完全な checkpoint より後の行は、その時点の model state を復元できないため切り詰められる。
 
 ### どっちを見るか
 
