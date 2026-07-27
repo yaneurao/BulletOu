@@ -2,86 +2,90 @@
 
 <a href="../../ja/tutorial/9-layerstack.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-A standard NNUE uses a single MLP to evaluate any position. **LayerStack-family** evaluation functions instead keep **several sub-networks** and pick one per position:
+A standard NNUE uses one MLP for every position. SFNN LayerStack models keep multiple small MLP stacks and select one stack from the position.
 
-- The right "shape" of evaluation can differ between opening / middlegame / endgame, or between different king-position relationships.
-- So the model keeps several independent small sub-networks, and at inference time picks just one based on the position.
-- The **bucket selection logic** has to agree between the engine and bulletou, and is encoded in the `--arch` suffix.
+The important rule is simple: BulletOu and YaneuraOu must compute exactly the same LayerStack index.
 
-In bulletou, LayerStack is used by the **SFNN family**. The suffix at the end of `--arch` selects the same bucket algorithm that the matching YaneuraOu build uses.
+## 9.1 LayerStack axes
 
-## 9.1 Choosing the LayerStack Suffix
+YaneuraOu now treats LayerStack selection as three independent axes:
 
-| `--arch` suffix | Buckets | YaneuraOu-loadable | Description |
-|---|---|---|---|
-| **`hand256`** | 256 | yes | Side-to-move / non-side 4-bit hand-presence buckets. |
-| **`hand256_k3k3`** | 2304 | yes | `hand256` bucket × `k3k3` bucket. Very large. |
-| **`hand256_k9k9`** | 20736 | yes | `hand256` bucket × `k9k9` bucket. Huge. |
-| **`hand256_k21k21`** | 112896 | yes | `hand256` bucket × `k21k21` bucket. Extreme. |
-| **`hand256_k29k29`** | 215296 | yes | `hand256` bucket × `k29k29` bucket. Extreme. |
-| **`hand1024`** | 1024 | yes | Side-to-move / non-side 5-bit hand-presence buckets. |
-| **`hand1024_k3k3`** | 9216 | yes | `hand1024` bucket × `k3k3` bucket. Huge. |
-| **`hand1024_k9k9`** | 82944 | yes | `hand1024` bucket × `k9k9` bucket. Extreme; expect very large VRAM and checkpoint sizes. |
-| **`hand1024_k21k21`** | 451584 | yes | `hand1024` bucket × `k21k21` bucket. Extremely large; use only with tiny dimensions and enough data. |
-| **`hand1024_k29k29`** | 861184 | yes | `hand1024` bucket × `k29k29` bucket. Extremely large; use only with tiny dimensions and enough data. |
-| **`hand64`** | 64 | yes | Side-to-move hand-score bucket (8 levels) × non-side hand-score bucket (8 levels). |
-| **`hand64_k3k3`** | 576 | yes | `hand64` bucket × `k3k3` bucket. This is much larger on GPU/disk because every stack has its own MLP weights. |
-| **`hand64_k9k9`** | 5184 | yes | `hand64` bucket × `k9k9` bucket. This is very large; use small FT/H1 sizes when experimenting. |
-| **`hand64_k21k21`** | 28224 | yes | `hand64` bucket × `k21k21` bucket. Huge. |
-| **`hand64_k29k29`** | 53824 | yes | `hand64` bucket × `k29k29` bucket. Huge. |
-| **`k3k3(king3-by-king3)`** (default) | 9 | yes | Friend king's rank in 3 groups (1-3 / 4-6 / 7-9) × enemy king's rank in 3 groups = 9 combos. Matches YaneuraOu's `stack_index_for_nnue` exactly. |
-| **`k9k9(king9-by-king9)`** | 81 | yes | Exact friend king rank × exact enemy king rank = 81 combos. |
-| **`k21k21(king21-by-king21)`** | 441 | yes | 21-way friend king square bucket × 21-way enemy king square bucket. |
-| **`k29k29(king29-by-king29)`** | 841 | yes | 29-way friend king square bucket × 29-way enemy king square bucket. |
+| Axis | Accepted tokens | Bucket count |
+|---|---|---:|
+| hand | omitted, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
+| king | omitted, `k3k3`, `k9k9`, `k21k21`, `k29k29` | 1 / 9 / 81 / 441 / 841 |
+| progress | omitted, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
-`king9_by_king9`, `king21_by_king21`, `king29_by_king29`, `hand64_king3_by_king3`, `hand64_king9_by_king9`, `hand64_king21_by_king21`, `hand64_king29_by_king29`, `hand256_king3_by_king3`, `hand256_king9_by_king9`, `hand256_king21_by_king21`, `hand256_king29_by_king29`, `hand1024_king3_by_king3`, `hand1024_king9_by_king9`, `hand1024_king21_by_king21`, and `hand1024_king29_by_king29` are accepted as aliases for the corresponding short suffixes.
-
-### The k3k3(king3-by-king3) bucket table
-
-After perspective flipping, both kings' ranks are coarsened into three groups, then combined:
-
-|  | enemy king rank 1-3 | enemy king rank 4-6 | enemy king rank 7-9 |
-|---|---|---|---|
-| **friend king rank 1-3** | bucket 0 | bucket 1 | bucket 2 |
-| **friend king rank 4-6** | bucket 3 | bucket 4 | bucket 5 |
-| **friend king rank 7-9** | bucket 6 | bucket 7 | bucket 8 |
-
-Each bucket owns its own set of `fc_0 + fc_1 + fc_2` weights; during training, the weights of bucket *k* are only updated by positions classified into bucket *k*.
-
-### The k29k29(king29-by-king29) bucket table
-
-After perspective flipping, each king square is mapped to a 29-way bucket:
+The final stack count is:
 
 ```text
-ranks 1-3: bucket 0
-ranks 4-6: bucket 1
-ranks 7-9: buckets 2..28, preserving the 3 ranks × 9 files exactly
+LayerStacks = hand_bucket_count * king_bucket_count * progress_bucket_count
 ```
 
-The exact formula is:
+The runtime index is composed in the same order as YaneuraOu:
 
 ```text
-if rank < 3: single = 0
-else if rank < 6: single = 1
-else: single = 2 + (rank - 6) * 9 + file
-
-bucket = friend_single * 29 + enemy_single
+idx = hand_bucket
+idx = idx * king_bucket_count + king_bucket
+idx = idx * progress_bucket_count + progress_bucket
 ```
 
-This keeps king positions in the home camp fine-grained while coarsening the far/central ranks.
-
-### The k21k21(king21-by-king21) bucket table
-
-After perspective flipping, each king square is mapped to a 21-way bucket:
+The architecture parser accepts tokens in any order, but BulletOu canonicalizes names as `hand`, then `king`, then `progress`. For example:
 
 ```text
-ranks 1-3: bucket 0
-ranks 4-6: bucket 1
-rank 7: bucket 2
-ranks 8-9: buckets 3..20, preserving the 2 ranks × 9 files exactly
+SFNN_halfka2_1024_7_64_k3k3_hand256_progress16
 ```
 
-The exact formula is:
+is accepted and displayed/saved as:
+
+```text
+SFNN_halfka2_1024_7_64_hand256_k3k3_progress16
+```
+
+## 9.2 Examples
+
+| `--arch` | LayerStacks | Meaning |
+|---|---:|---|
+| `SFNN_halfka2_1024_7_64` | 1 | single stack |
+| `SFNN_halfka2_1024_7_64_k3k3` | 9 | king 3x3 |
+| `SFNN_halfka2_1024_7_64_k29k29` | 841 | king 29x29 |
+| `SFNN_halfka2_1024_7_64_hand256` | 256 | hand256 only |
+| `SFNN_halfka2_1024_7_64_hand256_k3k3` | 2304 | hand256 x k3k3 |
+| `SFNN_halfka2_1024_7_64_progress8` | 8 | progress8 only |
+| `SFNN_halfka2_1024_7_64_k3k3_progress8` | 72 | k3k3 x progress8 |
+| `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` | 36864 | hand256 x k3k3 x progress16 |
+
+Grouped SFNN notation can be combined with the same suffixes:
+
+```text
+SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
+```
+
+## 9.3 King buckets
+
+Long aliases such as `king3_by_king3`, `king9_by_king9`, `king21_by_king21`, and `king29_by_king29` are also accepted.
+
+### `k3k3`
+
+After perspective normalization, both kings' ranks are grouped into three bands:
+
+|  | enemy rank 1-3 | enemy rank 4-6 | enemy rank 7-9 |
+|---|---:|---:|---:|
+| friend rank 1-3 | 0 | 1 | 2 |
+| friend rank 4-6 | 3 | 4 | 5 |
+| friend rank 7-9 | 6 | 7 | 8 |
+
+### `k9k9`
+
+Uses exact friend/enemy king ranks:
+
+```text
+bucket = friend_rank * 9 + enemy_rank
+```
+
+### `k21k21`
+
+Each king square is mapped to 21 buckets:
 
 ```text
 if rank < 3: single = 0
@@ -92,50 +96,128 @@ else: single = 3 + (rank - 7) * 9 + file
 bucket = friend_single * 21 + enemy_single
 ```
 
-This is a smaller alternative to `k29k29`: it keeps the deepest home ranks
-fine-grained while using fewer LayerStacks.
+### `k29k29`
 
-## 9.2 When it kicks in
+Each king square is mapped to 29 buckets:
 
-LayerStack is **only meaningful for the SFNN family**. The other target families (`NNUE_halfkp_*` / `NNUE_kp_*` / `NNUE_halfkpe9_*` / `NNUE_halfkpvm_*` / `KPPT` family) use a single MLP.
+```text
+if rank < 3: single = 0
+else if rank < 6: single = 1
+else: single = 2 + (rank - 6) * 9 + file
+
+bucket = friend_single * 29 + enemy_single
+```
+
+## 9.4 Hand buckets
+
+### `hand64`
+
+Each side's hand is converted to a score, then bucketed:
+
+```text
+bucket_one_side = min((score + 3) / 4, 7)
+bucket = side_to_move_bucket * 8 + non_side_bucket
+```
+
+Scores:
+
+- pawn: 1
+- lance/knight: 2
+- silver/gold: 3
+- bishop/rook: 5
+
+### `hand256`
+
+Each side uses four presence bits:
+
+- bit0: has pawn/lance/knight
+- bit1: has silver/gold
+- bit2: has bishop
+- bit3: has rook
+
+The final bucket is:
+
+```text
+bucket = side_to_move_bucket * 16 + non_side_bucket
+```
+
+### `hand1024`
+
+Each side uses five presence bits:
+
+- bit0: has pawn
+- bit1: has lance/knight
+- bit2: has silver/gold
+- bit3: has bishop
+- bit4: has rook
+
+The final bucket is:
+
+```text
+bucket = side_to_move_bucket * 32 + non_side_bucket
+```
+
+## 9.5 Progress buckets
+
+`progressN` uses YaneuraOu's SFNN progress parameters to compute a scalar progress value in `0..255`, then maps it to the requested bucket count:
+
+```text
+progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
+                      progress_bucket_count - 1)
+```
+
+When `progressN` is used, the exported `nn.bin` layout is:
+
+```text
+NNUE header
+FeatureTransformer section
+Progress section
+LayerStack network section 0
+LayerStack network section 1
+...
+```
+
+The Progress section is YaneuraOu-compatible:
+
+```text
+section_hash = 0x6f50524f  # "oPRO"
+int32 bias_q16
+int32 weights_q16[81][1548]
+```
+
+Use `--sfnn-progress-params <file>` only when you already have this q16 Progress::Parameters payload. The file may be either:
+
+- `bias_q16 + weights_q16[81][1548]`
+- `0x6f50524f + bias_q16 + weights_q16[81][1548]`
+
+This is not the older experimental f64 `progress8kpabs` / `progress.bin` format. If `--sfnn-progress-params` is omitted for a `progressN` architecture, BulletOu writes zero progress parameters, matching YaneuraOu's dummy zero behavior; all positions then map to the neutral progress bucket.
+
+Currently, `--sfnn-factorizer shared` works with `progressN`. `king=axis` / `hand=axis` factorizer terms are rejected with `progressN` because the current CUDA factorizer layout only models the two-axis hand/king decomposition.
+
+## 9.6 Usage
 
 ```bash
-# Train SFNN-1536 with k3k3(king3-by-king3) = 9 buckets
 ./target/release/examples/bulletou \
-    --arch SFNN_halfkahm2_1536_15_32_k3k3 \
-    --teacher teachers/
-
-# Train HalfKA2 SFNN with the YaneuraOu hand64 bucket split
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand64 \
+    --arch SFNN_halfka2_1024_7_64_k3k3_progress8 \
     --teacher teachers/
 ```
 
-Omitting `--output` puts checkpoints under `checkpoints/SFNN_HALFKA2HM-SFNN_halfkahm2_1536_15_32_k3k3/` (= the inferred target and arch values joined into the directory name).
+For a combined hand/king/progress experiment:
 
-Schedule flags (`--lr`, `--superbatches`, etc.) and the loss-log format are identical to the rest of the tutorial — see [§6 Tune the training](6-tune.md) and [§7 Inspect the result](7-result.md).
+```bash
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_hand256_k3k3_progress16 \
+    --teacher teachers/
+```
 
-## 9.3 Verifying the load in YaneuraOu
+Omitting `--output` puts checkpoints under a directory derived from the canonical architecture name.
 
-LayerStack training writes a regular `nn.bin` (same path as any NNUE eval). To verify it loads, use the **YaneuraOu SFNNwoP1536 build** and run `setoption EvalDir → isready → bench`. An `info string Warning: NNUE hash mismatch` line on `isready` is expected (load continues).
+## 9.7 Notes
 
-Loading procedure is the same as in [§8 Load into an engine](8-engine.md). See the [SFNN-1536 reference](../shogi/sfnn-1536.md) for the YaneuraOu build setup that supports this family.
-
-## 9.4 When you might want to skip LayerStack
-
-Because LayerStack stores per-bucket weights, both training and inference are heavier than a single MLP. The hand-combined variants range from 576 stacks (`hand64_k3k3`) to 861184 stacks (`hand1024_k29k29`), so start with a small FT/H1 size or a hand-only suffix when testing the idea.
-
-- If you only have a small teacher (e.g. < 100M positions), the per-bucket position count drops and each bucket trains less effectively.
-- If you don't need YaneuraOu's SFNNwoP1536 build, sticking with `NNUE_HALFKP` / `NNUE_HALFKPVM` etc. is simpler.
-
-Practical guidance:
-- **Need a YaneuraOu SFNNwoP1536-compatible eval** → use `SFNN_HALFKA2HM` + LayerStack.
-- **Otherwise** → a single-MLP NNUE architecture is enough.
-
-## 9.5 Related
-
-- [SFNN-1536 training reference](../shogi/sfnn-1536.md) — architecture, binary layout, quantisation scales
-- Existing example: `examples/shogi_layerstack.rs` — has additional (experimental) bucket modes beyond k3k3(king3-by-king3) (rshogi-format output, kept parallel to bulletou)
+- LayerStack is only meaningful for SFNN architectures.
+- More buckets reduce the amount of data seen by each stack, so large combinations need much more teacher data.
+- Checkpoint size and VRAM usage grow roughly with the number of LayerStacks.
+- Build YaneuraOu with the same architecture suffix when loading the exported `nn.bin`.
 
 ---
 

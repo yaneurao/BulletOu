@@ -64,7 +64,11 @@ use bulletou_lib::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
-    game::outputs::ShogiSfnnLayerStackBucketKind,
+    game::outputs::{
+        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
+        ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
+        set_shogi_sfnn_progress_q16_params,
+    },
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
@@ -226,58 +230,88 @@ enum LayerStackMode {
     Hand1024Kingrank21by21,
     /// 1024 hand buckets x 841 king buckets = 861184 stacks.
     Hand1024Kingrank29by29,
+    /// Axis-composed LayerStack bucket. Used for progress buckets and for
+    /// token-order canonicalisation compatible with YaneuraOu.
+    Custom { hand: ShogiSfnnHandBucketKind, king: ShogiSfnnKingBucketKind, progress: ShogiSfnnProgressBucketKind },
 }
 
 impl LayerStackMode {
     /// Human-facing display name.
-    fn cli_name(self) -> &'static str {
+    fn cli_name(self) -> std::borrow::Cow<'static, str> {
         match self {
-            LayerStackMode::Single => "none(single-stack)",
-            LayerStackMode::Kingrank3by3 => "k3k3(king3-by-king3)",
-            LayerStackMode::Kingrank9by9 => "k9k9(king9-by-king9)",
-            LayerStackMode::Kingrank21by21 => "k21k21(king21-by-king21)",
-            LayerStackMode::Kingrank29by29 => "k29k29(king29-by-king29)",
-            LayerStackMode::Hand64 => "hand64",
-            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3",
-            LayerStackMode::Hand64Kingrank9by9 => "hand64_k9k9",
-            LayerStackMode::Hand64Kingrank21by21 => "hand64_k21k21",
-            LayerStackMode::Hand64Kingrank29by29 => "hand64_k29k29",
-            LayerStackMode::Hand256 => "hand256",
-            LayerStackMode::Hand256Kingrank3by3 => "hand256_k3k3",
-            LayerStackMode::Hand256Kingrank9by9 => "hand256_k9k9",
-            LayerStackMode::Hand256Kingrank21by21 => "hand256_k21k21",
-            LayerStackMode::Hand256Kingrank29by29 => "hand256_k29k29",
-            LayerStackMode::Hand1024 => "hand1024",
-            LayerStackMode::Hand1024Kingrank3by3 => "hand1024_k3k3",
-            LayerStackMode::Hand1024Kingrank9by9 => "hand1024_k9k9",
-            LayerStackMode::Hand1024Kingrank21by21 => "hand1024_k21k21",
-            LayerStackMode::Hand1024Kingrank29by29 => "hand1024_k29k29",
+            LayerStackMode::Single => "none(single-stack)".into(),
+            LayerStackMode::Kingrank3by3 => "k3k3(king3-by-king3)".into(),
+            LayerStackMode::Kingrank9by9 => "k9k9(king9-by-king9)".into(),
+            LayerStackMode::Kingrank21by21 => "k21k21(king21-by-king21)".into(),
+            LayerStackMode::Kingrank29by29 => "k29k29(king29-by-king29)".into(),
+            LayerStackMode::Hand64 => "hand64".into(),
+            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3".into(),
+            LayerStackMode::Hand64Kingrank9by9 => "hand64_k9k9".into(),
+            LayerStackMode::Hand64Kingrank21by21 => "hand64_k21k21".into(),
+            LayerStackMode::Hand64Kingrank29by29 => "hand64_k29k29".into(),
+            LayerStackMode::Hand256 => "hand256".into(),
+            LayerStackMode::Hand256Kingrank3by3 => "hand256_k3k3".into(),
+            LayerStackMode::Hand256Kingrank9by9 => "hand256_k9k9".into(),
+            LayerStackMode::Hand256Kingrank21by21 => "hand256_k21k21".into(),
+            LayerStackMode::Hand256Kingrank29by29 => "hand256_k29k29".into(),
+            LayerStackMode::Hand1024 => "hand1024".into(),
+            LayerStackMode::Hand1024Kingrank3by3 => "hand1024_k3k3".into(),
+            LayerStackMode::Hand1024Kingrank9by9 => "hand1024_k9k9".into(),
+            LayerStackMode::Hand1024Kingrank21by21 => "hand1024_k21k21".into(),
+            LayerStackMode::Hand1024Kingrank29by29 => "hand1024_k29k29".into(),
+            LayerStackMode::Custom { .. } => self.arch_suffix().into_owned().into(),
         }
     }
 
     /// Short YaneuraOu architecture suffix.
-    fn arch_suffix(self) -> &'static str {
+    fn arch_suffix(self) -> std::borrow::Cow<'static, str> {
         match self {
-            LayerStackMode::Single => "",
-            LayerStackMode::Kingrank3by3 => "k3k3",
-            LayerStackMode::Kingrank9by9 => "k9k9",
-            LayerStackMode::Kingrank21by21 => "k21k21",
-            LayerStackMode::Kingrank29by29 => "k29k29",
-            LayerStackMode::Hand64 => "hand64",
-            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3",
-            LayerStackMode::Hand64Kingrank9by9 => "hand64_k9k9",
-            LayerStackMode::Hand64Kingrank21by21 => "hand64_k21k21",
-            LayerStackMode::Hand64Kingrank29by29 => "hand64_k29k29",
-            LayerStackMode::Hand256 => "hand256",
-            LayerStackMode::Hand256Kingrank3by3 => "hand256_k3k3",
-            LayerStackMode::Hand256Kingrank9by9 => "hand256_k9k9",
-            LayerStackMode::Hand256Kingrank21by21 => "hand256_k21k21",
-            LayerStackMode::Hand256Kingrank29by29 => "hand256_k29k29",
-            LayerStackMode::Hand1024 => "hand1024",
-            LayerStackMode::Hand1024Kingrank3by3 => "hand1024_k3k3",
-            LayerStackMode::Hand1024Kingrank9by9 => "hand1024_k9k9",
-            LayerStackMode::Hand1024Kingrank21by21 => "hand1024_k21k21",
-            LayerStackMode::Hand1024Kingrank29by29 => "hand1024_k29k29",
+            LayerStackMode::Single => "".into(),
+            LayerStackMode::Kingrank3by3 => "k3k3".into(),
+            LayerStackMode::Kingrank9by9 => "k9k9".into(),
+            LayerStackMode::Kingrank21by21 => "k21k21".into(),
+            LayerStackMode::Kingrank29by29 => "k29k29".into(),
+            LayerStackMode::Hand64 => "hand64".into(),
+            LayerStackMode::Hand64Kingrank3by3 => "hand64_k3k3".into(),
+            LayerStackMode::Hand64Kingrank9by9 => "hand64_k9k9".into(),
+            LayerStackMode::Hand64Kingrank21by21 => "hand64_k21k21".into(),
+            LayerStackMode::Hand64Kingrank29by29 => "hand64_k29k29".into(),
+            LayerStackMode::Hand256 => "hand256".into(),
+            LayerStackMode::Hand256Kingrank3by3 => "hand256_k3k3".into(),
+            LayerStackMode::Hand256Kingrank9by9 => "hand256_k9k9".into(),
+            LayerStackMode::Hand256Kingrank21by21 => "hand256_k21k21".into(),
+            LayerStackMode::Hand256Kingrank29by29 => "hand256_k29k29".into(),
+            LayerStackMode::Hand1024 => "hand1024".into(),
+            LayerStackMode::Hand1024Kingrank3by3 => "hand1024_k3k3".into(),
+            LayerStackMode::Hand1024Kingrank9by9 => "hand1024_k9k9".into(),
+            LayerStackMode::Hand1024Kingrank21by21 => "hand1024_k21k21".into(),
+            LayerStackMode::Hand1024Kingrank29by29 => "hand1024_k29k29".into(),
+            LayerStackMode::Custom { hand, king, progress } => {
+                let mut parts = Vec::new();
+                match hand {
+                    ShogiSfnnHandBucketKind::None => {}
+                    ShogiSfnnHandBucketKind::Hand64 => parts.push("hand64"),
+                    ShogiSfnnHandBucketKind::Hand256 => parts.push("hand256"),
+                    ShogiSfnnHandBucketKind::Hand1024 => parts.push("hand1024"),
+                }
+                match king {
+                    ShogiSfnnKingBucketKind::None => {}
+                    ShogiSfnnKingBucketKind::KingRank9 => parts.push("k3k3"),
+                    ShogiSfnnKingBucketKind::KingRank81 => parts.push("k9k9"),
+                    ShogiSfnnKingBucketKind::King21ByKing21 => parts.push("k21k21"),
+                    ShogiSfnnKingBucketKind::King29ByKing29 => parts.push("k29k29"),
+                }
+                match progress {
+                    ShogiSfnnProgressBucketKind::None => {}
+                    ShogiSfnnProgressBucketKind::Progress2 => parts.push("progress2"),
+                    ShogiSfnnProgressBucketKind::Progress3 => parts.push("progress3"),
+                    ShogiSfnnProgressBucketKind::Progress4 => parts.push("progress4"),
+                    ShogiSfnnProgressBucketKind::Progress8 => parts.push("progress8"),
+                    ShogiSfnnProgressBucketKind::Progress16 => parts.push("progress16"),
+                    ShogiSfnnProgressBucketKind::Progress32 => parts.push("progress32"),
+                }
+                parts.join("_").into()
+            }
         }
     }
 
@@ -286,7 +320,21 @@ impl LayerStackMode {
         self.bucket_kind().num_stacks()
     }
 
+    fn progress_bucket_count(self) -> usize {
+        match self {
+            LayerStackMode::Custom { progress, .. } => progress.bucket_count(),
+            _ => 1,
+        }
+    }
+
+    fn has_progress_axis(self) -> bool {
+        self.progress_bucket_count() > 1
+    }
+
     fn factorizer_king_axis_dim(self) -> usize {
+        if self.has_progress_axis() {
+            return 0;
+        }
         match self {
             LayerStackMode::Single | LayerStackMode::Hand64 | LayerStackMode::Hand256 | LayerStackMode::Hand1024 => 0,
             LayerStackMode::Kingrank3by3
@@ -305,10 +353,14 @@ impl LayerStackMode {
             | LayerStackMode::Hand64Kingrank29by29
             | LayerStackMode::Hand256Kingrank29by29
             | LayerStackMode::Hand1024Kingrank29by29 => 29,
+            LayerStackMode::Custom { king, .. } => king.axis_dim(),
         }
     }
 
     fn factorizer_hand_axis_dim(self) -> usize {
+        if self.has_progress_axis() {
+            return 0;
+        }
         match self {
             LayerStackMode::Single
             | LayerStackMode::Kingrank3by3
@@ -330,6 +382,12 @@ impl LayerStackMode {
             | LayerStackMode::Hand1024Kingrank9by9
             | LayerStackMode::Hand1024Kingrank21by21
             | LayerStackMode::Hand1024Kingrank29by29 => 32,
+            LayerStackMode::Custom { hand, .. } => match hand {
+                ShogiSfnnHandBucketKind::None => 0,
+                ShogiSfnnHandBucketKind::Hand64 => 8,
+                ShogiSfnnHandBucketKind::Hand256 => 16,
+                ShogiSfnnHandBucketKind::Hand1024 => 32,
+            },
         }
     }
 
@@ -355,12 +413,130 @@ impl LayerStackMode {
             LayerStackMode::Hand1024Kingrank9by9 => ShogiSfnnLayerStackBucketKind::Hand1024KingRank81,
             LayerStackMode::Hand1024Kingrank21by21 => ShogiSfnnLayerStackBucketKind::Hand1024King21ByKing21,
             LayerStackMode::Hand1024Kingrank29by29 => ShogiSfnnLayerStackBucketKind::Hand1024King29ByKing29,
+            LayerStackMode::Custom { hand, king, progress } => ShogiSfnnLayerStackBucketKind::new(hand, king, progress),
         }
     }
 
     fn bucket_index(self, pos: &bulletou_lib::shogi::PackedSfenValue) -> usize {
         self.bucket_kind().bucket(pos)
     }
+}
+
+fn layerstack_from_axes(
+    hand: ShogiSfnnHandBucketKind,
+    king: ShogiSfnnKingBucketKind,
+    progress: ShogiSfnnProgressBucketKind,
+) -> LayerStackMode {
+    if progress != ShogiSfnnProgressBucketKind::None {
+        return LayerStackMode::Custom { hand, king, progress };
+    }
+    match (hand, king) {
+        (ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::None) => LayerStackMode::Single,
+        (ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::KingRank9) => LayerStackMode::Kingrank3by3,
+        (ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::KingRank81) => LayerStackMode::Kingrank9by9,
+        (ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::King21ByKing21) => LayerStackMode::Kingrank21by21,
+        (ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::King29ByKing29) => LayerStackMode::Kingrank29by29,
+        (ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::None) => LayerStackMode::Hand64,
+        (ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::KingRank9) => LayerStackMode::Hand64Kingrank3by3,
+        (ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::KingRank81) => LayerStackMode::Hand64Kingrank9by9,
+        (ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::King21ByKing21) => {
+            LayerStackMode::Hand64Kingrank21by21
+        }
+        (ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::King29ByKing29) => {
+            LayerStackMode::Hand64Kingrank29by29
+        }
+        (ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::None) => LayerStackMode::Hand256,
+        (ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::KingRank9) => LayerStackMode::Hand256Kingrank3by3,
+        (ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::KingRank81) => LayerStackMode::Hand256Kingrank9by9,
+        (ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::King21ByKing21) => {
+            LayerStackMode::Hand256Kingrank21by21
+        }
+        (ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::King29ByKing29) => {
+            LayerStackMode::Hand256Kingrank29by29
+        }
+        (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::None) => LayerStackMode::Hand1024,
+        (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::KingRank9) => LayerStackMode::Hand1024Kingrank3by3,
+        (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::KingRank81) => {
+            LayerStackMode::Hand1024Kingrank9by9
+        }
+        (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::King21ByKing21) => {
+            LayerStackMode::Hand1024Kingrank21by21
+        }
+        (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::King29ByKing29) => {
+            LayerStackMode::Hand1024Kingrank29by29
+        }
+    }
+}
+
+fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, String> {
+    if raw.trim().is_empty() {
+        return Ok(LayerStackMode::Single);
+    }
+
+    let normalized = raw
+        .to_ascii_lowercase()
+        .replace("king3_by_king3", "k3k3")
+        .replace("king9_by_king9", "k9k9")
+        .replace("king21_by_king21", "k21k21")
+        .replace("king29_by_king29", "k29k29");
+
+    let mut hand = ShogiSfnnHandBucketKind::None;
+    let mut king = ShogiSfnnKingBucketKind::None;
+    let mut progress = ShogiSfnnProgressBucketKind::None;
+
+    for token in normalized.split('_').filter(|token| !token.is_empty()) {
+        match token {
+            "hand64" | "hand256" | "hand1024" => {
+                if hand != ShogiSfnnHandBucketKind::None {
+                    return Err(format!("invalid arch `{arch}`: duplicate SFNN hand bucket token in `{raw}`"));
+                }
+                hand = match token {
+                    "hand64" => ShogiSfnnHandBucketKind::Hand64,
+                    "hand256" => ShogiSfnnHandBucketKind::Hand256,
+                    "hand1024" => ShogiSfnnHandBucketKind::Hand1024,
+                    _ => unreachable!(),
+                };
+            }
+            "k3k3" | "k9k9" | "k21k21" | "k29k29" => {
+                if king != ShogiSfnnKingBucketKind::None {
+                    return Err(format!("invalid arch `{arch}`: duplicate SFNN king bucket token in `{raw}`"));
+                }
+                king = match token {
+                    "k3k3" => ShogiSfnnKingBucketKind::KingRank9,
+                    "k9k9" => ShogiSfnnKingBucketKind::KingRank81,
+                    "k21k21" => ShogiSfnnKingBucketKind::King21ByKing21,
+                    "k29k29" => ShogiSfnnKingBucketKind::King29ByKing29,
+                    _ => unreachable!(),
+                };
+            }
+            "progress2" | "progress3" | "progress4" | "progress8" | "progress16" | "progress32" => {
+                if progress != ShogiSfnnProgressBucketKind::None {
+                    return Err(format!("invalid arch `{arch}`: duplicate SFNN progress bucket token in `{raw}`"));
+                }
+                progress = match token {
+                    "progress2" => ShogiSfnnProgressBucketKind::Progress2,
+                    "progress3" => ShogiSfnnProgressBucketKind::Progress3,
+                    "progress4" => ShogiSfnnProgressBucketKind::Progress4,
+                    "progress8" => ShogiSfnnProgressBucketKind::Progress8,
+                    "progress16" => ShogiSfnnProgressBucketKind::Progress16,
+                    "progress32" => ShogiSfnnProgressBucketKind::Progress32,
+                    _ => unreachable!(),
+                };
+            }
+            "ls9" => {
+                return Err(format!(
+                    "invalid arch `{arch}`: ls9 is no longer supported; use one of {SFNN_LAYERSTACK_EXPECTED}"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "invalid arch `{arch}`: unsupported SFNN layer stack token `{other}` in `{raw}`; expected {SFNN_LAYERSTACK_EXPECTED}"
+                ));
+            }
+        }
+    }
+
+    Ok(layerstack_from_axes(hand, king, progress))
 }
 
 /// NNUE architecture name in the YaneuraOu Makefile form with the
@@ -642,8 +818,8 @@ impl std::fmt::Display for NnueArch {
     }
 }
 
-const SFNN_LAYERSTACK_EXPECTED: &str = "k3k3|k9k9|k21k21|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k21k21|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k21k21|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k21k21|hand1024_k29k29";
-const SFNN_ARCH_EXPECTED: &str = "SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<k3k3|k9k9|k21k21|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k21k21|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k21k21|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k21k21|hand1024_k29k29>]";
+const SFNN_LAYERSTACK_EXPECTED: &str = "[hand64|hand256|hand1024] [k3k3|k9k9|k21k21|k29k29] [progress2|progress3|progress4|progress8|progress16|progress32]";
+const SFNN_ARCH_EXPECTED: &str = "SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<hand*>][_<k*>][_<progress*>]";
 
 impl std::str::FromStr for NnueArch {
     type Err = String;
@@ -763,42 +939,8 @@ impl std::str::FromStr for NnueArch {
                         "invalid arch `{s}`: `_gN` shorthand is no longer supported; use `_{replacement}` instead"
                     ));
                 }
-                let layerstack_spec = tokens[layerstack_start..].join("_").to_ascii_lowercase();
-                let layerstack = if layerstack_spec.is_empty() {
-                    LayerStackMode::Single
-                } else {
-                    match layerstack_spec.as_str() {
-                        "k3k3" | "king3_by_king3" => LayerStackMode::Kingrank3by3,
-                        "k9k9" | "king9_by_king9" => LayerStackMode::Kingrank9by9,
-                        "k21k21" | "king21_by_king21" => LayerStackMode::Kingrank21by21,
-                        "k29k29" | "king29_by_king29" => LayerStackMode::Kingrank29by29,
-                        "hand64" => LayerStackMode::Hand64,
-                        "hand64_k3k3" | "hand64_king3_by_king3" => LayerStackMode::Hand64Kingrank3by3,
-                        "hand64_k9k9" | "hand64_king9_by_king9" => LayerStackMode::Hand64Kingrank9by9,
-                        "hand64_k21k21" | "hand64_king21_by_king21" => LayerStackMode::Hand64Kingrank21by21,
-                        "hand64_k29k29" | "hand64_king29_by_king29" => LayerStackMode::Hand64Kingrank29by29,
-                        "hand256" => LayerStackMode::Hand256,
-                        "hand256_k3k3" | "hand256_king3_by_king3" => LayerStackMode::Hand256Kingrank3by3,
-                        "hand256_k9k9" | "hand256_king9_by_king9" => LayerStackMode::Hand256Kingrank9by9,
-                        "hand256_k21k21" | "hand256_king21_by_king21" => LayerStackMode::Hand256Kingrank21by21,
-                        "hand256_k29k29" | "hand256_king29_by_king29" => LayerStackMode::Hand256Kingrank29by29,
-                        "hand1024" => LayerStackMode::Hand1024,
-                        "hand1024_k3k3" | "hand1024_king3_by_king3" => LayerStackMode::Hand1024Kingrank3by3,
-                        "hand1024_k9k9" | "hand1024_king9_by_king9" => LayerStackMode::Hand1024Kingrank9by9,
-                        "hand1024_k21k21" | "hand1024_king21_by_king21" => LayerStackMode::Hand1024Kingrank21by21,
-                        "hand1024_k29k29" | "hand1024_king29_by_king29" => LayerStackMode::Hand1024Kingrank29by29,
-                        "ls9" => {
-                            return Err(format!(
-                                "invalid arch `{s}`: ls9 is no longer supported; use one of {SFNN_LAYERSTACK_EXPECTED}"
-                            ));
-                        }
-                        other => {
-                            return Err(format!(
-                                "invalid arch `{s}`: unsupported SFNN layer stack `{other}`; expected {SFNN_LAYERSTACK_EXPECTED} or the corresponding king*_by_king* long names"
-                            ));
-                        }
-                    }
-                };
+                let layerstack_spec = tokens[layerstack_start..].join("_");
+                let layerstack = parse_sfnn_layerstack_spec(&layerstack_spec, s)?;
                 let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack));
                 let arch = if let Some((common_size, shard_size, group_count)) = sfnn_l1_common_shard {
                     arch.with_sfnn_l1_common_shard(common_size, shard_size, group_count)
@@ -1979,6 +2121,67 @@ fn effective_sfnn_axis_factorized_l2_l3(args: &Args) -> bool {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn load_sfnn_progress_q16_params_from_file(path: &Path) -> Result<ShogiSfnnProgressQ16Params, String> {
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("failed to read SFNN progress params {}: {err}", path.display()))?;
+    let weight_count = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT;
+    let q16_len = std::mem::size_of::<i32>() + weight_count * std::mem::size_of::<i32>();
+    let hashed_q16_len = std::mem::size_of::<u32>() + q16_len;
+
+    let payload = if bytes.len() == hashed_q16_len {
+        let hash = u32::from_le_bytes(bytes[0..4].try_into().expect("slice len checked"));
+        if hash != SHOGI_SFNN_PROGRESS_HASH {
+            return Err(format!(
+                "SFNN progress q16 hash mismatch in {}: expected 0x{SHOGI_SFNN_PROGRESS_HASH:08X}, got 0x{hash:08X}",
+                path.display()
+            ));
+        }
+        &bytes[4..]
+    } else if bytes.len() == q16_len {
+        &bytes[..]
+    } else {
+        return Err(format!(
+            "SFNN progress params size mismatch for {}: got {} bytes; expected q16 {} bytes or hashed q16 {} bytes",
+            path.display(),
+            bytes.len(),
+            q16_len,
+            hashed_q16_len
+        ));
+    };
+
+    let bias_q16 = i32::from_le_bytes(payload[0..4].try_into().expect("slice len checked"));
+    let weights = payload[4..]
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("chunk len checked")))
+        .collect::<Vec<_>>();
+    ShogiSfnnProgressQ16Params::new(bias_q16, weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_progress_params_for_layerstack(
+    args: &Args,
+    layerstack: LayerStackMode,
+) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
+    if layerstack.progress_bucket_count() == 1 {
+        if args.sfnn_progress_params.is_some() {
+            return Err("--sfnn-progress-params is only valid for SFNN progressN architectures".to_string());
+        }
+        return Ok(None);
+    }
+
+    if let Some(path) = args.sfnn_progress_params.as_deref() {
+        return load_sfnn_progress_q16_params_from_file(path).map(Some);
+    }
+
+    eprintln!(
+        "  WARN: {} uses progress{} but --sfnn-progress-params was not specified; zero progress parameters will map positions to the neutral bucket",
+        args.arch().cli_name(),
+        layerstack.progress_bucket_count()
+    );
+    Ok(Some(ShogiSfnnProgressQ16Params::zero()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_factorizer_active(args: &Args) -> bulletou_cuda_cpp::SfnnFactorizerActive {
     let spec = effective_sfnn_factorizer_spec(args);
     bulletou_cuda_cpp::SfnnFactorizerActive {
@@ -2437,6 +2640,14 @@ struct Args {
     #[arg(long = "no-sfnn-factorized", conflicts_with = "sfnn_factorizer")]
     no_sfnn_factorized: bool,
 
+    /// YaneuraOu-compatible SFNN progress parameters for `progressN`
+    /// LayerStacks. Accepts a q16 payload containing bias + `81*FE_OLD_END`
+    /// i32 weights, optionally preceded by the YaneuraOu progress hash.
+    /// If omitted for a `progressN` arch, zero parameters are used and
+    /// positions fall into the neutral progress bucket.
+    #[arg(long = "sfnn-progress-params")]
+    sfnn_progress_params: Option<PathBuf>,
+
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
@@ -2632,8 +2843,17 @@ impl Args {
         if self.sfnn_factorizer.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
         }
+        if self.sfnn_progress_params.is_some() && !eval_type.uses_layerstack() {
+            return Err("--sfnn-progress-params currently applies to SFNN / LayerStack eval types only".to_string());
+        }
         if let Some(spec) = self.sfnn_factorizer {
             if let Some(layerstack) = self.effective_layerstack() {
+                if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
+                    return Err(format!(
+                        "--sfnn-factorizer axis terms are not yet supported with progressN LayerStacks; arch {} can use --sfnn-factorizer shared or none",
+                        self.arch().cli_name()
+                    ));
+                }
                 if spec.explicit_king_axis && layerstack.factorizer_king_axis_dim() == 0 {
                     return Err(format!(
                         "--sfnn-factorizer requested king=axis, but arch {} has no king bucket axis",
@@ -2646,6 +2866,11 @@ impl Args {
                         self.arch().cli_name()
                     ));
                 }
+            }
+        }
+        if let Some(layerstack) = self.effective_layerstack() {
+            if self.sfnn_progress_params.is_some() && !layerstack.has_progress_axis() {
+                return Err("--sfnn-progress-params is only valid for SFNN progressN architectures".to_string());
             }
         }
 
@@ -3197,8 +3422,19 @@ fn main() {
         eprintln!("error: --sfnn-factorizer currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
+    if args.sfnn_progress_params.is_some() && !args.eval_type().uses_layerstack() {
+        eprintln!("error: --sfnn-progress-params currently applies to SFNN / LayerStack eval types only.");
+        std::process::exit(2);
+    }
     if let Some(spec) = args.sfnn_factorizer {
         if let Some(layerstack) = args.effective_layerstack() {
+            if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
+                eprintln!(
+                    "error: --sfnn-factorizer axis terms are not yet supported with progressN LayerStacks; arch {} can use --sfnn-factorizer shared or none.",
+                    args.arch().cli_name()
+                );
+                std::process::exit(2);
+            }
             if spec.explicit_king_axis && layerstack.factorizer_king_axis_dim() == 0 {
                 eprintln!(
                     "error: --sfnn-factorizer requested king=axis, but arch {} has no king bucket axis.",
@@ -3213,6 +3449,12 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+        }
+    }
+    if let Some(layerstack) = args.effective_layerstack() {
+        if args.sfnn_progress_params.is_some() && !layerstack.has_progress_axis() {
+            eprintln!("error: --sfnn-progress-params is only valid for SFNN progressN architectures.");
+            std::process::exit(2);
         }
     }
     // `geometric` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
@@ -5676,6 +5918,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let num_stacks = layerstack.num_stacks();
+    let sfnn_progress_params = sfnn_progress_params_for_layerstack(args, layerstack)?;
+    if let Some(params) = sfnn_progress_params.clone() {
+        set_shogi_sfnn_progress_q16_params(params)?;
+    }
     let device = args.cuda_cpp_device;
 
     eprintln!(
@@ -6014,6 +6260,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &trained_weights,
                         &trained_optimizer_states,
                         completed_steps,
+                        sfnn_progress_params.as_ref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
@@ -6177,6 +6424,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             &final_optimizer_states,
             completed_steps,
             factorizer_spec,
+            sfnn_progress_params.as_ref(),
         )?;
         eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
         if let Some(metrics) = last_checkpoint_metrics {
@@ -6336,6 +6584,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &trained_weights,
                         &trained_optimizer_states,
                         completed_step_offset + seen_steps,
+                        sfnn_progress_params.as_ref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
@@ -6554,6 +6803,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             &trained_weights,
             &trained_optimizer_states,
             completed_steps,
+            sfnn_progress_params.as_ref(),
             CudaCppCheckpointLog {
                 epoch: chunk.epoch,
                 superbatch: chunk.superbatch,
@@ -6603,6 +6853,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         &trained_optimizer_states,
         completed_steps,
         factorizer_spec,
+        sfnn_progress_params.as_ref(),
     )?;
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
     if checkpoint_chunk_idx != schedule.chunks.len() {
@@ -7159,6 +7410,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     completed_steps: usize,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
     let output_dir = args.output_dir();
@@ -7175,6 +7427,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         shape,
         weights,
         effective_sfnn_factorizer_spec(args),
+        progress_params,
     )?;
     write_cuda_cpp_sfnn_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
     write_cuda_cpp_direct_checkpoint_metadata(&output_dir, idx, &dir, args, log)?;
@@ -9138,9 +9391,10 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     completed_steps: usize,
     factorizer: SfnnFactorizerSpec,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-    write_cuda_cpp_sfnn_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights, factorizer)?;
+    write_cuda_cpp_sfnn_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights, factorizer, progress_params)?;
     write_cuda_cpp_sfnn_weights_bin(&dir.join("weights.bin"), weights, optimizer_states, completed_steps)
 }
 
@@ -9335,6 +9589,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     factorizer: SfnnFactorizerSpec,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -9376,9 +9631,10 @@ fn write_cuda_cpp_sfnn_nn_bin(
         shape.ft_size,
         shape.num_stacks
     );
+    let sfnn_hash = if progress_params.is_some() { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
     writer
         .write_all(&SFNN_NNUE_VERSION.to_le_bytes())
-        .and_then(|_| writer.write_all(&KHASH_SFNN.to_le_bytes()))
+        .and_then(|_| writer.write_all(&sfnn_hash.to_le_bytes()))
         .and_then(|_| writer.write_all(&(arch.len() as u32).to_le_bytes()))
         .and_then(|_| writer.write_all(arch.as_bytes()))
         .and_then(|_| writer.write_all(&FT_HASH_SFNN.to_le_bytes()))
@@ -9386,6 +9642,17 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0b", &weights.l0b, f32::from(SFNN_QA))?;
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0w", l0w_for_export, f32::from(SFNN_QA))?;
+    if let Some(params) = progress_params {
+        writer
+            .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
+            .and_then(|_| writer.write_all(&params.bias_q16.to_le_bytes()))
+            .map_err(|err| format!("failed to write SFNN progress params header {}: {err}", path.display()))?;
+        for &weight in params.weights_q16.iter() {
+            writer
+                .write_all(&weight.to_le_bytes())
+                .map_err(|err| format!("failed to write SFNN progress params {}: {err}", path.display()))?;
+        }
+    }
 
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
@@ -10316,6 +10583,8 @@ fn resume_signature(args: &Args) -> String {
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
+    let sfnn_progress_params =
+        args.sfnn_progress_params.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
 
     [
         "schema=bulletou-resume-v3".to_string(),
@@ -10363,6 +10632,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorized_l1={}", effective_sfnn_factorized_l1(args)),
         format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
+        format!("sfnn_progress_params={sfnn_progress_params}"),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -10401,16 +10671,21 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     }
     let stored_has_validation_rate = stored.lines().any(|line| line.starts_with("validation_rate="));
     let stored_has_factorizer = stored.lines().any(|line| line.starts_with("sfnn_factorizer="));
+    let stored_has_progress_params = stored.lines().any(|line| line.starts_with("sfnn_progress_params="));
     let factorizer = effective_sfnn_factorizer_spec(args);
     let can_omit_validation_rate =
         !stored_has_validation_rate && effective_validation_rate(args) == effective_save_rate(args);
     let can_omit_factorizer = !stored_has_factorizer && !factorizer.king_axis && !factorizer.hand_axis;
+    let can_omit_progress_params = !stored_has_progress_params && args.sfnn_progress_params.is_none();
     let mut candidate = current.clone();
     if can_omit_validation_rate {
         candidate = resume_signature_without_line(&candidate, "validation_rate=");
     }
     if can_omit_factorizer {
         candidate = resume_signature_without_line(&candidate, "sfnn_factorizer=");
+    }
+    if can_omit_progress_params {
+        candidate = resume_signature_without_line(&candidate, "sfnn_progress_params=");
     }
     stored.trim_end() == candidate.trim_end()
 }
@@ -11884,6 +12159,15 @@ mod tests {
         assert_eq!(hand1024_k29k29.cli_name(), "SFNN_halfka2_1024_7_64_hand1024_k29k29");
         let hand1024_king29_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand1024_king29_by_king29").unwrap();
         assert_eq!(hand1024_king29_alias.cli_name(), "SFNN_halfka2_1024_7_64_hand1024_k29k29");
+        let progress8 = NnueArch::from_str("SFNN_halfka2_1024_7_64_progress8").unwrap();
+        assert_eq!(progress8.layerstack.unwrap().num_stacks(), 8);
+        assert_eq!(progress8.cli_name(), "SFNN_halfka2_1024_7_64_progress8");
+        let k3_progress8 = NnueArch::from_str("SFNN_halfka2_1024_7_64_k3k3_progress8").unwrap();
+        assert_eq!(k3_progress8.layerstack.unwrap().num_stacks(), 9 * 8);
+        assert_eq!(k3_progress8.cli_name(), "SFNN_halfka2_1024_7_64_k3k3_progress8");
+        let hand256_k3_progress16 = NnueArch::from_str("SFNN_halfka2_1024_7_64_k3k3_hand256_progress16").unwrap();
+        assert_eq!(hand256_k3_progress16.layerstack.unwrap().num_stacks(), 256 * 9 * 16);
+        assert_eq!(hand256_k3_progress16.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16");
         assert_eq!(NnueArch::from_str("SFNN1536").unwrap().cli_name(), "SFNN_halfkahm2_1536_15_32_k3k3");
     }
 
@@ -11951,6 +12235,14 @@ mod tests {
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k9k9",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k21k21",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k29k29",
+            "SFNN_halfka2_1024_7_64_progress2",
+            "SFNN_halfka2_1024_7_64_progress3",
+            "SFNN_halfka2_1024_7_64_progress4",
+            "SFNN_halfka2_1024_7_64_progress8",
+            "SFNN_halfka2_1024_7_64_progress16",
+            "SFNN_halfka2_1024_7_64_progress32",
+            "SFNN_halfka2_1024_7_64_k3k3_progress8",
+            "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
@@ -11975,6 +12267,9 @@ mod tests {
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_s256x8_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1024_s256_k3k3").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_progress5").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_progress8_progress16").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_1024_7_64_hand64_hand256_progress8").is_err());
     }
 
     #[test]
@@ -11986,6 +12281,36 @@ mod tests {
         assert!(NnueArch::from_str("SFNN_halfka2_100_7_64_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3000_7_64_c1024_s256x8_k3k3").is_err());
         assert!(NnueArch::from_str("SFNN_ka2_3072_7_64_c1000_s259x8_k3k3").is_err());
+    }
+
+    #[test]
+    fn sfnn_progress_params_cli_uses_yaneuraou_params_name() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_progress8",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-progress-params",
+            "progress-params.bin",
+        ])
+        .unwrap();
+        assert_eq!(args.sfnn_progress_params, Some(std::path::PathBuf::from("progress-params.bin")));
+
+        assert!(
+            Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "SFNN_halfka2_1024_7_64_progress8",
+                "--teacher",
+                "/dev/null",
+                "--sfnn-progress-bin",
+                "progress.bin",
+            ])
+            .is_err()
+        );
     }
 
     /// Verify that `--tag` appends `-<tag>` to the auto-generated output

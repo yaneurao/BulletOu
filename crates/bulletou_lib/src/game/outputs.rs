@@ -581,85 +581,250 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand1024King29ByKing29Bucket {
     }
 }
 
-/// Runtime-selectable YaneuraOu-compatible SFNN LayerStack bucket.
-///
-/// The associated `OutputBuckets::BUCKETS` for the wrapper below is the maximum
-/// supported count; CUDA direct training uses the actual architecture stack
-/// count separately and validates each per-sample bucket against it.
+/// Hand axis for YaneuraOu-compatible SFNN LayerStack buckets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ShogiSfnnLayerStackBucketKind {
-    Single,
+pub enum ShogiSfnnHandBucketKind {
     #[default]
-    KingRank9,
-    KingRank81,
-    King21ByKing21,
-    King29ByKing29,
+    None,
     Hand64,
-    Hand64KingRank9,
-    Hand64KingRank81,
-    Hand64King21ByKing21,
-    Hand64King29ByKing29,
     Hand256,
-    Hand256KingRank9,
-    Hand256KingRank81,
-    Hand256King21ByKing21,
-    Hand256King29ByKing29,
     Hand1024,
-    Hand1024KingRank9,
-    Hand1024KingRank81,
-    Hand1024King21ByKing21,
-    Hand1024King29ByKing29,
 }
 
-impl ShogiSfnnLayerStackBucketKind {
-    pub const fn num_stacks(self) -> usize {
+impl ShogiSfnnHandBucketKind {
+    pub const fn bucket_count(self) -> usize {
         match self {
-            Self::Single => 1,
-            Self::KingRank9 => 9,
-            Self::KingRank81 => 81,
-            Self::King21ByKing21 => 441,
-            Self::King29ByKing29 => 841,
+            Self::None => 1,
             Self::Hand64 => 64,
-            Self::Hand64KingRank9 => 64 * 9,
-            Self::Hand64KingRank81 => 64 * 81,
-            Self::Hand64King21ByKing21 => 64 * 441,
-            Self::Hand64King29ByKing29 => 64 * 841,
             Self::Hand256 => 256,
-            Self::Hand256KingRank9 => 256 * 9,
-            Self::Hand256KingRank81 => 256 * 81,
-            Self::Hand256King21ByKing21 => 256 * 441,
-            Self::Hand256King29ByKing29 => 256 * 841,
             Self::Hand1024 => 1024,
-            Self::Hand1024KingRank9 => 1024 * 9,
-            Self::Hand1024KingRank81 => 1024 * 81,
-            Self::Hand1024King21ByKing21 => 1024 * 441,
-            Self::Hand1024King29ByKing29 => 1024 * 841,
         }
     }
 
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
         match self {
-            Self::Single => 0,
+            Self::None => 0,
+            Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
+            Self::Hand256 => ShogiHand256Bucket::bucket_index(pos),
+            Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
+        }
+    }
+}
+
+/// King axis for YaneuraOu-compatible SFNN LayerStack buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShogiSfnnKingBucketKind {
+    None,
+    #[default]
+    KingRank9,
+    KingRank81,
+    King21ByKing21,
+    King29ByKing29,
+}
+
+impl ShogiSfnnKingBucketKind {
+    pub const fn bucket_count(self) -> usize {
+        match self {
+            Self::None => 1,
+            Self::KingRank9 => 9,
+            Self::KingRank81 => 81,
+            Self::King21ByKing21 => 441,
+            Self::King29ByKing29 => 841,
+        }
+    }
+
+    pub const fn axis_dim(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::KingRank9 => 3,
+            Self::KingRank81 => 9,
+            Self::King21ByKing21 => 21,
+            Self::King29ByKing29 => 29,
+        }
+    }
+
+    pub fn bucket(self, pos: &PackedSfenValue) -> usize {
+        match self {
+            Self::None => 0,
             Self::KingRank9 => ShogiKingRankBucket::<9>.bucket(pos),
             Self::KingRank81 => ShogiKingRankBucket::<81>.bucket(pos),
             Self::King21ByKing21 => ShogiKing21ByKing21Bucket::bucket_index(pos),
             Self::King29ByKing29 => ShogiKing29ByKing29Bucket::bucket_index(pos),
-            Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
-            Self::Hand64KingRank9 => ShogiHand64KingRankBucket::bucket_index(pos),
-            Self::Hand64KingRank81 => ShogiHand64KingRank81Bucket::bucket_index(pos),
-            Self::Hand64King21ByKing21 => ShogiHand64King21ByKing21Bucket::bucket_index(pos),
-            Self::Hand64King29ByKing29 => ShogiHand64King29ByKing29Bucket::bucket_index(pos),
-            Self::Hand256 => ShogiHand256Bucket::bucket_index(pos),
-            Self::Hand256KingRank9 => ShogiHand256KingRankBucket::bucket_index(pos),
-            Self::Hand256KingRank81 => ShogiHand256KingRank81Bucket::bucket_index(pos),
-            Self::Hand256King21ByKing21 => ShogiHand256King21ByKing21Bucket::bucket_index(pos),
-            Self::Hand256King29ByKing29 => ShogiHand256King29ByKing29Bucket::bucket_index(pos),
-            Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
-            Self::Hand1024KingRank9 => ShogiHand1024KingRankBucket::bucket_index(pos),
-            Self::Hand1024KingRank81 => ShogiHand1024KingRank81Bucket::bucket_index(pos),
-            Self::Hand1024King21ByKing21 => ShogiHand1024King21ByKing21Bucket::bucket_index(pos),
-            Self::Hand1024King29ByKing29 => ShogiHand1024King29ByKing29Bucket::bucket_index(pos),
         }
+    }
+}
+
+/// Progress axis for YaneuraOu-compatible SFNN LayerStack buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShogiSfnnProgressBucketKind {
+    #[default]
+    None,
+    Progress2,
+    Progress3,
+    Progress4,
+    Progress8,
+    Progress16,
+    Progress32,
+}
+
+impl ShogiSfnnProgressBucketKind {
+    pub const fn bucket_count(self) -> usize {
+        match self {
+            Self::None => 1,
+            Self::Progress2 => 2,
+            Self::Progress3 => 3,
+            Self::Progress4 => 4,
+            Self::Progress8 => 8,
+            Self::Progress16 => 16,
+            Self::Progress32 => 32,
+        }
+    }
+
+    pub fn bucket(self, pos: &PackedSfenValue) -> usize {
+        let count = self.bucket_count();
+        if count == 1 { 0 } else { shogi_sfnn_progress_bucket(pos, count) }
+    }
+}
+
+/// Runtime-selectable YaneuraOu-compatible SFNN LayerStack bucket.
+///
+/// The LayerStack index is composed exactly like YaneuraOu:
+///
+/// `idx = ((hand_bucket * king_bucket_count) + king_bucket) * progress_bucket_count + progress_bucket`
+///
+/// The associated `OutputBuckets::BUCKETS` for the wrapper below is the maximum
+/// supported count; CUDA direct training uses the actual architecture stack
+/// count separately and validates each per-sample bucket against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShogiSfnnLayerStackBucketKind {
+    pub hand: ShogiSfnnHandBucketKind,
+    pub king: ShogiSfnnKingBucketKind,
+    pub progress: ShogiSfnnProgressBucketKind,
+}
+
+impl Default for ShogiSfnnLayerStackBucketKind {
+    fn default() -> Self {
+        Self::KingRank9
+    }
+}
+
+#[allow(non_upper_case_globals)]
+impl ShogiSfnnLayerStackBucketKind {
+    pub const fn new(
+        hand: ShogiSfnnHandBucketKind,
+        king: ShogiSfnnKingBucketKind,
+        progress: ShogiSfnnProgressBucketKind,
+    ) -> Self {
+        Self { hand, king, progress }
+    }
+
+    pub const Single: Self =
+        Self::new(ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const KingRank9: Self =
+        Self::new(ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::KingRank9, ShogiSfnnProgressBucketKind::None);
+    pub const KingRank81: Self = Self::new(
+        ShogiSfnnHandBucketKind::None,
+        ShogiSfnnKingBucketKind::KingRank81,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const King21ByKing21: Self = Self::new(
+        ShogiSfnnHandBucketKind::None,
+        ShogiSfnnKingBucketKind::King21ByKing21,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const King29ByKing29: Self = Self::new(
+        ShogiSfnnHandBucketKind::None,
+        ShogiSfnnKingBucketKind::King29ByKing29,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand64: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const Hand64KingRank9: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand64,
+        ShogiSfnnKingBucketKind::KingRank9,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand64KingRank81: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand64,
+        ShogiSfnnKingBucketKind::KingRank81,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand64King21ByKing21: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand64,
+        ShogiSfnnKingBucketKind::King21ByKing21,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand64King29ByKing29: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand64,
+        ShogiSfnnKingBucketKind::King29ByKing29,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand256: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand256, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const Hand256KingRank9: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand256,
+        ShogiSfnnKingBucketKind::KingRank9,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand256KingRank81: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand256,
+        ShogiSfnnKingBucketKind::KingRank81,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand256King21ByKing21: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand256,
+        ShogiSfnnKingBucketKind::King21ByKing21,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand256King29ByKing29: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand256,
+        ShogiSfnnKingBucketKind::King29ByKing29,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand1024: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const Hand1024KingRank9: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand1024,
+        ShogiSfnnKingBucketKind::KingRank9,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand1024KingRank81: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand1024,
+        ShogiSfnnKingBucketKind::KingRank81,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand1024King21ByKing21: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand1024,
+        ShogiSfnnKingBucketKind::King21ByKing21,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const Hand1024King29ByKing29: Self = Self::new(
+        ShogiSfnnHandBucketKind::Hand1024,
+        ShogiSfnnKingBucketKind::King29ByKing29,
+        ShogiSfnnProgressBucketKind::None,
+    );
+
+    pub const fn hand_bucket_count(self) -> usize {
+        self.hand.bucket_count()
+    }
+
+    pub const fn king_bucket_count(self) -> usize {
+        self.king.bucket_count()
+    }
+
+    pub const fn progress_bucket_count(self) -> usize {
+        self.progress.bucket_count()
+    }
+
+    pub const fn num_stacks(self) -> usize {
+        self.hand_bucket_count() * self.king_bucket_count() * self.progress_bucket_count()
+    }
+
+    pub fn bucket(self, pos: &PackedSfenValue) -> usize {
+        let hand_bucket = self.hand.bucket(pos);
+        let king_bucket = self.king.bucket(pos);
+        let progress_bucket = self.progress.bucket(pos);
+        (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
     }
 }
 
@@ -675,7 +840,7 @@ impl ShogiSfnnLayerStackBucket {
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiSfnnLayerStackBucket {
-    const BUCKETS: usize = 1024 * 841;
+    const BUCKETS: usize = 1024 * 841 * 32;
 
     fn bucket(&self, pos: &PackedSfenValue) -> usize {
         self.kind.bucket(pos)
@@ -706,9 +871,109 @@ pub const SHOGI_PROGRESS8_NUM_BUCKETS: usize = 8;
 /// Number of KP-absolute weights: `81 * FE_OLD_END`.
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
+/// Number of weights in YaneuraOu SFNN progress parameters:
+/// `SQ_NB * Eval::fe_end`.
+pub const SHOGI_SFNN_PROGRESS_WEIGHT_COUNT: usize = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
+
+/// Number of scalar progress values used by YaneuraOu SFNN progress buckets.
+pub const SHOGI_SFNN_PROGRESS_VALUE_COUNT: usize = 256;
+
+/// YaneuraOu hash block for SFNN progress parameters (`"oPRO"`).
+pub const SHOGI_SFNN_PROGRESS_HASH: u32 = 0x6F50_524F;
+
+/// YaneuraOu-compatible SFNN progress parameters.
+///
+/// The values are q16 logits:
+///
+/// `sum_q16 = bias_q16 + sum(active_kp_abs_weights_q16)`
+///
+/// `sum_q16` is converted to a scalar `0..=255`; each architecture-specific
+/// progress bucket then uses `progress * bucket_count / 256`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShogiSfnnProgressQ16Params {
+    pub bias_q16: i32,
+    pub weights_q16: Box<[i32]>,
+}
+
+impl ShogiSfnnProgressQ16Params {
+    pub fn zero() -> Self {
+        Self { bias_q16: 0, weights_q16: vec![0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT].into_boxed_slice() }
+    }
+
+    pub fn new(bias_q16: i32, weights_q16: Vec<i32>) -> Result<Self, String> {
+        if weights_q16.len() != SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
+            return Err(format!(
+                "SFNN progress q16 weight count mismatch: got {}, expected {}",
+                weights_q16.len(),
+                SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
+            ));
+        }
+        Ok(Self { bias_q16, weights_q16: weights_q16.into_boxed_slice() })
+    }
+}
+
 static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+static SHOGI_SFNN_PROGRESS_Q16_PARAMS: OnceLock<ShogiSfnnProgressQ16Params> = OnceLock::new();
+static SHOGI_SFNN_PROGRESS_Q16_THRESHOLDS: OnceLock<[i64; SHOGI_SFNN_PROGRESS_VALUE_COUNT - 1]> = OnceLock::new();
+
+pub fn set_shogi_sfnn_progress_q16_params(params: ShogiSfnnProgressQ16Params) -> Result<(), String> {
+    if let Some(existing) = SHOGI_SFNN_PROGRESS_Q16_PARAMS.get() {
+        if existing == &params {
+            return Ok(());
+        }
+        return Err("different SFNN progress q16 parameters are already loaded in this process".to_string());
+    }
+
+    SHOGI_SFNN_PROGRESS_Q16_PARAMS
+        .set(params)
+        .map_err(|_| "SFNN progress q16 parameters are already loaded in this process".to_string())
+}
+
+pub fn shogi_sfnn_progress_q16_params() -> Option<&'static ShogiSfnnProgressQ16Params> {
+    SHOGI_SFNN_PROGRESS_Q16_PARAMS.get()
+}
+
+fn shogi_sfnn_progress_q16_thresholds() -> &'static [i64; SHOGI_SFNN_PROGRESS_VALUE_COUNT - 1] {
+    SHOGI_SFNN_PROGRESS_Q16_THRESHOLDS.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let p = (i + 1) as f64 / SHOGI_SFNN_PROGRESS_VALUE_COUNT as f64;
+            (p.ln() - (1.0 - p).ln()).mul_add(65_536.0, 0.0).round() as i64
+        })
+    })
+}
+
+/// Convert a q16 logit sum to YaneuraOu's scalar progress value `0..=255`.
+pub fn shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16: i64) -> u8 {
+    shogi_sfnn_progress_q16_thresholds().partition_point(|&threshold| threshold <= sum_q16) as u8
+}
+
+/// Compute YaneuraOu-compatible SFNN progress value `0..=255`.
+pub fn shogi_sfnn_progress_0_to_255(pos: &PackedSfenValue) -> u8 {
+    let Some(params) = shogi_sfnn_progress_q16_params() else {
+        return shogi_sfnn_progress_0_to_255_from_sum_q16(0);
+    };
+    let mut sum_q16 = i64::from(params.bias_q16);
+    ShogiProgressKPAbs::for_each_active_index(pos, |idx| {
+        sum_q16 += i64::from(params.weights_q16[idx]);
+    });
+    shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16)
+}
+
+/// Map scalar progress `0..=255` into an arbitrary YaneuraOu progress bucket count.
+pub fn shogi_sfnn_progress_bucket_from_value(progress: u8, bucket_count: usize) -> usize {
+    if bucket_count <= 1 {
+        return 0;
+    }
+    let raw = usize::from(progress) * bucket_count / SHOGI_SFNN_PROGRESS_VALUE_COUNT;
+    raw.min(bucket_count - 1)
+}
+
+/// Compute a YaneuraOu-compatible SFNN progress bucket for `bucket_count`.
+pub fn shogi_sfnn_progress_bucket(pos: &PackedSfenValue, bucket_count: usize) -> usize {
+    shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255(pos), bucket_count)
+}
 
 /// Progress-based 8 bucket assignment (logistic regression).
 ///
@@ -1376,6 +1641,24 @@ mod tests {
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024KingRank81.num_stacks(), 82944);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024King21ByKing21.num_stacks(), 451584);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand1024King29ByKing29.num_stacks(), 861184);
+        assert_eq!(
+            ShogiSfnnLayerStackBucketKind::new(
+                ShogiSfnnHandBucketKind::None,
+                ShogiSfnnKingBucketKind::None,
+                ShogiSfnnProgressBucketKind::Progress8,
+            )
+            .num_stacks(),
+            8
+        );
+        assert_eq!(
+            ShogiSfnnLayerStackBucketKind::new(
+                ShogiSfnnHandBucketKind::Hand256,
+                ShogiSfnnKingBucketKind::KingRank9,
+                ShogiSfnnProgressBucketKind::Progress16,
+            )
+            .num_stacks(),
+            256 * 9 * 16
+        );
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiSfnnLayerStackBucket::default().bucket(&startpos_like), 8);
         assert_eq!(ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::Single).bucket(&startpos_like), 0);
@@ -1391,6 +1674,11 @@ mod tests {
             ShogiSfnnLayerStackBucket::new(ShogiSfnnLayerStackBucketKind::King21ByKing21).bucket(&startpos_like),
             352
         );
+        assert_eq!(shogi_sfnn_progress_0_to_255_from_sum_q16(0), 128);
+        assert_eq!(shogi_sfnn_progress_bucket_from_value(0, 8), 0);
+        assert_eq!(shogi_sfnn_progress_bucket_from_value(128, 8), 4);
+        assert_eq!(shogi_sfnn_progress_bucket_from_value(255, 8), 7);
+        assert_eq!(shogi_sfnn_progress_bucket_from_value(255, 32), 31);
     }
 
     #[test]
