@@ -1186,6 +1186,100 @@ __device__ float crelu_pre_gradient_from_value(float activation, float output_gr
     return activation > 0.0f && activation < 1.0f ? output_gradient : 0.0f;
 }
 
+constexpr unsigned int SFNN_DENSE_REDUCE_TILE = 16;
+constexpr unsigned int SFNN_DENSE_REDUCE_THREADS = SFNN_DENSE_REDUCE_TILE * SFNN_DENSE_REDUCE_TILE;
+constexpr size_t SFNN_DENSE_REDUCE_MAX_FAST_STACKS = 128;
+
+__device__ __forceinline__ float sfnn_dense_param_reduce_output_gradient(
+    const float* activations,
+    const float* output_gradients,
+    size_t index,
+    int use_crelu_gradient) {
+    float grad = output_gradients[index];
+    if (use_crelu_gradient != 0) {
+        grad = crelu_pre_gradient_from_value(activations[index], grad);
+    }
+    return grad;
+}
+
+__global__ void sfnn_dense_param_reduce_tiled_kernel(
+    const float* inputs,
+    const float* activations,
+    const float* output_gradients,
+    const int* buckets,
+    float* weight_gradients,
+    float* bias_gradients,
+    float* shared_weight_gradients,
+    float* shared_bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    int has_shared,
+    int shared_weight_input_major,
+    int use_crelu_gradient) {
+    const unsigned int input_tiles =
+        static_cast<unsigned int>((input_dim + SFNN_DENSE_REDUCE_TILE - 1U) / SFNN_DENSE_REDUCE_TILE);
+    const unsigned int tile = blockIdx.x;
+    const unsigned int input_tile = tile % input_tiles;
+    const unsigned int output_tile = tile / input_tiles;
+    const unsigned int input_lane = threadIdx.x >> 4;
+    const unsigned int output_lane = threadIdx.x & 15U;
+    const size_t in_col = static_cast<size_t>(input_tile) * SFNN_DENSE_REDUCE_TILE + input_lane;
+    const size_t out_col = static_cast<size_t>(output_tile) * SFNN_DENSE_REDUCE_TILE + output_lane;
+    const size_t stack = blockIdx.z;
+    if (stack >= num_stacks) {
+        return;
+    }
+
+    const size_t split_count = gridDim.y;
+    const size_t rows_per_split = (batch + split_count - 1) / split_count;
+    const size_t row_begin = blockIdx.y * rows_per_split;
+    const size_t row_end = min(row_begin + rows_per_split, batch);
+    float weight_sum = 0.0f;
+    float bias_sum = 0.0f;
+
+    const bool valid_weight_cell = in_col < input_dim && out_col < output_dim;
+    const bool valid_bias_cell = input_lane == 0 && input_tile == 0 && out_col < output_dim;
+    for (size_t sample = row_begin; sample < row_end; ++sample) {
+        int stack_i32 = buckets[sample];
+        if (stack_i32 < 0 || static_cast<size_t>(stack_i32) != stack) {
+            continue;
+        }
+        const size_t out_idx = sample * output_dim + out_col;
+        float grad = 0.0f;
+        if (out_col < output_dim) {
+            grad = sfnn_dense_param_reduce_output_gradient(activations, output_gradients, out_idx, use_crelu_gradient);
+        }
+        if (valid_weight_cell && grad != 0.0f) {
+            float input_value = inputs[sample * input_dim + in_col];
+            if (input_value != 0.0f) {
+                weight_sum += grad * input_value;
+            }
+        }
+        if (valid_bias_cell) {
+            bias_sum += grad;
+        }
+    }
+
+    if (valid_weight_cell && weight_sum != 0.0f) {
+        const size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+        atomicAdd(&weight_gradients[weight_idx], weight_sum);
+        if (has_shared != 0) {
+            const size_t shared_idx = shared_weight_input_major != 0
+                ? in_col * output_dim + out_col
+                : out_col * input_dim + in_col;
+            atomicAdd(&shared_weight_gradients[shared_idx], weight_sum);
+        }
+    }
+    if (valid_bias_cell && bias_sum != 0.0f) {
+        atomicAdd(&bias_gradients[stack * output_dim + out_col], bias_sum);
+        if (has_shared != 0) {
+            atomicAdd(&shared_bias_gradients[out_col], bias_sum);
+        }
+    }
+}
+
 __global__ void sfnn_stacked_l3_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -1210,7 +1304,8 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     int has_shared,
     int has_axis,
     int use_king_axis,
-    int use_hand_axis) {
+    int use_hand_axis,
+    int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t l1_gradient_len = batch * l1_out;
@@ -1242,7 +1337,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
             }
             value = output_gradient * weight;
             float input_value = inputs[tid];
-            if (output_gradient != 0.0f && input_value != 0.0f) {
+            if (compute_parameter_gradients != 0 && output_gradient != 0.0f && input_value != 0.0f) {
                 float weight_gradient = output_gradient * input_value;
                 atomicAdd(&weight_gradients[stack * input_dim + row], weight_gradient);
                 if (has_shared != 0) {
@@ -1264,7 +1359,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
         l1_gradients[tid] = (col + 1 == l1_out) ? output_gradients[sample] : 0.0f;
     }
 
-    if (tid < batch) {
+    if (compute_parameter_gradients != 0 && tid < batch) {
         int stack_i32 = buckets[tid];
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             float grad = output_gradients[tid];
@@ -1315,7 +1410,8 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
     int has_shared,
     int has_axis,
     int use_king_axis,
-    int use_hand_axis) {
+    int use_hand_axis,
+    int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
@@ -1357,7 +1453,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
         input_gradients[tid] = sum;
     }
 
-    if (tid < weight_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < weight_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t input_entry = tid / output_dim;
         size_t in_col = input_entry % input_dim;
@@ -1394,7 +1490,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
         }
     }
 
-    if (tid < bias_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < bias_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t sample = tid / output_dim;
         int stack_i32 = buckets[sample];
@@ -1467,7 +1563,8 @@ __global__ void sfnn_stacked_affine_backward_kernel(
     size_t batch,
     size_t input_dim,
     size_t output_dim,
-    size_t num_stacks) {
+    size_t num_stacks,
+    int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
@@ -1491,7 +1588,7 @@ __global__ void sfnn_stacked_affine_backward_kernel(
         input_gradients[tid] = sum;
     }
 
-    if (tid < weight_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < weight_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t input_entry = tid / output_dim;
         size_t in_col = input_entry % input_dim;
@@ -1508,7 +1605,7 @@ __global__ void sfnn_stacked_affine_backward_kernel(
         }
     }
 
-    if (tid < bias_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < bias_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t sample = tid / output_dim;
         int stack_i32 = buckets[sample];
@@ -1728,7 +1825,8 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     int has_shared,
     int has_axis,
     int use_king_axis,
-    int use_hand_axis) {
+    int use_hand_axis,
+    int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
@@ -1769,7 +1867,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
         input_gradients[tid] = sum;
     }
 
-    if (tid < weight_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < weight_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t input_entry = tid / output_dim;
         size_t in_col = input_entry % input_dim;
@@ -1805,7 +1903,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             }
         }
     }
-    if (tid < bias_scatter_len) {
+    if (compute_parameter_gradients != 0 && tid < bias_scatter_len) {
         size_t out_col = tid % output_dim;
         size_t sample = tid / output_dim;
         int stack_i32 = buckets[sample];
@@ -3420,6 +3518,77 @@ int launch_zero_sfnn_backward_parameter_gradients(
     return 0;
 }
 
+unsigned int sfnn_dense_reduce_split_count(size_t batch) {
+    if (batch <= 2048) {
+        return 1;
+    }
+    size_t splits = (batch + 2047) / 2048;
+    splits = std::max<size_t>(1, std::min<size_t>(32, splits));
+    return static_cast<unsigned int>(splits);
+}
+
+int launch_sfnn_dense_param_reduce_tiled(
+    BulletOuCudaCppContext* ctx,
+    const float* inputs,
+    const float* activations,
+    const float* output_gradients,
+    const int* buckets,
+    float* weight_gradients,
+    float* bias_gradients,
+    float* shared_weight_gradients,
+    float* shared_bias_gradients,
+    size_t batch,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    int has_shared,
+    int shared_weight_input_major,
+    int use_crelu_gradient,
+    const char* label) {
+    if (batch == 0 || input_dim == 0 || output_dim == 0 || num_stacks == 0) {
+        return 0;
+    }
+    if (num_stacks > SFNN_DENSE_REDUCE_MAX_FAST_STACKS) {
+        return fail_message("sfnn dense reduce fast path was requested for too many stacks");
+    }
+    const size_t input_tiles = (input_dim + SFNN_DENSE_REDUCE_TILE - 1) / SFNN_DENSE_REDUCE_TILE;
+    const size_t output_tiles = (output_dim + SFNN_DENSE_REDUCE_TILE - 1) / SFNN_DENSE_REDUCE_TILE;
+    if (input_tiles == 0 || output_tiles == 0 || input_tiles > UINT_MAX / output_tiles) {
+        return fail_message("sfnn dense reduce tile grid overflow");
+    }
+    const size_t tile_count = input_tiles * output_tiles;
+    if (tile_count > static_cast<size_t>(INT_MAX)) {
+        return fail_message("sfnn dense reduce x grid too large");
+    }
+    if (num_stacks > 65535) {
+        return fail_message("sfnn dense reduce z grid too large");
+    }
+    dim3 grid(
+        static_cast<unsigned int>(tile_count),
+        sfnn_dense_reduce_split_count(batch),
+        static_cast<unsigned int>(num_stacks));
+    sfnn_dense_param_reduce_tiled_kernel<<<grid, SFNN_DENSE_REDUCE_THREADS, 0, ctx->stream>>>(
+        inputs,
+        activations,
+        output_gradients,
+        buckets,
+        weight_gradients,
+        bias_gradients,
+        shared_weight_gradients,
+        shared_bias_gradients,
+        batch,
+        input_dim,
+        output_dim,
+        num_stacks,
+        has_shared,
+        shared_weight_input_major,
+        use_crelu_gradient);
+    if (check_kernel_launch(label) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int memset_i32_async(BulletOuCudaCppContext* ctx, int* ptr, size_t len, int value, const char* label) {
     if (len == 0) {
         return 0;
@@ -3749,6 +3918,10 @@ int launch_sfnn_backward_kernels(
     const size_t l2_in = l1_hidden * 2;
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
+    const bool dense_param_reduce_fast_path =
+        num_stacks <= SFNN_DENSE_REDUCE_MAX_FAST_STACKS &&
+        has_l1ax == 0 && has_l2ax == 0 && has_l3ax == 0 &&
+        use_king_axis == 0 && use_hand_axis == 0;
     if ((grouped_l1 || common_shard_l1) && (has_l1f != 0 || has_l1ax != 0)) {
         return fail_message("SFNN compact L1 does not support factorized L1");
     }
@@ -3829,16 +4002,43 @@ int launch_sfnn_backward_kernels(
         has_l3f,
         has_l3ax,
         use_king_axis,
-        use_hand_axis);
+        use_hand_axis,
+        dense_param_reduce_fast_path ? 0 : 1);
     if (check_kernel_launch("sfnn_stacked_l3_backward_kernel launch") != 0) {
         return -1;
+    }
+    if (dense_param_reduce_fast_path) {
+        if (launch_sfnn_dense_param_reduce_tiled(
+                ctx,
+                l2,
+                nullptr,
+                mean_output_gradients,
+                buckets,
+                l3w_gradients,
+                l3b_gradients,
+                has_l3f != 0 ? l3fw_gradients : nullptr,
+                has_l3f != 0 ? l3fb_gradients : nullptr,
+                batch,
+                l2_size,
+                1,
+                num_stacks,
+                has_l3f,
+                0,
+                0,
+                "sfnn dense reduce L3 params") != 0) {
+            return -1;
+        }
     }
     if (profile.record(2, ctx, "SFNN backward profile after L3") != 0) {
         return -1;
     }
 
-    size_t l2_threads = std::max(batch * l2_in, batch * l2_in * l2_size);
-    l2_threads = std::max(l2_threads, batch * l2_size);
+    size_t l2_threads = dense_param_reduce_fast_path
+        ? batch * l2_in
+        : std::max(batch * l2_in, batch * l2_in * l2_size);
+    if (!dense_param_reduce_fast_path) {
+        l2_threads = std::max(l2_threads, batch * l2_size);
+    }
     if (block_count_1d(l2_threads, threads, &blocks, "sfnn_stacked_crelu_backward_kernel") != 0) {
         return -1;
     }
@@ -3866,9 +4066,32 @@ int launch_sfnn_backward_kernels(
         has_l2f,
         has_l2ax,
         use_king_axis,
-        use_hand_axis);
+        use_hand_axis,
+        dense_param_reduce_fast_path ? 0 : 1);
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
         return -1;
+    }
+    if (dense_param_reduce_fast_path) {
+        if (launch_sfnn_dense_param_reduce_tiled(
+                ctx,
+                l2_input,
+                l2,
+                l2_gradients,
+                buckets,
+                l2w_gradients,
+                l2b_gradients,
+                has_l2f != 0 ? l2fw_gradients : nullptr,
+                has_l2f != 0 ? l2fb_gradients : nullptr,
+                batch,
+                l2_in,
+                l2_size,
+                num_stacks,
+                has_l2f,
+                0,
+                1,
+                "sfnn dense reduce L2 params") != 0) {
+            return -1;
+        }
     }
     if (profile.record(3, ctx, "SFNN backward profile after L2") != 0) {
         return -1;
@@ -3940,8 +4163,11 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
     } else if (has_l1f != 0 || has_l1ax != 0) {
-        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
-        l1_threads = std::max(l1_threads, batch * l1_out);
+        const bool reduce_l1_params = dense_param_reduce_fast_path && has_l1ax == 0;
+        size_t l1_threads = reduce_l1_params ? batch * ft_size : std::max(batch * ft_size, batch * ft_size * l1_out);
+        if (!reduce_l1_params) {
+            l1_threads = std::max(l1_threads, batch * l1_out);
+        }
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_factorized_l1_backward_kernel") != 0) {
             return -1;
         }
@@ -3968,13 +4194,39 @@ int launch_sfnn_backward_kernels(
             has_l1f,
             has_l1ax,
             use_king_axis,
-            use_hand_axis);
+            use_hand_axis,
+            reduce_l1_params ? 0 : 1);
         if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
             return -1;
         }
+        if (reduce_l1_params) {
+            if (launch_sfnn_dense_param_reduce_tiled(
+                    ctx,
+                    combined,
+                    nullptr,
+                    l1_gradients,
+                    buckets,
+                    l1w_gradients,
+                    l1b_gradients,
+                    has_l1f != 0 ? l1fw_gradients : nullptr,
+                    has_l1f != 0 ? l1fb_gradients : nullptr,
+                    batch,
+                    ft_size,
+                    l1_out,
+                    num_stacks,
+                    has_l1f,
+                    1,
+                    0,
+                    "sfnn dense reduce L1 params") != 0) {
+                return -1;
+            }
+        }
     } else {
-        size_t l1_threads = std::max(batch * ft_size, batch * ft_size * l1_out);
-        l1_threads = std::max(l1_threads, batch * l1_out);
+        const bool reduce_l1_params = dense_param_reduce_fast_path;
+        size_t l1_threads = reduce_l1_params ? batch * ft_size : std::max(batch * ft_size, batch * ft_size * l1_out);
+        if (!reduce_l1_params) {
+            l1_threads = std::max(l1_threads, batch * l1_out);
+        }
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_stacked_affine_backward_kernel") != 0) {
             return -1;
         }
@@ -3989,9 +4241,32 @@ int launch_sfnn_backward_kernels(
             batch,
             ft_size,
             l1_out,
-            num_stacks);
+            num_stacks,
+            reduce_l1_params ? 0 : 1);
         if (check_kernel_launch("sfnn_stacked_affine_backward_kernel launch") != 0) {
             return -1;
+        }
+        if (reduce_l1_params) {
+            if (launch_sfnn_dense_param_reduce_tiled(
+                    ctx,
+                    combined,
+                    nullptr,
+                    l1_gradients,
+                    buckets,
+                    l1w_gradients,
+                    l1b_gradients,
+                    nullptr,
+                    nullptr,
+                    batch,
+                    ft_size,
+                    l1_out,
+                    num_stacks,
+                    0,
+                    0,
+                    0,
+                    "sfnn dense reduce L1 params") != 0) {
+                return -1;
+            }
         }
     }
     if (profile.record(5, ctx, "SFNN backward profile after L1") != 0) {

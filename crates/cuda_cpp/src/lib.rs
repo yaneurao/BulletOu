@@ -4834,6 +4834,11 @@ pub struct SfnnTrainStepUploadSlot {
     pub device_batch: SfnnForwardDeviceBatch,
     pub targets: F32Buffer,
     pub entry_weights: F32Buffer,
+    pinned_stm_indices: I32PinnedBuffer,
+    pinned_nstm_indices: I32PinnedBuffer,
+    pinned_buckets: I32PinnedBuffer,
+    pinned_targets: F32PinnedBuffer,
+    pinned_entry_weights: F32PinnedBuffer,
     upload_ready: Event,
     compute_done: Event,
     in_use: bool,
@@ -4860,6 +4865,11 @@ impl SfnnTrainStepUploadSlot {
             },
             targets: F32Buffer::new(ctx, batch_size)?,
             entry_weights: F32Buffer::new(ctx, batch_size)?,
+            pinned_stm_indices: I32PinnedBuffer::new(ctx, sparse_len)?,
+            pinned_nstm_indices: I32PinnedBuffer::new(ctx, sparse_len)?,
+            pinned_buckets: I32PinnedBuffer::new(ctx, batch_size)?,
+            pinned_targets: F32PinnedBuffer::new(ctx, batch_size)?,
+            pinned_entry_weights: F32PinnedBuffer::new(ctx, batch_size)?,
             upload_ready: Event::new(ctx)?,
             compute_done: Event::new(ctx)?,
             in_use: false,
@@ -4877,11 +4887,11 @@ impl SfnnTrainStepUploadSlot {
         if self.in_use {
             self.compute_done.wait(upload_ctx)?;
         }
-        self.device_batch.stm_indices.upload(upload_ctx, batch.stm_indices)?;
-        self.device_batch.nstm_indices.upload(upload_ctx, batch.nstm_indices)?;
-        self.device_batch.buckets.upload(upload_ctx, batch.buckets)?;
-        self.targets.upload(upload_ctx, batch.targets)?;
-        self.entry_weights.upload(upload_ctx, batch.entry_weights)?;
+        self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
+        self.pinned_nstm_indices.upload_to_device(upload_ctx, &self.device_batch.nstm_indices, batch.nstm_indices)?;
+        self.pinned_buckets.upload_to_device(upload_ctx, &self.device_batch.buckets, batch.buckets)?;
+        self.pinned_targets.upload_to_device(upload_ctx, &self.targets, batch.targets)?;
+        self.pinned_entry_weights.upload_to_device(upload_ctx, &self.entry_weights, batch.entry_weights)?;
         self.upload_ready.record(upload_ctx)?;
         self.in_use = true;
         Ok(())
@@ -4904,7 +4914,15 @@ impl SfnnTrainStepUploadSlot {
         }
         self.device_batch.validate()?;
         expect_len("sfnn upload slot targets", batch_size, self.targets.len())?;
-        expect_len("sfnn upload slot entry_weights", batch_size, self.entry_weights.len())
+        expect_len("sfnn upload slot entry_weights", batch_size, self.entry_weights.len())?;
+        expect_len("sfnn upload slot pinned buckets", batch_size, self.pinned_buckets.len())?;
+        expect_len("sfnn upload slot pinned targets", batch_size, self.pinned_targets.len())?;
+        expect_len("sfnn upload slot pinned entry_weights", batch_size, self.pinned_entry_weights.len())?;
+        let sparse_len = batch_size
+            .checked_mul(max_active)
+            .ok_or_else(|| CudaCppError::message("SFNN upload slot sparse length overflow"))?;
+        expect_len("sfnn upload slot pinned stm_indices", sparse_len, self.pinned_stm_indices.len())?;
+        expect_len("sfnn upload slot pinned nstm_indices", sparse_len, self.pinned_nstm_indices.len())
     }
 }
 
@@ -6737,15 +6755,15 @@ mod tests {
     fn sfnn_tiny_backward_gpu_smoke() {
         let shape = tiny_sfnn_shape();
         let batch = SfnnForwardHostBatch {
-            stm_indices: &[0, 1, -1, 2, -1, -1],
-            nstm_indices: &[2, -1, -1, 0, 3, -1],
-            buckets: &[0, 1],
-            batch_size: 2,
+            stm_indices: &[0, 1, -1, 2, -1, -1, 1, 3, -1, 3, 2, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1, 0, -1, -1, 1, -1, -1],
+            buckets: &[0, 1, 0, 1],
+            batch_size: 4,
             max_active: 3,
         };
         let weights = tiny_sfnn_weights(shape);
-        let targets = [0.25, 0.75];
-        let entry_weights = [1.0, 0.5];
+        let targets = [0.25, 0.75, 0.6, 0.1];
+        let entry_weights = [1.0, 0.5, 0.75, 1.25];
         let expected = tiny_sfnn_backward_cpu(batch, weights, &targets, &entry_weights);
 
         let ctx = Context::new(0).unwrap();
@@ -6817,15 +6835,15 @@ mod tests {
     fn sfnn_tiny_train_step_runner_smoke() {
         let shape = tiny_sfnn_shape();
         let batch = SfnnForwardHostBatch {
-            stm_indices: &[0, 1, -1, 2, -1, -1],
-            nstm_indices: &[2, -1, -1, 0, 3, -1],
-            buckets: &[0, 1],
-            batch_size: 2,
+            stm_indices: &[0, 1, -1, 2, -1, -1, 1, 3, -1, 3, 2, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1, 0, -1, -1, 1, -1, -1],
+            buckets: &[0, 1, 0, 1],
+            batch_size: 4,
             max_active: 3,
         };
         let weights = tiny_sfnn_weights(shape);
-        let targets = [0.25, 0.75];
-        let entry_weights = [1.0, 0.5];
+        let targets = [0.25, 0.75, 0.6, 0.1];
+        let entry_weights = [1.0, 0.5, 0.75, 1.25];
         let params = RangerUpdateParams {
             radam: RAdamUpdateParams {
                 step: 1,
