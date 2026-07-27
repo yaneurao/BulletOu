@@ -48,8 +48,10 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 | `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | SFNN with YaneuraOu hand64 LayerStack buckets (64 stacks) |
 | `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 ÁEk3k3 LayerStack buckets (576 stacks; much larger) |
 | `SFNN_halfka2_1024_7_64_k9k9` | 1024 | 7 | 64 | king9-by-king9 LayerStack buckets (81 stacks) |
+| `SFNN_halfka2_1024_7_64_k21k21` | 1024 | 7 | 64 | king21-by-king21 LayerStack buckets (441 stacks) |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1024 | 7 | 64 | king29-by-king29 LayerStack buckets (841 stacks) |
 | `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 ÁEk9k9 LayerStack buckets (5184 stacks; very large) |
+| `SFNN_halfka2_1024_7_64_hand64_k21k21` | 1024 | 7 | 64 | hand64 x k21k21 LayerStack buckets (28224 stacks; huge) |
 | `SFNN_halfka2_1024_7_64_hand64_k29k29` | 1024 | 7 | 64 | hand64 ÁEk29k29 LayerStack buckets (53824 stacks; huge) |
 | `SFNN_halfka2_1024_7_64_hand256` | 1024 | 7 | 64 | hand256 hand-presence LayerStack buckets (256 stacks) |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 ÁEk3k3 LayerStack buckets (2304 stacks; very large) |
@@ -67,7 +69,7 @@ For NNUE names, the size part is `<L1>x2_<L2>_<L3>`. `L1` (the per-perspective a
 
 `--arch` is required for training because it is now the single source of truth for both the architecture and the internal target family. Sizes outside the table above are accepted for experimentation, but the resulting `nn.bin` is only loadable by a YaneuraOu build whose architecture header matches the same architecture  Egenerate it by passing the matching edition name to `make` (see [§8 Engine](8-engine.md)).
 
-Grouped SFNN experiments can be written with `_c0_sMxG` before the optional LayerStack suffix. For example, `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 shards of 1024 channels. Non-zero common+shard L1 uses the same form; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. If the suffix is omitted, the model uses a single stack (`LayerStacks = 1`). Otherwise the suffix may be `k3k3`, `k9k9`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, or `hand1024_k29k29`. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
+Grouped SFNN experiments can be written with `_c0_sMxG` before the optional LayerStack suffix. For example, `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` means `FT=8192`, `L1 hidden=7`, `L2=64`, and L1 is split into 8 shards of 1024 channels. Non-zero common+shard L1 uses the same form; for example `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` means 1024 common FT channels plus 8 shard blocks of 256 channels. If the suffix is omitted, the model uses a single stack (`LayerStacks = 1`). Otherwise the suffix may be `k3k3`, `k9k9`, `k21k21`, `k29k29`, `hand64`, `hand64_k3k3`, `hand64_k9k9`, `hand64_k21k21`, `hand64_k29k29`, `hand256`, `hand256_k3k3`, `hand256_k9k9`, `hand256_k21k21`, `hand256_k29k29`, `hand1024`, `hand1024_k3k3`, `hand1024_k9k9`, `hand1024_k21k21`, or `hand1024_k29k29`. The `ka2` / `halfka2` feature token in the architecture name selects the internal target automatically.
 
 ## 4.4 Training SFNN-1536 (YaneuraOu NNUEwoSQPT1536)
 
