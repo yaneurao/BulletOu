@@ -35,7 +35,7 @@ BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせ�
 
 | 軸 | 何を見るか | 指定できる token | bucket 数 |
 |---|---|---|---:|
-| hand | 手番側/非手番側の持ち駒 | 省略, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
+| hand | 手番側/非手番側の持ち駒 | 省略, `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 1 / 4 / 16 / 64 / 64 / 256 / 1024 |
 | king | 手番側玉/非手番側玉の位置 | 省略, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | 進行度 | 省略, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
@@ -49,6 +49,10 @@ BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせ�
 | `SFNN_halfka2_1024_7_64_k13k13z` | 1 | 169 | 1 | 169 |
 | `SFNN_halfka2_1024_7_64_k21k21` | 1 | 441 | 1 | 441 |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1 | 841 | 1 | 841 |
+| `SFNN_halfka2_1024_7_64_hand4` | 4 | 1 | 1 | 4 |
+| `SFNN_halfka2_1024_7_64_hand16` | 16 | 1 | 1 | 16 |
+| `SFNN_halfka2_1024_7_64_hand64` | 64 | 1 | 1 | 64 |
+| `SFNN_halfka2_1024_7_64_hand64z` | 64 | 1 | 1 | 64 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | 1 | 1 | 256 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 256 | 9 | 1 | 2304 |
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1 | 9 | 8 | 72 |
@@ -305,13 +309,47 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 | token | 片側の bucket 数 | 最終 hand buckets | 見ているもの |
 |---|---:|---:|---|
 | 省略 | 1 | 1 | 持ち駒を見ない |
-| `hand64` | 8 | 64 | 持ち駒のざっくりした点数 |
+| `hand4` | 2 | 4 | 角を持っているか |
+| `hand16` | 4 | 16 | 歩・角を持っているか |
+| `hand64` | 8 | 64 | 3種類の存在bit |
+| `hand64z` | 8 | 64 | 持ち駒のざっくりした点数 zone |
 | `hand256` | 16 | 256 | 4種類の存在bit |
 | `hand1024` | 32 | 1024 | 5種類の存在bit |
 
+`hand64` は以前の点数 zone 方式ではありません。やねうら王側で旧 `hand64` は `hand64z` に rename され、現在の `hand64` は持ち駒の種類グループを見る 3bit 方式です。
+
+### `hand4` と `hand16`
+
+`hand4` / `hand16` は、軽い hand bucket です。片側の bucket を作り、最後に手番側と非手番側を掛け合わせます。
+
+| token | 片側 bucket の作り方 | 最終 bucket |
+|---|---|---|
+| `hand4` | `角を持つ ? 1 : 0` | `stm_1bit * 2 + non_stm_1bit` |
+| `hand16` | bit0=`歩を持つ`, bit1=`角を持つ` | `stm_2bit * 4 + non_stm_2bit` |
+
+`hand4` は角持ちだけをかなり軽く分けたいとき、`hand16` は歩持ちも加えて少しだけ細かくしたいときの実験用です。
+
 ### `hand64`
 
-`hand64` は、片側の持ち駒を点数化し、8 bucket に丸めます。
+`hand64` は、片側の持ち駒の有無を3つのグループで表します。
+
+| bit | 意味 |
+|---:|---|
+| bit0 | 歩/香/桂を持つ |
+| bit1 | 金/銀/飛を持つ |
+| bit2 | 角を持つ |
+
+片側 bucket は 3bit の `0..7` です。最終 bucket は次のように作ります。
+
+```text
+hand64_bucket = stm_3bit * 8 + non_stm_3bit
+```
+
+`hand64` は、角持ちを独立に見つつ、`hand256` / `hand1024` ほど細かく分けたくない場合に使います。
+
+### `hand64z`
+
+`hand64z` は、旧 `hand64` と同じ点数 zone 方式です。片側の持ち駒を点数化し、8 bucket に丸めます。
 
 | 駒 | 点数 |
 |---|---:|
@@ -336,12 +374,12 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 最終 bucket は、
 
 ```text
-hand64_bucket = stm_bucket * 8 + non_stm_bucket
+hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 ```
 
 です。
 
-`hand64` は持ち駒の種類よりも「どれくらい持っているか」を粗く見たいときの bucket です。
+`hand64z` は持ち駒の種類よりも「どれくらい持っているか」を粗く見たいときの bucket です。同じ64 bucketでも、新しい `hand64` とは互換性がありません。
 
 ### `hand256` と `hand1024`
 
@@ -414,7 +452,10 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | `k9k9z` | 81 | `k9k9` と同じ大きさ |
 | `k13k13z` | 169 | 中間案 |
 | `k29k29` | 841 | king だけならまだ試しやすい |
+| `hand4` | 4 | 角持ちだけを見る軽量 hand bucket |
+| `hand16` | 16 | 歩/角持ちを見る軽量 hand bucket |
 | `hand64_k3k3` | 576 | 軽めの hand + king |
+| `hand64z_k3k3` | 576 | 旧 `hand64` 相当の点数 zone + king |
 | `hand256_k3k3` | 2304 | よく比較対象にしやすい |
 | `hand256_k9k9z` | 20736 | かなり大きい |
 | `hand256_k13k13z` | 43264 | 教師量・VRAM・保存サイズに注意 |
@@ -434,7 +475,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | `k9k9z` では粗すぎる | `k13k13z` | rank 1〜7 を保持し、8〜9段だけ zone 化 |
 | 自陣最深部をマス単位で見たい | `k21k21` | `k29k29` より軽い |
 | 自陣 7〜9段をマス単位で見たい | `k29k29` | 表現力は高いが教師密度が落ちる |
-| 持ち駒で局面を分けたい | `hand64`, `hand256`, `hand1024` | king bucket と掛け合わせると急激に巨大化する |
+| 持ち駒で局面を分けたい | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | king bucket と掛け合わせると急激に巨大化する |
 | 序盤/中盤/終盤で分けたい | `progress8`, `progress16` | hand / king と独立した第3軸として使える |
 
 大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、checkpoint サイズ、学習速度も合わせて見てください。

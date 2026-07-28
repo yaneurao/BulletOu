@@ -6,7 +6,7 @@ training selector is `--arch`:
 - `--arch KPPT`
 - `--arch KPP_KKPT`
 - `--arch NNUE_<feature>_<L1>x2_<L2>_<L3>`
-- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<k3k3|k9k9|k29k29|hand64|hand64_k3k3|hand64_k9k9|hand64_k29k29|hand256|hand256_k3k3|hand256_k9k9|hand256_k29k29|hand1024|hand1024_k3k3|hand1024_k9k9|hand1024_k29k29>]`
+- `--arch SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<stack>]`
 
 The old eval-type names still exist internally as checkpoint/log target
 identifiers so existing output directory names and resume signatures remain
@@ -92,19 +92,26 @@ YaneuraOu-compatible LayerStack bucket algorithm:
 
 - `k3k3` / `king3_by_king3`: 9 buckets by friend/enemy king ranks.
 - `k9k9` / `king9_by_king9`: 81 buckets by exact friend/enemy king ranks.
+- `k9k9z`: 81 buckets by 9-way king zones.
+- `k13k13z`: 169 buckets by 13-way king zones.
+- `k21k21` / `king21_by_king21`: 441 buckets by 21-way friend/enemy king-square buckets.
 - `k29k29` / `king29_by_king29`: 841 buckets by 29-way friend/enemy king-square buckets.
-- `hand64`: 64 buckets by side-to-move / non-side hand-score buckets.
-- `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets ÁE9 king buckets = 576 stacks.
-- `hand64_k9k9` / `hand64_king9_by_king9`: 64 hand buckets ÁE81 king buckets = 5184 stacks.
-- `hand64_k29k29` / `hand64_king29_by_king29`: 64 hand buckets ÁE841 king buckets = 53824 stacks.
+- `hand4`: 4 buckets by side-to-move / non-side bishop-in-hand presence.
+- `hand16`: 16 buckets by side-to-move / non-side pawn/bishop-in-hand presence.
+- `hand64`: 64 buckets by side-to-move / non-side 3-bit hand-presence buckets.
+- `hand64z`: 64 buckets by side-to-move / non-side hand-score zone buckets. This is the old `hand64` formula renamed to match YaneuraOu.
+- `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets x 9 king buckets = 576 stacks.
+- `hand64_k9k9` / `hand64_king9_by_king9`: 64 hand buckets x 81 king buckets = 5184 stacks.
+- `hand64_k29k29` / `hand64_king29_by_king29`: 64 hand buckets x 841 king buckets = 53824 stacks.
 - `hand256`: 256 buckets by side-to-move / non-side 4-bit hand-presence buckets.
-- `hand256_k3k3` / `hand256_king3_by_king3`: 256 hand buckets ÁE9 king buckets = 2304 stacks.
-- `hand256_k9k9` / `hand256_king9_by_king9`: 256 hand buckets ÁE81 king buckets = 20736 stacks.
-- `hand256_k29k29` / `hand256_king29_by_king29`: 256 hand buckets ÁE841 king buckets = 215296 stacks.
+- `hand256_k3k3` / `hand256_king3_by_king3`: 256 hand buckets x 9 king buckets = 2304 stacks.
+- `hand256_k9k9` / `hand256_king9_by_king9`: 256 hand buckets x 81 king buckets = 20736 stacks.
+- `hand256_k29k29` / `hand256_king29_by_king29`: 256 hand buckets x 841 king buckets = 215296 stacks.
 - `hand1024`: 1024 buckets by side-to-move / non-side 5-bit hand-presence buckets.
-- `hand1024_k3k3` / `hand1024_king3_by_king3`: 1024 hand buckets ÁE9 king buckets = 9216 stacks.
-- `hand1024_k9k9` / `hand1024_king9_by_king9`: 1024 hand buckets ÁE81 king buckets = 82944 stacks.
-- `hand1024_k29k29` / `hand1024_king29_by_king29`: 1024 hand buckets ÁE841 king buckets = 861184 stacks.
+- `hand1024_k3k3` / `hand1024_king3_by_king3`: 1024 hand buckets x 9 king buckets = 9216 stacks.
+- `hand1024_k9k9` / `hand1024_king9_by_king9`: 1024 hand buckets x 81 king buckets = 82944 stacks.
+- `hand1024_k29k29` / `hand1024_king29_by_king29`: 1024 hand buckets x 841 king buckets = 861184 stacks.
+- `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32`: multiply the selected hand/king bucket count by the progress bucket count.
 
 `_cN_sMxG` enables common+shard L1: the first `N` FT
 channels are common to every L1 output group, then `G` shard blocks of `M`
@@ -126,8 +133,12 @@ Examples currently used for experiments:
 - `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
 - `SFNN_halfka2_8192_7_64_c0_s1024x8`
 - `SFNN_halfka2_4096_15_64_c0_s256x16_k3k3`
+- `SFNN_halfka2_1024_7_64_hand4`
+- `SFNN_halfka2_1024_7_64_hand16`
 - `SFNN_halfka2_1024_7_64_hand64`
+- `SFNN_halfka2_1024_7_64_hand64z`
 - `SFNN_halfka2_1024_7_64_hand64_k3k3`
+- `SFNN_halfka2_1024_7_64_hand64z_k3k3`
 - `SFNN_halfka2_1024_7_64_k9k9`
 - `SFNN_halfka2_1024_7_64_k29k29`
 - `SFNN_halfka2_1024_7_64_hand64_k9k9`

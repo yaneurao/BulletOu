@@ -35,7 +35,7 @@ BulletOu's SFNN LayerStack selection is the product of three independent axes.
 
 | Axis | What it looks at | Accepted tokens | Bucket count |
 |---|---|---|---:|
-| hand | side-to-move / non-side hand pieces | omitted, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
+| hand | side-to-move / non-side hand pieces | omitted, `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 1 / 4 / 16 / 64 / 64 / 256 / 1024 |
 | king | side-to-move / non-side king positions | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | game progress | omitted, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
@@ -49,6 +49,10 @@ The final stack count is a product.
 | `SFNN_halfka2_1024_7_64_k13k13z` | 1 | 169 | 1 | 169 |
 | `SFNN_halfka2_1024_7_64_k21k21` | 1 | 441 | 1 | 441 |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1 | 841 | 1 | 841 |
+| `SFNN_halfka2_1024_7_64_hand4` | 4 | 1 | 1 | 4 |
+| `SFNN_halfka2_1024_7_64_hand16` | 16 | 1 | 1 | 16 |
+| `SFNN_halfka2_1024_7_64_hand64` | 64 | 1 | 1 | 64 |
+| `SFNN_halfka2_1024_7_64_hand64z` | 64 | 1 | 1 | 64 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | 1 | 1 | 256 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 256 | 9 | 1 | 2304 |
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1 | 9 | 8 | 72 |
@@ -293,13 +297,47 @@ Hand buckets combine the side-to-move hand bucket and the non-side hand bucket.
 | Token | Buckets per side | Final hand buckets | What it sees |
 |---|---:|---:|---|
 | omitted | 1 | 1 | ignores hands |
-| `hand64` | 8 | 64 | coarse hand-piece score |
+| `hand4` | 2 | 4 | bishop presence |
+| `hand16` | 4 | 16 | pawn and bishop presence |
+| `hand64` | 8 | 64 | 3 presence bits |
+| `hand64z` | 8 | 64 | coarse hand-piece score zone |
 | `hand256` | 16 | 256 | 4 presence bits |
 | `hand1024` | 32 | 1024 | 5 presence bits |
 
+`hand64` is no longer the old score-zone split. YaneuraOu renamed the old `hand64` formula to `hand64z`; the current `hand64` is a 3-bit hand-piece presence split.
+
+### `hand4` and `hand16`
+
+`hand4` / `hand16` are lightweight hand buckets. They build a one-side bucket, then combine the side-to-move and non-side buckets.
+
+| Token | One-side bucket | Final bucket |
+|---|---|---|
+| `hand4` | `has bishop ? 1 : 0` | `stm_1bit * 2 + non_stm_1bit` |
+| `hand16` | bit0=`has pawn`, bit1=`has bishop` | `stm_2bit * 4 + non_stm_2bit` |
+
+Use `hand4` when you only want a very cheap bishop-in-hand split, and `hand16` when pawn-in-hand should also be visible.
+
 ### `hand64`
 
-`hand64` scores one side's hand and rounds it into 8 buckets.
+`hand64` represents one side's hand with three presence-bit groups.
+
+| bit | Meaning |
+|---:|---|
+| bit0 | has pawn/lance/knight |
+| bit1 | has gold/silver/rook |
+| bit2 | has bishop |
+
+The one-side bucket is a 3-bit value in `0..7`. The final bucket is:
+
+```text
+hand64_bucket = stm_3bit * 8 + non_stm_3bit
+```
+
+Use `hand64` when bishop-in-hand should be independent, but `hand256` / `hand1024` are too fine-grained.
+
+### `hand64z`
+
+`hand64z` is the old `hand64` score-zone formula. It scores one side's hand and rounds it into 8 buckets.
 
 | Piece | Score |
 |---|---:|
@@ -324,8 +362,10 @@ One-side bucket is `min((score + 3) / 4, 7)`.
 Final bucket:
 
 ```text
-hand64_bucket = stm_bucket * 8 + non_stm_bucket
+hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 ```
+
+`hand64z` is useful when you care more about coarse hand-piece amount than exact hand-piece groups. It has the same 64-bucket count as `hand64`, but it is not compatible with `hand64`.
 
 ### `hand256` and `hand1024`
 
@@ -398,7 +438,10 @@ The hand / king / progress axes multiply, so combinations can become huge quickl
 | `k9k9z` | 81 | same size as `k9k9` |
 | `k13k13z` | 169 | middle ground |
 | `k29k29` | 841 | still reasonable if king-only |
+| `hand4` | 4 | lightweight bishop-in-hand split |
+| `hand16` | 16 | lightweight pawn/bishop-in-hand split |
 | `hand64_k3k3` | 576 | light hand + king split |
+| `hand64z_k3k3` | 576 | old `hand64`-style score zone + king |
 | `hand256_k3k3` | 2304 | useful comparison point |
 | `hand256_k9k9z` | 20736 | already large |
 | `hand256_k13k13z` | 43264 | watch teacher data, VRAM, and checkpoint size |
@@ -418,7 +461,7 @@ These are practical starting points, not universal rules.
 | `k9k9z` is too coarse | `k13k13z` | keeps ranks 1-7 and zones ranks 8-9 |
 | detailed deepest home ranks | `k21k21` | lighter than `k29k29` |
 | detailed ranks 7-9 | `k29k29` | high capacity, lower teacher density |
-| split by hand pieces | `hand64`, `hand256`, `hand1024` | grows quickly with king buckets |
+| split by hand pieces | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | grows quickly with king buckets |
 | split by game phase | `progress8`, `progress16` | independent third axis combined with hand / king |
 
 Larger buckets may show slower early accuracy because each stack receives fewer samples. Compare not only short-run accuracy, but also long-run loss, actual engine strength, checkpoint size, and training speed.

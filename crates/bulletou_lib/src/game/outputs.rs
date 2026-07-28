@@ -286,14 +286,57 @@ impl OutputBuckets<PackedSfenValue> for ShogiKing29ByKing29Bucket {
     }
 }
 
+/// SFNN `hand4` bucket for one side's hand.
+///
+/// This formula must match the engine-side `hand4_single_bucket()`:
+/// bit0 = bishop exists.
+#[inline]
+pub fn shogi_hand4_single_bucket(hand: Hand) -> usize {
+    usize::from(hand.bishop() > 0)
+}
+
+/// SFNN `hand16` bucket for one side's hand.
+///
+/// This formula must match the engine-side `hand16_single_bucket()`:
+/// bit0 = pawn exists, bit1 = bishop exists.
+#[inline]
+pub fn shogi_hand16_single_bucket(hand: Hand) -> usize {
+    let mut bucket = 0usize;
+    if hand.pawn() > 0 {
+        bucket |= 1;
+    }
+    if hand.bishop() > 0 {
+        bucket |= 2;
+    }
+    bucket
+}
+
 /// SFNN `hand64` bucket for one side's hand.
 ///
 /// This formula must match the engine-side `hand64_single_bucket()`:
-/// pawn=1, lance/knight=2, silver/gold=3, bishop/rook=5, then `(score+3)/4`
-/// clamped to `0..=7`. Dividing by 4 keeps a single bishop/rook out of the
-/// same bucket as a single pawn.
+/// bit0 = pawn/lance/knight exists, bit1 = gold/silver/rook exists,
+/// bit2 = bishop exists.
 #[inline]
 pub fn shogi_hand64_single_bucket(hand: Hand) -> usize {
+    let mut bucket = 0usize;
+    if hand.pawn() + hand.lance() + hand.knight() > 0 {
+        bucket |= 1;
+    }
+    if hand.gold() + hand.silver() + hand.rook() > 0 {
+        bucket |= 2;
+    }
+    if hand.bishop() > 0 {
+        bucket |= 4;
+    }
+    bucket
+}
+
+/// SFNN `hand64z` bucket for one side's hand.
+///
+/// This is the former BulletOu/YaneuraOu `hand64` score-zone formula, renamed
+/// on the engine side to `hand64z`.
+#[inline]
+pub fn shogi_hand64z_single_bucket(hand: Hand) -> usize {
     let score = usize::from(hand.pawn())
         + usize::from(hand.lance() + hand.knight()) * 2
         + usize::from(hand.silver() + hand.gold()) * 3
@@ -350,6 +393,56 @@ pub fn shogi_hand1024_single_bucket(hand: Hand) -> usize {
     bucket
 }
 
+/// YaneuraOu SFNN `hand4` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 2 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand4Bucket;
+
+impl ShogiHand4Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand4_single_bucket(stm_hand) * 2 + shogi_hand4_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand4Bucket {
+    const BUCKETS: usize = 4;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand16` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 4 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand16Bucket;
+
+impl ShogiHand16Bucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand16_single_bucket(stm_hand) * 4 + shogi_hand16_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand16Bucket {
+    const BUCKETS: usize = 16;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
 /// YaneuraOu SFNN `hand64` LayerStack bucket.
 ///
 /// Bucket index is `stm_hand_bucket * 8 + non_stm_hand_bucket`.
@@ -368,6 +461,31 @@ impl ShogiHand64Bucket {
 }
 
 impl OutputBuckets<PackedSfenValue> for ShogiHand64Bucket {
+    const BUCKETS: usize = 64;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> usize {
+        Self::bucket_index(pos)
+    }
+}
+
+/// YaneuraOu SFNN `hand64z` LayerStack bucket.
+///
+/// Bucket index is `stm_hand_bucket * 8 + non_stm_hand_bucket`.
+#[derive(Clone, Copy, Default)]
+pub struct ShogiHand64zBucket;
+
+impl ShogiHand64zBucket {
+    #[inline]
+    pub fn bucket_index(pos: &PackedSfenValue) -> usize {
+        let board = pos.decode();
+        let stm = board.side_to_move;
+        let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+        let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+        shogi_hand64z_single_bucket(stm_hand) * 8 + shogi_hand64z_single_bucket(ntm_hand)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiHand64zBucket {
     const BUCKETS: usize = 64;
 
     fn bucket(&self, pos: &PackedSfenValue) -> usize {
@@ -682,7 +800,10 @@ impl OutputBuckets<PackedSfenValue> for ShogiHand1024King29ByKing29Bucket {
 pub enum ShogiSfnnHandBucketKind {
     #[default]
     None,
+    Hand4,
+    Hand16,
     Hand64,
+    Hand64z,
     Hand256,
     Hand1024,
 }
@@ -691,7 +812,10 @@ impl ShogiSfnnHandBucketKind {
     pub const fn bucket_count(self) -> usize {
         match self {
             Self::None => 1,
+            Self::Hand4 => 4,
+            Self::Hand16 => 16,
             Self::Hand64 => 64,
+            Self::Hand64z => 64,
             Self::Hand256 => 256,
             Self::Hand1024 => 1024,
         }
@@ -700,7 +824,10 @@ impl ShogiSfnnHandBucketKind {
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
         match self {
             Self::None => 0,
+            Self::Hand4 => ShogiHand4Bucket::bucket_index(pos),
+            Self::Hand16 => ShogiHand16Bucket::bucket_index(pos),
             Self::Hand64 => ShogiHand64Bucket::bucket_index(pos),
+            Self::Hand64z => ShogiHand64zBucket::bucket_index(pos),
             Self::Hand256 => ShogiHand256Bucket::bucket_index(pos),
             Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
         }
@@ -851,8 +978,14 @@ impl ShogiSfnnLayerStackBucketKind {
         ShogiSfnnKingBucketKind::King29ByKing29,
         ShogiSfnnProgressBucketKind::None,
     );
+    pub const Hand4: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand4, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const Hand16: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand16, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
     pub const Hand64: Self =
         Self::new(ShogiSfnnHandBucketKind::Hand64, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
+    pub const Hand64z: Self =
+        Self::new(ShogiSfnnHandBucketKind::Hand64z, ShogiSfnnKingBucketKind::None, ShogiSfnnProgressBucketKind::None);
     pub const Hand64KingRank9: Self = Self::new(
         ShogiSfnnHandBucketKind::Hand64,
         ShogiSfnnKingBucketKind::KingRank9,
@@ -1658,6 +1791,26 @@ mod tests {
     }
 
     #[test]
+    fn test_shogi_hand4_and_hand16_single_bucket_formulas() {
+        let empty = Hand::EMPTY;
+        assert_eq!(shogi_hand4_single_bucket(empty), 0);
+        assert_eq!(shogi_hand16_single_bucket(empty), 0);
+
+        let mut hand = Hand::EMPTY;
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand4_single_bucket(hand), 0);
+        assert_eq!(shogi_hand16_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        assert_eq!(shogi_hand4_single_bucket(hand), 1);
+        assert_eq!(shogi_hand16_single_bucket(hand), 2);
+
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand16_single_bucket(hand), 3);
+    }
+
+    #[test]
     fn test_shogi_hand64_single_bucket_formula() {
         let empty = Hand::EMPTY;
         assert_eq!(shogi_hand64_single_bucket(empty), 0);
@@ -1668,7 +1821,7 @@ mod tests {
 
         hand = Hand::EMPTY;
         hand.set_pawn(5);
-        assert_eq!(shogi_hand64_single_bucket(hand), 2);
+        assert_eq!(shogi_hand64_single_bucket(hand), 1);
 
         hand = Hand::EMPTY;
         hand.set_lance(1);
@@ -1682,12 +1835,12 @@ mod tests {
 
         hand = Hand::EMPTY;
         hand.set_bishop(1);
-        assert_eq!(shogi_hand64_single_bucket(hand), 2);
+        assert_eq!(shogi_hand64_single_bucket(hand), 4);
 
         hand = Hand::EMPTY;
         hand.set_bishop(1);
         hand.set_rook(1);
-        assert_eq!(shogi_hand64_single_bucket(hand), 3);
+        assert_eq!(shogi_hand64_single_bucket(hand), 6);
 
         hand = Hand::EMPTY;
         hand.set_pawn(18);
@@ -1698,6 +1851,49 @@ mod tests {
         hand.set_bishop(2);
         hand.set_rook(2);
         assert_eq!(shogi_hand64_single_bucket(hand), 7);
+    }
+
+    #[test]
+    fn test_shogi_hand64z_single_bucket_formula() {
+        let empty = Hand::EMPTY;
+        assert_eq!(shogi_hand64z_single_bucket(empty), 0);
+
+        let mut hand = Hand::EMPTY;
+        hand.set_pawn(1);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(5);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_lance(1);
+        hand.set_knight(1);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 1);
+
+        hand = Hand::EMPTY;
+        hand.set_silver(1);
+        hand.set_gold(1);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 2);
+
+        hand = Hand::EMPTY;
+        hand.set_bishop(1);
+        hand.set_rook(1);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 3);
+
+        hand = Hand::EMPTY;
+        hand.set_pawn(18);
+        hand.set_lance(4);
+        hand.set_knight(4);
+        hand.set_silver(4);
+        hand.set_gold(4);
+        hand.set_bishop(2);
+        hand.set_rook(2);
+        assert_eq!(shogi_hand64z_single_bucket(hand), 7);
     }
 
     #[test]
@@ -1797,7 +1993,10 @@ mod tests {
         assert_eq!(ShogiSfnnLayerStackBucketKind::King13ZoneByKing13Zone.num_stacks(), 169);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King21ByKing21.num_stacks(), 441);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King29ByKing29.num_stacks(), 841);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand4.num_stacks(), 4);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand16.num_stacks(), 16);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64.num_stacks(), 64);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64z.num_stacks(), 64);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank9.num_stacks(), 576);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64KingRank81.num_stacks(), 5184);
         assert_eq!(ShogiSfnnLayerStackBucketKind::Hand64King21ByKing21.num_stacks(), 28224);
