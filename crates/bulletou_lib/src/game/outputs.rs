@@ -4,7 +4,11 @@ use bulletformat::{ChessBoard, chess::MarlinFormat};
 
 use crate::shogi::{
     BonaPiece, Color, Hand, PackedSfenValue, Piece,
-    bona_piece::FE_OLD_END,
+    bona_piece::{
+        E_DRAGON, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER,
+        E_HORSE, F_DRAGON, F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK,
+        F_HAND_SILVER, F_HORSE, FE_OLD_END,
+    },
     types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES, Square},
 };
 
@@ -1010,6 +1014,61 @@ impl ShogiSfnnProgressQ16Params {
         Self { bias_q16: 0, weights_q16: vec![0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT].into_boxed_slice() }
     }
 
+    /// Deterministic built-in progress parameters used by BulletOu when an
+    /// SFNN `progressN` architecture is selected.
+    ///
+    /// This is intentionally not loaded from a user-provided side file. The
+    /// parameters are exported into the `nn.bin` Progress section, so
+    /// YaneuraOu and BulletOu see the same bucket assignment.
+    ///
+    /// The heuristic is deliberately simple: hand material increases progress,
+    /// and promoted major pieces on board add a small amount. Normal board
+    /// pieces are left at zero so the start position maps near the opening
+    /// side of the scale.
+    pub fn material_heuristic() -> Self {
+        fn q16(x: f32) -> i32 {
+            (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+        }
+
+        fn fill_bp(bp_weights: &mut [i32], start: u16, len: usize, value: i32) {
+            let start = start as usize;
+            let end = start.saturating_add(len).min(bp_weights.len());
+            for weight in &mut bp_weights[start..end] {
+                *weight = value;
+            }
+        }
+
+        let mut bp_weights = vec![0i32; FE_OLD_END];
+        let hand_point = 0.07_f32;
+        for &(f_start, e_start, len, piece_points) in &[
+            (F_HAND_PAWN, E_HAND_PAWN, 18usize, 1.0_f32),
+            (F_HAND_LANCE, E_HAND_LANCE, 4usize, 2.0_f32),
+            (F_HAND_KNIGHT, E_HAND_KNIGHT, 4usize, 2.0_f32),
+            (F_HAND_SILVER, E_HAND_SILVER, 4usize, 3.0_f32),
+            (F_HAND_GOLD, E_HAND_GOLD, 4usize, 3.0_f32),
+            (F_HAND_BISHOP, E_HAND_BISHOP, 2usize, 5.0_f32),
+            (F_HAND_ROOK, E_HAND_ROOK, 2usize, 5.0_f32),
+        ] {
+            let value = q16(hand_point * piece_points);
+            fill_bp(&mut bp_weights, f_start, len, value);
+            fill_bp(&mut bp_weights, e_start, len, value);
+        }
+
+        // Horses and dragons usually imply the game has progressed even if the
+        // captured material is not currently in hand.
+        fill_bp(&mut bp_weights, F_HORSE, 81, q16(0.18));
+        fill_bp(&mut bp_weights, E_HORSE, 81, q16(0.18));
+        fill_bp(&mut bp_weights, F_DRAGON, 81, q16(0.22));
+        fill_bp(&mut bp_weights, E_DRAGON, 81, q16(0.22));
+
+        let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+        for _sq in 0..81 {
+            weights_q16.extend_from_slice(&bp_weights);
+        }
+
+        Self { bias_q16: q16(-3.0), weights_q16: weights_q16.into_boxed_slice() }
+    }
+
     pub fn new(bias_q16: i32, weights_q16: Vec<i32>) -> Result<Self, String> {
         if weights_q16.len() != SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
             return Err(format!(
@@ -1800,6 +1859,14 @@ mod tests {
         assert_eq!(shogi_sfnn_progress_bucket_from_value(128, 8), 4);
         assert_eq!(shogi_sfnn_progress_bucket_from_value(255, 8), 7);
         assert_eq!(shogi_sfnn_progress_bucket_from_value(255, 32), 31);
+    }
+
+    #[test]
+    fn test_shogi_sfnn_progress_material_heuristic_shape() {
+        let params = ShogiSfnnProgressQ16Params::material_heuristic();
+        assert_eq!(params.weights_q16.len(), SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+        assert!(params.bias_q16 < 0);
+        assert!(params.weights_q16.iter().any(|&w| w > 0));
     }
 
     #[test]

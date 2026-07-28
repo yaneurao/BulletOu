@@ -368,7 +368,11 @@ hand64_bucket = stm_bucket * 8 + non_stm_bucket
 
 ## 9.11 progress bucket
 
-`progressN` は、やねうら王互換の SFNN progress parameter から `0..255` の進行度を計算し、それを N 個の bucket に割り当てます。
+`progressN` は、局面から `0..255` の進行度値を計算し、それを N 個の bucket に割り当てる仕組みです。
+
+ユーザーが外部ファイルを指定する必要はありません。`progressN` に必要な Progress section は、BulletOu が `nn.bin` の一部として出力します。architecture 名に `progress8` や `progress16` を付けるだけで、LayerStack の第3軸として progress bucket が合成されます。
+
+現在の BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を内部で生成します。これにより、外部ファイルなしで BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
 
 | token | progress buckets |
 |---|---:|
@@ -397,7 +401,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
-既存の q16 progress parameter を使う場合だけ、`--sfnn-progress-params <file>` を指定します。省略した場合は zero parameter を書き出すので、全局面が中立付近の progress bucket に入ります。
+`--sfnn-progress-params` のような外部ファイル指定はありません。Progress parameter は BulletOu が内部で用意し、`nn.bin` の中に含めます。
 
 注意: 現状の CUDA factorizer layout では、`progressN` と `king=axis` / `hand=axis` factorizer は併用できません。`shared` factorizer は併用できます。
 
@@ -433,7 +437,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | 自陣最深部をマス単位で見たい | `k21k21` | `k29k29` より軽い |
 | 自陣 7〜9段をマス単位で見たい | `k29k29` | 表現力は高いが教師密度が落ちる |
 | 持ち駒で局面を分けたい | `hand64`, `hand256`, `hand1024` | king bucket と掛け合わせると急激に巨大化する |
-| 序盤/中盤/終盤で分けたい | `progress8`, `progress16` | progress parameter の扱いに注意 |
+| 序盤/中盤/終盤で分けたい | `progress8`, `progress16` | hand / king と独立した第3軸として使える |
 
 大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、checkpoint サイズ、学習速度も合わせて見てください。
 

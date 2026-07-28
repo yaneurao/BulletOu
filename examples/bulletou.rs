@@ -65,9 +65,8 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
-        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
-        ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
-        set_shogi_sfnn_progress_q16_params,
+        SHOGI_SFNN_PROGRESS_HASH, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind, ShogiSfnnLayerStackBucketKind,
+        ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params, set_shogi_sfnn_progress_q16_params,
     },
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
@@ -2130,64 +2129,11 @@ fn effective_sfnn_axis_factorized_l2_l3(args: &Args) -> bool {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn load_sfnn_progress_q16_params_from_file(path: &Path) -> Result<ShogiSfnnProgressQ16Params, String> {
-    let bytes =
-        std::fs::read(path).map_err(|err| format!("failed to read SFNN progress params {}: {err}", path.display()))?;
-    let weight_count = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT;
-    let q16_len = std::mem::size_of::<i32>() + weight_count * std::mem::size_of::<i32>();
-    let hashed_q16_len = std::mem::size_of::<u32>() + q16_len;
-
-    let payload = if bytes.len() == hashed_q16_len {
-        let hash = u32::from_le_bytes(bytes[0..4].try_into().expect("slice len checked"));
-        if hash != SHOGI_SFNN_PROGRESS_HASH {
-            return Err(format!(
-                "SFNN progress q16 hash mismatch in {}: expected 0x{SHOGI_SFNN_PROGRESS_HASH:08X}, got 0x{hash:08X}",
-                path.display()
-            ));
-        }
-        &bytes[4..]
-    } else if bytes.len() == q16_len {
-        &bytes[..]
-    } else {
-        return Err(format!(
-            "SFNN progress params size mismatch for {}: got {} bytes; expected q16 {} bytes or hashed q16 {} bytes",
-            path.display(),
-            bytes.len(),
-            q16_len,
-            hashed_q16_len
-        ));
-    };
-
-    let bias_q16 = i32::from_le_bytes(payload[0..4].try_into().expect("slice len checked"));
-    let weights = payload[4..]
-        .chunks_exact(std::mem::size_of::<i32>())
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("chunk len checked")))
-        .collect::<Vec<_>>();
-    ShogiSfnnProgressQ16Params::new(bias_q16, weights)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn sfnn_progress_params_for_layerstack(
-    args: &Args,
-    layerstack: LayerStackMode,
-) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
+fn sfnn_progress_params_for_layerstack(layerstack: LayerStackMode) -> Option<ShogiSfnnProgressQ16Params> {
     if layerstack.progress_bucket_count() == 1 {
-        if args.sfnn_progress_params.is_some() {
-            return Err("--sfnn-progress-params is only valid for SFNN progressN architectures".to_string());
-        }
-        return Ok(None);
+        return None;
     }
-
-    if let Some(path) = args.sfnn_progress_params.as_deref() {
-        return load_sfnn_progress_q16_params_from_file(path).map(Some);
-    }
-
-    eprintln!(
-        "  WARN: {} uses progress{} but --sfnn-progress-params was not specified; zero progress parameters will map positions to the neutral bucket",
-        args.arch().cli_name(),
-        layerstack.progress_bucket_count()
-    );
-    Ok(Some(ShogiSfnnProgressQ16Params::zero()))
+    Some(ShogiSfnnProgressQ16Params::material_heuristic())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -2649,14 +2595,6 @@ struct Args {
     #[arg(long = "no-sfnn-factorized", conflicts_with = "sfnn_factorizer")]
     no_sfnn_factorized: bool,
 
-    /// YaneuraOu-compatible SFNN progress parameters for `progressN`
-    /// LayerStacks. Accepts a q16 payload containing bias + `81*FE_OLD_END`
-    /// i32 weights, optionally preceded by the YaneuraOu progress hash.
-    /// If omitted for a `progressN` arch, zero parameters are used and
-    /// positions fall into the neutral progress bucket.
-    #[arg(long = "sfnn-progress-params")]
-    sfnn_progress_params: Option<PathBuf>,
-
     /// Held-out test set (.hcpe / .psv / .bin) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
@@ -2852,9 +2790,6 @@ impl Args {
         if self.sfnn_factorizer.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
         }
-        if self.sfnn_progress_params.is_some() && !eval_type.uses_layerstack() {
-            return Err("--sfnn-progress-params currently applies to SFNN / LayerStack eval types only".to_string());
-        }
         if let Some(spec) = self.sfnn_factorizer {
             if let Some(layerstack) = self.effective_layerstack() {
                 if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
@@ -2877,12 +2812,6 @@ impl Args {
                 }
             }
         }
-        if let Some(layerstack) = self.effective_layerstack() {
-            if self.sfnn_progress_params.is_some() && !layerstack.has_progress_axis() {
-                return Err("--sfnn-progress-params is only valid for SFNN progressN architectures".to_string());
-            }
-        }
-
         if let Some(0) = self.cuda_cpp_train_steps {
             return Err("--cuda-cpp-train-steps must be > 0".to_string());
         }
@@ -3431,10 +3360,6 @@ fn main() {
         eprintln!("error: --sfnn-factorizer currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
-    if args.sfnn_progress_params.is_some() && !args.eval_type().uses_layerstack() {
-        eprintln!("error: --sfnn-progress-params currently applies to SFNN / LayerStack eval types only.");
-        std::process::exit(2);
-    }
     if let Some(spec) = args.sfnn_factorizer {
         if let Some(layerstack) = args.effective_layerstack() {
             if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
@@ -3458,12 +3383,6 @@ fn main() {
                 );
                 std::process::exit(2);
             }
-        }
-    }
-    if let Some(layerstack) = args.effective_layerstack() {
-        if args.sfnn_progress_params.is_some() && !layerstack.has_progress_axis() {
-            eprintln!("error: --sfnn-progress-params is only valid for SFNN progressN architectures.");
-            std::process::exit(2);
         }
     }
     // `geometric` and `cos` sweep from `--lr` (lr_max) down to `--lr-min`.
@@ -5927,7 +5846,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let num_stacks = layerstack.num_stacks();
-    let sfnn_progress_params = sfnn_progress_params_for_layerstack(args, layerstack)?;
+    let sfnn_progress_params = sfnn_progress_params_for_layerstack(layerstack);
     if let Some(params) = sfnn_progress_params.clone() {
         set_shogi_sfnn_progress_q16_params(params)?;
     }
@@ -10592,9 +10511,6 @@ fn resume_signature(args: &Args) -> String {
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
-    let sfnn_progress_params =
-        args.sfnn_progress_params.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
-
     [
         "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
@@ -10641,7 +10557,6 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorized_l1={}", effective_sfnn_factorized_l1(args)),
         format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
-        format!("sfnn_progress_params={sfnn_progress_params}"),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={}", args.test_positions),
         format!("test_batch_size={}", args.test_batch_size),
@@ -10678,23 +10593,21 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     if stored.trim_end() == current.trim_end() {
         return true;
     }
+    if resume_signature_without_line(stored, "sfnn_progress_params=").trim_end() == current.trim_end() {
+        return true;
+    }
     let stored_has_validation_rate = stored.lines().any(|line| line.starts_with("validation_rate="));
     let stored_has_factorizer = stored.lines().any(|line| line.starts_with("sfnn_factorizer="));
-    let stored_has_progress_params = stored.lines().any(|line| line.starts_with("sfnn_progress_params="));
     let factorizer = effective_sfnn_factorizer_spec(args);
     let can_omit_validation_rate =
         !stored_has_validation_rate && effective_validation_rate(args) == effective_save_rate(args);
     let can_omit_factorizer = !stored_has_factorizer && !factorizer.king_axis && !factorizer.hand_axis;
-    let can_omit_progress_params = !stored_has_progress_params && args.sfnn_progress_params.is_none();
     let mut candidate = current.clone();
     if can_omit_validation_rate {
         candidate = resume_signature_without_line(&candidate, "validation_rate=");
     }
     if can_omit_factorizer {
         candidate = resume_signature_without_line(&candidate, "sfnn_factorizer=");
-    }
-    if can_omit_progress_params {
-        candidate = resume_signature_without_line(&candidate, "sfnn_progress_params=");
     }
     stored.trim_end() == candidate.trim_end()
 }
@@ -12335,20 +12248,8 @@ mod tests {
     }
 
     #[test]
-    fn sfnn_progress_params_cli_uses_yaneuraou_params_name() {
+    fn sfnn_progress_params_cli_is_not_supported() {
         use clap::Parser as _;
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "SFNN_halfka2_1024_7_64_progress8",
-            "--teacher",
-            "/dev/null",
-            "--sfnn-progress-params",
-            "progress-params.bin",
-        ])
-        .unwrap();
-        assert_eq!(args.sfnn_progress_params, Some(std::path::PathBuf::from("progress-params.bin")));
 
         assert!(
             Args::try_parse_from([
@@ -12357,8 +12258,8 @@ mod tests {
                 "SFNN_halfka2_1024_7_64_progress8",
                 "--teacher",
                 "/dev/null",
-                "--sfnn-progress-bin",
-                "progress.bin",
+                "--sfnn-progress-params",
+                "progress-params.bin",
             ])
             .is_err()
         );
@@ -15281,6 +15182,26 @@ mod tests {
         let old_axis_signature = resume_signature_without_line(&resume_signature(&axis), "sfnn_factorizer=");
 
         assert!(!resume_signature_matches(&old_axis_signature, &axis));
+    }
+
+    #[test]
+    fn resume_signature_accepts_removed_sfnn_progress_params_none_line() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3_progress8",
+            "--teacher",
+            "/dev/null",
+            "--save-rate",
+            "7",
+        ])
+        .unwrap();
+        let mut old_signature = resume_signature(&args);
+        old_signature.insert_str(old_signature.find("test_teacher=").unwrap(), "sfnn_progress_params=none\n");
+
+        assert!(resume_signature_matches(&old_signature, &args));
     }
 
     #[test]
