@@ -370,9 +370,9 @@ hand64_bucket = stm_bucket * 8 + non_stm_bucket
 
 `progressN` は、局面から `0..255` の進行度値を計算し、それを N 個の bucket に割り当てる仕組みです。
 
-ユーザーが外部ファイルを指定する必要はありません。`progressN` に必要な Progress section は、BulletOu が `nn.bin` の一部として出力します。architecture 名に `progress8` や `progress16` を付けるだけで、LayerStack の第3軸として progress bucket が合成されます。
+architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3軸として progress bucket が合成されます。`progressN` に必要な Progress section は、BulletOu が `nn.bin` の一部として出力します。
 
-現在の BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を内部で生成します。これにより、外部ファイルなしで BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
+現在の BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を使います。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
 
 | token | progress buckets |
 |---|---:|
@@ -400,8 +400,6 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 | FeatureTransformer | L0 bias/weight |
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
-
-`--sfnn-progress-params` のような外部ファイル指定はありません。Progress parameter は BulletOu が内部で用意し、`nn.bin` の中に含めます。
 
 注意: 現状の CUDA factorizer layout では、`progressN` と `king=axis` / `hand=axis` factorizer は併用できません。`shared` factorizer は併用できます。
 

@@ -354,9 +354,9 @@ hand64_bucket = stm_bucket * 8 + non_stm_bucket
 
 `progressN` computes a scalar progress value in `0..255`, then maps that value to N buckets.
 
-Users do not pass an external file. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`. Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis.
+Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`.
 
-Current BulletOu generates deterministic material-progress parameters internally, based on hand material and promoted major pieces. This keeps BulletOu training and YaneuraOu inference on the same progress bucket assignment without any external side file.
+Current BulletOu uses deterministic material-progress parameters based on hand material and promoted major pieces. This keeps BulletOu training and YaneuraOu inference on the same progress bucket assignment.
 
 | Token | Progress buckets |
 |---|---:|
@@ -384,8 +384,6 @@ When `progressN` is used, the exported `nn.bin` includes a Progress section.
 | FeatureTransformer | L0 bias/weight |
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
-
-There is no `--sfnn-progress-params` external-file option. BulletOu prepares the Progress parameters internally and writes them into `nn.bin`.
 
 Note: the current CUDA factorizer layout does not allow `progressN` together with `king=axis` or `hand=axis`. The `shared` factorizer can be used with `progressN`.
 
