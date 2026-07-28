@@ -118,7 +118,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--arch` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
-| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
+| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>` (例: `checkpoints/KPPT`、`checkpoints/KPP_KKPT`) |
 | `--net-id` | チェックポイント subdir 名のプレフィクス | target 別自動 |
 | `--batch-size` | 1 gradient step あたりの局面数 | 65536 |

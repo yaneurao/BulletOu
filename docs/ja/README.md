@@ -8,7 +8,7 @@
 
 - [NNUE の基礎](reference/1-basics.md) — 入力/隠れ/出力層、perspective ネットワーク
 - [BulletOu を始める](reference/2-getting-started.md) — トレーニング全体の概観 (上流由来)
-- [学習データフォーマット](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv (上流由来 + 将棋拡張)
+- [学習データフォーマット](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv / .bin (上流由来 + 将棋拡張)
 - [学習済みネットワーク](reference/4-saved-networks.md) — チェックポイントのレイアウト、SavedFormat、量子化、変換チェーン
 
 将棋固有:

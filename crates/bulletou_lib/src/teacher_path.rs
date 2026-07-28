@@ -2,7 +2,7 @@
 //!
 //! A `--teacher` argument may be:
 //! - a single file with one of the supported extensions
-//!   (`.hcpe` / `.hcpe3` / `.pack` / `.psv`),
+//!   (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`),
 //! - a directory containing such files (all matching files are concatenated,
 //!   sorted by filename), or
 //! - a comma-separated list of either.
@@ -14,7 +14,7 @@
 use std::path::Path;
 
 /// Supported teacher-file extensions (lowercase, no leading dot).
-pub const TEACHER_EXTS: &[&str] = &["hcpe", "hcpe3", "pack", "psv"];
+pub const TEACHER_EXTS: &[&str] = &["hcpe", "hcpe3", "pack", "psv", "bin"];
 
 /// Teacher file format inferred from the file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub enum DataFormat {
     Hcpe3,
     /// YaneuraOu-ScriptCollection `gensfen` `.pack` (per-game variable-length).
     Pack,
-    /// Flat `PackedSfenValue` dump (`.psv`, 40-byte fixed-length).
+    /// Flat `PackedSfenValue` dump (`.psv` / `.bin`, 40-byte fixed-length).
     Psv,
 }
 
@@ -60,7 +60,7 @@ pub fn expand_teacher(teacher: &str) -> Result<Vec<String>, String> {
             }
             if found.is_empty() {
                 return Err(format!(
-                    "no teacher files found in directory {part}\n  expected files with extension: .hcpe / .hcpe3 / .pack / .psv"
+                    "no teacher files found in directory {part}\n  expected files with extension: .hcpe / .hcpe3 / .pack / .psv / .bin"
                 ));
             }
             found.sort();
@@ -80,8 +80,9 @@ pub fn expand_teacher(teacher: &str) -> Result<Vec<String>, String> {
 /// Infer the [`DataFormat`] common to all the given paths.
 ///
 /// Returns an `Err` if a path has an unrecognised extension, or if multiple
-/// paths have different extensions (mixed-format teacher sets are rejected
-/// because the trainer dispatches one loader for the whole batch).
+/// paths map to different data formats (mixed-format teacher sets are rejected
+/// because the trainer dispatches one loader for the whole batch). `.bin` maps
+/// to the same fixed-record PSV format as `.psv`.
 pub fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
     let mut found: Option<DataFormat> = None;
     for p in paths {
@@ -90,10 +91,10 @@ pub fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
             Some("hcpe") => DataFormat::Hcpe,
             Some("hcpe3") => DataFormat::Hcpe3,
             Some("pack") => DataFormat::Pack,
-            Some("psv") => DataFormat::Psv,
+            Some("psv") | Some("bin") => DataFormat::Psv,
             _ => {
                 return Err(format!(
-                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack / .psv"
+                    "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack / .psv / .bin"
                 ));
             }
         };
@@ -134,14 +135,15 @@ mod tests {
     #[test]
     fn expand_directory_enumerates_matching_files_sorted() {
         let d = tmp_dir("dir_enum");
-        for n in ["c.hcpe", "a.hcpe", "b.hcpe", "ignored.txt"] {
+        for n in ["c.hcpe", "a.hcpe", "b.hcpe", "d.bin", "ignored.txt"] {
             fs::write(d.join(n), b"x").unwrap();
         }
         let got = expand_teacher(d.to_str().unwrap()).unwrap();
-        assert_eq!(got.len(), 3);
+        assert_eq!(got.len(), 4);
         assert!(got[0].ends_with("a.hcpe"));
         assert!(got[1].ends_with("b.hcpe"));
         assert!(got[2].ends_with("c.hcpe"));
+        assert!(got[3].ends_with("d.bin"));
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -168,6 +170,8 @@ mod tests {
         assert_eq!(infer_data_format(&["a.hcpe", "b.hcpe"]).unwrap(), DataFormat::Hcpe);
         assert_eq!(infer_data_format(&["a.pack"]).unwrap(), DataFormat::Pack);
         assert_eq!(infer_data_format(&["a.psv"]).unwrap(), DataFormat::Psv);
+        assert_eq!(infer_data_format(&["a.bin"]).unwrap(), DataFormat::Psv);
+        assert_eq!(infer_data_format(&["a.psv", "b.bin"]).unwrap(), DataFormat::Psv);
         assert_eq!(infer_data_format(&["a.HCPE3"]).unwrap(), DataFormat::Hcpe3);
     }
 

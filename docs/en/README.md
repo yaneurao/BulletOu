@@ -8,7 +8,7 @@ If you are new to BulletOu, start with the [tutorial](tutorial/).
 
 - [NNUE Basics](reference/1-basics.md) — input/hidden/output layers, perspective networks
 - [Getting started with BulletOu](reference/2-getting-started.md) — high-level training pipeline overview (upstream-derived)
-- [Training data formats](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv (upstream + shogi extensions)
+- [Training data formats](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv / .bin (upstream + shogi extensions)
 - [Saved Networks](reference/4-saved-networks.md) — checkpoint layout, SavedFormat, quantisation, transformation chains
 
 Shogi-specific:

@@ -30,10 +30,10 @@ single-component trainers are internal helpers driven by `--arch KPPT` /
 `--arch KPP_KKPT` rather than CLI options.)
 
 Teacher data is given via `--teacher`. The argument is either a single
-file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory containing such
+file (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`), a directory containing such
 files (all matching files are concatenated), or a comma-separated list
-of either. Format is inferred from the file extension; all files must
-share the same extension.
+of either. Format is inferred from the file extension; `.bin` is treated as
+PSV-compatible 40-byte `PackedSfenValue` data.
 
 Usage:
 
@@ -2326,10 +2326,10 @@ struct Args {
     cuda_cpp_loss_readback_interval: usize,
 
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /
-    /// `.psv`), a directory containing such files (all matching files are
+    /// `.psv` / `.bin`), a directory containing such files (all matching files are
     /// concatenated), or a comma-separated list of either. Format is
     /// inferred from the extension; all included files must share the same
-    /// extension.
+    /// data format. `.bin` is treated as PSV-compatible 40-byte records.
     #[arg(long)]
     teacher: String,
 
@@ -2648,7 +2648,7 @@ struct Args {
     #[arg(long = "sfnn-progress-params")]
     sfnn_progress_params: Option<PathBuf>,
 
-    /// Held-out test set (.hcpe / .psv) for sign-agreement validation
+    /// Held-out test set (.hcpe / .psv / .bin) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
     /// defaulting to `--save-rate`) and also at save events: samples
@@ -3008,7 +3008,7 @@ fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
 // ----- count-teacher -----------------------------------------------------
 
 /// Count positions in all files passed via `--teacher` and print the result to
-/// stdout. HCPE (38-byte fixed record) and PSV (40-byte fixed record) can be
+/// stdout. HCPE (38-byte fixed record) and PSV/.bin (40-byte fixed record) can be
 /// computed from file size; HCPE3 / pack are variable-length and are rejected.
 ///
 /// Helper for choosing `--superbatches N` relative to the default ~100M-position

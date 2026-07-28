@@ -23,7 +23,7 @@ const PSV_RECORD_BYTES: usize = size_of::<PackedSfenValue>();
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Teacher file, directory, or comma-separated list (.hcpe/.hcpe3/.pack/.psv).
+    /// Teacher file, directory, or comma-separated list (.hcpe/.hcpe3/.pack/.psv/.bin).
     #[arg(long)]
     teacher: String,
 

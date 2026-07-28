@@ -70,7 +70,7 @@ If `geometric` or `cos` is selected explicitly, the schedule sweeps from `--lr` 
 | Situation | period |
 |---|---|
 | `--superbatches N` set | `N × sb_size` (= one epoch, the **recommended** setup) |
-| Unlimited sb AND HCPE / PSV teacher | Total teacher position count (read from file sizes) |
+| Unlimited sb AND HCPE / PSV/.bin teacher | Total teacher position count (read from file sizes) |
 | Unlimited sb AND HCPE3 / pack teacher | Error — variable-length format, set `--superbatches` explicitly |
 
 When `--superbatches N` is set, an epoch is a validation / LR-control cycle, **not** one teacher pass. If the teacher reaches EOF in the middle of an epoch, BulletOu wraps to the teacher beginning and continues until N superbatches are complete. Conversely, epoch 2 does not rewind the teacher. It starts from the teacher position reached at the end of epoch 1. The teacher is a cyclic stream. `step` / `geometric` / `cos` restart LR back to `--lr` at epoch boundaries.
@@ -219,11 +219,11 @@ The trailing 61M of teacher is not discarded. Epoch 1 reads the first 400M posit
 | Format | Record size | `--count-teacher` |
 |---|---|---|
 | HCPE | 38 byte fixed | ✅ instant |
-| PSV  | 40 byte fixed | ✅ instant |
+| PSV / `.bin` | 40 byte fixed | ✅ instant |
 | HCPE3 | variable (game-structured) | ❌ not yet (would need to walk every game header) |
 | pack | variable (game-structured) | ❌ same |
 
-For HCPE3 / pack, pre-convert the corpus to HCPE / PSV, or set `--superbatches` manually.
+For HCPE3 / pack, pre-convert the corpus to HCPE / PSV/.bin, or set `--superbatches` manually.
 
 ### Multi-epoch training
 

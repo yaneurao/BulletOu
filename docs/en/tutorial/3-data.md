@@ -29,7 +29,7 @@ Architecture size variants such as `NNUE_halfkp_1024x2_8_64` or `SFNN_ka2_8192_7
 
 ## 3.2 Get training data
 
-You need a `.pack`, `.hcpe`, `.hcpe3`, or `.psv` file.
+You need a `.pack`, `.hcpe`, `.hcpe3`, `.psv`, or PSV-compatible `.bin` file.
 
 - **Generate your own** — `.pack` is produced by the `gensfen` script in [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection); `.hcpe` / `.hcpe3` come from dlshogi-style generators. For this tutorial, 10–100 million positions is enough.
 - **Use a shared dataset** — the shogi community shares files in all formats.
@@ -41,7 +41,7 @@ teachers/
     teacher.pack
 ```
 
-(`.hcpe` / `.hcpe3` / `.psv` work the same way. Format is inferred from the extension. You may also point `--teacher` at a directory, in which case all files of the same extension inside are concatenated.)
+(`.hcpe` / `.hcpe3` / `.psv` / `.bin` work the same way. Format is inferred from the extension. You may also point `--teacher` at a directory, in which case all matching files inside are concatenated. `.bin` is treated as the same 40-byte `PackedSfenValue` format as `.psv`, so `.psv` and `.bin` may be mixed.)
 
 ### Pre-shuffle the teacher file
 
@@ -52,7 +52,7 @@ BulletOu does not shuffle teacher positions during training. `--buffer-mb` contr
 `gensfen` and dlshogi-style generators usually emit positions **grouped by game** (positions from one game are contiguous). If you train on such files directly, nearby positions from the same game dominate consecutive mini-batches, and loss / plateau decisions become sensitive to local teacher bias.
 
 How to shuffle:
-- **`.hcpe` / `.psv`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
+- **`.hcpe` / `.psv` / `.bin`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
 - **`.hcpe3` / `.pack`**: these are variable-length game formats, so record-level shuffling is not straightforward. Shuffle at generation time, or convert to a fixed-position format such as `.psv` / `.hcpe` and shuffle that.
 
 Example: shuffle/split an HCPE or PSV folder into 10M-position files:

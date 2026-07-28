@@ -2,7 +2,7 @@
 //!
 //! Used by the `bulletou` example to compute "value-sign agreement"
 //! accuracy after training: random-pick N positions from a test
-//! `.hcpe` / `.psv`, run them through the trained model, then for each one
+//! `.hcpe` / `.psv` / `.bin`, run them through the trained model, then for each one
 //! check whether the network's raw output and the actual **game
 //! result** (win/loss for the side to move) have the same sign.
 //!
@@ -304,7 +304,7 @@ pub fn compute_sign_accuracy_with_loss(
 /// any other value uses that seed verbatim (= reproducible).
 ///
 /// The teacher may be any path accepted by [`expand_teacher`], but the
-/// format must be fixed-record `.hcpe` or `.psv`. Variable-length
+/// format must be fixed-record `.hcpe`, `.psv`, or PSV-compatible `.bin`. Variable-length
 /// `.hcpe3` / `.pack` teachers are intentionally rejected here; export
 /// them to `.psv` first when a held-out validation sample is needed.
 ///
@@ -733,6 +733,36 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got.iter().map(PackedSfenValue::score).collect::<Vec<_>>(), vec![123, -45, 0]);
         assert_eq!(got.iter().map(PackedSfenValue::game_result).collect::<Vec<_>>(), vec![1, -1, 0]);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_random_teacher_positions_treats_bin_as_psv() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-validate-test-fixed-bin-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        fn psv_with(score: i16, result: i8) -> PackedSfenValue {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut()[32..34].copy_from_slice(&score.to_le_bytes());
+            psv.as_bytes_mut()[38] = result as u8;
+            psv
+        }
+
+        let records = [psv_with(321, 1), psv_with(-54, -1)];
+        let mut bytes = Vec::new();
+        for psv in &records {
+            bytes.extend_from_slice(psv.as_bytes());
+        }
+        std::fs::write(&tmp, bytes).unwrap();
+
+        let got = read_random_teacher_positions(tmp.to_str().unwrap(), 10, 1).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.iter().map(PackedSfenValue::score).collect::<Vec<_>>(), vec![321, -54]);
+        assert_eq!(got.iter().map(PackedSfenValue::game_result).collect::<Vec<_>>(), vec![1, -1]);
 
         let _ = std::fs::remove_file(&tmp);
     }

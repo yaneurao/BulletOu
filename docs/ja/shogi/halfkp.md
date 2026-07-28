@@ -33,7 +33,7 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 ### 必要なもの
 
 - BulletOu をビルド済み (`cargo build --release --features cuda-cpp-backend --example bulletou`)
-- 学習データ (`.hcpe` / `.hcpe3` / `.pack` / `.psv` のいずれか)
+- 学習データ (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin` のいずれか)
 
 ### コマンド
 
@@ -86,7 +86,7 @@ checkpoints/my-halfkp/
 | フラグ | 意味 | デフォルト |
 |---|---|---|
 | `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | (required; target `NNUE_HALFKP` is inferred) |
-| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
+| `--teacher` | 教師ファイル (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`)、またはそれらが入ったディレクトリ、カンマ区切りで併用可 | (必須) |
 | `--output` | チェックポイント親ディレクトリ | `checkpoints/<target>-<arch>` (例: `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | epoch を最大何回実行するか。省略時は固定上限なし | 省略 |
 | `--superbatches` | epoch あたりの superbatch 数の上限 | 上限なし |

@@ -33,7 +33,7 @@ HalfKP sparse input (125,388 dims, per perspective)
 ### Prerequisites
 
 - BulletOu built (`cargo build --release --features cuda-cpp-backend --example bulletou`)
-- Training data (`.hcpe` / `.hcpe3` / `.pack` / `.psv`)
+- Training data (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`)
 
 ### Command
 
@@ -86,7 +86,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | Flag | Meaning | Default |
 |---|---|---|
 | `--arch` | `NNUE_halfkp_256x2_32_32`<br>`NNUE_halfkp_384x2_8_96`<br>`NNUE_halfkp_512x2_8_64`<br>`NNUE_halfkp_768x2_16_64`<br>`NNUE_halfkp_1024x2_8_32`<br>`NNUE_halfkp_1024x2_8_64` | (required; target `NNUE_HALFKP` is inferred) |
-| `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
+| `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<target>-<arch>` (e.g. `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32`) |
 | `--max-epochs` | Maximum number of epochs. If omitted: no fixed epoch cap | omitted |
 | `--superbatches` | Cap superbatches per epoch | unlimited |

@@ -118,7 +118,7 @@ Resume / restart behaviour is identical across every target; see [tutorial 5. St
 | Flag | Meaning | Default |
 |---|---|---|
 | `--arch` | `KPPT` (3-component sequential) / `KPP_KKPT` (factorised) | (required) |
-| `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv`), a directory of such files, or comma-separated combination | (required) |
+| `--teacher` | Teacher file (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`), a directory of such files, or comma-separated combination | (required) |
 | `--output` | Checkpoint parent directory | `checkpoints/<target>` (e.g. `checkpoints/KPPT`, `checkpoints/KPP_KKPT`) |
 | `--net-id` | Prefix of the saved checkpoint subdirectory name | per-target default |
 | `--batch-size` | Positions per gradient step | 65536 |

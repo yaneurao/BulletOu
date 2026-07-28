@@ -102,7 +102,7 @@ The default output dir is `checkpoints/KPPT/`. To get the factorised variant, sw
 
 `--teacher` accepts:
 - a single file (e.g. `teachers/teacher.pack`),
-- a directory (above; all same-extension files inside are concatenated),
+- a directory (above; all matching files inside are concatenated; `.bin` is treated like `.psv`),
 - or a comma-separated combination of the two.
 
 ## 4.7 How long does training run
