@@ -2,13 +2,36 @@
 
 <a href="../../ja/tutorial/9-layerstack.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-A standard NNUE uses the same MLP for every position. SFNN LayerStack models still share the FeatureTransformer, but select a different small MLP stack depending on the position.
+A standard NNUE uses the same late network for every position. SFNN LayerStack models share the input features and the FeatureTransformer, then switch the small MLP stack behind it depending on the position.
 
-The important rule is simple: BulletOu and YaneuraOu must compute exactly the same LayerStack index for the same position.
+For example, `k3k3` has 9 stacks selected by a coarse king-position bucket. `hand256_k3k3` combines 256 hand buckets with 9 king buckets, so it has `256 * 9 = 2304` stacks.
 
-## 9.1 Big picture
+The critical rule is that BulletOu and YaneuraOu must compute exactly the same LayerStack index for the same position. If the index differs by even one, the exported `nn.bin` may load successfully, but the engine will read the wrong stack.
 
-LayerStack selection is the product of three independent axes.
+## 9.1 What LayerStack changes
+
+LayerStack does not change the input feature set. The input features and FeatureTransformer are shared; only the late network is split into stacks.
+
+| Part | Shared across stacks? | Meaning |
+|---|---|---|
+| Input features | shared | `halfka2` / `ka2` etc. do not change |
+| FeatureTransformer | shared | L0 weights are common to all stacks |
+| Late MLP | per-stack | each bucket owns a small L1/L2/L3-style network |
+| Output value | one stack per position | the bucket index selects which stack produces the value |
+
+In practice, each bucket axis gives the late network a different specialization.
+
+| Split by | Intent |
+|---|---|
+| king position | specialize by own/enemy king placement |
+| hand pieces | specialize by material in hand, attack pieces, or endgame-like positions |
+| progress | specialize by opening/middlegame/endgame phase |
+
+The trade-off is teacher density. More buckets give the model more capacity, but each stack receives fewer samples.
+
+## 9.2 The three independent axes
+
+BulletOu's SFNN LayerStack selection is the product of three independent axes.
 
 | Axis | What it looks at | Accepted tokens | Bucket count |
 |---|---|---|---:|
@@ -16,20 +39,22 @@ LayerStack selection is the product of three independent axes.
 | king | side-to-move / non-side king positions | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | game progress | omitted, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
-The final stack count is a product:
+The final stack count is a product.
 
-| Example | hand | king | progress | LayerStacks |
+| Architecture | hand | king | progress | LayerStacks |
 |---|---:|---:|---:|---:|
 | `SFNN_halfka2_1024_7_64` | 1 | 1 | 1 | 1 |
 | `SFNN_halfka2_1024_7_64_k3k3` | 1 | 9 | 1 | 9 |
 | `SFNN_halfka2_1024_7_64_k9k9z` | 1 | 81 | 1 | 81 |
 | `SFNN_halfka2_1024_7_64_k13k13z` | 1 | 169 | 1 | 169 |
+| `SFNN_halfka2_1024_7_64_k21k21` | 1 | 441 | 1 | 441 |
+| `SFNN_halfka2_1024_7_64_k29k29` | 1 | 841 | 1 | 841 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | 1 | 1 | 256 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 256 | 9 | 1 | 2304 |
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1 | 9 | 8 | 72 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` | 256 | 9 | 16 | 36864 |
 
-YaneuraOu composes the runtime index in this order:
+YaneuraOu composes the index in `hand → king → progress` order.
 
 ```text
 idx = hand_bucket
@@ -43,7 +68,7 @@ So `hand256_k3k3_progress16` means:
 idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 ```
 
-## 9.2 Architecture names
+## 9.3 Architecture names
 
 LayerStack tokens may be written in any order, but BulletOu canonicalizes saved names as `hand → king → progress`.
 
@@ -53,7 +78,15 @@ LayerStack tokens may be written in any order, but BulletOu canonicalizes saved 
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | unchanged |
 
-Grouped SFNN / common+shard L1 notation can be combined with the same suffixes:
+No suffix is also valid:
+
+```text
+SFNN_halfka2_1024_7_64
+```
+
+This means LayerStacks=1: no split by king position, hand pieces, or progress.
+
+Grouped SFNN / common+shard L1 notation can be combined with the same suffixes.
 
 ```text
 SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
@@ -61,121 +94,212 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 This means KA2 input, FT=3072, L1 = 1024 common + 256 x 8 shards, and LayerStack = `hand256 × k3k3 × progress16`.
 
-## 9.3 King buckets
+## 9.4 Coordinate rule for king buckets
 
-King buckets normalize the friend king and enemy king to the side-to-move perspective, bucket each king, then combine the pair.
+King buckets bucket the side-to-move king and the non-side king separately, then combine the two single-king buckets.
 
-| Token | Buckets per king | Final king buckets | Rough intent |
+The important detail is that each king square is normalized to that king's own side.
+
+| Term | Meaning |
+|---|---|
+| side-to-move king | the king of the side to move |
+| non-side king | the opponent king |
+| normalized rank 1 | enemy-camp side from that king's perspective |
+| normalized rank 9 | deepest home rank from that king's perspective |
+| normalized file 1-9 | file after the same side-based normalization |
+
+So both black and white kings use the same bucket rules. A king deep in its own camp is near normalized rank 8-9 regardless of color.
+
+The king bucket generally has this form:
+
+```text
+king_bucket = stm_king_single_bucket * single_bucket_count
+            + non_stm_king_single_bucket
+```
+
+For `k29k29`, one king has 29 buckets:
+
+```text
+king_bucket = stm_king29 * 29 + non_stm_king29
+```
+
+That is why `k29k29` has `29 * 29 = 841` LayerStacks.
+
+## 9.5 King bucket variants
+
+King bucket variants choose how much position detail to keep.
+
+| Token | Buckets per king | Pair buckets | What it emphasizes |
 |---|---:|---:|---|
-| omitted | 1 | 1 | do not split by king position |
-| `k3k3` | 3 | 9 | lightest coarse rank split |
+| omitted | 1 | 1 | no king-position split |
+| `k3k3` | 3 | 9 | coarse rank grouping |
 | `k9k9` | 9 | 81 | exact king rank, no file information |
-| `k9k9z` | 9 | 81 | same count as `k9k9`, but keeps file/3 detail near home ranks |
+| `k9k9z` | 9 | 81 | same 81 stacks as `k9k9`, but spends detail on home-rank file zones |
 | `k13k13z` | 13 | 169 | ranks 1-7 exact, ranks 8-9 split by file/3 |
-| `k21k21` | 21 | 441 | full file detail on the deepest two home ranks |
-| `k29k29` | 29 | 841 | full file detail on the deepest three home ranks |
+| `k21k21` | 21 | 441 | ranks 8-9 keep full square detail |
+| `k29k29` | 29 | 841 | ranks 7-9 keep full square detail |
 
-Long aliases are also accepted, such as `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, and `king13zone_by_king13zone`.
+The `z` in `k9k9z` / `k13k13z` means zone. These are not plain rank splits; they spend resolution on areas expected to matter more.
 
-### `k3k3`
+Long aliases are also accepted, such as `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, and `king29_by_king29`.
 
-Ranks are grouped into three bands for each king.
+## 9.6 `k3k3` — the coarse baseline
 
-|  | enemy rank 1-3 | enemy rank 4-6 | enemy rank 7-9 |
+`k3k3` splits one king into three groups: enemy side, center, and home side. The two kings together produce `3 * 3 = 9` buckets.
+
+| Normalized rank | Single-king bucket |
+|---|---:|
+| 1-3 | 0 |
+| 4-6 | 1 |
+| 7-9 | 2 |
+
+Pair buckets:
+
+| STM king \ non-STM king | rank 1-3 | rank 4-6 | rank 7-9 |
 |---|---:|---:|---:|
-| friend rank 1-3 | 0 | 1 | 2 |
-| friend rank 4-6 | 3 | 4 | 5 |
-| friend rank 7-9 | 6 | 7 | 8 |
+| rank 1-3 | 0 | 1 | 2 |
+| rank 4-6 | 3 | 4 | 5 |
+| rank 7-9 | 6 | 7 | 8 |
+
+`k3k3` is light and keeps high teacher density, so it is a good first comparison point. It does not distinguish files on the home ranks.
+
+## 9.7 `k9k9` and `k9k9z` — same 81 stacks, different budget
+
+Both `k9k9` and `k9k9z` use 9 buckets per king, so both have `9 * 9 = 81` stacks. The difference is how those 9 buckets are spent.
+
+| Token | How the 9 buckets are used | Best when |
+|---|---|---|
+| `k9k9` | normalized ranks 1-9 directly | you want a plain rank split |
+| `k9k9z` | coarse far ranks, file/3 detail on home ranks 8-9 | you want home-rank file information without increasing stack count |
 
 ### `k9k9`
 
-This uses the exact rank of each king, but ignores file.
+`k9k9` maps the normalized rank directly:
 
-| One king | Value |
-|---|---|
-| rank 1 | 0 |
-| rank 2 | 1 |
-| ... | ... |
-| rank 9 | 8 |
+| Normalized rank | Single-king bucket |
+|---|---:|
+| 1 | 0 |
+| 2 | 1 |
+| 3 | 2 |
+| 4 | 3 |
+| 5 | 4 |
+| 6 | 5 |
+| 7 | 6 |
+| 8 | 7 |
+| 9 | 8 |
 
-Final bucket:
-
-```text
-bucket = friend_rank * 9 + enemy_rank
-```
+Files are ignored. On rank 9, file 1, file 5, and file 9 all map to bucket 8.
 
 ### `k9k9z`
 
-This also has 81 final buckets, but the meaning of one king's 9 buckets differs from `k9k9`. Far ranks are merged, while deeper home ranks keep file/3 information.
+`k9k9z` keeps the same 81 total stacks as `k9k9`, but reallocates the 9 single-king buckets. It merges ranks 1-6 aggressively and uses the saved resolution on file zones at ranks 8-9.
 
-| rank | file 1-3 | file 4-6 | file 7-9 |
-|---|---:|---:|---:|
-| 1-3 | 0 | 0 | 0 |
-| 4-6 | 1 | 1 | 1 |
-| 7 | 2 | 2 | 2 |
-| 8 | 3 | 4 | 5 |
-| 9 | 6 | 7 | 8 |
+| Normalized rank | file 1-3 | file 4-6 | file 7-9 | Meaning |
+|---|---:|---:|---:|---|
+| 1-3 | 0 | 0 | 0 | enemy-side ranks merged |
+| 4-6 | 1 | 1 | 1 | center ranks merged |
+| 7 | 2 | 2 | 2 | home-side rank, no file detail yet |
+| 8 | 3 | 4 | 5 | home rank split into three file zones |
+| 9 | 6 | 7 | 8 | deepest home rank split into three file zones |
 
-Final bucket:
+Compared with `k9k9`:
 
-```text
-bucket = friend_single * 9 + enemy_single
-```
+| Area | `k9k9` | `k9k9z` |
+|---|---|---|
+| ranks 1-6 | keeps exact rank | merges them coarsely |
+| rank 7 | rank only | rank only |
+| ranks 8-9 | rank only | rank + file/3 |
+| stack count | 81 | 81 |
 
-### `k13k13z`
+`k9k9z` is not a strict upgrade over `k9k9`. It spends the same 81-stack budget differently: less rank detail far from home, more file detail near home.
 
-Ranks 1-7 are kept separately. Ranks 8-9 are split into three file bands.
+## 9.8 `k13k13z` — keep rank detail, zone only deep home ranks
 
-| rank | file 1-3 | file 4-6 | file 7-9 |
-|---|---:|---:|---:|
-| 1 | 0 | 0 | 0 |
-| 2 | 1 | 1 | 1 |
-| 3 | 2 | 2 | 2 |
-| 4 | 3 | 3 | 3 |
-| 5 | 4 | 4 | 4 |
-| 6 | 5 | 5 | 5 |
-| 7 | 6 | 6 | 6 |
-| 8 | 7 | 8 | 9 |
-| 9 | 10 | 11 | 12 |
+`k13k13z` uses 13 buckets per king, so the pair has `13 * 13 = 169` stacks.
 
-Final bucket:
+It keeps ranks 1-7 as rank buckets, then splits ranks 8-9 by file/3.
 
-```text
-bucket = friend_single * 13 + enemy_single
-```
+| Normalized rank | file 1-3 | file 4-6 | file 7-9 | Meaning |
+|---|---:|---:|---:|---|
+| 1 | 0 | 0 | 0 | exact rank |
+| 2 | 1 | 1 | 1 | exact rank |
+| 3 | 2 | 2 | 2 | exact rank |
+| 4 | 3 | 3 | 3 | exact rank |
+| 5 | 4 | 4 | 4 | exact rank |
+| 6 | 5 | 5 | 5 | exact rank |
+| 7 | 6 | 6 | 6 | exact rank |
+| 8 | 7 | 8 | 9 | home rank split by file/3 |
+| 9 | 10 | 11 | 12 | deepest home rank split by file/3 |
 
-`k13k13z` is a middle ground: more rank information than `k9k9z`, but far fewer stacks than `k21k21` or `k29k29`.
+`k13k13z` is the middle ground when `k9k9z` is too coarse but `k21k21` / `k29k29` is too large.
 
-### `k21k21` / `k29k29`
+| Variant | Stacks | Comment |
+|---|---:|---|
+| `k9k9z` | 81 | light; ranks 1-6 are coarse |
+| `k13k13z` | 169 | keeps ranks 1-7, zones only ranks 8-9 |
+| `k21k21` | 441 | full square detail on ranks 8-9 |
+| `k29k29` | 841 | full square detail on ranks 7-9 |
 
-These keep full file detail on deeper home ranks.
+## 9.9 `k21k21` and `k29k29` — detailed home-side king location
 
-| Token | rank 1-3 | rank 4-6 | rank 7 | rank 8 | rank 9 | Buckets per king |
-|---|---:|---:|---:|---:|---:|---:|
-| `k21k21` | 0 | 1 | 2 | 3-11 | 12-20 | 21 |
-| `k29k29` | 0 | 1 | 2-10 | 11-19 | 20-28 | 29 |
+`k21k21` and `k29k29` keep full square detail on the deep home ranks.
 
-Final buckets:
+### `k21k21`
 
-```text
-k21k21: bucket = friend_single * 21 + enemy_single
-k29k29: bucket = friend_single * 29 + enemy_single
-```
+`k21k21` uses 21 buckets per king.
 
-## 9.4 Hand buckets
+| Normalized rank | file 1 | file 2 | file 3 | file 4 | file 5 | file 6 | file 7 | file 8 | file 9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1-3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4-6 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| 7 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+| 8 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+| 9 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
 
-Hand buckets combine a side-to-move hand bucket with a non-side hand bucket.
+Ranks 8-9 keep all `2 * 9 = 18` squares, while the other ranks are coarser. The pair has `21 * 21 = 441` stacks.
 
-| Token | Buckets per side | Final hand buckets | What it captures |
+### `k29k29`
+
+`k29k29` uses 29 buckets per king.
+
+| Normalized rank | file 1 | file 2 | file 3 | file 4 | file 5 | file 6 | file 7 | file 8 | file 9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1-3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4-6 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| 7 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| 8 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+| 9 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 |
+
+Ranks 7-9 keep all `3 * 9 = 27` squares. The pair has `29 * 29 = 841` stacks.
+
+`k29k29` is meant to model detailed king placement near home: whether the king is on rank 7 or 9, and whether it is on an edge or central file.
+
+The cost is teacher density:
+
+| Variant | LayerStacks | Compared with `k3k3` |
+|---|---:|---:|
+| `k3k3` | 9 | 1.0x |
+| `k9k9` / `k9k9z` | 81 | 9.0x |
+| `k13k13z` | 169 | 18.8x |
+| `k21k21` | 441 | 49.0x |
+| `k29k29` | 841 | 93.4x |
+
+So `k29k29` can learn more slowly in early accuracy because each stack sees fewer samples. That is expected; it is not automatically a bug. Compare it with enough data, and consider factorizer settings for large king buckets.
+
+## 9.10 Hand buckets
+
+Hand buckets combine the side-to-move hand bucket and the non-side hand bucket.
+
+| Token | Buckets per side | Final hand buckets | What it sees |
 |---|---:|---:|---|
-| omitted | 1 | 1 | no hand split |
-| `hand64` | 8 | 64 | coarse material-in-hand score |
-| `hand256` | 16 | 256 | four presence bits |
-| `hand1024` | 32 | 1024 | five presence bits |
+| omitted | 1 | 1 | ignores hands |
+| `hand64` | 8 | 64 | coarse hand-piece score |
+| `hand256` | 16 | 256 | 4 presence bits |
+| `hand1024` | 32 | 1024 | 5 presence bits |
 
 ### `hand64`
 
-Each side's hand is scored and rounded into 8 buckets.
+`hand64` scores one side's hand and rounds it into 8 buckets.
 
 | Piece | Score |
 |---|---:|
@@ -184,14 +308,30 @@ Each side's hand is scored and rounded into 8 buckets.
 | silver / gold | 3 |
 | bishop / rook | 5 |
 
+One-side bucket is `min((score + 3) / 4, 7)`.
+
+| One-side bucket | score |
+|---:|---|
+| 0 | 0 |
+| 1 | 1-4 |
+| 2 | 5-8 |
+| 3 | 9-12 |
+| 4 | 13-16 |
+| 5 | 17-20 |
+| 6 | 21-24 |
+| 7 | 25 or more |
+
+Final bucket:
+
 ```text
-one_side_bucket = min((score + 3) / 4, 7)
-bucket = stm_bucket * 8 + non_stm_bucket
+hand64_bucket = stm_bucket * 8 + non_stm_bucket
 ```
 
 ### `hand256` and `hand1024`
 
-| Token | Bit | Meaning |
+`hand256` / `hand1024` encode hand-piece presence bits.
+
+| Token | bit | Meaning |
 |---|---:|---|
 | `hand256` | bit0 | has pawn/lance/knight |
 | `hand256` | bit1 | has silver/gold |
@@ -203,12 +343,14 @@ bucket = stm_bucket * 8 + non_stm_bucket
 | `hand1024` | bit3 | has bishop |
 | `hand1024` | bit4 | has rook |
 
-```text
-hand256:  bucket = stm_4bit_bucket * 16 + non_stm_4bit_bucket
-hand1024: bucket = stm_5bit_bucket * 32 + non_stm_5bit_bucket
-```
+| Token | One-side bucket | Final bucket |
+|---|---|---|
+| `hand256` | 4 bits, 0-15 | `stm_4bit * 16 + non_stm_4bit` |
+| `hand1024` | 5 bits, 0-31 | `stm_5bit * 32 + non_stm_5bit` |
 
-## 9.5 Progress buckets
+`hand256` is a lighter piece-type split. `hand1024` keeps pawn presence separate, but grows much faster when combined with king buckets.
+
+## 9.11 Progress buckets
 
 `progressN` uses YaneuraOu-compatible SFNN progress parameters to compute a scalar progress value in `0..255`, then maps that value to N buckets.
 
@@ -221,10 +363,14 @@ hand1024: bucket = stm_5bit_bucket * 32 + non_stm_5bit_bucket
 | `progress16` | 16 |
 | `progress32` | 32 |
 
+Bucket mapping:
+
 ```text
 progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
                       progress_bucket_count - 1)
 ```
+
+For example, `progress8` splits `0..255` into roughly 32-point ranges. `progress16` uses roughly 16-point ranges.
 
 When `progressN` is used, the exported `nn.bin` includes a Progress section.
 
@@ -239,31 +385,69 @@ Pass `--sfnn-progress-params <file>` only when you already have the q16 progress
 
 Note: the current CUDA factorizer layout does not allow `progressN` together with `king=axis` or `hand=axis`. The `shared` factorizer can be used with `progressN`.
 
-## 9.6 Choosing a bucket scheme
+## 9.12 How large combinations get
+
+The hand / king / progress axes multiply, so combinations can become huge quickly.
+
+| Architecture suffix | LayerStacks | Comment |
+|---|---:|---|
+| none | 1 | no LayerStack split |
+| `k3k3` | 9 | smallest king bucket |
+| `k9k9z` | 81 | same size as `k9k9` |
+| `k13k13z` | 169 | middle ground |
+| `k29k29` | 841 | still reasonable if king-only |
+| `hand64_k3k3` | 576 | light hand + king split |
+| `hand256_k3k3` | 2304 | useful comparison point |
+| `hand256_k9k9z` | 20736 | already large |
+| `hand256_k13k13z` | 43264 | watch teacher data, VRAM, and checkpoint size |
+| `hand1024_k29k29` | 861184 | extremely heavy |
+
+Large suffixes affect not only training speed, but also checkpoint size, validation time, and teacher density per stack.
+
+## 9.13 Choosing a bucket scheme
 
 These are practical starting points, not universal rules.
 
 | Goal | Candidate | Comment |
 |---|---|---|
 | quick sanity check | no suffix / `k3k3` | small and easy to debug |
-| finer than `k3k3` without many more stacks | `k9k9`, `k9k9z`, `k13k13z` | `k9k9z` keeps the same 81 stack count as `k9k9` |
-| detailed king-position specialization | `k21k21`, `k29k29` | needs much more teacher data per experiment |
-| split by hand pieces | `hand64`, `hand256`, `hand1024` | grows very quickly when combined with king buckets |
-| split by opening/middlegame/endgame | `progress8`, `progress16` | depends on progress parameters |
+| finer than `k3k3` | `k9k9` | plain rank split |
+| keep 81 stacks but add home-rank file zones | `k9k9z` | same size as `k9k9`, different budget |
+| `k9k9z` is too coarse | `k13k13z` | keeps ranks 1-7 and zones ranks 8-9 |
+| detailed deepest home ranks | `k21k21` | lighter than `k29k29` |
+| detailed ranks 7-9 | `k29k29` | high capacity, lower teacher density |
+| split by hand pieces | `hand64`, `hand256`, `hand1024` | grows quickly with king buckets |
+| split by game phase | `progress8`, `progress16` | depends on progress parameters |
 
-More buckets give the model more specialization capacity, but reduce the amount of teacher data seen by each stack. For example, `hand256_k13k13z` has `256 * 169 = 43264` stacks, which is already a very large model.
+Larger buckets may show slower early accuracy because each stack receives fewer samples. Compare not only short-run accuracy, but also long-run loss, actual engine strength, checkpoint size, and training speed.
 
-## 9.7 Usage examples
+## 9.14 Usage examples
 
-Try a king zone bucket:
+Smallest king bucket:
 
 ```bash
 ./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k13k13z \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
     --teacher teachers/
 ```
 
-Combine hand and king zone buckets:
+Same 81 stacks as `k9k9`, but with home-rank file zones:
+
+```bash
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_k9k9z \
+    --teacher teachers/
+```
+
+Detailed `k29k29` king bucket:
+
+```bash
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_k29k29 \
+    --teacher teachers/
+```
+
+Combine hand and king zones:
 
 ```bash
 ./target/release/examples/bulletou \

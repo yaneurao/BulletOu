@@ -2,34 +2,59 @@
 
 <a href="../../en/tutorial/9-layerstack.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-通常の NNUE は、どの局面でも同じ MLP を使って評価値を出します。SFNN の LayerStack は、同じ FeatureTransformer 出力を使いながら、局面の種類ごとに後段の小さな MLP stack を切り替える仕組みです。
+通常の NNUE は、どの局面でも同じ後段ネットワークを使って評価値を出します。SFNN の LayerStack は、FeatureTransformer までは共有し、その後ろの小さな MLP stack を局面の種類ごとに切り替える仕組みです。
 
-大事なのは一点だけです。BulletOu と やねうら王 が、同じ局面に対して完全に同じ LayerStack index を計算しなければなりません。
+たとえば `k3k3` なら玉位置の粗い分類で 9 個の stack を持ち、局面ごとにそのうち 1 つを使います。`hand256_k3k3` なら、持ち駒分類 256 通りと玉位置分類 9 通りを掛け合わせて、`256 * 9 = 2304` 個の stack を持ちます。
 
-## 9.1 まず全体像
+重要なのは、BulletOu と やねうら王 が同じ局面に対して完全に同じ LayerStack index を計算することです。ここが 1 つでもずれると、学習した `nn.bin` をエンジン側で読めても、別の stack を参照してしまいます。
 
-LayerStack は、次の3つの軸を独立に組み合わせます。
+## 9.1 LayerStack が何をしているか
+
+LayerStack は「入力特徴量を変える」仕組みではありません。入力特徴量と FeatureTransformer は同じまま、後段だけを切り替えます。
+
+| 部分 | LayerStack で共有されるか | 説明 |
+|---|---|---|
+| 入力特徴量 | 共有 | `halfka2` / `ka2` などは変わらない |
+| FeatureTransformer | 共有 | L0 の重みは全 stack 共通 |
+| 後段 MLP | stack ごとに別 | L1/L2/L3 相当の小さなネットワークを bucket ごとに持つ |
+| 出力値 | 局面ごとに 1 stack だけ使う | bucket index で選ばれた stack の出力を評価値にする |
+
+直感的には、次のような分業です。
+
+| 分け方 | 狙い |
+|---|---|
+| 玉位置で分ける | 自玉/相手玉の位置によって評価の癖を変える |
+| 持ち駒で分ける | 駒の持ち合い、終盤度、攻め駒の有無で評価の癖を変える |
+| 進行度で分ける | 序盤/中盤/終盤で評価の癖を変える |
+
+ただし、bucket を増やすほど 1 stack あたりに届く教師局面は減ります。表現力は増えますが、教師密度は落ちます。ここが LayerStack の一番大きなトレードオフです。
+
+## 9.2 3つの軸を掛け合わせる
+
+BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせます。
 
 | 軸 | 何を見るか | 指定できる token | bucket 数 |
 |---|---|---|---:|
-| hand | 先手番側/後手番側の持ち駒 | 省略, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
+| hand | 手番側/非手番側の持ち駒 | 省略, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
 | king | 手番側玉/非手番側玉の位置 | 省略, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | 進行度 | 省略, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
 最終的な stack 数は掛け算です。
 
-| 例 | hand | king | progress | LayerStacks |
+| architecture | hand | king | progress | LayerStacks |
 |---|---:|---:|---:|---:|
 | `SFNN_halfka2_1024_7_64` | 1 | 1 | 1 | 1 |
 | `SFNN_halfka2_1024_7_64_k3k3` | 1 | 9 | 1 | 9 |
 | `SFNN_halfka2_1024_7_64_k9k9z` | 1 | 81 | 1 | 81 |
 | `SFNN_halfka2_1024_7_64_k13k13z` | 1 | 169 | 1 | 169 |
+| `SFNN_halfka2_1024_7_64_k21k21` | 1 | 441 | 1 | 441 |
+| `SFNN_halfka2_1024_7_64_k29k29` | 1 | 841 | 1 | 841 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | 1 | 1 | 256 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 256 | 9 | 1 | 2304 |
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1 | 9 | 8 | 72 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` | 256 | 9 | 16 | 36864 |
 
-index の合成順は、やねうら王と同じです。
+index の合成順は、やねうら王と同じく `hand → king → progress` です。
 
 ```text
 idx = hand_bucket
@@ -37,15 +62,15 @@ idx = idx * king_bucket_count + king_bucket
 idx = idx * progress_bucket_count + progress_bucket
 ```
 
-つまり、`hand256_k3k3_progress16` なら、
+たとえば `hand256_k3k3_progress16` は、
 
 ```text
 idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 ```
 
-という意味になります。
+という意味です。
 
-## 9.2 architecture 名の書き方
+## 9.3 architecture 名の書き方
 
 LayerStack token は任意の順番で書けますが、BulletOu は保存名では `hand → king → progress` の順に正規化します。
 
@@ -55,6 +80,14 @@ LayerStack token は任意の順番で書けますが、BulletOu は保存名で
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | そのまま |
 
+suffix なしも有効です。
+
+```text
+SFNN_halfka2_1024_7_64
+```
+
+この場合は LayerStacks=1、つまり玉位置・持ち駒・進行度で分けません。
+
 grouped SFNN / common+shard L1 とも組み合わせられます。
 
 ```text
@@ -63,110 +96,209 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 この例は、`ka2` 入力、FT=3072、L1 は 1024 common + 256 x 8 shard、LayerStack は `hand256 × k3k3 × progress16` です。
 
-## 9.3 king bucket の選び方
+## 9.4 king bucket を読む前の座標ルール
 
-king bucket は、手番側玉と非手番側玉をそれぞれ正規化してから bucket 化し、組み合わせます。
+king bucket は、手番側玉と非手番側玉を別々に bucket 化してから組み合わせます。
 
-| token | 1玉あたりの分類 | 最終 king buckets | ざっくりした性質 |
+ここで重要なのは、玉の座標をその玉の陣営から見た向きに正規化していることです。
+
+| 用語 | 意味 |
+|---|---|
+| 手番側玉 | いま手番の側の玉 |
+| 非手番側玉 | 相手側の玉 |
+| 正規化 rank 1 | その玉から見て敵陣側 |
+| 正規化 rank 9 | その玉から見て自陣最深部 |
+| 正規化 file 1〜9 | その玉の陣営から見た筋 |
+
+つまり、先手番でも後手番でも「自玉が自陣深くにいる」状態は同じように rank 8〜9 付近として扱われます。これにより、先手用と後手用で別の規則を作らずに済みます。
+
+最終的な king bucket は、基本的に次の形です。
+
+```text
+king_bucket = stm_king_single_bucket * single_bucket_count
+            + non_stm_king_single_bucket
+```
+
+たとえば `k29k29` なら 1玉あたり 29 bucket なので、
+
+```text
+king_bucket = stm_king29 * 29 + non_stm_king29
+```
+
+です。`k29k29` の LayerStacks が 841 になるのは、`29 * 29 = 841` だからです。
+
+## 9.5 king bucket の種類
+
+king bucket は「玉位置をどれくらい細かく見るか」を決めます。
+
+| token | 1玉あたり | 両玉の組み合わせ | 何を重視するか |
 |---|---:|---:|---|
-| 省略 | なし | 1 | 玉位置で分けない |
-| `k3k3` | 3 | 9 | 最も軽い。玉の大まかな段だけを見る |
-| `k9k9` | 9 | 81 | 玉の段をそのまま見る。file は見ない |
-| `k9k9z` | 9 | 81 | `k9k9` と同じ bucket 数だが、自陣側では file/3 も見る |
-| `k13k13z` | 13 | 169 | 1〜7段は段ごと、8〜9段は file/3 も見る |
-| `k21k21` | 21 | 441 | 自陣深い2段で file を細かく見る |
-| `k29k29` | 29 | 841 | 自陣深い3段で file を細かく見る |
+| 省略 | 1 | 1 | 玉位置で分けない |
+| `k3k3` | 3 | 9 | 玉の大まかな段だけを見る |
+| `k9k9` | 9 | 81 | 玉の段をそのまま見る。筋は見ない |
+| `k9k9z` | 9 | 81 | `k9k9` と同じ 81 stacks のまま、自陣深部の筋情報を入れる |
+| `k13k13z` | 13 | 169 | 1〜7段は段ごと、8〜9段は筋3分割 |
+| `k21k21` | 21 | 441 | 8〜9段を全マス区別する |
+| `k29k29` | 29 | 841 | 7〜9段を全マス区別する |
 
-long alias も使えます。たとえば `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone` などです。
+`k9k9z` / `k13k13z` の `z` は zone の意味です。単純な rank 分割ではなく、重要そうな領域に解像度を寄せる bucket です。
 
-### `k3k3`
+long alias も使えます。たとえば `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, `king29_by_king29` などです。
 
-玉の段を3分割します。手番側玉と非手番側玉の組み合わせなので `3 x 3 = 9` buckets です。
+## 9.6 `k3k3` — まず試す粗い玉 bucket
 
-|  | enemy rank 1-3 | enemy rank 4-6 | enemy rank 7-9 |
+`k3k3` は、玉1つを「敵陣側・中央・自陣側」の3つに分けます。手番側玉と非手番側玉の組み合わせなので `3 * 3 = 9` buckets です。
+
+| 正規化 rank | 1玉の分類 |
+|---|---:|
+| 1〜3 | 0 |
+| 4〜6 | 1 |
+| 7〜9 | 2 |
+
+両玉を組み合わせると次のようになります。
+
+| 手番側玉 \ 非手番側玉 | rank 1〜3 | rank 4〜6 | rank 7〜9 |
 |---|---:|---:|---:|
-| friend rank 1-3 | 0 | 1 | 2 |
-| friend rank 4-6 | 3 | 4 | 5 |
-| friend rank 7-9 | 6 | 7 | 8 |
+| rank 1〜3 | 0 | 1 | 2 |
+| rank 4〜6 | 3 | 4 | 5 |
+| rank 7〜9 | 6 | 7 | 8 |
+
+`k3k3` は軽く、教師密度も高いので、LayerStack の最初の比較対象として扱いやすいです。一方で、同じ rank 7〜9 にいる玉はすべて同じ扱いになるため、自陣深部で玉が何筋にいるかは区別できません。
+
+## 9.7 `k9k9` と `k9k9z` — 同じ 81 stacks で何を表現するか
+
+`k9k9` と `k9k9z` は、どちらも 1玉あたり 9 bucket、両玉で `9 * 9 = 81` stacks です。違いは、9 bucket の使い方です。
+
+| token | 9 bucket の使い方 | 向いている狙い |
+|---|---|---|
+| `k9k9` | rank 1〜9 をそのまま 9 分割 | 玉の段を素直に見たい |
+| `k9k9z` | 遠い段を粗くまとめ、自陣 rank 8〜9 の筋を3分割 | 同じ 81 stacks のまま、自陣深部の横位置を見たい |
 
 ### `k9k9`
 
-玉の段をそのまま使います。file は見ません。
+`k9k9` は 1玉の正規化 rank をそのまま bucket にします。
 
-| 1玉あたり | 値 |
-|---|---|
-| rank 1 | 0 |
-| rank 2 | 1 |
-| ... | ... |
-| rank 9 | 8 |
+| 正規化 rank | 1玉の bucket |
+|---|---:|
+| 1 | 0 |
+| 2 | 1 |
+| 3 | 2 |
+| 4 | 3 |
+| 5 | 4 |
+| 6 | 5 |
+| 7 | 6 |
+| 8 | 7 |
+| 9 | 8 |
 
-最終 bucket:
+筋は見ません。たとえば rank 9 なら、1筋でも5筋でも9筋でも同じ bucket 8 です。
 
-```text
-bucket = friend_rank * 9 + enemy_rank
-```
+`k9k9` はわかりやすい反面、実戦で重要になりやすい自陣深部の横位置を捨てています。
 
 ### `k9k9z`
 
-`k9k9` と同じく合計は 81 buckets ですが、1玉あたりの9分類の意味が違います。遠い段は粗くまとめ、自陣側の深い段では file を3分割します。
+`k9k9z` は、`k9k9` と同じ 81 stacks のまま、情報の置き場所を変えます。rank 1〜6 をかなり粗くまとめ、そのぶん rank 8〜9 で筋方向の情報を持ちます。
 
-| rank | file 1-3 | file 4-6 | file 7-9 |
-|---|---:|---:|---:|
-| 1-3 | 0 | 0 | 0 |
-| 4-6 | 1 | 1 | 1 |
-| 7 | 2 | 2 | 2 |
-| 8 | 3 | 4 | 5 |
-| 9 | 6 | 7 | 8 |
+1玉の bucket は次の通りです。
 
-最終 bucket:
+| 正規化 rank | file 1〜3 | file 4〜6 | file 7〜9 | 説明 |
+|---|---:|---:|---:|---|
+| 1〜3 | 0 | 0 | 0 | 敵陣側はまとめる |
+| 4〜6 | 1 | 1 | 1 | 中央付近もまとめる |
+| 7 | 2 | 2 | 2 | 自陣寄りだが筋はまだ見ない |
+| 8 | 3 | 4 | 5 | 自陣深部なので筋を3分割 |
+| 9 | 6 | 7 | 8 | 自陣最深部なので筋を3分割 |
 
-```text
-bucket = friend_single * 9 + enemy_single
-```
+`k9k9` との違いを一言で言うと、こうです。
 
-`k9k9` より「自陣深い場所で玉がどの筋にいるか」を少し見る、という設計です。
+| 領域 | `k9k9` | `k9k9z` |
+|---|---|---|
+| rank 1〜6 | rank を細かく見る | 粗くまとめる |
+| rank 7 | rank だけ見る | rank だけ見る |
+| rank 8〜9 | rank だけ見る | rank と file/3 を見る |
+| stack 数 | 81 | 81 |
 
-### `k13k13z`
+つまり `k9k9z` は、bucket 数を増やさずに「自陣深部の玉の横位置」を見たいときの設計です。たとえば、同じ rank 9 でも玉が端にいるか中央にいるかで評価の癖を変えたい、という狙いです。
 
-1〜7段は段ごとに分け、8〜9段だけ file を3分割します。
+逆に、rank 1〜6 の差をかなり潰すので、そこが効く教師・局面集合では `k9k9` より悪くなる可能性もあります。`k9k9z` は常に上位互換ではなく、81 stacks の予算配分を変えるものです。
 
-| rank | file 1-3 | file 4-6 | file 7-9 |
-|---|---:|---:|---:|
-| 1 | 0 | 0 | 0 |
-| 2 | 1 | 1 | 1 |
-| 3 | 2 | 2 | 2 |
-| 4 | 3 | 3 | 3 |
-| 5 | 4 | 4 | 4 |
-| 6 | 5 | 5 | 5 |
-| 7 | 6 | 6 | 6 |
-| 8 | 7 | 8 | 9 |
-| 9 | 10 | 11 | 12 |
+## 9.8 `k13k13z` — rank 情報を残しつつ自陣深部だけ zone 化する
 
-最終 bucket:
+`k13k13z` は 1玉を 13 bucket に分け、両玉で `13 * 13 = 169` stacks になります。
 
-```text
-bucket = friend_single * 13 + enemy_single
-```
+`k9k9z` より rank 情報を多く残します。rank 1〜7 は段ごとに分け、rank 8〜9 だけ file/3 で分けます。
 
-`k9k9z` より rank 情報を多く残しつつ、`k21k21` / `k29k29` より stack 数を抑える中間案です。
+| 正規化 rank | file 1〜3 | file 4〜6 | file 7〜9 | 説明 |
+|---|---:|---:|---:|---|
+| 1 | 0 | 0 | 0 | rank そのもの |
+| 2 | 1 | 1 | 1 | rank そのもの |
+| 3 | 2 | 2 | 2 | rank そのもの |
+| 4 | 3 | 3 | 3 | rank そのもの |
+| 5 | 4 | 4 | 4 | rank そのもの |
+| 6 | 5 | 5 | 5 | rank そのもの |
+| 7 | 6 | 6 | 6 | rank そのもの |
+| 8 | 7 | 8 | 9 | 自陣深部なので筋を3分割 |
+| 9 | 10 | 11 | 12 | 自陣最深部なので筋を3分割 |
 
-### `k21k21` / `k29k29`
+`k13k13z` は、`k9k9z` だと粗すぎるが、`k21k21` / `k29k29` は重すぎる、というときの中間案です。
 
-この2つは、自陣深い段では file を完全に見る方式です。
+| 比較 | stack 数 | コメント |
+|---|---:|---|
+| `k9k9z` | 81 | 軽い。rank 1〜6 は粗い |
+| `k13k13z` | 169 | rank 1〜7 を保持し、8〜9段だけ筋を見る |
+| `k21k21` | 441 | 8〜9段を全マス区別 |
+| `k29k29` | 841 | 7〜9段を全マス区別 |
 
-| token | rank 1-3 | rank 4-6 | rank 7 | rank 8 | rank 9 | 1玉あたり |
-|---|---:|---:|---:|---:|---:|---:|
-| `k21k21` | 0 | 1 | 2 | 3〜11 | 12〜20 | 21 |
-| `k29k29` | 0 | 1 | 2〜10 | 11〜19 | 20〜28 | 29 |
+## 9.9 `k21k21` と `k29k29` — 自陣付近の玉位置をかなり細かく見る
 
-最終 bucket:
+`k21k21` と `k29k29` は、zone というより「自陣の深い段をマス単位で見る」bucket です。
 
-```text
-k21k21: bucket = friend_single * 21 + enemy_single
-k29k29: bucket = friend_single * 29 + enemy_single
-```
+### `k21k21`
 
-## 9.4 hand bucket
+`k21k21` は 1玉を 21 bucket に分けます。
+
+| 正規化 rank | file 1 | file 2 | file 3 | file 4 | file 5 | file 6 | file 7 | file 8 | file 9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1〜3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4〜6 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| 7 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+| 8 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+| 9 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
+
+rank 8〜9 の 2段 x 9筋 = 18マスをそのまま区別し、それ以外は粗くまとめます。
+
+両玉では `21 * 21 = 441` stacks です。`k29k29` より軽く、自陣最深部の玉位置を見たいときに使います。
+
+### `k29k29`
+
+`k29k29` は 1玉を 29 bucket に分けます。
+
+| 正規化 rank | file 1 | file 2 | file 3 | file 4 | file 5 | file 6 | file 7 | file 8 | file 9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1〜3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4〜6 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| 7 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| 8 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+| 9 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 |
+
+rank 7〜9 の 3段 x 9筋 = 27マスをそのまま区別し、rank 1〜3 と rank 4〜6 はそれぞれ1つにまとめます。
+
+両玉では `29 * 29 = 841` stacks です。
+
+`k29k29` の狙いは、通常局面でよく現れる「自玉が自陣付近にいる状態」を細かく見ることです。たとえば、同じ自陣でも玉が 7段目に上がっているのか、9段目に深くいるのか、端寄りなのか中央なのかを別 stack にできます。
+
+一方で、stack 数は `k3k3` の約 93 倍です。
+
+| 比較 | LayerStacks | `k3k3` 比 |
+|---|---:|---:|
+| `k3k3` | 9 | 1.0x |
+| `k9k9` / `k9k9z` | 81 | 9.0x |
+| `k13k13z` | 169 | 18.8x |
+| `k21k21` | 441 | 49.0x |
+| `k29k29` | 841 | 93.4x |
+
+したがって、`k29k29` は教師量が足りないと accuracy が伸びるのが遅くなったり、検証 loss が不安定になったりします。表現力は高いですが、十分な教師局面と、必要なら factorizer を併用して比較するのが前提になります。
+
+## 9.10 hand bucket
 
 hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucket を組み合わせます。
 
@@ -179,7 +311,7 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 
 ### `hand64`
 
-片側の持ち駒を点数化し、8 bucket に丸めます。
+`hand64` は、片側の持ち駒を点数化し、8 bucket に丸めます。
 
 | 駒 | 点数 |
 |---|---:|
@@ -188,12 +320,32 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 | 銀 / 金 | 3 |
 | 角 / 飛 | 5 |
 
+片側 bucket は `min((score + 3) / 4, 7)` です。点数範囲で書くと次のようになります。
+
+| 片側 bucket | score |
+|---:|---|
+| 0 | 0 |
+| 1 | 1〜4 |
+| 2 | 5〜8 |
+| 3 | 9〜12 |
+| 4 | 13〜16 |
+| 5 | 17〜20 |
+| 6 | 21〜24 |
+| 7 | 25以上 |
+
+最終 bucket は、
+
 ```text
-one_side_bucket = min((score + 3) / 4, 7)
-bucket = stm_bucket * 8 + non_stm_bucket
+hand64_bucket = stm_bucket * 8 + non_stm_bucket
 ```
 
+です。
+
+`hand64` は持ち駒の種類よりも「どれくらい持っているか」を粗く見たいときの bucket です。
+
 ### `hand256` と `hand1024`
+
+`hand256` / `hand1024` は、持ち駒の有無を bit で表します。
 
 | token | bit | 意味 |
 |---|---:|---|
@@ -207,12 +359,14 @@ bucket = stm_bucket * 8 + non_stm_bucket
 | `hand1024` | bit3 | 角を持つ |
 | `hand1024` | bit4 | 飛を持つ |
 
-```text
-hand256:  bucket = stm_4bit_bucket * 16 + non_stm_4bit_bucket
-hand1024: bucket = stm_5bit_bucket * 32 + non_stm_5bit_bucket
-```
+| token | 片側 bucket | 最終 bucket |
+|---|---|---|
+| `hand256` | 4bit, 0〜15 | `stm_4bit * 16 + non_stm_4bit` |
+| `hand1024` | 5bit, 0〜31 | `stm_5bit * 32 + non_stm_5bit` |
 
-## 9.5 progress bucket
+`hand256` は軽めの種類分類、`hand1024` は歩の有無まで独立に見たい場合の分類です。king bucket と掛け合わせると stack 数が急増するので注意してください。
+
+## 9.11 progress bucket
 
 `progressN` は、やねうら王互換の SFNN progress parameter から `0..255` の進行度を計算し、それを N 個の bucket に割り当てます。
 
@@ -225,10 +379,14 @@ hand1024: bucket = stm_5bit_bucket * 32 + non_stm_5bit_bucket
 | `progress16` | 16 |
 | `progress32` | 32 |
 
+bucket 化は次の考え方です。
+
 ```text
 progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
                       progress_bucket_count - 1)
 ```
+
+たとえば `progress8` なら、進行度 `0..255` をほぼ 32 刻みで 8 個に分けます。`progress16` なら 16 刻みです。
 
 `progressN` を使うと、export される `nn.bin` には Progress section が入ります。
 
@@ -243,27 +401,65 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 注意: 現状の CUDA factorizer layout では、`progressN` と `king=axis` / `hand=axis` factorizer は併用できません。`shared` factorizer は併用できます。
 
-## 9.6 どれを選ぶべきか
+## 9.12 組み合わせるとどれくらい大きくなるか
+
+hand / king / progress は掛け算なので、少し足しただけで急に大きくなります。
+
+| architecture suffix | LayerStacks | コメント |
+|---|---:|---|
+| なし | 1 | LayerStack なし |
+| `k3k3` | 9 | 最小の king bucket |
+| `k9k9z` | 81 | `k9k9` と同じ大きさ |
+| `k13k13z` | 169 | 中間案 |
+| `k29k29` | 841 | king だけならまだ試しやすい |
+| `hand64_k3k3` | 576 | 軽めの hand + king |
+| `hand256_k3k3` | 2304 | よく比較対象にしやすい |
+| `hand256_k9k9z` | 20736 | かなり大きい |
+| `hand256_k13k13z` | 43264 | 教師量・VRAM・保存サイズに注意 |
+| `hand1024_k29k29` | 861184 | 実験としては非常に重い |
+
+大きい suffix は、学習速度だけでなく、checkpoint サイズ、validation 時間、1 stack あたりの教師密度にも効きます。
+
+## 9.13 どれを選ぶべきか
 
 目安です。絶対の正解ではないので、同じ教師・同じ検証条件で比較してください。
 
 | 目的 | 候補 | コメント |
 |---|---|---|
 | まず動作確認したい | suffix なし / `k3k3` | 軽く、失敗時の切り分けが楽 |
-| `k3k3` より細かくしたいが、stack 数を抑えたい | `k9k9`, `k9k9z`, `k13k13z` | `k9k9z` は `k9k9` と同じ 81 stacks で意味だけ変わる |
-| 玉位置をかなり細かく見たい | `k21k21`, `k29k29` | 教師量が少ないと各 stack の学習密度が落ちる |
+| `k3k3` より細かくしたい | `k9k9` | 素直な rank 分割 |
+| 81 stacks のまま自陣深部の筋を見たい | `k9k9z` | `k9k9` と同じ大きさだが予算配分が違う |
+| `k9k9z` では粗すぎる | `k13k13z` | rank 1〜7 を保持し、8〜9段だけ zone 化 |
+| 自陣最深部をマス単位で見たい | `k21k21` | `k29k29` より軽い |
+| 自陣 7〜9段をマス単位で見たい | `k29k29` | 表現力は高いが教師密度が落ちる |
 | 持ち駒で局面を分けたい | `hand64`, `hand256`, `hand1024` | king bucket と掛け合わせると急激に巨大化する |
 | 序盤/中盤/終盤で分けたい | `progress8`, `progress16` | progress parameter の扱いに注意 |
 
-bucket を増やすほど表現力は増えますが、1 stack あたりに届く教師局面は減ります。たとえば `hand256_k13k13z` は `256 * 169 = 43264` stacks です。これはかなり大きいので、教師量・VRAM・checkpointサイズを見ながら試してください。
+大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、checkpoint サイズ、学習速度も合わせて見てください。
 
-## 9.7 使用例
+## 9.14 使用例
 
-king zone bucket だけを試す例:
+もっとも軽い king bucket を試す例:
 
 ```bash
 ./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k13k13z \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --teacher teachers/
+```
+
+`k9k9` と同じ 81 stacks のまま、自陣深部の筋を見たい例:
+
+```bash
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_k9k9z \
+    --teacher teachers/
+```
+
+`k29k29` で玉位置を細かく見る例:
+
+```bash
+./target/release/examples/bulletou \
+    --arch SFNN_halfka2_1024_7_64_k29k29 \
     --teacher teachers/
 ```
 
