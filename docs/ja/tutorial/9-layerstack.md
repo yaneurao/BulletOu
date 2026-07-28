@@ -401,7 +401,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
-注意: 現状の CUDA factorizer layout では、`progressN` と `king=axis` / `hand=axis` factorizer は併用できません。`shared` factorizer は併用できます。
+`progressN` は `king=axis` / `hand=axis` factorizer と併用できます。この場合、progress 軸そのものは factorizer 対象にせず、hand / king 軸だけを分解します。たとえば `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` には `--sfnn-factorizer king=axis,hand=axis` を指定できます。
 
 ## 9.12 組み合わせるとどれくらい大きくなるか
 

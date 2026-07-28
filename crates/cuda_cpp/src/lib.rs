@@ -926,6 +926,19 @@ impl SfnnForwardShape {
             self.factorizer_hand_axis_dim.saturating_mul(self.factorizer_hand_axis_dim)
         }
     }
+
+    pub fn factorizer_stack_count(self) -> usize {
+        self.factorizer_king_bucket_count().saturating_mul(self.factorizer_hand_bucket_count())
+    }
+
+    pub fn factorizer_progress_multiplier(self) -> usize {
+        let factorizer_stack_count = self.factorizer_stack_count();
+        if factorizer_stack_count == 0 || self.num_stacks % factorizer_stack_count != 0 {
+            1
+        } else {
+            self.num_stacks / factorizer_stack_count
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5571,10 +5584,10 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
     {
         Err(CudaCppError::message(format!("SFNN grouped-L1 shape dimensions are invalid: {shape:?}")))
     } else if (shape.factorizer_king_axis_dim != 0 || shape.factorizer_hand_axis_dim != 0)
-        && expected_axis_stacks != shape.num_stacks
+        && shape.num_stacks % expected_axis_stacks != 0
     {
         Err(CudaCppError::message(format!(
-            "SFNN factorizer axis dimensions do not match num_stacks: expected {expected_axis_stacks}, got {} ({shape:?})",
+            "SFNN factorizer axis dimensions do not divide num_stacks: factorizer stacks {expected_axis_stacks}, got {} ({shape:?})",
             shape.num_stacks
         )))
     } else {
@@ -6543,6 +6556,30 @@ mod tests {
         assert_eq!(layout.l2_input_len(), 20);
         assert_eq!(layout.l2_len(), 15);
         assert_eq!(layout.output_len(), 5);
+    }
+
+    #[test]
+    fn sfnn_shape_validation_allows_progress_multiplier_for_axis_factorizer() {
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 3,
+            num_stacks: 64 * 9 * 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 3,
+            factorizer_hand_axis_dim: 8,
+        };
+
+        assert_eq!(shape.factorizer_stack_count(), 64 * 9);
+        assert_eq!(shape.factorizer_progress_multiplier(), 2);
+        assert!(validate_sfnn_shape(shape).is_ok());
+
+        let invalid_shape = SfnnForwardShape { num_stacks: 64 * 9 * 2 + 1, ..shape };
+        let err = validate_sfnn_shape(invalid_shape).unwrap_err();
+        assert!(err.to_string().contains("do not divide num_stacks"), "{err}");
     }
 
     #[test]

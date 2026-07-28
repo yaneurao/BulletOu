@@ -753,6 +753,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
 
 __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
     size_t stack,
+    size_t num_stacks,
     size_t king_axis_dim,
     size_t hand_axis_dim,
     int use_king_axis,
@@ -760,8 +761,13 @@ __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
     size_t* out_ids) {
     size_t count = 0;
     size_t king_bucket_count = king_axis_dim == 0 ? 1 : king_axis_dim * king_axis_dim;
-    size_t king_bucket = stack % king_bucket_count;
-    size_t hand_bucket = stack / king_bucket_count;
+    size_t hand_bucket_count = hand_axis_dim == 0 ? 1 : hand_axis_dim * hand_axis_dim;
+    size_t factorizer_stack_count = king_bucket_count * hand_bucket_count;
+    size_t progress_bucket_count =
+        (factorizer_stack_count != 0 && num_stacks % factorizer_stack_count == 0) ? num_stacks / factorizer_stack_count : 1;
+    size_t axis_stack = stack / progress_bucket_count;
+    size_t king_bucket = axis_stack % king_bucket_count;
+    size_t hand_bucket = (axis_stack / king_bucket_count) % hand_bucket_count;
 
     if (use_king_axis != 0 && king_axis_dim != 0) {
         out_ids[count++] = king_bucket / king_axis_dim;
@@ -819,6 +825,7 @@ __global__ void sfnn_stacked_l1_kernel(
     size_t axis_ids[4];
     size_t axis_count = sfnn_factorizer_axis_ids(
         stack,
+        num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
         use_king_axis,
@@ -1004,6 +1011,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     size_t axis_ids[4];
     size_t axis_count = sfnn_factorizer_axis_ids(
         stack,
+        num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
         use_king_axis,
@@ -1070,6 +1078,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
     size_t axis_ids[4];
     size_t axis_count = sfnn_factorizer_axis_ids(
         stack,
+        num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
         use_king_axis,
@@ -1325,6 +1334,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
             size_t axis_ids[4];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
+                num_stacks,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
                 use_king_axis,
@@ -1372,6 +1382,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
                     size_t axis_ids[4];
                     size_t axis_count = sfnn_factorizer_axis_ids(
                         static_cast<size_t>(stack_i32),
+                        num_stacks,
                         factorizer_king_axis_dim,
                         factorizer_hand_axis_dim,
                         use_king_axis,
@@ -1428,6 +1439,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             size_t axis_ids[4];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
+                num_stacks,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
                 use_king_axis,
@@ -1464,6 +1476,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             size_t axis_ids[4];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
+                num_stacks,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
                 use_king_axis,
@@ -1507,6 +1520,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                     size_t axis_ids[4];
                     size_t axis_count = sfnn_factorizer_axis_ids(
                         stack,
+                        num_stacks,
                         factorizer_king_axis_dim,
                         factorizer_hand_axis_dim,
                         use_king_axis,
@@ -1843,6 +1857,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             size_t axis_ids[4];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
+                num_stacks,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
                 use_king_axis,
@@ -1878,6 +1893,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             size_t axis_ids[4];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
+                num_stacks,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
                 use_king_axis,
@@ -1919,6 +1935,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                     size_t axis_ids[4];
                     size_t axis_count = sfnn_factorizer_axis_ids(
                         stack,
+                        num_stacks,
                         factorizer_king_axis_dim,
                         factorizer_hand_axis_dim,
                         use_king_axis,
@@ -3033,8 +3050,8 @@ int validate_sfnn_shape(
         return fail_message("SFNN factorizer bucket count overflow");
     }
     const size_t expected_stacks = king_bucket_count * hand_bucket_count;
-    if ((factorizer_king_axis_dim != 0 || factorizer_hand_axis_dim != 0) && expected_stacks != num_stacks) {
-        return fail_message("SFNN factorizer axis dimensions do not match num_stacks");
+    if ((factorizer_king_axis_dim != 0 || factorizer_hand_axis_dim != 0) && (num_stacks % expected_stacks) != 0) {
+        return fail_message("SFNN factorizer axis dimensions do not divide num_stacks");
     }
     if (batch == 0) {
         return fail_message("SFNN batch size must be greater than zero");

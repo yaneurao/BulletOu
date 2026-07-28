@@ -328,14 +328,7 @@ impl LayerStackMode {
         }
     }
 
-    fn has_progress_axis(self) -> bool {
-        self.progress_bucket_count() > 1
-    }
-
     fn factorizer_king_axis_dim(self) -> usize {
-        if self.has_progress_axis() {
-            return 0;
-        }
         match self {
             LayerStackMode::Single | LayerStackMode::Hand64 | LayerStackMode::Hand256 | LayerStackMode::Hand1024 => 0,
             LayerStackMode::Kingrank3by3
@@ -359,9 +352,6 @@ impl LayerStackMode {
     }
 
     fn factorizer_hand_axis_dim(self) -> usize {
-        if self.has_progress_axis() {
-            return 0;
-        }
         match self {
             LayerStackMode::Single
             | LayerStackMode::Kingrank3by3
@@ -2792,12 +2782,6 @@ impl Args {
         }
         if let Some(spec) = self.sfnn_factorizer {
             if let Some(layerstack) = self.effective_layerstack() {
-                if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
-                    return Err(format!(
-                        "--sfnn-factorizer axis terms are not yet supported with progressN LayerStacks; arch {} can use --sfnn-factorizer shared or none",
-                        self.arch().cli_name()
-                    ));
-                }
                 if spec.explicit_king_axis && layerstack.factorizer_king_axis_dim() == 0 {
                     return Err(format!(
                         "--sfnn-factorizer requested king=axis, but arch {} has no king bucket axis",
@@ -3362,13 +3346,6 @@ fn main() {
     }
     if let Some(spec) = args.sfnn_factorizer {
         if let Some(layerstack) = args.effective_layerstack() {
-            if layerstack.has_progress_axis() && (spec.king_axis || spec.hand_axis) {
-                eprintln!(
-                    "error: --sfnn-factorizer axis terms are not yet supported with progressN LayerStacks; arch {} can use --sfnn-factorizer shared or none.",
-                    args.arch().cli_name()
-                );
-                std::process::exit(2);
-            }
             if spec.explicit_king_axis && layerstack.factorizer_king_axis_dim() == 0 {
                 eprintln!(
                     "error: --sfnn-factorizer requested king=axis, but arch {} has no king bucket axis.",
@@ -7769,8 +7746,16 @@ fn cuda_cpp_sfnn_factorizer_axis_ids(
     factorizer: SfnnFactorizerSpec,
 ) -> Vec<usize> {
     let king_bucket_count = shape.factorizer_king_bucket_count();
-    let king_bucket = stack % king_bucket_count;
-    let hand_bucket = stack / king_bucket_count;
+    let hand_bucket_count = shape.factorizer_hand_bucket_count();
+    let factorizer_stack_count = king_bucket_count.saturating_mul(hand_bucket_count).max(1);
+    let progress_bucket_count = if shape.num_stacks % factorizer_stack_count == 0 {
+        shape.num_stacks / factorizer_stack_count
+    } else {
+        1
+    };
+    let axis_stack = stack / progress_bucket_count.max(1);
+    let king_bucket = axis_stack % king_bucket_count;
+    let hand_bucket = (axis_stack / king_bucket_count) % hand_bucket_count;
     let mut ids = Vec::with_capacity(4);
     if factorizer.king_axis && shape.factorizer_king_axis_dim != 0 {
         ids.push(king_bucket / shape.factorizer_king_axis_dim);
@@ -13515,6 +13500,78 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn sfnn_factorizer_can_select_axes_with_progress_axis() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3_hand64_progress2",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "king=axis,hand=axis",
+        ])
+        .unwrap();
+
+        let arch = args.arch();
+        assert_eq!(arch.cli_name(), "SFNN_halfka2_1024_7_64_hand64_k3k3_progress2");
+        let layerstack = arch.layerstack.unwrap();
+        assert_eq!(layerstack.num_stacks(), 64 * 9 * 2);
+        assert_eq!(layerstack.factorizer_king_axis_dim(), 3);
+        assert_eq!(layerstack.factorizer_hand_axis_dim(), 8);
+        assert_eq!(layerstack.progress_bucket_count(), 2);
+
+        let spec = effective_sfnn_factorizer_spec(&args);
+        assert!(spec.shared);
+        assert!(spec.king_axis);
+        assert!(spec.hand_axis);
+        assert!(effective_sfnn_axis_factorized_l1(&args));
+        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
+
+        let result = args.validate_backend_flags();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_factorizer_axis_ids_ignore_progress_axis() {
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l2_size: 3,
+            num_stacks: 64 * 9 * 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 3,
+            factorizer_hand_axis_dim: 8,
+        };
+        let factorizer = SfnnFactorizerSpec {
+            shared: true,
+            king_axis: true,
+            hand_axis: true,
+            explicit_king_axis: true,
+            explicit_hand_axis: true,
+        };
+        let hand_bucket = 45usize;
+        let king_bucket = 7usize;
+        let progress_bucket = 1usize;
+        let stack = (hand_bucket * 9 + king_bucket) * 2 + progress_bucket;
+
+        assert_eq!(cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer), vec![2, 4, 11, 19]);
     }
 
     #[test]
