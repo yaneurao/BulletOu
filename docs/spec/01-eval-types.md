@@ -99,7 +99,7 @@ YaneuraOu-compatible LayerStack bucket algorithm:
 - `hand4`: 4 buckets by side-to-move / non-side bishop-in-hand presence.
 - `hand16`: 16 buckets by side-to-move / non-side pawn/bishop-in-hand presence.
 - `hand64`: 64 buckets by side-to-move / non-side 3-bit hand-presence buckets.
-- `hand64z`: 64 buckets by side-to-move / non-side hand-score zone buckets. This is the old `hand64` formula renamed to match YaneuraOu.
+- `hand64z`: 64 buckets by side-to-move / non-side hand-score zone buckets.
 - `hand64_k3k3` / `hand64_king3_by_king3`: 64 hand buckets x 9 king buckets = 576 stacks.
 - `hand64_k9k9` / `hand64_king9_by_king9`: 64 hand buckets x 81 king buckets = 5184 stacks.
 - `hand64_k29k29` / `hand64_king29_by_king29`: 64 hand buckets x 841 king buckets = 53824 stacks.

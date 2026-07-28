@@ -316,7 +316,7 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 | `hand256` | 16 | 256 | 4種類の存在bit |
 | `hand1024` | 32 | 1024 | 5種類の存在bit |
 
-`hand64` は以前の点数 zone 方式ではありません。やねうら王側で旧 `hand64` は `hand64z` に rename され、現在の `hand64` は持ち駒の種類グループを見る 3bit 方式です。
+`hand64` と `hand64z` はどちらも最終的には64 bucketですが、見ている情報が違います。`hand64` は持ち駒の種類グループ、`hand64z` は持ち駒の点数 zone を見ます。
 
 ### `hand4` と `hand16`
 
@@ -349,7 +349,7 @@ hand64_bucket = stm_3bit * 8 + non_stm_3bit
 
 ### `hand64z`
 
-`hand64z` は、旧 `hand64` と同じ点数 zone 方式です。片側の持ち駒を点数化し、8 bucket に丸めます。
+`hand64z` は、片側の持ち駒を点数化し、8 bucket に丸めます。
 
 | 駒 | 点数 |
 |---|---:|
@@ -379,7 +379,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 です。
 
-`hand64z` は持ち駒の種類よりも「どれくらい持っているか」を粗く見たいときの bucket です。同じ64 bucketでも、新しい `hand64` とは互換性がありません。
+`hand64z` は持ち駒の種類よりも「どれくらい持っているか」を粗く見たいときの bucket です。同じ64 bucketでも、`hand64` とは bucket の分け方が違います。
 
 ### `hand256` と `hand1024`
 
@@ -455,7 +455,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | `hand4` | 4 | 角持ちだけを見る軽量 hand bucket |
 | `hand16` | 16 | 歩/角持ちを見る軽量 hand bucket |
 | `hand64_k3k3` | 576 | 軽めの hand + king |
-| `hand64z_k3k3` | 576 | 旧 `hand64` 相当の点数 zone + king |
+| `hand64z_k3k3` | 576 | 点数 zone による hand + king |
 | `hand256_k3k3` | 2304 | よく比較対象にしやすい |
 | `hand256_k9k9z` | 20736 | かなり大きい |
 | `hand256_k13k13z` | 43264 | 教師量・VRAM・保存サイズに注意 |

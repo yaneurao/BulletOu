@@ -304,7 +304,7 @@ Hand buckets combine the side-to-move hand bucket and the non-side hand bucket.
 | `hand256` | 16 | 256 | 4 presence bits |
 | `hand1024` | 32 | 1024 | 5 presence bits |
 
-`hand64` is no longer the old score-zone split. YaneuraOu renamed the old `hand64` formula to `hand64z`; the current `hand64` is a 3-bit hand-piece presence split.
+`hand64` and `hand64z` both produce 64 final buckets, but they look at different information. `hand64` uses hand-piece presence groups; `hand64z` uses coarse hand-piece score zones.
 
 ### `hand4` and `hand16`
 
@@ -337,7 +337,7 @@ Use `hand64` when bishop-in-hand should be independent, but `hand256` / `hand102
 
 ### `hand64z`
 
-`hand64z` is the old `hand64` score-zone formula. It scores one side's hand and rounds it into 8 buckets.
+`hand64z` scores one side's hand and rounds it into 8 buckets.
 
 | Piece | Score |
 |---|---:|
@@ -365,7 +365,7 @@ Final bucket:
 hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 ```
 
-`hand64z` is useful when you care more about coarse hand-piece amount than exact hand-piece groups. It has the same 64-bucket count as `hand64`, but it is not compatible with `hand64`.
+`hand64z` is useful when you care more about coarse hand-piece amount than exact hand-piece groups. It has the same 64-bucket count as `hand64`, but it partitions positions differently.
 
 ### `hand256` and `hand1024`
 
@@ -441,7 +441,7 @@ The hand / king / progress axes multiply, so combinations can become huge quickl
 | `hand4` | 4 | lightweight bishop-in-hand split |
 | `hand16` | 16 | lightweight pawn/bishop-in-hand split |
 | `hand64_k3k3` | 576 | light hand + king split |
-| `hand64z_k3k3` | 576 | old `hand64`-style score zone + king |
+| `hand64z_k3k3` | 576 | score-zone hand split + king |
 | `hand256_k3k3` | 2304 | useful comparison point |
 | `hand256_k9k9z` | 20736 | already large |
 | `hand256_k13k13z` | 43264 | watch teacher data, VRAM, and checkpoint size |

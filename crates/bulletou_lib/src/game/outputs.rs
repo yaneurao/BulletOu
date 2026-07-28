@@ -333,8 +333,7 @@ pub fn shogi_hand64_single_bucket(hand: Hand) -> usize {
 
 /// SFNN `hand64z` bucket for one side's hand.
 ///
-/// This is the former BulletOu/YaneuraOu `hand64` score-zone formula, renamed
-/// on the engine side to `hand64z`.
+/// This score-zone bucket is separate from the `hand64` hand-presence bucket.
 #[inline]
 pub fn shogi_hand64z_single_bucket(hand: Hand) -> usize {
     let score = usize::from(hand.pawn())
