@@ -50,6 +50,8 @@ NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごと�
 | `SFNN_halfka2_1024_7_64_hand64` | 1024 | 7 | 64 | やねうら王 hand64 LayerStack bucket (64 stacks) |
 | `SFNN_halfka2_1024_7_64_hand64_k3k3` | 1024 | 7 | 64 | hand64 × k3k3 LayerStack bucket (576 stacks。かなり大きい) |
 | `SFNN_halfka2_1024_7_64_k9k9` | 1024 | 7 | 64 | king9-by-king9 LayerStack bucket (81 stacks) |
+| `SFNN_halfka2_1024_7_64_k9k9z` | 1024 | 7 | 64 | king9-zone-by-king9-zone LayerStack bucket (81 stacks) |
+| `SFNN_halfka2_1024_7_64_k13k13z` | 1024 | 7 | 64 | king13-zone-by-king13-zone LayerStack bucket (169 stacks) |
 | `SFNN_halfka2_1024_7_64_k21k21` | 1024 | 7 | 64 | king21-by-king21 LayerStack bucket (441 stacks) |
 | `SFNN_halfka2_1024_7_64_k29k29` | 1024 | 7 | 64 | king29-by-king29 LayerStack bucket (841 stacks) |
 | `SFNN_halfka2_1024_7_64_hand64_k9k9` | 1024 | 7 | 64 | hand64 × k9k9 LayerStack bucket (5184 stacks。非常に大きい) |
@@ -78,7 +80,7 @@ grouped SFNN は、任意の LayerStack suffix の前に `_cN_sMxG` を置いて
 
 common 部分が非ゼロの common+shard L1 も同じ形式。たとえば `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は、1024 common channel + 256 channel × 8 shard。suffix を省略すると single stack (`LayerStacks = 1`) になる。
 
-suffix を付ける場合は、独立した `hand64/hand256/hand1024`, `k3k3/k9k9/k21k21/k29k29`, `progress2/3/4/8/16/32` axis を組み合わせられる。例: `hand256_k3k3_progress16`。parser はこれらの token を任意順で受け付け、内部では `hand`, `king`, `progress` の順に canonicalize する。`ka2` / `halfka2` などの feature token から内部 target は自動的に決まる。
+suffix を付ける場合は、独立した `hand64/hand256/hand1024`, `k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29`, `progress2/3/4/8/16/32` axis を組み合わせられる。例: `hand256_k3k3_progress16`。parser はこれらの token を任意順で受け付け、内部では `hand`, `king`, `progress` の順に canonicalize する。`ka2` / `halfka2` などの feature token から内部 target は自動的に決まる。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 

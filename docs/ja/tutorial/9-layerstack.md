@@ -13,7 +13,7 @@
 | 軸 | 指定できる token | bucket 数 |
 |---|---|---:|
 | hand | 省略, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
-| king | 省略, `k3k3`, `k9k9`, `k21k21`, `k29k29` | 1 / 9 / 81 / 441 / 841 |
+| king | 省略, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | 省略, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
 最終的な stack 数は次の積です。
@@ -48,6 +48,8 @@ SFNN_halfka2_1024_7_64_hand256_k3k3_progress16
 |---|---:|---|
 | `SFNN_halfka2_1024_7_64` | 1 | 単一 stack |
 | `SFNN_halfka2_1024_7_64_k3k3` | 9 | king 3x3 |
+| `SFNN_halfka2_1024_7_64_k9k9z` | 81 | king 9-zone x 9-zone |
+| `SFNN_halfka2_1024_7_64_k13k13z` | 169 | king 13-zone x 13-zone |
 | `SFNN_halfka2_1024_7_64_k29k29` | 841 | king 29x29 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | hand256 のみ |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 2304 | hand256 x k3k3 |
@@ -63,7 +65,7 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 ## 9.3 king bucket
 
-`king3_by_king3`, `king9_by_king9`, `king21_by_king21`, `king29_by_king29` のような長い alias も受け付けます。
+`king3_by_king3`, `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, `king29_by_king29` のような長い alias も受け付けます。
 
 ### `k3k3`
 
@@ -81,6 +83,30 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 ```text
 bucket = friend_rank * 9 + enemy_rank
+```
+
+### `k9k9z`
+
+玉1つを9個の zone に分けます。`k9k9` と同じく合計は 81 stacks ですが、遠い段をまとめ、自陣側の深い段では file/3 の情報を残します。
+
+```text
+if rank < 3: single = 0
+else if rank < 6: single = 1
+else if rank == 6: single = 2
+else: single = 3 + (rank - 7) * 3 + file / 3
+
+bucket = friend_single * 9 + enemy_single
+```
+
+### `k13k13z`
+
+玉1つを13個の zone に分けます。1〜7段は段ごと、8〜9段は file を3分割します。
+
+```text
+if rank < 7: single = rank
+else: single = 7 + (rank - 7) * 3 + file / 3
+
+bucket = friend_single * 13 + enemy_single
 ```
 
 ### `k21k21`

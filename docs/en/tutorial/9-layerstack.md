@@ -13,7 +13,7 @@ YaneuraOu now treats LayerStack selection as three independent axes:
 | Axis | Accepted tokens | Bucket count |
 |---|---|---:|
 | hand | omitted, `hand64`, `hand256`, `hand1024` | 1 / 64 / 256 / 1024 |
-| king | omitted, `k3k3`, `k9k9`, `k21k21`, `k29k29` | 1 / 9 / 81 / 441 / 841 |
+| king | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
 | progress | omitted, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
 The final stack count is:
@@ -48,6 +48,8 @@ SFNN_halfka2_1024_7_64_hand256_k3k3_progress16
 |---|---:|---|
 | `SFNN_halfka2_1024_7_64` | 1 | single stack |
 | `SFNN_halfka2_1024_7_64_k3k3` | 9 | king 3x3 |
+| `SFNN_halfka2_1024_7_64_k9k9z` | 81 | king 9-zone x 9-zone |
+| `SFNN_halfka2_1024_7_64_k13k13z` | 169 | king 13-zone x 13-zone |
 | `SFNN_halfka2_1024_7_64_k29k29` | 841 | king 29x29 |
 | `SFNN_halfka2_1024_7_64_hand256` | 256 | hand256 only |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 2304 | hand256 x k3k3 |
@@ -63,7 +65,7 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 ## 9.3 King buckets
 
-Long aliases such as `king3_by_king3`, `king9_by_king9`, `king21_by_king21`, and `king29_by_king29` are also accepted.
+Long aliases such as `king3_by_king3`, `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, and `king29_by_king29` are also accepted.
 
 ### `k3k3`
 
@@ -82,6 +84,34 @@ Uses exact friend/enemy king ranks:
 ```text
 bucket = friend_rank * 9 + enemy_rank
 ```
+
+### `k9k9z`
+
+Each king square is mapped to 9 zones. Compared with `k9k9`, this keeps finer file information near the home ranks while merging far ranks:
+
+```text
+if rank < 3: single = 0
+else if rank < 6: single = 1
+else if rank == 6: single = 2
+else: single = 3 + (rank - 7) * 3 + file / 3
+
+bucket = friend_single * 9 + enemy_single
+```
+
+This still has `9 * 9 = 81` stacks, but the meaning of the 9 buckets per king differs from `k9k9`.
+
+### `k13k13z`
+
+Each king square is mapped to 13 zones: ranks 1-7 are kept separately, while ranks 8-9 are split into three file bands:
+
+```text
+if rank < 7: single = rank
+else: single = 7 + (rank - 7) * 3 + file / 3
+
+bucket = friend_single * 13 + enemy_single
+```
+
+This has `13 * 13 = 169` stacks.
 
 ### `k21k21`
 

@@ -298,6 +298,8 @@ impl LayerStackMode {
                     ShogiSfnnKingBucketKind::None => {}
                     ShogiSfnnKingBucketKind::KingRank9 => parts.push("k3k3"),
                     ShogiSfnnKingBucketKind::KingRank81 => parts.push("k9k9"),
+                    ShogiSfnnKingBucketKind::King9ZoneByKing9Zone => parts.push("k9k9z"),
+                    ShogiSfnnKingBucketKind::King13ZoneByKing13Zone => parts.push("k13k13z"),
                     ShogiSfnnKingBucketKind::King21ByKing21 => parts.push("k21k21"),
                     ShogiSfnnKingBucketKind::King29ByKing29 => parts.push("k29k29"),
                 }
@@ -465,6 +467,7 @@ fn layerstack_from_axes(
         (ShogiSfnnHandBucketKind::Hand1024, ShogiSfnnKingBucketKind::King29ByKing29) => {
             LayerStackMode::Hand1024Kingrank29by29
         }
+        (hand, king) => LayerStackMode::Custom { hand, king, progress },
     }
 }
 
@@ -477,6 +480,10 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
         .to_ascii_lowercase()
         .replace("king3_by_king3", "k3k3")
         .replace("king9_by_king9", "k9k9")
+        .replace("king9z_by_king9z", "k9k9z")
+        .replace("king9zone_by_king9zone", "k9k9z")
+        .replace("king13z_by_king13z", "k13k13z")
+        .replace("king13zone_by_king13zone", "k13k13z")
         .replace("king21_by_king21", "k21k21")
         .replace("king29_by_king29", "k29k29");
 
@@ -497,13 +504,15 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
                     _ => unreachable!(),
                 };
             }
-            "k3k3" | "k9k9" | "k21k21" | "k29k29" => {
+            "k3k3" | "k9k9" | "k9k9z" | "k13k13z" | "k21k21" | "k29k29" => {
                 if king != ShogiSfnnKingBucketKind::None {
                     return Err(format!("invalid arch `{arch}`: duplicate SFNN king bucket token in `{raw}`"));
                 }
                 king = match token {
                     "k3k3" => ShogiSfnnKingBucketKind::KingRank9,
                     "k9k9" => ShogiSfnnKingBucketKind::KingRank81,
+                    "k9k9z" => ShogiSfnnKingBucketKind::King9ZoneByKing9Zone,
+                    "k13k13z" => ShogiSfnnKingBucketKind::King13ZoneByKing13Zone,
                     "k21k21" => ShogiSfnnKingBucketKind::King21ByKing21,
                     "k29k29" => ShogiSfnnKingBucketKind::King29ByKing29,
                     _ => unreachable!(),
@@ -818,7 +827,7 @@ impl std::fmt::Display for NnueArch {
     }
 }
 
-const SFNN_LAYERSTACK_EXPECTED: &str = "[hand64|hand256|hand1024] [k3k3|k9k9|k21k21|k29k29] [progress2|progress3|progress4|progress8|progress16|progress32]";
+const SFNN_LAYERSTACK_EXPECTED: &str = "[hand64|hand256|hand1024] [k3k3|k9k9|k9k9z|k13k13z|k21k21|k29k29] [progress2|progress3|progress4|progress8|progress16|progress32]";
 const SFNN_ARCH_EXPECTED: &str = "SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<hand*>][_<k*>][_<progress*>]";
 
 impl std::str::FromStr for NnueArch {
@@ -12074,6 +12083,24 @@ mod tests {
         assert_eq!(k9k9.cli_name(), "SFNN_halfka2_1024_7_64_k9k9");
         let king9_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king9_by_king9").unwrap();
         assert_eq!(king9_alias.cli_name(), "SFNN_halfka2_1024_7_64_k9k9");
+        let k9k9z = NnueArch::from_str("SFNN_halfka2_1024_7_64_k9k9z").unwrap();
+        assert_eq!(k9k9z.dims(), (1024, 7, 64));
+        assert_eq!(k9k9z.expected_eval_type(), EvalType::SfnnHalfka2);
+        assert_eq!(k9k9z.layerstack.unwrap().num_stacks(), 81);
+        assert_eq!(k9k9z.cli_name(), "SFNN_halfka2_1024_7_64_k9k9z");
+        let king9z_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king9z_by_king9z").unwrap();
+        assert_eq!(king9z_alias.cli_name(), "SFNN_halfka2_1024_7_64_k9k9z");
+        let king9zone_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king9zone_by_king9zone").unwrap();
+        assert_eq!(king9zone_alias.cli_name(), "SFNN_halfka2_1024_7_64_k9k9z");
+        let k13k13z = NnueArch::from_str("SFNN_halfka2_1024_7_64_k13k13z").unwrap();
+        assert_eq!(k13k13z.dims(), (1024, 7, 64));
+        assert_eq!(k13k13z.expected_eval_type(), EvalType::SfnnHalfka2);
+        assert_eq!(k13k13z.layerstack.unwrap().num_stacks(), 169);
+        assert_eq!(k13k13z.cli_name(), "SFNN_halfka2_1024_7_64_k13k13z");
+        let king13z_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king13z_by_king13z").unwrap();
+        assert_eq!(king13z_alias.cli_name(), "SFNN_halfka2_1024_7_64_k13k13z");
+        let king13zone_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king13zone_by_king13zone").unwrap();
+        assert_eq!(king13zone_alias.cli_name(), "SFNN_halfka2_1024_7_64_k13k13z");
         let k21k21 = NnueArch::from_str("SFNN_halfka2_1024_7_64_k21k21").unwrap();
         assert_eq!(k21k21.dims(), (1024, 7, 64));
         assert_eq!(k21k21.expected_eval_type(), EvalType::SfnnHalfka2);
@@ -12126,6 +12153,12 @@ mod tests {
         assert_eq!(hand256_k9k9.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k9k9");
         let hand256_king9_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand256_king9_by_king9").unwrap();
         assert_eq!(hand256_king9_alias.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k9k9");
+        let hand256_k9k9z = NnueArch::from_str("SFNN_halfka2_1024_7_64_k9k9z_hand256").unwrap();
+        assert_eq!(hand256_k9k9z.layerstack.unwrap().num_stacks(), 20736);
+        assert_eq!(hand256_k9k9z.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k9k9z");
+        let hand256_k13k13z = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand256_k13k13z").unwrap();
+        assert_eq!(hand256_k13k13z.layerstack.unwrap().num_stacks(), 43264);
+        assert_eq!(hand256_k13k13z.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k13k13z");
         let hand256_k21k21 = NnueArch::from_str("SFNN_halfka2_1024_7_64_hand256_k21k21").unwrap();
         assert_eq!(hand256_k21k21.layerstack.unwrap().num_stacks(), 112896);
         assert_eq!(hand256_k21k21.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k21k21");
@@ -12185,6 +12218,8 @@ mod tests {
             "SFNN_halfka2_1024_7_64",
             "SFNN_halfka2_1024_7_64_k3k3",
             "SFNN_halfka2_1024_7_64_k9k9",
+            "SFNN_halfka2_1024_7_64_k9k9z",
+            "SFNN_halfka2_1024_7_64_k13k13z",
             "SFNN_halfka2_1024_7_64_k21k21",
             "SFNN_halfka2_1024_7_64_k29k29",
             "SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3",
@@ -12211,28 +12246,40 @@ mod tests {
             "SFNN_halfka2_1024_7_64_hand64",
             "SFNN_halfka2_1024_7_64_hand64_k3k3",
             "SFNN_halfka2_1024_7_64_hand64_k9k9",
+            "SFNN_halfka2_1024_7_64_hand64_k9k9z",
+            "SFNN_halfka2_1024_7_64_hand64_k13k13z",
             "SFNN_halfka2_1024_7_64_hand64_k21k21",
             "SFNN_halfka2_1024_7_64_hand64_k29k29",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k9k9",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k9k9z",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k13k13z",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k21k21",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand64_k29k29",
             "SFNN_halfka2_1024_7_64_hand256",
             "SFNN_halfka2_1024_7_64_hand256_k3k3",
             "SFNN_halfka2_1024_7_64_hand256_k9k9",
+            "SFNN_halfka2_1024_7_64_hand256_k9k9z",
+            "SFNN_halfka2_1024_7_64_hand256_k13k13z",
             "SFNN_halfka2_1024_7_64_hand256_k21k21",
             "SFNN_halfka2_1024_7_64_hand256_k29k29",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k9k9",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k9k9z",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k21k21",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k29k29",
             "SFNN_halfka2_1024_7_64_hand1024",
             "SFNN_halfka2_1024_7_64_hand1024_k3k3",
             "SFNN_halfka2_1024_7_64_hand1024_k9k9",
+            "SFNN_halfka2_1024_7_64_hand1024_k9k9z",
+            "SFNN_halfka2_1024_7_64_hand1024_k13k13z",
             "SFNN_halfka2_1024_7_64_hand1024_k21k21",
             "SFNN_halfka2_1024_7_64_hand1024_k29k29",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k3k3",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k9k9",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k9k9z",
+            "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k13k13z",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k21k21",
             "SFNN_ka2_3072_7_64_c1024_s256x8_hand1024_k29k29",
             "SFNN_halfka2_1024_7_64_progress2",
@@ -12242,7 +12289,11 @@ mod tests {
             "SFNN_halfka2_1024_7_64_progress16",
             "SFNN_halfka2_1024_7_64_progress32",
             "SFNN_halfka2_1024_7_64_k3k3_progress8",
+            "SFNN_halfka2_1024_7_64_k9k9z_progress8",
+            "SFNN_halfka2_1024_7_64_k13k13z_progress8",
             "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
+            "SFNN_halfka2_1024_7_64_hand256_k9k9z_progress16",
+            "SFNN_halfka2_1024_7_64_hand256_k13k13z_progress16",
             "SFNN_halfkahm2_1536_15_32_k3k3",
         ] {
             let parsed = NnueArch::from_str(s).unwrap();
