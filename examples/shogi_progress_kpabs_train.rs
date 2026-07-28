@@ -1,8 +1,6 @@
 /*
-KP-absolute progress trainer: learns a YaneuraOu-compatible `progress.bin`
+KP-absolute progress trainer: learns a binary coefficient file
 for LayerStack bucket selection (`--bucket-mode progress8kpabs`).
-
-See docs/shogi/shogi_progress_kpabs_train.md for full documentation.
 
 Model:
     z = sum(weights[kp_abs_index])

@@ -19,5 +19,3 @@
 - [shogi/ka2.md](shogi/ka2.md) — NNUE K-A2 / SFNN K-A2 評価関数の学習 (`FeatureSet<K, A2>` v2 玉 collapse 全駒特徴)
 - [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT 評価関数の学習
 - [shogi/sfnn-1536.md](shogi/sfnn-1536.md) — SFNN-1536 (やねうら王 NNUEwoSQPT1536 ビルド向け、LayerStacks=9) の詳細仕様
-- [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — KP 絶対値を用いた進行度推定
-- [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — `shogi_progress_kpabs_train` ツールの CLI 仕様

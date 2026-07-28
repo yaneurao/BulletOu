@@ -19,5 +19,3 @@ Shogi-specific:
 - [shogi/ka2.md](shogi/ka2.md) — NNUE K-A2 / SFNN K-A2 evaluation function training (`FeatureSet<K, A2>` with v2 king-collapsed all-piece feature)
 - [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT evaluation function training
 - [shogi/sfnn-1536.md](shogi/sfnn-1536.md) — Full SFNN-1536 spec for YaneuraOu's NNUEwoSQPT1536 build (LayerStacks=9)
-- [shogi/kp-absolute-progress.md](shogi/kp-absolute-progress.md) — game-progress estimation using KP-Absolute features
-- [shogi/shogi_progress_kpabs_train.md](shogi/shogi_progress_kpabs_train.md) — CLI spec of the `shogi_progress_kpabs_train` tool

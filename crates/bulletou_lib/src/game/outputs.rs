@@ -1262,7 +1262,7 @@ impl ShogiProgressKPAbs {
         Self::for_each_active_index(pos, |idx| out.push(idx));
     }
 
-    /// Loads KP-absolute weights from a YaneuraOu-compatible `progress.bin`.
+    /// Loads KP-absolute weights from a binary coefficient file.
     ///
     /// Only one KP-absolute model can be loaded per process.
     pub fn load_from_bin(path: &Path) -> Result<Self, String> {
