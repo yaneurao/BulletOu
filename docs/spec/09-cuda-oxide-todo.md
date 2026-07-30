@@ -174,13 +174,13 @@ CUDA_HOME=/usr/local/cuda cargo run -p bulletou-cuda-train --features cuda -- \
 
 ### 2026-07-17 CO-008 WRM value loss extension
 
-- Added `ScalarValueLossKind::NnuePytorchWrm` to the root CPU golden. The
+- Added `ScalarValueLossKind::WinRateModel` to the root CPU golden. The
   formula matches `examples/bulletou.rs`: `scorenet = output * 600`,
   `q = sigmoid((scorenet - 270) / 340)`,
   `qm = sigmoid((-scorenet - 270) / 340)`,
   `prediction = (1 + q - qm) * 0.5`, and
   `abs(prediction - target)^2.5`.
-- Added CUDA kernel `loss_nnue_pytorch_wrm_reduce`, using
+- Added CUDA kernel `loss_win_rate_model_reduce`, using
   `core::intrinsics::expf32` and `core::intrinsics::powf32` for libdevice
   lowering.
 - Added `--loss-kind sigmoid-mse|wrm` to `bulletou-cuda-train --loss-smoke`.

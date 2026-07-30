@@ -31,7 +31,8 @@
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
-| `--nnue-pytorch-wrm-loss` | nnue-pytorch 互換の WRM loss を使う ([§6.2](#nnue-pytorch-互換の-wrm-loss) 参照) | off |
+| `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照) | off |
+| `--loss-pow-exp` | WRM の誤差項 `|prediction - target|^p` の指数。`--win-rate-model` 指定時のみ有効 | 2.0 |
 | `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて利用可能な bucket axis factorizer を有効化する。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
@@ -267,30 +268,29 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 対局結果 (W/D/L = Win / Draw / Loss) も混ぜたいときに `--lambda` を下げる。完全結果ベース (`--lambda 0.0`) は教師エンジンの強さに依存しないが、勾配が疎で収束が遅い傾向。実用は `0.5 〜 0.8` あたりの混合が多い。
 
-### nnue-pytorch 互換の WRM loss
+### WRM (win-rate-model) loss
 
-`--nnue-pytorch-wrm-loss` を付けると、標準の `sigmoid(model_output)` に対する MSE ではなく、nodchip 版 nnue-pytorch と同じ WRM (win-rate model) 形式の loss を使う。
+`--win-rate-model` を付けると、標準の `sigmoid(model_output)` に対する MSE ではなく、WRM 形式の target 変換と loss を使う。
 
-具体的には:
+変わるものは次の通り。
 
-- 教師 eval 側を `out_scaling=380`, `offset=270` の win-rate target に変換する
-- network 出力側を `nnue2score=600`, `in_scaling=340`, `offset=270` の win-rate prediction に変換する
-- loss を `abs(target - prediction)^2.5` にする
+- 教師 eval を `offset=270`, `out_scaling=380` の win-rate target に変換する
+- network output を `nnue2score=600`, `offset=270`, `in_scaling=340` の win-rate prediction に変換する
+- loss を `abs(target - prediction)^p` にする。この `p` が `--loss-pow-exp`
 - `test_value_loss` と `plateau` 判定も同じ WRM loss に切り替える
 
-これは **nnue-pytorch と BulletOu の学習条件を近づけて比較するための実験フラグ**。通常の BulletOu 学習では付けなくてよい。ON/OFF で比較するときは、同じ教師・同じ arch・同じ `--tag` ではなく、別の `--tag` を使う。
-
-`--nnue-pytorch-wrm-loss` を使った run の `test_value_loss` は、通常 loss の `test_value_loss` とは式が違うので、数値をそのまま横比較しない。比較するなら同じフラグ状態同士で見る。
-
-使用例:
+`--loss-pow-exp` は tatara と同じ意味のオプション。デフォルトは `2.0`、つまり二乗誤差。報告のあった nnue-pytorch 風の設定を試すなら `2.5` を指定する。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
-    --nnue-pytorch-wrm-loss
+    --win-rate-model \
+    --loss-pow-exp 2.5
 ```
+
+`--loss-pow-exp` は `--win-rate-model` を指定したときだけ loss に効く。WRM run の `test_value_loss` は通常 loss とは式が違うので、WRM なし run の loss 数値とそのまま横比較しない。同じ WRM 設定同士で比較するか、accuracy / 実戦棋力で見る。
 
 ### Optimizer の選択
 
@@ -332,7 +332,7 @@ BulletOu の標準設定は、tatara の SFNN-1536 reference run に寄せて `-
     --optimizer-weight-decay 0.01
 ```
 
-これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。`--nnue-pytorch-wrm-loss` とは独立した実験として、単独で ON/OFF 比較する。
+これは loss 定義を変えないので、`test_value_loss` は通常 run と直接比較できる。WRM loss (`--win-rate-model`) とは独立した実験として、単独で ON/OFF 比較する。
 
 ### Optimizer epsilon
 

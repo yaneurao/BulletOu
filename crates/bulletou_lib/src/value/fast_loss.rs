@@ -6,10 +6,10 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarValueLossKind {
     SigmoidMse,
-    NnuePytorchWrm,
+    WinRateModel { pow_exp: f32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +65,7 @@ pub fn scalar_value_loss_trace(
                 let gradient = 2.0 * error * prediction * (1.0 - prediction);
                 (loss, gradient)
             }
-            ScalarValueLossKind::NnuePytorchWrm => nnue_pytorch_wrm_loss_and_gradient(output, target),
+            ScalarValueLossKind::WinRateModel { pow_exp } => win_rate_model_loss_and_gradient(output, target, pow_exp),
         };
         let weighted = entry_weight * loss;
         per_sample.push(weighted);
@@ -89,11 +89,10 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn nnue_pytorch_wrm_loss_and_gradient(output: f32, target: f32) -> (f32, f32) {
+fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32) -> (f32, f32) {
     const NNUE2SCORE: f32 = 600.0;
     const IN_OFFSET: f32 = 270.0;
     const IN_SCALING: f32 = 340.0;
-    const POW_EXP: f32 = 2.5;
 
     let scorenet = output * NNUE2SCORE;
     let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
@@ -101,11 +100,11 @@ fn nnue_pytorch_wrm_loss_and_gradient(output: f32, target: f32) -> (f32, f32) {
     let prediction = (1.0 + q - qm) * 0.5;
     let error = prediction - target;
     let abs_error = error.abs();
-    let loss = abs_error.powf(POW_EXP);
+    let loss = abs_error.powf(pow_exp);
     let q_prime = q * (1.0 - q);
     let qm_prime = qm * (1.0 - qm);
     let prediction_gradient = 0.5 * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
-    let loss_gradient = POW_EXP * error.signum() * abs_error.powf(POW_EXP - 1.0);
+    let loss_gradient = pow_exp * error.signum() * abs_error.powf(pow_exp - 1.0);
     (loss, loss_gradient * prediction_gradient)
 }
 
@@ -141,14 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn nnue_pytorch_wrm_loss_matches_known_values() {
+    fn win_rate_model_pow_loss_matches_known_values() {
         let outputs = [-4.0, -1.25, 0.0, 1.5, 4.0];
         let targets = [0.0, 0.25, 0.5, 0.75, 1.0];
         let weights = [1.0, 0.0, 0.5, 2.0, 0.25];
 
-        let trace = scalar_value_loss_trace(ScalarValueLossKind::NnuePytorchWrm, &outputs, &targets, &weights).unwrap();
+        let trace =
+            scalar_value_loss_trace(ScalarValueLossKind::WinRateModel { pow_exp: 2.5 }, &outputs, &targets, &weights)
+                .unwrap();
 
-        assert_eq!(trace.kind, ScalarValueLossKind::NnuePytorchWrm);
+        assert_eq!(trace.kind, ScalarValueLossKind::WinRateModel { pow_exp: 2.5 });
         assert_close_slice("per_sample", &trace.per_sample, &[4.4222793e-8, 0.0, 0.0, 0.022698434, 1.1055698e-8]);
         assert_close_slice(
             "mean_output_gradients",

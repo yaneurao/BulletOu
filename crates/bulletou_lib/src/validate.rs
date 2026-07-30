@@ -99,17 +99,17 @@ impl AccuracyReport {
 }
 
 /// Loss formula used for `test_value_loss`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationLossKind {
     /// BulletOu's historical sigmoid MSE:
     /// `(sigmoid(model_output / model_output_scale) - target)^2`, where
     /// `model_output_scale=1` gives the historical logit-style behaviour and
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidMse,
-    /// nodchip nnue-pytorch shogi WRM value loss with fixed defaults:
+    /// Win-rate-model value loss with fixed shogi WRM transforms:
     /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
-    /// and `abs(prediction - target)^2.5`.
-    NnuePytorchWrm,
+    /// and configurable `abs(prediction - target)^pow_exp`.
+    WinRateModel { pow_exp: f32 },
 }
 
 #[inline]
@@ -276,17 +276,17 @@ pub fn compute_sign_accuracy_with_loss(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::NnuePytorchWrm => wrm_probability(f32::from(s), 270.0, 380.0),
+                ValidationLossKind::WinRateModel { .. } => wrm_probability(f32::from(s), 270.0, 380.0),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(*m * model_inv_scale),
-                ValidationLossKind::NnuePytorchWrm => wrm_probability(*m * 600.0, 270.0, 340.0),
+                ValidationLossKind::WinRateModel { .. } => wrm_probability(*m * 600.0, 270.0, 340.0),
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidMse => diff * diff,
-                ValidationLossKind::NnuePytorchWrm => diff.abs().powf(2.5),
+                ValidationLossKind::WinRateModel { pow_exp } => diff.abs().powf(pow_exp),
             };
             report.loss_sampled += 1;
         }
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_loss_can_use_nnue_pytorch_wrm() {
+    fn test_loss_can_use_win_rate_model_pow_loss() {
         let m = [0.0, 0.0];
         let t = [400i16, -400];
         let r = compute_sign_accuracy_with_loss(
@@ -656,7 +656,7 @@ mod tests {
             1.0,
             400.0,
             1.0,
-            ValidationLossKind::NnuePytorchWrm,
+            ValidationLossKind::WinRateModel { pow_exp: 2.5 },
         );
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");

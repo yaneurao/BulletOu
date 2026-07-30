@@ -31,7 +31,8 @@ Main flags:
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
-| `--nnue-pytorch-wrm-loss` | Use nnue-pytorch-compatible WRM loss (see [§6.2](#nnue-pytorch-compatible-wrm-loss)) | off |
+| `--win-rate-model` | Use WRM (win-rate-model) target conversion and loss (see [§6.2](#wrm-win-rate-model-loss)) | off |
+| `--loss-pow-exp` | Exponent `p` in the WRM error term `|prediction - target|^p`; used only with `--win-rate-model` | 2.0 |
 | `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus all available bucket-axis factorizer terms; combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for enabling shared factorizer or disabling all SFNN factorizer terms. Prefer `--sfnn-factorizer shared` or `--sfnn-factorizer none` in new commands. | on |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
@@ -257,30 +258,29 @@ The default `1.0` (pure eval) is the safe starting point: the network learns to 
 
 Lower `--lambda` to mix in the W/D/L game result. Pure-result training (`--lambda 0.0`) doesn't rely on teacher strength but has sparser gradients and slower convergence. A practical mix is usually `0.5–0.8`.
 
-### nnue-pytorch-compatible WRM loss
+### WRM (win-rate-model) loss
 
-Add `--nnue-pytorch-wrm-loss` to use nodchip nnue-pytorch's WRM (win-rate model) loss instead of BulletOu's default MSE on `sigmoid(model_output)`.
+Add `--win-rate-model` to use WRM target conversion and WRM loss instead of BulletOu's default MSE on `sigmoid(model_output)`.
 
 This changes:
 
 - teacher eval conversion to a win-rate target with `out_scaling=380` and `offset=270`
 - network output conversion to a win-rate prediction with `nnue2score=600`, `in_scaling=340`, and `offset=270`
-- loss formula to `abs(target - prediction)^2.5`
+- loss formula to `abs(target - prediction)^p`, where `p` is `--loss-pow-exp`
 - `test_value_loss` and `plateau` decisions to use the same WRM loss
 
-This is an **experimental comparison flag** for reducing the training-condition gap between nnue-pytorch and BulletOu. You do not need it for a normal first run. When comparing ON/OFF, use the same teacher and architecture but a different `--tag`.
-
-`test_value_loss` from a `--nnue-pytorch-wrm-loss` run uses a different formula from the default loss, so do not compare the raw loss number directly against a default-loss run. Compare runs with the same flag state.
-
-Example:
+`--loss-pow-exp` follows tatara's convention. The default is `2.0` (squared error). Use `2.5` for the commonly reported nnue-pytorch-style setting:
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ --test-teacher test.hcpe \
     --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
-    --nnue-pytorch-wrm-loss
+    --win-rate-model \
+    --loss-pow-exp 2.5
 ```
+
+`--loss-pow-exp` is used only when `--win-rate-model` is enabled. A WRM run's `test_value_loss` uses a different formula from the default loss, so do not compare the raw loss number directly against a non-WRM run. Compare runs with the same WRM setting, or use accuracy / engine strength.
 
 ### Optimizer Selection
 
@@ -322,7 +322,7 @@ BulletOu's default setting uses `--optimizer-weight-decay 0.0`, matching the tat
     --optimizer-weight-decay 0.01
 ```
 
-This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from `--nnue-pytorch-wrm-loss`.
+This does not change the loss formula, so `test_value_loss` is directly comparable with the default run. Treat it as a separate ON/OFF experiment from WRM loss (`--win-rate-model`).
 
 ### Optimizer Epsilon
 

@@ -1140,17 +1140,17 @@ __global__ void loss_sigmoid_mse_reduce_kernel(
     mean_output_gradients[idx] = entry_weights[idx] * gradient / static_cast<float>(batch);
 }
 
-__global__ void loss_nnue_pytorch_wrm_reduce_kernel(
+__global__ void loss_win_rate_model_reduce_kernel(
     const float* outputs,
     const float* targets,
     const float* entry_weights,
     float* per_sample,
     float* mean_output_gradients,
+    float loss_pow_exp,
     size_t batch) {
     constexpr float NNUE2SCORE = 600.0f;
     constexpr float IN_OFFSET = 270.0f;
     constexpr float IN_SCALING = 340.0f;
-    constexpr float POW_EXP = 2.5f;
 
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= batch) {
@@ -1165,11 +1165,11 @@ __global__ void loss_nnue_pytorch_wrm_reduce_kernel(
     float prediction = (1.0f + q - qm) * 0.5f;
     float error = prediction - target;
     float abs_error = fabsf(error);
-    float loss = powf(abs_error, POW_EXP);
+    float loss = powf(abs_error, loss_pow_exp);
     float q_prime = q * (1.0f - q);
     float qm_prime = qm * (1.0f - qm);
     float prediction_gradient = 0.5f * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
-    float loss_gradient = POW_EXP * sign_f32(error) * powf(abs_error, POW_EXP - 1.0f);
+    float loss_gradient = loss_pow_exp * sign_f32(error) * powf(abs_error, loss_pow_exp - 1.0f);
     per_sample[idx] = entry_weights[idx] * loss;
     mean_output_gradients[idx] = entry_weights[idx] * loss_gradient * prediction_gradient / static_cast<float>(batch);
 }
@@ -4350,12 +4350,15 @@ int launch_sfnn_backward_kernels(
     return 0;
 }
 
-int validate_scalar_loss(size_t batch, int kind) {
+int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp) {
     if (batch == 0) {
         return fail_message("scalar loss batch size must be greater than zero");
     }
     if (kind != 0 && kind != 1) {
-        return fail_message("scalar loss kind must be 0 (sigmoid-mse) or 1 (nnue-pytorch-wrm)");
+        return fail_message("scalar loss kind must be 0 (sigmoid-mse) or 1 (win-rate-model)");
+    }
+    if (!(std::isfinite(loss_pow_exp) && loss_pow_exp >= 1.0f)) {
+        return fail_message("loss_pow_exp must be finite and >= 1");
     }
     return 0;
 }
@@ -4364,6 +4367,7 @@ int launch_scalar_loss_kernels(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float loss_pow_exp,
     size_t batch,
     const float* outputs,
     const float* targets,
@@ -4373,7 +4377,7 @@ int launch_scalar_loss_kernels(
     float* weighted_sum,
     float* mean,
     int finalize_loss) {
-    if (validate_scalar_loss(batch, kind) != 0) {
+    if (validate_scalar_loss(batch, kind, loss_pow_exp) != 0) {
         return -1;
     }
     if (set_context_device(ctx) != 0) {
@@ -4399,14 +4403,15 @@ int launch_scalar_loss_kernels(
             return -1;
         }
     } else {
-        loss_nnue_pytorch_wrm_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        loss_win_rate_model_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
             outputs,
             targets,
             entry_weights,
             per_sample,
             mean_output_gradients,
+            loss_pow_exp,
             batch);
-        if (check_kernel_launch("loss_nnue_pytorch_wrm_reduce_kernel launch") != 0) {
+        if (check_kernel_launch("loss_win_rate_model_reduce_kernel launch") != 0) {
             return -1;
         }
     }
@@ -5932,6 +5937,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float loss_pow_exp,
     size_t batch,
     const BulletOuCudaCppF32Buffer* outputs,
     const BulletOuCudaCppF32Buffer* targets,
@@ -5941,7 +5947,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     BulletOuCudaCppF32Buffer* weighted_sum,
     BulletOuCudaCppF32Buffer* mean,
     int finalize_loss) {
-    if (validate_scalar_loss(batch, kind) != 0 ||
+    if (validate_scalar_loss(batch, kind, loss_pow_exp) != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outputs), batch, "outputs") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(targets), batch, "targets") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(entry_weights), batch, "entry_weights") != 0 ||
@@ -5956,6 +5962,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
             ctx,
             kind,
             output_inv_scale,
+            loss_pow_exp,
             batch,
             outputs->ptr,
             targets->ptr,
@@ -5975,6 +5982,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float loss_pow_exp,
     size_t batch,
     const BulletOuCudaCppF32Buffer* outputs,
     const BulletOuCudaCppF32Buffer* targets,
@@ -5987,6 +5995,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
         ctx,
         kind,
         output_inv_scale,
+        loss_pow_exp,
         batch,
         outputs,
         targets,
@@ -6099,6 +6108,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
     int device,
     int kind,
     float output_inv_scale,
+    float loss_pow_exp,
     size_t batch,
     const float* outputs,
     const float* targets,
@@ -6107,7 +6117,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
     float* mean_output_gradients,
     float* weighted_sum,
     float* mean) {
-    if (validate_scalar_loss(batch, kind) != 0 ||
+    if (validate_scalar_loss(batch, kind, loss_pow_exp) != 0 ||
         validate_host_ptr(outputs, batch, "outputs") != 0 ||
         validate_host_ptr(targets, batch, "targets") != 0 ||
         validate_host_ptr(entry_weights, batch, "entry_weights") != 0 ||
@@ -6149,6 +6159,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
             ctx,
             kind,
             output_inv_scale,
+            loss_pow_exp,
             batch,
             d_outputs,
             d_targets,

@@ -1161,7 +1161,7 @@ impl EvalType {
         }
     }
 
-    fn supports_nnue_pytorch_wrm_loss(self) -> bool {
+    fn supports_win_rate_model(self) -> bool {
         self.uses_arch()
     }
 
@@ -2474,12 +2474,16 @@ struct Args {
     #[arg(long, default_value = "290")]
     scale: u32,
 
-    /// Use nnue-pytorch's WRM value loss and target conversion for NNUE /
-    /// SFNN scalar value networks. This uses the nodchip shogi defaults:
-    /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
-    /// and |target-prediction|^2.5. Default is off for A/B comparisons.
+    /// Use tatara-style win-rate-model target conversion and WRM loss for
+    /// NNUE / SFNN scalar value networks.
     #[arg(long)]
-    nnue_pytorch_wrm_loss: bool,
+    win_rate_model: bool,
+
+    /// Exponent of the WRM error term `|prediction - target|^p`.
+    /// Used only with `--win-rate-model`. The tatara default is 2.0;
+    /// nnue-pytorch-style experiments commonly use 2.5.
+    #[arg(long, default_value = "2.0")]
+    loss_pow_exp: f32,
 
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
@@ -2793,6 +2797,12 @@ impl Args {
         if self.sfnn_factorizer.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
         }
+        if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
+            return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
+        }
+        if self.win_rate_model && !eval_type.supports_win_rate_model() {
+            return Err("--win-rate-model currently applies to NNUE / SFNN eval types only".to_string());
+        }
         if let Some(spec) = self.sfnn_factorizer {
             if let Some(layerstack) = self.effective_layerstack() {
                 if spec.explicit_king_axis && layerstack.factorizer_king_axis_dim() == 0 {
@@ -2908,10 +2918,31 @@ impl Args {
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
-    if args.nnue_pytorch_wrm_loss {
-        ValidationLossKind::NnuePytorchWrm
+    if args.win_rate_model {
+        ValidationLossKind::WinRateModel { pow_exp: effective_loss_pow_exp(args) }
     } else {
         ValidationLossKind::SigmoidMse
+    }
+}
+
+fn effective_loss_pow_exp(args: &Args) -> f32 {
+    if args.win_rate_model { args.loss_pow_exp } else { 2.0 }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
+    if args.win_rate_model {
+        bulletou_cuda_cpp::ScalarLossKind::WinRateModel { pow_exp: effective_loss_pow_exp(args) }
+    } else {
+        bulletou_cuda_cpp::ScalarLossKind::SigmoidMse
+    }
+}
+
+fn value_loss_label(args: &Args) -> String {
+    if args.win_rate_model {
+        format!("win-rate-model(pow_exp={:.3})", effective_loss_pow_exp(args))
+    } else {
+        "sigmoid-mse".to_string()
     }
 }
 
@@ -3431,8 +3462,12 @@ fn main() {
             }
         }
     }
-    if args.nnue_pytorch_wrm_loss && !args.eval_type().supports_nnue_pytorch_wrm_loss() {
-        eprintln!("error: --nnue-pytorch-wrm-loss currently applies to NNUE / SFNN eval types only.");
+    if args.win_rate_model && !args.eval_type().supports_win_rate_model() {
+        eprintln!("error: --win-rate-model currently applies to NNUE / SFNN eval types only.");
+        std::process::exit(2);
+    }
+    if !(args.loss_pow_exp.is_finite() && args.loss_pow_exp >= 1.0) {
+        eprintln!("error: --loss-pow-exp must be finite and >= 1 (got {}).", args.loss_pow_exp);
         std::process::exit(2);
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
@@ -3903,7 +3938,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                win_rate_model: args.win_rate_model,
                 ft_factorize: false,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
@@ -3930,7 +3965,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
@@ -3956,7 +3991,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
@@ -3988,7 +4023,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
@@ -4020,7 +4055,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
@@ -4140,7 +4175,7 @@ where
         queue_depth: options.queue_depth,
         lambda: args.lambda,
         scale: args.scale as f32,
-        nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+        win_rate_model: args.win_rate_model,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
@@ -4266,7 +4301,7 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     eprintln!("  batch size = {batch_size}");
-    eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    eprintln!("  loss = {}", value_loss_label(args));
     eprintln!(
         "  cuda-cpp loss progress log = {} ({})",
         cuda_cpp_loss_progress_log_path(args).display(),
@@ -4300,7 +4335,6 @@ fn run_cuda_cpp_kppt_component_direct_steps(
 ) -> Result<(), String> {
     use bulletou_cuda_cpp::{
         Context, KpptTableTrainStepHostBatch, KpptTableTrainStepRunner, RAdamUpdateParams, RangerUpdateParams,
-        ScalarLossKind,
     };
 
     let train_steps = schedule.total_steps;
@@ -4351,8 +4385,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         (runner, initial_state.completed_steps)
     };
 
-    let loss_kind =
-        if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
+    let loss_kind = cuda_cpp_scalar_loss_kind(args);
     let output_inv_scale = 1.0_f32;
     let mut seen_steps = 0usize;
     let mut reported_loss_sum = 0.0_f64;
@@ -4885,7 +4918,7 @@ fn run_cuda_cpp_halfkpvm_direct_steps(args: &Args) -> Result<(), String> {
 fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureKind) -> Result<(), String> {
     use bulletou_cuda_cpp::{
         Context, NnueForwardHostWeights as CudaNnueForwardHostWeights, NnueForwardShape as CudaNnueForwardShape,
-        NnueTrainStepHostBatch, NnueTrainStepRunner, RAdamUpdateParams, RangerUpdateParams, ScalarLossKind,
+        NnueTrainStepHostBatch, NnueTrainStepRunner, RAdamUpdateParams, RangerUpdateParams,
     };
 
     let schedule = cuda_cpp_run_schedule(args)?;
@@ -4954,7 +4987,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             feature_kind.source_label()
         );
     }
-    eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    eprintln!("  loss = {}", value_loss_label(args));
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
         eprintln!("  cuda-cpp profile steps = {profile_steps}");
@@ -5002,8 +5035,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         feature_kind.source_label()
     );
 
-    let loss_kind =
-        if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
+    let loss_kind = cuda_cpp_scalar_loss_kind(args);
     // Bullet's scalar value loss applies sigmoid directly to the model output;
     // `--scale` is used only while preparing the teacher target.
     let output_inv_scale = 1.0_f32;
@@ -5826,7 +5858,7 @@ fn run_cuda_cpp_sfnn_ka2_direct_steps(args: &Args) -> Result<(), String> {
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<(), String> {
     use bulletou_cuda_cpp::{
-        Context, RAdamUpdateParams, RangerUpdateParams, ScalarLossKind, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
+        Context, RAdamUpdateParams, RangerUpdateParams, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
     };
     use bulletou_lib::value::SfnnTeacherBatchConfig;
 
@@ -5927,7 +5959,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_weights.shape.l1_group_output()
         );
     }
-    eprintln!("  loss = {}", if args.nnue_pytorch_wrm_loss { "nnue-pytorch-wrm" } else { "sigmoid-mse" });
+    eprintln!("  loss = {}", value_loss_label(args));
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
         eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
@@ -5963,8 +5995,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     .map_err(|e| e.to_string())?;
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
-    let loss_kind =
-        if args.nnue_pytorch_wrm_loss { ScalarLossKind::NnuePytorchWrm } else { ScalarLossKind::SigmoidMse };
+    let loss_kind = cuda_cpp_scalar_loss_kind(args);
     // Bullet's scalar value loss applies sigmoid directly to the model output;
     // `--scale` is used only while preparing the teacher target.
     let output_inv_scale = 1.0_f32;
@@ -6017,7 +6048,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: args.scale as f32,
-        nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+        win_rate_model: args.win_rate_model,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
@@ -6066,7 +6097,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     queue_depth: batch_queue_size,
                     lambda: args.lambda,
                     scale: args.scale as f32,
-                    nnue_pytorch_wrm_loss: args.nnue_pytorch_wrm_loss,
+                    win_rate_model: args.win_rate_model,
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                     profile_prepare: args.cuda_cpp_profile_teacher_prepare,
                 };
@@ -10532,7 +10563,8 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
-        format!("nnue_pytorch_wrm_loss={}", args.nnue_pytorch_wrm_loss),
+        format!("win_rate_model={}", args.win_rate_model),
+        format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!(
             "optimizer_epsilon={}",
@@ -10586,12 +10618,36 @@ fn resume_signature_without_line(signature: &str, prefix: &str) -> String {
     out
 }
 
+fn resume_signature_normalize_loss_flags(signature: &str) -> String {
+    let mut out = Vec::new();
+    for line in signature.lines() {
+        if let Some(value) = line.strip_prefix("nnue_pytorch_wrm_loss=") {
+            let enabled = value.trim() == "true";
+            out.push(format!("win_rate_model={enabled}"));
+            out.push(format!("loss_pow_exp={:.9}", if enabled { 2.5_f32 } else { 2.0_f32 }));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    let has_loss_pow_exp = out.iter().any(|line| line.starts_with("loss_pow_exp="));
+    let has_win_rate_model = out.iter().position(|line| line.starts_with("win_rate_model="));
+    if !has_loss_pow_exp {
+        if let Some(index) = has_win_rate_model {
+            out.insert(index + 1, "loss_pow_exp=2.000000000".to_string());
+        }
+    }
+    let mut normalized = out.join("\n");
+    normalized.push('\n');
+    normalized
+}
+
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
-    let current = resume_signature(args);
+    let current = resume_signature_normalize_loss_flags(&resume_signature(args));
+    let stored = resume_signature_normalize_loss_flags(stored);
     if stored.trim_end() == current.trim_end() {
         return true;
     }
-    if resume_signature_without_line(stored, "sfnn_progress_params=").trim_end() == current.trim_end() {
+    if resume_signature_without_line(&stored, "sfnn_progress_params=").trim_end() == current.trim_end() {
         return true;
     }
     let stored_has_validation_rate = stored.lines().any(|line| line.starts_with("validation_rate="));
@@ -15158,6 +15214,37 @@ mod tests {
     }
 
     #[test]
+    fn win_rate_model_loss_pow_exp_replaces_old_wrm_flag() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--win-rate-model",
+            "--loss-pow-exp",
+            "2.5",
+        ])
+        .unwrap();
+
+        assert!(args.win_rate_model);
+        assert_eq!(args.loss_pow_exp, 2.5);
+
+        let old = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--nnue-pytorch-wrm-loss",
+        ]);
+
+        assert!(old.is_err());
+    }
+
+    #[test]
     fn batches_per_superbatch_cli_option_is_removed() {
         use clap::Parser as _;
 
@@ -15243,6 +15330,32 @@ mod tests {
         ])
         .unwrap();
         assert!(!resume_signature_matches(&old_signature, &changed));
+    }
+
+    #[test]
+    fn resume_signature_accepts_old_wrm_loss_key() {
+        use clap::Parser as _;
+
+        let no_wrm =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
+        let old_no_wrm = resume_signature(&no_wrm)
+            .replace("win_rate_model=false\nloss_pow_exp=2.000000000\n", "nnue_pytorch_wrm_loss=false\n");
+        assert!(resume_signature_matches(&old_no_wrm, &no_wrm));
+
+        let wrm = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--win-rate-model",
+            "--loss-pow-exp",
+            "2.5",
+        ])
+        .unwrap();
+        let old_wrm = resume_signature(&wrm)
+            .replace("win_rate_model=true\nloss_pow_exp=2.500000000\n", "nnue_pytorch_wrm_loss=true\n");
+        assert!(resume_signature_matches(&old_wrm, &wrm));
     }
 
     #[test]

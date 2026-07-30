@@ -1040,7 +1040,7 @@ current cuda-cpp follow-up queue.
   - `ShogiHalfKP::map_features` and the non-factorized `fill_halfkp_feature_indices` path now decode the `PackedSfenValue` bitstream directly instead of constructing a temporary `ShogiBoard`;
   - the old board-based mapper remains test-only, and a synthetic PackedSfen unit test covers board pieces, promoted pieces, hands, and both STM colours to assert exact sparse-index order parity;
   - HalfKP bs65k/3-step teacher-prepare profile on `shuffled-001.hcpe` printed `14.056ms`, `15.303ms`, and `18.178ms`, so the short prepare-only profile is mostly noise-neutral;
-  - WRM/tatara-style bs65k speed-only probes (`--nnue-pytorch-wrm-loss --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024`, final-only loss readback) reported 4M repeats `2758937` and `2834683` pos/s, and a longer 16M run reported `2920370` pos/s;
+  - WRM/tatara-style bs65k speed-only probes (`--win-rate-model --loss-pow-exp 2.5 --optimizer-weight-decay 0 --optimizer-beta1 0.975 --lr 0.024`, final-only loss readback) reported 4M repeats `2758937` and `2834683` pos/s, and a longer 16M run reported `2920370` pos/s;
   - a yamaoka-fixed 4M validation run using only `C:\shogi\teacher\test\yamaoka-floodgate.psv` reported `2655504` pos/s, `test_loss=0.03627902`, `test_acc=0.6215057`; this short quality point is slightly worse than the preceding best and needs a longer/seed-matched check before treating the mapper change as a quality improvement.
 - Added SFNN C++/CUDA backward stage profiling for the direct train-step runner:
   - `SfnnTrainStepRunner::step_profiled_no_readback` now returns an SFNN-specific profile that includes C++/CUDA event timings for zero, L3, L2, L2-input, L1, pairwise/L0, and total backward stages;

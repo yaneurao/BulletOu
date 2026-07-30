@@ -54,8 +54,8 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub lambda: f32,
     /// Eval-to-score sigmoid scale used while preparing teacher targets.
     pub scale: f32,
-    /// Use nnue-pytorch WRM target conversion while preparing teacher targets.
-    pub nnue_pytorch_wrm_loss: bool,
+    /// Use win-rate-model target conversion while preparing teacher targets.
+    pub win_rate_model: bool,
     /// Add tatara-style HalfKP piece-input virtual rows to the FT input.
     pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
@@ -83,7 +83,7 @@ pub struct KpTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub nnue_pytorch_wrm_loss: bool,
+    pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
@@ -108,7 +108,7 @@ pub struct KpptTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub nnue_pytorch_wrm_loss: bool,
+    pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
@@ -134,7 +134,7 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub nnue_pytorch_wrm_loss: bool,
+    pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
@@ -1068,7 +1068,7 @@ fn prepare_halfkp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = if config.nnue_pytorch_wrm_loss {
+            let score = if config.win_rate_model {
                 win_rate_model_score(pos.score())
             } else {
                 let score = f32::from(pos.score());
@@ -1161,7 +1161,7 @@ fn prepare_kp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = if config.nnue_pytorch_wrm_loss {
+            let score = if config.win_rate_model {
                 win_rate_model_score(pos.score())
             } else {
                 let score = f32::from(pos.score());
@@ -1587,7 +1587,7 @@ where
         NoOutputBuckets,
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.nnue_pytorch_wrm_loss,
+        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
@@ -1762,7 +1762,7 @@ where
         NoOutputBuckets,
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.nnue_pytorch_wrm_loss,
+        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
@@ -1936,7 +1936,7 @@ where
         ShogiSfnnLayerStackBucket::new(config.layerstack_bucket),
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.nnue_pytorch_wrm_loss,
+        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
@@ -2115,7 +2115,7 @@ mod tests {
             queue_depth: 1,
             lambda: 1.0,
             scale: 400.0,
-            nnue_pytorch_wrm_loss: false,
+            win_rate_model: false,
             ft_factorize: false,
             score_drop_abs: Some(32_000),
             profile_prepare: false,
@@ -2135,7 +2135,7 @@ mod tests {
             queue_depth: 2,
             lambda: 1.0,
             scale: 400.0,
-            nnue_pytorch_wrm_loss: false,
+            win_rate_model: false,
             score_drop_abs: Some(32_000),
             profile_prepare: false,
         }

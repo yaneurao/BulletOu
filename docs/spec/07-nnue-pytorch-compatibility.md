@@ -240,7 +240,7 @@ BulletOu の `ShogiKingRankBucket<9>` は、この mapping が一致している
    - `in_offset=270`, `out_offset=270`
    - `in_scaling=340`, `out_scaling=380`
    - `pow_exp=2.5`
-   - 実装済み: `--nnue-pytorch-wrm-loss` で opt-in
+   - 実装済み: `--win-rate-model --loss-pow-exp 2.5` で opt-in
    - 有効時は学習 loss だけでなく `test_value_loss` / plateau 判定も WRM loss に切り替わる
 
 4. optimizer 条件を近づける
