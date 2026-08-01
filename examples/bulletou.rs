@@ -8320,6 +8320,22 @@ struct CudaCppSfnnInitialState {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CudaCppSfnnCreatedFactorizers {
+    shared_l1: bool,
+    shared_l2_l3: bool,
+    axis_l1: bool,
+    axis_l2_l3: bool,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppSfnnCreatedFactorizers {
+    fn any(self) -> bool {
+        self.shared_l1 || self.shared_l2_l3 || self.axis_l1 || self.axis_l2_l3
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppSfnnOptimizerState {
     l0w: CudaCppRangerGroupState,
@@ -8663,6 +8679,7 @@ fn load_cuda_cpp_sfnn_initial_state(
             path.display()
         ));
     }
+    let mut created_factorizers = CudaCppSfnnCreatedFactorizers::default();
     if wants_l1f && weights.l1fw.is_none() && !weights.shape.has_compact_l1() {
         eprintln!(
             "  WARN: loaded SFNN state {} has no L1 shared stack factorizer tensors; adding zero-initialized l1f terms",
@@ -8670,6 +8687,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         );
         weights.l1fw = Some(vec![0.0; weights.shape.ft_size * weights.shape.l1_out()]);
         weights.l1fb = Some(vec![0.0; weights.shape.l1_out()]);
+        created_factorizers.shared_l1 = true;
     }
     if wants_l2_l3f && weights.l2fw.is_none() {
         eprintln!(
@@ -8680,6 +8698,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         weights.l2fb = Some(vec![0.0; weights.shape.l2_size]);
         weights.l3fw = Some(vec![0.0; weights.shape.l2_size]);
         weights.l3fb = Some(vec![0.0; 1]);
+        created_factorizers.shared_l2_l3 = true;
     }
     let axis_count = weights.shape.factorizer_axis_count();
     if wants_l1ax && weights.l1axw.is_none() && !weights.shape.has_compact_l1() {
@@ -8689,6 +8708,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         );
         weights.l1axw = Some(vec![0.0; axis_count * weights.shape.ft_size * weights.shape.l1_out()]);
         weights.l1axb = Some(vec![0.0; axis_count * weights.shape.l1_out()]);
+        created_factorizers.axis_l1 = true;
     }
     if wants_l2_l3ax && weights.l2axw.is_none() {
         eprintln!(
@@ -8699,6 +8719,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         weights.l2axb = Some(vec![0.0; axis_count * weights.shape.l2_size]);
         weights.l3axw = Some(vec![0.0; axis_count * weights.shape.l2_size]);
         weights.l3axb = Some(vec![0.0; axis_count]);
+        created_factorizers.axis_l2_l3 = true;
     }
     if weights.l1fw.is_some() && weights.shape.has_compact_l1() {
         return Err(format!(
@@ -8712,22 +8733,166 @@ fn load_cuda_cpp_sfnn_initial_state(
             path.display()
         ));
     }
+    let extracted_new_factorizers = extract_cuda_cpp_sfnn_new_factorizers_from_base(
+        &mut weights,
+        effective_sfnn_factorizer_spec(args),
+        created_factorizers,
+    )?;
     let folded_inactive_factorizers =
         fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut weights, effective_sfnn_factorizer_spec(args))?;
+    if extracted_new_factorizers {
+        eprintln!(
+            "  initial factorizer migration = extracted common base-weight components into newly enabled factorizer tensors"
+        );
+    }
     if folded_inactive_factorizers {
         eprintln!(
             "  initial factorizer migration = folded checkpoint factorizer tensors disabled by the current --sfnn-factorizer into base weights"
         );
-        eprintln!("  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration");
     }
     let completed_steps = load_cuda_cpp_sfnn_completed_steps(&records, &weights)?;
-    let optimizer_states = if folded_inactive_factorizers {
+    let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers {
+        eprintln!("  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration");
         None
     } else {
         load_cuda_cpp_sfnn_optimizer_state(&records, &weights)?
     };
 
     Ok(CudaCppSfnnInitialState { weights, optimizer_states, completed_steps })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
+    weights: &mut CudaCppSfnnInitialWeights,
+    active: SfnnFactorizerSpec,
+    created: CudaCppSfnnCreatedFactorizers,
+) -> Result<bool, String> {
+    if !created.any() {
+        return Ok(false);
+    }
+    let shape = weights.shape;
+    let mut extracted_any = false;
+
+    if active.shared {
+        if created.shared_l1 {
+            let l1fw = weights
+                .l1fw
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L1 factorizer was requested but l1fw is missing".to_string())?;
+            let l1fb = weights
+                .l1fb
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L1 factorizer was requested but l1fb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(
+                shape,
+                &mut weights.l1w,
+                &mut weights.l1b,
+                l1fw,
+                l1fb,
+            )?;
+            extracted_any = true;
+        }
+        if created.shared_l2_l3 {
+            let l2fw = weights
+                .l2fw
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l2fw is missing".to_string())?;
+            let l2fb = weights
+                .l2fb
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l2fb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l2_shared_from_stacked_l2(
+                shape,
+                &mut weights.l2w,
+                &mut weights.l2b,
+                l2fw,
+                l2fb,
+            )?;
+            let l3fw = weights
+                .l3fw
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l3fw is missing".to_string())?;
+            let l3fb = weights
+                .l3fb
+                .as_mut()
+                .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l3fb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l3_shared_from_stacked_l3(
+                shape,
+                &mut weights.l3w,
+                &mut weights.l3b,
+                l3fw,
+                l3fb,
+            )?;
+            extracted_any = true;
+        }
+    }
+
+    let active_axis = SfnnFactorizerSpec {
+        shared: true,
+        king_axis: active.king_axis,
+        hand_axis: active.hand_axis,
+        explicit_king_axis: true,
+        explicit_hand_axis: true,
+    };
+    if active_axis.king_axis || active_axis.hand_axis {
+        if created.axis_l1 {
+            let l1axw = weights
+                .l1axw
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L1 factorizer was requested but l1axw is missing".to_string())?;
+            let l1axb = weights
+                .l1axb
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L1 factorizer was requested but l1axb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(
+                shape,
+                &mut weights.l1w,
+                &mut weights.l1b,
+                l1axw,
+                l1axb,
+                active_axis,
+            )?;
+            extracted_any = true;
+        }
+        if created.axis_l2_l3 {
+            let l2axw = weights
+                .l2axw
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L2/L3 factorizer was requested but l2axw is missing".to_string())?;
+            let l2axb = weights
+                .l2axb
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L2/L3 factorizer was requested but l2axb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l2_axis_from_stacked_l2(
+                shape,
+                &mut weights.l2w,
+                &mut weights.l2b,
+                l2axw,
+                l2axb,
+                active_axis,
+            )?;
+            let l3axw = weights
+                .l3axw
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L2/L3 factorizer was requested but l3axw is missing".to_string())?;
+            let l3axb = weights
+                .l3axb
+                .as_mut()
+                .ok_or_else(|| "new SFNN axis L2/L3 factorizer was requested but l3axb is missing".to_string())?;
+            extract_cuda_cpp_sfnn_l3_axis_from_stacked_l3(
+                shape,
+                &mut weights.l3w,
+                &mut weights.l3b,
+                l3axw,
+                l3axb,
+                active_axis,
+            )?;
+            extracted_any = true;
+        }
+    }
+
+    weights.validate()?;
+    Ok(extracted_any)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8831,6 +8996,267 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
 
     weights.validate()?;
     Ok(folded_any)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l1w: &mut [f32],
+    l1b: &mut [f32],
+    l1fw: &mut [f32],
+    l1fb: &mut [f32],
+) -> Result<(), String> {
+    if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
+        return Err("SFNN compact L1 does not support shared L1 factorizer extraction".to_string());
+    }
+    let l1_out = shape.l1_out();
+    let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
+    if l1w.len() != expected_l1w {
+        return Err(format!("SFNN l1w length mismatch: got {}, expected {expected_l1w}", l1w.len()));
+    }
+    if l1b.len() != shape.num_stacks * l1_out {
+        return Err(format!("SFNN l1b length mismatch: got {}, expected {}", l1b.len(), shape.num_stacks * l1_out));
+    }
+    if l1fw.len() != shape.ft_size * l1_out {
+        return Err(format!("SFNN l1fw length mismatch: got {}, expected {}", l1fw.len(), shape.ft_size * l1_out));
+    }
+    if l1fb.len() != l1_out {
+        return Err(format!("SFNN l1fb length mismatch: got {}, expected {l1_out}", l1fb.len()));
+    }
+    extract_cuda_cpp_sfnn_shared_row_major_from_stacks(l1b, shape.num_stacks, l1_out, l1fb, "SFNN l1fb")?;
+    let stack_stride = l1_out * shape.ft_size;
+    let denom = shape.num_stacks.max(1) as f32;
+    for in_col in 0..shape.ft_size {
+        for out_col in 0..l1_out {
+            let mut sum = 0.0_f32;
+            for stack in 0..shape.num_stacks {
+                sum += l1w[stack * stack_stride + out_col * shape.ft_size + in_col];
+            }
+            let mean = sum / denom;
+            l1fw[in_col * l1_out + out_col] += mean;
+            for stack in 0..shape.num_stacks {
+                l1w[stack * stack_stride + out_col * shape.ft_size + in_col] -= mean;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l2_shared_from_stacked_l2(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l2w: &mut [f32],
+    l2b: &mut [f32],
+    l2fw: &mut [f32],
+    l2fb: &mut [f32],
+) -> Result<(), String> {
+    let l2_in = shape.l2_in();
+    let l2_stride = shape.l2_size * l2_in;
+    extract_cuda_cpp_sfnn_shared_row_major_from_stacks(l2w, shape.num_stacks, l2_stride, l2fw, "SFNN l2fw")?;
+    extract_cuda_cpp_sfnn_shared_row_major_from_stacks(l2b, shape.num_stacks, shape.l2_size, l2fb, "SFNN l2fb")
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l3_shared_from_stacked_l3(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l3w: &mut [f32],
+    l3b: &mut [f32],
+    l3fw: &mut [f32],
+    l3fb: &mut [f32],
+) -> Result<(), String> {
+    extract_cuda_cpp_sfnn_shared_row_major_from_stacks(l3w, shape.num_stacks, shape.l2_size, l3fw, "SFNN l3fw")?;
+    extract_cuda_cpp_sfnn_shared_row_major_from_stacks(l3b, shape.num_stacks, 1, l3fb, "SFNN l3fb")
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_shared_row_major_from_stacks(
+    stacked: &mut [f32],
+    stack_count: usize,
+    stack_stride: usize,
+    shared: &mut [f32],
+    label: &'static str,
+) -> Result<(), String> {
+    let expected_stacked = stack_count
+        .checked_mul(stack_stride)
+        .ok_or_else(|| format!("{label} stacked length overflow"))?;
+    if stacked.len() != expected_stacked {
+        return Err(format!("{label} stacked length mismatch: got {}, expected {expected_stacked}", stacked.len()));
+    }
+    if shared.len() != stack_stride {
+        return Err(format!("{label} shared length mismatch: got {}, expected {stack_stride}", shared.len()));
+    }
+    let denom = stack_count.max(1) as f32;
+    for idx in 0..stack_stride {
+        let mut sum = 0.0_f32;
+        for stack in 0..stack_count {
+            sum += stacked[stack * stack_stride + idx];
+        }
+        let mean = sum / denom;
+        shared[idx] += mean;
+        for stack in 0..stack_count {
+            stacked[stack * stack_stride + idx] -= mean;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l1w: &mut [f32],
+    l1b: &mut [f32],
+    l1axw: &mut [f32],
+    l1axb: &mut [f32],
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
+        return Err("SFNN compact L1 does not support axis L1 factorizer extraction".to_string());
+    }
+    let l1_out = shape.l1_out();
+    extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l1b, l1_out, l1axb, factorizer, "SFNN l1axb")?;
+    let axis_count = shape.factorizer_axis_count();
+    let axis_stride = shape.ft_size * l1_out;
+    let stack_stride = l1_out * shape.ft_size;
+    let expected_l1w = shape
+        .num_stacks
+        .checked_mul(stack_stride)
+        .ok_or_else(|| "SFNN l1w length overflow".to_string())?;
+    let expected_axis = axis_count
+        .checked_mul(axis_stride)
+        .ok_or_else(|| "SFNN l1axw length overflow".to_string())?;
+    if l1w.len() != expected_l1w {
+        return Err(format!("SFNN l1w length mismatch: got {}, expected {expected_l1w}", l1w.len()));
+    }
+    if l1axw.len() != expected_axis {
+        return Err(format!("SFNN l1axw length mismatch: got {}, expected {expected_axis}", l1axw.len()));
+    }
+    let mut sums = vec![0.0_f32; expected_axis];
+    let mut counts = vec![0usize; axis_count];
+    for stack in 0..shape.num_stacks {
+        let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
+        let stack_base = stack * stack_stride;
+        for axis in axis_ids {
+            counts[axis] += 1;
+            let axis_base = axis * axis_stride;
+            for in_col in 0..shape.ft_size {
+                for out_col in 0..l1_out {
+                    sums[axis_base + in_col * l1_out + out_col] += l1w[stack_base + out_col * shape.ft_size + in_col];
+                }
+            }
+        }
+    }
+    for (axis, count) in counts.iter().copied().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let axis_base = axis * axis_stride;
+        let denom = count as f32;
+        for idx in 0..axis_stride {
+            sums[axis_base + idx] /= denom;
+            l1axw[axis_base + idx] += sums[axis_base + idx];
+        }
+    }
+    for stack in 0..shape.num_stacks {
+        let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
+        let stack_base = stack * stack_stride;
+        for axis in axis_ids {
+            let axis_base = axis * axis_stride;
+            for in_col in 0..shape.ft_size {
+                for out_col in 0..l1_out {
+                    l1w[stack_base + out_col * shape.ft_size + in_col] -=
+                        sums[axis_base + in_col * l1_out + out_col];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l2_axis_from_stacked_l2(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l2w: &mut [f32],
+    l2b: &mut [f32],
+    l2axw: &mut [f32],
+    l2axb: &mut [f32],
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    let l2_stride = shape.l2_size * shape.l2_in();
+    extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l2w, l2_stride, l2axw, factorizer, "SFNN l2axw")?;
+    extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l2b, shape.l2_size, l2axb, factorizer, "SFNN l2axb")
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_l3_axis_from_stacked_l3(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l3w: &mut [f32],
+    l3b: &mut [f32],
+    l3axw: &mut [f32],
+    l3axb: &mut [f32],
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l3w, shape.l2_size, l3axw, factorizer, "SFNN l3axw")?;
+    extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l3b, 1, l3axb, factorizer, "SFNN l3axb")
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn extract_cuda_cpp_sfnn_axis_row_major_from_stacks(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    stacked: &mut [f32],
+    stack_stride: usize,
+    axis_values: &mut [f32],
+    factorizer: SfnnFactorizerSpec,
+    label: &'static str,
+) -> Result<(), String> {
+    let axis_count = shape.factorizer_axis_count();
+    let expected_stacked = shape
+        .num_stacks
+        .checked_mul(stack_stride)
+        .ok_or_else(|| format!("{label} stacked length overflow"))?;
+    let expected_axis = axis_count
+        .checked_mul(stack_stride)
+        .ok_or_else(|| format!("{label} axis length overflow"))?;
+    if stacked.len() != expected_stacked {
+        return Err(format!("{label} stacked length mismatch: got {}, expected {expected_stacked}", stacked.len()));
+    }
+    if axis_values.len() != expected_axis {
+        return Err(format!("{label} axis length mismatch: got {}, expected {expected_axis}", axis_values.len()));
+    }
+    let mut sums = vec![0.0_f32; expected_axis];
+    let mut counts = vec![0usize; axis_count];
+    for stack in 0..shape.num_stacks {
+        let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
+        let stack_base = stack * stack_stride;
+        for axis in axis_ids {
+            counts[axis] += 1;
+            let axis_base = axis * stack_stride;
+            for idx in 0..stack_stride {
+                sums[axis_base + idx] += stacked[stack_base + idx];
+            }
+        }
+    }
+    for (axis, count) in counts.iter().copied().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let axis_base = axis * stack_stride;
+        let denom = count as f32;
+        for idx in 0..stack_stride {
+            sums[axis_base + idx] /= denom;
+            axis_values[axis_base + idx] += sums[axis_base + idx];
+        }
+    }
+    for stack in 0..shape.num_stacks {
+        let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
+        let stack_base = stack * stack_stride;
+        for axis in axis_ids {
+            let axis_base = axis * stack_stride;
+            for idx in 0..stack_stride {
+                stacked[stack_base + idx] -= sums[axis_base + idx];
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -15501,6 +15927,148 @@ mod tests {
 
         assert_eq!(migrated, expected);
         migrated.validate().unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_factorizer_activation_extracts_base_components_without_changing_effective_weights() {
+        fn seq(len: usize, base: f32) -> Vec<f32> {
+            (0..len).map(|idx| base + idx as f32 * 0.01).collect()
+        }
+        fn assert_close_vec(label: &str, actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len(), "{label} length mismatch");
+            for (idx, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+                assert!((a - e).abs() <= 1.0e-5, "{label}[{idx}] expected {e}, got {a}");
+            }
+        }
+
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 2,
+            l1_hidden: 1,
+            l2_size: 1,
+            num_stacks: 4,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 2,
+            factorizer_hand_axis_dim: 1,
+        };
+        let l1_out = shape.l1_out();
+        let l2_in = shape.l2_in();
+        let original = CudaCppSfnnInitialWeights {
+            shape,
+            l0w: seq(shape.input_size * shape.ft_size, 0.0),
+            l0b: seq(shape.ft_size, 0.1),
+            l1w: seq(shape.num_stacks * l1_out * shape.ft_size, 1.0),
+            l1b: seq(shape.num_stacks * l1_out, 2.0),
+            l1fw: None,
+            l1fb: None,
+            l1axw: None,
+            l1axb: None,
+            l2w: seq(shape.num_stacks * shape.l2_size * l2_in, 7.0),
+            l2b: seq(shape.num_stacks * shape.l2_size, 8.0),
+            l2fw: None,
+            l2fb: None,
+            l2axw: None,
+            l2axb: None,
+            l3w: seq(shape.num_stacks * shape.l2_size, 13.0),
+            l3b: seq(shape.num_stacks, 14.0),
+            l3fw: None,
+            l3fb: None,
+            l3axw: None,
+            l3axb: None,
+        };
+        original.validate().unwrap();
+
+        let axis_count = shape.factorizer_axis_count();
+        let mut migrated = original.clone();
+        migrated.l1fw = Some(vec![0.0; shape.ft_size * l1_out]);
+        migrated.l1fb = Some(vec![0.0; l1_out]);
+        migrated.l1axw = Some(vec![0.0; axis_count * shape.ft_size * l1_out]);
+        migrated.l1axb = Some(vec![0.0; axis_count * l1_out]);
+        migrated.l2fw = Some(vec![0.0; shape.l2_size * l2_in]);
+        migrated.l2fb = Some(vec![0.0; shape.l2_size]);
+        migrated.l2axw = Some(vec![0.0; axis_count * shape.l2_size * l2_in]);
+        migrated.l2axb = Some(vec![0.0; axis_count * shape.l2_size]);
+        migrated.l3fw = Some(vec![0.0; shape.l2_size]);
+        migrated.l3fb = Some(vec![0.0; 1]);
+        migrated.l3axw = Some(vec![0.0; axis_count * shape.l2_size]);
+        migrated.l3axb = Some(vec![0.0; axis_count]);
+
+        assert!(extract_cuda_cpp_sfnn_new_factorizers_from_base(
+            &mut migrated,
+            SfnnFactorizerSpec::AXIS,
+            CudaCppSfnnCreatedFactorizers {
+                shared_l1: true,
+                shared_l2_l3: true,
+                axis_l1: true,
+                axis_l2_l3: true,
+            },
+        )
+        .unwrap());
+        assert!(migrated.l1fw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
+        assert!(migrated.l1axw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
+
+        let mut effective = migrated.clone();
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+            shape,
+            &mut effective.l1w,
+            &mut effective.l1b,
+            effective.l1fw.as_deref(),
+            effective.l1fb.as_deref(),
+        )
+        .unwrap();
+        fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+            shape,
+            &mut effective.l2w,
+            &mut effective.l2b,
+            effective.l2fw.as_deref(),
+            effective.l2fb.as_deref(),
+        )
+        .unwrap();
+        fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+            shape,
+            &mut effective.l3w,
+            &mut effective.l3b,
+            effective.l3fw.as_deref(),
+            effective.l3fb.as_deref(),
+        )
+        .unwrap();
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+            shape,
+            &mut effective.l1w,
+            &mut effective.l1b,
+            effective.l1axw.as_deref(),
+            effective.l1axb.as_deref(),
+            SfnnFactorizerSpec::AXIS,
+        )
+        .unwrap();
+        fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
+            shape,
+            &mut effective.l2w,
+            &mut effective.l2b,
+            effective.l2axw.as_deref(),
+            effective.l2axb.as_deref(),
+            SfnnFactorizerSpec::AXIS,
+        )
+        .unwrap();
+        fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
+            shape,
+            &mut effective.l3w,
+            &mut effective.l3b,
+            effective.l3axw.as_deref(),
+            effective.l3axb.as_deref(),
+            SfnnFactorizerSpec::AXIS,
+        )
+        .unwrap();
+
+        assert_close_vec("l1w", &effective.l1w, &original.l1w);
+        assert_close_vec("l1b", &effective.l1b, &original.l1b);
+        assert_close_vec("l2w", &effective.l2w, &original.l2w);
+        assert_close_vec("l2b", &effective.l2b, &original.l2b);
+        assert_close_vec("l3w", &effective.l3w, &original.l3w);
+        assert_close_vec("l3b", &effective.l3b, &original.l3b);
     }
 
     #[test]
