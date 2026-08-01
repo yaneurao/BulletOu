@@ -5937,9 +5937,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_weights.shape.input_size
         );
     }
-    eprintln!("  SFNN factorizer = {}", factorizer_spec.label());
+    let stored_shared_factorizers =
+        initial_weights.l1fw.is_some() || initial_weights.l2fw.is_some() || initial_weights.l3fw.is_some();
+    let stored_axis_factorizers =
+        initial_weights.l1axw.is_some() || initial_weights.l2axw.is_some() || initial_weights.l3axw.is_some();
+    eprintln!("  SFNN factorizer = {} (active)", factorizer_spec.label());
     eprintln!(
-        "  factorizer tensors = shared[L1 {}, L2 {}, L3 {}], axis[L1 {}, L2 {}, L3 {}; king_dim={}, hand_dim={}]",
+        "  stored factorizer tensors = shared[L1 {}, L2 {}, L3 {}], axis[L1 {}, L2 {}, L3 {}; king_dim={}, hand_dim={}]",
         if initial_weights.l1fw.is_some() { "present" } else { "absent" },
         if initial_weights.l2fw.is_some() { "present" } else { "absent" },
         if initial_weights.l3fw.is_some() { "present" } else { "absent" },
@@ -5949,6 +5953,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         initial_weights.shape.factorizer_king_axis_dim,
         initial_weights.shape.factorizer_hand_axis_dim,
     );
+    if (!factorizer_active.shared && stored_shared_factorizers)
+        || (!factorizer_active.any_axis() && stored_axis_factorizers)
+    {
+        eprintln!("  factorizer note = stored tensors are present in state.bin but inactive for this run");
+    }
     if args.arch().has_common_shard_sfnn_l1() {
         eprintln!(
             "  l1 common+shard = c{}_s{}x{} (row fan-in {}; {} output(s) per shard group; compact state)",
