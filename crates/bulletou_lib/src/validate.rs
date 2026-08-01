@@ -98,6 +98,33 @@ impl AccuracyReport {
     }
 }
 
+/// Fixed subset information for a validation set.
+///
+/// Draw/mate filtering depends only on the teacher records and
+/// `score_drop_abs`, not on the network output. Build this once when a
+/// held-out set is loaded, then reuse it for every validation pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationSampleMask {
+    /// Indices used for value-sign accuracy: not score-capped and not drawn.
+    pub accuracy_indices: Vec<usize>,
+    /// Indices used for value loss: not score-capped. Draws are kept.
+    pub loss_indices: Vec<usize>,
+    /// Number of sampled draw positions excluded from accuracy.
+    pub drawn_games: usize,
+    /// Number of sampled positions excluded by `score_drop_abs`.
+    pub filtered_by_score_cap: usize,
+}
+
+impl ValidationSampleMask {
+    pub fn compared(&self) -> usize {
+        self.accuracy_indices.len()
+    }
+
+    pub fn loss_sampled(&self) -> usize {
+        self.loss_indices.len()
+    }
+}
+
 /// Loss formula used for `test_value_loss`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationLossKind {
@@ -208,6 +235,19 @@ pub fn compute_sign_accuracy_with_loss(
     if have_results {
         assert_eq!(model_outputs.len(), teacher_results.len(), "model_outputs and teacher_results length mismatch");
     }
+    if teacher_scores.len() == model_outputs.len() {
+        let mask = build_validation_sample_mask(teacher_scores, teacher_results, score_drop_abs);
+        return compute_sign_accuracy_with_loss_masked(
+            model_outputs,
+            teacher_scores,
+            teacher_results,
+            &mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+        );
+    }
     let mut report = AccuracyReport::default();
     let blend = 1.0 - lambda;
     let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
@@ -294,6 +334,111 @@ pub fn compute_sign_accuracy_with_loss(
     if have_results && report.loss_sampled > 0 {
         report.test_loss = Some(loss_sum / report.loss_sampled as f32);
     }
+    report
+}
+
+pub fn build_validation_sample_mask(
+    teacher_scores: &[i16],
+    teacher_results: &[i8],
+    score_drop_abs: Option<u16>,
+) -> ValidationSampleMask {
+    let have_results = !teacher_results.is_empty();
+    if have_results {
+        assert_eq!(teacher_scores.len(), teacher_results.len(), "teacher_scores and teacher_results length mismatch");
+    }
+    let mut mask = ValidationSampleMask::default();
+    for (i, &s) in teacher_scores.iter().enumerate() {
+        if let Some(cap) = score_drop_abs {
+            if s.unsigned_abs() >= cap {
+                mask.filtered_by_score_cap += 1;
+                continue;
+            }
+        }
+        mask.loss_indices.push(i);
+        let is_draw = if have_results { teacher_results[i] == 0 } else { s == 0 };
+        if is_draw {
+            mask.drawn_games += 1;
+        } else {
+            mask.accuracy_indices.push(i);
+        }
+    }
+    mask
+}
+
+pub fn compute_sign_accuracy_with_loss_masked(
+    model_outputs: &[f32],
+    teacher_scores: &[i16],
+    teacher_results: &[i8],
+    mask: &ValidationSampleMask,
+    lambda: f32,
+    eval_scale: f32,
+    model_output_scale: f32,
+    loss_kind: ValidationLossKind,
+) -> AccuracyReport {
+    assert_eq!(model_outputs.len(), teacher_scores.len(), "model_outputs and teacher_scores length mismatch");
+    let have_results = !teacher_results.is_empty();
+    if have_results {
+        assert_eq!(model_outputs.len(), teacher_results.len(), "model_outputs and teacher_results length mismatch");
+    }
+
+    let mut report = AccuracyReport {
+        compared: mask.compared(),
+        drawn_games: mask.drawn_games,
+        filtered_by_score_cap: mask.filtered_by_score_cap,
+        loss_sampled: if have_results { mask.loss_sampled() } else { 0 },
+        ..AccuracyReport::default()
+    };
+
+    for &i in &mask.accuracy_indices {
+        let m = model_outputs[i];
+        let pred = m >= 0.0;
+        if pred {
+            report.predicted_nonnegative += 1;
+        } else {
+            report.predicted_negative += 1;
+        }
+        if m == 0.0 {
+            report.predicted_zero += 1;
+        }
+        let truth = if have_results { teacher_results[i] > 0 } else { teacher_scores[i] > 0 };
+        if pred == truth {
+            report.sign_matches += 1;
+        }
+    }
+
+    if have_results {
+        let blend = 1.0 - lambda;
+        let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
+        let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
+        let mut loss_sum = 0.0f32;
+        for &i in &mask.loss_indices {
+            let s = teacher_scores[i];
+            let m = model_outputs[i];
+            let result_norm = match teacher_results[i].signum() {
+                1 => 1.0,
+                -1 => 0.0,
+                _ => 0.5,
+            };
+            let score_norm = match loss_kind {
+                ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::WinRateModel { .. } => wrm_probability(f32::from(s), 270.0, 380.0),
+            };
+            let target = blend * result_norm + (1.0 - blend) * score_norm;
+            let model_p = match loss_kind {
+                ValidationLossKind::SigmoidMse => sigmoid(m * model_inv_scale),
+                ValidationLossKind::WinRateModel { .. } => wrm_probability(m * 600.0, 270.0, 340.0),
+            };
+            let diff = model_p - target;
+            loss_sum += match loss_kind {
+                ValidationLossKind::SigmoidMse => diff * diff,
+                ValidationLossKind::WinRateModel { pow_exp } => diff.abs().powf(pow_exp),
+            };
+        }
+        if report.loss_sampled > 0 {
+            report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+        }
+    }
+
     report
 }
 

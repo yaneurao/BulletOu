@@ -51,7 +51,7 @@ Usage:
 #![cfg_attr(not(feature = "cuda-cpp-backend"), allow(dead_code, unused_imports))]
 
 #[cfg(feature = "cuda-cpp-backend")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -72,8 +72,8 @@ use bulletou_lib::{
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
     validate::{
-        ValidationLossKind, compute_sign_accuracy_with_loss, read_random_teacher_positions,
-        read_teacher_positions_prefix,
+        ValidationLossKind, ValidationSampleMask, build_validation_sample_mask, compute_sign_accuracy_with_loss_masked,
+        read_random_teacher_positions, read_teacher_positions_prefix,
     },
     value::{
         nnue_save::{
@@ -6928,18 +6928,31 @@ impl CudaCppValidationTiming {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn print_cuda_cpp_validation_timing(
-    prefix: &str,
-    positions: usize,
-    batch_size: usize,
-    timing: CudaCppValidationTiming,
-) {
+static CUDA_CPP_VALIDATION_FORWARD_CONFIGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_validation_forward_config_once(prefix: &str, mode: &str, positions: usize, batch_size: usize) {
+    let key = format!("{prefix}|{mode}|{positions}|{batch_size}");
+    let cell = CUDA_CPP_VALIDATION_FORWARD_CONFIGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let should_print = cell.lock().is_ok_and(|mut seen| seen.insert(key));
+    if should_print {
+        eprintln!(
+            "  {} {} = {}: positions={}, batch_size={}",
+            paint(prefix, ConsoleColor::Dim),
+            paint("validation forward config", ConsoleColor::BoldYellow),
+            mode,
+            format_count(positions),
+            format_count(batch_size),
+        );
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_validation_timing(prefix: &str, timing: CudaCppValidationTiming) {
     eprintln!(
-        "  {} {}: positions={}, batch_size={}, load/cache={}, weight_fold={}, context={}, weight_upload={}, batches={}, metrics={}, total={}",
+        "  {} {}: load/cache={}, weight_fold={}, context={}, weight_upload={}, batches={}, metrics={}, total={}",
         paint(prefix, ConsoleColor::Dim),
         paint("validation detail", ConsoleColor::BoldYellow),
-        format_count(positions),
-        format_count(batch_size),
         format_duration_secs(timing.load_cache),
         format_duration_secs(timing.weight_fold),
         format_duration_secs(timing.context),
@@ -7000,6 +7013,12 @@ fn run_cuda_cpp_nnue_final_validation(
     .map_err(|e| e.to_string())?;
     let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
+    print_cuda_cpp_validation_forward_config_once(
+        &format!("cuda-cpp {}", feature_kind.source_label()),
+        "gpu",
+        cache.positions.len(),
+        batch_size,
+    );
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
@@ -7026,10 +7045,8 @@ fn run_cuda_cpp_nnue_final_validation(
     }
     let batches_elapsed = started.elapsed();
     eprintln!(
-        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={}",
+        "  cuda-cpp {} validation forward elapsed={}",
         feature_kind.source_label(),
-        outputs.len(),
-        batch_size,
         format_duration_secs(batches_elapsed)
     );
 
@@ -7038,8 +7055,6 @@ fn run_cuda_cpp_nnue_final_validation(
     let metrics_elapsed = metrics_started.elapsed();
     print_cuda_cpp_validation_timing(
         &format!("cuda-cpp {}", feature_kind.source_label()),
-        cache.positions.len(),
-        batch_size,
         CudaCppValidationTiming {
             load_cache: load_cache_elapsed,
             weight_fold: weight_fold_elapsed,
@@ -7074,6 +7089,12 @@ fn run_cuda_cpp_sfnn_resident_validation(
     }
 
     let batch_size = args.test_batch_size.max(1);
+    print_cuda_cpp_validation_forward_config_once(
+        &format!("cuda-cpp {}", feature_kind.source_label()),
+        "gpu-resident",
+        cache.positions.len(),
+        batch_size,
+    );
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let mut outputs = Vec::with_capacity(cache.positions.len());
     let started = std::time::Instant::now();
@@ -7101,10 +7122,8 @@ fn run_cuda_cpp_sfnn_resident_validation(
     }
     let batches_elapsed = started.elapsed();
     eprintln!(
-        "  cuda-cpp {} validation forward = gpu-resident: positions={}, batch_size={}, elapsed={}",
+        "  cuda-cpp {} validation forward elapsed={}",
         feature_kind.source_label(),
-        outputs.len(),
-        batch_size,
         format_duration_secs(batches_elapsed)
     );
 
@@ -7113,8 +7132,6 @@ fn run_cuda_cpp_sfnn_resident_validation(
     let metrics_elapsed = metrics_started.elapsed();
     print_cuda_cpp_validation_timing(
         &format!("cuda-cpp {}", feature_kind.source_label()),
-        cache.positions.len(),
-        batch_size,
         CudaCppValidationTiming {
             load_cache: load_cache_elapsed,
             weight_fold: std::time::Duration::ZERO,
@@ -12314,6 +12331,7 @@ struct TestPositionsCache {
     positions: Vec<bulletou_lib::shogi::PackedSfenValue>,
     teacher_scores: Vec<i16>,
     teacher_results: Vec<i8>,
+    sample_mask: ValidationSampleMask,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12322,6 +12340,7 @@ struct TestPositionsCacheKey {
     positions: usize,
     sample: TestSampleMode,
     seed: u64,
+    score_drop_abs: u16,
 }
 
 struct TestPositionsCacheEntry {
@@ -12348,6 +12367,7 @@ impl TestPositionsCache {
             positions: args.test_positions,
             sample: args.test_sample,
             seed: args.test_seed,
+            score_drop_abs: args.score_drop_abs,
         };
         let cache_cell = TEST_POSITIONS_CACHE.get_or_init(|| Mutex::new(None));
         if let Some(cache) = cache_cell
@@ -12376,8 +12396,17 @@ impl TestPositionsCache {
             Ok(positions) => {
                 let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
                 let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
-                eprintln!("  ...{} test positions ready", positions.len());
-                let cache = Arc::new(Self { positions, teacher_scores, teacher_results });
+                let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
+                let sample_mask = build_validation_sample_mask(&teacher_scores, &teacher_results, cap);
+                eprintln!(
+                    "  ...{} test positions ready: decisive={}, draws={}, mate_filtered={}, loss_n={}",
+                    format_count(positions.len()),
+                    format_count(sample_mask.compared()),
+                    format_count(sample_mask.drawn_games),
+                    format_count(sample_mask.filtered_by_score_cap),
+                    format_count(sample_mask.loss_sampled()),
+                );
+                let cache = Arc::new(Self { positions, teacher_scores, teacher_results, sample_mask });
                 if let Ok(mut guard) = cache_cell.lock() {
                     *guard = Some(TestPositionsCacheEntry { key, cache: Arc::clone(&cache) });
                 }
@@ -12398,12 +12427,11 @@ impl TestPositionsCache {
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
 fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: Vec<f32>) -> TestMetrics {
-    let cap = if args.score_drop_abs > 0 { Some(args.score_drop_abs) } else { None };
-    let report = compute_sign_accuracy_with_loss(
+    let report = compute_sign_accuracy_with_loss_masked(
         &trainer_outputs,
         &cache.teacher_scores,
         &cache.teacher_results,
-        cap,
+        &cache.sample_mask,
         args.lambda,
         args.scale as f32,
         1.0,
@@ -12411,16 +12439,7 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: V
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
-    eprintln!(
-        "  test: accuracy={:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered), loss={:.6} (n={})",
-        accuracy * 100.0,
-        report.sign_matches,
-        report.compared,
-        report.drawn_games,
-        report.filtered_by_score_cap,
-        loss,
-        report.loss_sampled,
-    );
+    eprintln!("  test: accuracy={:.4}%, loss={:.6}", accuracy * 100.0, loss);
     TestMetrics { accuracy, loss }
 }
 
