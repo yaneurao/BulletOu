@@ -1615,17 +1615,48 @@ fn colored_pos_s(positions_per_sec: f64) -> String {
     paint(format!("pos/s={}", format_count(rate)), ConsoleColor::BoldGreen)
 }
 
-fn colored_train_time(positions: usize, positions_per_sec: f64) -> String {
-    let seconds = if positions_per_sec.is_finite() && positions_per_sec > 0.0 {
-        positions as f64 / positions_per_sec
-    } else {
-        0.0
-    };
-    paint(format!("train_time={seconds:.1}s"), ConsoleColor::BoldCyan)
+fn colored_seconds(label: &str, seconds: f64) -> String {
+    let seconds = if seconds.is_finite() && seconds >= 0.0 { seconds } else { 0.0 };
+    paint(format!("{label}={seconds:.1}s"), ConsoleColor::BoldCyan)
 }
 
 fn colored_metric(label: &str, value: f32, precision: usize) -> String {
     paint(format!("{label}={value:.precision$}"), ConsoleColor::Magenta)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaCppProgressStats {
+    interval_positions: usize,
+    interval_train_elapsed_sec: f64,
+    interval_positions_per_sec: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaCppProgressMeter {
+    last_positions: usize,
+    last_train_elapsed_sec: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppProgressMeter {
+    fn sample(&mut self, positions: usize, train_elapsed_sec: f64) -> CudaCppProgressStats {
+        let interval_positions = positions.saturating_sub(self.last_positions);
+        let interval_train_elapsed_sec = if train_elapsed_sec.is_finite() {
+            (train_elapsed_sec - self.last_train_elapsed_sec).max(0.0)
+        } else {
+            0.0
+        };
+        let interval_positions_per_sec = if interval_train_elapsed_sec > 0.0 {
+            interval_positions as f64 / interval_train_elapsed_sec
+        } else {
+            0.0
+        };
+        self.last_positions = positions;
+        self.last_train_elapsed_sec = train_elapsed_sec.max(0.0);
+        CudaCppProgressStats { interval_positions, interval_train_elapsed_sec, interval_positions_per_sec }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1718,7 +1749,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
     progress: Option<CudaCppScheduleProgress>,
     batch_size: usize,
     positions: usize,
-    positions_per_sec: f64,
+    stats: CudaCppProgressStats,
     checkpoint_dir: &std::path::Path,
     timing: Option<CudaCppCheckpointTiming>,
 ) {
@@ -1758,17 +1789,18 @@ fn print_cuda_cpp_checkpoint_with_timing(
                 ),
                 paint(batch_detail, ConsoleColor::Yellow),
                 paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
-                colored_train_time(positions, positions_per_sec),
-                colored_pos_s(positions_per_sec)
+                colored_seconds("sb_time", stats.interval_train_elapsed_sec),
+                colored_pos_s(stats.interval_positions_per_sec)
             );
         }
         None => eprintln!(
-            "  {} {}  {}  {}  {}",
+            "  {} {}  {}  {}  {}  {}",
             paint(prefix, ConsoleColor::Dim),
             paint("[checkpoint]", ConsoleColor::BoldGreen),
+            paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
-            colored_train_time(positions, positions_per_sec),
-            colored_pos_s(positions_per_sec)
+            colored_seconds("step_time", stats.interval_train_elapsed_sec),
+            colored_pos_s(stats.interval_positions_per_sec)
         ),
     }
     if let Some(timing) = timing {
@@ -1798,7 +1830,7 @@ fn print_cuda_cpp_superbatch_progress(
     progress: Option<CudaCppScheduleProgress>,
     batch_size: usize,
     positions: usize,
-    positions_per_sec: f64,
+    stats: CudaCppProgressStats,
 ) {
     match progress {
         Some(progress) => {
@@ -1824,17 +1856,18 @@ fn print_cuda_cpp_superbatch_progress(
                     ConsoleColor::Yellow
                 ),
                 paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
-                colored_train_time(positions, positions_per_sec),
-                colored_pos_s(positions_per_sec)
+                colored_seconds("sb_time", stats.interval_train_elapsed_sec),
+                colored_pos_s(stats.interval_positions_per_sec)
             );
         }
         None => eprintln!(
-            "  {} {}  {}  {}  {}",
+            "  {} {}  {}  {}  {}  {}",
             paint(prefix, ConsoleColor::Dim),
             paint("[progress]", ConsoleColor::BoldCyan),
+            paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
-            colored_train_time(positions, positions_per_sec),
-            colored_pos_s(positions_per_sec)
+            colored_seconds("step_time", stats.interval_train_elapsed_sec),
+            colored_pos_s(stats.interval_positions_per_sec)
         ),
     }
 }
@@ -4410,6 +4443,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     );
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
+    let mut progress_meter = CudaCppProgressMeter::default();
     let teacher_options = CudaCppNnueTeacherOptions {
         batch_size,
         batch_index: 0,
@@ -4515,14 +4549,15 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
                 let progress = schedule.progress_for_step(seen_steps);
                 let positions = seen_steps.saturating_mul(batch_size);
-                let (_train_elapsed_sec, positions_per_sec) =
+                let (train_elapsed_sec, _positions_per_sec) =
                     cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                 print_cuda_cpp_checkpoint_with_timing(
                     &format!("cuda-cpp {}", component.label()),
                     progress,
                     batch_size,
                     positions,
-                    positions_per_sec,
+                    progress_stats,
                     &checkpoint_dir,
                     Some(CudaCppCheckpointTiming::new(readback_elapsed, None, Some(save_elapsed), checkpoint_elapsed)),
                 );
@@ -4543,13 +4578,14 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         {
             let progress = schedule.progress_for_step(seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            let (train_elapsed_sec, _positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
             print_cuda_cpp_superbatch_progress(
                 &format!("cuda-cpp {}", component.label()),
                 progress,
                 batch_size,
                 positions,
-                positions_per_sec,
+                progress_stats,
             );
         }
         Ok::<(), String>(())
@@ -5053,6 +5089,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let mut profile_count = 0usize;
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
+    let mut progress_meter = CudaCppProgressMeter::default();
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
@@ -5256,14 +5293,15 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
                     let progress = schedule.progress_for_step(accepted_steps_total);
                     let positions = accepted_steps_total.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                     print_cuda_cpp_checkpoint_with_timing(
                         "cuda-cpp",
                         progress,
                         batch_size,
                         positions,
-                        positions_per_sec,
+                        progress_stats,
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
@@ -5558,14 +5596,15 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                     print_cuda_cpp_checkpoint_with_timing(
                         "cuda-cpp",
                         progress,
                         batch_size,
                         positions,
-                        positions_per_sec,
+                        progress_stats,
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
@@ -5612,9 +5651,10 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     )?;
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-                    print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, positions_per_sec);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
+                    print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, progress_stats);
                     print_cuda_cpp_validation_overhead(
                         "cuda-cpp",
                         CudaCppCheckpointTiming::new(
@@ -5651,8 +5691,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         {
             let progress = schedule.progress_for_step(seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-            print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, positions_per_sec);
+            let (train_elapsed_sec, _positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
+            print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, progress_stats);
         }
         Ok::<(), String>(())
     })
@@ -5758,12 +5799,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let save_elapsed = save_started.elapsed();
         let checkpoint_elapsed = final_readback_elapsed.saturating_add(checkpoint_started.elapsed());
         let progress = schedule.progress_for_step(seen_steps);
+        let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
         print_cuda_cpp_checkpoint_with_timing(
             "cuda-cpp",
             progress,
             batch_size,
             positions,
-            positions_per_sec,
+            progress_stats,
             &checkpoint_dir,
             Some(CudaCppCheckpointTiming::new(
                 final_readback_elapsed,
@@ -6029,6 +6071,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let completed_step_offset = initial_state.completed_steps;
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
+    let mut progress_meter = CudaCppProgressMeter::default();
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
@@ -6236,14 +6279,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
                     let progress = schedule.progress_for_step(accepted_steps_total);
                     let positions = accepted_steps_total.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                     print_cuda_cpp_checkpoint_with_timing(
                         "cuda-cpp SFNN",
                         progress,
                         batch_size,
                         positions,
-                        positions_per_sec,
+                        progress_stats,
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
@@ -6560,14 +6604,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                     print_cuda_cpp_checkpoint_with_timing(
                         "cuda-cpp SFNN",
                         progress,
                         batch_size,
                         positions,
-                        positions_per_sec,
+                        progress_stats,
                         &checkpoint_dir,
                         Some(CudaCppCheckpointTiming::new(
                             readback_elapsed,
@@ -6612,14 +6657,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     )?;
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
-                    let (_train_elapsed_sec, positions_per_sec) =
+                    let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
                     print_cuda_cpp_superbatch_progress(
                         "cuda-cpp SFNN",
                         progress,
                         batch_size,
                         positions,
-                        positions_per_sec,
+                        progress_stats,
                     );
                     print_cuda_cpp_validation_overhead(
                         "cuda-cpp SFNN",
@@ -6657,8 +6703,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         {
             let progress = schedule.progress_for_step(seen_steps);
             let positions = seen_steps.saturating_mul(batch_size);
-            let (_train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-            print_cuda_cpp_superbatch_progress("cuda-cpp SFNN", progress, batch_size, positions, positions_per_sec);
+            let (train_elapsed_sec, _positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+            let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
+            print_cuda_cpp_superbatch_progress("cuda-cpp SFNN", progress, batch_size, positions, progress_stats);
         }
         Ok::<(), String>(())
     })
@@ -6769,12 +6816,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let save_elapsed = save_started.elapsed();
         let checkpoint_elapsed = final_readback_elapsed.saturating_add(checkpoint_started.elapsed());
         let progress = schedule.progress_for_step(seen_steps);
+        let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
         print_cuda_cpp_checkpoint_with_timing(
             "cuda-cpp SFNN",
             progress,
             batch_size,
             positions,
-            positions_per_sec,
+            progress_stats,
             &checkpoint_dir,
             Some(CudaCppCheckpointTiming::new(
                 final_readback_elapsed,
