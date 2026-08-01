@@ -6176,7 +6176,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
                 let validation_started = std::time::Instant::now();
                 let test_metrics =
-                    run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?.ok_or_else(
+                    run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?.ok_or_else(
                         || "--backend cuda-cpp SFNN plateau requires readable --test-teacher metrics".to_string(),
                     )?;
                 let validation_elapsed = validation_started.elapsed();
@@ -6525,7 +6525,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let test_metrics = if chunk.run_validation {
                         let validation_started = std::time::Instant::now();
                         let metrics =
-                            run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                            run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
                         validation_elapsed = validation_started.elapsed();
                         metrics
                     } else {
@@ -6588,12 +6588,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     last_checkpoint_metrics = test_metrics;
                 } else if chunk.run_validation {
                     let validation_event_started = std::time::Instant::now();
-                    let readback_started = std::time::Instant::now();
-                    let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-                    let readback_elapsed = readback_started.elapsed();
+                    let readback_elapsed = std::time::Duration::ZERO;
                     let validation_started = std::time::Instant::now();
                     let test_metrics =
-                        run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+                        run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
                     let validation_elapsed = validation_started.elapsed();
                     let validation_event_elapsed = validation_event_started.elapsed();
                     excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
@@ -6707,19 +6705,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if args.cuda_cpp_skip_final_output {
         if let Some((chunk, _)) = deferred_direct_checkpoint {
             if let Some((metrics, validation_elapsed)) = {
-                let trained_weights = if args.test_teacher.is_some() {
-                    Some(runner.read_weights(&ctx).map_err(|e| e.to_string())?)
+                if args.test_teacher.is_some() {
+                    let validation_started = std::time::Instant::now();
+                    let metrics = run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
+                    let validation_elapsed = validation_started.elapsed();
+                    metrics.map(|metrics| (metrics, validation_elapsed))
                 } else {
                     None
-                };
-                match trained_weights.as_ref() {
-                    Some(weights) => {
-                        let validation_started = std::time::Instant::now();
-                        let metrics = run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, weights)?;
-                        let validation_elapsed = validation_started.elapsed();
-                        metrics.map(|metrics| (metrics, validation_elapsed))
-                    }
-                    None => None,
                 }
             } {
                 print_cuda_cpp_validation_summary_elapsed(
@@ -6751,7 +6743,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
         let checkpoint_started = std::time::Instant::now();
         let validation_started = std::time::Instant::now();
-        let test_metrics = run_cuda_cpp_sfnn_final_validation(args, feature_kind, cuda_shape, &trained_weights)?;
+        let test_metrics = run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
         let validation_elapsed = validation_started.elapsed();
         let save_started = std::time::Instant::now();
         let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
@@ -7061,11 +7053,12 @@ fn run_cuda_cpp_nnue_final_validation(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn run_cuda_cpp_sfnn_final_validation(
+fn run_cuda_cpp_sfnn_resident_validation(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
+    ctx: &bulletou_cuda_cpp::Context,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
-    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
 ) -> Result<Option<TestMetrics>, String> {
     let load_started = std::time::Instant::now();
     let Some(cache) = TestPositionsCache::try_load(args) else {
@@ -7080,54 +7073,6 @@ fn run_cuda_cpp_sfnn_final_validation(
         return Ok(None);
     }
 
-    let fold_started = std::time::Instant::now();
-    let factorizer = effective_sfnn_factorizer_spec(args);
-    let validation_weights = cuda_cpp_sfnn_weights_for_cpu_validation(feature_kind, shape, weights, factorizer)?;
-    let weight_fold_elapsed = fold_started.elapsed();
-    let validation_shape = bulletou_cuda_cpp::SfnnForwardShape {
-        input_size: validation_weights.shape.input_size,
-        ft_size: validation_weights.shape.ft_size,
-        l1_hidden: validation_weights.shape.l1_hidden,
-        l2_size: validation_weights.shape.l2_size,
-        num_stacks: validation_weights.shape.num_stacks,
-        l1_group_count: validation_weights.shape.l1_group_count,
-        l1_common_size: 0,
-        l1_shard_size: 0,
-        factorizer_king_axis_dim: shape.factorizer_king_axis_dim,
-        factorizer_hand_axis_dim: shape.factorizer_hand_axis_dim,
-    };
-    let context_started = std::time::Instant::now();
-    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
-    let context_elapsed = context_started.elapsed();
-    let upload_started = std::time::Instant::now();
-    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(
-        &ctx,
-        bulletou_cuda_cpp::SfnnForwardHostWeights {
-            shape: validation_shape,
-            l0w: &validation_weights.l0w,
-            l0b: &validation_weights.l0b,
-            l1w: &validation_weights.l1w,
-            l1b: &validation_weights.l1b,
-            l1fw: None,
-            l1fb: None,
-            l1axw: None,
-            l1axb: None,
-            l2w: &validation_weights.l2w,
-            l2b: &validation_weights.l2b,
-            l2fw: None,
-            l2fb: None,
-            l2axw: None,
-            l2axb: None,
-            l3w: &validation_weights.l3w,
-            l3b: &validation_weights.l3b,
-            l3fw: None,
-            l3fb: None,
-            l3axw: None,
-            l3axb: None,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let mut outputs = Vec::with_capacity(cache.positions.len());
@@ -7135,7 +7080,7 @@ fn run_cuda_cpp_sfnn_final_validation(
     for positions in cache.positions.chunks(batch_size) {
         let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
         let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
-            &ctx,
+            ctx,
             bulletou_cuda_cpp::SfnnForwardHostBatch {
                 stm_indices: &batch.stm,
                 nstm_indices: &batch.nstm,
@@ -7146,18 +7091,17 @@ fn run_cuda_cpp_sfnn_final_validation(
         )
         .map_err(|e| e.to_string())?;
         let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
-            &ctx,
-            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(validation_shape, batch.layout.batch_size),
+            ctx,
+            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(shape, batch.layout.batch_size),
         )
         .map_err(|e| e.to_string())?;
-        bulletou_cuda_cpp::sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace)
-            .map_err(|e| e.to_string())?;
-        let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
+        runner.forward_current_weights(ctx, &device_batch, &workspace).map_err(|e| e.to_string())?;
+        let mut chunk_outputs = workspace.download_output(ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
     let batches_elapsed = started.elapsed();
     eprintln!(
-        "  cuda-cpp {} validation forward = gpu: positions={}, batch_size={}, elapsed={}",
+        "  cuda-cpp {} validation forward = gpu-resident: positions={}, batch_size={}, elapsed={}",
         feature_kind.source_label(),
         outputs.len(),
         batch_size,
@@ -7173,9 +7117,9 @@ fn run_cuda_cpp_sfnn_final_validation(
         batch_size,
         CudaCppValidationTiming {
             load_cache: load_cache_elapsed,
-            weight_fold: weight_fold_elapsed,
-            context: context_elapsed,
-            weight_upload: weight_upload_elapsed,
+            weight_fold: std::time::Duration::ZERO,
+            context: std::time::Duration::ZERO,
+            weight_upload: std::time::Duration::ZERO,
             batches: batches_elapsed,
             metrics: metrics_elapsed,
         },
@@ -7546,91 +7490,6 @@ fn cuda_cpp_halfkp_weights_for_cpu_validation(
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
 ) -> Result<bulletou_lib::value::NnueForwardOwnedWeights, String> {
     cuda_cpp_nnue_weights_for_cpu_validation(CudaCppNnueFeatureKind::Halfkp, shape, weights)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_sfnn_weights_for_cpu_validation(
-    feature_kind: CudaCppSfnnFeatureKind,
-    shape: bulletou_cuda_cpp::SfnnForwardShape,
-    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
-    factorizer: SfnnFactorizerSpec,
-) -> Result<bulletou_lib::value::SfnnForwardOwnedWeights, String> {
-    use bulletou_lib::value::{
-        SfnnForwardOwnedWeights as CpuSfnnForwardOwnedWeights, SfnnForwardShape as CpuSfnnForwardShape,
-    };
-
-    let base_input_size = feature_kind.base_input_size();
-    let virtual_rows = feature_kind.virtual_rows();
-    let factorized_input_size = base_input_size + virtual_rows;
-    let l0w = if shape.input_size == base_input_size {
-        weights.l0w.clone()
-    } else if virtual_rows > 0 && shape.input_size == factorized_input_size {
-        fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?
-    } else {
-        return Err(format!(
-            "cannot validate cuda-cpp {} SFNN weights with input_size={}, expected {} or factorized {}",
-            feature_kind.source_label(),
-            shape.input_size,
-            base_input_size,
-            factorized_input_size
-        ));
-    };
-    let mut l1w = weights.l1w.clone();
-    let mut l1b = weights.l1b.clone();
-    let mut l2w = weights.l2w.clone();
-    let mut l2b = weights.l2b.clone();
-    let mut l3w = weights.l3w.clone();
-    let mut l3b = weights.l3b.clone();
-    let use_axis = factorizer.king_axis || factorizer.hand_axis;
-    if factorizer.shared {
-        let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
-            !shape.has_compact_l1(),
-            "l1f",
-            weights.l1fw.as_deref(),
-            weights.l1fb.as_deref(),
-        )?;
-        let (l2fw, l2fb) =
-            cuda_cpp_sfnn_active_factorizer_pair(true, "l2f", weights.l2fw.as_deref(), weights.l2fb.as_deref())?;
-        let (l3fw, l3fb) =
-            cuda_cpp_sfnn_active_factorizer_pair(true, "l3f", weights.l3fw.as_deref(), weights.l3fb.as_deref())?;
-        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(shape, &mut l1w, &mut l1b, l1fw, l1fb)?;
-        fold_cuda_cpp_sfnn_l2f_into_stacked_l2(shape, &mut l2w, &mut l2b, l2fw, l2fb)?;
-        fold_cuda_cpp_sfnn_l3f_into_stacked_l3(shape, &mut l3w, &mut l3b, l3fw, l3fb)?;
-    }
-    if use_axis {
-        let (l1axw, l1axb) = cuda_cpp_sfnn_active_factorizer_pair(
-            !shape.has_compact_l1(),
-            "l1ax",
-            weights.l1axw.as_deref(),
-            weights.l1axb.as_deref(),
-        )?;
-        let (l2axw, l2axb) =
-            cuda_cpp_sfnn_active_factorizer_pair(true, "l2ax", weights.l2axw.as_deref(), weights.l2axb.as_deref())?;
-        let (l3axw, l3axb) =
-            cuda_cpp_sfnn_active_factorizer_pair(true, "l3ax", weights.l3axw.as_deref(), weights.l3axb.as_deref())?;
-        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(shape, &mut l1w, &mut l1b, l1axw, l1axb, factorizer)?;
-        fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(shape, &mut l2w, &mut l2b, l2axw, l2axb, factorizer)?;
-        fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(shape, &mut l3w, &mut l3b, l3axw, l3axb, factorizer)?;
-    }
-    let cpu_l1_group_count = if cuda_cpp_sfnn_is_common_shard_l1_shape(shape) {
-        l1w = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &l1w)?;
-        1
-    } else {
-        shape.l1_group_count
-    };
-    let cpu_shape = CpuSfnnForwardShape {
-        input_size: base_input_size,
-        ft_size: shape.ft_size,
-        l1_hidden: shape.l1_hidden,
-        l2_size: shape.l2_size,
-        num_stacks: shape.num_stacks,
-        l1_group_count: cpu_l1_group_count,
-    };
-
-    let cpu_weights =
-        CpuSfnnForwardOwnedWeights { shape: cpu_shape, l0w, l0b: weights.l0b.clone(), l1w, l1b, l2w, l2b, l3w, l3b };
-    cpu_weights.validate().map_err(|e| e.to_string())?;
-    Ok(cpu_weights)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8752,7 +8611,9 @@ fn load_cuda_cpp_sfnn_initial_state(
     }
     let completed_steps = load_cuda_cpp_sfnn_completed_steps(&records, &weights)?;
     let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers {
-        eprintln!("  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration");
+        eprintln!(
+            "  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration"
+        );
         None
     } else {
         load_cuda_cpp_sfnn_optimizer_state(&records, &weights)?
@@ -8783,13 +8644,7 @@ fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
                 .l1fb
                 .as_mut()
                 .ok_or_else(|| "new SFNN shared L1 factorizer was requested but l1fb is missing".to_string())?;
-            extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(
-                shape,
-                &mut weights.l1w,
-                &mut weights.l1b,
-                l1fw,
-                l1fb,
-            )?;
+            extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(shape, &mut weights.l1w, &mut weights.l1b, l1fw, l1fb)?;
             extracted_any = true;
         }
         if created.shared_l2_l3 {
@@ -8801,13 +8656,7 @@ fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
                 .l2fb
                 .as_mut()
                 .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l2fb is missing".to_string())?;
-            extract_cuda_cpp_sfnn_l2_shared_from_stacked_l2(
-                shape,
-                &mut weights.l2w,
-                &mut weights.l2b,
-                l2fw,
-                l2fb,
-            )?;
+            extract_cuda_cpp_sfnn_l2_shared_from_stacked_l2(shape, &mut weights.l2w, &mut weights.l2b, l2fw, l2fb)?;
             let l3fw = weights
                 .l3fw
                 .as_mut()
@@ -8816,13 +8665,7 @@ fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
                 .l3fb
                 .as_mut()
                 .ok_or_else(|| "new SFNN shared L2/L3 factorizer was requested but l3fb is missing".to_string())?;
-            extract_cuda_cpp_sfnn_l3_shared_from_stacked_l3(
-                shape,
-                &mut weights.l3w,
-                &mut weights.l3b,
-                l3fw,
-                l3fb,
-            )?;
+            extract_cuda_cpp_sfnn_l3_shared_from_stacked_l3(shape, &mut weights.l3w, &mut weights.l3b, l3fw, l3fb)?;
             extracted_any = true;
         }
     }
@@ -9076,9 +8919,8 @@ fn extract_cuda_cpp_sfnn_shared_row_major_from_stacks(
     shared: &mut [f32],
     label: &'static str,
 ) -> Result<(), String> {
-    let expected_stacked = stack_count
-        .checked_mul(stack_stride)
-        .ok_or_else(|| format!("{label} stacked length overflow"))?;
+    let expected_stacked =
+        stack_count.checked_mul(stack_stride).ok_or_else(|| format!("{label} stacked length overflow"))?;
     if stacked.len() != expected_stacked {
         return Err(format!("{label} stacked length mismatch: got {}, expected {expected_stacked}", stacked.len()));
     }
@@ -9117,13 +8959,9 @@ fn extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(
     let axis_count = shape.factorizer_axis_count();
     let axis_stride = shape.ft_size * l1_out;
     let stack_stride = l1_out * shape.ft_size;
-    let expected_l1w = shape
-        .num_stacks
-        .checked_mul(stack_stride)
-        .ok_or_else(|| "SFNN l1w length overflow".to_string())?;
-    let expected_axis = axis_count
-        .checked_mul(axis_stride)
-        .ok_or_else(|| "SFNN l1axw length overflow".to_string())?;
+    let expected_l1w =
+        shape.num_stacks.checked_mul(stack_stride).ok_or_else(|| "SFNN l1w length overflow".to_string())?;
+    let expected_axis = axis_count.checked_mul(axis_stride).ok_or_else(|| "SFNN l1axw length overflow".to_string())?;
     if l1w.len() != expected_l1w {
         return Err(format!("SFNN l1w length mismatch: got {}, expected {expected_l1w}", l1w.len()));
     }
@@ -9163,8 +9001,7 @@ fn extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(
             let axis_base = axis * axis_stride;
             for in_col in 0..shape.ft_size {
                 for out_col in 0..l1_out {
-                    l1w[stack_base + out_col * shape.ft_size + in_col] -=
-                        sums[axis_base + in_col * l1_out + out_col];
+                    l1w[stack_base + out_col * shape.ft_size + in_col] -= sums[axis_base + in_col * l1_out + out_col];
                 }
             }
         }
@@ -9209,13 +9046,9 @@ fn extract_cuda_cpp_sfnn_axis_row_major_from_stacks(
     label: &'static str,
 ) -> Result<(), String> {
     let axis_count = shape.factorizer_axis_count();
-    let expected_stacked = shape
-        .num_stacks
-        .checked_mul(stack_stride)
-        .ok_or_else(|| format!("{label} stacked length overflow"))?;
-    let expected_axis = axis_count
-        .checked_mul(stack_stride)
-        .ok_or_else(|| format!("{label} axis length overflow"))?;
+    let expected_stacked =
+        shape.num_stacks.checked_mul(stack_stride).ok_or_else(|| format!("{label} stacked length overflow"))?;
+    let expected_axis = axis_count.checked_mul(stack_stride).ok_or_else(|| format!("{label} axis length overflow"))?;
     if stacked.len() != expected_stacked {
         return Err(format!("{label} stacked length mismatch: got {}, expected {expected_stacked}", stacked.len()));
     }
@@ -15996,17 +15829,14 @@ mod tests {
         migrated.l3axw = Some(vec![0.0; axis_count * shape.l2_size]);
         migrated.l3axb = Some(vec![0.0; axis_count]);
 
-        assert!(extract_cuda_cpp_sfnn_new_factorizers_from_base(
-            &mut migrated,
-            SfnnFactorizerSpec::AXIS,
-            CudaCppSfnnCreatedFactorizers {
-                shared_l1: true,
-                shared_l2_l3: true,
-                axis_l1: true,
-                axis_l2_l3: true,
-            },
-        )
-        .unwrap());
+        assert!(
+            extract_cuda_cpp_sfnn_new_factorizers_from_base(
+                &mut migrated,
+                SfnnFactorizerSpec::AXIS,
+                CudaCppSfnnCreatedFactorizers { shared_l1: true, shared_l2_l3: true, axis_l1: true, axis_l2_l3: true },
+            )
+            .unwrap()
+        );
         assert!(migrated.l1fw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
         assert!(migrated.l1axw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
 

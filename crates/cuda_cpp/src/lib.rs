@@ -5312,6 +5312,17 @@ impl SfnnTrainStepRunner {
         self.loss_workspace.download(ctx)
     }
 
+    pub fn forward_current_weights(
+        &self,
+        ctx: &Context,
+        batch: &SfnnForwardDeviceBatch,
+        workspace: &SfnnForwardWorkspace,
+    ) -> Result<()> {
+        self.weights.validate()?;
+        self.factorizer.validate_for_shape(self.shape)?;
+        sfnn_forward_device_with_factorizer(ctx, batch, &self.weights, workspace, self.factorizer)
+    }
+
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
         Ok(SfnnTrainWeightsReadback {
             l0w: self.weights.l0w.download(ctx)?,
