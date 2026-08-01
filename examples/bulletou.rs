@@ -6905,29 +6905,6 @@ fn cuda_cpp_sfnn_optimizer_readback_as_host(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-#[derive(Clone, Copy, Debug, Default)]
-struct CudaCppValidationTiming {
-    load_cache: std::time::Duration,
-    weight_fold: std::time::Duration,
-    context: std::time::Duration,
-    weight_upload: std::time::Duration,
-    batches: std::time::Duration,
-    metrics: std::time::Duration,
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-impl CudaCppValidationTiming {
-    fn total(self) -> std::time::Duration {
-        self.load_cache
-            .saturating_add(self.weight_fold)
-            .saturating_add(self.context)
-            .saturating_add(self.weight_upload)
-            .saturating_add(self.batches)
-            .saturating_add(self.metrics)
-    }
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 static CUDA_CPP_VALIDATION_FORWARD_CONFIGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6948,33 +6925,15 @@ fn print_cuda_cpp_validation_forward_config_once(prefix: &str, mode: &str, posit
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn print_cuda_cpp_validation_timing(prefix: &str, timing: CudaCppValidationTiming) {
-    eprintln!(
-        "  {} {}: load/cache={}, weight_fold={}, context={}, weight_upload={}, batches={}, metrics={}, total={}",
-        paint(prefix, ConsoleColor::Dim),
-        paint("validation detail", ConsoleColor::BoldYellow),
-        format_duration_secs(timing.load_cache),
-        format_duration_secs(timing.weight_fold),
-        format_duration_secs(timing.context),
-        format_duration_secs(timing.weight_upload),
-        format_duration_secs(timing.batches),
-        format_duration_secs(timing.metrics),
-        format_duration_secs(timing.total()),
-    );
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_nnue_final_validation(
     args: &Args,
     feature_kind: CudaCppNnueFeatureKind,
     shape: bulletou_cuda_cpp::NnueForwardShape,
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
 ) -> Result<Option<TestMetrics>, String> {
-    let load_started = std::time::Instant::now();
     let Some(cache) = TestPositionsCache::try_load(args) else {
         return Ok(None);
     };
-    let load_cache_elapsed = load_started.elapsed();
     if cache.positions.is_empty() {
         eprintln!(
             "  WARN: --test-teacher yielded no positions; cuda-cpp {} final validation skipped",
@@ -6983,19 +6942,14 @@ fn run_cuda_cpp_nnue_final_validation(
         return Ok(None);
     }
 
-    let fold_started = std::time::Instant::now();
     let validation_weights_owned = cuda_cpp_nnue_weights_for_cpu_validation(feature_kind, shape, weights)?;
-    let weight_fold_elapsed = fold_started.elapsed();
     let validation_shape = bulletou_cuda_cpp::NnueForwardShape {
         input_size: validation_weights_owned.shape.input_size,
         l1: validation_weights_owned.shape.l1,
         l2: validation_weights_owned.shape.l2,
         l3: validation_weights_owned.shape.l3,
     };
-    let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
-    let context_elapsed = context_started.elapsed();
-    let upload_started = std::time::Instant::now();
     let device_weights = bulletou_cuda_cpp::NnueForwardDeviceWeights::from_host(
         &ctx,
         bulletou_cuda_cpp::NnueForwardHostWeights {
@@ -7011,7 +6965,6 @@ fn run_cuda_cpp_nnue_final_validation(
         },
     )
     .map_err(|e| e.to_string())?;
-    let weight_upload_elapsed = upload_started.elapsed();
     let batch_size = args.test_batch_size.max(1);
     print_cuda_cpp_validation_forward_config_once(
         &format!("cuda-cpp {}", feature_kind.source_label()),
@@ -7020,7 +6973,6 @@ fn run_cuda_cpp_nnue_final_validation(
         batch_size,
     );
     let mut outputs = Vec::with_capacity(cache.positions.len());
-    let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
         let batch = build_nnue_validation_fast_batch(feature_kind, positions)?;
         let device_batch = bulletou_cuda_cpp::NnueForwardDeviceBatch::from_host(
@@ -7043,28 +6995,7 @@ fn run_cuda_cpp_nnue_final_validation(
         let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
-    let batches_elapsed = started.elapsed();
-    eprintln!(
-        "  cuda-cpp {} validation forward elapsed={}",
-        feature_kind.source_label(),
-        format_duration_secs(batches_elapsed)
-    );
-
-    let metrics_started = std::time::Instant::now();
-    let metrics = run_one_test_pass(&cache, args, outputs);
-    let metrics_elapsed = metrics_started.elapsed();
-    print_cuda_cpp_validation_timing(
-        &format!("cuda-cpp {}", feature_kind.source_label()),
-        CudaCppValidationTiming {
-            load_cache: load_cache_elapsed,
-            weight_fold: weight_fold_elapsed,
-            context: context_elapsed,
-            weight_upload: weight_upload_elapsed,
-            batches: batches_elapsed,
-            metrics: metrics_elapsed,
-        },
-    );
-    Ok(Some(metrics))
+    Ok(Some(run_one_test_pass(&cache, args, outputs)))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7075,11 +7006,9 @@ fn run_cuda_cpp_sfnn_resident_validation(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
 ) -> Result<Option<TestMetrics>, String> {
-    let load_started = std::time::Instant::now();
     let Some(cache) = TestPositionsCache::try_load(args) else {
         return Ok(None);
     };
-    let load_cache_elapsed = load_started.elapsed();
     if cache.positions.is_empty() {
         eprintln!(
             "  WARN: --test-teacher yielded no positions; cuda-cpp {} final validation skipped",
@@ -7097,7 +7026,6 @@ fn run_cuda_cpp_sfnn_resident_validation(
     );
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let mut outputs = Vec::with_capacity(cache.positions.len());
-    let started = std::time::Instant::now();
     for positions in cache.positions.chunks(batch_size) {
         let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
         let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
@@ -7120,28 +7048,7 @@ fn run_cuda_cpp_sfnn_resident_validation(
         let mut chunk_outputs = workspace.download_output(ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
-    let batches_elapsed = started.elapsed();
-    eprintln!(
-        "  cuda-cpp {} validation forward elapsed={}",
-        feature_kind.source_label(),
-        format_duration_secs(batches_elapsed)
-    );
-
-    let metrics_started = std::time::Instant::now();
-    let metrics = run_one_test_pass(&cache, args, outputs);
-    let metrics_elapsed = metrics_started.elapsed();
-    print_cuda_cpp_validation_timing(
-        &format!("cuda-cpp {}", feature_kind.source_label()),
-        CudaCppValidationTiming {
-            load_cache: load_cache_elapsed,
-            weight_fold: std::time::Duration::ZERO,
-            context: std::time::Duration::ZERO,
-            weight_upload: std::time::Duration::ZERO,
-            batches: batches_elapsed,
-            metrics: metrics_elapsed,
-        },
-    );
-    Ok(Some(metrics))
+    Ok(Some(run_one_test_pass(&cache, args, outputs)))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12439,7 +12346,6 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: V
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
     let loss = report.test_loss.unwrap_or(f32::NAN);
-    eprintln!("  test: accuracy={:.4}%, loss={:.6}", accuracy * 100.0, loss);
     TestMetrics { accuracy, loss }
 }
 
