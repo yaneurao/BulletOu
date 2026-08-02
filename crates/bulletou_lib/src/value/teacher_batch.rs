@@ -247,8 +247,14 @@ where
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
             let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
-                loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset % total_bytes)
+                if config.teacher_shuffle_buffer_batches > 0 {
+                    let record_index =
+                        fixed_record_resume_start_position("HCPE", pos, crate::value::loader::hcpe::HCPE_RECORD_SIZE)?;
+                    (record_index, pos.byte_offset % total_bytes)
+                } else {
+                    loader = loader.with_exact_resume_offset(pos.byte_offset);
+                    (0, pos.byte_offset % total_bytes)
+                }
             } else {
                 let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
@@ -399,8 +405,14 @@ where
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
             let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
-                loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset % total_bytes)
+                if config.teacher_shuffle_buffer_batches > 0 {
+                    let record_index =
+                        fixed_record_resume_start_position("HCPE", pos, crate::value::loader::hcpe::HCPE_RECORD_SIZE)?;
+                    (record_index, pos.byte_offset % total_bytes)
+                } else {
+                    loader = loader.with_exact_resume_offset(pos.byte_offset);
+                    (0, pos.byte_offset % total_bytes)
+                }
             } else {
                 let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
@@ -554,8 +566,14 @@ where
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
             let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
-                loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset % total_bytes)
+                if config.teacher_shuffle_buffer_batches > 0 {
+                    let record_index =
+                        fixed_record_resume_start_position("HCPE", pos, crate::value::loader::hcpe::HCPE_RECORD_SIZE)?;
+                    (record_index, pos.byte_offset % total_bytes)
+                } else {
+                    loader = loader.with_exact_resume_offset(pos.byte_offset);
+                    (0, pos.byte_offset % total_bytes)
+                }
             } else {
                 let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)
@@ -729,8 +747,14 @@ where
             }
             let total_bytes = total_hcpe_teacher_bytes(&data_files_owned)?;
             let (loader_start_position, base_byte_offset) = if let Some(pos) = config.dataloader_resume_pos {
-                loader = loader.with_exact_resume_offset(pos.byte_offset);
-                (0, pos.byte_offset % total_bytes)
+                if config.teacher_shuffle_buffer_batches > 0 {
+                    let record_index =
+                        fixed_record_resume_start_position("HCPE", pos, crate::value::loader::hcpe::HCPE_RECORD_SIZE)?;
+                    (record_index, pos.byte_offset % total_bytes)
+                } else {
+                    loader = loader.with_exact_resume_offset(pos.byte_offset);
+                    (0, pos.byte_offset % total_bytes)
+                }
             } else {
                 let consumed_records = checked_batch_start_position("HCPE", config.batch_index, config.batch_size)?;
                 let base_byte_offset = (consumed_records as u64)

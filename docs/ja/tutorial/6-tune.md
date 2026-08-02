@@ -15,7 +15,7 @@
 | `--backend` | 学習 backend。現行は Windows-native `cuda-cpp` のみ対応。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
-| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window。`batch_size × N` 局面のCPU windowを2個確保し、片方を消費中に片方を読み込み・Fisher-Yates shuffleする。`N` は実効 `batches_per_superbatch` を割り切る必要がある。`0` で無効 | 0 |
+| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window。`batch_size × N` 局面のCPU windowを2個確保し、片方を消費中に片方を読み込み・Fisher-Yates shuffleする。省略時の `N` は 1 epoch 分 (`batches_per_superbatch × superbatches`)。`0` で無効 | 1 epoch |
 | `--teacher-shuffle-seed` | 学習時 teacher shuffle の base seed | 0 |
 | `--cuda-cpp-diagnostics-rate` | SFNN の superbatch 診断ログ。`cuda-cpp-diagnostics.log` に teacher queue wait / load / prepare と CUDA 代表 step の stage 時間を書く。`1` なら毎 sb、`N` なら N sb ごとに CUDA stage を profile、`0` で無効 | 1 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |

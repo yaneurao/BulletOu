@@ -549,6 +549,13 @@ pub(crate) fn load_and_map_shuffled_batches_with_prefetch<T, D, F>(
     let Some(window_records) = teacher_shuffle_window_records(batch_size, shuffle_buffer_batches) else {
         return;
     };
+    let window_start_position = (start_position / window_records).saturating_mul(window_records);
+    let mut records_to_skip_in_first_window = start_position.saturating_sub(window_start_position);
+    debug_assert_eq!(
+        records_to_skip_in_first_window % batch_size,
+        0,
+        "teacher shuffle resume position must stay on a batch boundary"
+    );
 
     thread::scope(|scope| {
         // Capacity 1 is intentional: while the consumer owns one shuffled window,
@@ -564,7 +571,7 @@ pub(crate) fn load_and_map_shuffled_batches_with_prefetch<T, D, F>(
         let producer = scope.spawn(move || {
             produce_shuffled_teacher_windows(
                 loader,
-                start_position,
+                window_start_position,
                 batch_size,
                 window_records,
                 shuffle_seed,
@@ -575,7 +582,9 @@ pub(crate) fn load_and_map_shuffled_batches_with_prefetch<T, D, F>(
 
         let mut stopped = false;
         while let Ok(mut window) = ready_rx.recv() {
-            for batch in window.chunks_exact(batch_size) {
+            let start = records_to_skip_in_first_window.min(window.len());
+            records_to_skip_in_first_window = 0;
+            for batch in window[start..].chunks_exact(batch_size) {
                 if f(batch) {
                     stopped = true;
                     break;
@@ -886,6 +895,26 @@ mod tests {
             super::shuffle_teacher_buffer(window, 99, window_index);
         }
         assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn teacher_shuffle_prefetch_resume_skips_inside_window() {
+        let data: Vec<u32> = (0..40).collect();
+        let mut full_batches = Vec::new();
+        let mut resumed_batches = Vec::new();
+
+        super::load_and_map_shuffled_batches_with_prefetch(VecLoader::new(data.clone(), 5), 0, 4, 2, 99, |batch| {
+            full_batches.push(batch.to_vec());
+            false
+        });
+        super::load_and_map_shuffled_batches_with_prefetch(VecLoader::new(data, 5), 12, 4, 2, 99, |batch| {
+            resumed_batches.push(batch.to_vec());
+            false
+        });
+
+        let full: Vec<_> = full_batches.into_iter().flatten().collect();
+        let resumed: Vec<_> = resumed_batches.into_iter().flatten().collect();
+        assert_eq!(resumed, full[12..]);
     }
 
     #[test]
