@@ -15,7 +15,7 @@
 | `--backend` | 学習 backend。現行は Windows-native `cuda-cpp` のみ対応。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
-| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window。`batch_size × N` 局面をCPU上に貯めて Fisher-Yates shuffle してから batch に切る。`N` は実効 `batches_per_superbatch` を割り切る必要がある。`0` で無効 | 0 |
+| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window。`batch_size × N` 局面のCPU windowを2個確保し、片方を消費中に片方を読み込み・Fisher-Yates shuffleする。`N` は実効 `batches_per_superbatch` を割り切る必要がある。`0` で無効 | 0 |
 | `--teacher-shuffle-seed` | 学習時 teacher shuffle の base seed | 0 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |

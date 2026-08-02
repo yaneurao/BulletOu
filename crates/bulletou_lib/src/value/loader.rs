@@ -19,7 +19,10 @@ pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
 use bulletformat::BulletFormat;
 use rayon::prelude::*;
-use std::sync::OnceLock;
+use std::{
+    sync::{OnceLock, mpsc},
+    thread,
+};
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 
@@ -198,92 +201,16 @@ where
         &self,
         start_position: usize,
         batch_size: usize,
-        mut f: F,
+        f: F,
     ) {
-        let Some(window_records) = teacher_shuffle_window_records(batch_size, self.teacher_shuffle_buffer_batches)
-        else {
-            return;
-        };
-        let mut incomplete_buf = Vec::new();
-        let mut shuffle_buf = Vec::with_capacity(window_records);
-        let mut window_index = start_position / window_records;
-        let shuffle_seed = self.teacher_shuffle_seed;
-
-        let mut flush_window = |shuffle_buf: &mut Vec<I::RequiredDataType>, window_index: &mut usize| -> bool {
-            if shuffle_buf.is_empty() {
-                return false;
-            }
-            shuffle_teacher_buffer(shuffle_buf, shuffle_seed, *window_index);
-            *window_index = window_index.saturating_add(1);
-
-            let mut emitted = 0usize;
-            for batch in shuffle_buf.chunks_exact(batch_size) {
-                emitted += batch.len();
-                if f(batch) {
-                    shuffle_buf.clear();
-                    return true;
-                }
-            }
-
-            let remainder = shuffle_buf.len().saturating_sub(emitted);
-            if remainder == 0 {
-                shuffle_buf.clear();
-            } else {
-                shuffle_buf.copy_within(emitted.., 0);
-                shuffle_buf.truncate(remainder);
-            }
-            false
-        };
-
-        let mut stopped = false;
-        self.loader.map_chunks(start_position, |chunk| {
-            let mut emit_complete_batch = |batch: &[I::RequiredDataType]| -> bool {
-                shuffle_buf.extend_from_slice(batch);
-                if shuffle_buf.len() >= window_records {
-                    debug_assert_eq!(shuffle_buf.len(), window_records);
-                    return flush_window(&mut shuffle_buf, &mut window_index);
-                }
-                false
-            };
-
-            let remainder = if !incomplete_buf.is_empty() {
-                let remainder = batch_size - incomplete_buf.len();
-
-                if chunk.len() >= remainder {
-                    incomplete_buf.extend_from_slice(&chunk[..remainder]);
-                    if emit_complete_batch(&incomplete_buf) {
-                        incomplete_buf.clear();
-                        stopped = true;
-                        return true;
-                    }
-                    incomplete_buf.clear();
-                } else {
-                    incomplete_buf.extend_from_slice(chunk);
-                }
-
-                remainder
-            } else {
-                0
-            };
-
-            if chunk.len() >= remainder {
-                let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
-                incomplete_buf.extend_from_slice(chunks.remainder());
-
-                for batch in chunks {
-                    if emit_complete_batch(batch) {
-                        stopped = true;
-                        return true;
-                    }
-                }
-            }
-
-            false
-        });
-
-        if !stopped {
-            let _ = flush_window(&mut shuffle_buf, &mut window_index);
-        }
+        load_and_map_shuffled_batches_with_prefetch(
+            self.loader.clone(),
+            start_position,
+            batch_size,
+            self.teacher_shuffle_buffer_batches,
+            self.teacher_shuffle_seed,
+            f,
+        );
     }
 
     pub fn prepare(&self, data: &[I::RequiredDataType], threads: usize, blend: f32) -> PreparedData<I, O> {
@@ -605,6 +532,186 @@ pub(crate) fn teacher_shuffle_window_records(batch_size: usize, buffer_batches: 
     batch_size.checked_mul(buffer_batches)
 }
 
+pub(crate) const TEACHER_SHUFFLE_PREFETCH_BUFFERS: usize = 2;
+
+pub(crate) fn load_and_map_shuffled_batches_with_prefetch<T, D, F>(
+    loader: D,
+    start_position: usize,
+    batch_size: usize,
+    shuffle_buffer_batches: usize,
+    shuffle_seed: u64,
+    mut f: F,
+) where
+    T: Copy + Send,
+    D: DataLoader<T>,
+    F: FnMut(&[T]) -> bool,
+{
+    let Some(window_records) = teacher_shuffle_window_records(batch_size, shuffle_buffer_batches) else {
+        return;
+    };
+
+    thread::scope(|scope| {
+        // Capacity 1 is intentional: while the consumer owns one shuffled window,
+        // the producer can fill/shuffle exactly one more window in the background.
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Vec<T>>(TEACHER_SHUFFLE_PREFETCH_BUFFERS - 1);
+        let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<T>>(TEACHER_SHUFFLE_PREFETCH_BUFFERS);
+        for _ in 0..TEACHER_SHUFFLE_PREFETCH_BUFFERS {
+            empty_tx
+                .send(Vec::with_capacity(window_records))
+                .expect("teacher shuffle empty-buffer channel is live during setup");
+        }
+
+        let producer = scope.spawn(move || {
+            produce_shuffled_teacher_windows(
+                loader,
+                start_position,
+                batch_size,
+                window_records,
+                shuffle_seed,
+                ready_tx,
+                empty_rx,
+            );
+        });
+
+        let mut stopped = false;
+        while let Ok(mut window) = ready_rx.recv() {
+            for batch in window.chunks_exact(batch_size) {
+                if f(batch) {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+            window.clear();
+            if empty_tx.send(window).is_err() {
+                break;
+            }
+        }
+
+        drop(ready_rx);
+        drop(empty_tx);
+        if let Err(payload) = producer.join() {
+            std::panic::resume_unwind(payload);
+        }
+    });
+}
+
+fn produce_shuffled_teacher_windows<T, D>(
+    loader: D,
+    start_position: usize,
+    batch_size: usize,
+    window_records: usize,
+    shuffle_seed: u64,
+    ready_tx: mpsc::SyncSender<Vec<T>>,
+    empty_rx: mpsc::Receiver<Vec<T>>,
+) where
+    T: Copy,
+    D: DataLoader<T>,
+{
+    let mut incomplete_buf = Vec::new();
+    let mut shuffle_buf = match empty_rx.recv() {
+        Ok(mut buf) => {
+            buf.clear();
+            buf
+        }
+        Err(_) => return,
+    };
+    let mut window_index = start_position / window_records;
+    let mut stopped = false;
+
+    loader.map_chunks(start_position, |chunk| {
+        let mut emit_complete_batch = |batch: &[T]| -> bool {
+            shuffle_buf.extend_from_slice(batch);
+            if shuffle_buf.len() >= window_records {
+                debug_assert_eq!(shuffle_buf.len(), window_records);
+                return send_and_reuse_teacher_shuffle_window(
+                    &mut shuffle_buf,
+                    &ready_tx,
+                    &empty_rx,
+                    shuffle_seed,
+                    &mut window_index,
+                );
+            }
+            false
+        };
+
+        let remainder = if !incomplete_buf.is_empty() {
+            let remainder = batch_size - incomplete_buf.len();
+
+            if chunk.len() >= remainder {
+                incomplete_buf.extend_from_slice(&chunk[..remainder]);
+                if emit_complete_batch(&incomplete_buf) {
+                    incomplete_buf.clear();
+                    stopped = true;
+                    return true;
+                }
+                incomplete_buf.clear();
+            } else {
+                incomplete_buf.extend_from_slice(chunk);
+            }
+
+            remainder
+        } else {
+            0
+        };
+
+        if chunk.len() >= remainder {
+            let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
+            incomplete_buf.extend_from_slice(chunks.remainder());
+
+            for batch in chunks {
+                if emit_complete_batch(batch) {
+                    stopped = true;
+                    return true;
+                }
+            }
+        }
+
+        false
+    });
+
+    if !stopped && !shuffle_buf.is_empty() {
+        send_final_teacher_shuffle_window(shuffle_buf, &ready_tx, shuffle_seed, window_index);
+    }
+}
+
+fn send_and_reuse_teacher_shuffle_window<T>(
+    shuffle_buf: &mut Vec<T>,
+    ready_tx: &mpsc::SyncSender<Vec<T>>,
+    empty_rx: &mpsc::Receiver<Vec<T>>,
+    shuffle_seed: u64,
+    window_index: &mut usize,
+) -> bool {
+    let mut full_window = Vec::new();
+    std::mem::swap(shuffle_buf, &mut full_window);
+    shuffle_teacher_buffer(&mut full_window, shuffle_seed, *window_index);
+    if ready_tx.send(full_window).is_err() {
+        return true;
+    }
+    *window_index = window_index.saturating_add(1);
+
+    match empty_rx.recv() {
+        Ok(mut next) => {
+            next.clear();
+            *shuffle_buf = next;
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+fn send_final_teacher_shuffle_window<T>(
+    mut shuffle_buf: Vec<T>,
+    ready_tx: &mpsc::SyncSender<Vec<T>>,
+    shuffle_seed: u64,
+    window_index: usize,
+) {
+    shuffle_teacher_buffer(&mut shuffle_buf, shuffle_seed, window_index);
+    let _ = ready_tx.send(shuffle_buf);
+}
+
 pub(crate) fn shuffle_teacher_buffer<T>(data: &mut [T], seed: u64, window_index: usize) {
     if data.len() <= 1 {
         return;
@@ -654,7 +761,7 @@ pub(crate) fn win_rate_model_score(score: i16) -> f32 {
 mod tests {
     use crate::{
         game::{inputs::SparseInputType, outputs::OutputBuckets},
-        value::loader::{GameResult, LoadableDataType, PreparedData},
+        value::loader::{DataLoader, GameResult, LoadableDataType, PreparedData},
     };
 
     #[derive(Clone, Copy)]
@@ -714,6 +821,33 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct VecLoader<T> {
+        data: Vec<T>,
+        chunk_size: usize,
+        paths: Vec<String>,
+    }
+
+    impl<T> VecLoader<T> {
+        fn new(data: Vec<T>, chunk_size: usize) -> Self {
+            Self { data, chunk_size, paths: vec!["memory".to_string()] }
+        }
+    }
+
+    impl<T: Copy + Send + Sync + 'static> DataLoader<T> for VecLoader<T> {
+        fn data_file_paths(&self) -> &[String] {
+            &self.paths
+        }
+
+        fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, mut f: F) {
+            for chunk in self.data[start_position..].chunks(self.chunk_size) {
+                if f(chunk) {
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn teacher_shuffle_is_reproducible_and_preserves_records() {
         let mut a: Vec<u32> = (0..256).collect();
@@ -733,6 +867,39 @@ mod tests {
     fn teacher_shuffle_window_records_uses_batch_multiple() {
         assert_eq!(super::teacher_shuffle_window_records(65_536, 61), Some(3_997_696));
         assert_eq!(super::teacher_shuffle_window_records(65_536, 0), None);
+    }
+
+    #[test]
+    fn teacher_shuffle_prefetch_matches_window_shuffle_order() {
+        let data: Vec<u32> = (0..24).collect();
+        let mut batches = Vec::new();
+
+        super::load_and_map_shuffled_batches_with_prefetch(VecLoader::new(data.clone(), 5), 0, 4, 2, 99, |batch| {
+            batches.push(batch.to_vec());
+            false
+        });
+
+        assert!(batches.iter().all(|batch| batch.len() == 4));
+        let flattened: Vec<_> = batches.into_iter().flatten().collect();
+        let mut expected = data;
+        for (window_index, window) in expected.chunks_mut(8).enumerate() {
+            super::shuffle_teacher_buffer(window, 99, window_index);
+        }
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn teacher_shuffle_prefetch_stops_without_deadlock() {
+        let data: Vec<u32> = (0..64).collect();
+        let mut seen_batches = 0usize;
+
+        super::load_and_map_shuffled_batches_with_prefetch(VecLoader::new(data, 3), 0, 4, 2, 7, |batch| {
+            assert_eq!(batch.len(), 4);
+            seen_batches += 1;
+            seen_batches == 3
+        });
+
+        assert_eq!(seen_batches, 3);
     }
 
     #[test]

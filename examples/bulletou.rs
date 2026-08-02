@@ -2222,6 +2222,8 @@ fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
     Ok(effective_batches_per_superbatch(args)?.saturating_mul(effective_batch_size(args)))
 }
 
+const TEACHER_SHUFFLE_PREFETCH_BUFFERS: usize = 2;
+
 fn teacher_shuffle_buffer_records(args: &Args) -> Result<Option<usize>, String> {
     let batches = args.teacher_shuffle_buffer_batches;
     if batches == 0 {
@@ -2634,8 +2636,10 @@ struct Args {
     buffer_mb: usize,
 
     /// In-trainer teacher shuffle window in mini-batches. `0` disables it.
-    /// When enabled, BulletOu accumulates `batch_size * N` decoded positions,
-    /// Fisher-Yates shuffles that window on CPU, then emits mini-batches.
+    /// When enabled, BulletOu uses two CPU windows, each accumulating
+    /// `batch_size * N` decoded positions. It Fisher-Yates shuffles each
+    /// window, emits mini-batches from one window, and fills/shuffles the other
+    /// window in the background.
     /// `N` must divide the effective batches per superbatch so checkpoints
     /// and resume stay on shuffle-window boundaries.
     #[arg(long, default_value = "0")]
@@ -10812,12 +10816,14 @@ fn cuda_cpp_print_teacher_shuffle_buffer(args: &Args, schedule: &CudaCppRunSched
     let Some(records) = teacher_shuffle_buffer_records(args)? else {
         return Ok(());
     };
-    let mib = teacher_shuffle_buffer_mib(args)?.unwrap_or(0.0);
+    let window_mib = teacher_shuffle_buffer_mib(args)?.unwrap_or(0.0);
+    let total_mib = window_mib * (TEACHER_SHUFFLE_PREFETCH_BUFFERS as f64);
     eprintln!(
-        "  teacher shuffle buffer = enabled: {} batches x {} = {} positions ({mib:.1} MiB CPU), seed={}",
+        "  teacher shuffle buffer = double-buffered: {} batches x {} = {} positions/window ({window_mib:.1} MiB x {} = {total_mib:.1} MiB CPU), seed={}",
         args.teacher_shuffle_buffer_batches,
         format_count(effective_batch_size(args)),
         format_count(records),
+        TEACHER_SHUFFLE_PREFETCH_BUFFERS,
         args.teacher_shuffle_seed
     );
     Ok(())

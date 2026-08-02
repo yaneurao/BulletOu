@@ -23,7 +23,8 @@ use crate::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, shuffle_teacher_buffer, teacher_shuffle_window_records, win_rate_model_score,
+            ShogiPackLoader, load_and_map_shuffled_batches_with_prefetch, teacher_shuffle_window_records,
+            win_rate_model_score,
         },
     },
 };
@@ -1242,8 +1243,8 @@ fn load_and_map_packed_batches<D, F>(
     F: FnMut(&[PackedSfenValue]) -> bool,
 {
     if shuffle_buffer_batches > 0 {
-        load_and_map_shuffled_packed_batches(
-            loader,
+        load_and_map_shuffled_batches_with_prefetch(
+            loader.clone(),
             start_position,
             batch_size,
             shuffle_buffer_batches,
@@ -1292,102 +1293,6 @@ fn load_and_map_packed_batches<D, F>(
         false
     });
 }
-
-fn load_and_map_shuffled_packed_batches<D, F>(
-    loader: &D,
-    start_position: usize,
-    batch_size: usize,
-    shuffle_buffer_batches: usize,
-    shuffle_seed: u64,
-    mut f: F,
-) where
-    D: DataLoader<PackedSfenValue>,
-    F: FnMut(&[PackedSfenValue]) -> bool,
-{
-    let Some(window_records) = teacher_shuffle_window_records(batch_size, shuffle_buffer_batches) else {
-        return;
-    };
-    let mut incomplete_buf = Vec::new();
-    let mut shuffle_buf = Vec::with_capacity(window_records);
-    let mut window_index = start_position / window_records;
-    let mut stopped = false;
-
-    let mut flush_window = |shuffle_buf: &mut Vec<PackedSfenValue>, window_index: &mut usize| -> bool {
-        if shuffle_buf.is_empty() {
-            return false;
-        }
-        shuffle_teacher_buffer(shuffle_buf, shuffle_seed, *window_index);
-        *window_index = window_index.saturating_add(1);
-
-        let mut emitted = 0usize;
-        for batch in shuffle_buf.chunks_exact(batch_size) {
-            emitted += batch.len();
-            if f(batch) {
-                shuffle_buf.clear();
-                return true;
-            }
-        }
-
-        let remainder = shuffle_buf.len().saturating_sub(emitted);
-        if remainder == 0 {
-            shuffle_buf.clear();
-        } else {
-            shuffle_buf.copy_within(emitted.., 0);
-            shuffle_buf.truncate(remainder);
-        }
-        false
-    };
-
-    loader.map_chunks(start_position, |chunk| {
-        let mut emit_complete_batch = |batch: &[PackedSfenValue]| -> bool {
-            shuffle_buf.extend_from_slice(batch);
-            if shuffle_buf.len() >= window_records {
-                debug_assert_eq!(shuffle_buf.len(), window_records);
-                return flush_window(&mut shuffle_buf, &mut window_index);
-            }
-            false
-        };
-
-        let remainder = if !incomplete_buf.is_empty() {
-            let remainder = batch_size - incomplete_buf.len();
-
-            if chunk.len() >= remainder {
-                incomplete_buf.extend_from_slice(&chunk[..remainder]);
-                if emit_complete_batch(&incomplete_buf) {
-                    incomplete_buf.clear();
-                    stopped = true;
-                    return true;
-                }
-                incomplete_buf.clear();
-            } else {
-                incomplete_buf.extend_from_slice(chunk);
-            }
-
-            remainder
-        } else {
-            0
-        };
-
-        if chunk.len() >= remainder {
-            let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
-            incomplete_buf.extend_from_slice(chunks.remainder());
-
-            for batch in chunks {
-                if emit_complete_batch(batch) {
-                    stopped = true;
-                    return true;
-                }
-            }
-        }
-
-        false
-    });
-
-    if !stopped {
-        let _ = flush_window(&mut shuffle_buf, &mut window_index);
-    }
-}
-
 fn visit_halfkp_batches_direct<D, P, F, E>(
     loader: D,
     format: DataFormat,
