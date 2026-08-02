@@ -2268,17 +2268,19 @@ fn effective_teacher_shuffle_buffer_batches(args: &Args, batches_per_superbatch:
     if let Some(batches) = args.teacher_shuffle_buffer_batches {
         return Ok(batches);
     }
-    let default_windows = if let Some(train_steps) = args.cuda_cpp_train_steps {
-        train_steps
-    } else {
-        let superbatches = args.superbatches.unwrap_or(1).max(1);
-        batches_per_superbatch.checked_mul(superbatches).ok_or_else(|| {
-            format!(
-                "default teacher shuffle buffer overflow: batches_per_superbatch={batches_per_superbatch}, superbatches={superbatches}"
-            )
-        })?
-    };
+    let default_windows =
+        if let Some(train_steps) = args.cuda_cpp_train_steps { train_steps } else { batches_per_superbatch };
     Ok(default_windows)
+}
+
+fn teacher_shuffle_buffer_mode(args: &Args) -> &'static str {
+    if args.teacher_shuffle_buffer_batches.is_some() {
+        "explicit"
+    } else if args.cuda_cpp_train_steps.is_some() {
+        "default run"
+    } else {
+        "default superbatch"
+    }
 }
 
 fn teacher_shuffle_buffer_records(args: &Args, batches_per_superbatch: usize) -> Result<Option<usize>, String> {
@@ -2709,8 +2711,8 @@ struct Args {
     buffer_mb: usize,
 
     /// In-trainer teacher shuffle window in mini-batches. If omitted, the
-    /// window defaults to one epoch (`batches_per_superbatch * superbatches`).
-    /// `0` disables it. When enabled, BulletOu uses two CPU windows, each
+    /// window defaults to one superbatch (`batches_per_superbatch`). `0`
+    /// disables it. When enabled, BulletOu uses two CPU windows, each
     /// accumulating `batch_size * N` decoded positions. It Fisher-Yates
     /// shuffles each window, emits mini-batches from one window, and
     /// fills/shuffles the other window in the background.
@@ -10975,7 +10977,7 @@ fn cuda_cpp_print_teacher_shuffle_buffer(args: &Args, schedule: &CudaCppRunSched
     };
     let window_mib = teacher_shuffle_buffer_mib(args, schedule.batches_per_superbatch)?.unwrap_or(0.0);
     let total_mib = window_mib * (TEACHER_SHUFFLE_PREFETCH_BUFFERS as f64);
-    let mode = if args.teacher_shuffle_buffer_batches.is_some() { "explicit" } else { "default epoch" };
+    let mode = teacher_shuffle_buffer_mode(args);
     eprintln!(
         "  teacher shuffle buffer = double-buffered ({mode}): {} batches x {} = {} positions/window ({window_mib:.1} MiB x {} = {total_mib:.1} MiB CPU), seed={}",
         buffer_batches,
@@ -13411,7 +13413,7 @@ mod tests {
     }
 
     #[test]
-    fn teacher_shuffle_buffer_defaults_to_epoch_window() {
+    fn teacher_shuffle_buffer_defaults_to_superbatch_window() {
         use clap::Parser as _;
 
         let defaulted = Args::try_parse_from([
@@ -13430,12 +13432,9 @@ mod tests {
         .unwrap();
         let batches_per_superbatch = effective_batches_per_superbatch(&defaulted).unwrap();
         assert_eq!(batches_per_superbatch, 610);
-        assert_eq!(effective_teacher_shuffle_buffer_batches(&defaulted, batches_per_superbatch).unwrap(), 610 * 36);
-        assert_eq!(
-            teacher_shuffle_buffer_records(&defaulted, batches_per_superbatch).unwrap(),
-            Some(65_536 * 610 * 36)
-        );
-        assert!(resume_signature(&defaulted).contains("teacher_shuffle_buffer_batches=21960"));
+        assert_eq!(effective_teacher_shuffle_buffer_batches(&defaulted, batches_per_superbatch).unwrap(), 610);
+        assert_eq!(teacher_shuffle_buffer_records(&defaulted, batches_per_superbatch).unwrap(), Some(65_536 * 610));
+        assert!(resume_signature(&defaulted).contains("teacher_shuffle_buffer_batches=610"));
 
         let explicit = Args::try_parse_from([
             "bulletou",

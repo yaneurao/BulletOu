@@ -15,7 +15,7 @@ Main flags:
 | `--backend` | Training backend. BulletOu training is Windows-native `cuda-cpp`; this option remains only for explicit scripts and currently accepts only `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 to match tatara | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
-| `--teacher-shuffle-buffer-batches` | In-trainer teacher shuffle window. BulletOu allocates two CPU windows of `batch_size × N` positions each, consuming mini-batches from one while reading and Fisher-Yates shuffling the other. If omitted, `N` defaults to one epoch (`batches_per_superbatch × superbatches`). `0` disables it | one epoch |
+| `--teacher-shuffle-buffer-batches` | In-trainer teacher shuffle window. BulletOu allocates two CPU windows of `batch_size × N` positions each, consuming mini-batches from one while reading and Fisher-Yates shuffling the other. If omitted, `N` defaults to one superbatch (`batches_per_superbatch`). `0` disables it | one superbatch |
 | `--teacher-shuffle-seed` | Base seed for in-trainer teacher shuffle | 0 |
 | `--cuda-cpp-diagnostics-rate` | SFNN per-superbatch diagnostics log. Writes teacher queue wait / load / prepare and representative CUDA stage timings to `cuda-cpp-diagnostics.log`. `1` profiles one CUDA step every sb, `N` every N superbatches, `0` disables it | 1 |
 | `--superbatches` | Number of superbatches per epoch. For `geometric` / `cos`, this is the LR cycle length. For `step`, it is the epoch processing cap. For `plateau`, it is a safety cap | unlimited (= non-plateau runs until teacher EOF; plateau runs until `lr_min`) |
