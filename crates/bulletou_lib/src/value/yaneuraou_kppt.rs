@@ -71,7 +71,8 @@
 //! and an order of magnitude smaller for the i16 KPP component.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 const SQ_NB: usize = 81;
@@ -160,6 +161,119 @@ pub fn parse_model_weights_bin(bytes: &[u8]) -> io::Result<BTreeMap<String, Vec<
     }
 
     Ok(map)
+}
+
+/// Streaming variant of [`parse_model_weights_bin`].
+///
+/// This avoids allocating a second `Vec<u8>` for huge `state.bin` files. The
+/// returned map still owns the selected f32 tensors, but the serialized byte
+/// stream is consumed record-by-record.
+pub fn parse_model_weights_bin_reader<R: Read>(reader: R) -> io::Result<BTreeMap<String, Vec<f32>>> {
+    parse_model_weights_bin_reader_select_map(reader, |id| Some(id.to_string()))
+}
+
+/// Read a model-weight record stream from `path` without first loading the
+/// entire file into memory.
+pub fn parse_model_weights_bin_file(path: &Path) -> io::Result<BTreeMap<String, Vec<f32>>> {
+    let file = File::open(path)?;
+    parse_model_weights_bin_reader(BufReader::with_capacity(8 * 1024 * 1024, file))
+}
+
+/// Streaming parser with record selection/renaming.
+///
+/// `map_id` receives each on-disk record id. Returning `Some(new_id)` stores
+/// the record under `new_id`; returning `None` skips the payload without
+/// allocating a tensor for it. This is intended for combined `state.bin` files
+/// where only one component/section is needed.
+pub fn parse_model_weights_bin_file_select_map<F>(path: &Path, map_id: F) -> io::Result<BTreeMap<String, Vec<f32>>>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let file = File::open(path)?;
+    parse_model_weights_bin_reader_select_map(BufReader::with_capacity(8 * 1024 * 1024, file), map_id)
+}
+
+pub fn parse_model_weights_bin_reader_select_map<R, F>(
+    mut reader: R,
+    mut map_id: F,
+) -> io::Result<BTreeMap<String, Vec<f32>>>
+where
+    R: Read,
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut map = BTreeMap::new();
+    while let Some(id) = read_model_weight_id(&mut reader)? {
+        const USIZE_BYTES: usize = std::mem::size_of::<usize>();
+        let mut len_bytes = [0u8; USIZE_BYTES];
+        reader.read_exact(&mut len_bytes).map_err(|err| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("raw.bin: EOF inside length (id={id:?}): {err}"))
+        })?;
+        let len = usize::from_le_bytes(len_bytes);
+        let byte_len = len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("raw.bin: record {id:?} byte length overflow"))
+        })?;
+
+        if let Some(new_id) = map_id(&id) {
+            let values = read_f32_values_from_reader(&mut reader, len, &id)?;
+            map.insert(new_id, values);
+        } else {
+            skip_exact(&mut reader, byte_len, &id)?;
+        }
+    }
+    Ok(map)
+}
+
+fn read_model_weight_id<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut id = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) if id.is_empty() => return Ok(None),
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::InvalidData, "raw.bin: EOF inside id")),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => id.push(byte[0]),
+            Err(err) => return Err(err),
+        }
+    }
+    String::from_utf8(id)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("raw.bin: non-UTF8 id: {err}")))
+}
+
+fn read_f32_values_from_reader<R: Read>(reader: &mut R, len: usize, id: &str) -> io::Result<Vec<f32>> {
+    let mut values = Vec::with_capacity(len);
+    let mut remaining = len;
+    let mut buf = [0u8; 256 * 1024];
+    while remaining > 0 {
+        let values_this_round = remaining.min(buf.len() / std::mem::size_of::<f32>());
+        let bytes_this_round = values_this_round * std::mem::size_of::<f32>();
+        reader.read_exact(&mut buf[..bytes_this_round]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("raw.bin: EOF inside values (id={id:?}, remaining_values={remaining}): {err}"),
+            )
+        })?;
+        for chunk in buf[..bytes_this_round].chunks_exact(4) {
+            values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        remaining -= values_this_round;
+    }
+    Ok(values)
+}
+
+fn skip_exact<R: Read>(reader: &mut R, mut bytes: usize, id: &str) -> io::Result<()> {
+    let mut buf = [0u8; 256 * 1024];
+    while bytes > 0 {
+        let n = bytes.min(buf.len());
+        reader.read_exact(&mut buf[..n]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("raw.bin: EOF while skipping values (id={id:?}, remaining_bytes={bytes}): {err}"),
+            )
+        })?;
+        bytes -= n;
+    }
+    Ok(())
 }
 
 /// Serialise an iterator of `(id, weights)` pairs into the same
@@ -524,6 +638,21 @@ mod tests {
         let map = parse_model_weights_bin(&buf).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["hello"], vec![1.5, -2.25]);
+    }
+
+    #[test]
+    fn streaming_parse_can_select_and_rename_records() {
+        let buf = write_model_weights_bin([
+            ("nnue/weights/l0w", [1.0f32, 2.0].as_slice()),
+            ("nnue/momentum/l0w", [3.0f32, 4.0].as_slice()),
+            ("nnue/velocity/l0w", [5.0f32, 6.0].as_slice()),
+        ]);
+        let map = parse_model_weights_bin_reader_select_map(std::io::Cursor::new(buf), |id| {
+            id.strip_prefix("nnue/weights/").map(str::to_string)
+        })
+        .unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["l0w"], vec![1.0, 2.0]);
     }
 
     #[test]

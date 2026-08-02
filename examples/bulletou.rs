@@ -82,7 +82,8 @@ use bulletou_lib::{
         },
         nnue_save_sfnn1536::{LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION},
         yaneuraou_kppt::{
-            KppFormat, bundle_component_state, parse_model_weights_bin, save_yaneuraou_eval, write_state_backend_marker,
+            KppFormat, bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
+            save_yaneuraou_eval, write_state_backend_marker,
         },
     },
 };
@@ -4850,25 +4851,63 @@ fn load_cuda_cpp_kppt_initial_state(
     path: &Path,
     component: CudaCppKpptComponent,
 ) -> Result<CudaCppKpptInitialState, String> {
-    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let records =
-        parse_model_weights_bin(&bytes).map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    let component_weights =
-        bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, component.input_label(), "weights");
-    let weights_records = if component_weights.is_empty() { &records } else { &component_weights };
+    let mut sections = load_cuda_cpp_component_state_sections(
+        path,
+        component.input_label(),
+        &["weights", "momentum", "velocity", "slow", "step_ranger"],
+        true,
+    )?;
+    let weights_records = sections.remove("weights").unwrap_or_default();
     let weights = CudaCppKpptInitialWeights {
         shape: bulletou_cuda_cpp::KpptTableShape { input_size: component.input_size() },
-        table_w: load_cuda_cpp_kppt_weight_record(weights_records, component.table_weight_id())?,
-        table_b: load_cuda_cpp_kppt_weight_record(weights_records, component.table_bias_id())?,
-        outw: load_cuda_cpp_kppt_weight_record(weights_records, "outw")?,
-        outb: load_cuda_cpp_kppt_weight_record(weights_records, "outb")?,
+        table_w: load_cuda_cpp_kppt_weight_record(&weights_records, component.table_weight_id())?,
+        table_b: load_cuda_cpp_kppt_weight_record(&weights_records, component.table_bias_id())?,
+        outw: load_cuda_cpp_kppt_weight_record(&weights_records, "outw")?,
+        outb: load_cuda_cpp_kppt_weight_record(&weights_records, "outb")?,
     };
     weights.validate().map_err(|err| {
         format!("failed to load cuda-cpp {} weights from {}: {err}", component.label(), path.display())
     })?;
-    let optimizer_states = load_cuda_cpp_kppt_optimizer_state(&records, component, &weights)?;
-    let completed_steps = load_cuda_cpp_kppt_completed_steps(&records, component)?;
+    let momentum = sections.remove("momentum").unwrap_or_default();
+    let velocity = sections.remove("velocity").unwrap_or_default();
+    let slow = sections.remove("slow").unwrap_or_default();
+    let optimizer_states =
+        load_cuda_cpp_kppt_optimizer_state_from_sections(component, &weights, &momentum, &velocity, &slow)?;
+    let step_ranger = sections.remove("step_ranger").unwrap_or_default();
+    let completed_steps = load_cuda_cpp_kppt_completed_steps_from_steps(&step_ranger, component)?;
     Ok(CudaCppKpptInitialState { weights, optimizer_states, completed_steps })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_component_state_sections(
+    path: &Path,
+    component: &str,
+    section_names: &[&'static str],
+    include_top_level_weights: bool,
+) -> Result<BTreeMap<String, BTreeMap<String, Vec<f32>>>, String> {
+    let prefixes =
+        section_names.iter().map(|section| (*section, format!("{component}/{section}/"))).collect::<Vec<_>>();
+    let flat = parse_model_weights_bin_file_select_map(path, |id| {
+        for (section, prefix) in &prefixes {
+            if let Some(tail) = id.strip_prefix(prefix) {
+                return Some(format!("{section}/{tail}"));
+            }
+        }
+        if include_top_level_weights && section_names.contains(&"weights") && !id.contains('/') {
+            return Some(format!("weights/{id}"));
+        }
+        None
+    })
+    .map_err(|err| format!("failed to stream-parse {}: {err}", path.display()))?;
+
+    let mut sections: BTreeMap<String, BTreeMap<String, Vec<f32>>> = BTreeMap::new();
+    for (key, values) in flat {
+        let Some((section, id)) = key.split_once('/') else {
+            return Err(format!("internal error: malformed streamed state key `{key}`"));
+        };
+        sections.entry(section.to_string()).or_default().insert(id.to_string(), values);
+    }
+    Ok(sections)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4880,15 +4919,14 @@ fn load_cuda_cpp_kppt_weight_record(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn load_cuda_cpp_kppt_optimizer_state(
-    records: &BTreeMap<String, Vec<f32>>,
+fn load_cuda_cpp_kppt_optimizer_state_from_sections(
     component: CudaCppKpptComponent,
     weights: &CudaCppKpptInitialWeights,
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
 ) -> Result<Option<CudaCppKpptOptimizerState>, String> {
     let comp = component.input_label();
-    let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "momentum");
-    let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "velocity");
-    let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, comp, "slow");
     let has_any = !momentum.is_empty() || !velocity.is_empty() || !slow.is_empty();
     if !has_any {
         return Ok(None);
@@ -4973,12 +5011,10 @@ fn load_cuda_cpp_kppt_optimizer_record(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn load_cuda_cpp_kppt_completed_steps(
-    records: &BTreeMap<String, Vec<f32>>,
+fn load_cuda_cpp_kppt_completed_steps_from_steps(
+    steps: &BTreeMap<String, Vec<f32>>,
     component: CudaCppKpptComponent,
 ) -> Result<usize, String> {
-    let steps =
-        bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, component.input_label(), "step_ranger");
     if steps.is_empty() {
         return Ok(0);
     }
@@ -8764,11 +8800,9 @@ fn load_cuda_cpp_sfnn_initial_state(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
 ) -> Result<CudaCppSfnnInitialState, String> {
-    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let records =
-        parse_model_weights_bin(&bytes).map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    let component_weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
-    let weights = if component_weights.is_empty() { &records } else { &component_weights };
+    let mut initial_sections =
+        load_cuda_cpp_component_state_sections(path, "nnue", &["weights", "train", "step_ranger"], true)?;
+    let weights_records = initial_sections.remove("weights").unwrap_or_default();
 
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
@@ -8784,14 +8818,15 @@ fn load_cuda_cpp_sfnn_initial_state(
         factorizer_king_axis_dim: layerstack.factorizer_king_axis_dim(),
         factorizer_hand_axis_dim: layerstack.factorizer_hand_axis_dim(),
     };
-    let mut weights = load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, weights).map_err(|err| {
-        format!(
-            "failed to load cuda-cpp SFNN {} weights from {} for arch {}: {err}",
-            feature_kind.source_label(),
-            path.display(),
-            args.arch().cli_name()
-        )
-    })?;
+    let mut weights =
+        load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, &weights_records).map_err(|err| {
+            format!(
+                "failed to load cuda-cpp SFNN {} weights from {} for arch {}: {err}",
+                feature_kind.source_label(),
+                path.display(),
+                args.arch().cli_name()
+            )
+        })?;
     let wants_l1f = effective_sfnn_factorized_l1(args);
     let wants_l2_l3f = effective_sfnn_factorized_l2_l3(args);
     let wants_l1ax = effective_sfnn_axis_factorized_l1(args);
@@ -8879,15 +8914,22 @@ fn load_cuda_cpp_sfnn_initial_state(
             "  initial factorizer migration = folded checkpoint factorizer tensors disabled by the current --sfnn-factorizer into base weights"
         );
     }
-    let completed_steps = load_cuda_cpp_sfnn_completed_steps(&records, &weights)?;
-    let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps(&records, &weights)?;
+    let train = initial_sections.remove("train").unwrap_or_default();
+    let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
+    let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
+    let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_steps(&step_ranger, &weights)?;
     let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers {
         eprintln!(
             "  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration"
         );
         None
     } else {
-        load_cuda_cpp_sfnn_optimizer_state(&records, &weights)?
+        let mut optimizer_sections =
+            load_cuda_cpp_component_state_sections(path, "nnue", &["momentum", "velocity", "slow"], false)?;
+        let momentum = optimizer_sections.remove("momentum").unwrap_or_default();
+        let velocity = optimizer_sections.remove("velocity").unwrap_or_default();
+        let slow = optimizer_sections.remove("slow").unwrap_or_default();
+        load_cuda_cpp_sfnn_optimizer_state_from_sections(&weights, &momentum, &velocity, &slow)?
     };
     let optimizer_steps = if optimizer_states.is_some() {
         stored_optimizer_steps
@@ -9511,7 +9553,7 @@ fn load_cuda_cpp_optional_weight_pair(
     }
 }
 
-#[cfg(feature = "cuda-cpp-backend")]
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn load_cuda_cpp_sfnn_optimizer_state(
     records: &BTreeMap<String, Vec<f32>>,
     weights: &CudaCppSfnnInitialWeights,
@@ -9519,6 +9561,16 @@ fn load_cuda_cpp_sfnn_optimizer_state(
     let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "momentum");
     let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "velocity");
     let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "slow");
+    load_cuda_cpp_sfnn_optimizer_state_from_sections(weights, &momentum, &velocity, &slow)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_optimizer_state_from_sections(
+    weights: &CudaCppSfnnInitialWeights,
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
+) -> Result<Option<CudaCppSfnnOptimizerState>, String> {
     let has_any = !momentum.is_empty() || !velocity.is_empty() || !slow.is_empty();
     if !has_any {
         return Ok(None);
@@ -9602,50 +9654,68 @@ fn load_cuda_cpp_sfnn_optimizer_state(
     }))
 }
 
-#[cfg(feature = "cuda-cpp-backend")]
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn load_cuda_cpp_sfnn_completed_steps(
     records: &BTreeMap<String, Vec<f32>>,
     weights: &CudaCppSfnnInitialWeights,
 ) -> Result<usize, String> {
     let train = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "train");
-    if let Some(values) = train.get("completed_steps") {
-        return load_cuda_cpp_single_step_record("SFNN", "nnue/train/completed_steps", values);
-    }
-    load_cuda_cpp_sfnn_optimizer_steps(records, weights)
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
+    load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &steps, weights)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_completed_steps_from_sections(
+    train: &BTreeMap<String, Vec<f32>>,
+    steps: &BTreeMap<String, Vec<f32>>,
+    weights: &CudaCppSfnnInitialWeights,
+) -> Result<usize, String> {
+    if let Some(values) = train.get("completed_steps") {
+        return load_cuda_cpp_single_step_record("SFNN", "nnue/train/completed_steps", values);
+    }
+    load_cuda_cpp_sfnn_optimizer_steps_from_steps(steps, weights)
+}
+
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn load_cuda_cpp_sfnn_optimizer_steps(
     records: &BTreeMap<String, Vec<f32>>,
     weights: &CudaCppSfnnInitialWeights,
 ) -> Result<usize, String> {
-    let mut ids = vec!["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"];
     let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
-    if weights.l1fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l1fw", "l1fb")? {
+    load_cuda_cpp_sfnn_optimizer_steps_from_steps(&steps, weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_optimizer_steps_from_steps(
+    steps: &BTreeMap<String, Vec<f32>>,
+    weights: &CudaCppSfnnInitialWeights,
+) -> Result<usize, String> {
+    let mut ids = vec!["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"];
+    if weights.l1fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l1fw", "l1fb")? {
         ids.push("l1fw");
         ids.push("l1fb");
     }
-    if weights.l1axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l1axw", "l1axb")? {
+    if weights.l1axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l1axw", "l1axb")? {
         ids.push("l1axw");
         ids.push("l1axb");
     }
-    if weights.l2fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l2fw", "l2fb")? {
+    if weights.l2fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l2fw", "l2fb")? {
         ids.push("l2fw");
         ids.push("l2fb");
     }
-    if weights.l2axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l2axw", "l2axb")? {
+    if weights.l2axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l2axw", "l2axb")? {
         ids.push("l2axw");
         ids.push("l2axb");
     }
-    if weights.l3fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l3fw", "l3fb")? {
+    if weights.l3fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l3fw", "l3fb")? {
         ids.push("l3fw");
         ids.push("l3fb");
     }
-    if weights.l3axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l3axw", "l3axb")? {
+    if weights.l3axw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", steps, "l3axw", "l3axb")? {
         ids.push("l3axw");
         ids.push("l3axb");
     }
-    load_cuda_cpp_completed_steps_for("SFNN", records, &ids)
+    load_cuda_cpp_completed_steps_from_steps_for("SFNN", steps, &ids)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9866,16 +9936,18 @@ fn load_cuda_cpp_nnue_initial_state(
 ) -> Result<CudaCppHalfkpInitialState, String> {
     use bulletou_lib::value::NnueForwardShape as FastNnueForwardShape;
 
-    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let records =
-        parse_model_weights_bin(&bytes).map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-    let component_weights = bulletou_lib::value::yaneuraou_kppt::extract_component_section(&records, "nnue", "weights");
-    let weights = if component_weights.is_empty() { &records } else { &component_weights };
+    let mut sections = load_cuda_cpp_component_state_sections(
+        path,
+        "nnue",
+        &["weights", "momentum", "velocity", "slow", "step_ranger"],
+        true,
+    )?;
+    let weights_records = sections.remove("weights").unwrap_or_default();
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let input_size = feature_kind.training_input_size();
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
-    let weights = load_cuda_cpp_nnue_owned_weights(feature_kind, shape, weights).map_err(|err| {
+    let weights = load_cuda_cpp_nnue_owned_weights(feature_kind, shape, &weights_records).map_err(|err| {
         format!(
             "failed to load cuda-cpp {} weights from {} for arch {}: {err}",
             feature_kind.source_label(),
@@ -9883,13 +9955,17 @@ fn load_cuda_cpp_nnue_initial_state(
             args.arch().cli_name()
         )
     })?;
-    let optimizer_states = load_cuda_cpp_halfkp_optimizer_state(&records, &weights)?;
-    let completed_steps = load_cuda_cpp_halfkp_completed_steps(&records)?;
+    let momentum = sections.remove("momentum").unwrap_or_default();
+    let velocity = sections.remove("velocity").unwrap_or_default();
+    let slow = sections.remove("slow").unwrap_or_default();
+    let optimizer_states = load_cuda_cpp_halfkp_optimizer_state_from_sections(&weights, &momentum, &velocity, &slow)?;
+    let step_ranger = sections.remove("step_ranger").unwrap_or_default();
+    let completed_steps = load_cuda_cpp_halfkp_completed_steps_from_steps(&step_ranger)?;
 
     Ok(CudaCppHalfkpInitialState { weights, optimizer_states, completed_steps })
 }
 
-#[cfg(feature = "cuda-cpp-backend")]
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn load_cuda_cpp_halfkp_optimizer_state(
     records: &BTreeMap<String, Vec<f32>>,
     weights: &bulletou_lib::value::NnueForwardOwnedWeights,
@@ -9897,6 +9973,16 @@ fn load_cuda_cpp_halfkp_optimizer_state(
     let momentum = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "momentum");
     let velocity = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "velocity");
     let slow = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "slow");
+    load_cuda_cpp_halfkp_optimizer_state_from_sections(weights, &momentum, &velocity, &slow)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_halfkp_optimizer_state_from_sections(
+    weights: &bulletou_lib::value::NnueForwardOwnedWeights,
+    momentum: &BTreeMap<String, Vec<f32>>,
+    velocity: &BTreeMap<String, Vec<f32>>,
+    slow: &BTreeMap<String, Vec<f32>>,
+) -> Result<Option<CudaCppHalfkpOptimizerState>, String> {
     let has_any = !momentum.is_empty() || !velocity.is_empty() || !slow.is_empty();
     if !has_any {
         return Ok(None);
@@ -9983,18 +10069,27 @@ fn load_cuda_cpp_optimizer_record_for(
     Ok(values.clone())
 }
 
-#[cfg(feature = "cuda-cpp-backend")]
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn load_cuda_cpp_halfkp_completed_steps(records: &BTreeMap<String, Vec<f32>>) -> Result<usize, String> {
-    load_cuda_cpp_completed_steps_for("HalfKP", records, &["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "outw", "outb"])
+    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
+    load_cuda_cpp_halfkp_completed_steps_from_steps(&steps)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn load_cuda_cpp_completed_steps_for(
+fn load_cuda_cpp_halfkp_completed_steps_from_steps(steps: &BTreeMap<String, Vec<f32>>) -> Result<usize, String> {
+    load_cuda_cpp_completed_steps_from_steps_for(
+        "HalfKP",
+        steps,
+        &["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "outw", "outb"],
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_completed_steps_from_steps_for(
     label: &'static str,
-    records: &BTreeMap<String, Vec<f32>>,
+    steps: &BTreeMap<String, Vec<f32>>,
     ids: &[&'static str],
 ) -> Result<usize, String> {
-    let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
     if steps.is_empty() {
         return Ok(0);
     }
@@ -15853,6 +15948,36 @@ mod tests {
         assert_eq!(records["nnue/step_ranger/l1fb"], vec![11.0]);
         assert_eq!(records["nnue/step_ranger/l2fb"], vec![11.0]);
         assert_eq!(records["nnue/step_ranger/l3fw"], vec![11.0]);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_streams_component_state_sections_without_unrelated_records() {
+        let mut bytes = write_state_backend_marker("bullet");
+        bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin([
+            ("nnue/weights/l0w", [1.0f32, 2.0].as_slice()),
+            ("nnue/momentum/l0w", [3.0f32].as_slice()),
+            ("nnue/velocity/l0w", [4.0f32].as_slice()),
+            ("kk/weights/kkw", [5.0f32].as_slice()),
+            ("legacy_top_level", [6.0f32].as_slice()),
+        ]));
+        let path = std::env::temp_dir().join(format!(
+            "bulletou-test-stream-state-sections-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let sections =
+            load_cuda_cpp_component_state_sections(&path, "nnue", &["weights", "momentum", "slow"], true).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(sections["weights"]["l0w"], vec![1.0, 2.0]);
+        assert_eq!(sections["weights"]["legacy_top_level"], vec![6.0]);
+        assert_eq!(sections["momentum"]["l0w"], vec![3.0]);
+        assert!(!sections.contains_key("velocity"));
+        assert!(!sections.contains_key("slow"));
+        assert!(!sections["weights"].contains_key("kkw"));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
