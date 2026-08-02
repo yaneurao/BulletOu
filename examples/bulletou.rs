@@ -5006,7 +5006,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         eprintln!("  initial weights = {}", feature_kind.scratch_init_label());
     }
     if initial_state.completed_steps > 0 {
-        eprintln!("  initial completed optimizer steps = {}", initial_state.completed_steps);
+        eprintln!("  initial completed training steps = {}", initial_state.completed_steps);
     }
     let input_size = initial_weights.shape.input_size;
     let max_active = feature_kind.max_active();
@@ -5961,7 +5961,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         eprintln!("  initial weights = deterministic nnue-pytorch-style scratch");
     }
     if initial_state.completed_steps > 0 {
-        eprintln!("  initial completed optimizer steps = {}", initial_state.completed_steps);
+        eprintln!("  initial completed training steps = {}", initial_state.completed_steps);
+    }
+    if initial_state.optimizer_steps != initial_state.completed_steps {
+        eprintln!(
+            "  initial Ranger local optimizer steps = {} (training completed steps = {})",
+            initial_state.optimizer_steps, initial_state.completed_steps
+        );
     }
     eprintln!("  batch size = {batch_size}");
     if feature_kind.virtual_rows() > 0 {
@@ -6069,6 +6075,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut profile_bwd_total_ms = 0.0_f64;
     let mut profile_count = 0usize;
     let completed_step_offset = initial_state.completed_steps;
+    let optimizer_step_offset = initial_state.optimizer_steps;
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut progress_meter = CudaCppProgressMeter::default();
@@ -6108,6 +6115,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
         let mut current_resume_pos = dataloader_resume_pos;
         let mut completed_steps = completed_step_offset;
+        let mut optimizer_steps = optimizer_step_offset;
         let mut accepted_steps_total = 0usize;
         let mut attempted_steps_total = 0usize;
         let mut last_checkpoint_metrics = None;
@@ -6134,6 +6142,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 let snapshot_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                 let snapshot_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                 let snapshot_completed_steps = completed_steps;
+                let snapshot_optimizer_steps = optimizer_steps;
                 let chunk_resume_pos = current_resume_pos;
                 let mut chunk_seen_steps = 0usize;
                 let mut chunk_last_pos = None;
@@ -6161,7 +6170,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     chunk_seen_steps += 1;
                     attempted_steps_total += 1;
                     chunk_last_pos = teacher_batch.dataloader_pos;
-                    let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
+                    let optimizer_step = snapshot_optimizer_steps + chunk_seen_steps;
                     let fast = teacher_batch.batch;
                     let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
                     let params = RangerUpdateParams {
@@ -6248,9 +6257,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     )
                     .map_err(|e| e.to_string())?;
                     completed_steps = snapshot_completed_steps;
+                    optimizer_steps = snapshot_optimizer_steps;
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
                 } else {
                     completed_steps = snapshot_completed_steps + chunk_seen_steps;
+                    optimizer_steps = snapshot_optimizer_steps + chunk_seen_steps;
                     accepted_steps_total += chunk_seen_steps;
                     current_resume_pos = Some(accepted_dataloader_pos);
                     let save_started = std::time::Instant::now();
@@ -6261,6 +6272,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &trained_weights,
                         &trained_optimizer_states,
                         completed_steps,
+                        optimizer_steps,
                         sfnn_progress_params.as_ref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
@@ -6425,6 +6437,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             &final_weights,
             &final_optimizer_states,
             completed_steps,
+            optimizer_steps,
             factorizer_spec,
             sfnn_progress_params.as_ref(),
         )?;
@@ -6441,7 +6454,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
-        let optimizer_step = completed_step_offset + seen_steps;
+        let optimizer_step = optimizer_step_offset + seen_steps;
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
@@ -6586,6 +6599,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &trained_weights,
                         &trained_optimizer_states,
                         completed_step_offset + seen_steps,
+                        optimizer_step_offset + seen_steps,
                         sfnn_progress_params.as_ref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
@@ -6749,6 +6763,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     let completed_steps = completed_step_offset + seen_steps;
+    let optimizer_steps = optimizer_step_offset + seen_steps;
     if args.cuda_cpp_skip_final_output {
         if let Some((chunk, _)) = deferred_direct_checkpoint {
             if let Some((metrics, validation_elapsed)) = {
@@ -6800,6 +6815,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             &trained_weights,
             &trained_optimizer_states,
             completed_steps,
+            optimizer_steps,
             sfnn_progress_params.as_ref(),
             CudaCppCheckpointLog {
                 epoch: chunk.epoch,
@@ -6850,6 +6866,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         &trained_weights,
         &trained_optimizer_states,
         completed_steps,
+        optimizer_steps,
         factorizer_spec,
         sfnn_progress_params.as_ref(),
     )?;
@@ -7284,6 +7301,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     completed_steps: usize,
+    optimizer_steps: usize,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
@@ -7303,7 +7321,13 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         effective_sfnn_factorizer_spec(args),
         progress_params,
     )?;
-    write_cuda_cpp_sfnn_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
+    write_cuda_cpp_sfnn_weights_bin(
+        &dir.join("state.bin"),
+        weights,
+        optimizer_states,
+        completed_steps,
+        optimizer_steps,
+    )?;
     write_cuda_cpp_direct_checkpoint_metadata(&output_dir, idx, &dir, args, log)?;
     Ok(dir)
 }
@@ -8148,6 +8172,7 @@ struct CudaCppSfnnInitialState {
     weights: CudaCppSfnnInitialWeights,
     optimizer_states: Option<CudaCppSfnnOptimizerState>,
     completed_steps: usize,
+    optimizer_steps: usize,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8235,6 +8260,7 @@ fn build_sfnn_initial_state_for_cuda_cpp(
         weights: build_sfnn_initial_weights_for_cuda_cpp(args, feature_kind)?,
         optimizer_states: None,
         completed_steps: 0,
+        optimizer_steps: 0,
     })
 }
 
@@ -8582,6 +8608,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         );
     }
     let completed_steps = load_cuda_cpp_sfnn_completed_steps(&records, &weights)?;
+    let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps(&records, &weights)?;
     let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers {
         eprintln!(
             "  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration"
@@ -8590,8 +8617,16 @@ fn load_cuda_cpp_sfnn_initial_state(
     } else {
         load_cuda_cpp_sfnn_optimizer_state(&records, &weights)?
     };
+    let optimizer_steps = if optimizer_states.is_some() {
+        stored_optimizer_steps
+    } else {
+        if completed_steps > 0 && stored_optimizer_steps > 0 {
+            eprintln!("  initial optimizer step counter = reset to 0 because no compatible optimizer state was loaded");
+        }
+        0
+    };
 
-    Ok(CudaCppSfnnInitialState { weights, optimizer_states, completed_steps })
+    Ok(CudaCppSfnnInitialState { weights, optimizer_states, completed_steps, optimizer_steps })
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9300,6 +9335,18 @@ fn load_cuda_cpp_sfnn_completed_steps(
     records: &BTreeMap<String, Vec<f32>>,
     weights: &CudaCppSfnnInitialWeights,
 ) -> Result<usize, String> {
+    let train = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "train");
+    if let Some(values) = train.get("completed_steps") {
+        return load_cuda_cpp_single_step_record("SFNN", "nnue/train/completed_steps", values);
+    }
+    load_cuda_cpp_sfnn_optimizer_steps(records, weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_optimizer_steps(
+    records: &BTreeMap<String, Vec<f32>>,
+    weights: &CudaCppSfnnInitialWeights,
+) -> Result<usize, String> {
     let mut ids = vec!["l0w", "l0b", "l1w", "l1b", "l2w", "l2b", "l3w", "l3b"];
     let steps = bulletou_lib::value::yaneuraou_kppt::extract_component_section(records, "nnue", "step_ranger");
     if weights.l1fw.is_some() && cuda_cpp_optional_step_pair_present("SFNN", &steps, "l1fw", "l1fb")? {
@@ -9327,6 +9374,15 @@ fn load_cuda_cpp_sfnn_completed_steps(
         ids.push("l3axb");
     }
     load_cuda_cpp_completed_steps_for("SFNN", records, &ids)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_single_step_record(label: &'static str, id: &'static str, values: &[f32]) -> Result<usize, String> {
+    let value = values.first().copied().ok_or_else(|| format!("cuda-cpp {label} state {id} is empty"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("cuda-cpp {label} state {id} is invalid: {value}"));
+    }
+    Ok(value.round() as usize)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9765,12 +9821,19 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     completed_steps: usize,
+    optimizer_steps: usize,
     factorizer: SfnnFactorizerSpec,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     write_cuda_cpp_sfnn_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights, factorizer, progress_params)?;
-    write_cuda_cpp_sfnn_weights_bin(&dir.join("weights.bin"), weights, optimizer_states, completed_steps)
+    write_cuda_cpp_sfnn_weights_bin(
+        &dir.join("weights.bin"),
+        weights,
+        optimizer_states,
+        completed_steps,
+        optimizer_steps,
+    )
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9779,10 +9842,13 @@ fn write_cuda_cpp_sfnn_weights_bin(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     completed_steps: usize,
+    optimizer_steps: usize,
 ) -> Result<(), String> {
-    let completed_steps = [completed_steps as f32];
+    let completed_steps_record = [completed_steps as f32];
+    let optimizer_steps_record = [optimizer_steps as f32];
     let mut bytes = write_state_backend_marker("cuda-cpp");
     let mut records: Vec<(&str, &[f32])> = vec![
+        ("nnue/train/completed_steps", completed_steps_record.as_slice()),
         ("nnue/weights/l0w", weights.l0w.as_slice()),
         ("nnue/weights/l0b", weights.l0b.as_slice()),
         ("nnue/weights/l1w", weights.l1w.as_slice()),
@@ -9907,49 +9973,49 @@ fn write_cuda_cpp_sfnn_weights_bin(
     }
 
     records.extend([
-        ("nnue/step_ranger/l0w", completed_steps.as_slice()),
-        ("nnue/step_ranger/l0b", completed_steps.as_slice()),
-        ("nnue/step_ranger/l1w", completed_steps.as_slice()),
-        ("nnue/step_ranger/l1b", completed_steps.as_slice()),
-        ("nnue/step_ranger/l2w", completed_steps.as_slice()),
-        ("nnue/step_ranger/l2b", completed_steps.as_slice()),
-        ("nnue/step_ranger/l3w", completed_steps.as_slice()),
-        ("nnue/step_ranger/l3b", completed_steps.as_slice()),
+        ("nnue/step_ranger/l0w", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l0b", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l1w", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l1b", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l2w", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l2b", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l3w", optimizer_steps_record.as_slice()),
+        ("nnue/step_ranger/l3b", optimizer_steps_record.as_slice()),
     ]);
     if weights.l1fw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l1fw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l1fb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l1fw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l1fb", optimizer_steps_record.as_slice()),
         ]);
     }
     if weights.l1axw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l1axw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l1axb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l1axw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l1axb", optimizer_steps_record.as_slice()),
         ]);
     }
     if weights.l2fw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l2fw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l2fb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l2fw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l2fb", optimizer_steps_record.as_slice()),
         ]);
     }
     if weights.l2axw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l2axw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l2axb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l2axw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l2axb", optimizer_steps_record.as_slice()),
         ]);
     }
     if weights.l3fw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l3fw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l3fb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l3fw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l3fb", optimizer_steps_record.as_slice()),
         ]);
     }
     if weights.l3axw.is_some() {
         records.extend([
-            ("nnue/step_ranger/l3axw", completed_steps.as_slice()),
-            ("nnue/step_ranger/l3axb", completed_steps.as_slice()),
+            ("nnue/step_ranger/l3axw", optimizer_steps_record.as_slice()),
+            ("nnue/step_ranger/l3axb", optimizer_steps_record.as_slice()),
         ]);
     }
 
@@ -15301,7 +15367,7 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, 11).unwrap();
+        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, 1234, 11).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let records = parse_model_weights_bin(&bytes).unwrap();
@@ -15313,6 +15379,7 @@ mod tests {
         assert_eq!(records["nnue/velocity/l3b"], vec![12.25]);
         assert_eq!(records["nnue/slow/l2w"], vec![7.5]);
         assert_eq!(records["nnue/momentum/l3fw"], vec![13.0]);
+        assert_eq!(records["nnue/train/completed_steps"], vec![1234.0]);
         assert_eq!(records["nnue/step_ranger/l1fb"], vec![11.0]);
         assert_eq!(records["nnue/step_ranger/l2fb"], vec![11.0]);
         assert_eq!(records["nnue/step_ranger/l3fw"], vec![11.0]);
@@ -15386,6 +15453,12 @@ mod tests {
         assert_eq!(state.l3fb.as_ref().unwrap().momentum, vec![1.0]);
         assert_eq!(state.l3b.slow_params, vec![3.0; shape.num_stacks]);
         assert_eq!(load_cuda_cpp_sfnn_completed_steps(&records, &weights).unwrap(), 42);
+        assert_eq!(load_cuda_cpp_sfnn_optimizer_steps(&records, &weights).unwrap(), 42);
+
+        let mut split_step_records = records.clone();
+        split_step_records.insert("nnue/train/completed_steps".to_string(), vec![1234.0]);
+        assert_eq!(load_cuda_cpp_sfnn_completed_steps(&split_step_records, &weights).unwrap(), 1234);
+        assert_eq!(load_cuda_cpp_sfnn_optimizer_steps(&split_step_records, &weights).unwrap(), 42);
 
         let mut legacy_records = records.clone();
         for section in ["momentum", "velocity", "slow"] {
