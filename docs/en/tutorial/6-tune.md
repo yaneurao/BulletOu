@@ -33,6 +33,7 @@ Main flags:
 | `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 | `--win-rate-model` | Use WRM (win-rate-model) target conversion and loss (see [§6.2](#wrm-win-rate-model-loss)) | off |
 | `--loss-pow-exp` | Exponent `p` in the WRM error term `|prediction - target|^p`; used only with `--win-rate-model` | 2.0 |
+| `--wrm-nnue2score` | WRM prediction-side scale. In `prediction = wrm(model_output × wrm_nnue2score)`, this sets `wrm_nnue2score` | 600 |
 | `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus all available bucket-axis factorizer terms; combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for enabling shared factorizer or disabling all SFNN factorizer terms. Prefer `--sfnn-factorizer shared` or `--sfnn-factorizer none` in new commands. | on |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
@@ -269,7 +270,7 @@ This changes:
 - loss formula to `abs(target - prediction)^p`, where `p` is `--loss-pow-exp`
 - `test_value_loss` and `plateau` decisions to use the same WRM loss
 
-`--loss-pow-exp` follows tatara's convention. The default is `2.0` (squared error). Use `2.5` for the commonly reported nnue-pytorch-style setting:
+`--loss-pow-exp` and `--wrm-nnue2score` follow tatara's convention. The `--loss-pow-exp` default is `2.0` (squared error). Use `2.5` for the commonly reported nnue-pytorch-style setting. The `--wrm-nnue2score` default is `600`.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -277,10 +278,11 @@ This changes:
     --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
     --win-rate-model \
-    --loss-pow-exp 2.5
+    --loss-pow-exp 2.5 \
+    --wrm-nnue2score 600
 ```
 
-`--loss-pow-exp` is used only when `--win-rate-model` is enabled. A WRM run's `test_value_loss` uses a different formula from the default loss, so do not compare the raw loss number directly against a non-WRM run. Compare runs with the same WRM setting, or use accuracy / engine strength.
+`--loss-pow-exp` and `--wrm-nnue2score` are used only when `--win-rate-model` is enabled. A WRM run's `test_value_loss` uses a different formula from the default loss, so do not compare the raw loss number directly against a non-WRM run. Compare runs with the same WRM setting, or use accuracy / engine strength.
 
 ### Optimizer Selection
 

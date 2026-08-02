@@ -1962,6 +1962,7 @@ const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
+const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 
 fn effective_batch_size(args: &Args) -> usize {
     args.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
@@ -2518,6 +2519,11 @@ struct Args {
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
+    /// WRM prediction-side scale: `scorenet = model_output * wrm_nnue2score`.
+    /// Used only with `--win-rate-model`. The tatara default is 600.
+    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
+    wrm_nnue2score: f32,
+
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
     #[arg(long, default_value = "0.0")]
@@ -2833,6 +2839,9 @@ impl Args {
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
         }
+        if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
+            return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
+        }
         if self.win_rate_model && !eval_type.supports_win_rate_model() {
             return Err("--win-rate-model currently applies to NNUE / SFNN eval types only".to_string());
         }
@@ -2952,7 +2961,10 @@ impl Args {
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
     if args.win_rate_model {
-        ValidationLossKind::WinRateModel { pow_exp: effective_loss_pow_exp(args) }
+        ValidationLossKind::WinRateModel {
+            pow_exp: effective_loss_pow_exp(args),
+            nnue2score: effective_wrm_nnue2score(args),
+        }
     } else {
         ValidationLossKind::SigmoidMse
     }
@@ -2962,10 +2974,17 @@ fn effective_loss_pow_exp(args: &Args) -> f32 {
     if args.win_rate_model { args.loss_pow_exp } else { 2.0 }
 }
 
+fn effective_wrm_nnue2score(args: &Args) -> f32 {
+    if args.win_rate_model { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
     if args.win_rate_model {
-        bulletou_cuda_cpp::ScalarLossKind::WinRateModel { pow_exp: effective_loss_pow_exp(args) }
+        bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
+            pow_exp: effective_loss_pow_exp(args),
+            nnue2score: effective_wrm_nnue2score(args),
+        }
     } else {
         bulletou_cuda_cpp::ScalarLossKind::SigmoidMse
     }
@@ -2973,7 +2992,11 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
 
 fn value_loss_label(args: &Args) -> String {
     if args.win_rate_model {
-        format!("win-rate-model(pow_exp={:.3})", effective_loss_pow_exp(args))
+        format!(
+            "win-rate-model(pow_exp={:.3}, nnue2score={:.3})",
+            effective_loss_pow_exp(args),
+            effective_wrm_nnue2score(args)
+        )
     } else {
         "sigmoid-mse".to_string()
     }
@@ -3501,6 +3524,10 @@ fn main() {
     }
     if !(args.loss_pow_exp.is_finite() && args.loss_pow_exp >= 1.0) {
         eprintln!("error: --loss-pow-exp must be finite and >= 1 (got {}).", args.loss_pow_exp);
+        std::process::exit(2);
+    }
+    if !(args.wrm_nnue2score.is_finite() && args.wrm_nnue2score > 0.0) {
+        eprintln!("error: --wrm-nnue2score must be finite and > 0 (got {}).", args.wrm_nnue2score);
         std::process::exit(2);
     }
     if args.lr_schedule == LrScheduleKind::Plateau {
@@ -11049,6 +11076,7 @@ fn resume_signature(args: &Args) -> String {
         format!("scale={}", args.scale),
         format!("win_rate_model={}", args.win_rate_model),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
+        format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!(
             "optimizer_epsilon={}",
@@ -11109,15 +11137,24 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
             let enabled = value.trim() == "true";
             out.push(format!("win_rate_model={enabled}"));
             out.push(format!("loss_pow_exp={:.9}", if enabled { 2.5_f32 } else { 2.0_f32 }));
+            out.push(format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
         } else {
             out.push(line.to_string());
         }
     }
     let has_loss_pow_exp = out.iter().any(|line| line.starts_with("loss_pow_exp="));
+    let has_wrm_nnue2score = out.iter().any(|line| line.starts_with("wrm_nnue2score="));
     let has_win_rate_model = out.iter().position(|line| line.starts_with("win_rate_model="));
     if !has_loss_pow_exp {
         if let Some(index) = has_win_rate_model {
             out.insert(index + 1, "loss_pow_exp=2.000000000".to_string());
+        }
+    }
+    if !has_wrm_nnue2score {
+        if let Some(index) = out.iter().position(|line| line.starts_with("loss_pow_exp=")) {
+            out.insert(index + 1, format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
+        } else if let Some(index) = has_win_rate_model {
+            out.insert(index + 1, format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
         }
     }
     let mut normalized = out.join("\n");
@@ -15977,11 +16014,15 @@ mod tests {
             "--win-rate-model",
             "--loss-pow-exp",
             "2.5",
+            "--wrm-nnue2score",
+            "512",
         ])
         .unwrap();
 
         assert!(args.win_rate_model);
         assert_eq!(args.loss_pow_exp, 2.5);
+        assert_eq!(args.wrm_nnue2score, 512.0);
+        assert!(value_loss_label(&args).contains("nnue2score=512.000"));
 
         let old = Args::try_parse_from([
             "bulletou",
@@ -16089,8 +16130,10 @@ mod tests {
 
         let no_wrm =
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
-        let old_no_wrm = resume_signature(&no_wrm)
-            .replace("win_rate_model=false\nloss_pow_exp=2.000000000\n", "nnue_pytorch_wrm_loss=false\n");
+        let old_no_wrm = resume_signature(&no_wrm).replace(
+            "win_rate_model=false\nloss_pow_exp=2.000000000\nwrm_nnue2score=600.000000000\n",
+            "nnue_pytorch_wrm_loss=false\n",
+        );
         assert!(resume_signature_matches(&old_no_wrm, &no_wrm));
 
         let wrm = Args::try_parse_from([
@@ -16104,8 +16147,10 @@ mod tests {
             "2.5",
         ])
         .unwrap();
-        let old_wrm = resume_signature(&wrm)
-            .replace("win_rate_model=true\nloss_pow_exp=2.500000000\n", "nnue_pytorch_wrm_loss=true\n");
+        let old_wrm = resume_signature(&wrm).replace(
+            "win_rate_model=true\nloss_pow_exp=2.500000000\nwrm_nnue2score=600.000000000\n",
+            "nnue_pytorch_wrm_loss=true\n",
+        );
         assert!(resume_signature_matches(&old_wrm, &wrm));
     }
 

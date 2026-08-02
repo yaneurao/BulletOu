@@ -9,7 +9,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarValueLossKind {
     SigmoidMse,
-    WinRateModel { pow_exp: f32 },
+    WinRateModel { pow_exp: f32, nnue2score: f32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +65,9 @@ pub fn scalar_value_loss_trace(
                 let gradient = 2.0 * error * prediction * (1.0 - prediction);
                 (loss, gradient)
             }
-            ScalarValueLossKind::WinRateModel { pow_exp } => win_rate_model_loss_and_gradient(output, target, pow_exp),
+            ScalarValueLossKind::WinRateModel { pow_exp, nnue2score } => {
+                win_rate_model_loss_and_gradient(output, target, pow_exp, nnue2score)
+            }
         };
         let weighted = entry_weight * loss;
         per_sample.push(weighted);
@@ -89,12 +91,11 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32) -> (f32, f32) {
-    const NNUE2SCORE: f32 = 600.0;
+fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32, nnue2score: f32) -> (f32, f32) {
     const IN_OFFSET: f32 = 270.0;
     const IN_SCALING: f32 = 340.0;
 
-    let scorenet = output * NNUE2SCORE;
+    let scorenet = output * nnue2score;
     let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
     let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
     let prediction = (1.0 + q - qm) * 0.5;
@@ -103,7 +104,7 @@ fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32) -> (
     let loss = abs_error.powf(pow_exp);
     let q_prime = q * (1.0 - q);
     let qm_prime = qm * (1.0 - qm);
-    let prediction_gradient = 0.5 * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
+    let prediction_gradient = 0.5 * (nnue2score / IN_SCALING) * (q_prime + qm_prime);
     let loss_gradient = pow_exp * error.signum() * abs_error.powf(pow_exp - 1.0);
     (loss, loss_gradient * prediction_gradient)
 }
@@ -145,11 +146,15 @@ mod tests {
         let targets = [0.0, 0.25, 0.5, 0.75, 1.0];
         let weights = [1.0, 0.0, 0.5, 2.0, 0.25];
 
-        let trace =
-            scalar_value_loss_trace(ScalarValueLossKind::WinRateModel { pow_exp: 2.5 }, &outputs, &targets, &weights)
-                .unwrap();
+        let trace = scalar_value_loss_trace(
+            ScalarValueLossKind::WinRateModel { pow_exp: 2.5, nnue2score: 600.0 },
+            &outputs,
+            &targets,
+            &weights,
+        )
+        .unwrap();
 
-        assert_eq!(trace.kind, ScalarValueLossKind::WinRateModel { pow_exp: 2.5 });
+        assert_eq!(trace.kind, ScalarValueLossKind::WinRateModel { pow_exp: 2.5, nnue2score: 600.0 });
         assert_close_slice("per_sample", &trace.per_sample, &[4.4222793e-8, 0.0, 0.0, 0.022698434, 1.1055698e-8]);
         assert_close_slice(
             "mean_output_gradients",

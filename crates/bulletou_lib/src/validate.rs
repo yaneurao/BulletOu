@@ -133,10 +133,10 @@ pub enum ValidationLossKind {
     /// `model_output_scale=1` gives the historical logit-style behaviour and
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidMse,
-    /// Win-rate-model value loss with fixed shogi WRM transforms:
-    /// nnue2score=600, offset=270, input scaling=340, output scaling=380,
-    /// and configurable `abs(prediction - target)^pow_exp`.
-    WinRateModel { pow_exp: f32 },
+    /// Win-rate-model value loss with shogi WRM transforms:
+    /// configurable `nnue2score`, offset=270, input scaling=340,
+    /// target scaling=380, and configurable `abs(prediction - target)^pow_exp`.
+    WinRateModel { pow_exp: f32, nnue2score: f32 },
 }
 
 #[inline]
@@ -321,12 +321,12 @@ pub fn compute_sign_accuracy_with_loss(
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(*m * model_inv_scale),
-                ValidationLossKind::WinRateModel { .. } => wrm_probability(*m * 600.0, 270.0, 340.0),
+                ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(*m * nnue2score, 270.0, 340.0),
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidMse => diff * diff,
-                ValidationLossKind::WinRateModel { pow_exp } => diff.abs().powf(pow_exp),
+                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
             report.loss_sampled += 1;
         }
@@ -426,12 +426,12 @@ pub fn compute_sign_accuracy_with_loss_masked(
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(m * model_inv_scale),
-                ValidationLossKind::WinRateModel { .. } => wrm_probability(m * 600.0, 270.0, 340.0),
+                ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(m * nnue2score, 270.0, 340.0),
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidMse => diff * diff,
-                ValidationLossKind::WinRateModel { pow_exp } => diff.abs().powf(pow_exp),
+                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
         }
         if report.loss_sampled > 0 {
@@ -801,7 +801,7 @@ mod tests {
             1.0,
             400.0,
             1.0,
-            ValidationLossKind::WinRateModel { pow_exp: 2.5 },
+            ValidationLossKind::WinRateModel { pow_exp: 2.5, nnue2score: 600.0 },
         );
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");

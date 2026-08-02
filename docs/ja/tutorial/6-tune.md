@@ -33,6 +33,7 @@
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 | `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照) | off |
 | `--loss-pow-exp` | WRM の誤差項 `|prediction - target|^p` の指数。`--win-rate-model` 指定時のみ有効 | 2.0 |
+| `--wrm-nnue2score` | WRM で network output を score 空間へ戻す倍率。`prediction = wrm(model_output × wrm_nnue2score)` の `wrm_nnue2score` | 600 |
 | `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて利用可能な bucket axis factorizer を有効化する。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
@@ -279,7 +280,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 - loss を `abs(target - prediction)^p` にする。この `p` が `--loss-pow-exp`
 - `test_value_loss` と `plateau` 判定も同じ WRM loss に切り替える
 
-`--loss-pow-exp` は tatara と同じ意味のオプション。デフォルトは `2.0`、つまり二乗誤差。報告のあった nnue-pytorch 風の設定を試すなら `2.5` を指定する。
+`--loss-pow-exp` と `--wrm-nnue2score` は tatara と同じ意味のオプション。`--loss-pow-exp` のデフォルトは `2.0`、つまり二乗誤差。報告のあった nnue-pytorch 風の設定を試すなら `2.5` を指定する。`--wrm-nnue2score` のデフォルトは `600`。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -287,10 +288,11 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --arch SFNN_halfka2_1536_15_32_k3k3 \
     --tag sfnn-wrm-test \
     --win-rate-model \
-    --loss-pow-exp 2.5
+    --loss-pow-exp 2.5 \
+    --wrm-nnue2score 600
 ```
 
-`--loss-pow-exp` は `--win-rate-model` を指定したときだけ loss に効く。WRM run の `test_value_loss` は通常 loss とは式が違うので、WRM なし run の loss 数値とそのまま横比較しない。同じ WRM 設定同士で比較するか、accuracy / 実戦棋力で見る。
+`--loss-pow-exp` と `--wrm-nnue2score` は `--win-rate-model` を指定したときだけ loss に効く。WRM run の `test_value_loss` は通常 loss とは式が違うので、WRM なし run の loss 数値とそのまま横比較しない。同じ WRM 設定同士で比較するか、accuracy / 実戦棋力で見る。
 
 ### Optimizer の選択
 
