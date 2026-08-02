@@ -2603,13 +2603,19 @@ struct Args {
     scale: u32,
 
     /// Use tatara-style win-rate-model target conversion and WRM loss for
-    /// NNUE / SFNN scalar value networks.
+    /// NNUE / SFNN scalar value networks. This is the default for supported
+    /// value networks; the flag is kept for tatara-compatible explicitness.
     #[arg(long)]
     win_rate_model: bool,
 
+    /// Use the legacy sigmoid(model_output)-MSE value loss instead of the
+    /// default win-rate-model loss.
+    #[arg(long)]
+    loss_sigmoid_mse: bool,
+
     /// Exponent of the WRM error term `|prediction - target|^p`.
-    /// Used only with `--win-rate-model`. The tatara default is 2.0;
-    /// nnue-pytorch-style experiments commonly use 2.5.
+    /// Used by the default WRM loss unless `--loss-sigmoid-mse` is selected.
+    /// The tatara default is 2.0; nnue-pytorch-style experiments commonly use 2.5.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
@@ -2951,7 +2957,10 @@ impl Args {
         if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
             return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
         }
-        if self.win_rate_model && !eval_type.supports_win_rate_model() {
+        if self.win_rate_model && self.loss_sigmoid_mse {
+            return Err("--win-rate-model and --loss-sigmoid-mse cannot be used together".to_string());
+        }
+        if effective_win_rate_model(self) && !eval_type.supports_win_rate_model() {
             return Err("--win-rate-model currently applies to NNUE / SFNN eval types only".to_string());
         }
         if let Some(spec) = self.sfnn_factorizer {
@@ -3075,7 +3084,7 @@ impl Args {
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
-    if args.win_rate_model {
+    if effective_win_rate_model(args) {
         ValidationLossKind::WinRateModel {
             pow_exp: effective_loss_pow_exp(args),
             nnue2score: effective_wrm_nnue2score(args),
@@ -3085,17 +3094,24 @@ fn validation_loss_kind(args: &Args) -> ValidationLossKind {
     }
 }
 
+fn effective_win_rate_model(args: &Args) -> bool {
+    if args.loss_sigmoid_mse {
+        return false;
+    }
+    args.win_rate_model || args.eval_type().supports_win_rate_model()
+}
+
 fn effective_loss_pow_exp(args: &Args) -> f32 {
-    if args.win_rate_model { args.loss_pow_exp } else { 2.0 }
+    if effective_win_rate_model(args) { args.loss_pow_exp } else { 2.0 }
 }
 
 fn effective_wrm_nnue2score(args: &Args) -> f32 {
-    if args.win_rate_model { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
+    if effective_win_rate_model(args) { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
-    if args.win_rate_model {
+    if effective_win_rate_model(args) {
         bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
             pow_exp: effective_loss_pow_exp(args),
             nnue2score: effective_wrm_nnue2score(args),
@@ -3106,7 +3122,7 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
 }
 
 fn value_loss_label(args: &Args) -> String {
-    if args.win_rate_model {
+    if effective_win_rate_model(args) {
         format!(
             "win-rate-model(pow_exp={:.3}, nnue2score={:.3})",
             effective_loss_pow_exp(args),
@@ -3633,7 +3649,11 @@ fn main() {
             }
         }
     }
-    if args.win_rate_model && !args.eval_type().supports_win_rate_model() {
+    if args.win_rate_model && args.loss_sigmoid_mse {
+        eprintln!("error: --win-rate-model and --loss-sigmoid-mse cannot be used together.");
+        std::process::exit(2);
+    }
+    if effective_win_rate_model(&args) && !args.eval_type().supports_win_rate_model() {
         eprintln!("error: --win-rate-model currently applies to NNUE / SFNN eval types only.");
         std::process::exit(2);
     }
@@ -4118,7 +4138,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                win_rate_model: args.win_rate_model,
+                win_rate_model: effective_win_rate_model(args),
                 ft_factorize: false,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
@@ -4147,7 +4167,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                win_rate_model: args.win_rate_model,
+                win_rate_model: effective_win_rate_model(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -4175,7 +4195,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                win_rate_model: args.win_rate_model,
+                win_rate_model: effective_win_rate_model(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -4209,7 +4229,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                win_rate_model: args.win_rate_model,
+                win_rate_model: effective_win_rate_model(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -4243,7 +4263,7 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: args.scale as f32,
-                win_rate_model: args.win_rate_model,
+                win_rate_model: effective_win_rate_model(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -4365,7 +4385,7 @@ where
         queue_depth: options.queue_depth,
         lambda: args.lambda,
         scale: args.scale as f32,
-        win_rate_model: args.win_rate_model,
+        win_rate_model: effective_win_rate_model(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6277,7 +6297,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: args.scale as f32,
-        win_rate_model: args.win_rate_model,
+        win_rate_model: effective_win_rate_model(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6330,7 +6350,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     queue_depth: batch_queue_size,
                     lambda: args.lambda,
                     scale: args.scale as f32,
-                    win_rate_model: args.win_rate_model,
+                    win_rate_model: effective_win_rate_model(args),
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                     teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
                     teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -11369,7 +11389,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={}", args.scale),
-        format!("win_rate_model={}", args.win_rate_model),
+        format!("win_rate_model={}", effective_win_rate_model(args)),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
@@ -16363,6 +16383,38 @@ mod tests {
     fn win_rate_model_loss_pow_exp_replaces_old_wrm_flag() {
         use clap::Parser as _;
 
+        let default_args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
+        assert!(effective_win_rate_model(&default_args));
+        assert!(value_loss_label(&default_args).contains("win-rate-model"));
+
+        let sigmoid_args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--loss-sigmoid-mse",
+        ])
+        .unwrap();
+        assert!(!effective_win_rate_model(&sigmoid_args));
+        assert_eq!(value_loss_label(&sigmoid_args), "sigmoid-mse");
+
+        let kppt_default = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
+        assert!(!effective_win_rate_model(&kppt_default));
+
+        let conflict = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--win-rate-model",
+            "--loss-sigmoid-mse",
+        ])
+        .unwrap();
+        assert!(conflict.validate_backend_flags().is_err());
+
         let args = Args::try_parse_from([
             "bulletou",
             "--arch",
@@ -16378,6 +16430,7 @@ mod tests {
         .unwrap();
 
         assert!(args.win_rate_model);
+        assert!(effective_win_rate_model(&args));
         assert_eq!(args.loss_pow_exp, 2.5);
         assert_eq!(args.wrm_nnue2score, 512.0);
         assert!(value_loss_label(&args).contains("nnue2score=512.000"));
@@ -16500,8 +16553,15 @@ mod tests {
     fn resume_signature_accepts_old_wrm_loss_key() {
         use clap::Parser as _;
 
-        let no_wrm =
-            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
+        let no_wrm = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--loss-sigmoid-mse",
+        ])
+        .unwrap();
         let old_no_wrm = resume_signature(&no_wrm).replace(
             "win_rate_model=false\nloss_pow_exp=2.000000000\nwrm_nnue2score=600.000000000\n",
             "nnue_pytorch_wrm_loss=false\n",
