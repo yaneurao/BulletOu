@@ -43,17 +43,18 @@ teachers/
 
 (`.hcpe` / `.hcpe3` / `.psv` / `.bin` work the same way. Format is inferred from the extension. You may also point `--teacher` at a directory, in which case all matching files inside are concatenated. `.bin` is treated as the same 40-byte `PackedSfenValue` format as `.psv`, so `.psv` and `.bin` may be mixed.)
 
-### Pre-shuffle the teacher file
+### Shuffle teacher positions
 
-> ⚠️ **Important**: shuffle the teacher file **before** handing it to BulletOu.
+> ⚠️ **Important**: shuffle teacher positions either before training, or during training with `--teacher-shuffle-buffer-batches`.
 
-BulletOu does not shuffle teacher positions during training. `--buffer-mb` controls the read buffer size; it is not a shuffle option.
+`--buffer-mb` controls the loader read buffer size; it is not a shuffle option. To shuffle during training, use `--teacher-shuffle-buffer-batches N`. BulletOu accumulates `batch_size × N` decoded positions on CPU, Fisher-Yates shuffles that window, and then emits mini-batches. `N` must divide the effective `batches_per_superbatch`.
 
 `gensfen` and dlshogi-style generators usually emit positions **grouped by game** (positions from one game are contiguous). If you train on such files directly, nearby positions from the same game dominate consecutive mini-batches, and loss / plateau decisions become sensitive to local teacher bias.
 
 How to shuffle:
 - **`.hcpe` / `.psv` / `.bin`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
 - **`.hcpe3` / `.pack`**: these are variable-length game formats, so record-level shuffling is not straightforward. Shuffle at generation time, or convert to a fixed-position format such as `.psv` / `.hcpe` and shuffle that.
+- **In-trainer shuffle**: specify something like `--teacher-shuffle-buffer-batches 61`. For example, with `batch_size=65536` and `positions-per-superbatch=40000000`, the effective `batches_per_superbatch` is `610`, so `61` gives 10 shuffle windows per superbatch and keeps checkpoint/resume boundaries aligned.
 
 Example: shuffle/split an HCPE or PSV folder into 10M-position files:
 

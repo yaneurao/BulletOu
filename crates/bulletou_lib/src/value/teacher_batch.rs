@@ -23,7 +23,7 @@ use crate::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, win_rate_model_score,
+            ShogiPackLoader, shuffle_teacher_buffer, teacher_shuffle_window_records, win_rate_model_score,
         },
     },
 };
@@ -60,6 +60,10 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
     pub score_drop_abs: Option<u16>,
+    /// Shuffle window size in mini-batches. `0` disables in-trainer shuffling.
+    pub teacher_shuffle_buffer_batches: usize,
+    /// Base seed for deterministic teacher shuffle windows.
+    pub teacher_shuffle_seed: u64,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
 }
@@ -85,6 +89,8 @@ pub struct KpTeacherBatchConfig<'a> {
     pub scale: f32,
     pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
+    pub teacher_shuffle_buffer_batches: usize,
+    pub teacher_shuffle_seed: u64,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
 }
@@ -110,6 +116,8 @@ pub struct KpptTeacherBatchConfig<'a> {
     pub scale: f32,
     pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
+    pub teacher_shuffle_buffer_batches: usize,
+    pub teacher_shuffle_seed: u64,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
 }
@@ -136,6 +144,8 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub scale: f32,
     pub win_rate_model: bool,
     pub score_drop_abs: Option<u16>,
+    pub teacher_shuffle_buffer_batches: usize,
+    pub teacher_shuffle_seed: u64,
     /// Print CPU batch materialisation timing for profiling runs.
     pub profile_prepare: bool,
 }
@@ -939,6 +949,7 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
     }
+    validate_teacher_shuffle_size(config.batch_size, config.teacher_shuffle_buffer_batches)?;
     if !(0.0..=1.0).contains(&config.lambda) {
         return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
     }
@@ -952,6 +963,7 @@ fn validate_kp_config(config: &KpTeacherBatchConfig<'_>) -> Result<(), TeacherBa
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
     }
+    validate_teacher_shuffle_size(config.batch_size, config.teacher_shuffle_buffer_batches)?;
     if !(0.0..=1.0).contains(&config.lambda) {
         return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
     }
@@ -965,6 +977,7 @@ fn validate_kppt_config(config: &KpptTeacherBatchConfig<'_>) -> Result<(), Teach
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
     }
+    validate_teacher_shuffle_size(config.batch_size, config.teacher_shuffle_buffer_batches)?;
     if !(0.0..=1.0).contains(&config.lambda) {
         return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
     }
@@ -978,12 +991,25 @@ fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), Teach
     if config.batch_size == 0 {
         return Err(TeacherBatchError::invalid_input("--batch-size must be greater than zero"));
     }
+    validate_teacher_shuffle_size(config.batch_size, config.teacher_shuffle_buffer_batches)?;
     if !(0.0..=1.0).contains(&config.lambda) {
         return Err(TeacherBatchError::invalid_input("--lambda must be in [0, 1]"));
     }
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    Ok(())
+}
+
+fn validate_teacher_shuffle_size(batch_size: usize, buffer_batches: usize) -> Result<(), TeacherBatchError> {
+    if buffer_batches == 0 {
+        return Ok(());
+    }
+    teacher_shuffle_window_records(batch_size, buffer_batches).ok_or_else(|| {
+        TeacherBatchError::invalid_input(format!(
+            "teacher shuffle buffer size overflow: batch_size={batch_size}, buffer_batches={buffer_batches}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -1204,11 +1230,29 @@ fn prepare_kp_direct_fast_batch(
     batch
 }
 
-fn load_and_map_packed_batches<D, F>(loader: &D, start_position: usize, batch_size: usize, mut f: F)
-where
+fn load_and_map_packed_batches<D, F>(
+    loader: &D,
+    start_position: usize,
+    batch_size: usize,
+    shuffle_buffer_batches: usize,
+    shuffle_seed: u64,
+    mut f: F,
+) where
     D: DataLoader<PackedSfenValue>,
     F: FnMut(&[PackedSfenValue]) -> bool,
 {
+    if shuffle_buffer_batches > 0 {
+        load_and_map_shuffled_packed_batches(
+            loader,
+            start_position,
+            batch_size,
+            shuffle_buffer_batches,
+            shuffle_seed,
+            f,
+        );
+        return;
+    }
+
     let mut incomplete_buf = Vec::new();
 
     loader.map_chunks(start_position, |chunk| {
@@ -1247,6 +1291,101 @@ where
 
         false
     });
+}
+
+fn load_and_map_shuffled_packed_batches<D, F>(
+    loader: &D,
+    start_position: usize,
+    batch_size: usize,
+    shuffle_buffer_batches: usize,
+    shuffle_seed: u64,
+    mut f: F,
+) where
+    D: DataLoader<PackedSfenValue>,
+    F: FnMut(&[PackedSfenValue]) -> bool,
+{
+    let Some(window_records) = teacher_shuffle_window_records(batch_size, shuffle_buffer_batches) else {
+        return;
+    };
+    let mut incomplete_buf = Vec::new();
+    let mut shuffle_buf = Vec::with_capacity(window_records);
+    let mut window_index = start_position / window_records;
+    let mut stopped = false;
+
+    let mut flush_window = |shuffle_buf: &mut Vec<PackedSfenValue>, window_index: &mut usize| -> bool {
+        if shuffle_buf.is_empty() {
+            return false;
+        }
+        shuffle_teacher_buffer(shuffle_buf, shuffle_seed, *window_index);
+        *window_index = window_index.saturating_add(1);
+
+        let mut emitted = 0usize;
+        for batch in shuffle_buf.chunks_exact(batch_size) {
+            emitted += batch.len();
+            if f(batch) {
+                shuffle_buf.clear();
+                return true;
+            }
+        }
+
+        let remainder = shuffle_buf.len().saturating_sub(emitted);
+        if remainder == 0 {
+            shuffle_buf.clear();
+        } else {
+            shuffle_buf.copy_within(emitted.., 0);
+            shuffle_buf.truncate(remainder);
+        }
+        false
+    };
+
+    loader.map_chunks(start_position, |chunk| {
+        let mut emit_complete_batch = |batch: &[PackedSfenValue]| -> bool {
+            shuffle_buf.extend_from_slice(batch);
+            if shuffle_buf.len() >= window_records {
+                debug_assert_eq!(shuffle_buf.len(), window_records);
+                return flush_window(&mut shuffle_buf, &mut window_index);
+            }
+            false
+        };
+
+        let remainder = if !incomplete_buf.is_empty() {
+            let remainder = batch_size - incomplete_buf.len();
+
+            if chunk.len() >= remainder {
+                incomplete_buf.extend_from_slice(&chunk[..remainder]);
+                if emit_complete_batch(&incomplete_buf) {
+                    incomplete_buf.clear();
+                    stopped = true;
+                    return true;
+                }
+                incomplete_buf.clear();
+            } else {
+                incomplete_buf.extend_from_slice(chunk);
+            }
+
+            remainder
+        } else {
+            0
+        };
+
+        if chunk.len() >= remainder {
+            let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
+            incomplete_buf.extend_from_slice(chunks.remainder());
+
+            for batch in chunks {
+                if emit_complete_batch(batch) {
+                    stopped = true;
+                    return true;
+                }
+            }
+        }
+
+        false
+    });
+
+    if !stopped {
+        let _ = flush_window(&mut shuffle_buf, &mut window_index);
+    }
 }
 
 fn visit_halfkp_batches_direct<D, P, F, E>(
@@ -1288,7 +1427,13 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
+                load_and_map_packed_batches(
+                    &loader,
+                    loader_start_position,
+                    config.batch_size,
+                    config.teacher_shuffle_buffer_batches,
+                    config.teacher_shuffle_seed,
+                    |raw_batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let batch = prepare_halfkp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
                     if let Err(err) = batch.validate() {
@@ -1304,7 +1449,8 @@ where
 
                     produced_batches += 1;
                     produced_batches >= batch_count
-                });
+                    },
+                );
 
                 if let Some(err) = producer_error {
                     let _ = sender.send(Err(err.clone()));
@@ -1361,33 +1507,40 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
-        let batch_index = config.batch_index + visited_batches;
-        let prepare_started = config.profile_prepare.then(std::time::Instant::now);
-        let batch = prepare_halfkp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
-        if let Some(started) = prepare_started {
-            println!(
-                "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        if let Err(err) = batch.validate() {
-            visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
-            return true;
-        }
+    load_and_map_packed_batches(
+        &loader,
+        loader_start_position,
+        config.batch_size,
+        config.teacher_shuffle_buffer_batches,
+        config.teacher_shuffle_seed,
+        |raw_batch| {
+            let batch_index = config.batch_index + visited_batches;
+            let prepare_started = config.profile_prepare.then(std::time::Instant::now);
+            let batch = prepare_halfkp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
+            if let Some(started) = prepare_started {
+                println!(
+                    "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            if let Err(err) = batch.validate() {
+                visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+                return true;
+            }
 
-        let source = format!("{format:?} teacher batch {batch_index}: {}", config.teacher);
-        let dataloader_pos = dataloader_pos(visited_batches);
-        if let Err(err) = visitor(HalfkpTeacherBatch { batch, source, dataloader_pos }) {
-            visit_error = Some(TeacherBatchError::invalid_input(format!(
-                "teacher batch callback failed at batch {batch_index}: {err}"
-            )));
-            return true;
-        }
+            let source = format!("{format:?} teacher batch {batch_index}: {}", config.teacher);
+            let dataloader_pos = dataloader_pos(visited_batches);
+            if let Err(err) = visitor(HalfkpTeacherBatch { batch, source, dataloader_pos }) {
+                visit_error = Some(TeacherBatchError::invalid_input(format!(
+                    "teacher batch callback failed at batch {batch_index}: {err}"
+                )));
+                return true;
+            }
 
-        visited_batches += 1;
-        visited_batches >= batch_count
-    });
+            visited_batches += 1;
+            visited_batches >= batch_count
+        },
+    );
     if let Some(err) = visit_error {
         return Err(err);
     }
@@ -1438,7 +1591,13 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
-                load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
+                load_and_map_packed_batches(
+                    &loader,
+                    loader_start_position,
+                    config.batch_size,
+                    config.teacher_shuffle_buffer_batches,
+                    config.teacher_shuffle_seed,
+                    |raw_batch| {
                     let batch_index = config.batch_index + produced_batches;
                     let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
                     if let Err(err) = batch.validate() {
@@ -1454,7 +1613,8 @@ where
 
                     produced_batches += 1;
                     produced_batches >= batch_count
-                });
+                    },
+                );
 
                 if let Some(err) = producer_error {
                     let _ = sender.send(Err(err.clone()));
@@ -1510,33 +1670,40 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
-    load_and_map_packed_batches(&loader, loader_start_position, config.batch_size, |raw_batch| {
-        let batch_index = config.batch_index + visited_batches;
-        let prepare_started = config.profile_prepare.then(std::time::Instant::now);
-        let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
-        if let Some(started) = prepare_started {
-            println!(
-                "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        if let Err(err) = batch.validate() {
-            visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
-            return true;
-        }
+    load_and_map_packed_batches(
+        &loader,
+        loader_start_position,
+        config.batch_size,
+        config.teacher_shuffle_buffer_batches,
+        config.teacher_shuffle_seed,
+        |raw_batch| {
+            let batch_index = config.batch_index + visited_batches;
+            let prepare_started = config.profile_prepare.then(std::time::Instant::now);
+            let batch = prepare_kp_direct_fast_batch(raw_batch, config, threads, rayon_pool.as_ref());
+            if let Some(started) = prepare_started {
+                println!(
+                    "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            if let Err(err) = batch.validate() {
+                visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
+                return true;
+            }
 
-        let source = format!("{format:?} KP teacher batch {batch_index}: {}", config.teacher);
-        let dataloader_pos = dataloader_pos(visited_batches);
-        if let Err(err) = visitor(KpTeacherBatch { batch, source, dataloader_pos }) {
-            visit_error = Some(TeacherBatchError::invalid_input(format!(
-                "teacher batch callback failed at KP batch {batch_index}: {err}"
-            )));
-            return true;
-        }
+            let source = format!("{format:?} KP teacher batch {batch_index}: {}", config.teacher);
+            let dataloader_pos = dataloader_pos(visited_batches);
+            if let Err(err) = visitor(KpTeacherBatch { batch, source, dataloader_pos }) {
+                visit_error = Some(TeacherBatchError::invalid_input(format!(
+                    "teacher batch callback failed at KP batch {batch_index}: {err}"
+                )));
+                return true;
+            }
 
-        visited_batches += 1;
-        visited_batches >= batch_count
-    });
+            visited_batches += 1;
+            visited_batches >= batch_count
+        },
+    );
     if let Some(err) = visit_error {
         return Err(err);
     }
@@ -1592,7 +1759,8 @@ where
         config.scale,
         config.score_drop_abs,
         loader,
-    );
+    )
+    .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
         let (sender, receiver) =
@@ -1767,7 +1935,8 @@ where
         config.scale,
         config.score_drop_abs,
         loader,
-    );
+    )
+    .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
         let (sender, receiver) = mpsc::sync_channel::<Result<KpptTeacherBatch, TeacherBatchError>>(config.queue_depth);
@@ -1941,7 +2110,8 @@ where
         config.scale,
         config.score_drop_abs,
         loader,
-    );
+    )
+    .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
         let (sender, receiver) = mpsc::sync_channel::<Result<SfnnTeacherBatch, TeacherBatchError>>(config.queue_depth);
@@ -2118,6 +2288,8 @@ mod tests {
             win_rate_model: false,
             ft_factorize: false,
             score_drop_abs: Some(32_000),
+            teacher_shuffle_buffer_batches: 0,
+            teacher_shuffle_seed: 0,
             profile_prepare: false,
         }
     }
@@ -2137,6 +2309,8 @@ mod tests {
             scale: 400.0,
             win_rate_model: false,
             score_drop_abs: Some(32_000),
+            teacher_shuffle_buffer_batches: 0,
+            teacher_shuffle_seed: 0,
             profile_prepare: false,
         }
     }

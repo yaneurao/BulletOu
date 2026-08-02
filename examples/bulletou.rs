@@ -2222,6 +2222,51 @@ fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
     Ok(effective_batches_per_superbatch(args)?.saturating_mul(effective_batch_size(args)))
 }
 
+fn teacher_shuffle_buffer_records(args: &Args) -> Result<Option<usize>, String> {
+    let batches = args.teacher_shuffle_buffer_batches;
+    if batches == 0 {
+        return Ok(None);
+    }
+    effective_batch_size(args).checked_mul(batches).map(Some).ok_or_else(|| {
+        format!(
+            "--teacher-shuffle-buffer-batches overflow: batch_size={} batches={batches}",
+            effective_batch_size(args)
+        )
+    })
+}
+
+fn validate_teacher_shuffle_buffer(args: &Args, batches_per_superbatch: usize) -> Result<(), String> {
+    let Some(records) = teacher_shuffle_buffer_records(args)? else { return Ok(()) };
+    let buffer_batches = args.teacher_shuffle_buffer_batches;
+    if batches_per_superbatch == 0 {
+        return Err("--teacher-shuffle-buffer-batches requires a nonzero superbatch size".to_string());
+    }
+    if buffer_batches == 0 {
+        return Ok(());
+    }
+    if batches_per_superbatch % buffer_batches != 0 {
+        return Err(format!(
+            "--teacher-shuffle-buffer-batches ({buffer_batches}) must divide effective batches_per_superbatch ({batches_per_superbatch}) so checkpoints/resume stay on shuffle-window boundaries"
+        ));
+    }
+    if records == 0 {
+        return Err("--teacher-shuffle-buffer-batches resolved to an empty buffer".to_string());
+    }
+    Ok(())
+}
+
+fn teacher_shuffle_buffer_mib(args: &Args) -> Result<Option<f64>, String> {
+    let Some(records) = teacher_shuffle_buffer_records(args)? else { return Ok(None) };
+    let bytes = (records as u128)
+        .checked_mul(std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u128)
+        .ok_or_else(|| "--teacher-shuffle-buffer-batches byte size overflow".to_string())?;
+    Ok(Some(bytes as f64 / (1024.0 * 1024.0)))
+}
+
+fn effective_teacher_shuffle_seed(args: &Args) -> u64 {
+    if args.teacher_shuffle_buffer_batches > 0 { args.teacher_shuffle_seed } else { 0 }
+}
+
 fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result<(f32, bool), String> {
     if let Some(gamma) = args.lr_step_gamma {
         return Ok((gamma, false));
@@ -2578,14 +2623,27 @@ struct Args {
 
     /// Loader read buffer size in megabytes. PSV uses 40 bytes per record, so
     /// `--buffer-mb 4096` can hold about 107M positions (roughly one default
-    /// superbatch) in the read buffer. BulletOu does not reshuffle during
-    /// training; pass pre-shuffled teacher files.
+    /// superbatch) in the read buffer. This is the loader read buffer, not the
+    /// optional training shuffle window; use `--teacher-shuffle-buffer-batches`
+    /// for in-trainer shuffling.
     ///
     /// RAM usage: the buffer itself is `buffer_mb` MB. Including model,
     /// optimiser, and batch-queue data, expect peak memory to be somewhat
     /// higher than this buffer alone.
     #[arg(long, default_value = "4096")]
     buffer_mb: usize,
+
+    /// In-trainer teacher shuffle window in mini-batches. `0` disables it.
+    /// When enabled, BulletOu accumulates `batch_size * N` decoded positions,
+    /// Fisher-Yates shuffles that window on CPU, then emits mini-batches.
+    /// `N` must divide the effective batches per superbatch so checkpoints
+    /// and resume stay on shuffle-window boundaries.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_buffer_batches: usize,
+
+    /// Base seed for `--teacher-shuffle-buffer-batches`.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_seed: u64,
 
     /// HCPE decode parallelism. `0` (default) means auto =
     /// `available_parallelism()` (logical core count). Use
@@ -2903,6 +2961,12 @@ impl Args {
         if effective_batch_size(self) == 0 {
             return Err("--batch-size must be > 0 for --backend cuda-cpp".to_string());
         }
+        let shuffle_boundary_batches = if let Some(train_steps) = self.cuda_cpp_train_steps {
+            train_steps
+        } else {
+            effective_batches_per_superbatch(self)?
+        };
+        validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
         if self.validation_rate.is_some_and(|validation_rate| validation_rate == 0) {
             return Err("--validation-rate must be > 0".to_string());
         }
@@ -3530,6 +3594,11 @@ fn main() {
         eprintln!("error: --wrm-nnue2score must be finite and > 0 (got {}).", args.wrm_nnue2score);
         std::process::exit(2);
     }
+    let teacher_shuffle_boundary_batches = args.cuda_cpp_train_steps.unwrap_or(batches_per_superbatch);
+    if let Err(e) = validate_teacher_shuffle_buffer(&args, teacher_shuffle_boundary_batches) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     if args.lr_schedule == LrScheduleKind::Plateau {
         if args.test_teacher.is_none() {
             eprintln!("error: --lr-schedule plateau requires --test-teacher so validation metrics can be monitored.");
@@ -4001,6 +4070,8 @@ where
                 win_rate_model: args.win_rate_model,
                 ft_factorize: false,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                teacher_shuffle_seed: args.teacher_shuffle_seed,
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_halfkp_teacher_fast_batch(&config, batch_count, |teacher_batch| {
@@ -4027,6 +4098,8 @@ where
                 scale: args.scale as f32,
                 win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                teacher_shuffle_seed: args.teacher_shuffle_seed,
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_kp_teacher_fast_batch(&config, batch_count, |teacher_batch| {
@@ -4053,6 +4126,8 @@ where
                 scale: args.scale as f32,
                 win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                teacher_shuffle_seed: args.teacher_shuffle_seed,
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_kppt_teacher_fast_batch(
@@ -4085,6 +4160,8 @@ where
                 scale: args.scale as f32,
                 win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                teacher_shuffle_seed: args.teacher_shuffle_seed,
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_kppt_teacher_fast_batch(
@@ -4117,6 +4194,8 @@ where
                 scale: args.scale as f32,
                 win_rate_model: args.win_rate_model,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                teacher_shuffle_seed: args.teacher_shuffle_seed,
                 profile_prepare: args.cuda_cpp_profile_teacher_prepare,
             };
             for_each_kppt_teacher_fast_batch(
@@ -4237,6 +4316,8 @@ where
         scale: args.scale as f32,
         win_rate_model: args.win_rate_model,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+        teacher_shuffle_seed: args.teacher_shuffle_seed,
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
@@ -4358,6 +4439,7 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
         print_cuda_cpp_no_remaining_work(args);
         return Ok(());
     }
+    cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     eprintln!("  batch size = {batch_size}");
@@ -5013,6 +5095,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         print_cuda_cpp_no_remaining_work(args);
         return Ok(());
     }
+    cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -5966,6 +6049,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_cuda_cpp_no_remaining_work(args);
         return Ok(());
     }
+    cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     eprintln!("  cuda-cpp device {device}: {name}");
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -6136,6 +6220,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         scale: args.scale as f32,
         win_rate_model: args.win_rate_model,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+        teacher_shuffle_seed: args.teacher_shuffle_seed,
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
@@ -6187,6 +6273,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     scale: args.scale as f32,
                     win_rate_model: args.win_rate_model,
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+                    teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+                    teacher_shuffle_seed: args.teacher_shuffle_seed,
                     profile_prepare: args.cuda_cpp_profile_teacher_prepare,
                 };
                 eprintln!(
@@ -10719,6 +10807,23 @@ fn cuda_cpp_loss_progress_policy(args: &Args) -> String {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_print_teacher_shuffle_buffer(args: &Args, schedule: &CudaCppRunSchedule) -> Result<(), String> {
+    validate_teacher_shuffle_buffer(args, schedule.batches_per_superbatch)?;
+    let Some(records) = teacher_shuffle_buffer_records(args)? else {
+        return Ok(());
+    };
+    let mib = teacher_shuffle_buffer_mib(args)?.unwrap_or(0.0);
+    eprintln!(
+        "  teacher shuffle buffer = enabled: {} batches x {} = {} positions ({mib:.1} MiB CPU), seed={}",
+        args.teacher_shuffle_buffer_batches,
+        format_count(effective_batch_size(args)),
+        format_count(records),
+        args.teacher_shuffle_seed
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn append_cuda_cpp_progress_log(
     args: &Args,
     kind: &str,
@@ -11059,6 +11164,8 @@ fn resume_signature(args: &Args) -> String {
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", effective_batch_size(args)),
         format!("positions_per_superbatch={positions_per_superbatch}"),
+        format!("teacher_shuffle_buffer_batches={}", args.teacher_shuffle_buffer_batches),
+        format!("teacher_shuffle_seed={}", effective_teacher_shuffle_seed(args)),
         format!("superbatches={superbatches}"),
         format!("lr_schedule={}", args.lr_schedule.cli_name()),
         format!("optimizer={}", args.optimizer.cli_name()),
@@ -11144,7 +11251,19 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
     }
     let has_loss_pow_exp = out.iter().any(|line| line.starts_with("loss_pow_exp="));
     let has_wrm_nnue2score = out.iter().any(|line| line.starts_with("wrm_nnue2score="));
+    let has_teacher_shuffle_buffer_batches = out.iter().any(|line| line.starts_with("teacher_shuffle_buffer_batches="));
+    let has_teacher_shuffle_seed = out.iter().any(|line| line.starts_with("teacher_shuffle_seed="));
     let has_win_rate_model = out.iter().position(|line| line.starts_with("win_rate_model="));
+    if !has_teacher_shuffle_buffer_batches {
+        if let Some(index) = out.iter().position(|line| line.starts_with("positions_per_superbatch=")) {
+            out.insert(index + 1, "teacher_shuffle_buffer_batches=0".to_string());
+        }
+    }
+    if !has_teacher_shuffle_seed {
+        if let Some(index) = out.iter().position(|line| line.starts_with("teacher_shuffle_buffer_batches=")) {
+            out.insert(index + 1, "teacher_shuffle_seed=0".to_string());
+        }
+    }
     if !has_loss_pow_exp {
         if let Some(index) = has_win_rate_model {
             out.insert(index + 1, "loss_pow_exp=2.000000000".to_string());
@@ -13045,6 +13164,55 @@ mod tests {
 
         assert_eq!(effective_batches_per_superbatch(&args).unwrap(), 610);
         assert_eq!(effective_positions_per_superbatch(&args).unwrap(), 9_994_240);
+    }
+
+    #[test]
+    fn teacher_shuffle_buffer_batches_must_divide_superbatch() {
+        use clap::Parser as _;
+
+        let good = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--superbatches",
+            "36",
+            "--max-epochs",
+            "1",
+            "--teacher-shuffle-buffer-batches",
+            "61",
+            "--teacher-shuffle-seed",
+            "42",
+        ])
+        .unwrap();
+        let batches_per_superbatch = effective_batches_per_superbatch(&good).unwrap();
+        assert_eq!(batches_per_superbatch, 610);
+        validate_teacher_shuffle_buffer(&good, batches_per_superbatch).unwrap();
+        assert_eq!(teacher_shuffle_buffer_records(&good).unwrap(), Some(65_536 * 61));
+        assert!(resume_signature(&good).contains("teacher_shuffle_buffer_batches=61"));
+        assert!(resume_signature(&good).contains("teacher_shuffle_seed=42"));
+
+        let bad = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--superbatches",
+            "36",
+            "--max-epochs",
+            "1",
+            "--teacher-shuffle-buffer-batches",
+            "64",
+        ])
+        .unwrap();
+        let err = validate_teacher_shuffle_buffer(&bad, effective_batches_per_superbatch(&bad).unwrap()).unwrap_err();
+        assert!(err.contains("must divide effective batches_per_superbatch"));
     }
 
     #[test]
@@ -16122,6 +16290,20 @@ mod tests {
         ])
         .unwrap();
         assert!(!resume_signature_matches(&old_signature, &changed));
+    }
+
+    #[test]
+    fn resume_signature_accepts_old_configs_without_teacher_shuffle_lines() {
+        use clap::Parser as _;
+
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
+        let old_signature = resume_signature_without_line(
+            &resume_signature_without_line(&resume_signature(&args), "teacher_shuffle_buffer_batches="),
+            "teacher_shuffle_seed=",
+        );
+
+        assert!(resume_signature_matches(&old_signature, &args));
     }
 
     #[test]

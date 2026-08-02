@@ -43,17 +43,18 @@ teachers/
 
 (`.hcpe` / `.hcpe3` / `.psv` でも同様に動く。フォーマットは拡張子から自動判別される。複数ファイル混在もディレクトリ指定で OK だが、すべて同じ拡張子であること。)
 
-### 教師ファイルは事前にシャッフルしておく
+### 教師局面をシャッフルする
 
-> ⚠️ **重要**: 教師ファイルは BulletOu に渡す前にシャッフルしておくこと。
+> ⚠️ **重要**: 教師局面は、事前にシャッフルするか、学習時に `--teacher-shuffle-buffer-batches` を使ってシャッフルすること。
 
-BulletOu は学習時に教師局面を追加シャッフルしない。`--buffer-mb` は読み込みバッファのサイズであり、シャッフル用の指定ではない。
+`--buffer-mb` は読み込みバッファのサイズであり、シャッフル用の指定ではない。学習時にシャッフルしたい場合は `--teacher-shuffle-buffer-batches N` を使う。これは `batch_size × N` 局面を CPU 上に貯め、Fisher-Yates shuffle してから mini-batch に切る。`N` は実効 `batches_per_superbatch` を割り切る値でなければならない。
 
 `gensfen` / dlshogi-style 生成器の出力は **同一対局内の局面が連続して並んでいる** のが普通なので、ファイル全体をシャッフルしないまま学習すると、近い局面ばかりが連続して mini-batch に入り、loss や plateau 判定が教師の局所的な偏りに振り回される。
 
 対策:
 - **`.hcpe` / `.psv`**: [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `teacher/shuffle_split_teacher_external.py` を使う。巨大な教師フォルダでも全体をメモリに載せず、bucket 分配してから出力ファイルへ分割できる。
 - **`.hcpe3` / `.pack`**: 棋譜単位の可変長形式なので単純な固定長レコード shuffle には向かない。生成時点で局面順を混ぜる、または `.psv` / `.hcpe` のような固定長局面形式に変換してからシャッフルする。
+- **学習時 shuffle**: `--teacher-shuffle-buffer-batches 61` のように指定する。たとえば `batch_size=65536`, `positions-per-superbatch=40000000` なら実効 `batches_per_superbatch=610` なので、`61` は 1 superbatch あたり 10 window になり、checkpoint/resume 境界と綺麗に揃う。
 
 HCPE/PSVフォルダを 1000 万局面ごとにシャッフル分割する例:
 
