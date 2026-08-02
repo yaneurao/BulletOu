@@ -2226,12 +2226,21 @@ fn cuda_cpp_sfnn_factorizer_active(args: &Args) -> bulletou_cuda_cpp::SfnnFactor
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_default_cpu_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).clamp(4, 24)).unwrap_or(24)
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
+    cuda_cpp_default_cpu_threads_from_logical(logical)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_default_cpu_threads_from_logical(logical: usize) -> usize {
+    logical.max(1).div_ceil(2).max(1)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_effective_teacher_threads(args: &Args) -> usize {
-    if args.threads == 4 { cuda_cpp_default_cpu_threads() } else { args.threads }
+    match args.threads {
+        Some(0) | None => cuda_cpp_default_cpu_threads(),
+        Some(threads) => threads,
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -2691,9 +2700,10 @@ struct Args {
     #[arg(long = "no-save-epoch-end")]
     no_save_epoch_end: bool,
 
-    /// Dataloader worker threads (CPU side).
-    #[arg(long, default_value = "4")]
-    threads: usize,
+    /// Teacher batch preparation worker threads (CPU side). Omit or set `0`
+    /// for auto ~= physical thread count (`available_parallelism() / 2`).
+    #[arg(long)]
+    threads: Option<usize>,
 
     /// GPU-side batch queue depth.
     #[arg(long, default_value = "32")]
@@ -2724,12 +2734,11 @@ struct Args {
     #[arg(long, default_value = "0")]
     teacher_shuffle_seed: u64,
 
-    /// HCPE decode parallelism. `0` (default) means auto =
-    /// `available_parallelism()` (logical core count). Use
-    /// `--loader-threads 8` etc. to leave CPU for other processes. The actual
-    /// value is printed at startup as `read buffer ready: ... (N decode threads)`.
-    /// Currently this only affects the HCPE loader; HCPE3 / .pack / .psv do not
-    /// use this knob.
+    /// HCPE decode parallelism. `0` (default) means auto ~= physical thread
+    /// count (`available_parallelism() / 2`). Use `--loader-threads 8` etc. to
+    /// tune CPU pressure manually. The actual value is printed at startup as
+    /// `read buffer ready: ... (N decode threads)`. Currently this only affects
+    /// the HCPE loader; HCPE3 / .pack / .psv do not use this knob.
     #[arg(long, default_value = "0")]
     loader_threads: usize,
 
@@ -15369,8 +15378,14 @@ mod tests {
         ])
         .unwrap();
 
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(1), 1);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(12), 6);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(24), 12);
+
+        let logical_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
         let default_threads = cuda_cpp_default_cpu_threads();
-        assert!((4..=24).contains(&default_threads));
+        assert_eq!(default_threads, cuda_cpp_default_cpu_threads_from_logical(logical_threads));
+        assert!(default_threads <= logical_threads.max(1));
         assert_eq!(cuda_cpp_effective_teacher_threads(&args), default_threads);
         assert_eq!(cuda_cpp_effective_loader_threads(&args), default_threads);
         assert_eq!(cuda_cpp_effective_batch_queue_size(&args), 4);
@@ -15403,6 +15418,22 @@ mod tests {
         assert_eq!(cuda_cpp_effective_teacher_threads(&args), 10);
         assert_eq!(cuda_cpp_effective_loader_threads(&args), 12);
         assert_eq!(cuda_cpp_effective_batch_queue_size(&args), 8);
+
+        let explicit_four = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--threads",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(cuda_cpp_effective_teacher_threads(&explicit_four), 4);
     }
 
     #[test]
