@@ -156,6 +156,21 @@ pub struct SfnnTeacherBatch {
     pub batch: FastBatchHost,
     pub source: String,
     pub dataloader_pos: Option<TeacherDataloaderPos>,
+    pub timing: TeacherBatchTiming,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TeacherBatchTiming {
+    /// Time spent in the producer before the next complete batch is yielded by
+    /// the data loader. This includes file I/O, decoding, incomplete-batch
+    /// assembly, and optional teacher-shuffle window preparation.
+    pub producer_load_sec: f64,
+    /// Time spent materialising `FastBatchHost` from decoded teacher positions.
+    pub producer_prepare_sec: f64,
+    /// Time the consumer spent waiting for a prepared batch from the producer
+    /// queue. A large value means the GPU-side training loop was starved by the
+    /// teacher producer.
+    pub consumer_queue_wait_sec: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2024,12 +2039,16 @@ where
             let producer = scope.spawn(move || -> Result<usize, TeacherBatchError> {
                 let mut produced_batches = 0usize;
                 let mut producer_error = None;
+                let mut producer_ready = std::time::Instant::now();
                 dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
+                    let producer_load_sec = producer_ready.elapsed().as_secs_f64();
                     let batch_index = config.batch_index + produced_batches;
+                    let prepare_started = std::time::Instant::now();
                     let prepared = match rayon_pool.as_ref() {
                         Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
                         None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
                     };
+                    let producer_prepare_sec = prepare_started.elapsed().as_secs_f64();
                     let batch = FastBatchHost::from(prepared);
                     if let Err(err) = batch.validate() {
                         producer_error = Some(TeacherBatchError::invalid_input(err.to_string()));
@@ -2039,11 +2058,20 @@ where
                     let source =
                         format!("{format:?} SFNN/{input_label} teacher batch {batch_index}: {}", config.teacher);
                     let dataloader_pos = dataloader_pos(produced_batches);
-                    if sender.send(Ok(SfnnTeacherBatch { batch, source, dataloader_pos })).is_err() {
+                    let timing = TeacherBatchTiming {
+                        producer_load_sec,
+                        producer_prepare_sec,
+                        consumer_queue_wait_sec: 0.0,
+                    };
+                    if sender
+                        .send(Ok(SfnnTeacherBatch { batch, source, dataloader_pos, timing }))
+                        .is_err()
+                    {
                         return true;
                     }
 
                     produced_batches += 1;
+                    producer_ready = std::time::Instant::now();
                     produced_batches >= batch_count
                 });
 
@@ -2063,8 +2091,10 @@ where
             let mut consumed_batches = 0usize;
             let mut visit_error = None;
             while consumed_batches < batch_count {
+                let recv_started = std::time::Instant::now();
                 match receiver.recv() {
-                    Ok(Ok(batch)) => {
+                    Ok(Ok(mut batch)) => {
+                        batch.timing.consumer_queue_wait_sec = recv_started.elapsed().as_secs_f64();
                         if let Err(err) = visitor(batch) {
                             visit_error = Some(TeacherBatchError::invalid_input(format!(
                                 "SFNN/{input_label} teacher batch callback failed at batch {}: {err}",
@@ -2102,13 +2132,17 @@ where
 
     let mut visited_batches = 0usize;
     let mut visit_error = None;
+    let mut producer_ready = std::time::Instant::now();
     dataloader.load_and_map_batches_from_position(loader_start_position, config.batch_size, |batch| {
+        let producer_load_sec = producer_ready.elapsed().as_secs_f64();
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
+        let prepare_timing_started = std::time::Instant::now();
         let prepared = match rayon_pool.as_ref() {
             Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
             None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
         };
+        let producer_prepare_sec = prepare_timing_started.elapsed().as_secs_f64();
         if let Some(started) = prepare_started {
             println!(
                 "  profile_teacher : batch={batch_index:<6} prepare {:>9.3} ms",
@@ -2123,7 +2157,8 @@ where
 
         let source = format!("{format:?} SFNN/{input_label} teacher batch {batch_index}: {}", config.teacher);
         let dataloader_pos = dataloader_pos(visited_batches);
-        if let Err(err) = visitor(SfnnTeacherBatch { batch, source, dataloader_pos }) {
+        let timing = TeacherBatchTiming { producer_load_sec, producer_prepare_sec, consumer_queue_wait_sec: 0.0 };
+        if let Err(err) = visitor(SfnnTeacherBatch { batch, source, dataloader_pos, timing }) {
             visit_error = Some(TeacherBatchError::invalid_input(format!(
                 "SFNN/{input_label} teacher batch callback failed at batch {batch_index}: {err}"
             )));
@@ -2131,6 +2166,7 @@ where
         }
 
         visited_batches += 1;
+        producer_ready = std::time::Instant::now();
         visited_batches >= batch_count
     });
 

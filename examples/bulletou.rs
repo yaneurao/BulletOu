@@ -1660,6 +1660,46 @@ impl CudaCppProgressMeter {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaCppSfnnDiagnostics {
+    batches: usize,
+    teacher_queue_wait_sec: f64,
+    teacher_load_sec: f64,
+    teacher_prepare_sec: f64,
+    cuda_profile_steps: usize,
+    cuda_upload_ms: f64,
+    cuda_forward_ms: f64,
+    cuda_loss_ms: f64,
+    cuda_backward_ms: f64,
+    cuda_update_ms: f64,
+    cuda_total_ms: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppSfnnDiagnostics {
+    fn observe_teacher(&mut self, timing: bulletou_lib::value::TeacherBatchTiming) {
+        self.batches += 1;
+        self.teacher_queue_wait_sec += timing.consumer_queue_wait_sec;
+        self.teacher_load_sec += timing.producer_load_sec;
+        self.teacher_prepare_sec += timing.producer_prepare_sec;
+    }
+
+    fn observe_profile(&mut self, profile: &bulletou_cuda_cpp::SfnnTrainStepProfile) {
+        self.cuda_profile_steps += 1;
+        self.cuda_upload_ms += f64::from(profile.upload_ms);
+        self.cuda_forward_ms += f64::from(profile.forward_ms);
+        self.cuda_loss_ms += f64::from(profile.loss_ms);
+        self.cuda_backward_ms += f64::from(profile.backward_ms);
+        self.cuda_update_ms += f64::from(profile.update_ms);
+        self.cuda_total_ms += f64::from(profile.total_ms);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Copy, Debug)]
 struct CudaCppCheckpointTiming {
     readback: std::time::Duration,
@@ -2345,6 +2385,13 @@ struct Args {
     /// Prints upload/forward/loss/backward/update GPU time per profiled step.
     #[arg(long, default_value = "0")]
     cuda_cpp_profile_steps: usize,
+
+    /// Write per-superbatch cuda-cpp diagnostics. `1` profiles one CUDA step
+    /// every superbatch, `N` profiles one CUDA step every N superbatches, and
+    /// `0` disables the diagnostics log. The profiled step synchronises CUDA
+    /// streams, so keep this at a small rate only while diagnosing throughput.
+    #[arg(long, default_value = "1")]
+    cuda_cpp_diagnostics_rate: usize,
 
     /// In C++/CUDA direct-step mode, skip the final numbered checkpoint and
     /// `cuda-cpp-direct` full-state output. Useful for throughput/validation
@@ -6141,6 +6188,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         cuda_cpp_loss_progress_log_path(args).display(),
         cuda_cpp_loss_progress_policy(args)
     );
+    if args.cuda_cpp_diagnostics_rate > 0 {
+        eprintln!(
+            "  cuda-cpp SFNN diagnostics log = {} (teacher queue/load/prepare per sb; 1 CUDA-profiled step every {} sb)",
+            cuda_cpp_diagnostics_log_path(args).display(),
+            args.cuda_cpp_diagnostics_rate
+        );
+    }
     eprintln!("  cuda-cpp SFNN upload pipeline = enabled (2 slots; non-profiled steps)");
 
     let cuda_shape = initial_weights.shape;
@@ -6189,6 +6243,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut profile_bwd_l0_ms = 0.0_f64;
     let mut profile_bwd_total_ms = 0.0_f64;
     let mut profile_count = 0usize;
+    let mut sfnn_diagnostics = CudaCppSfnnDiagnostics::default();
     let completed_step_offset = initial_state.completed_steps;
     let optimizer_step_offset = initial_state.optimizer_steps;
     let started = std::time::Instant::now();
@@ -6573,6 +6628,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
+        let progress_for_step = schedule.progress_for_step(seen_steps);
+        sfnn_diagnostics.observe_teacher(teacher_batch.timing);
         let optimizer_step = optimizer_step_offset + seen_steps;
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
@@ -6608,42 +6665,48 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         };
         let should_report = is_checkpoint_step
             || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
-        if seen_steps <= profile_steps {
+        let explicit_profile_step = seen_steps <= profile_steps;
+        let diagnostic_profile_step =
+            !explicit_profile_step && cuda_cpp_should_profile_sfnn_diagnostics(args, progress_for_step);
+        if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
                 .map_err(|e| e.to_string())?;
-            profile_upload_ms += f64::from(profile.upload_ms);
-            profile_forward_ms += f64::from(profile.forward_ms);
-            profile_loss_ms += f64::from(profile.loss_ms);
-            profile_backward_ms += f64::from(profile.backward_ms);
-            profile_update_ms += f64::from(profile.update_ms);
-            profile_total_ms += f64::from(profile.total_ms);
-            profile_bwd_zero_ms += f64::from(profile.backward_stages.zero_ms);
-            profile_bwd_l3_ms += f64::from(profile.backward_stages.l3_ms);
-            profile_bwd_l2_ms += f64::from(profile.backward_stages.l2_ms);
-            profile_bwd_l2_input_ms += f64::from(profile.backward_stages.l2_input_ms);
-            profile_bwd_l1_ms += f64::from(profile.backward_stages.l1_ms);
-            profile_bwd_l0_ms += f64::from(profile.backward_stages.l0_ms);
-            profile_bwd_total_ms += f64::from(profile.backward_stages.total_ms);
-            profile_count += 1;
-            eprintln!(
-                "  profile_cuda_cpp_sfnn step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
-                 backward={:.3}ms update={:.3}ms total={:.3}ms \
-                 bwd[zero={:.3} l3={:.3} l2={:.3} l2in={:.3} l1={:.3} l0={:.3} total={:.3}]",
-                profile.upload_ms,
-                profile.forward_ms,
-                profile.loss_ms,
-                profile.backward_ms,
-                profile.update_ms,
-                profile.total_ms,
-                profile.backward_stages.zero_ms,
-                profile.backward_stages.l3_ms,
-                profile.backward_stages.l2_ms,
-                profile.backward_stages.l2_input_ms,
-                profile.backward_stages.l1_ms,
-                profile.backward_stages.l0_ms,
-                profile.backward_stages.total_ms
-            );
+            sfnn_diagnostics.observe_profile(&profile);
+            if explicit_profile_step {
+                profile_upload_ms += f64::from(profile.upload_ms);
+                profile_forward_ms += f64::from(profile.forward_ms);
+                profile_loss_ms += f64::from(profile.loss_ms);
+                profile_backward_ms += f64::from(profile.backward_ms);
+                profile_update_ms += f64::from(profile.update_ms);
+                profile_total_ms += f64::from(profile.total_ms);
+                profile_bwd_zero_ms += f64::from(profile.backward_stages.zero_ms);
+                profile_bwd_l3_ms += f64::from(profile.backward_stages.l3_ms);
+                profile_bwd_l2_ms += f64::from(profile.backward_stages.l2_ms);
+                profile_bwd_l2_input_ms += f64::from(profile.backward_stages.l2_input_ms);
+                profile_bwd_l1_ms += f64::from(profile.backward_stages.l1_ms);
+                profile_bwd_l0_ms += f64::from(profile.backward_stages.l0_ms);
+                profile_bwd_total_ms += f64::from(profile.backward_stages.total_ms);
+                profile_count += 1;
+                eprintln!(
+                    "  profile_cuda_cpp_sfnn step={seen_steps:<6} upload={:.3}ms forward={:.3}ms loss={:.3}ms \
+                     backward={:.3}ms update={:.3}ms total={:.3}ms \
+                     bwd[zero={:.3} l3={:.3} l2={:.3} l2in={:.3} l1={:.3} l0={:.3} total={:.3}]",
+                    profile.upload_ms,
+                    profile.forward_ms,
+                    profile.loss_ms,
+                    profile.backward_ms,
+                    profile.update_ms,
+                    profile.total_ms,
+                    profile.backward_stages.zero_ms,
+                    profile.backward_stages.l3_ms,
+                    profile.backward_stages.l2_ms,
+                    profile.backward_stages.l2_input_ms,
+                    profile.backward_stages.l1_ms,
+                    profile.backward_stages.l0_ms,
+                    profile.backward_stages.total_ms
+                );
+            }
         } else {
             runner
                 .step_pipelined_no_readback_with_loss_finalize(
@@ -6754,6 +6817,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             checkpoint_elapsed,
                         )),
                     );
+                    if let Some(progress) = progress {
+                        append_cuda_cpp_sfnn_diagnostics_log(
+                            args,
+                            progress,
+                            positions,
+                            progress_stats,
+                            &sfnn_diagnostics,
+                        )?;
+                        sfnn_diagnostics.reset();
+                    }
                     if let Some(metrics) = test_metrics {
                         print_cuda_cpp_validation_summary_elapsed(
                             "cuda-cpp SFNN",
@@ -6800,6 +6873,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         positions,
                         progress_stats,
                     );
+                    if let Some(progress) = progress {
+                        append_cuda_cpp_sfnn_diagnostics_log(
+                            args,
+                            progress,
+                            positions,
+                            progress_stats,
+                            &sfnn_diagnostics,
+                        )?;
+                        sfnn_diagnostics.reset();
+                    }
                     print_cuda_cpp_validation_overhead(
                         "cuda-cpp SFNN",
                         CudaCppCheckpointTiming::new(
@@ -6824,6 +6907,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         "  cuda-cpp SFNN checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
                         chunk.epoch, chunk.superbatch
                     );
+                    let progress = schedule.progress_for_step(seen_steps);
+                    let positions = seen_steps.saturating_mul(batch_size);
+                    let (train_elapsed_sec, _positions_per_sec) =
+                        cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                    let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
+                    if let Some(progress) = progress {
+                        append_cuda_cpp_sfnn_diagnostics_log(
+                            args,
+                            progress,
+                            positions,
+                            progress_stats,
+                            &sfnn_diagnostics,
+                        )?;
+                        sfnn_diagnostics.reset();
+                    }
                 }
             } else {
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
@@ -6839,6 +6937,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             let (train_elapsed_sec, _positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
             let progress_stats = progress_meter.sample(positions, train_elapsed_sec);
             print_cuda_cpp_superbatch_progress("cuda-cpp SFNN", progress, batch_size, positions, progress_stats);
+            if let Some(progress) = progress {
+                append_cuda_cpp_sfnn_diagnostics_log(args, progress, positions, progress_stats, &sfnn_diagnostics)?;
+                sfnn_diagnostics.reset();
+            }
         }
         Ok::<(), String>(())
     })
@@ -10802,6 +10904,11 @@ fn cuda_cpp_loss_progress_log_path(args: &Args) -> PathBuf {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_diagnostics_log_path(args: &Args) -> PathBuf {
+    args.output_dir().join(CUDA_CPP_DIAGNOSTICS_LOG_NAME)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_loss_progress_policy(args: &Args) -> String {
     if args.cuda_cpp_loss_readback_interval == 0 {
         "checkpoint/validation/final only".to_string()
@@ -10827,6 +10934,81 @@ fn cuda_cpp_print_teacher_shuffle_buffer(args: &Args, schedule: &CudaCppRunSched
         args.teacher_shuffle_seed
     );
     Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCppScheduleProgress>) -> bool {
+    let rate = args.cuda_cpp_diagnostics_rate;
+    if rate == 0 {
+        return false;
+    }
+    let Some(progress) = progress else { return false };
+    progress.batch_in_superbatch == 1 && (progress.superbatch.saturating_sub(1) % rate == 0)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn append_cuda_cpp_sfnn_diagnostics_log(
+    args: &Args,
+    progress: CudaCppScheduleProgress,
+    positions: usize,
+    stats: CudaCppProgressStats,
+    diag: &CudaCppSfnnDiagnostics,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if args.cuda_cpp_diagnostics_rate == 0 || diag.batches == 0 {
+        return Ok(());
+    }
+
+    let path = cuda_cpp_diagnostics_log_path(args);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let write_header = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    if write_header {
+        writeln!(file, "{CUDA_CPP_DIAGNOSTICS_LOG_HEADER}")
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+
+    let train_sec = stats.interval_train_elapsed_sec.max(0.0);
+    let pct = |seconds: f64| -> f64 {
+        if train_sec > 0.0 && seconds.is_finite() { 100.0 * seconds.max(0.0) / train_sec } else { 0.0 }
+    };
+    let profile_denom = diag.cuda_profile_steps.max(1) as f64;
+    let avg_or_zero = |sum_ms: f64| -> f64 {
+        if diag.cuda_profile_steps > 0 && sum_ms.is_finite() { sum_ms / profile_denom } else { 0.0 }
+    };
+
+    writeln!(
+        file,
+        "SFNN,{},{},{},{},{},{:.6},{:.0},{:.6},{:.6},{:.6},{:.3},{:.3},{:.3},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+        progress.epoch,
+        progress.superbatch,
+        progress.superbatches_per_epoch,
+        diag.batches,
+        positions,
+        train_sec,
+        stats.interval_positions_per_sec,
+        diag.teacher_queue_wait_sec,
+        diag.teacher_load_sec,
+        diag.teacher_prepare_sec,
+        pct(diag.teacher_queue_wait_sec),
+        pct(diag.teacher_load_sec),
+        pct(diag.teacher_prepare_sec),
+        diag.cuda_profile_steps,
+        avg_or_zero(diag.cuda_upload_ms),
+        avg_or_zero(diag.cuda_forward_ms),
+        avg_or_zero(diag.cuda_loss_ms),
+        avg_or_zero(diag.cuda_backward_ms),
+        avg_or_zero(diag.cuda_update_ms),
+        avg_or_zero(diag.cuda_total_ms),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -11567,6 +11749,8 @@ const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
 /// instead of stdout; console output stays at checkpoint/validation granularity.
 const CUDA_CPP_PROGRESS_LOG_NAME: &str = "cuda-cpp-progress.log";
 const CUDA_CPP_PROGRESS_LOG_HEADER: &str = "kind,step,total_steps,optimizer_step,epoch,superbatch,superbatches_per_epoch,batch,batches_per_superbatch,positions,train_elapsed_sec,pos_per_sec,loss_mean,source";
+const CUDA_CPP_DIAGNOSTICS_LOG_NAME: &str = "cuda-cpp-diagnostics.log";
+const CUDA_CPP_DIAGNOSTICS_LOG_HEADER: &str = "kind,epoch,superbatch,superbatches_per_epoch,batches,positions,sb_train_sec,sb_pos_per_sec,teacher_queue_wait_sec,teacher_load_sec,teacher_prepare_sec,teacher_queue_wait_pct,teacher_load_pct,teacher_prepare_pct,cuda_profile_steps,cuda_upload_ms,cuda_forward_ms,cuda_loss_ms,cuda_backward_ms,cuda_update_ms,cuda_total_ms";
 const PLATEAU_EPOCH_DONE_NAME: &str = "plateau_epoch_done.txt";
 
 /// Bundle of parameters the enrichment functions need to turn bullet's
