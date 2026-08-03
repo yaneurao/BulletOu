@@ -4157,7 +4157,7 @@ fn quantized_test_positions(
                     &mut state,
                 )?;
                 state.report.records += 1;
-                if score_cap.is_some_and(|cap| score.abs() >= cap) {
+                if score_cap.is_some_and(|cap| i32::from(positions[sample].score()).abs() >= cap) {
                     state.report.filtered_by_score_cap += 1;
                     return Ok(state);
                 }
