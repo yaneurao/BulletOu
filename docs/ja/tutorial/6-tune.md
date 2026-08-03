@@ -18,8 +18,8 @@
 | `--teacher-shuffle-buffer-sbs` | 学習時 teacher shuffle window を superbatch 単位で指定する。`4` なら 4 superbatch 分の CPU window を 2 個確保する。`0` で無効。通常はこちらを使う | 1 |
 | `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window を mini-batch 単位で細かく指定する。`--teacher-shuffle-buffer-sbs` とは同時指定不可 | 省略 |
 | `--teacher-shuffle-seed` | 学習時 teacher shuffle の base seed | 0 |
-| `--threads` | teacher batch preparation の CPU worker 数。省略または `0` なら OS の論理スレッド数の半分、つまり物理スレッド相当を使う。明示値はそのまま使う | auto (= logical/2) |
-| `--loader-threads` | HCPE decode の CPU worker 数。省略または `0` なら `--threads` と同じ auto 値。decode が GPU upload/main thread を圧迫する場合は明示的に下げる | auto (= logical/2) |
+| `--threads` | teacher batch preparation の CPU worker 数。省略または `0` なら throughput 優先の auto 値として `logical_threads * 2` を使い、最大 24 に丸める。明示値はそのまま使う | auto (= min(logical*2, 24)) |
+| `--loader-threads` | HCPE decode の CPU worker 数。省略または `0` なら `--threads` と同じ auto 値。decode が GPU upload/main thread を圧迫する場合は明示的に下げる | auto (= min(logical*2, 24)) |
 | `--cuda-cpp-diagnostics-rate` | SFNN の superbatch 診断ログ。`cuda-cpp-diagnostics.log` に teacher queue wait / load / prepare と CUDA 代表 step の stage 時間を書く。`1` なら毎 sb、`N` なら N sb ごとに CUDA stage を profile、`0` で無効 | 1 |
 | `--superbatches` | 1 epoch を何 superbatch にするか。`geometric` / `cos` では LR cycle 長そのもの。`step` では epoch 内の処理上限、`plateau` では安全上限 | 上限なし (= 非 plateau は教師EOFまで、plateau は `lr_min` 到達まで) |
 | `--max-epochs` | epoch を最大何回実行するか。`--max-epoch` も alias として使える。`step` / `geometric` / `cos` では LR cycle を最大何回繰り返すか、`plateau` では plateau epoch を最大何回繰り返すか。`--test-teacher` があれば epoch 末の loss/accuracy がどちらも改善しない時点で上限前でも停止 | 省略時は epoch 上限なし |

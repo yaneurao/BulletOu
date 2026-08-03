@@ -2232,7 +2232,7 @@ fn cuda_cpp_default_cpu_threads() -> usize {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_default_cpu_threads_from_logical(logical: usize) -> usize {
-    logical.max(1).div_ceil(2).max(1)
+    logical.saturating_mul(2).clamp(4, 24)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -2710,7 +2710,8 @@ struct Args {
     no_save_epoch_end: bool,
 
     /// Teacher batch preparation worker threads (CPU side). Omit or set `0`
-    /// for auto ~= physical thread count (`available_parallelism() / 2`).
+    /// for throughput-oriented auto (`available_parallelism() * 2`, capped at
+    /// 24). If decode workers starve other CPU work, set this explicitly.
     #[arg(long)]
     threads: Option<usize>,
 
@@ -2751,11 +2752,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     teacher_shuffle_seed: u64,
 
-    /// HCPE decode parallelism. `0` (default) means auto ~= physical thread
-    /// count (`available_parallelism() / 2`). Use `--loader-threads 8` etc. to
-    /// tune CPU pressure manually. The actual value is printed at startup as
-    /// `read buffer ready: ... (N decode threads)`. Currently this only affects
-    /// the HCPE loader; HCPE3 / .pack / .psv do not use this knob.
+    /// HCPE decode parallelism. `0` (default) means throughput-oriented auto
+    /// (`available_parallelism() * 2`, capped at 24). Use
+    /// `--loader-threads 8` etc. to tune CPU pressure manually. The actual
+    /// value is printed at startup as `read buffer ready: ... (N decode
+    /// threads)`. Currently this only affects the HCPE loader; HCPE3 / .pack /
+    /// .psv do not use this knob.
     #[arg(long, default_value = "0")]
     loader_threads: usize,
 
@@ -15589,14 +15591,15 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(1), 1);
-        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(12), 6);
-        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(24), 12);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(1), 4);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(2), 4);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(12), 24);
+        assert_eq!(cuda_cpp_default_cpu_threads_from_logical(24), 24);
 
         let logical_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
         let default_threads = cuda_cpp_default_cpu_threads();
         assert_eq!(default_threads, cuda_cpp_default_cpu_threads_from_logical(logical_threads));
-        assert!(default_threads <= logical_threads.max(1));
+        assert!(default_threads <= 24);
         assert_eq!(cuda_cpp_effective_teacher_threads(&args), default_threads);
         assert_eq!(cuda_cpp_effective_loader_threads(&args), default_threads);
         assert_eq!(cuda_cpp_effective_batch_queue_size(&args), 4);
