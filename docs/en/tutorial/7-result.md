@@ -103,7 +103,7 @@ A healthy training run typically shows:
    - Drops sharply at first, then slowly tapers
    - You should see a visible drop per superbatch consumed
    - No drop after a full superbatch ⇒ `--lr` may be too large, or the teacher is too small for the model
-   - **Periodic loss spikes** or local loss bias almost always mean teacher positions were not shuffled enough. Pre-shuffle the teacher, or use `--teacher-shuffle-buffer-batches`. See [§3.2 Shuffle teacher positions](3-data.md#shuffle-teacher-positions)
+   - **Periodic loss spikes** or local loss bias almost always mean teacher positions were not shuffled enough. Pre-shuffle the teacher, or use `--teacher-shuffle-buffer-sbs`. See [§3.2 Shuffle teacher positions](3-data.md#shuffle-teacher-positions)
 
 2. **`lr_start` / `lr_end` follow the configured schedule**
    - `--lr-schedule step` (default): multiply lr by `gamma` once per superbatch, floor at `--lr-min`, and restart to `--lr` at epoch boundaries. `gamma` is either explicit or auto-computed from one epoch's length.

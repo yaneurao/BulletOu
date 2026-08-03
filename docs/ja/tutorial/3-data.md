@@ -45,16 +45,16 @@ teachers/
 
 ### 教師局面をシャッフルする
 
-> ⚠️ **重要**: 教師局面は、事前にシャッフルするか、学習時に `--teacher-shuffle-buffer-batches` を使ってシャッフルすること。
+> ⚠️ **重要**: 教師局面は、事前にシャッフルするか、学習時に `--teacher-shuffle-buffer-sbs` / `--teacher-shuffle-buffer-batches` を使ってシャッフルすること。
 
-`--buffer-mb` は読み込みバッファのサイズであり、シャッフル用の指定ではない。BulletOu は、`--teacher-shuffle-buffer-batches` を省略すると学習時 shuffle をデフォルトで有効にする。このとき `batch_size × batches_per_superbatch` 局面、つまり 1 superbatch 分の CPU window を 2 個確保する。片方から mini-batch を取り出している間に、もう片方を読み込み・Fisher-Yates shuffle する。window を変更したい場合は `--teacher-shuffle-buffer-batches N`、学習時 shuffle を無効化したい場合は `--teacher-shuffle-buffer-batches 0` を指定する。
+`--buffer-mb` は読み込みバッファのサイズであり、シャッフル用の指定ではない。BulletOu は、shuffle window を省略すると学習時 shuffle をデフォルトで有効にする。このとき `batch_size × batches_per_superbatch` 局面、つまり 1 superbatch 分の CPU window を 2 個確保する。片方から mini-batch を取り出している間に、もう片方を読み込み・Fisher-Yates shuffle する。window を superbatch 単位で変更したい場合は `--teacher-shuffle-buffer-sbs N`、mini-batch 単位で細かく指定したい場合は `--teacher-shuffle-buffer-batches N`、学習時 shuffle を無効化したい場合は `--teacher-shuffle-buffer-sbs 0` を指定する。
 
 `gensfen` / dlshogi-style 生成器の出力は **同一対局内の局面が連続して並んでいる** のが普通なので、ファイル全体をシャッフルしないまま学習すると、近い局面ばかりが連続して mini-batch に入り、loss や plateau 判定が教師の局所的な偏りに振り回される。
 
 対策:
 - **`.hcpe` / `.psv`**: [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `teacher/shuffle_split_teacher_external.py` を使う。巨大な教師フォルダでも全体をメモリに載せず、bucket 分配してから出力ファイルへ分割できる。
 - **`.hcpe3` / `.pack`**: 棋譜単位の可変長形式なので単純な固定長レコード shuffle には向かない。生成時点で局面順を混ぜる、または `.psv` / `.hcpe` のような固定長局面形式に変換してからシャッフルする。
-- **学習時 shuffle**: デフォルトで有効。たとえば `batch_size=65536`, `positions-per-superbatch=40000000` なら実効 `batches_per_superbatch=610` なので、デフォルト window は `610` batches になる。40 byte の PSV/HCPE 互換 record として 1 window は約 1.5 GiB、double buffer なので合計約 3.0 GiB の CPU メモリを使う。実際の確保量は学習開始時に表示される。window を大きくしたい場合は `--teacher-shuffle-buffer-batches 21960` のように明示する。
+- **学習時 shuffle**: デフォルトで有効。たとえば `batch_size=65536`, `positions-per-superbatch=40000000` なら実効 `batches_per_superbatch=610` なので、デフォルト window は `610` batches になる。40 byte の PSV/HCPE 互換 record として 1 window は約 1.5 GiB、double buffer なので合計約 3.0 GiB の CPU メモリを使う。実際の確保量は学習開始時に表示される。4 superbatch 分にしたい場合は `--teacher-shuffle-buffer-sbs 4` のように指定する。
 
 HCPE/PSVフォルダを 1000 万局面ごとにシャッフル分割する例:
 

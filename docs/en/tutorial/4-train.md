@@ -4,7 +4,7 @@
 
 Goal: produce a YaneuraOu-loadable evaluation function from the teacher data you prepared.
 
-This page assumes you have already completed [3. Prepare training data](3-data.md): the teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready, and teacher positions are either pre-shuffled or will be shuffled during training with `--teacher-shuffle-buffer-batches`.
+This page assumes you have already completed [3. Prepare training data](3-data.md): the teacher file (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) is ready, and teacher positions are either pre-shuffled or will be shuffled during training with `--teacher-shuffle-buffer-sbs`.
 
 ## 4.1 Build (one-off)
 

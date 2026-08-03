@@ -45,16 +45,16 @@ teachers/
 
 ### Shuffle teacher positions
 
-> ⚠️ **Important**: shuffle teacher positions either before training, or during training with `--teacher-shuffle-buffer-batches`.
+> ⚠️ **Important**: shuffle teacher positions either before training, or during training with `--teacher-shuffle-buffer-sbs` / `--teacher-shuffle-buffer-batches`.
 
-`--buffer-mb` controls the loader read buffer size; it is not a shuffle option. BulletOu shuffles during training by default with `--teacher-shuffle-buffer-batches` omitted: it allocates two CPU windows of one superbatch each (`batch_size × batches_per_superbatch` decoded positions per window). While mini-batches are consumed from one window, the other window is read and Fisher-Yates shuffled in the background. Use `--teacher-shuffle-buffer-batches N` to choose an explicit window, or `--teacher-shuffle-buffer-batches 0` to disable in-trainer shuffling.
+`--buffer-mb` controls the loader read buffer size; it is not a shuffle option. BulletOu shuffles during training by default when the shuffle window is omitted: it allocates two CPU windows of one superbatch each (`batch_size × batches_per_superbatch` decoded positions per window). While mini-batches are consumed from one window, the other window is read and Fisher-Yates shuffled in the background. Use `--teacher-shuffle-buffer-sbs N` to choose a window in superbatches, `--teacher-shuffle-buffer-batches N` for exact mini-batch units, or `--teacher-shuffle-buffer-sbs 0` to disable in-trainer shuffling.
 
 `gensfen` and dlshogi-style generators usually emit positions **grouped by game** (positions from one game are contiguous). If you train on such files directly, nearby positions from the same game dominate consecutive mini-batches, and loss / plateau decisions become sensitive to local teacher bias.
 
 How to shuffle:
 - **`.hcpe` / `.psv` / `.bin`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
 - **`.hcpe3` / `.pack`**: these are variable-length game formats, so record-level shuffling is not straightforward. Shuffle at generation time, or convert to a fixed-position format such as `.psv` / `.hcpe` and shuffle that.
-- **In-trainer shuffle**: enabled by default. For example, with `batch_size=65536` and `positions-per-superbatch=40000000`, the effective `batches_per_superbatch` is `610`, so the default window is `610` batches. One window is about 1.5 GiB for 40-byte PSV/HCPE-compatible records, so the double buffer uses about 3.0 GiB of CPU memory. The exact allocation is printed at startup. Use an explicit value such as `--teacher-shuffle-buffer-batches 21960` if you want a larger shuffle window.
+- **In-trainer shuffle**: enabled by default. For example, with `batch_size=65536` and `positions-per-superbatch=40000000`, the effective `batches_per_superbatch` is `610`, so the default window is `610` batches. One window is about 1.5 GiB for 40-byte PSV/HCPE-compatible records, so the double buffer uses about 3.0 GiB of CPU memory. The exact allocation is printed at startup. Use `--teacher-shuffle-buffer-sbs 4` if you want a 4-superbatch window.
 
 Example: shuffle/split an HCPE or PSV folder into 10M-position files:
 

@@ -15,7 +15,8 @@ Main flags:
 | `--backend` | Training backend. BulletOu training is Windows-native `cuda-cpp`; this option remains only for explicit scripts and currently accepts only `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses 65536 to match tatara | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. The actual value is rounded down to a multiple of `--batch-size` | 100000000 |
-| `--teacher-shuffle-buffer-batches` | In-trainer teacher shuffle window. BulletOu allocates two CPU windows of `batch_size × N` positions each, consuming mini-batches from one while reading and Fisher-Yates shuffling the other. If omitted, `N` defaults to one superbatch (`batches_per_superbatch`). `0` disables it | one superbatch |
+| `--teacher-shuffle-buffer-sbs` | In-trainer teacher shuffle window in superbatches. `4` means two CPU windows of four superbatches each. `0` disables it. This is the usual human-facing knob | 1 |
+| `--teacher-shuffle-buffer-batches` | In-trainer teacher shuffle window in exact mini-batches. Mutually exclusive with `--teacher-shuffle-buffer-sbs` | omitted |
 | `--teacher-shuffle-seed` | Base seed for in-trainer teacher shuffle | 0 |
 | `--threads` | CPU workers for teacher batch preparation. If omitted or set to `0`, BulletOu uses half of the OS logical thread count, approximating the physical thread count. Explicit values are preserved | auto (= logical/2) |
 | `--loader-threads` | CPU workers for HCPE decode. If omitted or set to `0`, BulletOu uses the same auto value as `--threads`. Lower it explicitly if decode workers starve GPU upload/main threads | auto (= logical/2) |

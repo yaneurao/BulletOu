@@ -2275,6 +2275,16 @@ fn effective_positions_per_superbatch(args: &Args) -> Result<usize, String> {
 const TEACHER_SHUFFLE_PREFETCH_BUFFERS: usize = 2;
 
 fn effective_teacher_shuffle_buffer_batches(args: &Args, batches_per_superbatch: usize) -> Result<usize, String> {
+    if args.teacher_shuffle_buffer_batches.is_some() && args.teacher_shuffle_buffer_sbs.is_some() {
+        return Err(
+            "--teacher-shuffle-buffer-batches and --teacher-shuffle-buffer-sbs cannot be used together".to_string()
+        );
+    }
+    if let Some(sbs) = args.teacher_shuffle_buffer_sbs {
+        return batches_per_superbatch.checked_mul(sbs).ok_or_else(|| {
+            format!("--teacher-shuffle-buffer-sbs overflow: batches_per_superbatch={batches_per_superbatch}, sbs={sbs}")
+        });
+    }
     if let Some(batches) = args.teacher_shuffle_buffer_batches {
         return Ok(batches);
     }
@@ -2283,13 +2293,15 @@ fn effective_teacher_shuffle_buffer_batches(args: &Args, batches_per_superbatch:
     Ok(default_windows)
 }
 
-fn teacher_shuffle_buffer_mode(args: &Args) -> &'static str {
+fn teacher_shuffle_buffer_mode(args: &Args) -> String {
     if args.teacher_shuffle_buffer_batches.is_some() {
-        "explicit"
+        "explicit batches".to_string()
+    } else if let Some(sbs) = args.teacher_shuffle_buffer_sbs {
+        format!("explicit {sbs} sb")
     } else if args.cuda_cpp_train_steps.is_some() {
-        "default run"
+        "default run".to_string()
     } else {
-        "default superbatch"
+        "default superbatch".to_string()
     }
 }
 
@@ -2299,10 +2311,7 @@ fn teacher_shuffle_buffer_records(args: &Args, batches_per_superbatch: usize) ->
         return Ok(None);
     }
     effective_batch_size(args).checked_mul(batches).map(Some).ok_or_else(|| {
-        format!(
-            "--teacher-shuffle-buffer-batches overflow: batch_size={} batches={batches}",
-            effective_batch_size(args)
-        )
+        format!("teacher shuffle buffer overflow: batch_size={} batches={batches}", effective_batch_size(args))
     })
 }
 
@@ -2312,13 +2321,13 @@ fn validate_teacher_shuffle_buffer(args: &Args, batches_per_superbatch: usize) -
     };
     let buffer_batches = effective_teacher_shuffle_buffer_batches(args, batches_per_superbatch)?;
     if batches_per_superbatch == 0 {
-        return Err("--teacher-shuffle-buffer-batches requires a nonzero superbatch size".to_string());
+        return Err("teacher shuffle buffer requires a nonzero superbatch size".to_string());
     }
     if buffer_batches == 0 {
         return Ok(());
     }
     if records == 0 {
-        return Err("--teacher-shuffle-buffer-batches resolved to an empty buffer".to_string());
+        return Err("teacher shuffle buffer resolved to an empty buffer".to_string());
     }
     Ok(())
 }
@@ -2329,7 +2338,7 @@ fn teacher_shuffle_buffer_mib(args: &Args, batches_per_superbatch: usize) -> Res
     };
     let bytes = (records as u128)
         .checked_mul(std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u128)
-        .ok_or_else(|| "--teacher-shuffle-buffer-batches byte size overflow".to_string())?;
+        .ok_or_else(|| "teacher shuffle buffer byte size overflow".to_string())?;
     Ok(Some(bytes as f64 / (1024.0 * 1024.0)))
 }
 
@@ -2712,8 +2721,8 @@ struct Args {
     /// Loader read buffer size in megabytes. PSV uses 40 bytes per record, so
     /// `--buffer-mb 4096` can hold about 107M positions (roughly one default
     /// superbatch) in the read buffer. This is the loader read buffer, not the
-    /// optional training shuffle window; use `--teacher-shuffle-buffer-batches`
-    /// for in-trainer shuffling.
+    /// optional training shuffle window; use `--teacher-shuffle-buffer-sbs` or
+    /// `--teacher-shuffle-buffer-batches` for in-trainer shuffling.
     ///
     /// RAM usage: the buffer itself is `buffer_mb` MB. Including model,
     /// optimiser, and batch-queue data, expect peak memory to be somewhat
@@ -2726,11 +2735,19 @@ struct Args {
     /// disables it. When enabled, BulletOu uses two CPU windows, each
     /// accumulating `batch_size * N` decoded positions. It Fisher-Yates
     /// shuffles each window, emits mini-batches from one window, and
-    /// fills/shuffles the other window in the background.
+    /// fills/shuffles the other window in the background. Mutually exclusive
+    /// with `--teacher-shuffle-buffer-sbs`.
     #[arg(long)]
     teacher_shuffle_buffer_batches: Option<usize>,
 
-    /// Base seed for `--teacher-shuffle-buffer-batches`.
+    /// In-trainer teacher shuffle window in superbatches. For example,
+    /// `--teacher-shuffle-buffer-sbs 4` means four superbatches per CPU window,
+    /// double-buffered. `0` disables it. Mutually exclusive with
+    /// `--teacher-shuffle-buffer-batches`.
+    #[arg(long)]
+    teacher_shuffle_buffer_sbs: Option<usize>,
+
+    /// Base seed for in-trainer teacher shuffle.
     #[arg(long, default_value = "0")]
     teacher_shuffle_seed: u64,
 
@@ -13562,6 +13579,70 @@ mod tests {
         assert_eq!(teacher_shuffle_buffer_records(&explicit, batches_per_superbatch).unwrap(), Some(65_536 * 61));
         assert!(resume_signature(&explicit).contains("teacher_shuffle_buffer_batches=61"));
         assert!(resume_signature(&explicit).contains("teacher_shuffle_seed=42"));
+
+        let explicit_sbs = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--superbatches",
+            "36",
+            "--max-epochs",
+            "1",
+            "--teacher-shuffle-buffer-sbs",
+            "4",
+        ])
+        .unwrap();
+        validate_teacher_shuffle_buffer(&explicit_sbs, batches_per_superbatch).unwrap();
+        assert_eq!(effective_teacher_shuffle_buffer_batches(&explicit_sbs, batches_per_superbatch).unwrap(), 610 * 4);
+        assert_eq!(
+            teacher_shuffle_buffer_records(&explicit_sbs, batches_per_superbatch).unwrap(),
+            Some(65_536 * 610 * 4)
+        );
+        assert!(resume_signature(&explicit_sbs).contains("teacher_shuffle_buffer_batches=2440"));
+
+        let disabled_sbs = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--superbatches",
+            "36",
+            "--max-epochs",
+            "1",
+            "--teacher-shuffle-buffer-sbs",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(effective_teacher_shuffle_buffer_batches(&disabled_sbs, batches_per_superbatch).unwrap(), 0);
+        assert_eq!(teacher_shuffle_buffer_records(&disabled_sbs, batches_per_superbatch).unwrap(), None);
+        assert!(resume_signature(&disabled_sbs).contains("teacher_shuffle_buffer_batches=0"));
+
+        let conflicting = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--superbatches",
+            "36",
+            "--max-epochs",
+            "1",
+            "--teacher-shuffle-buffer-batches",
+            "61",
+            "--teacher-shuffle-buffer-sbs",
+            "4",
+        ])
+        .unwrap();
+        assert!(validate_teacher_shuffle_buffer(&conflicting, batches_per_superbatch).is_err());
 
         let disabled = Args::try_parse_from([
             "bulletou",

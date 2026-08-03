@@ -15,7 +15,8 @@
 | `--backend` | 学習 backend。現行は Windows-native `cuda-cpp` のみ対応。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
-| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window。`batch_size × N` 局面のCPU windowを2個確保し、片方を消費中に片方を読み込み・Fisher-Yates shuffleする。省略時の `N` は 1 superbatch 分 (`batches_per_superbatch`)。`0` で無効 | 1 superbatch |
+| `--teacher-shuffle-buffer-sbs` | 学習時 teacher shuffle window を superbatch 単位で指定する。`4` なら 4 superbatch 分の CPU window を 2 個確保する。`0` で無効。通常はこちらを使う | 1 |
+| `--teacher-shuffle-buffer-batches` | 学習時 teacher shuffle window を mini-batch 単位で細かく指定する。`--teacher-shuffle-buffer-sbs` とは同時指定不可 | 省略 |
 | `--teacher-shuffle-seed` | 学習時 teacher shuffle の base seed | 0 |
 | `--threads` | teacher batch preparation の CPU worker 数。省略または `0` なら OS の論理スレッド数の半分、つまり物理スレッド相当を使う。明示値はそのまま使う | auto (= logical/2) |
 | `--loader-threads` | HCPE decode の CPU worker 数。省略または `0` なら `--threads` と同じ auto 値。decode が GPU upload/main thread を圧迫する場合は明示的に下げる | auto (= logical/2) |

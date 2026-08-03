@@ -102,7 +102,7 @@ CSV header 付きなので `pd.read_csv` で列名は自動取得される。
    - 学習開始直後は急に下がり、徐々に減衰
    - 1 superbatch を消化するごとに目に見えて下がるのが理想
    - 1 superbatch まわっても下がらない場合は `--lr` が大きすぎる、または教師サイズが学習器のキャパに対して小さすぎる可能性
-   - **periodic な loss スパイク** や局所的な loss の偏りが見える場合は、教師局面のシャッフル不足の可能性が高い。事前シャッフルするか、`--teacher-shuffle-buffer-batches` を使う。対処は [§3.2 教師局面をシャッフルする](3-data.md#教師局面をシャッフルする) を参照
+   - **periodic な loss スパイク** や局所的な loss の偏りが見える場合は、教師局面のシャッフル不足の可能性が高い。事前シャッフルするか、`--teacher-shuffle-buffer-sbs` を使う。対処は [§3.2 教師局面をシャッフルする](3-data.md#教師局面をシャッフルする) を参照
 
 2. **`lr_start` / `lr_end` がスケジュール通りに動いている**
    - `--lr-schedule step` (デフォルト): 1 superbatch ごとに `lr *= gamma` し、`--lr-min` を下限にする。`gamma` は明示値、または 1 epoch 長から自動計算された値。epoch 境界で `--lr` に戻る
