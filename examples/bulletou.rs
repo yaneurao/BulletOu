@@ -1595,7 +1595,35 @@ fn paint_log_tag(tag: &str, color: ConsoleColor) -> String {
     paint(format!("{tag:<7}"), color)
 }
 
+fn paint_startup_label(label: &str) -> String {
+    paint(format!("{label:<28}"), ConsoleColor::BoldCyan)
+}
+
+fn print_startup_kv(label: &str, value: impl std::fmt::Display) {
+    eprintln!("  {} = {}", paint_startup_label(label), value);
+}
+
+fn print_startup_kv_colored(label: &str, value: impl std::fmt::Display, color: ConsoleColor) {
+    print_startup_kv(label, paint(value, color));
+}
+
+fn print_startup_banner(text: impl std::fmt::Display) {
+    eprintln!("  {}", paint(text, ConsoleColor::BoldGreen));
+}
+
 fn format_count(value: usize) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx > 0 && (raw.len() - idx) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_count_u64(value: u64) -> String {
     let raw = value.to_string();
     let mut out = String::with_capacity(raw.len() + raw.len() / 3);
     for (idx, ch) in raw.chars().enumerate() {
@@ -4591,23 +4619,31 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     let device = args.cuda_cpp_device;
     let output_dir = args.output_dir();
 
-    eprintln!(
-        "  backend = cuda-cpp Windows-native direct {} trainer (KK + KKP + KPP, {train_steps} batch step{} each)",
-        args.eval_type().cli_name(),
-        if train_steps == 1 { "" } else { "s" }
+    print_startup_kv_colored(
+        "backend",
+        format!(
+            "cuda-cpp Windows-native direct {} trainer (KK + KKP + KPP, {train_steps} batch step{} each)",
+            args.eval_type().cli_name(),
+            if train_steps == 1 { "" } else { "s" }
+        ),
+        ConsoleColor::BoldGreen,
     );
     if schedule.production {
-        eprintln!(
-            "  cuda-cpp KPPT schedule = production: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
-            args.max_epochs.unwrap_or(1).max(1),
-            args.superbatches.unwrap_or(1),
-            effective_save_rate(args),
-            effective_save_epoch_end(args),
-            schedule.batches_per_superbatch,
-            args.lr_schedule.cli_name()
+        print_startup_kv(
+            "schedule",
+            format!(
+                "{}: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                paint("production", ConsoleColor::BoldGreen),
+                args.max_epochs.unwrap_or(1).max(1),
+                args.superbatches.unwrap_or(1),
+                effective_save_rate(args),
+                effective_save_epoch_end(args),
+                schedule.batches_per_superbatch,
+                args.lr_schedule.cli_name()
+            ),
         );
     } else {
-        eprintln!("  cuda-cpp KPPT schedule = direct train-steps smoke mode");
+        print_startup_kv_colored("schedule", "direct train-steps smoke mode", ConsoleColor::Yellow);
     }
     if schedule.production && train_steps == 0 {
         print_cuda_cpp_no_remaining_work(args);
@@ -4615,17 +4651,21 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
-    eprintln!("  cuda-cpp device {device}: {name}");
-    eprintln!("  batch size = {batch_size}");
-    eprintln!("  loss = {}", value_loss_label(args));
-    eprintln!(
-        "  cuda-cpp loss progress log = {} ({})",
-        cuda_cpp_loss_progress_log_path(args).display(),
-        cuda_cpp_loss_progress_policy(args)
+    print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
+    print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
+    print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
+    print_startup_kv(
+        "loss progress log",
+        format!(
+            "{} ({})",
+            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
+            cuda_cpp_loss_progress_policy(args)
+        ),
     );
 
     for component in [CudaCppKpptComponent::Kk, CudaCppKpptComponent::Kkp, CudaCppKpptComponent::Kpp] {
-        eprintln!("\n=== [cuda-cpp {}] training ===", component.label());
+        eprintln!();
+        print_startup_banner(format!("=== [cuda-cpp {}] training ===", component.label()));
         run_cuda_cpp_kppt_component_direct_steps(args, component, &schedule)?;
     }
 
@@ -4714,17 +4754,27 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let dataloader_resume_pos =
         cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, component.input_label());
     if let Some(pos) = dataloader_resume_pos {
-        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+        print_startup_kv(
+            "dataloader resume",
+            format!(
+                "byte_offset {}, plies {}",
+                paint(format_count_u64(pos.byte_offset), ConsoleColor::BoldYellow),
+                pos.plies
+            ),
+        );
     }
     let teacher_threads = cuda_cpp_effective_teacher_threads(args);
     let loader_threads = cuda_cpp_effective_loader_threads(args);
     let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
-    eprintln!(
-        "  cuda-cpp {} teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
-        component.label(),
-        teacher_threads,
-        loader_threads,
-        batch_queue_size
+    print_startup_kv(
+        "teacher CPU",
+        format!(
+            "{}: prepare_threads={}, loader_threads={}, batch_queue_size={}",
+            component.label(),
+            paint(format_count(teacher_threads), ConsoleColor::BoldYellow),
+            paint(format_count(loader_threads), ConsoleColor::BoldYellow),
+            paint(format_count(batch_queue_size), ConsoleColor::BoldYellow)
+        ),
     );
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
@@ -5290,24 +5340,32 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let teacher_shuffle_buffer_batches =
         effective_teacher_shuffle_buffer_batches(args, schedule.batches_per_superbatch)?;
 
-    eprintln!(
-        "  backend = cuda-cpp Windows-native direct {} trainer ({train_steps} batch step{})",
-        feature_kind.train_label(),
-        if train_steps == 1 { "" } else { "s" }
+    print_startup_kv_colored(
+        "backend",
+        format!(
+            "cuda-cpp Windows-native direct {} trainer ({train_steps} batch step{})",
+            feature_kind.train_label(),
+            if train_steps == 1 { "" } else { "s" }
+        ),
+        ConsoleColor::BoldGreen,
     );
     if schedule.production {
-        eprintln!(
-            "  cuda-cpp schedule = production: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
-            args.max_epochs.unwrap_or(1).max(1),
-            args.superbatches.unwrap_or(1),
-            effective_save_rate(args),
-            effective_validation_rate(args),
-            effective_save_epoch_end(args),
-            schedule.batches_per_superbatch,
-            args.lr_schedule.cli_name()
+        print_startup_kv(
+            "schedule",
+            format!(
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                paint("production", ConsoleColor::BoldGreen),
+                args.max_epochs.unwrap_or(1).max(1),
+                args.superbatches.unwrap_or(1),
+                effective_save_rate(args),
+                effective_validation_rate(args),
+                effective_save_epoch_end(args),
+                schedule.batches_per_superbatch,
+                args.lr_schedule.cli_name()
+            ),
         );
     } else {
-        eprintln!("  cuda-cpp schedule = direct train-steps smoke mode");
+        print_startup_kv_colored("schedule", "direct train-steps smoke mode", ConsoleColor::Yellow);
     }
     if schedule.production && train_steps == 0 {
         print_cuda_cpp_no_remaining_work(args);
@@ -5315,7 +5373,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
-    eprintln!("  cuda-cpp device {device}: {name}");
+    print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_nnue_initial_state_for_cuda_cpp(args, feature_kind)?;
     let initial_weights = &initial_state.weights;
@@ -5327,39 +5385,61 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         } else {
             "weights only"
         };
-        eprintln!("  initial state = {} ({state_kind})", path.display());
+        print_startup_kv("initial state", format!("{} ({state_kind})", paint(path.display(), ConsoleColor::Cyan)));
     } else if let Some(path) = auto_resume_state_bin.as_deref() {
-        eprintln!("  initial state = {} (auto-resume weights + Ranger optimizer state)", path.display());
+        print_startup_kv(
+            "initial state",
+            format!(
+                "{} ({})",
+                paint(path.display(), ConsoleColor::Cyan),
+                paint("auto-resume weights + Ranger optimizer state", ConsoleColor::BoldGreen)
+            ),
+        );
     } else {
-        eprintln!("  initial weights = {}", feature_kind.scratch_init_label());
+        print_startup_kv_colored("initial weights", feature_kind.scratch_init_label(), ConsoleColor::Yellow);
     }
     if initial_state.completed_steps > 0 {
-        eprintln!("  initial completed training steps = {}", initial_state.completed_steps);
+        print_startup_kv_colored(
+            "initial completed steps",
+            format_count(initial_state.completed_steps),
+            ConsoleColor::BoldYellow,
+        );
     }
     let input_size = initial_weights.shape.input_size;
     let max_active = feature_kind.max_active();
-    eprintln!("  batch size = {batch_size}");
+    print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
     if feature_kind.virtual_rows() > 0 {
-        eprintln!(
-            "  arch = {} (factorized input {input_size}, implicit HalfKP piece rows, {l1_size}x2-{l2_size}-{l3_size})",
-            args.arch().cli_name()
+        print_startup_kv(
+            "arch",
+            format!(
+                "{} (factorized input {}, implicit HalfKP piece rows, {l1_size}x2-{l2_size}-{l3_size})",
+                paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
+                format_count(input_size)
+            ),
         );
     } else {
-        eprintln!(
-            "  arch = {} ({} input {input_size}, {l1_size}x2-{l2_size}-{l3_size})",
-            args.arch().cli_name(),
-            feature_kind.source_label()
+        print_startup_kv(
+            "arch",
+            format!(
+                "{} ({} input {}, {l1_size}x2-{l2_size}-{l3_size})",
+                paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
+                feature_kind.source_label(),
+                format_count(input_size)
+            ),
         );
     }
-    eprintln!("  loss = {}", value_loss_label(args));
+    print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
-        eprintln!("  cuda-cpp profile steps = {profile_steps}");
+        print_startup_kv_colored("profile steps", format_count(profile_steps), ConsoleColor::Yellow);
     }
-    eprintln!(
-        "  cuda-cpp loss progress log = {} ({})",
-        cuda_cpp_loss_progress_log_path(args).display(),
-        cuda_cpp_loss_progress_policy(args)
+    print_startup_kv(
+        "loss progress log",
+        format!(
+            "{} ({})",
+            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
+            cuda_cpp_loss_progress_policy(args)
+        ),
     );
 
     let cuda_shape = CudaNnueForwardShape {
@@ -5392,11 +5472,12 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     }
     .map_err(|e| e.to_string())?;
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
-    eprintln!("  cuda-cpp warmup = done (NNUE dense-backward kernels)");
+    print_startup_kv_colored("warmup", "done (NNUE dense-backward kernels)", ConsoleColor::BoldGreen);
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
-    eprintln!(
-        "  cuda-cpp {} upload pipeline = enabled (2 pinned slots; non-profiled steps)",
-        feature_kind.source_label()
+    print_startup_kv_colored(
+        "upload pipeline",
+        format!("enabled ({}; 2 pinned slots; non-profiled steps)", feature_kind.source_label()),
+        ConsoleColor::BoldGreen,
     );
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
@@ -5421,14 +5502,26 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
-        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+        print_startup_kv(
+            "dataloader resume",
+            format!(
+                "byte_offset {}, plies {}",
+                paint(format_count_u64(pos.byte_offset), ConsoleColor::BoldYellow),
+                pos.plies
+            ),
+        );
     }
     let teacher_threads = cuda_cpp_effective_teacher_threads(args);
     let loader_threads = cuda_cpp_effective_loader_threads(args);
     let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
-    eprintln!(
-        "  cuda-cpp teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
-        teacher_threads, loader_threads, batch_queue_size
+    print_startup_kv(
+        "teacher CPU",
+        format!(
+            "prepare_threads={}, loader_threads={}, batch_queue_size={}",
+            paint(format_count(teacher_threads), ConsoleColor::BoldYellow),
+            paint(format_count(loader_threads), ConsoleColor::BoldYellow),
+            paint(format_count(batch_queue_size), ConsoleColor::BoldYellow)
+        ),
     );
     if args.cuda_cpp_profile_teacher_prepare {
         eprintln!("  cuda-cpp teacher prepare profiling = enabled (serial prepared-batch consumer)");
@@ -6375,24 +6468,32 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     let device = args.cuda_cpp_device;
 
-    eprintln!(
-        "  backend = cuda-cpp Windows-native direct {} trainer ({train_steps} batch step{})",
-        feature_kind.train_label(),
-        if train_steps == 1 { "" } else { "s" }
+    print_startup_kv_colored(
+        "backend",
+        format!(
+            "cuda-cpp Windows-native direct {} trainer ({train_steps} batch step{})",
+            feature_kind.train_label(),
+            if train_steps == 1 { "" } else { "s" }
+        ),
+        ConsoleColor::BoldGreen,
     );
     if schedule.production {
-        eprintln!(
-            "  cuda-cpp SFNN schedule = production: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
-            args.max_epochs.unwrap_or(1).max(1),
-            args.superbatches.unwrap_or(1),
-            effective_save_rate(args),
-            effective_validation_rate(args),
-            effective_save_epoch_end(args),
-            schedule.batches_per_superbatch,
-            args.lr_schedule.cli_name()
+        print_startup_kv(
+            "schedule",
+            format!(
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                paint("production", ConsoleColor::BoldGreen),
+                args.max_epochs.unwrap_or(1).max(1),
+                args.superbatches.unwrap_or(1),
+                effective_save_rate(args),
+                effective_validation_rate(args),
+                effective_save_epoch_end(args),
+                schedule.batches_per_superbatch,
+                args.lr_schedule.cli_name()
+            ),
         );
     } else {
-        eprintln!("  cuda-cpp SFNN schedule = direct train-steps smoke mode");
+        print_startup_kv_colored("schedule", "direct train-steps smoke mode", ConsoleColor::Yellow);
     }
     if schedule.production && train_steps == 0 {
         print_cuda_cpp_no_remaining_work(args);
@@ -6400,7 +6501,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
-    eprintln!("  cuda-cpp device {device}: {name}");
+    print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_sfnn_initial_state_for_cuda_cpp(args, feature_kind)?;
     let initial_weights = &initial_state.weights;
@@ -6414,86 +6515,149 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         } else {
             "weights only"
         };
-        eprintln!("  initial state = {} ({state_kind})", path.display());
+        print_startup_kv("initial state", format!("{} ({state_kind})", paint(path.display(), ConsoleColor::Cyan)));
     } else if let Some(path) = auto_resume_state_bin.as_deref() {
-        eprintln!("  initial state = {} (auto-resume weights + Ranger optimizer state)", path.display());
+        print_startup_kv(
+            "initial state",
+            format!(
+                "{} ({})",
+                paint(path.display(), ConsoleColor::Cyan),
+                paint("auto-resume weights + Ranger optimizer state", ConsoleColor::BoldGreen)
+            ),
+        );
     } else {
-        eprintln!("  initial weights = deterministic nnue-pytorch-style scratch");
+        print_startup_kv_colored("initial weights", "deterministic nnue-pytorch-style scratch", ConsoleColor::Yellow);
     }
     if initial_state.completed_steps > 0 {
-        eprintln!("  initial completed training steps = {}", initial_state.completed_steps);
+        print_startup_kv_colored(
+            "initial completed steps",
+            format_count(initial_state.completed_steps),
+            ConsoleColor::BoldYellow,
+        );
     }
     if initial_state.optimizer_steps != initial_state.completed_steps {
-        eprintln!(
-            "  initial Ranger local optimizer steps = {} (training completed steps = {})",
-            initial_state.optimizer_steps, initial_state.completed_steps
+        print_startup_kv(
+            "initial Ranger steps",
+            format!(
+                "{} (training completed steps = {})",
+                paint(format_count(initial_state.optimizer_steps), ConsoleColor::BoldYellow),
+                format_count(initial_state.completed_steps)
+            ),
         );
     }
-    eprintln!("  batch size = {batch_size}");
+    print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
     if feature_kind.virtual_rows() > 0 {
-        eprintln!(
-            "  arch = {} (factorized {} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={num_stacks})",
-            args.arch().cli_name(),
-            feature_kind.source_label(),
-            initial_weights.shape.input_size
+        print_startup_kv(
+            "arch",
+            format!(
+                "{} (factorized {} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={})",
+                paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
+                feature_kind.source_label(),
+                format_count(initial_weights.shape.input_size),
+                format_count(num_stacks)
+            ),
         );
     } else {
-        eprintln!(
-            "  arch = {} ({} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={num_stacks})",
-            args.arch().cli_name(),
-            feature_kind.source_label(),
-            initial_weights.shape.input_size
+        print_startup_kv(
+            "arch",
+            format!(
+                "{} ({} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={})",
+                paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
+                feature_kind.source_label(),
+                format_count(initial_weights.shape.input_size),
+                format_count(num_stacks)
+            ),
         );
     }
     let stored_shared_factorizers =
         initial_weights.l1fw.is_some() || initial_weights.l2fw.is_some() || initial_weights.l3fw.is_some();
     let stored_axis_factorizers =
         initial_weights.l1axw.is_some() || initial_weights.l2axw.is_some() || initial_weights.l3axw.is_some();
-    eprintln!("  SFNN factorizer = {} (active)", factorizer_spec.label());
-    eprintln!(
-        "  stored factorizer tensors = shared[L1 {}, L2 {}, L3 {}], axis[L1 {}, L2 {}, L3 {}; king_dim={}, hand_dim={}]",
-        if initial_weights.l1fw.is_some() { "present" } else { "absent" },
-        if initial_weights.l2fw.is_some() { "present" } else { "absent" },
-        if initial_weights.l3fw.is_some() { "present" } else { "absent" },
-        if initial_weights.l1axw.is_some() { "present" } else { "absent" },
-        if initial_weights.l2axw.is_some() { "present" } else { "absent" },
-        if initial_weights.l3axw.is_some() { "present" } else { "absent" },
-        initial_weights.shape.factorizer_king_axis_dim,
-        initial_weights.shape.factorizer_hand_axis_dim,
+    print_startup_kv_colored("SFNN factorizer", format!("{} (active)", factorizer_spec.label()), ConsoleColor::Magenta);
+    print_startup_kv(
+        "stored factorizers",
+        format!(
+            "shared[L1 {}, L2 {}, L3 {}], axis[L1 {}, L2 {}, L3 {}; king_dim={}, hand_dim={}]",
+            if initial_weights.l1fw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            if initial_weights.l2fw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            if initial_weights.l3fw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            if initial_weights.l1axw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            if initial_weights.l2axw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            if initial_weights.l3axw.is_some() {
+                paint("present", ConsoleColor::BoldGreen)
+            } else {
+                paint("absent", ConsoleColor::Dim)
+            },
+            initial_weights.shape.factorizer_king_axis_dim,
+            initial_weights.shape.factorizer_hand_axis_dim,
+        ),
     );
     if (!factorizer_active.shared && stored_shared_factorizers)
         || (!factorizer_active.any_axis() && stored_axis_factorizers)
     {
-        eprintln!("  factorizer note = stored tensors are present in state.bin but inactive for this run");
+        print_startup_kv_colored(
+            "factorizer note",
+            "stored tensors are present in state.bin but inactive for this run",
+            ConsoleColor::Yellow,
+        );
     }
     if args.arch().has_common_shard_sfnn_l1() {
-        eprintln!(
-            "  l1 common+shard = c{}_s{}x{} (row fan-in {}; {} output(s) per shard group; compact state)",
-            initial_weights.shape.l1_common_size,
-            initial_weights.shape.l1_shard_size,
-            initial_weights.shape.l1_group_count(),
-            initial_weights.shape.l1_common_shard_input(),
-            initial_weights.shape.l1_group_output()
+        print_startup_kv(
+            "l1 common+shard",
+            format!(
+                "c{}_s{}x{} (row fan-in {}; {} output(s) per shard group; compact state)",
+                initial_weights.shape.l1_common_size,
+                initial_weights.shape.l1_shard_size,
+                initial_weights.shape.l1_group_count(),
+                initial_weights.shape.l1_common_shard_input(),
+                initial_weights.shape.l1_group_output()
+            ),
         );
     }
-    eprintln!("  loss = {}", value_loss_label(args));
+    print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
-        eprintln!("  cuda-cpp SFNN profile steps = {profile_steps}");
+        print_startup_kv_colored("profile steps", format_count(profile_steps), ConsoleColor::Yellow);
     }
-    eprintln!(
-        "  cuda-cpp SFNN loss progress log = {} ({})",
-        cuda_cpp_loss_progress_log_path(args).display(),
-        cuda_cpp_loss_progress_policy(args)
+    print_startup_kv(
+        "loss progress log",
+        format!(
+            "{} ({})",
+            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
+            cuda_cpp_loss_progress_policy(args)
+        ),
     );
     if args.cuda_cpp_diagnostics_rate > 0 {
-        eprintln!(
-            "  cuda-cpp SFNN diagnostics log = {} (teacher queue/load/prepare per sb; 1 CUDA-profiled step every {} sb)",
-            cuda_cpp_diagnostics_log_path(args).display(),
-            args.cuda_cpp_diagnostics_rate
+        print_startup_kv(
+            "diagnostics log",
+            format!(
+                "{} (teacher queue/load/prepare per sb; 1 CUDA-profiled step every {} sb)",
+                paint(cuda_cpp_diagnostics_log_path(args).display(), ConsoleColor::Cyan),
+                args.cuda_cpp_diagnostics_rate
+            ),
         );
     }
-    eprintln!("  cuda-cpp SFNN upload pipeline = enabled (2 slots; non-profiled steps)");
+    print_startup_kv_colored("upload pipeline", "enabled (2 slots; non-profiled steps)", ConsoleColor::BoldGreen);
 
     let cuda_shape = initial_weights.shape;
     let ctx = Context::new(device).map_err(|e| e.to_string())?;
@@ -6550,17 +6714,33 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos = cuda_cpp_auto_resume_dataloader_pos(args, batch_size, completed_step_offset, "nnue");
     if let Some(pos) = dataloader_resume_pos {
-        eprintln!("  dataloader resume = byte_offset {}, plies {}", pos.byte_offset, pos.plies);
+        print_startup_kv(
+            "dataloader resume",
+            format!(
+                "byte_offset {}, plies {}",
+                paint(format_count_u64(pos.byte_offset), ConsoleColor::BoldYellow),
+                pos.plies
+            ),
+        );
     }
     let teacher_threads = cuda_cpp_effective_teacher_threads(args);
     let loader_threads = cuda_cpp_effective_loader_threads(args);
     let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
-    eprintln!(
-        "  cuda-cpp SFNN teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
-        teacher_threads, loader_threads, batch_queue_size
+    print_startup_kv(
+        "teacher CPU",
+        format!(
+            "SFNN: prepare_threads={}, loader_threads={}, batch_queue_size={}",
+            paint(format_count(teacher_threads), ConsoleColor::BoldYellow),
+            paint(format_count(loader_threads), ConsoleColor::BoldYellow),
+            paint(format_count(batch_queue_size), ConsoleColor::BoldYellow)
+        ),
     );
     if args.cuda_cpp_profile_teacher_prepare {
-        eprintln!("  cuda-cpp SFNN teacher prepare profiling = enabled (serial prepared-batch consumer)");
+        print_startup_kv_colored(
+            "teacher prepare profile",
+            "enabled (serial prepared-batch consumer)",
+            ConsoleColor::Yellow,
+        );
     }
 
     let config = SfnnTeacherBatchConfig {
@@ -11418,13 +11598,17 @@ fn cuda_cpp_print_teacher_shuffle_buffer(args: &Args, schedule: &CudaCppRunSched
     let window_mib = teacher_shuffle_buffer_mib(args, schedule.batches_per_superbatch)?.unwrap_or(0.0);
     let total_mib = window_mib * (TEACHER_SHUFFLE_PREFETCH_BUFFERS as f64);
     let mode = teacher_shuffle_buffer_mode(args);
-    eprintln!(
-        "  teacher shuffle buffer = double-buffered ({mode}): {} batches x {} = {} positions/window ({window_mib:.1} MiB x {} = {total_mib:.1} MiB CPU), seed={}",
-        buffer_batches,
-        format_count(effective_batch_size(args)),
-        format_count(records),
-        TEACHER_SHUFFLE_PREFETCH_BUFFERS,
-        args.teacher_shuffle_seed
+    print_startup_kv(
+        "teacher shuffle",
+        format!(
+            "{} ({mode}): {} batches x {} = {} positions/window ({window_mib:.1} MiB x {} = {total_mib:.1} MiB CPU), seed={}",
+            paint("double-buffered", ConsoleColor::BoldGreen),
+            paint(format_count(buffer_batches), ConsoleColor::BoldYellow),
+            paint(format_count(effective_batch_size(args)), ConsoleColor::Yellow),
+            paint(format_count(records), ConsoleColor::BoldYellow),
+            TEACHER_SHUFFLE_PREFETCH_BUFFERS,
+            args.teacher_shuffle_seed
+        ),
     );
     Ok(())
 }
