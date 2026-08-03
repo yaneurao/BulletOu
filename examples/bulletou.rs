@@ -2846,6 +2846,9 @@ struct Args {
     /// Select SFNN stack factorizer terms. Accepted values:
     /// `none`, `shared`, `axis`, or comma-separated per-family forms such as
     /// `king=axis,hand=shared` / `king=axis,hand=axis`.
+    /// `axis` is shorthand for enabling every bucket axis available in the
+    /// architecture: for example, `hand1024_k3k3` becomes
+    /// `king=axis,hand=axis`, while `k3k3` becomes `king=axis`.
     /// Axis terms are full residual factors; they are folded into stack
     /// weights for validation and `nn.bin` export.
     #[arg(long = "sfnn-factorizer", conflicts_with_all = ["sfnn_factorized", "no_sfnn_factorized"])]
@@ -15252,6 +15255,70 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn sfnn_factorizer_axis_shorthand_selects_available_bucket_axes() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_hand1024_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "axis",
+        ])
+        .unwrap();
+
+        let layerstack = args.arch().layerstack.unwrap();
+        assert_eq!(layerstack.factorizer_king_axis_dim(), 3);
+        assert_eq!(layerstack.factorizer_hand_axis_dim(), 32);
+
+        let spec = effective_sfnn_factorizer_spec(&args);
+        assert!(spec.shared);
+        assert!(spec.king_axis);
+        assert!(spec.hand_axis);
+        assert_eq!(spec.label(), "shared+king-axis+hand-axis");
+        assert!(effective_sfnn_axis_factorized_l1(&args));
+        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
+    }
+
+    #[test]
+    fn sfnn_factorizer_axis_shorthand_ignores_missing_bucket_axes() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "axis",
+        ])
+        .unwrap();
+
+        let layerstack = args.arch().layerstack.unwrap();
+        assert_eq!(layerstack.factorizer_king_axis_dim(), 3);
+        assert_eq!(layerstack.factorizer_hand_axis_dim(), 0);
+
+        let spec = effective_sfnn_factorizer_spec(&args);
+        assert!(spec.shared);
+        assert!(spec.king_axis);
+        assert!(!spec.hand_axis);
+        assert_eq!(spec.label(), "shared+king-axis");
+        assert!(effective_sfnn_axis_factorized_l1(&args));
+        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
     }
 
     #[test]

@@ -43,7 +43,7 @@
 | `--loss-sigmoid-mse` | WRM ではなく従来の `sigmoid(model_output)` MSE loss を使う | off |
 | `--loss-pow-exp` | WRM の誤差項 `|prediction - target|^p` の指数。デフォルト WRM loss で使われる | 2.0 |
 | `--wrm-nnue2score` | WRM で network output を score 空間へ戻す倍率。`prediction = wrm(model_output × wrm_nnue2score)` の `wrm_nnue2score` | 600 |
-| `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて利用可能な bucket axis factorizer を有効化する。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
+| `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて、その arch に存在する bucket axis factorizer をすべて有効化する。たとえば `hand1024_k3k3` なら `king=axis,hand=axis` 相当、`k3k3` だけなら `king=axis` 相当。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |

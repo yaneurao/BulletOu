@@ -43,7 +43,7 @@ Main flags:
 | `--loss-sigmoid-mse` | Use the legacy `sigmoid(model_output)` MSE loss instead of WRM | off |
 | `--loss-pow-exp` | Exponent `p` in the WRM error term `|prediction - target|^p`; used by the default WRM loss | 2.0 |
 | `--wrm-nnue2score` | WRM prediction-side scale. In `prediction = wrm(model_output × wrm_nnue2score)`, this sets `wrm_nnue2score` | 600 |
-| `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus all available bucket-axis factorizer terms; combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
+| `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus every bucket-axis factorizer available in the architecture. For example, `hand1024_k3k3` is treated like `king=axis,hand=axis`, while plain `k3k3` is treated like `king=axis`. Combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for enabling shared factorizer or disabling all SFNN factorizer terms. Prefer `--sfnn-factorizer shared` or `--sfnn-factorizer none` in new commands. | on |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
 | `--optimizer-epsilon` | Override epsilon for the selected optimizer. If omitted, the optimizer's own default is used | omitted |

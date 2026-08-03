@@ -56,7 +56,7 @@ Total effective epochs trained: 3 + 3 = 6.
 | `--lambda` | Teacher-target blend. |
 | `--teacher` | Teacher-change detection triggers; dataloader reads new teacher from the start. See the LR note in [§5.5.4](#554-fine-tune-on-a-different-teacher). |
 | `--test-teacher` | Validation set swap. |
-| `--sfnn-factorizer` | Changes which SFNN residual factorizer terms are active (`shared`, `none`, `axis`, or mixed forms such as `king=axis,hand=shared`). If reusing an existing checkpoint, pass `--resume` explicitly. `state.bin` keeps all available factorizer tensors; validation and `nn.bin` fold only the terms active for the current invocation. |
+| `--sfnn-factorizer` | Changes which SFNN residual factorizer terms are active (`shared`, `none`, `axis`, or mixed forms such as `king=axis,hand=shared`). `axis` is shorthand for enabling every bucket axis available in the architecture; for example, `hand1024_k3k3` is treated like `king=axis,hand=axis`. If reusing an existing checkpoint, pass `--resume` explicitly. `state.bin` keeps all available factorizer tensors; validation and `nn.bin` fold only the terms active for the current invocation. |
 
 ### ❌ Don't change (model topology)
 

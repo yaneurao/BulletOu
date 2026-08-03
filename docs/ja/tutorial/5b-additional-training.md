@@ -57,7 +57,7 @@
 | `--validation-rate` | `--test-teacher` の accuracy/loss 計測頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
-| `--sfnn-factorizer` | SFNN residual factorizer の有効項を変える。`shared` / `none` / `axis`、または `king=axis,hand=shared` のような混合指定が可能。既存 checkpoint を引き継ぐなら `--resume` を明示する。`state.bin` は利用可能なfactorizer tensorを保持し、validation と `nn.bin` export では現在の invocation で有効な項だけをfoldする |
+| `--sfnn-factorizer` | SFNN residual factorizer の有効項を変える。`shared` / `none` / `axis`、または `king=axis,hand=shared` のような混合指定が可能。`axis` は arch に存在する bucket axis をまとめて有効化する shorthand で、`hand1024_k3k3` なら `king=axis,hand=axis` 相当。既存 checkpoint を引き継ぐなら `--resume` を明示する。`state.bin` は利用可能なfactorizer tensorを保持し、validation と `nn.bin` export では現在の invocation で有効な項だけをfoldする |
 
 これらはモデル構造とは無関係なので、重みと Ranger optimizer state 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
 
