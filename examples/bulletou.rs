@@ -2475,8 +2475,8 @@ struct Args {
     /// Write per-superbatch cuda-cpp diagnostics. `1` profiles one CUDA step
     /// every superbatch, `N` profiles one CUDA step every N superbatches, and
     /// `0` disables the diagnostics log. The profiled step synchronises CUDA
-    /// streams, so keep this at a small rate only while diagnosing throughput.
-    #[arg(long, default_value = "1")]
+    /// streams, so enable this only while diagnosing throughput.
+    #[arg(long, default_value = "0")]
     cuda_cpp_diagnostics_rate: usize,
 
     /// In C++/CUDA direct-step mode, skip the final numbered checkpoint and
@@ -2499,9 +2499,9 @@ struct Args {
     bench_teacher_prepare_batches: Option<usize>,
 
     /// Read and print C++/CUDA direct-trainer loss every N steps. This
-    /// synchronises the compute stream, so use 0 for throughput probes
-    /// where only the final loss is needed.
-    #[arg(long, default_value = "10")]
+    /// synchronises the compute stream. The default `0` reads loss only for
+    /// checkpoint/validation/final reporting; specify e.g. `10` for diagnosis.
+    #[arg(long, default_value = "0")]
     cuda_cpp_loss_readback_interval: usize,
 
     /// Teacher data: either a single file (`.hcpe` / `.hcpe3` / `.pack` /

@@ -139,13 +139,13 @@ Batch Size             : 65536
 Batches / Superbatch   : 1525
 Positions / Superbatch : 99942400
 ...
-  cuda-cpp loss progress log = checkpoints/.../cuda-cpp-progress.log (step 1, every 10 step(s), checkpoint, final)
+  cuda-cpp loss progress log = checkpoints/.../cuda-cpp-progress.log (checkpoint/validation/final only)
   [save]  epoch 1  sb 1/36  this-sb=... pos (...)  total=... pos  sb_time=...s  pos/s=...
   [valid]  epoch 1 sb 1  test_value_accuracy=..., test_value_loss=..., elapsed=...
   cuda-cpp SFNN direct train = ok: steps=..., positions=..., train_elapsed=...s, elapsed=...s, throughput=... pos/s, ...
 ```
 
-cuda-cpp backend の stdout に出る `pos/s` は、checkpoint file save / validation / loss readback / progress-log write の時間を除外した純粋な学習 throughput。batch ごとの loss は stdout には流さず、`<output>/cuda-cpp-progress.log` に CSV として追記される。
+cuda-cpp backend の stdout に出る `pos/s` は、checkpoint file save / validation / loss readback / progress-log write の時間を除外した純粋な学習 throughput。デフォルトでは、loss は checkpoint / validation / final のタイミングだけ readback される。細かい batch loss を診断したい場合だけ `--cuda-cpp-loss-readback-interval N` を指定する。
 
 `pos/s` は 1秒あたりに処理した局面数で、学習速度の目安。RTX 4090 なら構成によって数百万〜数千万 pos/s 程度が目安。低位 GPU では比例して低下する。
 

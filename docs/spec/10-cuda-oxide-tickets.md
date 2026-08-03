@@ -694,7 +694,7 @@ current cuda-cpp follow-up queue.
   - initial weights are generated host-side with the same affine default scale as the Bullet builder (`Normal(0, sqrt(2/fan_in))`, zero biases), so `cuda-cpp-backend` no longer needs Bullet's old GPU runtime just to create the model.
 - Reduced direct-step synchronization overhead:
   - `NnueTrainStepRunner::step_no_readback` runs upload -> forward -> loss -> backward -> Ranger update without downloading the loss every batch;
-  - the compatibility `step` method remains readback-producing, while the direct CLI now samples loss only at step 1, every 10 steps, and the final step.
+  - the compatibility `step` method remains readback-producing, while the direct CLI defaults to loss readback only for checkpoint / validation / final reporting. Use `--cuda-cpp-loss-readback-interval N` for fine-grained diagnosis.
 - Moved the direct C++/CUDA HalfKP scratch path onto the tatara/cuda-oxide factorized FT layout:
   - the input shape is now `HALFKP_PIECE_INPUTS + ShogiHalfKP` (virtual piece rows first, normal HalfKP rows offset by 1548);
   - C++/CUDA sparse L0 forward/backward now expands each normal HalfKP feature into both its offset base row and its virtual piece row when the factorized input size is selected;
