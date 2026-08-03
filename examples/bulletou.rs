@@ -2446,6 +2446,13 @@ struct Args {
     #[arg(long)]
     cuda_cpp_profile_teacher_prepare: bool,
 
+    /// Benchmark CPU teacher decoding/materialisation for the selected SFNN
+    /// architecture and exit without training or touching checkpoints.
+    /// The benchmark runs the normal cuda-cpp teacher pipeline for N complete
+    /// mini-batches and reports aggregate load/prepare/queue timings.
+    #[arg(long)]
+    bench_teacher_prepare_batches: Option<usize>,
+
     /// Read and print C++/CUDA direct-trainer loss every N steps. This
     /// synchronises the compute stream, so use 0 for throughput probes
     /// where only the final loss is needed.
@@ -3011,6 +3018,17 @@ impl Args {
         }
         if effective_win_rate_model(self) && !eval_type.supports_win_rate_model() {
             return Err("--win-rate-model currently applies to NNUE / SFNN eval types only".to_string());
+        }
+        if let Some(batches) = self.bench_teacher_prepare_batches {
+            if batches == 0 {
+                return Err("--bench-teacher-prepare-batches must be > 0".to_string());
+            }
+            if !eval_type.uses_layerstack() {
+                return Err(
+                    "--bench-teacher-prepare-batches currently supports SFNN / LayerStack arch only".to_string()
+                );
+            }
+            return Ok(());
         }
         if let Some(spec) = self.sfnn_factorizer {
             if let Some(layerstack) = self.effective_layerstack() {
@@ -3756,6 +3774,21 @@ fn main() {
     if let Err(e) = args.validate_backend_flags() {
         eprintln!("error: {e}");
         std::process::exit(2);
+    }
+    if args.bench_teacher_prepare_batches.is_some() {
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            if let Err(e) = run_cuda_cpp_sfnn_teacher_prepare_benchmark(&args) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: --bench-teacher-prepare-batches requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
     }
     if !args.cuda_cpp_smoke {
         prepare_resume_config_or_exit(&args);
@@ -6148,6 +6181,125 @@ where
         }
     }
     .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_teacher_prepare_benchmark(args: &Args) -> Result<(), String> {
+    use bulletou_lib::value::SfnnTeacherBatchConfig;
+
+    let batch_count =
+        args.bench_teacher_prepare_batches.ok_or_else(|| "--bench-teacher-prepare-batches is not set".to_string())?;
+    if batch_count == 0 {
+        return Err("--bench-teacher-prepare-batches must be > 0".to_string());
+    }
+    let feature_kind = match args.eval_type() {
+        EvalType::SfnnHalfka1hm => CudaCppSfnnFeatureKind::Halfka1hm,
+        EvalType::SfnnHalfka2hm => CudaCppSfnnFeatureKind::Halfka2hm,
+        EvalType::SfnnHalfka2 => CudaCppSfnnFeatureKind::Halfka2,
+        EvalType::SfnnKa2 => CudaCppSfnnFeatureKind::Ka2,
+        other => {
+            return Err(format!(
+                "--bench-teacher-prepare-batches currently supports SFNN arch only, got {}",
+                other.cli_name()
+            ));
+        }
+    };
+
+    let batch_size = effective_batch_size(args);
+    let batches_per_superbatch = effective_batches_per_superbatch(args)?;
+    let teacher_shuffle_buffer_batches = effective_teacher_shuffle_buffer_batches(args, batches_per_superbatch)?;
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    if let Some(params) = sfnn_progress_params_for_layerstack(layerstack) {
+        set_shogi_sfnn_progress_q16_params(params)?;
+    }
+    let teacher_threads = cuda_cpp_effective_teacher_threads(args);
+    let loader_threads = cuda_cpp_effective_loader_threads(args);
+    let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
+    let total_positions = batch_size.saturating_mul(batch_count);
+
+    eprintln!(
+        "  teacher prepare benchmark: arch={} feature={} batches={} batch_size={} positions={}",
+        args.arch().cli_name(),
+        feature_kind.source_label(),
+        batch_count,
+        batch_size,
+        colored_positions(total_positions)
+    );
+    eprintln!(
+        "  teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}, shuffle_window={} batch(es)",
+        teacher_threads, loader_threads, batch_queue_size, teacher_shuffle_buffer_batches
+    );
+    if teacher_shuffle_buffer_batches > batch_count {
+        eprintln!(
+            "  note: shuffle window ({teacher_shuffle_buffer_batches} batches) is larger than benchmark batches ({batch_count}); \
+             startup fill/shuffle time is included. Use --teacher-shuffle-buffer-sbs 0 to isolate raw decode/prepare."
+        );
+    }
+
+    let config = SfnnTeacherBatchConfig {
+        teacher: &args.teacher,
+        batch_size,
+        batch_index: 0,
+        dataloader_resume_pos: None,
+        layerstack_bucket: layerstack.bucket_kind(),
+        buffer_mb: args.buffer_mb,
+        loader_threads,
+        threads: teacher_threads,
+        queue_depth: batch_queue_size,
+        lambda: args.lambda,
+        scale: args.scale as f32,
+        win_rate_model: effective_win_rate_model(args),
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        teacher_shuffle_buffer_batches,
+        teacher_shuffle_seed: args.teacher_shuffle_seed,
+        profile_prepare: args.cuda_cpp_profile_teacher_prepare,
+    };
+
+    let started = std::time::Instant::now();
+    let mut seen_batches = 0usize;
+    let mut load_sec = 0.0f64;
+    let mut prepare_sec = 0.0f64;
+    let mut queue_wait_sec = 0.0f64;
+    let mut last_layout = None;
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, batch_count, |teacher_batch| {
+        seen_batches += 1;
+        load_sec += teacher_batch.timing.producer_load_sec;
+        prepare_sec += teacher_batch.timing.producer_prepare_sec;
+        queue_wait_sec += teacher_batch.timing.consumer_queue_wait_sec;
+        last_layout = Some(teacher_batch.batch.layout);
+        Ok(())
+    })?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let positions = seen_batches.saturating_mul(batch_size);
+    let pos_per_sec = if elapsed > 0.0 { positions as f64 / elapsed } else { 0.0 };
+    let prepare_pos_per_sec = if prepare_sec > 0.0 { positions as f64 / prepare_sec } else { 0.0 };
+    let load_pos_per_sec = if load_sec > 0.0 { positions as f64 / load_sec } else { 0.0 };
+    let queue_pos_per_sec = if queue_wait_sec > 0.0 { positions as f64 / queue_wait_sec } else { 0.0 };
+
+    eprintln!(
+        "  teacher prepare benchmark result: batches={} positions={} elapsed={:.3}s pos/s={}",
+        seen_batches,
+        colored_positions(positions),
+        elapsed,
+        colored_pos_s(pos_per_sec)
+    );
+    eprintln!(
+        "  timing: load={:.3}s ({} pos/s), prepare={:.3}s ({} pos/s), queue_wait={:.3}s ({} pos/s)",
+        load_sec,
+        colored_pos_s(load_pos_per_sec),
+        prepare_sec,
+        colored_pos_s(prepare_pos_per_sec),
+        queue_wait_sec,
+        colored_pos_s(queue_pos_per_sec)
+    );
+    if let Some(layout) = last_layout {
+        eprintln!(
+            "  layout: max_active={}, output_size={}, hand_count_dim={}",
+            layout.max_active, layout.output_size, layout.hand_count_dim
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]

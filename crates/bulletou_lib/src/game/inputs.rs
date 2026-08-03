@@ -31,7 +31,8 @@ pub use chess768::Chess768;
 pub use factorised::{Factorised, Factorises};
 pub use shogi_halfka::{
     FEATURE_HASH_HALFKA2, FEATURE_HASH_HM_V2, FEATURE_HASH_NONMIRROR, HALFKA_HM_DIMENSIONS, HALFKA2_DIMENSIONS,
-    NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKa2,
+    NUM_KING_BUCKETS, PIECE_INPUTS, ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKa2, fill_halfka2_feature_indices,
+    fill_halfka2_feature_indices_from_board,
 };
 pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
@@ -45,7 +46,10 @@ pub use shogi_halfkp::{
 };
 pub use shogi_halfkpe9::{FEATURE_HASH_HALFKPE9, HALFKPE9_DIMENSIONS, ShogiHalfKpe9};
 pub use shogi_halfkpvm::{FEATURE_HASH_HALFKPVM, HALFKPVM_DIMENSIONS, ShogiHalfKPvm};
-pub use shogi_ka2::{FEATURE_HASH_KA2, KA2_DIMENSIONS, KA2_MAX_ACTIVE, ShogiKa2};
+pub use shogi_ka2::{
+    FEATURE_HASH_KA2, KA2_DIMENSIONS, KA2_MAX_ACTIVE, ShogiKa2, fill_ka2_feature_indices,
+    fill_ka2_feature_indices_from_board,
+};
 pub use shogi_kk::{KK_INPUTS, KK_MAX_ACTIVE, ShogiKk};
 pub use shogi_kkp::{KKP_FE_END, KKP_INPUTS, KKP_MAX_ACTIVE, ShogiKkp};
 pub use shogi_kp::{FEATURE_HASH_KP, KP_DIMENSIONS, KP_MAX_ACTIVE, ShogiKp, fill_kp_feature_indices};

@@ -1,4 +1,5 @@
 /target
+/target-codex
 /cuda-oxide/target
 /cuda-oxide/*.cubin
 /cuda-oxide/*.ll

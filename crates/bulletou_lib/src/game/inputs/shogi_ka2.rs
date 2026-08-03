@@ -71,6 +71,27 @@ impl SparseInputType for ShogiKa2 {
     }
 }
 
+pub fn fill_ka2_feature_indices(pos: &PackedSfenValue, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
+    let board = ShogiBoard::from_packed_sfen(pos);
+    fill_ka2_feature_indices_from_board(&board, stm, nstm)
+}
+
+pub fn fill_ka2_feature_indices_from_board(board: &ShogiBoard, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
+    let mut stm_count = 0usize;
+    let mut nstm_count = 0usize;
+    map_ka2_features(board, |stm_idx, nstm_idx| {
+        if stm_count < stm.len() {
+            stm[stm_count] = stm_idx as i32;
+        }
+        stm_count += 1;
+        if nstm_count < nstm.len() {
+            nstm[nstm_count] = nstm_idx as i32;
+        }
+        nstm_count += 1;
+    });
+    (stm_count, nstm_count)
+}
+
 /// 視点 `perspective` から見た square index (0..80)。
 /// 後手視点では盤を反転させる (YaneuraOu の piece_list_fw と同じ)。
 #[inline]

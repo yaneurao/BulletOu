@@ -13,11 +13,12 @@ use crate::{
     game::{
         inputs::{
             Factorised, HALFKP_MAX_ACTIVE_FEATURES, KP_MAX_ACTIVE, ShogiHalfKP, ShogiHalfKPPieceFactorizer,
-            ShogiHalfKa2, SparseInputType, fill_halfkp_feature_indices, fill_kp_feature_indices,
+            ShogiHalfKa2, SparseInputType, fill_halfka2_feature_indices_from_board, fill_halfkp_feature_indices,
+            fill_ka2_feature_indices_from_board, fill_kp_feature_indices,
         },
         outputs::{ShogiSfnnLayerStackBucket, ShogiSfnnLayerStackBucketKind},
     },
-    shogi::PackedSfenValue,
+    shogi::{PackedSfenValue, ShogiBoard},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     value::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
@@ -2029,6 +2030,8 @@ where
     E: fmt::Display,
 {
     let threads = config.threads.max(1);
+    let input_size = input_getter.num_inputs();
+    let max_active = input_getter.max_active();
     let rayon_pool = if threads > 1 {
         Some(
             rayon::ThreadPoolBuilder::new()
@@ -2068,12 +2071,34 @@ where
                     let producer_load_sec = producer_ready.elapsed().as_secs_f64();
                     let batch_index = config.batch_index + produced_batches;
                     let prepare_started = std::time::Instant::now();
-                    let prepared = match rayon_pool.as_ref() {
-                        Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
-                        None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+                    let batch = match input_label {
+                        "halfka2" => prepare_sfnn_fast_batch_from_board_features(
+                            input_label,
+                            batch,
+                            config,
+                            rayon_pool.as_ref(),
+                            fill_halfka2_feature_indices_from_board,
+                            input_size,
+                            max_active,
+                        ),
+                        "ka2" => prepare_sfnn_fast_batch_from_board_features(
+                            input_label,
+                            batch,
+                            config,
+                            rayon_pool.as_ref(),
+                            fill_ka2_feature_indices_from_board,
+                            input_size,
+                            max_active,
+                        ),
+                        _ => {
+                            let prepared = match rayon_pool.as_ref() {
+                                Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+                                None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+                            };
+                            FastBatchHost::from(prepared)
+                        }
                     };
                     let producer_prepare_sec = prepare_started.elapsed().as_secs_f64();
-                    let batch = FastBatchHost::from(prepared);
                     if let Err(err) = batch.validate() {
                         producer_error = Some(TeacherBatchError::invalid_input(err.to_string()));
                         return true;
@@ -2162,9 +2187,32 @@ where
         let batch_index = config.batch_index + visited_batches;
         let prepare_started = config.profile_prepare.then(std::time::Instant::now);
         let prepare_timing_started = std::time::Instant::now();
-        let prepared = match rayon_pool.as_ref() {
-            Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
-            None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+        let batch = match input_label {
+            "halfka2" => prepare_sfnn_fast_batch_from_board_features(
+                input_label,
+                batch,
+                config,
+                rayon_pool.as_ref(),
+                fill_halfka2_feature_indices_from_board,
+                input_size,
+                max_active,
+            ),
+            "ka2" => prepare_sfnn_fast_batch_from_board_features(
+                input_label,
+                batch,
+                config,
+                rayon_pool.as_ref(),
+                fill_ka2_feature_indices_from_board,
+                input_size,
+                max_active,
+            ),
+            _ => {
+                let prepared = match rayon_pool.as_ref() {
+                    Some(pool) => dataloader.prepare_with_pool(batch, pool, threads, 1.0 - config.lambda),
+                    None => dataloader.prepare(batch, threads, 1.0 - config.lambda),
+                };
+                FastBatchHost::from(prepared)
+            }
         };
         let producer_prepare_sec = prepare_timing_started.elapsed().as_secs_f64();
         if let Some(started) = prepare_started {
@@ -2173,7 +2221,6 @@ where
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
-        let batch = FastBatchHost::from(prepared);
         if let Err(err) = batch.validate() {
             visit_error = Some(TeacherBatchError::invalid_input(err.to_string()));
             return true;
@@ -2205,6 +2252,138 @@ where
     }
 
     Ok(visited_batches)
+}
+
+fn prepare_sfnn_fast_batch_from_board_features(
+    input_label: &'static str,
+    data: &[PackedSfenValue],
+    config: &SfnnTeacherBatchConfig<'_>,
+    pool: Option<&rayon::ThreadPool>,
+    fill_features: fn(&ShogiBoard, &mut [i32], &mut [i32]) -> (usize, usize),
+    input_size: usize,
+    max_active: usize,
+) -> FastBatchHost {
+    let batch_size = data.len();
+    let sparse_len = max_active * batch_size;
+    let mut batch = FastBatchHost {
+        layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
+        stm: vec![-1; sparse_len],
+        nstm: vec![-1; sparse_len],
+        buckets: vec![0; batch_size],
+        targets: vec![0.0; batch_size],
+        weights: vec![0.0; batch_size],
+        hand_count: None,
+    };
+    let threads = config.threads.max(1);
+    let chunk_size = batch_size.div_ceil(threads).max(1);
+    let sparse_chunk_size = max_active * chunk_size;
+    let target_blend = 1.0 - config.lambda;
+    let rscale = 1.0 / config.scale;
+    let layerstack_bucket = config.layerstack_bucket;
+
+    let fill_chunk = |chunk_index: usize,
+                      data_chunk: &[PackedSfenValue],
+                      stm_chunk: &mut [i32],
+                      nstm_chunk: &mut [i32],
+                      buckets_chunk: &mut [i32],
+                      targets_chunk: &mut [f32],
+                      weights_chunk: &mut [f32]| {
+        for (i, pos) in data_chunk.iter().enumerate() {
+            let board = pos.decode();
+            let sparse_offset = max_active * i;
+            let (stm_count, nstm_count) = fill_features(
+                &board,
+                &mut stm_chunk[sparse_offset..sparse_offset + max_active],
+                &mut nstm_chunk[sparse_offset..sparse_offset + max_active],
+            );
+            assert!(
+                stm_count <= max_active && nstm_count <= max_active,
+                "SFNN/{input_label} active feature count exceeded max_active {max_active}"
+            );
+            for &idx in &stm_chunk[sparse_offset..sparse_offset + stm_count] {
+                assert!(
+                    idx >= 0 && (idx as usize) < input_size,
+                    "SFNN/{input_label} STM feature index exceeded input size"
+                );
+            }
+            for &idx in &nstm_chunk[sparse_offset..sparse_offset + nstm_count] {
+                assert!(
+                    idx >= 0 && (idx as usize) < input_size,
+                    "SFNN/{input_label} NSTM feature index exceeded input size"
+                );
+            }
+
+            buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
+            let mut weight = 1.0;
+            if let Some(cap) = config.score_drop_abs {
+                if pos.score().unsigned_abs() >= cap {
+                    weight = 0.0;
+                }
+            }
+            weights_chunk[i] = weight;
+
+            let score = if config.win_rate_model {
+                win_rate_model_score(pos.score())
+            } else {
+                let score = f32::from(pos.score());
+                1.0 / (1.0 + (-(rscale * score)).exp())
+            };
+            let result = match pos.game_result() {
+                r if r > 0 => 1.0,
+                r if r < 0 => 0.0,
+                _ => 0.5,
+            };
+            targets_chunk[i] = target_blend * result + (1.0 - target_blend) * score;
+        }
+        let _ = chunk_index;
+    };
+
+    if let Some(pool) = pool
+        && threads > 1
+        && batch_size > 1
+    {
+        pool.install(|| {
+            data.par_chunks(chunk_size)
+                .enumerate()
+                .zip(batch.stm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.nstm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.buckets.par_chunks_mut(chunk_size))
+                .zip(batch.targets.par_chunks_mut(chunk_size))
+                .zip(batch.weights.par_chunks_mut(chunk_size))
+                .for_each(
+                    |(((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), targets_chunk), weights_chunk)| {
+                        let (chunk_index, data_chunk) = data_chunk;
+                        fill_chunk(
+                            chunk_index,
+                            data_chunk,
+                            stm_chunk,
+                            nstm_chunk,
+                            buckets_chunk,
+                            targets_chunk,
+                            weights_chunk,
+                        );
+                    },
+                );
+        });
+    } else {
+        for (chunk_index, data_chunk) in data.chunks(chunk_size).enumerate() {
+            let start = chunk_index * chunk_size;
+            let sparse_start = start * max_active;
+            let sparse_end = sparse_start + data_chunk.len() * max_active;
+            let end = start + data_chunk.len();
+            fill_chunk(
+                chunk_index,
+                data_chunk,
+                &mut batch.stm[sparse_start..sparse_end],
+                &mut batch.nstm[sparse_start..sparse_end],
+                &mut batch.buckets[start..end],
+                &mut batch.targets[start..end],
+                &mut batch.weights[start..end],
+            );
+        }
+    }
+
+    batch
 }
 
 #[cfg(test)]

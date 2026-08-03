@@ -3,7 +3,7 @@ use std::{path::Path, sync::OnceLock};
 use bulletformat::{ChessBoard, chess::MarlinFormat};
 
 use crate::shogi::{
-    BonaPiece, Color, Hand, PackedSfenValue, Piece,
+    BonaPiece, Color, Hand, PackedSfenValue, Piece, PieceType, ShogiBoard,
     bona_piece::{
         E_DRAGON, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER,
         E_HORSE, F_DRAGON, F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK,
@@ -96,6 +96,40 @@ impl<const N: usize> OutputBuckets<PackedSfenValue> for ShogiKingRankBucket<N> {
             9 => F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)],
             _ => (F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)]).min(N.saturating_sub(1)),
         }
+    }
+}
+
+#[inline]
+fn shogi_stm_ntm_hands_from_board(board: &ShogiBoard) -> (Hand, Hand) {
+    let stm = board.side_to_move;
+    let stm_hand = if stm == Color::Black { board.black_hand } else { board.white_hand };
+    let ntm_hand = if stm == Color::Black { board.white_hand } else { board.black_hand };
+    (stm_hand, ntm_hand)
+}
+
+#[inline]
+fn shogi_perspective_king_squares_from_board(board: &ShogiBoard) -> (Square, Square) {
+    let stm = board.side_to_move;
+    let f_king = board.king_square(stm);
+    let e_king = board.king_square(stm.opponent());
+    let f_sq = if stm == Color::Black { f_king } else { f_king.inverse() };
+    let e_sq = if stm == Color::Black { e_king.inverse() } else { e_king };
+    (f_sq, e_sq)
+}
+
+#[inline]
+fn shogi_king_rank_bucket_from_board<const N: usize>(board: &ShogiBoard) -> usize {
+    let (f_sq, e_sq) = shogi_perspective_king_squares_from_board(board);
+    let f_rank = f_sq.rank() as usize;
+    let e_rank = e_sq.rank() as usize;
+
+    const F_TO_INDEX: [usize; 9] = [0, 0, 0, 3, 3, 3, 6, 6, 6];
+    const E_TO_INDEX: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+
+    match N {
+        81 => f_rank.min(8) * 9 + e_rank.min(8),
+        9 => F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)],
+        _ => (F_TO_INDEX[f_rank.min(8)] + E_TO_INDEX[e_rank.min(8)]).min(N.saturating_sub(1)),
     }
 }
 
@@ -831,6 +865,19 @@ impl ShogiSfnnHandBucketKind {
             Self::Hand1024 => ShogiHand1024Bucket::bucket_index(pos),
         }
     }
+
+    pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
+        let (stm_hand, ntm_hand) = shogi_stm_ntm_hands_from_board(board);
+        match self {
+            Self::None => 0,
+            Self::Hand4 => shogi_hand4_single_bucket(stm_hand) * 2 + shogi_hand4_single_bucket(ntm_hand),
+            Self::Hand16 => shogi_hand16_single_bucket(stm_hand) * 4 + shogi_hand16_single_bucket(ntm_hand),
+            Self::Hand64 => shogi_hand64_single_bucket(stm_hand) * 8 + shogi_hand64_single_bucket(ntm_hand),
+            Self::Hand64z => shogi_hand64z_single_bucket(stm_hand) * 8 + shogi_hand64z_single_bucket(ntm_hand),
+            Self::Hand256 => shogi_hand256_single_bucket(stm_hand) * 16 + shogi_hand256_single_bucket(ntm_hand),
+            Self::Hand1024 => shogi_hand1024_single_bucket(stm_hand) * 32 + shogi_hand1024_single_bucket(ntm_hand),
+        }
+    }
 }
 
 /// King axis for YaneuraOu-compatible SFNN LayerStack buckets.
@@ -882,6 +929,23 @@ impl ShogiSfnnKingBucketKind {
             Self::King29ByKing29 => ShogiKing29ByKing29Bucket::bucket_index(pos),
         }
     }
+
+    pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
+        let (f_sq, e_sq) = shogi_perspective_king_squares_from_board(board);
+        match self {
+            Self::None => 0,
+            Self::KingRank9 => shogi_king_rank_bucket_from_board::<9>(board),
+            Self::KingRank81 => shogi_king_rank_bucket_from_board::<81>(board),
+            Self::King9ZoneByKing9Zone => {
+                shogi_king9_zone_single_bucket(f_sq) * 9 + shogi_king9_zone_single_bucket(e_sq)
+            }
+            Self::King13ZoneByKing13Zone => {
+                shogi_king13_zone_single_bucket(f_sq) * 13 + shogi_king13_zone_single_bucket(e_sq)
+            }
+            Self::King21ByKing21 => shogi_king21_single_bucket(f_sq) * 21 + shogi_king21_single_bucket(e_sq),
+            Self::King29ByKing29 => shogi_king29_single_bucket(f_sq) * 29 + shogi_king29_single_bucket(e_sq),
+        }
+    }
 }
 
 /// Progress axis for YaneuraOu-compatible SFNN LayerStack buckets.
@@ -913,6 +977,15 @@ impl ShogiSfnnProgressBucketKind {
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
         let count = self.bucket_count();
         if count == 1 { 0 } else { shogi_sfnn_progress_bucket(pos, count) }
+    }
+
+    pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
+        let count = self.bucket_count();
+        if count == 1 {
+            0
+        } else {
+            shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_board(board), count)
+        }
     }
 }
 
@@ -1067,9 +1140,14 @@ impl ShogiSfnnLayerStackBucketKind {
     }
 
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
-        let hand_bucket = self.hand.bucket(pos);
-        let king_bucket = self.king.bucket(pos);
-        let progress_bucket = self.progress.bucket(pos);
+        let board = pos.decode();
+        self.bucket_from_board(&board)
+    }
+
+    pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
+        let hand_bucket = self.hand.bucket_from_board(board);
+        let king_bucket = self.king.bucket_from_board(board);
+        let progress_bucket = self.progress.bucket_from_board(board);
         (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
     }
 }
@@ -1217,6 +1295,7 @@ static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 static SHOGI_SFNN_PROGRESS_Q16_PARAMS: OnceLock<ShogiSfnnProgressQ16Params> = OnceLock::new();
+static SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC: OnceLock<bool> = OnceLock::new();
 static SHOGI_SFNN_PROGRESS_Q16_THRESHOLDS: OnceLock<[i64; SHOGI_SFNN_PROGRESS_VALUE_COUNT - 1]> = OnceLock::new();
 
 pub fn set_shogi_sfnn_progress_q16_params(params: ShogiSfnnProgressQ16Params) -> Result<(), String> {
@@ -1227,6 +1306,10 @@ pub fn set_shogi_sfnn_progress_q16_params(params: ShogiSfnnProgressQ16Params) ->
         return Err("different SFNN progress q16 parameters are already loaded in this process".to_string());
     }
 
+    let is_material_heuristic = params == ShogiSfnnProgressQ16Params::material_heuristic();
+    SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC
+        .set(is_material_heuristic)
+        .map_err(|_| "SFNN progress q16 parameter kind is already loaded in this process".to_string())?;
     SHOGI_SFNN_PROGRESS_Q16_PARAMS
         .set(params)
         .map_err(|_| "SFNN progress q16 parameters are already loaded in this process".to_string())
@@ -1255,11 +1338,104 @@ pub fn shogi_sfnn_progress_0_to_255(pos: &PackedSfenValue) -> u8 {
     let Some(params) = shogi_sfnn_progress_q16_params() else {
         return shogi_sfnn_progress_0_to_255_from_sum_q16(0);
     };
+    let board = pos.decode();
+    shogi_sfnn_progress_0_to_255_from_sum_q16(shogi_sfnn_progress_sum_q16_from_board(&board, params))
+}
+
+fn shogi_sfnn_progress_0_to_255_from_board(board: &ShogiBoard) -> u8 {
+    let Some(params) = shogi_sfnn_progress_q16_params() else {
+        return shogi_sfnn_progress_0_to_255_from_sum_q16(0);
+    };
+    shogi_sfnn_progress_0_to_255_from_sum_q16(shogi_sfnn_progress_sum_q16_from_board(board, params))
+}
+
+fn shogi_sfnn_progress_sum_q16_from_board(board: &ShogiBoard, params: &ShogiSfnnProgressQ16Params) -> i64 {
+    if SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC.get().copied().unwrap_or(false) {
+        return shogi_sfnn_material_heuristic_sum_q16_from_board(board);
+    }
+
+    if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
+        return i64::from(params.bias_q16);
+    }
+
+    let weights = &params.weights_q16;
+    let bk_base = board.black_king_sq.index() * FE_OLD_END;
+    let wk_base = board.white_king_sq.inverse().index() * FE_OLD_END;
     let mut sum_q16 = i64::from(params.bias_q16);
-    ShogiProgressKPAbs::for_each_active_index(pos, |idx| {
-        sum_q16 += i64::from(params.weights_q16[idx]);
-    });
-    shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16)
+
+    for &pt in &BOARD_PIECE_TYPES {
+        for color in [Color::Black, Color::White] {
+            for sq in board.pieces(color, pt) {
+                let piece = Piece::new(color, pt);
+
+                let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
+                if bp_b != BonaPiece::ZERO {
+                    sum_q16 += i64::from(weights[bk_base + bp_b.value() as usize]);
+                }
+
+                let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
+                if bp_w != BonaPiece::ZERO {
+                    sum_q16 += i64::from(weights[wk_base + bp_w.value() as usize]);
+                }
+            }
+        }
+    }
+
+    for owner in [Color::Black, Color::White] {
+        let hand = if owner == Color::Black { board.black_hand } else { board.white_hand };
+        for &pt in &HAND_PIECE_TYPES {
+            let count = hand.count(pt);
+            for c in 1..=count {
+                let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
+                if bp_b != BonaPiece::ZERO {
+                    sum_q16 += i64::from(weights[bk_base + bp_b.value() as usize]);
+                }
+
+                let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
+                if bp_w != BonaPiece::ZERO {
+                    sum_q16 += i64::from(weights[wk_base + bp_w.value() as usize]);
+                }
+            }
+        }
+    }
+
+    sum_q16
+}
+
+fn shogi_sfnn_material_heuristic_sum_q16_from_board(board: &ShogiBoard) -> i64 {
+    #[inline]
+    fn q16(x: f32) -> i64 {
+        (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i64
+    }
+
+    let mut sum_q16 = q16(-3.0);
+    let hand_point = 0.07_f32;
+    let pawn = q16(hand_point * 1.0);
+    let lance_knight = q16(hand_point * 2.0);
+    let silver_gold = q16(hand_point * 3.0);
+    let bishop_rook = q16(hand_point * 5.0);
+    let horse = q16(0.18);
+    let dragon = q16(0.22);
+
+    for piece in &board.board {
+        match piece.piece_type {
+            PieceType::Horse => sum_q16 += 2 * horse,
+            PieceType::Dragon => sum_q16 += 2 * dragon,
+            _ => {}
+        }
+    }
+
+    for hand in [board.black_hand, board.white_hand] {
+        sum_q16 += 2 * i64::from(hand.pawn()) * pawn;
+        sum_q16 += 2 * i64::from(hand.lance()) * lance_knight;
+        sum_q16 += 2 * i64::from(hand.knight()) * lance_knight;
+        sum_q16 += 2 * i64::from(hand.silver()) * silver_gold;
+        sum_q16 += 2 * i64::from(hand.gold()) * silver_gold;
+        sum_q16 += 2 * i64::from(hand.bishop()) * bishop_rook;
+        sum_q16 += 2 * i64::from(hand.rook()) * bishop_rook;
+    }
+
+    sum_q16
 }
 
 /// Map scalar progress `0..=255` into an arbitrary YaneuraOu progress bucket count.
@@ -1403,6 +1579,10 @@ impl ShogiProgressKPAbs {
     /// This is the exact feature expansion used by `progress8kpabs`.
     pub fn for_each_active_index(pos: &PackedSfenValue, mut f: impl FnMut(usize)) {
         let board = pos.decode();
+        Self::for_each_active_index_from_board(&board, &mut f);
+    }
+
+    fn for_each_active_index_from_board(board: &ShogiBoard, mut f: impl FnMut(usize)) {
         if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
             return;
         }
@@ -2065,6 +2245,23 @@ mod tests {
         assert_eq!(params.weights_q16.len(), SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
         assert!(params.bias_q16 < 0);
         assert!(params.weights_q16.iter().any(|&w| w > 0));
+    }
+
+    #[test]
+    fn test_shogi_sfnn_progress_material_heuristic_fast_sum_matches_weight_sum() {
+        let params = ShogiSfnnProgressQ16Params::material_heuristic();
+        let mut board =
+            ShogiBoard { black_king_sq: Square::new(4, 8), white_king_sq: Square::new(4, 0), ..Default::default() };
+        board.board[Square::new(2, 3).index()] = Piece::new(Color::Black, PieceType::Horse);
+        board.board[Square::new(6, 5).index()] = Piece::new(Color::White, PieceType::Dragon);
+        board.black_hand.set_pawn(3);
+        board.black_hand.set_bishop(1);
+        board.white_hand.set_lance(2);
+        board.white_hand.set_rook(1);
+
+        let generic = shogi_sfnn_progress_sum_q16_from_board(&board, &params);
+        let fast = shogi_sfnn_material_heuristic_sum_q16_from_board(&board);
+        assert_eq!(fast, generic);
     }
 
     #[test]
