@@ -1786,7 +1786,7 @@ fn cuda_cpp_checkpoint_timing_text(timing: CudaCppCheckpointTiming, save_bytes: 
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_cuda_cpp_checkpoint_with_timing(
-    prefix: &str,
+    _prefix: &str,
     progress: Option<CudaCppScheduleProgress>,
     batch_size: usize,
     positions: usize,
@@ -1820,9 +1820,8 @@ fn print_cuda_cpp_checkpoint_with_timing(
                 )
             };
             eprintln!(
-                "  {} {}  {}  {}  {}  {}  {}  {}",
-                paint(prefix, ConsoleColor::Dim),
-                paint("[checkpoint]", ConsoleColor::BoldGreen),
+                "  {}  {}  {}  {}  {}  {}  {}",
+                paint("[save]", ConsoleColor::BoldGreen),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
                     format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
@@ -1835,9 +1834,8 @@ fn print_cuda_cpp_checkpoint_with_timing(
             );
         }
         None => eprintln!(
-            "  {} {}  {}  {}  {}  {}",
-            paint(prefix, ConsoleColor::Dim),
-            paint("[checkpoint]", ConsoleColor::BoldGreen),
+            "  {}  {}  {}  {}  {}",
+            paint("[save]", ConsoleColor::BoldGreen),
             paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
             colored_seconds("step_time", stats.interval_train_elapsed_sec),
@@ -1847,27 +1845,24 @@ fn print_cuda_cpp_checkpoint_with_timing(
     if let Some(timing) = timing {
         let save_bytes = if timing.save.is_some() { cuda_cpp_checkpoint_state_bytes(checkpoint_dir) } else { None };
         eprintln!(
-            "  {} {}: {}",
-            paint(prefix, ConsoleColor::Dim),
-            paint("checkpoint overhead", ConsoleColor::BoldYellow),
+            "  {} {}",
+            paint("[overhead]", ConsoleColor::BoldYellow),
             cuda_cpp_checkpoint_timing_text(timing, save_bytes)
         );
     }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn print_cuda_cpp_validation_overhead(prefix: &str, timing: CudaCppCheckpointTiming) {
-    eprintln!(
-        "  {} {}: {}",
-        paint(prefix, ConsoleColor::Dim),
-        paint("validation overhead", ConsoleColor::BoldYellow),
-        cuda_cpp_checkpoint_timing_text(timing, None)
-    );
+fn print_cuda_cpp_validation_overhead(_prefix: &str, timing: CudaCppCheckpointTiming) {
+    if timing.readback.is_zero() && timing.save.is_none() {
+        return;
+    }
+    eprintln!("  {} {}", paint("[overhead]", ConsoleColor::BoldYellow), cuda_cpp_checkpoint_timing_text(timing, None));
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_cuda_cpp_superbatch_progress(
-    prefix: &str,
+    _prefix: &str,
     progress: Option<CudaCppScheduleProgress>,
     batch_size: usize,
     positions: usize,
@@ -1878,9 +1873,8 @@ fn print_cuda_cpp_superbatch_progress(
             let sb_total_positions = progress.batches_per_superbatch.saturating_mul(batch_size);
             let batch_word = if progress.batches_per_superbatch == 1 { "batch" } else { "batches" };
             eprintln!(
-                "  {} {}  {}  {}  {}  {}  {}  {}",
-                paint(prefix, ConsoleColor::Dim),
-                paint("[progress]", ConsoleColor::BoldCyan),
+                "  {}  {}  {}  {}  {}  {}  {}",
+                paint("[sb]", ConsoleColor::BoldCyan),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
                     format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
@@ -1902,9 +1896,8 @@ fn print_cuda_cpp_superbatch_progress(
             );
         }
         None => eprintln!(
-            "  {} {}  {}  {}  {}  {}",
-            paint(prefix, ConsoleColor::Dim),
-            paint("[progress]", ConsoleColor::BoldCyan),
+            "  {}  {}  {}  {}  {}",
+            paint("[step]", ConsoleColor::BoldCyan),
             paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
             colored_seconds("step_time", stats.interval_train_elapsed_sec),
@@ -1918,7 +1911,7 @@ fn print_cuda_cpp_validation_summary(prefix: &str, epoch_superbatch: Option<(usi
 }
 
 fn print_cuda_cpp_validation_summary_elapsed(
-    prefix: &str,
+    _prefix: &str,
     epoch_superbatch: Option<(usize, usize)>,
     accuracy: f32,
     loss: f32,
@@ -1931,17 +1924,16 @@ fn print_cuda_cpp_validation_summary_elapsed(
         .unwrap_or_default();
     match epoch_superbatch {
         Some((epoch, superbatch)) => eprintln!(
-            "  {} {}: epoch={epoch}, superbatch={superbatch}, {}, {}{}",
-            paint(prefix, ConsoleColor::Dim),
-            paint("validation", ConsoleColor::Yellow),
+            "  {}  {}  {}, {}{}",
+            paint("[val]", ConsoleColor::Yellow),
+            paint(format!("epoch {epoch} sb {superbatch}"), ConsoleColor::BoldYellow),
             colored_metric("test_value_accuracy", accuracy, 7),
             colored_metric("test_value_loss", loss, 8),
             elapsed_text
         ),
         None => eprintln!(
-            "  {} {}: {}, {}{}",
-            paint(prefix, ConsoleColor::Dim),
-            paint("final validation", ConsoleColor::Yellow),
+            "  {}  {}, {}{}",
+            paint("[final-val]", ConsoleColor::Yellow),
             colored_metric("test_value_accuracy", accuracy, 7),
             colored_metric("test_value_loss", loss, 8),
             elapsed_text
@@ -2834,7 +2826,7 @@ struct Args {
     /// GPU batch size for the validation forward pass. Larger is faster
     /// but uses more VRAM. Independent of `--batch-size` (which
     /// controls training).
-    #[arg(long, default_value = "8192")]
+    #[arg(long, default_value = "65536")]
     test_batch_size: usize,
 
     /// Seed for the random sampler in `--test-teacher`. `0`
@@ -6397,6 +6389,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
+    let validation_cache_started = std::time::Instant::now();
+    let mut sfnn_resident_validation_cache =
+        CudaCppSfnnResidentValidationCache::try_new(args, feature_kind, &ctx, cuda_shape)?;
+    excluded_elapsed = excluded_elapsed.saturating_add(validation_cache_started.elapsed());
+
     if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
         let mut current_resume_pos = dataloader_resume_pos;
         let mut completed_steps = completed_step_offset;
@@ -6514,10 +6511,17 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                 readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
                 let validation_started = std::time::Instant::now();
-                let test_metrics =
-                    run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?.ok_or_else(
-                        || "--backend cuda-cpp SFNN plateau requires readable --test-teacher metrics".to_string(),
-                    )?;
+                let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                    args,
+                    feature_kind,
+                    &ctx,
+                    cuda_shape,
+                    &runner,
+                    &mut sfnn_resident_validation_cache,
+                )?
+                .ok_or_else(|| {
+                    "--backend cuda-cpp SFNN plateau requires readable --test-teacher metrics".to_string()
+                })?;
                 let validation_elapsed = validation_started.elapsed();
                 let readback_started = std::time::Instant::now();
                 let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
@@ -6876,8 +6880,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let mut validation_elapsed = std::time::Duration::ZERO;
                     let test_metrics = if chunk.run_validation {
                         let validation_started = std::time::Instant::now();
-                        let metrics =
-                            run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
+                        let metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                            args,
+                            feature_kind,
+                            &ctx,
+                            cuda_shape,
+                            &runner,
+                            &mut sfnn_resident_validation_cache,
+                        )?;
                         validation_elapsed = validation_started.elapsed();
                         metrics
                     } else {
@@ -6954,8 +6964,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let validation_event_started = std::time::Instant::now();
                     let readback_elapsed = std::time::Duration::ZERO;
                     let validation_started = std::time::Instant::now();
-                    let test_metrics =
-                        run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
+                    let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                        args,
+                        feature_kind,
+                        &ctx,
+                        cuda_shape,
+                        &runner,
+                        &mut sfnn_resident_validation_cache,
+                    )?;
                     let validation_elapsed = validation_started.elapsed();
                     let validation_event_elapsed = validation_event_started.elapsed();
                     excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
@@ -7103,7 +7119,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if let Some((metrics, validation_elapsed)) = {
                 if args.test_teacher.is_some() {
                     let validation_started = std::time::Instant::now();
-                    let metrics = run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
+                    let metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                        args,
+                        feature_kind,
+                        &ctx,
+                        cuda_shape,
+                        &runner,
+                        &mut sfnn_resident_validation_cache,
+                    )?;
                     let validation_elapsed = validation_started.elapsed();
                     metrics.map(|metrics| (metrics, validation_elapsed))
                 } else {
@@ -7139,7 +7162,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if let Some((chunk, dataloader_pos)) = deferred_direct_checkpoint {
         let checkpoint_started = std::time::Instant::now();
         let validation_started = std::time::Instant::now();
-        let test_metrics = run_cuda_cpp_sfnn_resident_validation(args, feature_kind, &ctx, cuda_shape, &runner)?;
+        let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+            args,
+            feature_kind,
+            &ctx,
+            cuda_shape,
+            &runner,
+            &mut sfnn_resident_validation_cache,
+        )?;
         let validation_elapsed = validation_started.elapsed();
         let save_started = std::time::Instant::now();
         let checkpoint_dir = write_cuda_cpp_sfnn_numbered_checkpoint(
@@ -7394,60 +7424,147 @@ fn run_cuda_cpp_nnue_final_validation(
         let mut chunk_outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
         outputs.append(&mut chunk_outputs);
     }
-    Ok(Some(run_one_test_pass(&cache, args, outputs)))
+    Ok(Some(run_one_test_pass(&cache, args, &outputs)))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn run_cuda_cpp_sfnn_resident_validation(
+struct CudaCppSfnnResidentValidationChunk {
+    batch_size: usize,
+    workspace_index: usize,
+    device_batch: bulletou_cuda_cpp::SfnnForwardDeviceBatch,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+struct CudaCppSfnnResidentValidationCache {
+    cache: Arc<TestPositionsCache>,
+    chunks: Vec<CudaCppSfnnResidentValidationChunk>,
+    workspaces: Vec<bulletou_cuda_cpp::SfnnForwardWorkspace>,
+    outputs: Vec<f32>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppSfnnResidentValidationCache {
+    fn try_new(
+        args: &Args,
+        feature_kind: CudaCppSfnnFeatureKind,
+        ctx: &bulletou_cuda_cpp::Context,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+    ) -> Result<Option<Self>, String> {
+        let Some(cache) = TestPositionsCache::try_load(args) else {
+            return Ok(None);
+        };
+        if cache.positions.is_empty() {
+            eprintln!(
+                "  WARN: --test-teacher yielded no positions; cuda-cpp {} validation skipped",
+                feature_kind.source_label()
+            );
+            return Ok(None);
+        }
+
+        let batch_size = args.test_batch_size.max(1);
+        let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+        let started = std::time::Instant::now();
+        let mut chunks = Vec::new();
+        let mut workspaces = Vec::new();
+
+        for positions in cache.positions.chunks(batch_size) {
+            let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
+            let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+                ctx,
+                bulletou_cuda_cpp::SfnnForwardHostBatch {
+                    stm_indices: &batch.stm,
+                    nstm_indices: &batch.nstm,
+                    buckets: &batch.buckets,
+                    batch_size: batch.layout.batch_size,
+                    max_active: batch.layout.max_active,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let workspace_index =
+                match workspaces.iter().position(|workspace: &bulletou_cuda_cpp::SfnnForwardWorkspace| {
+                    workspace.layout.shape == shape && workspace.layout.batch_size == batch.layout.batch_size
+                }) {
+                    Some(index) => index,
+                    None => {
+                        let index = workspaces.len();
+                        workspaces.push(
+                            bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+                                ctx,
+                                bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(shape, batch.layout.batch_size),
+                            )
+                            .map_err(|e| e.to_string())?,
+                        );
+                        index
+                    }
+                };
+            chunks.push(CudaCppSfnnResidentValidationChunk {
+                batch_size: batch.layout.batch_size,
+                workspace_index,
+                device_batch,
+            });
+        }
+
+        let elapsed = started.elapsed();
+        print_cuda_cpp_validation_forward_config_once(
+            &format!("cuda-cpp {}", feature_kind.source_label()),
+            "gpu-resident-cached",
+            cache.positions.len(),
+            batch_size,
+        );
+        eprintln!(
+            "  validation cache = gpu-resident: positions={}, chunks={}, batch_size={}, workspaces={}, prepared={}",
+            format_count(cache.positions.len()),
+            format_count(chunks.len()),
+            format_count(batch_size),
+            format_count(workspaces.len()),
+            format_duration_secs(elapsed)
+        );
+        let output_len = cache.positions.len();
+        Ok(Some(Self { cache, chunks, workspaces, outputs: vec![0.0; output_len] }))
+    }
+
+    fn run(
+        &mut self,
+        args: &Args,
+        ctx: &bulletou_cuda_cpp::Context,
+        runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
+    ) -> Result<TestMetrics, String> {
+        let mut offset = 0usize;
+        for chunk in &self.chunks {
+            let workspace = &self.workspaces[chunk.workspace_index];
+            runner.forward_current_weights(ctx, &chunk.device_batch, workspace).map_err(|e| e.to_string())?;
+            let end = offset
+                .checked_add(chunk.batch_size)
+                .ok_or_else(|| "SFNN validation output offset overflow".to_string())?;
+            workspace.output.download_prefix(ctx, &mut self.outputs[offset..end]).map_err(|e| e.to_string())?;
+            offset = end;
+        }
+        if offset != self.outputs.len() {
+            return Err(format!(
+                "SFNN validation cache output mismatch: wrote {offset}, expected {}",
+                self.outputs.len()
+            ));
+        }
+        Ok(run_one_test_pass(self.cache.as_ref(), args, &self.outputs))
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_resident_validation_cached(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
     ctx: &bulletou_cuda_cpp::Context,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
+    cache: &mut Option<CudaCppSfnnResidentValidationCache>,
 ) -> Result<Option<TestMetrics>, String> {
-    let Some(cache) = TestPositionsCache::try_load(args) else {
-        return Ok(None);
-    };
-    if cache.positions.is_empty() {
-        eprintln!(
-            "  WARN: --test-teacher yielded no positions; cuda-cpp {} final validation skipped",
-            feature_kind.source_label()
-        );
-        return Ok(None);
+    if cache.is_none() {
+        *cache = CudaCppSfnnResidentValidationCache::try_new(args, feature_kind, ctx, shape)?;
     }
-
-    let batch_size = args.test_batch_size.max(1);
-    print_cuda_cpp_validation_forward_config_once(
-        &format!("cuda-cpp {}", feature_kind.source_label()),
-        "gpu-resident",
-        cache.positions.len(),
-        batch_size,
-    );
-    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
-    let mut outputs = Vec::with_capacity(cache.positions.len());
-    for positions in cache.positions.chunks(batch_size) {
-        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
-        let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
-            ctx,
-            bulletou_cuda_cpp::SfnnForwardHostBatch {
-                stm_indices: &batch.stm,
-                nstm_indices: &batch.nstm,
-                buckets: &batch.buckets,
-                batch_size: batch.layout.batch_size,
-                max_active: batch.layout.max_active,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
-            ctx,
-            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(shape, batch.layout.batch_size),
-        )
-        .map_err(|e| e.to_string())?;
-        runner.forward_current_weights(ctx, &device_batch, &workspace).map_err(|e| e.to_string())?;
-        let mut chunk_outputs = workspace.download_output(ctx).map_err(|e| e.to_string())?;
-        outputs.append(&mut chunk_outputs);
+    match cache.as_mut() {
+        Some(cache) => Ok(Some(cache.run(args, ctx, runner)?)),
+        None => Ok(None),
     }
-    Ok(Some(run_one_test_pass(&cache, args, outputs)))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -11646,9 +11763,14 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
     normalized
 }
 
+fn resume_signature_for_match(signature: &str) -> String {
+    let signature = resume_signature_normalize_loss_flags(signature);
+    resume_signature_without_line(&signature, "test_batch_size=")
+}
+
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
-    let current = resume_signature_normalize_loss_flags(&resume_signature(args));
-    let stored = resume_signature_normalize_loss_flags(stored);
+    let current = resume_signature_for_match(&resume_signature(args));
+    let stored = resume_signature_for_match(stored);
     if stored.trim_end() == current.trim_end() {
         return true;
     }
@@ -12745,7 +12867,7 @@ fn run_kppt_component_dirs_final_validation(
     let elapsed = started.elapsed().as_secs_f64();
     eprintln!("  KPPT f32 composed validation forward = ok: positions={}, elapsed={elapsed:.3}s", outputs.len());
 
-    Ok(Some(run_one_test_pass(cache, args, outputs)))
+    Ok(Some(run_one_test_pass(cache, args, &outputs)))
 }
 
 /// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
@@ -12970,9 +13092,9 @@ impl TestPositionsCache {
 /// Run validation on the cached test positions and produce per-validation
 /// `TestMetrics`. Caller must already hold `&mut trainer` (= called
 /// outside `trainer.run`).
-fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: Vec<f32>) -> TestMetrics {
+fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &[f32]) -> TestMetrics {
     let report = compute_sign_accuracy_with_loss_masked(
-        &trainer_outputs,
+        trainer_outputs,
         &cache.teacher_scores,
         &cache.teacher_results,
         &cache.sample_mask,
@@ -16847,6 +16969,54 @@ mod tests {
         );
 
         assert!(resume_signature_matches(&old_signature, &args));
+    }
+
+    #[test]
+    fn resume_signature_ignores_test_batch_size() {
+        use clap::Parser as _;
+
+        let old = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "/tmp/test.hcpe",
+            "--test-positions",
+            "300000",
+            "--test-batch-size",
+            "8192",
+        ])
+        .unwrap();
+        let current = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "/tmp/test.hcpe",
+            "--test-positions",
+            "300000",
+        ])
+        .unwrap();
+
+        assert!(resume_signature_matches(&resume_signature(&old), &current));
+
+        let changed_positions = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "/tmp/test.hcpe",
+            "--test-positions",
+            "300001",
+        ])
+        .unwrap();
+        assert!(!resume_signature_matches(&resume_signature(&old), &changed_positions));
     }
 
     #[test]
