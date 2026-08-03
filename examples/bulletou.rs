@@ -11033,15 +11033,17 @@ fn write_cuda_cpp_sfnn_nn_bin(
         weights.l1w.clone()
     };
     let mut l1b_for_export = weights.l1b.clone();
-    fold_cuda_cpp_sfnn_l1f_into_stacked_l1(shape, &mut l1w_for_export, &mut l1b_for_export, l1fw, l1fb)?;
-    fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
-        shape,
-        &mut l1w_for_export,
-        &mut l1b_for_export,
-        l1axw,
-        l1axb,
-        factorizer,
-    )?;
+    if !compact_l1 {
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(shape, &mut l1w_for_export, &mut l1b_for_export, l1fw, l1fb)?;
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+            shape,
+            &mut l1w_for_export,
+            &mut l1b_for_export,
+            l1axw,
+            l1axb,
+            factorizer,
+        )?;
+    }
     let mut l2w_for_export = weights.l2w.clone();
     let mut l2b_for_export = weights.l2b.clone();
     let mut l3w_for_export = weights.l3w.clone();
@@ -16381,6 +16383,67 @@ mod tests {
                 "{arch}"
             );
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_common_shard_export_allows_inactive_l1_factorizer() {
+        let feature_kind = CudaCppSfnnFeatureKind::Halfka2;
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: feature_kind.training_input_size(),
+            ft_size: 4,
+            l1_hidden: 1,
+            l2_size: 2,
+            num_stacks: 4,
+            l1_group_count: 2,
+            l1_common_size: 2,
+            l1_shard_size: 1,
+            factorizer_king_axis_dim: 2,
+            factorizer_hand_axis_dim: 0,
+        };
+        assert!(shape.has_common_shard_l1());
+        assert_eq!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(), 24);
+        assert_eq!(cuda_cpp_sfnn_dense_l1w_len_for_shape(shape).unwrap(), 32);
+
+        let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+            l0w: vec![0.0; shape.input_size * shape.ft_size],
+            l0b: vec![0.0; shape.ft_size],
+            l1w: vec![0.0; cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap()],
+            l1b: vec![0.0; shape.num_stacks * shape.l1_out()],
+            l1fw: None,
+            l1fb: None,
+            l1axw: None,
+            l1axb: None,
+            l2w: vec![0.0; shape.num_stacks * shape.l2_size * shape.l2_in()],
+            l2b: vec![0.0; shape.num_stacks * shape.l2_size],
+            l2fw: Some(vec![0.0; shape.l2_size * shape.l2_in()]),
+            l2fb: Some(vec![0.0; shape.l2_size]),
+            l2axw: Some(vec![0.0; shape.factorizer_axis_count() * shape.l2_size * shape.l2_in()]),
+            l2axb: Some(vec![0.0; shape.factorizer_axis_count() * shape.l2_size]),
+            l3w: vec![0.0; shape.num_stacks * shape.l2_size],
+            l3b: vec![0.0; shape.num_stacks],
+            l3fw: Some(vec![0.0; shape.l2_size]),
+            l3fb: Some(vec![0.0; 1]),
+            l3axw: Some(vec![0.0; shape.factorizer_axis_count() * shape.l2_size]),
+            l3axb: Some(vec![0.0; shape.factorizer_axis_count()]),
+        };
+        let factorizer = SfnnFactorizerSpec {
+            shared: true,
+            king_axis: true,
+            hand_axis: false,
+            explicit_king_axis: true,
+            explicit_hand_axis: false,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "bulletou-test-sfnn-common-shard-export-{}-{}.nn.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        write_cuda_cpp_sfnn_nn_bin(&path, feature_kind, shape, &weights, factorizer, None).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(metadata.len() > 0);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
