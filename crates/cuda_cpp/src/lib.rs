@@ -1472,6 +1472,28 @@ pub fn sfnn_forward_device_with_factorizer(
     workspace: &SfnnForwardWorkspace,
     factorizer: SfnnFactorizerActive,
 ) -> Result<()> {
+    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, None)
+}
+
+fn sfnn_forward_train_device_with_factorizer(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &SfnnForwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    folded_l0w_scratch: &F32Buffer,
+) -> Result<()> {
+    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, Some(folded_l0w_scratch))
+}
+
+fn sfnn_forward_device_with_factorizer_impl(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &SfnnForwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    folded_l0w_scratch: Option<&F32Buffer>,
+) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
     workspace.validate()?;
@@ -1489,6 +1511,9 @@ pub fn sfnn_forward_device_with_factorizer(
         )));
     }
     let shape = weights.shape;
+    if let Some(scratch) = folded_l0w_scratch {
+        expect_len("sfnn folded_l0w scratch", shape.input_size * shape.ft_size, scratch.len())?;
+    }
     let (l1axw, l1axb, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
         (Some(l1axw), Some(l1axb)) if factorizer.king_axis || factorizer.hand_axis => {
             (l1axw.as_ptr(), l1axb.as_ptr(), 1)
@@ -1564,6 +1589,7 @@ pub fn sfnn_forward_device_with_factorizer(
             batch.nstm_indices.as_ptr(),
             batch.buckets.as_ptr(),
             weights.l0w.as_ptr(),
+            folded_l0w_scratch.map_or(std::ptr::null_mut(), F32Buffer::as_ptr),
             weights.l0b.as_ptr(),
             weights.l1w.as_ptr(),
             weights.l1b.as_ptr(),
@@ -5128,12 +5154,13 @@ impl SfnnTrainStepRunner {
         self.targets.upload(ctx, batch.targets)?;
         self.entry_weights.upload(ctx, batch.entry_weights)?;
 
-        sfnn_forward_device_with_factorizer(
+        sfnn_forward_train_device_with_factorizer(
             ctx,
             &self.device_batch,
             &self.weights,
             &self.forward_workspace,
             self.factorizer,
+            &self.backward_workspace.l0w_gradients,
         )?;
         scalar_loss_device_from_buffers_with_finalize(
             ctx,
@@ -5209,12 +5236,13 @@ impl SfnnTrainStepRunner {
         {
             let slot = &self.upload_slots[slot_idx];
             slot.wait_upload_on(ctx)?;
-            sfnn_forward_device_with_factorizer(
+            sfnn_forward_train_device_with_factorizer(
                 ctx,
                 &slot.device_batch,
                 &self.weights,
                 &self.forward_workspace,
                 self.factorizer,
+                &self.backward_workspace.l0w_gradients,
             )?;
             scalar_loss_device_from_buffers_with_finalize(
                 ctx,
@@ -5273,12 +5301,13 @@ impl SfnnTrainStepRunner {
         self.entry_weights.upload(ctx, batch.entry_weights)?;
         after_upload.record(ctx)?;
 
-        sfnn_forward_device_with_factorizer(
+        sfnn_forward_train_device_with_factorizer(
             ctx,
             &self.device_batch,
             &self.weights,
             &self.forward_workspace,
             self.factorizer,
+            &self.backward_workspace.l0w_gradients,
         )?;
         after_forward.record(ctx)?;
         scalar_loss_device_from_buffers(
@@ -6216,6 +6245,7 @@ mod ffi {
             nstm_indices: *mut BulletOuCudaCppI32Buffer,
             buckets: *mut BulletOuCudaCppI32Buffer,
             l0w: *mut BulletOuCudaCppF32Buffer,
+            folded_l0w: *mut BulletOuCudaCppF32Buffer,
             l0b: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
             l1b: *mut BulletOuCudaCppF32Buffer,
