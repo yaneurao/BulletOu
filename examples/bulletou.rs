@@ -1591,6 +1591,10 @@ fn paint(text: impl std::fmt::Display, color: ConsoleColor) -> String {
     }
 }
 
+fn paint_log_tag(tag: &str, color: ConsoleColor) -> String {
+    paint(format!("{tag:<7}"), color)
+}
+
 fn format_count(value: usize) -> String {
     let raw = value.to_string();
     let mut out = String::with_capacity(raw.len() + raw.len() / 3);
@@ -1821,7 +1825,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
             };
             eprintln!(
                 "  {}  {}  {}  {}  {}  {}  {}",
-                paint("[save]", ConsoleColor::BoldGreen),
+                paint_log_tag("[save]", ConsoleColor::BoldGreen),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
                     format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
@@ -1835,7 +1839,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
         }
         None => eprintln!(
             "  {}  {}  {}  {}  {}",
-            paint("[save]", ConsoleColor::BoldGreen),
+            paint_log_tag("[save]", ConsoleColor::BoldGreen),
             paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
             colored_seconds("step_time", stats.interval_train_elapsed_sec),
@@ -1846,7 +1850,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
         let save_bytes = if timing.save.is_some() { cuda_cpp_checkpoint_state_bytes(checkpoint_dir) } else { None };
         eprintln!(
             "  {} {}",
-            paint("[overhead]", ConsoleColor::BoldYellow),
+            paint_log_tag("[overhead]", ConsoleColor::BoldYellow),
             cuda_cpp_checkpoint_timing_text(timing, save_bytes)
         );
     }
@@ -1857,7 +1861,11 @@ fn print_cuda_cpp_validation_overhead(_prefix: &str, timing: CudaCppCheckpointTi
     if timing.readback.is_zero() && timing.save.is_none() {
         return;
     }
-    eprintln!("  {} {}", paint("[overhead]", ConsoleColor::BoldYellow), cuda_cpp_checkpoint_timing_text(timing, None));
+    eprintln!(
+        "  {} {}",
+        paint_log_tag("[overhead]", ConsoleColor::BoldYellow),
+        cuda_cpp_checkpoint_timing_text(timing, None)
+    );
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1874,7 +1882,7 @@ fn print_cuda_cpp_superbatch_progress(
             let batch_word = if progress.batches_per_superbatch == 1 { "batch" } else { "batches" };
             eprintln!(
                 "  {}  {}  {}  {}  {}  {}  {}",
-                paint("[sb]", ConsoleColor::BoldCyan),
+                paint_log_tag("[train]", ConsoleColor::BoldCyan),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
                     format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
@@ -1897,7 +1905,7 @@ fn print_cuda_cpp_superbatch_progress(
         }
         None => eprintln!(
             "  {}  {}  {}  {}  {}",
-            paint("[step]", ConsoleColor::BoldCyan),
+            paint_log_tag("[train]", ConsoleColor::BoldCyan),
             paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
             colored_seconds("step_time", stats.interval_train_elapsed_sec),
@@ -1925,7 +1933,7 @@ fn print_cuda_cpp_validation_summary_elapsed(
     match epoch_superbatch {
         Some((epoch, superbatch)) => eprintln!(
             "  {}  {}  {}, {}{}",
-            paint("[val]", ConsoleColor::Yellow),
+            paint_log_tag("[valid]", ConsoleColor::Yellow),
             paint(format!("epoch {epoch} sb {superbatch}"), ConsoleColor::BoldYellow),
             colored_metric("test_value_accuracy", accuracy, 7),
             colored_metric("test_value_loss", loss, 8),
@@ -1933,7 +1941,7 @@ fn print_cuda_cpp_validation_summary_elapsed(
         ),
         None => eprintln!(
             "  {}  {}, {}{}",
-            paint("[final-val]", ConsoleColor::Yellow),
+            paint_log_tag("[final]", ConsoleColor::Yellow),
             colored_metric("test_value_accuracy", accuracy, 7),
             colored_metric("test_value_loss", loss, 8),
             elapsed_text
