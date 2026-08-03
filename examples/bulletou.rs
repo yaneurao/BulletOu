@@ -5707,7 +5707,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: accepted_steps_total,
                             train_loss: last_loss,
                             test_metrics: Some(test_metrics),
                             lr_start: plateau_state.current_lr,
@@ -6013,7 +6014,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: seen_steps,
                             train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
@@ -6073,7 +6075,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: seen_steps,
                             train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
@@ -6222,7 +6225,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 epoch: chunk.epoch,
                 superbatch: chunk.superbatch,
                 curr_batch: chunk.steps,
-                train_steps: chunk.steps,
+                prior_positions: schedule.prior_positions,
+                train_steps: seen_steps,
                 train_loss: last_loss,
                 test_metrics,
                 lr_start: chunk.lr_start,
@@ -6946,7 +6950,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: accepted_steps_total,
                             train_loss: last_loss,
                             test_metrics: Some(test_metrics),
                             lr_start: plateau_state.current_lr,
@@ -7290,7 +7295,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: seen_steps,
                             train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
@@ -7364,7 +7370,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
                             curr_batch: schedule.batches_per_superbatch,
-                            train_steps: chunk.steps,
+                            prior_positions: schedule.prior_positions,
+                            train_steps: seen_steps,
                             train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
@@ -7570,7 +7577,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 epoch: chunk.epoch,
                 superbatch: chunk.superbatch,
                 curr_batch: chunk.steps,
-                train_steps: chunk.steps,
+                prior_positions: schedule.prior_positions,
+                train_steps: seen_steps,
                 train_loss: last_loss,
                 test_metrics,
                 lr_start: chunk.lr_start,
@@ -8097,6 +8105,7 @@ struct CudaCppCheckpointLog {
     epoch: usize,
     superbatch: usize,
     curr_batch: usize,
+    prior_positions: usize,
     train_steps: usize,
     train_loss: f32,
     test_metrics: Option<TestMetrics>,
@@ -8184,12 +8193,10 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     )
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
 
-    let prior_positions =
-        read_prior_positions(&output_dir.join(SUMMARY_LEARN_LOG_NAME)).get("nnue").copied().unwrap_or(0);
     let mut learn = String::new();
     learn.push_str(LEARN_LOG_HEADER);
     learn.push('\n');
-    learn.push_str(&cuda_cpp_direct_learn_log_row(args, log, prior_positions));
+    learn.push_str(&cuda_cpp_direct_learn_log_row(args, log));
     std::fs::write(dir.join("learn.log"), learn)
         .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))?;
     append_to_top_level_log(output_dir, idx, Some(args))
@@ -8197,7 +8204,7 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog, prior_positions: usize) -> String {
+fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog) -> String {
     let eval_field = if args.eval_type().uses_arch() {
         format!("{}-{}", args.eval_type().cli_name(), args.arch().cli_name())
     } else {
@@ -8207,7 +8214,7 @@ fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog, prior_p
         Some(metrics) => (format!("{:.6}", metrics.accuracy), format!("{:.6}", metrics.loss)),
         None => ("-".to_string(), "-".to_string()),
     };
-    let positions = prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
+    let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
         "{eval},{epoch},{superbatch},{batch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher}\n",
         eval = eval_field,
@@ -8223,7 +8230,7 @@ fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog, prior_p
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog, prior_positions: usize) -> String {
+fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog) -> String {
     let eval_field = if args.eval_type().uses_arch() {
         format!("{}-{}", args.eval_type().cli_name(), args.arch().cli_name())
     } else {
@@ -8233,7 +8240,7 @@ fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog, prior
         Some(metrics) => (format!("{:.6}", metrics.accuracy), format!("{:.6}", metrics.loss)),
         None => ("-".to_string(), "-".to_string()),
     };
-    let positions = prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
+    let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
         "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher}\n",
         eval = eval_field,
@@ -8260,7 +8267,6 @@ fn append_cuda_cpp_direct_summary_log_row(
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed =
         ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
-    let prior_positions = read_prior_positions(&top).get("nnue").copied().unwrap_or(0);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -8270,7 +8276,7 @@ fn append_cuda_cpp_direct_summary_log_row(
         writeln!(file, "{SUMMARY_LEARN_LOG_HEADER}")
             .map_err(|err| format!("failed to write {}: {err}", top.display()))?;
     }
-    file.write_all(cuda_cpp_direct_summary_log_row(args, log, prior_positions).as_bytes())
+    file.write_all(cuda_cpp_direct_summary_log_row(args, log).as_bytes())
         .map_err(|err| format!("failed to write {}: {err}", top.display()))
 }
 
@@ -12317,6 +12323,18 @@ fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
     resume_config_matches(output_dir, args).unwrap_or(false)
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn remove_non_resume_cuda_cpp_top_level_logs(output_dir: &std::path::Path) {
+    for name in [SUMMARY_LEARN_LOG_NAME, CUDA_CPP_PROGRESS_LOG_NAME, CUDA_CPP_DIAGNOSTICS_LOG_NAME] {
+        let path = output_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("  WARN: failed to remove stale non-resume log {}: {e}", path.display()),
+        }
+    }
+}
+
 fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
 }
@@ -12364,7 +12382,8 @@ fn prepare_resume_config_or_exit(args: &Args) {
         }
     }
 
-    if resume_enabled(args, &output_dir) {
+    let will_resume = resume_enabled(args, &output_dir);
+    if will_resume {
         if let Some(anchor) = latest_checkpoint_epoch_superbatch(&output_dir) {
             match truncate_summary_log_after_checkpoint(&output_dir, anchor) {
                 Ok(0) => {}
@@ -12378,6 +12397,8 @@ fn prepare_resume_config_or_exit(args: &Args) {
                 ),
             }
         }
+    } else {
+        remove_non_resume_cuda_cpp_top_level_logs(&output_dir);
     }
 
     if let Err(e) = write_resume_config(&output_dir, args) {
@@ -17966,6 +17987,7 @@ mod tests {
                 epoch: 1,
                 superbatch: 1,
                 curr_batch: 1,
+                prior_positions: 0,
                 train_steps: 3,
                 train_loss: 0.25,
                 test_metrics: Some(TestMetrics { accuracy: 0.625, loss: 0.125 }),
@@ -17984,6 +18006,90 @@ mod tests {
             lines[1],
             "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,0.250000,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_direct_summary_row_ignores_stale_summary_positions() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-summary-prior-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(SUMMARY_LEARN_LOG_NAME),
+            format!(
+                "{SUMMARY_LEARN_LOG_HEADER}\n\
+                 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,99,0.1,0.2,0.3,0.1,0.1,1.0,9999,old.psv,old-val.hcpe\n"
+            ),
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "teacher.psv",
+            "--test-teacher",
+            "validation.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "5",
+        ])
+        .unwrap();
+
+        append_cuda_cpp_direct_summary_log_row(
+            &tmp,
+            &args,
+            CudaCppCheckpointLog {
+                epoch: 1,
+                superbatch: 1,
+                curr_batch: 1,
+                prior_positions: 0,
+                train_steps: 3,
+                train_loss: 0.25,
+                test_metrics: Some(TestMetrics { accuracy: 0.625, loss: 0.125 }),
+                lr_start: args.lr,
+                lr_end: args.lr,
+                dataloader_pos: bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 },
+            },
+        )
+        .unwrap();
+
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines = summary.lines().collect::<Vec<_>>();
+        let cols = lines.last().unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(cols[9], "15");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn non_resume_cuda_cpp_start_removes_stale_top_level_logs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-clear-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for name in [SUMMARY_LEARN_LOG_NAME, CUDA_CPP_PROGRESS_LOG_NAME, CUDA_CPP_DIAGNOSTICS_LOG_NAME] {
+            std::fs::write(tmp.join(name), "stale\n").unwrap();
+        }
+
+        remove_non_resume_cuda_cpp_top_level_logs(&tmp);
+
+        for name in [SUMMARY_LEARN_LOG_NAME, CUDA_CPP_PROGRESS_LOG_NAME, CUDA_CPP_DIAGNOSTICS_LOG_NAME] {
+            assert!(!tmp.join(name).exists(), "{name} should be removed for a fresh non-resume run");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -18059,6 +18165,7 @@ mod tests {
                 epoch: 1,
                 superbatch: 1,
                 curr_batch: 3,
+                prior_positions: 0,
                 train_steps: 3,
                 train_loss: 0.25,
                 test_metrics: Some(metrics),
@@ -18097,7 +18204,8 @@ mod tests {
                 epoch: 1,
                 superbatch: 2,
                 curr_batch: 2,
-                train_steps: 2,
+                prior_positions: 0,
+                train_steps: 5,
                 train_loss: 0.5,
                 test_metrics: None,
                 lr_start: args.lr,
