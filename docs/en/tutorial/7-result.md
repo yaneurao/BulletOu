@@ -37,7 +37,7 @@ The loss trajectory of every run, both during training and afterwards, is record
 
 `--validation-rate` controls how often held-out accuracy/loss are computed. It defaults to `--save-rate`, but you can set a smaller value (for example `--validation-rate 1 --save-rate 20`) to validate every superbatch while saving checkpoints less often. Validation-only summary rows do not have a matching numbered checkpoint directory; if training is interrupted, rows after the latest complete checkpoint are trimmed on resume because that unsaved model state cannot be restored.
 
-For reproducible comparisons, pass an explicit non-zero `--test-seed` (for example `--test-seed 1`) or use `--test-sample sequential`. The default `--test-seed 0` intentionally uses a time-based random validation sample, so two runs can report slightly different accuracy/loss even with the same training controls.
+By default, when `--test-positions` is omitted, validation uses all fixed-record positions in `--test-teacher`, so repeated runs use the same held-out set. If you pass `--test-positions N` to use a smaller subset, pass an explicit non-zero `--test-seed` (for example `--test-seed 1`) or use `--test-sample sequential` for reproducible comparisons. With sampled validation, the default `--test-seed 0` uses a time-based random sample, so two runs can report slightly different accuracy/loss even with the same training controls.
 
 ### Which one to look at
 

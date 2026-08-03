@@ -37,7 +37,7 @@ KPPT / KPP_KKPT の場合は `nn.bin` の代わりに `KK_synthesized.bin` / `KK
 
 `--validation-rate` は held-out accuracy/loss を何 superbatch ごとに計算するかを制御する。デフォルトは `--save-rate` と同じだが、たとえば `--validation-rate 1 --save-rate 20` のように指定すると、checkpoint 保存は 20 sb ごとのまま、検証だけを毎 sb 実行できる。検証だけの summary 行には対応する番号付き checkpoint ディレクトリがない。学習を中断して resume した場合、最新の完全な checkpoint より後の行は、その時点の model state を復元できないため切り詰められる。
 
-再現性のある比較をしたいときは、明示的に非ゼロの `--test-seed` (例: `--test-seed 1`) を指定するか、`--test-sample sequential` を使う。デフォルトの `--test-seed 0` は意図的に時刻ベースのランダム検証サンプルを使うため、学習条件が同じでも run ごとに accuracy/loss が少し揺れる。
+`--test-positions` を省略した場合、validation は `--test-teacher` に含まれる固定長形式の全局面を使うので、同じ検証ファイルなら毎回同じ held-out set で比較できる。`--test-positions N` で小さい subset を使う場合に再現性のある比較をしたいときは、明示的に非ゼロの `--test-seed` (例: `--test-seed 1`) を指定するか、`--test-sample sequential` を使う。サンプル検証でデフォルトの `--test-seed 0` を使うと、時刻ベースのランダムサンプルになるため、学習条件が同じでも run ごとに accuracy/loss が少し揺れる。
 
 ### どっちを見るか
 

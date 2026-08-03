@@ -73,7 +73,7 @@ use bulletou_lib::{
     trainer::schedule::lr::LrScheduler,
     validate::{
         ValidationLossKind, ValidationSampleMask, build_validation_sample_mask, compute_sign_accuracy_with_loss_masked,
-        read_random_teacher_positions, read_teacher_positions_prefix,
+        read_all_teacher_positions, read_random_teacher_positions, read_teacher_positions_prefix,
     },
     value::{
         nnue_save::{
@@ -2816,8 +2816,8 @@ struct Args {
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
     /// defaulting to `--save-rate`) and also at save events: samples
-    /// `--test-positions` positions from this file, runs them
-    /// through the model, and emits per-superbatch
+    /// all positions from this file by default, runs them through
+    /// the model, and emits per-superbatch
     /// `test_value_accuracy` and `test_value_loss` columns into
     /// `learn.log`. Positions whose teacher score is 0 (draw stamp)
     /// or `|score| >= --score-drop-abs` (mate stamp) are excluded
@@ -2829,13 +2829,16 @@ struct Args {
     test_teacher: Option<PathBuf>,
 
     /// Number of positions to sample from `--test-teacher` per validation
-    /// event.
-    #[arg(long, default_value = "100000")]
-    test_positions: usize,
+    /// event. If omitted, all positions in the fixed-record validation
+    /// teacher are used.
+    #[arg(long)]
+    test_positions: Option<usize>,
 
     /// How to choose validation positions from `--test-teacher`.
     /// `sequential` reads the first `--test-positions` fixed records and
-    /// is useful for byte-for-byte parity against external trainers.
+    /// is useful for byte-for-byte parity against external trainers. This
+    /// option has no effect when `--test-positions` is omitted because all
+    /// validation positions are used.
     #[arg(long, value_enum, default_value = "random")]
     test_sample: TestSampleMode,
 
@@ -11796,6 +11799,9 @@ fn resume_signature(args: &Args) -> String {
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
+    let test_positions = args.test_positions.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
+    let test_sample = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+    let test_seed = if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() };
     [
         "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
@@ -11850,10 +11856,10 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("test_teacher={test_teacher}"),
-        format!("test_positions={}", args.test_positions),
+        format!("test_positions={test_positions}"),
         format!("test_batch_size={}", args.test_batch_size),
-        format!("test_sample={}", args.test_sample.cli_name()),
-        format!("test_seed={}", args.test_seed),
+        format!("test_sample={test_sample}"),
+        format!("test_seed={test_seed}"),
     ]
     .join("\n")
         + "\n"
@@ -13164,7 +13170,7 @@ struct TestPositionsCache {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestPositionsCacheKey {
     path: String,
-    positions: usize,
+    positions: Option<usize>,
     sample: TestSampleMode,
     seed: u64,
     score_drop_abs: u16,
@@ -13192,8 +13198,8 @@ impl TestPositionsCache {
         let key = TestPositionsCacheKey {
             path,
             positions: args.test_positions,
-            sample: args.test_sample,
-            seed: args.test_seed,
+            sample: if args.test_positions.is_some() { args.test_sample } else { TestSampleMode::Sequential },
+            seed: if args.test_positions.is_some() { args.test_seed } else { 0 },
             score_drop_abs: args.score_drop_abs,
         };
         let cache_cell = TEST_POSITIONS_CACHE.get_or_init(|| Mutex::new(None));
@@ -13204,20 +13210,23 @@ impl TestPositionsCache {
         {
             return Some(cache);
         }
+        let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
+        let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+        let seed_label = if args.test_positions.is_some() && args.test_sample == TestSampleMode::Random {
+            args.test_seed.to_string()
+        } else {
+            "-".to_string()
+        };
         eprintln!(
             "  loading {} test positions from {} (sample={}, seed={}) for validation...",
-            args.test_positions,
-            key.path,
-            args.test_sample.cli_name(),
-            if args.test_sample == TestSampleMode::Random {
-                args.test_seed.to_string()
-            } else {
-                "-".to_string()
-            }
+            positions_label, key.path, sample_label, seed_label,
         );
-        let loaded = match args.test_sample {
-            TestSampleMode::Random => read_random_teacher_positions(&key.path, args.test_positions, args.test_seed),
-            TestSampleMode::Sequential => read_teacher_positions_prefix(&key.path, args.test_positions),
+        let loaded = match args.test_positions {
+            None => read_all_teacher_positions(&key.path),
+            Some(n) => match args.test_sample {
+                TestSampleMode::Random => read_random_teacher_positions(&key.path, n, args.test_seed),
+                TestSampleMode::Sequential => read_teacher_positions_prefix(&key.path, n),
+            },
         };
         match loaded {
             Ok(positions) => {
@@ -13790,7 +13799,8 @@ mod tests {
         assert!(sig_with.contains("backend=cuda-cpp"));
         assert!(sig_with.contains("positions_per_superbatch=99942400"));
         assert!(sig_with.contains("superbatches=19"));
-        assert!(sig_with.contains("test_sample=random"));
+        assert!(sig_with.contains("test_positions=all"));
+        assert!(sig_with.contains("test_sample=all"));
         assert!(sig_without.contains("superbatches=none"));
         assert_ne!(sig_with, sig_without);
     }
@@ -15319,6 +15329,63 @@ mod tests {
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
         }
+    }
+
+    #[test]
+    fn omitted_test_positions_means_all_validation_positions() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "heldout.psv",
+        ])
+        .unwrap();
+
+        assert_eq!(args.test_positions, None);
+        let sig = resume_signature(&args);
+        assert!(sig.contains("test_positions=all"));
+        assert!(sig.contains("test_sample=all"));
+        assert!(sig.contains("test_seed=-"));
+
+        let all_with_irrelevant_sampling_flags = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "heldout.psv",
+            "--test-sample",
+            "sequential",
+            "--test-seed",
+            "123",
+        ])
+        .unwrap();
+        assert!(resume_signature_matches(&sig, &all_with_irrelevant_sampling_flags));
+
+        let explicit = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "heldout.psv",
+            "--test-positions",
+            "300000",
+        ])
+        .unwrap();
+
+        assert_eq!(explicit.test_positions, Some(300000));
+        let explicit_sig = resume_signature(&explicit);
+        assert!(explicit_sig.contains("test_positions=300000"));
+        assert!(explicit_sig.contains("test_sample=random"));
+        assert!(explicit_sig.contains("test_seed=0"));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
