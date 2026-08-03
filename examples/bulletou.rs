@@ -1218,6 +1218,12 @@ struct QuantizedTestArgs {
     /// Rounding mode for the final `output / FV_SCALE` engine score.
     #[arg(long, value_enum, default_value = "floor")]
     quant_final_div_round: QuantizedRoundMode,
+
+    /// Diagnostic-only additive offset applied to the engine-scale score
+    /// after `output / FV_SCALE`. This emulates a simple final score bias
+    /// without changing the nn.bin payload.
+    #[arg(long, default_value = "0.0")]
+    engine_score_offset: f32,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1253,6 +1259,9 @@ impl QuantizedTestArgs {
         }
         if self.scale == 0 {
             return Err("--scale must be > 0".to_string());
+        }
+        if !self.engine_score_offset.is_finite() {
+            return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
         Ok(())
     }
@@ -4321,7 +4330,8 @@ fn quantized_test_positions(
     let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
     let sample_mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
 
-    let engine_outputs: Vec<f32> = outputs.iter().map(|out| out.engine_score as f32).collect();
+    let engine_outputs: Vec<f32> =
+        outputs.iter().map(|out| out.engine_score as f32 + args.engine_score_offset).collect();
     let train_scale = quantized_sfnn_raw_output_scale();
     let train_outputs: Vec<f32> = outputs.iter().map(|out| out.raw as f32 / train_scale).collect();
 
@@ -4394,6 +4404,9 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
         "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
         quantized_sfnn_raw_output_scale(),
     );
+    if args.engine_score_offset != 0.0 {
+        eprintln!("  engine offset     = {:+.3}", args.engine_score_offset);
+    }
 
     let teacher = args
         .test_teacher
