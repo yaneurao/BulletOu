@@ -56,6 +56,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda-cpp-backend")]
+use rayon::prelude::*;
+#[cfg(feature = "cuda-cpp-backend")]
 use bulletou_lib::value::nnue_save_sfnn1536::{
     FT_HASH_SFNN, KHASH_SFNN, NETWORK_HASH_SFNN, QA as SFNN_QA, QB as SFNN_QB,
 };
@@ -65,8 +67,9 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
-        SHOGI_SFNN_PROGRESS_HASH, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind, ShogiSfnnLayerStackBucketKind,
-        ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params, set_shogi_sfnn_progress_q16_params,
+        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind,
+        ShogiSfnnKingBucketKind, ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind,
+        ShogiSfnnProgressQ16Params, set_shogi_sfnn_progress_q16_params,
     },
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
@@ -1121,6 +1124,73 @@ impl NerfArgs {
                 "--arch {} is not an SFNN architecture; nerf currently supports only SFNN nn.bin layouts",
                 self.arch.cli_name()
             ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou quantized-test")]
+#[command(about = "Measure sign accuracy by evaluating an exported quantized SFNN nn.bin")]
+struct QuantizedTestArgs {
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed, e.g.
+    /// `SFNN_halfka2_1024_7_64_k3k3`.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// Exported YaneuraOu-compatible quantized `nn.bin` to test.
+    #[arg(long = "nn-bin")]
+    nn_bin: PathBuf,
+
+    /// Held-out test set (.hcpe / .psv / .bin).
+    #[arg(long = "test-teacher")]
+    test_teacher: PathBuf,
+
+    /// Number of positions to test. If omitted, all positions in the
+    /// fixed-record validation teacher are used.
+    #[arg(long)]
+    test_positions: Option<usize>,
+
+    /// How to choose validation positions when `--test-positions` is set.
+    /// Omitted `--test-positions` always means all positions.
+    #[arg(long, value_enum, default_value = "sequential")]
+    test_sample: TestSampleMode,
+
+    /// Seed for random validation sampling.
+    #[arg(long, default_value = "0")]
+    test_seed: u64,
+
+    /// Drop positions whose |score| >= this. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+
+    /// YaneuraOu FV_SCALE applied before the final sign test.
+    #[arg(long, default_value = "16")]
+    fv_scale: i32,
+
+    /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
+    /// YaneuraOu's normal x86 builds define USE_SSE2, so the engine path uses 7.
+    #[arg(long, default_value = "7")]
+    sfnn_ft_shift: u32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedTestArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; quantized-test currently supports only SFNN nn.bin layouts",
+                self.arch.cli_name()
+            ));
+        }
+        if self.fv_scale == 0 {
+            return Err("--fv-scale must not be 0".to_string());
         }
         Ok(())
     }
@@ -2439,7 +2509,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf    Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n\nRun `bulletou nerf --help` for nerf-specific options."
+    after_help = "Subcommands:\n  nerf             Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test   Measure sign accuracy using an exported quantized SFNN nn.bin\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -3601,10 +3671,623 @@ fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
     Ok(report)
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug)]
+struct QuantizedSfnnWeights {
+    arch_desc: String,
+    feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
+    input_size: usize,
+    ft_size: usize,
+    l1_hidden: usize,
+    l2_size: usize,
+    num_stacks: usize,
+    l1_pad_in: usize,
+    l2_pad_in: usize,
+    l3_pad_in: usize,
+    l0b: Vec<i16>,
+    l0w: Vec<i16>,
+    progress_params: Option<ShogiSfnnProgressQ16Params>,
+    l1b: Vec<i32>,
+    l1w: Vec<i8>,
+    l2b: Vec<i32>,
+    l2w: Vec<i8>,
+    l3b: Vec<i32>,
+    l3w: Vec<i8>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
+struct QuantizedTestReport {
+    records: usize,
+    compared: usize,
+    sign_match: usize,
+    drawn: usize,
+    filtered_by_score_cap: usize,
+    elapsed: std::time::Duration,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedTestReport {
+    fn accuracy_percent(self) -> f64 {
+        if self.compared == 0 { 0.0 } else { 100.0 * self.sign_match as f64 / self.compared as f64 }
+    }
+
+    fn positions_per_sec(self) -> usize {
+        let secs = self.elapsed.as_secs_f64();
+        if secs <= 0.0 { 0 } else { (self.records as f64 / secs).round() as usize }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl std::ops::Add for QuantizedTestReport {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            records: self.records + rhs.records,
+            compared: self.compared + rhs.compared,
+            sign_match: self.sign_match + rhs.sign_match,
+            drawn: self.drawn + rhs.drawn,
+            filtered_by_score_cap: self.filtered_by_score_cap + rhs.filtered_by_score_cap,
+            elapsed: self.elapsed + rhs.elapsed,
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_i32_le(bytes: &[u8], pos: usize, label: &str) -> Result<i32, String> {
+    let end = pos.checked_add(4).ok_or_else(|| format!("{label}: offset overflow"))?;
+    let slice = bytes.get(pos..end).ok_or_else(|| format!("{label}: truncated at byte {pos}"))?;
+    Ok(i32::from_le_bytes(slice.try_into().expect("slice len checked")))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_i32_vec_le(bytes: &[u8], pos: usize, count: usize, label: &str) -> Result<(Vec<i32>, usize), String> {
+    let byte_len = count
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| format!("{label}: byte count overflow"))?;
+    let end = pos.checked_add(byte_len).ok_or_else(|| format!("{label}: offset overflow"))?;
+    let slice = bytes.get(pos..end).ok_or_else(|| {
+        format!("{label}: truncated at byte {pos}; wanted {byte_len} byte(s), file has {}", bytes.len())
+    })?;
+    let mut out = Vec::with_capacity(count);
+    for chunk in slice.chunks_exact(4) {
+        out.push(i32::from_le_bytes(chunk.try_into().expect("chunk len checked")));
+    }
+    Ok((out, end))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_i8_vec(bytes: &[u8], pos: usize, count: usize, label: &str) -> Result<(Vec<i8>, usize), String> {
+    let end = pos.checked_add(count).ok_or_else(|| format!("{label}: offset overflow"))?;
+    let slice = bytes.get(pos..end).ok_or_else(|| {
+        format!("{label}: truncated at byte {pos}; wanted {count} byte(s), file has {}", bytes.len())
+    })?;
+    Ok((slice.iter().map(|&v| v as i8).collect(), end))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_sfnn_signed_leb128_i16(payload: &[u8], pos: &mut usize, label: &str, index: usize) -> Result<i16, String> {
+    let mut result = 0_i32;
+    let mut shift = 0_u32;
+    loop {
+        let byte = *payload
+            .get(*pos)
+            .ok_or_else(|| format!("{label}: truncated signed LEB128 value at item {index}"))?;
+        *pos += 1;
+        result |= i32::from(byte & 0x7f) << shift;
+        let done = byte & 0x80 == 0;
+        shift += 7;
+        if done {
+            if shift < 32 && (byte & 0x40) != 0 {
+                result |= (!0_i32) << shift;
+            }
+            break;
+        }
+        if shift >= 35 {
+            return Err(format!("{label}: overlong signed LEB128 value at item {index}"));
+        }
+    }
+    if result < i16::MIN as i32 || result > i16::MAX as i32 {
+        return Err(format!("{label}: decoded value {result} at item {index} does not fit i16"));
+    }
+    Ok(result as i16)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_sfnn_leb128_i16_chunk(
+    bytes: &[u8],
+    pos: usize,
+    count: usize,
+    label: &str,
+) -> Result<(Vec<i16>, usize), String> {
+    let magic_end = pos.checked_add(LEB128_MAGIC.len()).ok_or_else(|| format!("{label}: offset overflow"))?;
+    if bytes.get(pos..magic_end) != Some(LEB128_MAGIC) {
+        return Err(format!("{label}: missing LEB128 magic at byte {pos}"));
+    }
+    let size_pos = magic_end;
+    let payload_size = read_u32_le(bytes, size_pos, label)? as usize;
+    let payload_start = size_pos + 4;
+    let payload_end =
+        payload_start.checked_add(payload_size).ok_or_else(|| format!("{label}: payload size overflow"))?;
+    let payload = bytes.get(payload_start..payload_end).ok_or_else(|| {
+        format!(
+            "{label}: payload claims {payload_size} byte(s) at byte {payload_start}, beyond file size {}",
+            bytes.len()
+        )
+    })?;
+
+    let mut payload_pos = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        out.push(read_sfnn_signed_leb128_i16(payload, &mut payload_pos, label, index)?);
+    }
+    if payload_pos != payload.len() {
+        return Err(format!(
+            "{label}: decoded {count} i16 values but {} trailing payload byte(s) remain",
+            payload.len() - payload_pos
+        ));
+    }
+    Ok((out, payload_end))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_feature_kind_from_arch(arch: NnueArch) -> Result<CudaCppSfnnFeatureKind, String> {
+    match (arch.family, arch.feature) {
+        (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm1) => Ok(CudaCppSfnnFeatureKind::Halfka1hm),
+        (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2) => Ok(CudaCppSfnnFeatureKind::Halfka2hm),
+        (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2) => Ok(CudaCppSfnnFeatureKind::Halfka2),
+        (NnueArchFamily::Sfnn, NnueArchFeature::Ka2) => Ok(CudaCppSfnnFeatureKind::Ka2),
+        _ => Err(format!("--arch {} is not a supported SFNN architecture", arch.cli_name())),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn parse_quantized_sfnn_nn_bin(path: &Path, arch: NnueArch, layerstack: LayerStackMode) -> Result<QuantizedSfnnWeights, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if bytes.len() < 12 {
+        return Err(format!("{} is too small to contain an NNUE header", path.display()));
+    }
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(arch)?;
+    let version = read_u32_le(&bytes, 0, "NNUE header version")?;
+    if version != SFNN_NNUE_VERSION {
+        return Err(format!(
+            "{}: NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}",
+            path.display()
+        ));
+    }
+    let model_hash = read_u32_le(&bytes, 4, "NNUE header hash")?;
+    let desc_len = read_u32_le(&bytes, 8, "NNUE header desc_len")? as usize;
+    let desc_start = 12usize;
+    let desc_end = desc_start.checked_add(desc_len).ok_or_else(|| "NNUE header desc_len overflow".to_string())?;
+    let desc_bytes = bytes.get(desc_start..desc_end).ok_or_else(|| {
+        format!("{}: NNUE header description claims {desc_len} byte(s), beyond file size {}", path.display(), bytes.len())
+    })?;
+    let arch_desc = String::from_utf8_lossy(desc_bytes).to_string();
+    let ft_hash_pos = desc_end;
+    let ft_hash = read_u32_le(&bytes, ft_hash_pos, "FeatureTransformer hash")?;
+    if ft_hash != FT_HASH_SFNN {
+        return Err(format!(
+            "{}: FeatureTransformer hash mismatch: expected 0x{FT_HASH_SFNN:08X}, got 0x{ft_hash:08X}",
+            path.display()
+        ));
+    }
+    let wants_progress = layerstack.progress_bucket_count() > 1;
+    let expected_hash = if wants_progress { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
+    if model_hash != expected_hash {
+        eprintln!(
+            "  WARN: NNUE header hash 0x{model_hash:08X} differs from expected 0x{expected_hash:08X} for --arch {}",
+            arch.cli_name()
+        );
+    }
+
+    let input_size = feature_kind.base_input_size();
+    let (ft_size, l1_hidden, l2_size) = arch.dims();
+    if ft_size % 2 != 0 {
+        return Err(format!("SFNN ft_size must be even for quantized element-wise multiply, got {ft_size}"));
+    }
+    let num_stacks = layerstack.num_stacks();
+    let l1_out = l1_hidden + 1;
+    let l2_in = l1_hidden * 2;
+    let l1_pad_in = nnue_pad32(ft_size);
+    let l2_pad_in = nnue_pad32(l2_in);
+    let l3_pad_in = nnue_pad32(l2_size);
+
+    let mut pos = ft_hash_pos + 4;
+    let (l0b, next) = read_sfnn_leb128_i16_chunk(&bytes, pos, ft_size, "FeatureTransformer biases")?;
+    pos = next;
+    let l0w_count = input_size
+        .checked_mul(ft_size)
+        .ok_or_else(|| format!("FeatureTransformer weight shape overflow: input_size={input_size}, ft_size={ft_size}"))?;
+    let (l0w, next) = read_sfnn_leb128_i16_chunk(&bytes, pos, l0w_count, "FeatureTransformer weights")?;
+    pos = next;
+
+    let has_progress_blob =
+        pos.checked_add(4).is_some_and(|end| end <= bytes.len()) && read_u32_le(&bytes, pos, "SFNN progress hash")? == SHOGI_SFNN_PROGRESS_HASH;
+    let progress_params = if has_progress_blob {
+        if !wants_progress {
+            return Err(format!(
+                "{} contains SFNN progress parameters, but --arch {} has no progressN suffix",
+                path.display(),
+                arch.cli_name()
+            ));
+        }
+        pos += 4;
+        let bias_q16 = read_i32_le(&bytes, pos, "SFNN progress bias")?;
+        pos += 4;
+        let (weights_q16, next) = read_i32_vec_le(&bytes, pos, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, "SFNN progress weights")?;
+        pos = next;
+        Some(ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)?)
+    } else {
+        if wants_progress {
+            return Err(format!(
+                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
+                arch.cli_name(),
+                path.display()
+            ));
+        }
+        None
+    };
+
+    let mut l1b = Vec::with_capacity(num_stacks * l1_out);
+    let mut l1w = Vec::with_capacity(num_stacks * l1_out * l1_pad_in);
+    let mut l2b = Vec::with_capacity(num_stacks * l2_size);
+    let mut l2w = Vec::with_capacity(num_stacks * l2_size * l2_pad_in);
+    let mut l3b = Vec::with_capacity(num_stacks);
+    let mut l3w = Vec::with_capacity(num_stacks * l3_pad_in);
+    for stack in 0..num_stacks {
+        let hash = read_u32_le(&bytes, pos, "SFNN network hash")?;
+        if hash != NETWORK_HASH_SFNN {
+            return Err(format!(
+                "{}: SFNN stack {stack} network hash mismatch: expected 0x{NETWORK_HASH_SFNN:08X}, got 0x{hash:08X}",
+                path.display()
+            ));
+        }
+        pos += 4;
+        let (chunk, next) = read_i32_vec_le(&bytes, pos, l1_out, "SFNN l1 biases")?;
+        l1b.extend(chunk);
+        pos = next;
+        let (chunk, next) = read_i8_vec(&bytes, pos, l1_out * l1_pad_in, "SFNN l1 weights")?;
+        l1w.extend(chunk);
+        pos = next;
+        let (chunk, next) = read_i32_vec_le(&bytes, pos, l2_size, "SFNN l2 biases")?;
+        l2b.extend(chunk);
+        pos = next;
+        let (chunk, next) = read_i8_vec(&bytes, pos, l2_size * l2_pad_in, "SFNN l2 weights")?;
+        l2w.extend(chunk);
+        pos = next;
+        let (chunk, next) = read_i32_vec_le(&bytes, pos, 1, "SFNN l3 bias")?;
+        l3b.extend(chunk);
+        pos = next;
+        let (chunk, next) = read_i8_vec(&bytes, pos, l3_pad_in, "SFNN l3 weights")?;
+        l3w.extend(chunk);
+        pos = next;
+    }
+    if pos != bytes.len() {
+        return Err(format!(
+            "{}: parsed expected SFNN payload for --arch {}, but {} trailing byte(s) remain",
+            path.display(),
+            arch.cli_name(),
+            bytes.len() - pos
+        ));
+    }
+
+    Ok(QuantizedSfnnWeights {
+        arch_desc,
+        feature_kind,
+        layerstack,
+        input_size,
+        ft_size,
+        l1_hidden,
+        l2_size,
+        num_stacks,
+        l1_pad_in,
+        l2_pad_in,
+        l3_pad_in,
+        l0b,
+        l0w,
+        progress_params,
+        l1b,
+        l1w,
+        l2b,
+        l2w,
+        l3b,
+        l3w,
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug)]
+struct QuantizedSfnnThreadState {
+    ft: Vec<u8>,
+    l1: Vec<i32>,
+    l2_input: Vec<u8>,
+    l2: Vec<u8>,
+    report: QuantizedTestReport,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedSfnnThreadState {
+    fn new(weights: &QuantizedSfnnWeights) -> Self {
+        Self {
+            ft: vec![0; weights.ft_size],
+            l1: vec![0; weights.l1_hidden + 1],
+            l2_input: vec![0; weights.l1_hidden * 2],
+            l2: vec![0; weights.l2_size],
+            report: QuantizedTestReport::default(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_ft_pair_value(sum0: i32, sum1: i32, ft_shift: u32) -> u8 {
+    let sum0 = sum0.clamp(0, i32::from(SFNN_QA) * 2);
+    let sum1 = sum1.clamp(0, i32::from(SFNN_QA) * 2);
+    let product = ((sum0 as i64) << ft_shift) * sum1 as i64;
+    ((product >> 16).clamp(0, 255)) as u8
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_clipped_relu(value: i32) -> u8 {
+    let shifted = value >> 6;
+    shifted.clamp(0, i32::from(SFNN_QA)) as u8
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_sqr_clipped_relu(value: i32) -> u8 {
+    let sqr = ((value as i64) * (value as i64)) >> (2 * 6 + 7);
+    sqr.min(i64::from(SFNN_QA)) as u8
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_forward_sample(
+    weights: &QuantizedSfnnWeights,
+    batch: &bulletou_lib::value::FastBatchHost,
+    sample: usize,
+    ft_shift: u32,
+    fv_scale: i32,
+    state: &mut QuantizedSfnnThreadState,
+) -> Result<i32, String> {
+    let max_active = batch.layout.max_active;
+    let sparse_offset = sample
+        .checked_mul(max_active)
+        .ok_or_else(|| format!("sample {sample}: sparse offset overflow"))?;
+    let bucket = *batch
+        .buckets
+        .get(sample)
+        .ok_or_else(|| format!("sample {sample}: missing LayerStack bucket"))? as isize;
+    if bucket < 0 || bucket as usize >= weights.num_stacks {
+        return Err(format!("sample {sample}: LayerStack bucket {bucket} out of range 0..{}", weights.num_stacks));
+    }
+    let stack = bucket as usize;
+    let pairwise = weights.ft_size / 2;
+
+    for j in 0..pairwise {
+        let mut stm0 = i32::from(weights.l0b[j]) * 2;
+        let mut stm1 = i32::from(weights.l0b[pairwise + j]) * 2;
+        let mut nstm0 = i32::from(weights.l0b[j]) * 2;
+        let mut nstm1 = i32::from(weights.l0b[pairwise + j]) * 2;
+
+        for slot in 0..max_active {
+            let stm_feature = batch.stm[sparse_offset + slot];
+            if stm_feature >= 0 {
+                let feature = stm_feature as usize;
+                if feature >= weights.input_size {
+                    return Err(format!("sample {sample}: STM feature {feature} out of range {}", weights.input_size));
+                }
+                let base = feature * weights.ft_size;
+                stm0 += i32::from(weights.l0w[base + j]) * 2;
+                stm1 += i32::from(weights.l0w[base + pairwise + j]) * 2;
+            }
+
+            let nstm_feature = batch.nstm[sparse_offset + slot];
+            if nstm_feature >= 0 {
+                let feature = nstm_feature as usize;
+                if feature >= weights.input_size {
+                    return Err(format!("sample {sample}: NSTM feature {feature} out of range {}", weights.input_size));
+                }
+                let base = feature * weights.ft_size;
+                nstm0 += i32::from(weights.l0w[base + j]) * 2;
+                nstm1 += i32::from(weights.l0w[base + pairwise + j]) * 2;
+            }
+        }
+
+        state.ft[j] = quantized_sfnn_ft_pair_value(stm0, stm1, ft_shift);
+        state.ft[pairwise + j] = quantized_sfnn_ft_pair_value(nstm0, nstm1, ft_shift);
+    }
+
+    let l1_out = weights.l1_hidden + 1;
+    let l1b_base = stack * l1_out;
+    let l1w_base = stack * l1_out * weights.l1_pad_in;
+    for out in 0..l1_out {
+        let mut sum = weights.l1b[l1b_base + out];
+        let row = l1w_base + out * weights.l1_pad_in;
+        for i in 0..weights.ft_size {
+            sum += i32::from(state.ft[i]) * i32::from(weights.l1w[row + i]);
+        }
+        state.l1[out] = sum;
+    }
+
+    for i in 0..weights.l1_hidden {
+        state.l2_input[i] = quantized_sfnn_sqr_clipped_relu(state.l1[i]);
+        state.l2_input[weights.l1_hidden + i] = quantized_sfnn_clipped_relu(state.l1[i]);
+    }
+
+    let l2b_base = stack * weights.l2_size;
+    let l2w_base = stack * weights.l2_size * weights.l2_pad_in;
+    for out in 0..weights.l2_size {
+        let mut sum = weights.l2b[l2b_base + out];
+        let row = l2w_base + out * weights.l2_pad_in;
+        for i in 0..(weights.l1_hidden * 2) {
+            sum += i32::from(state.l2_input[i]) * i32::from(weights.l2w[row + i]);
+        }
+        state.l2[out] = quantized_sfnn_clipped_relu(sum);
+    }
+
+    let mut output = weights.l3b[stack];
+    let l3w_base = stack * weights.l3_pad_in;
+    for i in 0..weights.l2_size {
+        output += i32::from(state.l2[i]) * i32::from(weights.l3w[l3w_base + i]);
+    }
+    output += state.l1[weights.l1_hidden];
+
+    Ok(output / fv_scale)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_test_positions(
+    weights: &QuantizedSfnnWeights,
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    batch: &bulletou_lib::value::FastBatchHost,
+    args: &QuantizedTestArgs,
+) -> Result<QuantizedTestReport, String> {
+    let score_cap = (args.score_drop_abs > 0).then_some(i32::from(args.score_drop_abs));
+    let report = (0..positions.len())
+        .into_par_iter()
+        .try_fold(
+            || QuantizedSfnnThreadState::new(weights),
+            |mut state, sample| -> Result<QuantizedSfnnThreadState, String> {
+                let score = quantized_sfnn_forward_sample(
+                    weights,
+                    batch,
+                    sample,
+                    args.sfnn_ft_shift,
+                    args.fv_scale,
+                    &mut state,
+                )?;
+                state.report.records += 1;
+                if score_cap.is_some_and(|cap| score.abs() >= cap) {
+                    state.report.filtered_by_score_cap += 1;
+                    return Ok(state);
+                }
+                let result = positions[sample].game_result();
+                if result == 0 {
+                    state.report.drawn += 1;
+                    return Ok(state);
+                }
+                state.report.compared += 1;
+                let pred_win = score >= 0;
+                let truth_win = result > 0;
+                if pred_win == truth_win {
+                    state.report.sign_match += 1;
+                }
+                Ok(state)
+            },
+        )
+        .try_reduce(
+            || QuantizedSfnnThreadState::new(weights),
+            |mut left, right| -> Result<QuantizedSfnnThreadState, String> {
+                left.report = left.report + right.report;
+                Ok(left)
+            },
+        )?
+        .report;
+    Ok(report)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
+    args.validate_arch_flags()?;
+    let layerstack = args.effective_layerstack();
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
+    let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
+    if let Some(params) = &weights.progress_params {
+        set_shogi_sfnn_progress_q16_params(params.clone())?;
+    }
+    eprintln!("quantized-test:");
+    eprintln!("  arch              = {}", args.arch);
+    eprintln!("  nn_bin            = {}", args.nn_bin.display());
+    eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
+    eprintln!("  feature           = {}", weights.feature_kind.source_label());
+    eprintln!(
+        "  layerstack        = {} ({} stack(s))",
+        weights.layerstack.cli_name(),
+        format_count(weights.num_stacks)
+    );
+    eprintln!("  fv_scale          = {}", args.fv_scale);
+    eprintln!("  sfnn_ft_shift     = {}", args.sfnn_ft_shift);
+
+    let teacher = args
+        .test_teacher
+        .to_str()
+        .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
+    let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
+    let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+    eprintln!(
+        "  loading test positions from {} (positions={}, sample={}, seed={})...",
+        args.test_teacher.display(),
+        positions_label,
+        sample_label,
+        if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
+    );
+    let positions = match args.test_positions {
+        None => read_all_teacher_positions(teacher),
+        Some(n) => match args.test_sample {
+            TestSampleMode::Random => read_random_teacher_positions(teacher, n, args.test_seed),
+            TestSampleMode::Sequential => read_teacher_positions_prefix(teacher, n),
+        },
+    }
+    .map_err(|err| format!("failed to read validation teacher {}: {err}", args.test_teacher.display()))?;
+    if positions.is_empty() {
+        return Err("validation teacher produced no positions".to_string());
+    }
+    eprintln!("  ...{} positions ready", format_count(positions.len()));
+
+    let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
+    let started = std::time::Instant::now();
+    let mut report = quantized_test_positions(&weights, &positions, &batch, args)?;
+    report.elapsed = started.elapsed();
+    Ok(report)
+}
+
 // ----- dispatch ----------------------------------------------------------
 
 fn main() {
     let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("quantized-test")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou quantized-test");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = QuantizedTestArgs::parse_from(raw_args);
+            match run_quantized_test(&args) {
+                Ok(report) => {
+                    println!("quantized-test complete:");
+                    println!("  arch              = {}", args.arch);
+                    println!("  layerstack        = {}", args.effective_layerstack().cli_name());
+                    println!("  nn_bin            = {}", args.nn_bin.display());
+                    println!("  test_teacher      = {}", args.test_teacher.display());
+                    println!("  records           = {}", format_count(report.records));
+                    println!(
+                        "  accuracy          = {:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered)",
+                        report.accuracy_percent(),
+                        report.sign_match,
+                        report.compared,
+                        report.drawn,
+                        report.filtered_by_score_cap
+                    );
+                    println!(
+                        "  elapsed           = {:.3}s ({}/sec)",
+                        report.elapsed.as_secs_f64(),
+                        format_count(report.positions_per_sec())
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: quantized-test failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: quantized-test requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("nerf")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {

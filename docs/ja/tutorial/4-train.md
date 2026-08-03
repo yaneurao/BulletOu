@@ -149,6 +149,21 @@ cuda-cpp backend の stdout に出る `pos/s` は、checkpoint file save / valid
 
 `pos/s` は 1秒あたりに処理した局面数で、学習速度の目安。RTX 4090 なら構成によって数百万〜数千万 pos/s 程度が目安。低位 GPU では比例して低下する。
 
+## 4.9 書き出した `nn.bin` の量子化 accuracy を測る
+
+学習中の validation は基本的に f32 weight の forward で測る。一方、やねうら王で実際に使うのは checkpoint に書き出された量子化済み `nn.bin` なので、量子化後の符号一致率を確認したいときは `quantized-test` を使う。
+
+```powershell
+.\target\release\examples\bulletou.exe quantized-test `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --nn-bin checkpoints\...\0002\nn.bin `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.psv
+```
+
+`--test-positions` を省略すると検証ファイルの全局面を使う。`--test-positions N` を指定した場合は、`--test-sample sequential` / `random` と `--test-seed` でサンプル方法を選べる。
+
+出力される `accuracy` は、やねうら王の `test eval_accuracy` と同じく、draw を除外した W/L の符号一致率。SFNN の量子化 forward を CPU で再現するため、学習中 validation より遅いが、たまに確認する用途なら十分。
+
 ---
 
 次へ:

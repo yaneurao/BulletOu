@@ -142,6 +142,21 @@ For cuda-cpp, stdout `pos/s` excludes checkpoint file saving, validation, loss r
 
 `pos/s` (positions per second) is the rough training-speed indicator. On a single RTX 4090 expect tens of millions of pos/s; on slower GPUs proportionally less.
 
+## 4.9 Test an exported quantized `nn.bin`
+
+Training-time validation normally uses the current f32 weights. The engine, however, plays with the exported quantized `nn.bin`. Use `quantized-test` when you want to measure the sign accuracy of that exported file directly.
+
+```powershell
+.\target\release\examples\bulletou.exe quantized-test `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --nn-bin checkpoints\...\0002\nn.bin `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.psv
+```
+
+If `--test-positions` is omitted, BulletOu tests every position in the validation file. If it is set, choose the sampling mode with `--test-sample sequential` / `random` and `--test-seed`.
+
+The reported `accuracy` is draw-excluded W/L sign agreement, matching YaneuraOu's `test eval_accuracy` command. This CPU quantized forward path is intentionally slower than training-time validation; it is meant for occasional checks.
+
 ---
 
 Next:
