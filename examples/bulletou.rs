@@ -1276,6 +1276,34 @@ impl QuantizedTestArgs {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuantizedCalibrateFvScale {
+    Fixed(i32),
+    Auto,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedCalibrateFvScale {
+    fn cli_label(self) -> String {
+        match self {
+            Self::Fixed(value) => value.to_string(),
+            Self::Auto => "auto".to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn parse_quantized_calibrate_fv_scale(value: &str) -> Result<QuantizedCalibrateFvScale, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(QuantizedCalibrateFvScale::Auto);
+    }
+    let scale = value
+        .parse::<i32>()
+        .map_err(|err| format!("invalid FV_SCALE `{value}`: {err}; use a positive integer or `auto`"))?;
+    Ok(QuantizedCalibrateFvScale::Fixed(scale))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou calibrate-nn-bin")]
 #[command(
@@ -1317,9 +1345,22 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
-    /// YaneuraOu FV_SCALE used by the target engine.
+    /// YaneuraOu FV_SCALE used by the target engine, or `auto` to search
+    /// `--fv-scale-min..=--fv-scale-max`.
+    #[arg(long, default_value = "16", value_name = "FV_SCALE|auto", value_parser = parse_quantized_calibrate_fv_scale)]
+    fv_scale: QuantizedCalibrateFvScale,
+
+    /// Minimum FV_SCALE to try when `--fv-scale auto` is used.
     #[arg(long, default_value = "16")]
-    fv_scale: i32,
+    fv_scale_min: i32,
+
+    /// Maximum FV_SCALE to try when `--fv-scale auto` is used.
+    #[arg(long, default_value = "40")]
+    fv_scale_max: i32,
+
+    /// Positive FV_SCALE step when `--fv-scale auto` is used.
+    #[arg(long, default_value = "1")]
+    fv_scale_step: i32,
 
     /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
     #[arg(long, default_value = "7")]
@@ -1394,7 +1435,7 @@ impl QuantizedCalibrateArgs {
         self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
     }
 
-    fn as_quantized_test_args(&self) -> QuantizedTestArgs {
+    fn as_quantized_test_args(&self, fv_scale: i32) -> QuantizedTestArgs {
         QuantizedTestArgs {
             arch: self.arch,
             nn_bin: self.nn_bin.clone(),
@@ -1403,7 +1444,7 @@ impl QuantizedCalibrateArgs {
             test_sample: self.test_sample,
             test_seed: self.test_seed,
             score_drop_abs: self.score_drop_abs,
-            fv_scale: self.fv_scale,
+            fv_scale,
             sfnn_ft_shift: self.sfnn_ft_shift,
             lambda: self.lambda,
             scale: self.scale,
@@ -1419,8 +1460,59 @@ impl QuantizedCalibrateArgs {
         }
     }
 
+    fn initial_fv_scale(&self) -> i32 {
+        match self.fv_scale {
+            QuantizedCalibrateFvScale::Fixed(value) => value,
+            QuantizedCalibrateFvScale::Auto => self.fv_scale_min,
+        }
+    }
+
+    fn fv_scale_candidates(&self) -> Result<Vec<i32>, String> {
+        match self.fv_scale {
+            QuantizedCalibrateFvScale::Fixed(value) => Ok(vec![value]),
+            QuantizedCalibrateFvScale::Auto => {
+                let mut out = Vec::new();
+                let mut value = self.fv_scale_min;
+                while value <= self.fv_scale_max {
+                    out.push(value);
+                    match value.checked_add(self.fv_scale_step) {
+                        Some(next) if next > value => value = next,
+                        _ => break,
+                    }
+                }
+                if out.is_empty() {
+                    return Err("--fv-scale auto produced no candidates".to_string());
+                }
+                Ok(out)
+            }
+        }
+    }
+
     fn validate_arch_flags(&self) -> Result<(), String> {
-        let test_args = self.as_quantized_test_args();
+        match self.fv_scale {
+            QuantizedCalibrateFvScale::Fixed(value) => {
+                if value <= 0 {
+                    return Err(format!("--fv-scale must be a positive integer or `auto` (got {value})"));
+                }
+            }
+            QuantizedCalibrateFvScale::Auto => {}
+        }
+        if self.fv_scale_min <= 0 {
+            return Err(format!("--fv-scale-min must be positive (got {})", self.fv_scale_min));
+        }
+        if self.fv_scale_max <= 0 {
+            return Err(format!("--fv-scale-max must be positive (got {})", self.fv_scale_max));
+        }
+        if self.fv_scale_min > self.fv_scale_max {
+            return Err(format!(
+                "--fv-scale-min must be <= --fv-scale-max (got {} > {})",
+                self.fv_scale_min, self.fv_scale_max
+            ));
+        }
+        if self.fv_scale_step <= 0 {
+            return Err(format!("--fv-scale-step must be positive (got {})", self.fv_scale_step));
+        }
+        let test_args = self.as_quantized_test_args(self.initial_fv_scale());
         test_args.validate_arch_flags()?;
         if self.nn_bin == self.output {
             return Err("--nn-bin and --output must be different paths".to_string());
@@ -4211,12 +4303,35 @@ struct QuantizedCalibrationReport {
     records: usize,
     stacks: usize,
     scale_estimate: Option<QuantizedScaleEstimate>,
+    fv_scale: i32,
     offset: i32,
     raw_delta: i32,
     before: QuantizedTestReport,
     after: QuantizedTestReport,
+    searched_fv_scales: usize,
     searched_offsets: usize,
+    searched_candidates: usize,
     elapsed: std::time::Duration,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Debug)]
+struct QuantizedCalibrationPrepared {
+    accuracy_indices: Vec<(usize, bool)>,
+    loss_targets: Vec<(usize, f32)>,
+    compared: usize,
+    drawn_games: usize,
+    filtered_by_score_cap: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Debug)]
+struct QuantizedCalibrationCandidate {
+    fv_scale: i32,
+    offset: i32,
+    raw_delta: i32,
+    report: AccuracyReport,
+    loss: f32,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4983,10 +5098,161 @@ fn quantized_calibration_raw_delta(offset: i32, fv_scale: i32) -> Result<i32, St
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_calibration_sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_calibration_wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
+    let q = (score - offset) / scaling;
+    let qm = (-score - offset) / scaling;
+    0.5 * (1.0 + quantized_calibration_sigmoid(q) - quantized_calibration_sigmoid(qm))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn build_quantized_calibration_prepared(
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    args: &QuantizedTestArgs,
+) -> QuantizedCalibrationPrepared {
+    let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+    let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
+    let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
+    let mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
+    let accuracy_indices = mask
+        .accuracy_indices
+        .iter()
+        .map(|&i| (i, teacher_results[i] > 0))
+        .collect::<Vec<_>>();
+
+    let blend = 1.0 - args.lambda;
+    let inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 0.0025 };
+    let loss_kind = quantized_engine_scale_loss_kind(args);
+    let loss_targets = mask
+        .loss_indices
+        .iter()
+        .map(|&i| {
+            let result_norm = match teacher_results[i].signum() {
+                1 => 1.0,
+                -1 => 0.0,
+                _ => 0.5,
+            };
+            let score = f32::from(teacher_scores[i]);
+            let score_norm = match loss_kind {
+                ValidationLossKind::SigmoidMse => quantized_calibration_sigmoid(inv_scale * score),
+                ValidationLossKind::WinRateModel { target, .. } => target.probability(score),
+            };
+            (i, blend * result_norm + (1.0 - blend) * score_norm)
+        })
+        .collect::<Vec<_>>();
+
+    QuantizedCalibrationPrepared {
+        accuracy_indices,
+        loss_targets,
+        compared: mask.compared(),
+        drawn_games: mask.drawn_games,
+        filtered_by_score_cap: mask.filtered_by_score_cap,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_calibration_engine_report_from_outputs(
+    prepared: &QuantizedCalibrationPrepared,
+    outputs: &[QuantizedSfnnForwardOutput],
+    args: &QuantizedTestArgs,
+    raw_delta: i32,
+) -> Result<AccuracyReport, String> {
+    let mut report = AccuracyReport {
+        compared: prepared.compared,
+        drawn_games: prepared.drawn_games,
+        filtered_by_score_cap: prepared.filtered_by_score_cap,
+        loss_sampled: prepared.loss_targets.len(),
+        ..AccuracyReport::default()
+    };
+
+    for &(i, truth) in &prepared.accuracy_indices {
+        let raw = outputs[i]
+            .raw
+            .checked_add(raw_delta)
+            .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
+        let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
+        let pred = model_score >= 0.0;
+        if pred {
+            report.predicted_nonnegative += 1;
+        } else {
+            report.predicted_negative += 1;
+        }
+        if model_score == 0.0 {
+            report.predicted_zero += 1;
+        }
+        if pred == truth {
+            report.sign_matches += 1;
+        }
+    }
+
+    if !prepared.loss_targets.is_empty() {
+        let mut loss_sum = 0.0f32;
+        if quantized_test_uses_wrm(args) {
+            for &(i, target) in &prepared.loss_targets {
+                let raw = outputs[i]
+                    .raw
+                    .checked_add(raw_delta)
+                    .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
+                let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
+                let model_p = quantized_calibration_wrm_probability(model_score, 270.0, 340.0);
+                loss_sum += (model_p - target).abs().powf(args.loss_pow_exp);
+            }
+        } else {
+            let model_inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 1.0 };
+            for &(i, target) in &prepared.loss_targets {
+                let raw = outputs[i]
+                    .raw
+                    .checked_add(raw_delta)
+                    .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
+                let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
+                let diff = quantized_calibration_sigmoid(model_score * model_inv_scale) - target;
+                loss_sum += diff * diff;
+            }
+        }
+        report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+    }
+
+    Ok(report)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_calibration_candidate_is_better(
+    candidate: &QuantizedCalibrationCandidate,
+    best: &QuantizedCalibrationCandidate,
+    scale_estimate: Option<&QuantizedScaleEstimate>,
+) -> bool {
+    if candidate.loss < best.loss {
+        return true;
+    }
+    if candidate.loss > best.loss {
+        return false;
+    }
+    if candidate.report.sign_matches != best.report.sign_matches {
+        return candidate.report.sign_matches > best.report.sign_matches;
+    }
+    if candidate.offset.abs() != best.offset.abs() {
+        return candidate.offset.abs() < best.offset.abs();
+    }
+    if let Some(est) = scale_estimate {
+        let c = (f64::from(candidate.fv_scale) - est.fv_scale).abs();
+        let b = (f64::from(best.fv_scale) - est.fv_scale).abs();
+        if c != b {
+            return c < b;
+        }
+    }
+    candidate.fv_scale < best.fv_scale
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedCalibrationReport, String> {
     args.validate_arch_flags()?;
     let started = std::time::Instant::now();
-    let test_args = args.as_quantized_test_args();
+    let initial_fv_scale = args.initial_fv_scale();
+    let test_args = args.as_quantized_test_args(initial_fv_scale);
     let layerstack = args.effective_layerstack();
     let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
     let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
@@ -5000,7 +5266,13 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     eprintln!("  output            = {}", args.output.display());
     eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
     eprintln!("  layerstack        = {} ({} stack(s))", layerstack.cli_name(), format_count(weights.num_stacks));
-    eprintln!("  fv_scale          = {}", args.fv_scale);
+    eprintln!("  fv_scale          = {}", args.fv_scale.cli_label());
+    if matches!(args.fv_scale, QuantizedCalibrateFvScale::Auto) {
+        eprintln!(
+            "  fv_scale search   = {}..={} step {}",
+            args.fv_scale_min, args.fv_scale_max, args.fv_scale_step
+        );
+    }
     if let Some(offset) = args.engine_score_offset {
         eprintln!("  offset            = {offset} (explicit)");
     } else {
@@ -5036,56 +5308,80 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
     let outputs = quantized_sfnn_forward_outputs(&weights, &batch, &test_args)?;
     let scale_estimate = estimate_quantized_fv_scale_from_outputs(&positions, &outputs, &test_args)?;
-    let mut before = quantized_test_report_from_outputs(&positions, &outputs, &test_args, 0)?;
-    let before_loss = before
-        .engine_scale
-        .test_loss
-        .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
+    let prepared = build_quantized_calibration_prepared(&positions, &test_args);
+    if prepared.loss_targets.is_empty() {
+        return Err("engine-scale loss is unavailable; validation teacher must include game results".to_string());
+    }
 
-    let mut best_offset = args.engine_score_offset.unwrap_or(args.offset_min);
-    let mut best_raw_delta = quantized_calibration_raw_delta(best_offset, args.fv_scale)?;
-    let mut best_report = quantized_test_report_from_outputs(&positions, &outputs, &test_args, best_raw_delta)?;
-    let mut best_loss = best_report
-        .engine_scale
-        .test_loss
-        .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
-    let mut searched_offsets = 1usize;
-
-    if args.engine_score_offset.is_none() {
-        searched_offsets = 0;
+    let fv_scale_candidates = args.fv_scale_candidates()?;
+    let offset_candidates = if let Some(offset) = args.engine_score_offset {
+        vec![offset]
+    } else {
+        let mut out = Vec::new();
         let mut offset = args.offset_min;
-        let step = args.offset_step;
-        let mut first = true;
         while offset <= args.offset_max {
-            searched_offsets += 1;
-            let raw_delta = quantized_calibration_raw_delta(offset, args.fv_scale)?;
-            let report = quantized_test_report_from_outputs(&positions, &outputs, &test_args, raw_delta)?;
-            let loss = report.engine_scale.test_loss.ok_or_else(|| {
-                "engine-scale loss is unavailable; validation teacher must include game results".to_string()
-            })?;
-            if first
-                || loss < best_loss
-                || (loss == best_loss && report.engine_scale.sign_matches > best_report.engine_scale.sign_matches)
-                || (loss == best_loss
-                    && report.engine_scale.sign_matches == best_report.engine_scale.sign_matches
-                    && offset.abs() < best_offset.abs())
-            {
-                best_offset = offset;
-                best_raw_delta = raw_delta;
-                best_report = report;
-                best_loss = loss;
-            }
-            first = false;
-            match offset.checked_add(step) {
+            out.push(offset);
+            match offset.checked_add(args.offset_step) {
                 Some(next) if next > offset => offset = next,
                 _ => break,
             }
         }
+        out
+    };
+    if offset_candidates.is_empty() {
+        return Err("offset search produced no candidates".to_string());
     }
+    let candidate_pairs = fv_scale_candidates
+        .iter()
+        .flat_map(|&fv_scale| offset_candidates.iter().map(move |&offset| (fv_scale, offset)))
+        .collect::<Vec<_>>();
+    let searched_candidates = candidate_pairs.len();
+    let candidates = candidate_pairs
+        .par_iter()
+        .map(|&(fv_scale, offset)| -> Result<QuantizedCalibrationCandidate, String> {
+            let raw_delta = quantized_calibration_raw_delta(offset, fv_scale)?;
+            let mut candidate_args = test_args.clone();
+            candidate_args.fv_scale = fv_scale;
+            let report =
+                quantized_calibration_engine_report_from_outputs(&prepared, &outputs, &candidate_args, raw_delta)?;
+            let loss = report
+                .test_loss
+                .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
+            if !loss.is_finite() {
+                return Err(format!("non-finite calibration loss for FV_SCALE={fv_scale}, offset={offset}: {loss}"));
+            }
+            Ok(QuantizedCalibrationCandidate { fv_scale, offset, raw_delta, report, loss })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let best = candidates
+        .into_iter()
+        .reduce(|best, candidate| {
+            if quantized_calibration_candidate_is_better(&candidate, &best, scale_estimate.as_ref()) {
+                candidate
+            } else {
+                best
+            }
+        })
+        .ok_or_else(|| "calibration search produced no candidates".to_string())?;
+
+    let mut selected_test_args = test_args.clone();
+    selected_test_args.fv_scale = best.fv_scale;
+    let selected_scale_estimate = estimate_quantized_fv_scale_from_outputs(&positions, &outputs, &selected_test_args)?;
+    let mut before = quantized_test_report_from_outputs(&positions, &outputs, &selected_test_args, 0)?;
+    let before_loss = before
+        .engine_scale
+        .test_loss
+        .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
+    let mut best_report =
+        quantized_test_report_from_outputs(&positions, &outputs, &selected_test_args, best.raw_delta)?;
+    let best_loss = best_report
+        .engine_scale
+        .test_loss
+        .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
 
     best_report.elapsed = started.elapsed();
     before.elapsed = started.elapsed();
-    if let Some(est) = &scale_estimate {
+    if let Some(est) = &selected_scale_estimate {
         eprintln!(
             "  estimated FV_SCALE = {:.3}  score ~= raw/{:.3} {:+.3}  samples={}  rmse={:.3}  r2={:.5}",
             est.fv_scale,
@@ -5097,18 +5393,18 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
         );
         eprintln!(
             "  current FV offset  = {:+.3} Value by score-MSE fit at FV_SCALE={}",
-            est.current_fv_score_offset, args.fv_scale,
+            est.current_fv_score_offset, best.fv_scale,
         );
     } else {
         eprintln!("  estimated FV_SCALE = unavailable (not enough score variation in validation subset)");
     }
     eprintln!(
-        "  selected offset   = {:+} Value  raw_delta={:+}  loss {:.8} -> {:.8}",
-        best_offset, best_raw_delta, before_loss, best_loss
+        "  selected          = FV_SCALE={}  offset={:+} Value  raw_delta={:+}  loss {:.8} -> {:.8}",
+        best.fv_scale, best.offset, best.raw_delta, before_loss, best_loss
     );
 
     let bytes = std::fs::read(&args.nn_bin).map_err(|e| format!("failed to read {}: {e}", args.nn_bin.display()))?;
-    let patched = patch_sfnn_l3b_delta(bytes, args.arch, layerstack, best_raw_delta)?;
+    let patched = patch_sfnn_l3b_delta(bytes, args.arch, layerstack, best.raw_delta)?;
     write_bytes_atomic(&args.output, &patched)
         .map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
 
@@ -5117,12 +5413,15 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
         output: args.output.clone(),
         records: positions.len(),
         stacks: weights.num_stacks,
-        scale_estimate,
-        offset: best_offset,
-        raw_delta: best_raw_delta,
+        scale_estimate: selected_scale_estimate,
+        fv_scale: best.fv_scale,
+        offset: best.offset,
+        raw_delta: best.raw_delta,
         before,
         after: best_report,
-        searched_offsets,
+        searched_fv_scales: fv_scale_candidates.len(),
+        searched_offsets: offset_candidates.len(),
+        searched_candidates,
         elapsed: started.elapsed(),
     })
 }
@@ -5148,8 +5447,10 @@ fn main() {
                     println!("  layerstack        = {}", args.effective_layerstack().cli_name());
                     println!("  records           = {}", format_count(report.records));
                     println!("  stacks            = {}", format_count(report.stacks));
+                    println!("  searched_fv_scales= {}", format_count(report.searched_fv_scales));
                     println!("  searched_offsets  = {}", format_count(report.searched_offsets));
-                    println!("  fv_scale          = {}", args.fv_scale);
+                    println!("  searched_candidates= {}", format_count(report.searched_candidates));
+                    println!("  selected_fv_scale = {}", report.fv_scale);
                     if let Some(est) = &report.scale_estimate {
                         println!(
                             "  estimated_fv_scale= {:.3}  score ~= raw/{:.3} {:+.3}",

@@ -35,12 +35,13 @@ engine_score = raw / FV_SCALE
 
 So the same `FV_SCALE` can produce a different score range for different exported networks.
 
-Use `calibrate-nn-bin` to run quantized forward on a validation set and inspect two values:
+Use `calibrate-nn-bin` to run quantized forward on a validation set and choose `FV_SCALE` plus an offset.
 
 | Item | Meaning |
 | --- | --- |
-| `estimated_fv_scale` | Estimated `FV_SCALE` from a linear fit between raw output and teacher score |
-| `selected_offset` | Score offset that gives the lowest validation loss under the supplied `--fv-scale` |
+| `estimated_fv_scale` | Diagnostic linear-fit scale between raw output and teacher score |
+| `selected_fv_scale` | `FV_SCALE` with the lowest validation loss |
+| `selected_offset` | Score offset with the lowest validation loss under the selected `FV_SCALE` |
 
 Example:
 
@@ -50,18 +51,26 @@ Example:
   --nn-bin checkpoints\...\0002\nn.bin `
   --output checkpoints\...\0002\nn2.bin `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.psv `
-  --fv-scale 28
+  --fv-scale auto
 ```
+
+`--fv-scale auto` searches integer `FV_SCALE` values in `16..=40` by default. Use `--fv-scale-min`, `--fv-scale-max`, and `--fv-scale-step` to change that range.
+
+If you pass an integer such as `--fv-scale 28`, BulletOu keeps that `FV_SCALE` fixed and searches only the offset.
 
 Example output:
 
 ```text
-estimated_fv_scale= 27.832  score ~= raw/27.832 -12.345
-scale_fit         = samples 921,060  rmse 620.123  r2 0.41234  current_fv_offset -9.876
-selected_offset   = -10 Value
-folded_raw_delta  = -280 l3b
-before            = acc 62.7604%  loss_engine 0.12345678
-after             = acc 62.8012%  loss_engine 0.12298765
+searched_fv_scales= 25
+searched_offsets  = 257
+searched_candidates= 6,425
+selected_fv_scale = 16
+estimated_fv_scale= 2.390  score ~= raw/2.390 +200.311
+scale_fit         = samples 921,060  rmse 2271.179  r2 0.27811  current_fv_offset +27.783
+selected_offset   = +26 Value
+folded_raw_delta  = +416 l3b
+before            = acc 63.2031%  loss_engine 0.07208891
+after             = acc 62.8638%  loss_engine 0.07186714
 ```
 
 `estimated_fv_scale` comes from the least-squares fit:
@@ -70,10 +79,10 @@ after             = acc 62.8012%  loss_engine 0.12298765
 teacher_score ~= raw / FV_SCALE + offset
 ```
 
-It is a practical estimate of the `FV_SCALE` that matches this `nn.bin` to the teacher score scale.
+It is a diagnostic value, not necessarily the loss-minimizing `FV_SCALE`. WRM loss is nonlinear, so use `selected_fv_scale` for the actual selected candidate.
 
-`selected_offset` is the loss-reducing score offset under the `--fv-scale` you supplied. The command writes that offset into the output `nn.bin` by adding `selected_offset * FV_SCALE` to every final LayerStack bias.
+`selected_offset` is the loss-reducing score offset under `selected_fv_scale`. The command writes that offset into the output `nn.bin` by adding `selected_offset * selected_fv_scale` to every final LayerStack bias.
 
-The command does not write `FV_SCALE` itself into the `nn.bin`. When using the exported file in YaneuraOu, set the engine option `FV_SCALE` using the displayed `estimated_fv_scale` as a guide.
+The command does not write `FV_SCALE` itself into the `nn.bin`. When using the exported file in YaneuraOu, set the engine option `FV_SCALE` to the displayed `selected_fv_scale`.
 
 Previous: [Advanced guide](README.md)

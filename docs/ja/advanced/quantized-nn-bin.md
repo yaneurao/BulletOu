@@ -35,12 +35,13 @@ engine_score = raw / FV_SCALE
 
 として評価値に戻すため、同じ `FV_SCALE` でも `nn.bin` によって評価値の振れ幅が変わることがあります。
 
-`calibrate-nn-bin` は、検証局面に対して量子化後の forward を行い、次の2つを調べます。
+`calibrate-nn-bin` は、検証局面に対して量子化後の forward を行い、`FV_SCALE` と offset を調べます。
 
 | 項目 | 意味 |
 | --- | --- |
-| `estimated_fv_scale` | 教師評価値に raw output を線形に合わせたときの推定 `FV_SCALE` |
-| `selected_offset` | 指定された `FV_SCALE` のもとで、loss が一番小さくなる評価値 offset |
+| `estimated_fv_scale` | 教師評価値に raw output を線形に合わせたときの診断値 |
+| `selected_fv_scale` | loss が一番小さくなる `FV_SCALE` |
+| `selected_offset` | 選ばれた `FV_SCALE` のもとで loss が一番小さくなる評価値 offset |
 
 例:
 
@@ -50,18 +51,26 @@ engine_score = raw / FV_SCALE
   --nn-bin checkpoints\...\0002\nn.bin `
   --output checkpoints\...\0002\nn2.bin `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.psv `
-  --fv-scale 28
+  --fv-scale auto
 ```
+
+`--fv-scale auto` は、デフォルトで `16..=40` の整数 `FV_SCALE` を探索します。範囲を変える場合は `--fv-scale-min` / `--fv-scale-max` / `--fv-scale-step` を指定します。
+
+`--fv-scale 28` のように整数を指定した場合は、その `FV_SCALE` に固定して offset だけを探します。
 
 出力例:
 
 ```text
-estimated_fv_scale= 27.832  score ~= raw/27.832 -12.345
-scale_fit         = samples 921,060  rmse 620.123  r2 0.41234  current_fv_offset -9.876
-selected_offset   = -10 Value
-folded_raw_delta  = -280 l3b
-before            = acc 62.7604%  loss_engine 0.12345678
-after             = acc 62.8012%  loss_engine 0.12298765
+searched_fv_scales= 25
+searched_offsets  = 257
+searched_candidates= 6,425
+selected_fv_scale = 16
+estimated_fv_scale= 2.390  score ~= raw/2.390 +200.311
+scale_fit         = samples 921,060  rmse 2271.179  r2 0.27811  current_fv_offset +27.783
+selected_offset   = +26 Value
+folded_raw_delta  = +416 l3b
+before            = acc 63.2031%  loss_engine 0.07208891
+after             = acc 62.8638%  loss_engine 0.07186714
 ```
 
 `estimated_fv_scale` は、`raw` と教師評価値の関係を
@@ -70,10 +79,10 @@ after             = acc 62.8012%  loss_engine 0.12298765
 teacher_score ~= raw / FV_SCALE + offset
 ```
 
-として最小二乗で合わせた推定値です。この `nn.bin` に対して、やねうら王側の `FV_SCALE` をいくらにすると教師評価値のスケールに近いかを見る目安になります。
+として最小二乗で合わせた診断値です。これは loss を最小にする `FV_SCALE` そのものではありません。WRM loss は非線形なので、実際に使う候補は `selected_fv_scale` を見てください。
 
-`selected_offset` は、指定した `--fv-scale` のまま loss を下げるための補正値です。この補正は `--output` の `nn.bin` に書き込まれます。具体的には、全 LayerStack の最終 bias に `selected_offset * FV_SCALE` を加えます。
+`selected_offset` は、`selected_fv_scale` のもとで loss を下げるための補正値です。この補正は `--output` の `nn.bin` に書き込まれます。具体的には、全 LayerStack の最終 bias に `selected_offset * selected_fv_scale` を加えます。
 
-`FV_SCALE` 自体は、このコマンドでは `nn.bin` に書き込みません。やねうら王で使うときは、表示された `estimated_fv_scale` を参考にして、エンジンオプションの `FV_SCALE` を設定してください。
+`FV_SCALE` 自体は、このコマンドでは `nn.bin` に書き込みません。やねうら王で使うときは、表示された `selected_fv_scale` をエンジン側の `FV_SCALE` に設定してください。
 
 前へ: [応用編トップ](README.md)
