@@ -10,7 +10,7 @@ The architecture file in YaneuraOu source is `source/eval/nnue/architectures/kp_
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch NNUE_kp_<L1>x2_<L2>_<L3>` (same common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)). YaneuraOu currently ships its `NNUE_kp_*` engine binaries only for `256x2-32-32`; the trainer will happily produce others if you want to experiment. On the CLI, use the full architecture name such as `NNUE_kp_256x2_32_32`. Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch NNUE_kp_<L1>x2_<L2>_<L3>` (same common sizes as NNUE_HALFKP; see [tutorial: Run the training](../tutorial/3-train.md)). YaneuraOu currently ships its `NNUE_kp_*` engine binaries only for `256x2-32-32`; the trainer will happily produce others if you want to experiment. On the CLI, use the full architecture name such as `NNUE_kp_256x2_32_32`. Below shows the default:
 
 ```
 Shogi position

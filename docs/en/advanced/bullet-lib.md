@@ -1,14 +1,14 @@
-# 2. Using `bulletou_lib` from your own code (optional)
+# Using `bulletou_lib` from your own code
 
-<a href="../../ja/tutorial/2-bullet-lib.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/advanced/bullet-lib.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-Material beyond the smoke test, for when you start adapting BulletOu to your own training. **Safe to skip on first read** — feel free to jump to [3. Prepare training data](3-data.md).
+This page is for using BulletOu components from your own code. It is not needed for a first training run.
 
-## 2.1 Editing an existing example
+## 1. Editing an existing example
 
 The usual workflow: clone the repo and edit one of the files under [examples/](/examples) to your taste. `shogi_simple.rs` or `bulletou.rs` are common starting points.
 
-## 2.2 Registering a custom example
+## 2. Registering a custom example
 
 Just placing a new file under `examples/` is not enough — `cargo build --example xxx` will not find it until you register it in `bulletou_lib`'s `Cargo.toml`:
 
@@ -21,7 +21,7 @@ path = "../../examples/my_example.rs"
 
 Once registered, the example survives `git pull` from upstream more easily, which helps when maintaining long-running custom experiments.
 
-## 2.3 Importing `bulletou_lib` from another project
+## 3. Importing `bulletou_lib` from another project
 
 You can also depend on `bulletou_lib` as a crate from a separate project:
 
@@ -30,7 +30,7 @@ You can also depend on `bulletou_lib` as a crate from a separate project:
 bullet = { git = "https://github.com/yaneurao/BulletOu", package = "bulletou_lib" }
 ```
 
-## 2.4 API documentation
+## 4. API documentation
 
 Detailed API documentation lives in Rust's docstrings. To generate and open it locally:
 
@@ -40,6 +40,4 @@ cargo doc --open
 
 ---
 
-Next: [3. Prepare training data](3-data.md)
-
-Previous: [1. Quick Start](1-quickstart.md)
+Previous: [Advanced guide](README.md)

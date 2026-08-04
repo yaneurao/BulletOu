@@ -6,7 +6,7 @@
 
 `--arch NNUE_ka2_256x2_32_32` は、入力特徴量に `FeatureSet<Features::K, Features::A2>` を使うやねうら王 NNUE を学習する (architecture ファイルは `source/eval/nnue/architectures/ka2_*.h`、`nnue_arch_gen.py` で自動生成される)。ネットワーク本体は [HalfKP](halfkp.md) / [K-P](kp.md) と同じ 4 層 ClippedReLU で、入力特徴量だけが違う。
 
-関連: `--arch SFNN_ka2_1536_15_32_k3k3` は同じ KA2 入力を SFNN-1536 architecture (LayerStacks=9) で学習する版 ([§4.4](../tutorial/4-train.md) と [SFNN-1536](sfnn-1536.md))。
+関連: `--arch SFNN_ka2_1536_15_32_k3k3` は同じ KA2 入力を SFNN-1536 architecture (LayerStacks=9) で学習する版 ([チュートリアル: 学習を走らせる](../tutorial/3-train.md) と [SFNN-1536](sfnn-1536.md))。
 
 ## アーキテクチャ
 
@@ -143,7 +143,7 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
 ```
 
-やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [§8 Engine](../tutorial/8-engine.md) を参照。
+やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [チュートリアル: エンジンに組み込む](../tutorial/6-engine.md) を参照。
 
 ### 主要 CLI フラグ
 

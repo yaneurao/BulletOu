@@ -1,6 +1,6 @@
-# 9. LayerStack — pick a different small network per position
+# LayerStack — pick a different small network per position
 
-<a href="../../ja/tutorial/9-layerstack.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/advanced/layerstack.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 A standard NNUE uses the same late network for every position. SFNN LayerStack models share the input features and the FeatureTransformer, then switch the small MLP stack behind it depending on the position.
 
@@ -8,7 +8,7 @@ For example, `k3k3` has 9 stacks selected by a coarse king-position bucket. `han
 
 The critical rule is that BulletOu and YaneuraOu must compute exactly the same LayerStack index for the same position. If the index differs by even one, the exported `nn.bin` may load successfully, but the engine will read the wrong stack.
 
-## 9.1 What LayerStack changes
+## 1. What LayerStack changes
 
 LayerStack does not change the input feature set. The input features and FeatureTransformer are shared; only the late network is split into stacks.
 
@@ -29,7 +29,7 @@ In practice, each bucket axis gives the late network a different specialization.
 
 The trade-off is teacher density. More buckets give the model more capacity, but each stack receives fewer samples.
 
-## 9.2 The three independent axes
+## 2. The three independent axes
 
 BulletOu's SFNN LayerStack selection is the product of three independent axes.
 
@@ -72,7 +72,7 @@ So `hand256_k3k3_progress16` means:
 idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 ```
 
-## 9.3 Architecture names
+## 3. Architecture names
 
 The `hand256`, `k3k3`, and `progress8` parts may be written in any order. BulletOu organizes output directory names as `hand → king → progress`.
 
@@ -98,7 +98,7 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 This means KA2 input, FT=3072, L1 = 1024 common + 256 x 8 shards, and LayerStack = `hand256 × k3k3 × progress16`.
 
-## 9.4 Coordinate rule for king buckets
+## 4. Coordinate rule for king buckets
 
 King buckets bucket the side-to-move king and the non-side king separately, then combine the two single-king buckets.
 
@@ -129,7 +129,7 @@ king_bucket = stm_king29 * 29 + non_stm_king29
 
 That is why `k29k29` has `29 * 29 = 841` LayerStacks.
 
-## 9.5 King bucket variants
+## 5. King bucket variants
 
 King bucket variants choose how much position detail to keep.
 
@@ -147,7 +147,7 @@ The `z` in `k9k9z` / `k13k13z` means zone. These are not plain rank splits; they
 
 Long aliases are also accepted, such as `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, and `king29_by_king29`.
 
-## 9.6 `k3k3` — the coarse baseline
+## 6. `k3k3` — the coarse baseline
 
 `k3k3` splits one king into three groups: enemy side, center, and home side. The two kings together produce `3 * 3 = 9` buckets.
 
@@ -167,7 +167,7 @@ Pair buckets:
 
 `k3k3` is light and keeps high teacher density, so it is a good first comparison point. It does not distinguish files on the home ranks.
 
-## 9.7 `k9k9` and `k9k9z` — same 81 stacks, different budget
+## 7. `k9k9` and `k9k9z` — same 81 stacks, different budget
 
 Both `k9k9` and `k9k9z` use 9 buckets per king, so both have `9 * 9 = 81` stacks. The difference is how those 9 buckets are spent.
 
@@ -217,7 +217,7 @@ Compared with `k9k9`:
 
 `k9k9z` is not a strict upgrade over `k9k9`. It spends the same 81-stack budget differently: less rank detail far from home, more file detail near home.
 
-## 9.8 `k13k13z` — keep rank detail, zone only deep home ranks
+## 8. `k13k13z` — keep rank detail, zone only deep home ranks
 
 `k13k13z` uses 13 buckets per king, so the pair has `13 * 13 = 169` stacks.
 
@@ -244,7 +244,7 @@ It keeps ranks 1-7 as rank buckets, then splits ranks 8-9 by file/3.
 | `k21k21` | 441 | full square detail on ranks 8-9 |
 | `k29k29` | 841 | full square detail on ranks 7-9 |
 
-## 9.9 `k21k21` and `k29k29` — detailed home-side king location
+## 9. `k21k21` and `k29k29` — detailed home-side king location
 
 `k21k21` and `k29k29` keep full square detail on the deep home ranks.
 
@@ -290,7 +290,7 @@ The cost is teacher density:
 
 So `k29k29` can learn more slowly in early accuracy because each stack sees fewer samples. That is expected; it is not automatically a bug. Compare it with enough data, and consider factorizer settings for large king buckets.
 
-## 9.10 Hand buckets
+## 10. Hand buckets
 
 Hand buckets combine the side-to-move hand bucket and the non-side hand bucket.
 
@@ -390,7 +390,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `hand256` is a lighter piece-type split. `hand1024` keeps pawn presence separate, but grows much faster when combined with king buckets.
 
-## 9.11 Progress buckets
+## 11. Progress buckets
 
 `progressN` computes a scalar progress value in `0..255`, then maps that value to N buckets.
 
@@ -427,7 +427,7 @@ When `progressN` is used, the exported `nn.bin` includes a Progress section.
 
 `progressN` can be combined with `king=axis` / `hand=axis` factorizers. In that case, the progress axis itself is not factorized; only the hand and king axes are decomposed. For example, `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` can use `--sfnn-factorizer king=axis,hand=axis`.
 
-## 9.12 How large combinations get
+## 12. How large combinations get
 
 The hand / king / progress axes multiply, so combinations can become huge quickly.
 
@@ -449,7 +449,7 @@ The hand / king / progress axes multiply, so combinations can become huge quickl
 
 Large choices affect not only training speed, but also save size, validation time, and teacher density per stack.
 
-## 9.13 Choosing a bucket scheme
+## 13. Choosing a bucket scheme
 
 These are practical starting points, not universal rules.
 
@@ -466,7 +466,7 @@ These are practical starting points, not universal rules.
 
 Larger buckets may show slower early accuracy because each stack receives fewer samples. Compare not only short-run accuracy, but also long-run loss, actual engine strength, checkpoint size, and training speed.
 
-## 9.14 Usage examples
+## 14. Usage examples
 
 Smallest king bucket:
 
@@ -512,4 +512,4 @@ When loading the exported `nn.bin`, build YaneuraOu with the same architecture n
 
 ---
 
-Previous: [8. Load into an engine](8-engine.md)
+Previous: [Advanced guide](README.md)

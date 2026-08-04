@@ -99,7 +99,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 
-中断・再開の挙動は target 横断で同じなので、[チュートリアル 5. 中断・再開](../tutorial/5-resume.md) を参照。
+中断・再開の挙動は target 横断で同じなので、[チュートリアル: 中断・再開](../tutorial/4-resume.md) を参照。
 
 ### KPP_KKPT (factorised)
 
@@ -127,13 +127,13 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--max-epochs` | epoch を何回実行するか。`--superbatches` 指定時の epoch は教師1周ではなく LR/validation cycle。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る | 1 |
 | `--save-rate` | N superbatch ごとに保存。デフォルトでは epoch 末尾も保存 | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine。詳細は [応用編: 学習設定を調整する](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 
-学習単位の意味は [§6.1 学習スケジュール](../tutorial/6-tune.md#61-学習スケジュール) を参照。
+学習単位の意味は [応用編: 学習設定を調整する](../advanced/tuning.md) を参照。
 
 ## メモリ要件
 

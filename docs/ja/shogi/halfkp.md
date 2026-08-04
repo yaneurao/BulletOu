@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-L1 / L2 / L3 サイズは `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` で指定する (`L1` は 32 の倍数)。やねうら王が実エンジンとして配布している共通サイズ: `256x2-32-32` (default)、`384x2-8-96`、`512x2-8-64`、`768x2-16-64`、`1024x2-8-32`、`1024x2-8-64`。CLI では古い短縮形 `256x2-32-32` ではなく `NNUE_halfkp_256x2_32_32` のように書く。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する) 参照。以下はデフォルト構成の図:
+L1 / L2 / L3 サイズは `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` で指定する (`L1` は 32 の倍数)。やねうら王が実エンジンとして配布している共通サイズ: `256x2-32-32` (default)、`384x2-8-96`、`512x2-8-64`、`768x2-16-64`、`1024x2-8-32`、`1024x2-8-64`。CLI では `NNUE_halfkp_256x2_32_32` のように書く。基本のコマンド形は [チュートリアル: 学習を走らせる](../tutorial/3-train.md) を参照。以下はデフォルト構成の図:
 
 ```
 HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
@@ -94,7 +94,7 @@ checkpoints/my-halfkp/
 | `--positions-per-superbatch` | superbatch あたりの目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--save-rate` | N superbatch ごとに save。デフォルトでは epoch 末尾も save | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰、詳細は [§6.1](../tutorial/6-tune.md#61-学習スケジュール)) | 0.000875 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰。詳細は [応用編: 学習設定を調整する](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--scale` | デフォルトの sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
 

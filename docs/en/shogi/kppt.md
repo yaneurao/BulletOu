@@ -99,7 +99,7 @@ Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.log
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-Resume / restart behaviour is identical across every target; see [tutorial 5. Stop and resume](../tutorial/5-resume.md) for details.
+Resume / restart behaviour is identical across every target; see [tutorial: Stop and resume](../tutorial/4-resume.md) for details.
 
 ### KPP_KKPT (factorised)
 
@@ -127,13 +127,13 @@ Resume / restart behaviour is identical across every target; see [tutorial 5. St
 | `--max-epochs` | Number of epochs to run. With `--superbatches`, an epoch is an LR/validation cycle rather than one teacher pass. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries | 1 |
 | `--save-rate` | Save every N superbatches; epoch end is also saved by default | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit epoch-end save | on |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR scheduler (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR scheduler (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine; see [Advanced: Adjust training settings](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 | `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} quantisation scale | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | Drop positions where `|score| >= N` (mate-stamp filter) | 32000 |
 
-For the meaning of the scheduling units, see [§6.1 Training schedule](../tutorial/6-tune.md#61-training-schedule).
+For the meaning of the scheduling units, see [Advanced: Adjust training settings](../advanced/tuning.md).
 
 ## Memory requirements
 

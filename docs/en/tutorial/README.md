@@ -2,20 +2,19 @@
 
 <a href="../../ja/tutorial/README.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-Step-by-step guide for users who are new to BulletOu. Read these pages in order.
+The shortest path for new BulletOu users.
+Read these pages in order to run one training job and load the result in an engine.
+
+Detailed tuning, comparison experiments, and deeper output-file checks are in the [Advanced guide](../advanced/).
 
 | # | Page | What you'll do |
 |---|---|---|
 | 0 | [Overview](0-overview.md) | Understand what BulletOu trains and which evaluation function families are supported |
 | 1 | [Quick Start](1-quickstart.md) | Install prerequisites, build BulletOu, and run a tiny training session to verify everything works |
-| 2 | [Using `bulletou_lib` from your own code](2-bullet-lib.md) | Developer notes (registering custom examples, importing as a crate). Optional |
-| 3 | [Prepare training data](3-data.md) | Choose the eval type and pre-process (shuffle) the teacher file |
-| 4 | [Run the training](4-train.md) | Invoke `bulletou` (arch / teacher) |
-| 5 | [Stop and resume](5-resume.md) | Auto-resume by re-running with the same `--output` |
-| 5.5 | [Continued training](5b-additional-training.md) | Add more epochs to a finished run; swap teacher, batch_size, LR, etc. |
-| 6 | [Adjust training settings](6-tune.md) | Adjust LR, save frequency, validation frequency, loss, and `--lambda` |
-| 7 | [Inspect the result](7-result.md) | Output layout and reading `learn.log` |
-| 8 | [Load into an engine](8-engine.md) | Verify the trained weights in YaneuraOu |
-| 9 | [LayerStack](9-layerstack.md) | Using SFNN models that switch later layers by position type |
+| 2 | [Prepare training data](2-data.md) | Choose an architecture and point BulletOu at teacher data |
+| 3 | [Run the training](3-train.md) | Run the minimal `bulletou` command |
+| 4 | [Stop and resume](4-resume.md) | Continue from an interrupted run |
+| 5 | [Inspect the result](5-result.md) | Check output files and the training log |
+| 6 | [Load into an engine](6-engine.md) | Verify the trained weights in YaneuraOu |
 
-After finishing the tutorial, the [Reference docs](../) cover specifications and design details (data formats, network output formats, etc.).
+After this tutorial, go to the [Advanced guide](../advanced/) for practical experiments, or the [Reference docs](../) for specifications.

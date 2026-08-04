@@ -10,7 +10,7 @@ The activation-function history (why ClippedReLU and not SCReLU) is documented i
 
 ## Architecture
 
-L1 / L2 / L3 sizes are selected via `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` (`L1` must be a multiple of 32). Common YaneuraOu-shipped sizes: `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. On the CLI, use the full architecture name such as `NNUE_halfkp_256x2_32_32`; the old shorthand `256x2-32-32` is not accepted. See [§4.3](../tutorial/4-train.md#43-specifying---arch) for the full description. Below shows the default:
+L1 / L2 / L3 sizes are selected via `--arch NNUE_halfkp_<L1>x2_<L2>_<L3>` (`L1` must be a multiple of 32). Common YaneuraOu-shipped sizes: `256x2-32-32` (default), `384x2-8-96`, `512x2-8-64`, `768x2-16-64`, `1024x2-8-32`, `1024x2-8-64`. On the CLI, use the full architecture name such as `NNUE_halfkp_256x2_32_32`. See [tutorial: Run the training](../tutorial/3-train.md) for the basic command shape. Below shows the default:
 
 ```
 HalfKP sparse input (125,388 dims, per perspective)
@@ -94,7 +94,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--save-rate` | Save every N superbatches; epoch end is also saved by default | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit epoch-end save | on |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine, details in [§6.1](../tutorial/6-tune.md#61-training-schedule)) | 0.000875 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine; see [Advanced: Adjust training settings](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 | `--scale` | Eval-to-score sigmoid scale for the default sigmoid-MSE target | 290 |
 

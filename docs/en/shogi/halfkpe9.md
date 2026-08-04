@@ -10,7 +10,7 @@ Network structure is identical to HalfKP / K-P, but the input dimension is **9×
 
 ## Architecture
 
-`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` selects L1 / L2 / L3 (same set of common sizes as NNUE_HALFKP, see [§4.3](../tutorial/4-train.md#43-specifying---arch)):
+`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` selects L1 / L2 / L3 (same set of common sizes as NNUE_HALFKP; see [tutorial: Run the training](../tutorial/3-train.md)):
 
 ```
 shogi position

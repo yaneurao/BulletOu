@@ -1,8 +1,8 @@
-# 5.5 Continued training (after a clean finish)
+# Continued training
 
-<a href="../../ja/tutorial/5b-additional-training.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/advanced/additional-training.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-[§5 Interrupt & resume](5-resume.md) covered the case where training stopped and you want to continue. This page covers the case where **training finished cleanly and you want to add more training**.
+[Tutorial §4 Stop and resume](../tutorial/4-resume.md) covers the case where training stopped and you want to continue. This page covers the case where **training finished cleanly and you want to add more training**.
 
 Examples:
 - 3 epochs done → look at the results, want 3 more epochs.
@@ -10,9 +10,9 @@ Examples:
 - Have saved weights → want to continue with a **different teacher**.
 - Want to lower the LR and polish for a bit.
 
-## 5.5.1 The simple rule: same `--tag` resumes
+## 1. The simple rule: same `--tag` resumes
 
-Continued training works with the same auto-resume mechanism as §5: **same `--tag` → auto-resume, different `--tag` → fresh start.**
+Continued training uses the same auto-resume mechanism: **same `--tag` → auto-resume, different `--tag` → fresh start.**
 
 ```powershell
 # Round 1: train 3 epochs
@@ -38,7 +38,7 @@ Total effective epochs trained: 3 + 3 = 6.
 
 ⚠️ `--max-epochs` means **"epochs to run in this launch"**, not "total epochs to reach."
 
-## 5.5.2 What you can / can't change between launches
+## 2. What you can / can't change between launches
 
 ### ✅ Safe to change
 
@@ -54,7 +54,7 @@ Total effective epochs trained: 3 + 3 = 6.
 | `--save-rate` | Changes checkpoint frequency only. If reusing an existing checkpoint, pass `--resume` explicitly. |
 | `--validation-rate` | Changes validation frequency only. If reusing saved data, pass `--resume` explicitly. |
 | `--lambda` | Teacher-target blend. |
-| `--teacher` | BulletOu detects the teacher change and reads the new teacher from the start. See the LR note in [§5.5.4](#554-continue-with-a-different-teacher). |
+| `--teacher` | BulletOu detects the teacher change and reads the new teacher from the start. See the LR note in [Continue with a different teacher](#4-continue-with-a-different-teacher). |
 | `--test-teacher` | Validation set swap. |
 | `--sfnn-factorizer` | Changes how SFNN shares common components between buckets. If reusing saved data, pass `--resume` explicitly. |
 
@@ -69,7 +69,7 @@ Total effective epochs trained: 3 + 3 = 6.
 
 To change any of these, pass a different `--tag` and run as a separate experiment.
 
-## 5.5.3 Example: bump batch_size from 16384 to 32768
+## 3. Example: bump batch_size from 16384 to 32768
 
 ```powershell
 # Continue with 3 more epochs at the larger batch size
@@ -96,7 +96,7 @@ Changing `--batch-size` can slightly change the rounded effective sb_size. If yo
 
 Changing `--batch-size` keeps the weights reusable, but the optimizer has internal statistics from earlier updates. The first 1–2 sb may look slightly different. If the loss recovers quickly, this is not a problem.
 
-## 5.5.4 Continue with a different teacher
+## 4. Continue with a different teacher
 
 A common workflow: train on a large weaker corpus, then continue on a smaller stronger corpus:
 
@@ -125,7 +125,7 @@ Teacher-change handling:
 
 For `step` / `geometric` / `cos`, every epoch starts from `--lr`. When changing teachers, pass explicit `--lr` / `--lr-min` values as needed, and use a different `--tag` when you want a separate experiment.
 
-## 5.5.5 Cooling down with a smaller LR
+## 5. Cooling down with a smaller LR
 
 After a near-converged run, a final polish at 1/10 the LR is a classic move:
 
@@ -145,7 +145,7 @@ After a near-converged run, a final polish at 1/10 the LR is a classic move:
 
 This is a simple final low-LR polish: small final step, no big swings.
 
-## 5.5.6 Multiple launches vs one long run
+## 6. Multiple launches vs one long run
 
 Splitting 6 epochs into two 3-epoch launches is **functionally close** to one 6-epoch launch:
 
@@ -161,6 +161,6 @@ In practice, 2–3 epoch chunks are often convenient: you get regular points to 
 
 ---
 
-Next: [6. Adjust training settings](6-tune.md) — what `--lr` / `--superbatches` / `--lambda` actually mean.
+Next: [Adjust training settings](tuning.md)
 
-Previous: [5. Interrupt & resume](5-resume.md)
+Previous: [Advanced guide](README.md)

@@ -10,7 +10,7 @@
 
 ## アーキテクチャ
 
-`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` で L1 / L2 / L3 サイズを選択 (NNUE_HALFKP と同じよく使われるサイズ。詳細は [§4.3](../tutorial/4-train.md#43---arch-を指定する)):
+`--arch NNUE_halfkpe9_<L1>x2_<L2>_<L3>` で L1 / L2 / L3 サイズを選択 (NNUE_HALFKP と同じよく使われるサイズ。基本のコマンド形は [チュートリアル: 学習を走らせる](../tutorial/3-train.md) を参照):
 
 ```
 将棋の局面

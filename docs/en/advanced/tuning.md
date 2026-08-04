@@ -1,10 +1,10 @@
-# 6. Adjust training settings
+# Adjust training settings
 
-<a href="../../ja/tutorial/6-tune.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-2563EB?style=flat-square"></a>
+<a href="../../ja/advanced/tuning.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-2563EB?style=flat-square"></a>
 
-Read this after the command in [4. Run training](4-train.md) works. For a first run, keep the defaults. Come back here when you want to change speed, save frequency, validation frequency, learning-rate schedule, loss, or SFNN factorizer settings.
+Read this after the command in [Tutorial §3 Run the training](../tutorial/3-train.md) works. For a first run, keep the defaults. Come back here when you want to change speed, save frequency, validation frequency, learning-rate schedule, loss, or SFNN factorizer settings.
 
-## 6.1 Units used in the logs
+## 1. Units used in the logs
 
 BulletOu logs use `batch`, `superbatch`, and `epoch`. Keep these separate; many training-control flags are defined in terms of one of them.
 
@@ -28,7 +28,7 @@ Here, one sb is `65536 × 610 = 39,976,960` positions. One epoch is 36 sb, or ab
 
 When `--superbatches` is set, an epoch is not “one pass over the teacher.” It is the boundary where learning rate, saving, and validation comparison are grouped. The teacher stream rewinds only when it reaches EOF.
 
-## 6.2 Common options
+## 2. Common options
 
 The options you are most likely to change:
 
@@ -80,7 +80,7 @@ Fuller option table:
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients for controlled experiments | omitted |
 
-## 6.3 Learning-rate schedules
+## 3. Learning-rate schedules
 
 `--lr-schedule step` is the default. It applies:
 
@@ -131,7 +131,7 @@ In this example, each epoch’s 36 sb move from `--lr` toward `--lr-min`, then e
 | `cos` | Uses a cosine curve from `--lr` to `--lr-min` |
 | `plateau` | Repeats the same teacher interval at a lower LR when validation does not improve |
 
-## 6.4 Turning teacher data into training labels
+## 4. Turning teacher data into training labels
 
 Teacher files usually contain two useful pieces of information:
 
@@ -154,7 +154,7 @@ training label = λ × label from teacher score + (1 - λ) × label from game re
 
 Start with `1.0`. Try values such as `0.5` or `0.7` only when you intentionally want game results to affect the training label.
 
-## 6.5 WRM loss
+## 5. WRM loss
 
 WRM means win-rate model. BulletOu does not feed teacher scores directly into the loss. It first converts a teacher score such as `+300` into a 0–1 win-rate-like label, converts the network output into the same 0–1 space, then compares them. This is the default loss.
 
@@ -222,7 +222,7 @@ To train with MSE on `sigmoid(model_output)` instead of WRM, pass:
 
 WRM and sigmoid-MSE use different formulas, so compare raw loss values only between runs with the same loss setting.
 
-## 6.6 SFNN factorizer
+## 6. SFNN factorizer
 
 SFNN architectures such as `k3k3` or `hand1024` create many buckets. More buckets give more expressive power, but fewer teacher positions reach each bucket.
 
@@ -249,7 +249,7 @@ Example:
 
 If you change factorizer settings while continuing from saved data, pass `--resume` explicitly. BulletOu stops automatic resume when training settings change, so accidental continuation does not happen silently.
 
-## 6.7 Save and validation frequency
+## 7. Save and validation frequency
 
 Saving and validation are separate:
 
@@ -267,7 +267,7 @@ Epoch-end saving is enabled by default. If one epoch is 36 sb and you want only 
 
 The save rate is never reached inside the 36-sb epoch, so the epoch-end save is the one that remains.
 
-## 6.8 Reading training speed
+## 8. Reading training speed
 
 Look at stdout `[train]` rows:
 
@@ -288,7 +288,7 @@ If the GPU is idle but `pos/s` is low, teacher loading, decoding, or shuffling m
 - Whether `--threads` / `--loader-threads` are oversubscribing the CPU
 - Whether `cuda-cpp-diagnostics.log` shows large teacher queue wait time
 
-## 6.9 Optimizer
+## 9. Optimizer
 
 Usually leave `--optimizer ranger` and `--optimizer-weight-decay 0.0`.
 
@@ -307,7 +307,7 @@ When changing optimizer coefficients, change one condition at a time.
     --tag optimizer-test
 ```
 
-## 6.10 A good starting command
+## 10. A good starting command
 
 This SFNN example uses 36 sb per epoch, validates every sb, and keeps only epoch-end saves.
 
@@ -330,6 +330,6 @@ This SFNN example uses 36 sb per epoch, validates every sb, and keeps only epoch
   --tag sfnn-sojo-36sb
 ```
 
-Next: [7. Inspect results](7-result.md) — accuracy, loss, and logs
+Next: [Continued training](additional-training.md)
 
-Previous: [4. Run training](4-train.md)
+Previous: [Advanced guide](README.md)

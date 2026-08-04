@@ -1,6 +1,6 @@
-# 9. LayerStack — 局面ごとに別の小さなネットワークを使う
+# LayerStack — 局面ごとに別の小さなネットワークを使う
 
-<a href="../../en/tutorial/9-layerstack.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/advanced/layerstack.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 通常の NNUE は、どの局面でも同じ後段ネットワークを使って評価値を出します。SFNN の LayerStack は、入力側の大きな変換部分は共有し、その後ろの小さなネットワークを局面の種類ごとに切り替える仕組みです。
 
@@ -17,7 +17,7 @@
 | bucket | 玉位置・持ち駒・進行度などで局面を分類した番号 |
 | `k3k3` / `hand256` など | architecture 名に付ける「分け方」の指定 |
 
-## 9.1 LayerStack が何をしているか
+## 1. LayerStack が何をしているか
 
 LayerStack は「入力特徴量を変える」仕組みではありません。入力特徴量と FeatureTransformer は同じまま、後段だけを切り替えます。
 
@@ -38,7 +38,7 @@ LayerStack は「入力特徴量を変える」仕組みではありません。
 
 ただし、bucket を増やすほど 1 stack あたりに届く教師局面は減ります。表現力は増えますが、教師密度は落ちます。ここが LayerStack の一番大きなトレードオフです。
 
-## 9.2 3つの軸を掛け合わせる
+## 2. 3つの軸を掛け合わせる
 
 BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせます。
 
@@ -83,7 +83,7 @@ idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 
 という意味です。
 
-## 9.3 architecture 名の書き方
+## 3. architecture 名の書き方
 
 `hand256` や `k3k3` などの指定は任意の順番で書けます。ただし BulletOu は、出力ディレクトリ名では `hand → king → progress` の順に整理します。
 
@@ -109,7 +109,7 @@ SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 
 この例は、`ka2` 入力、FT=3072、L1 は共有 1024 channel + 256 channel × 8 個、LayerStack は `hand256 × k3k3 × progress16` です。
 
-## 9.4 king bucket を読む前の座標ルール
+## 4. king bucket を読む前の座標ルール
 
 king bucket は、手番側玉と非手番側玉を別々に bucket 化してから組み合わせます。
 
@@ -140,7 +140,7 @@ king_bucket = stm_king29 * 29 + non_stm_king29
 
 です。`k29k29` の LayerStacks が 841 になるのは、`29 * 29 = 841` だからです。
 
-## 9.5 king bucket の種類
+## 5. king bucket の種類
 
 king bucket は「玉位置をどれくらい細かく見るか」を決めます。
 
@@ -158,7 +158,7 @@ king bucket は「玉位置をどれくらい細かく見るか」を決めま�
 
 長い名前でも指定できます。たとえば `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, `king29_by_king29` などです。
 
-## 9.6 `k3k3` — まず試す粗い玉 bucket
+## 6. `k3k3` — まず試す粗い玉 bucket
 
 `k3k3` は、玉1つを「敵陣側・中央・自陣側」の3つに分けます。手番側玉と非手番側玉の組み合わせなので `3 * 3 = 9` buckets です。
 
@@ -178,7 +178,7 @@ king bucket は「玉位置をどれくらい細かく見るか」を決めま�
 
 `k3k3` は軽く、教師密度も高いので、LayerStack の最初の比較対象として扱いやすいです。一方で、同じ rank 7〜9 にいる玉はすべて同じ扱いになるため、自陣深部で玉が何筋にいるかは区別できません。
 
-## 9.7 `k9k9` と `k9k9z` — 同じ 81 stacks で何を表現するか
+## 7. `k9k9` と `k9k9z` — 同じ 81 stacks で何を表現するか
 
 `k9k9` と `k9k9z` は、どちらも 1玉あたり 9 bucket、両玉で `9 * 9 = 81` stacks です。違いは、9 bucket の使い方です。
 
@@ -234,7 +234,7 @@ king bucket は「玉位置をどれくらい細かく見るか」を決めま�
 
 逆に、rank 1〜6 の差をかなり潰すので、そこが効く教師・局面集合では `k9k9` より悪くなる可能性もあります。`k9k9z` は 81 stacks の予算配分を変える指定であり、常に `k9k9` より良いとは限りません。
 
-## 9.8 `k13k13z` — rank 情報を残しつつ自陣深部だけ zone 化する
+## 8. `k13k13z` — rank 情報を残しつつ自陣深部だけ zone 化する
 
 `k13k13z` は 1玉を 13 bucket に分け、両玉で `13 * 13 = 169` stacks になります。
 
@@ -261,7 +261,7 @@ king bucket は「玉位置をどれくらい細かく見るか」を決めま�
 | `k21k21` | 441 | 8〜9段を全マス区別 |
 | `k29k29` | 841 | 7〜9段を全マス区別 |
 
-## 9.9 `k21k21` と `k29k29` — 自陣付近の玉位置をかなり細かく見る
+## 9. `k21k21` と `k29k29` — 自陣付近の玉位置をかなり細かく見る
 
 `k21k21` と `k29k29` は、zone というより「自陣の深い段をマス単位で見る」bucket です。
 
@@ -311,7 +311,7 @@ rank 7〜9 の 3段 x 9筋 = 27マスをそのまま区別し、rank 1〜3 と r
 
 したがって、`k29k29` は教師量が足りないと accuracy が伸びるのが遅くなったり、検証 loss が不安定になったりします。表現力は高いですが、十分な教師局面と、必要なら factorizer を併用して比較するのが前提になります。
 
-## 9.10 hand bucket
+## 10. hand bucket
 
 hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucket を組み合わせます。
 
@@ -413,7 +413,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `hand256` は軽めの種類分類、`hand1024` は歩の有無まで独立に見たい場合の分類です。king bucket と掛け合わせると stack 数が急増するので注意してください。
 
-## 9.11 progress bucket
+## 11. progress bucket
 
 `progressN` は、局面から `0..255` の進行度値を計算し、それを N 個の bucket に割り当てる仕組みです。
 
@@ -450,7 +450,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 `progressN` は `king=axis` / `hand=axis` factorizer と併用できます。この場合、factorizer は hand / king の分け方にだけ掛かります。progress 方向には掛かりません。たとえば `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` には `--sfnn-factorizer king=axis,hand=axis` を指定できます。
 
-## 9.12 組み合わせるとどれくらい大きくなるか
+## 12. 組み合わせるとどれくらい大きくなるか
 
 hand / king / progress は掛け算なので、少し足しただけで急に大きくなります。
 
@@ -472,7 +472,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 
 大きい指定は、学習速度だけでなく、保存サイズ、検証時間、1 stack あたりの教師密度にも効きます。
 
-## 9.13 どれを選ぶべきか
+## 13. どれを選ぶべきか
 
 目安です。絶対の正解ではないので、同じ教師・同じ検証条件で比較してください。
 
@@ -489,7 +489,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 
 大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、保存サイズ、学習速度も合わせて見てください。
 
-## 9.14 使用例
+## 14. 使用例
 
 もっとも軽い king bucket を試す例:
 
@@ -535,4 +535,4 @@ hand / king / progress を全部組み合わせる例:
 
 ---
 
-前へ: [8. エンジンに組み込む](8-engine.md)
+前へ: [応用編トップ](README.md)

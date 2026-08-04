@@ -1,0 +1,87 @@
+# 3. 学習を走らせる
+
+<a href="../../en/tutorial/3-train.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+
+ゴール: 用意した教師データから、やねうら王が読める評価関数ファイルを作ります。
+
+このページは [2. 教師データを用意する](2-data.md) の続きです。
+
+## 3.1 まずビルドする
+
+```powershell
+cargo build --release --features cuda-cpp-backend --example bulletou
+```
+
+Windows では、実行ファイルは次にできます。
+
+```text
+.\target\release\examples\bulletou.exe
+```
+
+## 3.2 最小コマンド
+
+最初は HalfKP NNUE で動作確認するのが簡単です。
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --arch NNUE_halfkp_256x2_32_32 `
+  --teacher teachers `
+  --tag first-halfkp
+```
+
+`--arch` は学習する評価関数の形です。`NNUE_halfkp_256x2_32_32` は小さめで試しやすい構成です。
+
+`--teacher` には教師ファイル、または教師ファイルが入ったフォルダを指定します。
+
+`--tag` は実験名です。省略しても動きますが、複数回試すなら付けておくほうが出力を見分けやすくなります。
+
+## 3.3 出力先
+
+学習結果は `checkpoints/` の下に保存されます。NNUE / SFNN なら各 checkpoint に `nn.bin` ができます。
+
+例:
+
+```text
+checkpoints/
+  NNUE_HALFKP-NNUE_halfkp_256x2_32_32-first-halfkp/
+    0001/
+      nn.bin
+      state.bin
+```
+
+`nn.bin` が、やねうら王に読み込ませる評価関数ファイルです。
+
+## 3.4 学習を短く試したい場合
+
+巨大な教師データでいきなり長時間回す前に、次のように小さめにして動作確認できます。
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --arch NNUE_halfkp_256x2_32_32 `
+  --teacher teachers `
+  --positions-per-superbatch 1000000 `
+  --superbatches 1 `
+  --max-epochs 1 `
+  --tag smoke-halfkp
+```
+
+まずこの形で「読み込み・学習・保存」が通ることを確認してください。
+
+## 3.5 画面に出るもの
+
+学習中は、おおむね次のような行が出ます。
+
+```text
+[train] epoch 1  sb 1/1  this-sb=... pos  wall=...s  train=...s  pos/s=...
+[valid] epoch 1  sb 1    test_value_accuracy=...  test_value_loss=...
+```
+
+`pos/s` は学習速度の目安です。保存や検証の時間は学習速度からは除外されます。
+
+---
+
+次へ: [4. 中断・再開](4-resume.md)
+
+詳しい調整や比較実験: [応用編](../advanced/)
+
+前へ: [2. 教師データを用意する](2-data.md)

@@ -1,21 +1,33 @@
-# BulletOu リファレンス
+# BulletOu ドキュメント
 
 <a href="../en/"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-学習パイプラインの仕様レベルのドキュメント。「ある程度わかっている前提」で書かれている。
+BulletOu は、やねうら王向け評価関数を学習するためのプロジェクトです。
+初めて使う場合は、まず [チュートリアル](tutorial/) を読んでください。必要最小限の手順だけで、学習を1回動かすところまで案内します。
 
-初めて BulletOu を使う場合は、まず [チュートリアル](tutorial/) を参照。
+より細かい調整や検証は [応用編](advanced/) に分けています。
 
-- [NNUE の基礎](reference/1-basics.md) — 入力/隠れ/出力層、perspective ネットワーク
-- [BulletOu を始める](reference/2-getting-started.md) — トレーニング全体の概観 (上流由来)
-- [学習データフォーマット](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv / .bin (上流由来 + 将棋拡張)
-- [学習済みネットワーク](reference/4-saved-networks.md) — チェックポイントのレイアウト、SavedFormat、量子化、変換チェーン
+## 読む順番
 
-将棋固有:
+| 目的 | ページ |
+| --- | --- |
+| まず学習を動かしたい | [チュートリアル](tutorial/) |
+| 学習条件を調整したい、出力を詳しく検証したい | [応用編](advanced/) |
+| ファイル形式や実装仕様を確認したい | [リファレンス](reference/) |
+| 評価関数ごとの詳細を確認したい | [将棋向け評価関数](shogi/) |
 
-- [shogi/halfkp.md](shogi/halfkp.md) — NNUE HalfKP 評価関数の学習
-- [shogi/halfkpe9.md](shogi/halfkpe9.md) — NNUE HalfKPE9 評価関数の学習 (HalfKP に利き数情報を加えた版)
-- [shogi/kp.md](shogi/kp.md) — NNUE K-P 評価関数の学習 (HalfKP と同じ NN、入力だけ違う版)
-- [shogi/ka2.md](shogi/ka2.md) — NNUE K-A2 / SFNN K-A2 評価関数の学習 (`FeatureSet<K, A2>` v2 玉 collapse 全駒特徴)
-- [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT 評価関数の学習
-- [shogi/sfnn-1536.md](shogi/sfnn-1536.md) — SFNN-1536 (やねうら王 NNUEwoSQPT1536 ビルド向け、LayerStacks=9) の詳細仕様
+## リファレンス
+
+- [NNUE の基本](reference/1-basics.md)
+- [BulletOu の学習パイプライン](reference/2-getting-started.md)
+- [学習データフォーマット](reference/3-data.md)
+- [保存されるネットワーク](reference/4-saved-networks.md)
+
+## 将棋向け評価関数
+
+- [NNUE HalfKP](shogi/halfkp.md)
+- [NNUE HalfKPE9](shogi/halfkpe9.md)
+- [NNUE K-P](shogi/kp.md)
+- [NNUE K-A2 / SFNN K-A2](shogi/ka2.md)
+- [KPPT / KPP_KKPT](shogi/kppt.md)
+- [SFNN-1536](shogi/sfnn-1536.md)

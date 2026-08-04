@@ -1,21 +1,33 @@
-# BulletOu Reference
+# BulletOu Documentation
 
 <a href="../ja/"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-Specification-level documents on the training pipeline. These assume you already know what you are doing.
+BulletOu trains evaluation functions for YaneuraOu.
+If you are new to BulletOu, start with the [Tutorial](tutorial/). It keeps to the minimum steps needed to run one training job.
 
-If you are new to BulletOu, start with the [tutorial](tutorial/).
+Practical tuning and detailed checks live in the [Advanced guide](advanced/).
 
-- [NNUE Basics](reference/1-basics.md) — input/hidden/output layers, perspective networks
-- [Getting started with BulletOu](reference/2-getting-started.md) — high-level training pipeline overview (upstream-derived)
-- [Training data formats](reference/3-data.md) — bulletformat / .pack / .hcpe / .hcpe3 / .psv / .bin (upstream + shogi extensions)
-- [Saved Networks](reference/4-saved-networks.md) — checkpoint layout, SavedFormat, quantisation, transformation chains
+## Where to start
 
-Shogi-specific:
+| Goal | Page |
+| --- | --- |
+| Run your first training job | [Tutorial](tutorial/) |
+| Tune training or inspect exported files | [Advanced guide](advanced/) |
+| Check file formats and implementation details | [Reference](reference/) |
+| Read evaluation-function-specific notes | [Shogi evaluation functions](shogi/) |
 
-- [shogi/halfkp.md](shogi/halfkp.md) — NNUE HalfKP evaluation function training
-- [shogi/halfkpe9.md](shogi/halfkpe9.md) — NNUE HalfKPE9 evaluation function training (HalfKP plus per-square attacker-count buckets)
-- [shogi/kp.md](shogi/kp.md) — NNUE K-P evaluation function training (same network as HalfKP with a different input)
-- [shogi/ka2.md](shogi/ka2.md) — NNUE K-A2 / SFNN K-A2 evaluation function training (`FeatureSet<K, A2>` with v2 king-collapsed all-piece feature)
-- [shogi/kppt.md](shogi/kppt.md) — KPPT / KPP_KKPT evaluation function training
-- [shogi/sfnn-1536.md](shogi/sfnn-1536.md) — Full SFNN-1536 spec for YaneuraOu's NNUEwoSQPT1536 build (LayerStacks=9)
+## Reference
+
+- [NNUE Basics](reference/1-basics.md)
+- [BulletOu training pipeline](reference/2-getting-started.md)
+- [Training data formats](reference/3-data.md)
+- [Saved networks](reference/4-saved-networks.md)
+
+## Shogi evaluation functions
+
+- [NNUE HalfKP](shogi/halfkp.md)
+- [NNUE HalfKPE9](shogi/halfkpe9.md)
+- [NNUE K-P](shogi/kp.md)
+- [NNUE K-A2 / SFNN K-A2](shogi/ka2.md)
+- [KPPT / KPP_KKPT](shogi/kppt.md)
+- [SFNN-1536](shogi/sfnn-1536.md)

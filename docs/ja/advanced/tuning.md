@@ -1,10 +1,10 @@
-# 6. 学習設定を調整する
+# 学習設定を調整する
 
-<a href="../../en/tutorial/6-tune.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/advanced/tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-[4. 学習を走らせる](4-train.md) のコマンドで動くことを確認したあとに読む章です。最初はデフォルトのままで構いません。速度が出ない、保存頻度を変えたい、tatara と条件を揃えたい、loss を変えて試したい、という段階になってから触ってください。
+[チュートリアル §3 学習を走らせる](../tutorial/3-train.md) のコマンドで動くことを確認したあとに読むページです。最初はデフォルトのままで構いません。速度が出ない、保存頻度を変えたい、tatara と条件を揃えたい、loss を変えて試したい、という段階になってから触ってください。
 
-## 6.1 まず覚える単位
+## 1. まず覚える単位
 
 BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。ここが混ざると設定を読み違えます。
 
@@ -28,7 +28,7 @@ BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。�
 
 `--superbatches` を指定した場合、epoch は「教師データを 1 周した」という意味ではありません。学習率を戻す区切り、保存する区切り、検証結果を比較する区切りです。教師データは、EOF に到達したときだけ先頭へ戻ります。
 
-## 6.2 よく変更するオプション
+## 2. よく変更するオプション
 
 まず触ることが多いものだけを先にまとめます。
 
@@ -80,7 +80,7 @@ BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。�
 | `--optimizer-weight-decay` | weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizer の細かい係数。比較実験用 | 省略 |
 
-## 6.3 学習率をどう下げるか
+## 3. 学習率をどう下げるか
 
 `--lr-schedule step` がデフォルトです。`step` は、一定間隔で
 
@@ -131,7 +131,7 @@ tatara と同じように `gamma=0.992` を明示するなら、こう書きま�
 | `cos` | cosine カーブで滑らかに下げる |
 | `plateau` | 検証 loss / accuracy が改善しないときだけ学習率を下げて同じ区間をやり直す |
 
-## 6.4 教師評価値を学習用ラベルにする
+## 4. 教師評価値を学習用ラベルにする
 
 教師データには、主に次の 2 種類の情報があります。
 
@@ -154,7 +154,7 @@ tatara と同じように `gamma=0.992` を明示するなら、こう書きま�
 
 通常は `1.0` から始めます。勝敗結果も混ぜたい実験だけ `0.5` や `0.7` などを試してください。
 
-## 6.5 WRM loss
+## 5. WRM loss
 
 WRM は win-rate-model の略です。BulletOu では、教師評価値をそのまま loss に入れるのではなく、まず「勝率っぽい 0〜1 の値」に変換してから学習します。これがデフォルトです。
 
@@ -224,7 +224,7 @@ WRM を使わず、`sigmoid(model_output)` に対する MSE で比較したい�
 
 WRM と sigmoid-MSE では loss の式が違うので、数値をそのまま横比較しないでください。同じ loss 設定同士で比較します。
 
-## 6.6 SFNN factorizer
+## 6. SFNN factorizer
 
 SFNN では、`k3k3` や `hand1024` のように bucket を増やすと、bucket ごとに別の後段ネットワークを持ちます。bucket が多いほど表現力は増えますが、各 bucket に届く教師局面は減ります。
 
@@ -251,7 +251,7 @@ factorizer は、bucket ごとに完全に別々の重みを持つのではな�
 
 途中で factorizer 設定を変えて再開する場合、必ず `--resume` を明示してください。BulletOu は設定変更を検出して、意図しない再開を止めます。
 
-## 6.7 保存と検証の頻度
+## 7. 保存と検証の頻度
 
 保存と検証は別々に指定できます。
 
@@ -269,7 +269,7 @@ epoch 末の保存はデフォルトで有効です。1 epoch が 36 sb で、ep
 
 この場合、36 sb の中では `save-rate` に到達しないので、epoch 末保存だけが残ります。
 
-## 6.8 速度が遅いときに見るところ
+## 8. 速度が遅いときに見るところ
 
 速度を見るときは stdout の `[train]` 行を見ます。
 
@@ -290,7 +290,7 @@ GPU が空いているのに `pos/s` が低い場合は、教師局面の読み�
 - `--threads` / `--loader-threads` が CPU を使い切っていないか
 - `cuda-cpp-diagnostics.log` で teacher queue wait が大きくないか
 
-## 6.9 optimizer
+## 9. optimizer
 
 通常は `--optimizer ranger` のままで構いません。`--optimizer-weight-decay` もデフォルト `0.0` のままで始めます。
 
@@ -309,7 +309,7 @@ optimizer の細かい係数を変える場合は、他の条件を動かさず 
     --tag optimizer-test
 ```
 
-## 6.10 迷ったときの基本形
+## 10. 迷ったときの基本形
 
 SFNN で 1 epoch = 36 sb、毎 sb 検証、epoch 末だけ保存する例です。
 
@@ -332,6 +332,6 @@ SFNN で 1 epoch = 36 sb、毎 sb 検証、epoch 末だけ保存する例です�
   --tag sfnn-sojo-36sb
 ```
 
-次へ: [7. 結果を確認する](7-result.md) — accuracy / loss / ログの読み方
+次へ: [追加学習](additional-training.md)
 
-前へ: [4. 学習を走らせる](4-train.md)
+前へ: [応用編トップ](README.md)
