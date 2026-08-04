@@ -41,7 +41,10 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
 use crate::teacher_path::{DataFormat, expand_teacher, infer_data_format};
-use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
+use crate::value::loader::{
+    WinRateModelTargetParams,
+    hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record},
+};
 
 const PSV_RECORD_SIZE: usize = std::mem::size_of::<PackedSfenValue>();
 
@@ -134,9 +137,10 @@ pub enum ValidationLossKind {
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidMse,
     /// Win-rate-model value loss with shogi WRM transforms:
-    /// configurable `nnue2score`, offset=270, input scaling=340,
-    /// target scaling=380, and configurable `abs(prediction - target)^pow_exp`.
-    WinRateModel { pow_exp: f32, nnue2score: f32 },
+    /// configurable `nnue2score`, prediction WRM offset=270 / scaling=340,
+    /// target-side WRM parameters, and configurable
+    /// `abs(prediction - target)^pow_exp`.
+    WinRateModel { pow_exp: f32, nnue2score: f32, target: WinRateModelTargetParams },
 }
 
 #[inline]
@@ -316,7 +320,7 @@ pub fn compute_sign_accuracy_with_loss(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { .. } => wrm_probability(f32::from(s), 270.0, 380.0),
+                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
@@ -421,7 +425,7 @@ pub fn compute_sign_accuracy_with_loss_masked(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { .. } => wrm_probability(f32::from(s), 270.0, 380.0),
+                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
@@ -853,7 +857,11 @@ mod tests {
             1.0,
             400.0,
             1.0,
-            ValidationLossKind::WinRateModel { pow_exp: 2.5, nnue2score: 600.0 },
+            ValidationLossKind::WinRateModel {
+                pow_exp: 2.5,
+                nnue2score: 600.0,
+                target: WinRateModelTargetParams::DEFAULT,
+            },
         );
         assert_eq!(r.compared, 2);
         let loss = r.test_loss.expect("loss requested");

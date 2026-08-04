@@ -24,8 +24,8 @@ use crate::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, load_and_map_shuffled_batches_with_prefetch, teacher_shuffle_window_records,
-            win_rate_model_score,
+            ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
+            teacher_shuffle_window_records, win_rate_model_score_from_table, win_rate_model_score_table,
         },
     },
 };
@@ -58,6 +58,8 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub scale: f32,
     /// Use win-rate-model target conversion while preparing teacher targets.
     pub win_rate_model: bool,
+    /// WRM target-side score-to-probability parameters.
+    pub wrm_target: WinRateModelTargetParams,
     /// Add tatara-style HalfKP piece-input virtual rows to the FT input.
     pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
@@ -90,6 +92,7 @@ pub struct KpTeacherBatchConfig<'a> {
     pub lambda: f32,
     pub scale: f32,
     pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -117,6 +120,7 @@ pub struct KpptTeacherBatchConfig<'a> {
     pub lambda: f32,
     pub scale: f32,
     pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -145,6 +149,7 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub lambda: f32,
     pub scale: f32,
     pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -192,6 +197,218 @@ impl fmt::Display for TeacherBatchError {
 }
 
 impl Error for TeacherBatchError {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WrmTargetCalibrationConfig<'a> {
+    pub teacher: &'a str,
+    pub positions: usize,
+    pub buffer_mb: usize,
+    pub loader_threads: usize,
+    pub score_drop_abs: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WrmTargetCalibrationReport {
+    pub params: WinRateModelTargetParams,
+    pub requested_positions: usize,
+    pub observed_positions: usize,
+    pub fitted_positions: usize,
+    pub decisive_positions: usize,
+    pub drawn_positions: usize,
+    pub filtered_positions: usize,
+    pub bce_loss: f64,
+    pub fitted: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WrmTargetOutcomeBin {
+    wins: u32,
+    losses: u32,
+    draws: u32,
+}
+
+pub fn estimate_wrm_target_from_teacher_prefix(
+    config: &WrmTargetCalibrationConfig<'_>,
+) -> Result<WrmTargetCalibrationReport, TeacherBatchError> {
+    if config.positions == 0 {
+        return Ok(WrmTargetCalibrationReport {
+            params: WinRateModelTargetParams::DEFAULT,
+            requested_positions: 0,
+            observed_positions: 0,
+            fitted_positions: 0,
+            decisive_positions: 0,
+            drawn_positions: 0,
+            filtered_positions: 0,
+            bce_loss: 0.0,
+            fitted: false,
+        });
+    }
+
+    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
+    let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+    let mut observed_positions = 0usize;
+    let mut filtered_positions = 0usize;
+    let mut decisive_positions = 0usize;
+    let mut drawn_positions = 0usize;
+    let mut observe = |chunk: &[PackedSfenValue]| {
+        let remaining = config.positions.saturating_sub(observed_positions);
+        let take = remaining.min(chunk.len());
+        for pos in &chunk[..take] {
+            observed_positions += 1;
+            if let Some(cap) = config.score_drop_abs {
+                if pos.score().unsigned_abs() >= cap {
+                    filtered_positions += 1;
+                    continue;
+                }
+            }
+            let bin = &mut bins[(i32::from(pos.score()) - i32::from(i16::MIN)) as usize];
+            match pos.game_result() {
+                r if r > 0 => {
+                    bin.wins += 1;
+                    decisive_positions += 1;
+                }
+                r if r < 0 => {
+                    bin.losses += 1;
+                    decisive_positions += 1;
+                }
+                _ => {
+                    bin.draws += 1;
+                    drawn_positions += 1;
+                }
+            }
+        }
+        observed_positions >= config.positions
+    };
+
+    match format {
+        DataFormat::Hcpe => {
+            let loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                config.buffer_mb,
+                (|_| true) as fn(&PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(config.positions.min(65_536).max(1))
+            .with_loader_threads(config.loader_threads)
+            .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
+        }
+        DataFormat::Hcpe3 => {
+            let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.positions.min(65_536).max(1))
+                .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
+        }
+        DataFormat::Pack => {
+            let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(config.positions.min(65_536).max(1))
+                .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
+        }
+        DataFormat::Psv => {
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
+        }
+    }
+
+    let (params, bce_loss, fitted) =
+        fit_wrm_target_params(&bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
+    let fitted_positions = decisive_positions + drawn_positions;
+    Ok(WrmTargetCalibrationReport {
+        params,
+        requested_positions: config.positions,
+        observed_positions,
+        fitted_positions,
+        decisive_positions,
+        drawn_positions,
+        filtered_positions,
+        bce_loss,
+        fitted,
+    })
+}
+
+fn scan_packed_teacher_prefix<D, F>(loader: &D, limit: usize, f: &mut F)
+where
+    D: DataLoader<PackedSfenValue>,
+    F: FnMut(&[PackedSfenValue]) -> bool,
+{
+    if limit == 0 {
+        return;
+    }
+    loader.map_chunks(0, |chunk| f(chunk));
+}
+
+fn fit_wrm_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTargetParams, f64, bool)> {
+    let mut samples = Vec::new();
+    let mut fitted_positions = 0usize;
+    let mut total_pos = 0.0f64;
+    let mut total_neg = 0.0f64;
+    for (idx, bin) in bins.iter().enumerate() {
+        let count = bin.wins as usize + bin.losses as usize + bin.draws as usize;
+        if count == 0 {
+            continue;
+        }
+        let score = (idx as i32 + i32::from(i16::MIN)) as f32;
+        let positives = f64::from(bin.wins) + 0.5 * f64::from(bin.draws);
+        let negatives = f64::from(bin.losses) + 0.5 * f64::from(bin.draws);
+        samples.push((score, positives, negatives));
+        fitted_positions += count;
+        total_pos += positives;
+        total_neg += negatives;
+    }
+    if fitted_positions == 0 || total_pos <= 0.0 || total_neg <= 0.0 {
+        return None;
+    }
+
+    let mut best = WinRateModelTargetParams::DEFAULT;
+    let mut best_loss = wrm_target_bce_loss(&samples, best);
+
+    for offset in (0..=800).step_by(20) {
+        for scaling in (80..=1200).step_by(20) {
+            let params = WinRateModelTargetParams { offset: offset as f32, scaling: scaling as f32 };
+            let loss = wrm_target_bce_loss(&samples, params);
+            if loss < best_loss {
+                best = params;
+                best_loss = loss;
+            }
+        }
+    }
+
+    for step in [10i32, 5, 2, 1] {
+        let span = step * 6;
+        let offset_min = ((best.offset as i32) - span).max(0);
+        let offset_max = ((best.offset as i32) + span).min(1200);
+        let scaling_min = ((best.scaling as i32) - span).max(20);
+        let scaling_max = ((best.scaling as i32) + span).min(2000);
+        let mut offset = offset_min;
+        while offset <= offset_max {
+            let mut scaling = scaling_min;
+            while scaling <= scaling_max {
+                let params = WinRateModelTargetParams { offset: offset as f32, scaling: scaling as f32 };
+                let loss = wrm_target_bce_loss(&samples, params);
+                if loss < best_loss {
+                    best = params;
+                    best_loss = loss;
+                }
+                scaling += step;
+            }
+            offset += step;
+        }
+    }
+
+    let total = total_pos + total_neg;
+    Some((best, best_loss / total, true))
+}
+
+fn wrm_target_bce_loss(samples: &[(f32, f64, f64)], params: WinRateModelTargetParams) -> f64 {
+    let mut loss = 0.0f64;
+    for &(score, positives, negatives) in samples {
+        let p = f64::from(params.probability(score)).clamp(1.0e-6, 1.0 - 1.0e-6);
+        loss -= positives * p.ln() + negatives * (1.0 - p).ln();
+    }
+    loss
+}
 
 pub fn load_halfkp_teacher_fast_batch(
     config: &HalfkpTeacherBatchConfig<'_>,
@@ -997,6 +1214,7 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1011,6 +1229,7 @@ fn validate_kp_config(config: &KpTeacherBatchConfig<'_>) -> Result<(), TeacherBa
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1025,6 +1244,7 @@ fn validate_kppt_config(config: &KpptTeacherBatchConfig<'_>) -> Result<(), Teach
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1038,6 +1258,17 @@ fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), Teach
     }
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
+    }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
+    Ok(())
+}
+
+fn validate_wrm_target(enabled: bool, params: WinRateModelTargetParams) -> Result<(), TeacherBatchError> {
+    if enabled && WinRateModelTargetParams::new(params.offset, params.scaling).is_none() {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "WRM target parameters must be finite and scaling > 0 (offset={}, scaling={})",
+            params.offset, params.scaling
+        )));
     }
     Ok(())
 }
@@ -1109,6 +1340,7 @@ fn prepare_halfkp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1136,7 +1368,10 @@ fn prepare_halfkp_direct_fast_batch(
             weights[i] = weight;
 
             let score = if config.win_rate_model {
-                win_rate_model_score(pos.score())
+                win_rate_model_score_from_table(
+                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
+                    pos.score(),
+                )
             } else {
                 let score = f32::from(pos.score());
                 1.0 / (1.0 + (-rscale * score).exp())
@@ -1202,6 +1437,7 @@ fn prepare_kp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1229,7 +1465,10 @@ fn prepare_kp_direct_fast_batch(
             weights[i] = weight;
 
             let score = if config.win_rate_model {
-                win_rate_model_score(pos.score())
+                win_rate_model_score_from_table(
+                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
+                    pos.score(),
+                )
             } else {
                 let score = f32::from(pos.score());
                 1.0 / (1.0 + (-rscale * score).exp())
@@ -1705,6 +1944,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -1881,6 +2121,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2058,6 +2299,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2280,6 +2522,7 @@ fn prepare_sfnn_fast_batch_from_board_features(
     let target_blend = 1.0 - config.lambda;
     let rscale = 1.0 / config.scale;
     let layerstack_bucket = config.layerstack_bucket;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
 
     let fill_chunk = |chunk_index: usize,
                       data_chunk: &[PackedSfenValue],
@@ -2323,7 +2566,10 @@ fn prepare_sfnn_fast_batch_from_board_features(
             weights_chunk[i] = weight;
 
             let score = if config.win_rate_model {
-                win_rate_model_score(pos.score())
+                win_rate_model_score_from_table(
+                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
+                    pos.score(),
+                )
             } else {
                 let score = f32::from(pos.score());
                 1.0 / (1.0 + (-(rscale * score)).exp())
@@ -2430,6 +2676,7 @@ mod tests {
             lambda: 1.0,
             scale: 400.0,
             win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
             ft_factorize: false,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
@@ -2452,6 +2699,7 @@ mod tests {
             lambda: 1.0,
             scale: 400.0,
             win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
             teacher_shuffle_seed: 0,

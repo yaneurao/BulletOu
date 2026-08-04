@@ -39,10 +39,12 @@ Main flags:
 | `--lr-plateau-monitor` | Validation metric used by `plateau`: `loss`, `accuracy`, or `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | Blend weight between teacher eval and W/D/L (see [§6.2](#62-training-target-lambda)) | 1.0 (= pure eval) |
 | `--scale` | Eval-to-score sigmoid scale for the legacy sigmoid-MSE target | 290 |
-| `--win-rate-model` | Use WRM (win-rate-model) target conversion and loss (see [§6.2](#wrm-win-rate-model-loss)). This is now enabled by default for supported value networks | on |
+| `--win-rate-model` | Use WRM (win-rate-model) target conversion and loss (see [§6.2](#wrm-win-rate-model-loss)). This is now enabled by default for scalar value networks, including KPPT / KPP_KKPT / NNUE / SFNN | on |
 | `--loss-sigmoid-mse` | Use the legacy `sigmoid(model_output)` MSE loss instead of WRM | off |
 | `--loss-pow-exp` | Exponent `p` in the WRM error term `|prediction - target|^p`; used by the default WRM loss | 2.0 |
 | `--wrm-nnue2score` | WRM prediction-side scale. In `prediction = wrm(model_output × wrm_nnue2score)`, this sets `wrm_nnue2score` | 600 |
+| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate WRM target-side score conversion from `(teacher_score, game_result)`. `0` restores the fixed legacy target transform | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | Explicit fixed WRM target-side transform. Specify both to disable automatic target calibration | omitted |
 | `--sfnn-factorizer` | Select SFNN residual factorizer terms. `shared` is the default shared stack factorizer; `none` disables it; `axis` enables shared plus every bucket-axis factorizer available in the architecture. For example, `hand1024_k3k3` is treated like `king=axis,hand=axis`, while plain `k3k3` is treated like `king=axis`. Combined forms such as `king=axis,hand=shared` are accepted for mixed king/hand bucket experiments. | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for enabling shared factorizer or disabling all SFNN factorizer terms. Prefer `--sfnn-factorizer shared` or `--sfnn-factorizer none` in new commands. | on |
 | `--optimizer-weight-decay` | Weight decay for the selected optimizer | 0.0 |
@@ -270,13 +272,17 @@ Lower `--lambda` to mix in the W/D/L game result. Pure-result training (`--lambd
 
 ### WRM (win-rate-model) loss
 
-BulletOu now uses WRM target conversion and WRM loss by default for NNUE / SFNN scalar value networks. This is the same setting as explicitly passing `--win-rate-model` in older versions.
+BulletOu now uses WRM target conversion and WRM loss by default for scalar value networks: KPPT / KPP_KKPT / NNUE / SFNN. This is the same setting as explicitly passing `--win-rate-model` in older versions.
 
 Pass `--loss-sigmoid-mse` if you need to compare against the legacy MSE on `sigmoid(model_output)`.
 
+At startup, BulletOu estimates the target-side WRM conversion from the first `--wrm-target-calibration-positions` teacher positions (default: 100,000). It fits the teacher score to the actual game result carried by the teacher records, then uses the fitted target conversion for both training targets and `test_value_loss`.
+
+Set `--wrm-target-calibration-positions 0` to use the fixed legacy target transform (`offset=270`, `out_scaling=380`). For exact experiments, you can also specify both `--wrm-target-offset` and `--wrm-target-scaling`.
+
 This changes:
 
-- teacher eval conversion to a win-rate target with `out_scaling=380` and `offset=270`
+- teacher eval conversion to a win-rate target with the calibrated target-side WRM parameters
 - network output conversion to a win-rate prediction with `nnue2score=600`, `in_scaling=340`, and `offset=270`
 - loss formula to `abs(target - prediction)^p`, where `p` is `--loss-pow-exp`
 - `test_value_loss` and `plateau` decisions to use the same WRM loss

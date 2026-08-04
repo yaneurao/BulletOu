@@ -39,10 +39,12 @@
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
 | `--scale` | 従来の sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
-| `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照)。現在はデフォルトで有効 | on |
+| `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照)。現在は KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network でデフォルト有効 | on |
 | `--loss-sigmoid-mse` | WRM ではなく従来の `sigmoid(model_output)` MSE loss を使う | off |
 | `--loss-pow-exp` | WRM の誤差項 `|prediction - target|^p` の指数。デフォルト WRM loss で使われる | 2.0 |
 | `--wrm-nnue2score` | WRM で network output を score 空間へ戻す倍率。`prediction = wrm(model_output × wrm_nnue2score)` の `wrm_nnue2score` | 600 |
+| `--wrm-target-calibration-positions` | 教師データ先頭 N 局面の `(teacher_score, game_result)` から、WRM target 側の score 変換係数を推定する。`0` なら従来固定値を使う | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | WRM target 側の固定係数を明示指定する。両方指定すると自動推定を使わない | 省略 |
 | `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて、その arch に存在する bucket axis factorizer をすべて有効化する。たとえば `hand1024_k3k3` なら `king=axis,hand=axis` 相当、`k3k3` だけなら `king=axis` 相当。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
 | `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
@@ -280,13 +282,17 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 ### WRM (win-rate-model) loss
 
-現在の BulletOu は、NNUE / SFNN の scalar value network で WRM 形式の target 変換と loss をデフォルトで使う。これは、以前 `--win-rate-model` を付けていた設定と同じ。
+現在の BulletOu は、KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network で WRM 形式の target 変換と loss をデフォルトで使う。これは、以前 `--win-rate-model` を付けていた設定と同じ。
 
 従来の `sigmoid(model_output)` に対する MSE で比較したい場合は、`--loss-sigmoid-mse` を指定する。
 
+起動時に、教師データ先頭 `--wrm-target-calibration-positions` 局面（デフォルト 100,000）を使い、教師 score と実際の game_result の対応から WRM target 側の `offset` / `scaling` を推定する。推定した target 変換は、学習 target と `test_value_loss` の両方で使われる。
+
+従来の固定 target 変換（`offset=270`, `out_scaling=380`）に戻したい場合は `--wrm-target-calibration-positions 0` を指定する。完全に固定したい実験では、`--wrm-target-offset` と `--wrm-target-scaling` を両方指定できる。
+
 変わるものは次の通り。
 
-- 教師 eval を `offset=270`, `out_scaling=380` の win-rate target に変換する
+- 教師 eval を、推定済みの target 側 WRM 係数による win-rate target に変換する
 - network output を `nnue2score=600`, `offset=270`, `in_scaling=340` の win-rate prediction に変換する
 - loss を `abs(target - prediction)^p` にする。この `p` が `--loss-pow-exp`
 - `test_value_loss` と `plateau` 判定も同じ WRM loss に切り替える

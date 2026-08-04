@@ -32,10 +32,12 @@ pub use fast_sfnn::{
     FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape, SfnnForwardTrace,
     SfnnForwardWeights, SfnnForwardWorkspaceLayout,
 };
+pub use loader::WinRateModelTargetParams;
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
     KpptTeacherBatchConfig, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
-    TeacherDataloaderPos, for_each_halfkp_teacher_fast_batch, for_each_kp_teacher_fast_batch,
+    TeacherDataloaderPos, WrmTargetCalibrationConfig, WrmTargetCalibrationReport,
+    estimate_wrm_target_from_teacher_prefix, for_each_halfkp_teacher_fast_batch, for_each_kp_teacher_fast_batch,
     for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch, for_each_sfnn_teacher_fast_batch,
     load_halfkp_teacher_fast_batch,
 };
@@ -128,6 +130,7 @@ where
             blend,
             scale,
             self.score_drop_abs,
+            None,
         ))
     }
 }
