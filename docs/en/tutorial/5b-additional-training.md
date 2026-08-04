@@ -2,12 +2,12 @@
 
 <a href="../../ja/tutorial/5b-additional-training.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-[§5 Interrupt & resume](5-resume.md) covered the case where training died mid-run and you just want to pick up the pieces. This page covers the related but distinct case: **training finished cleanly, and now you want to add more epochs or change some settings and continue**.
+[§5 Interrupt & resume](5-resume.md) covered the case where training stopped and you want to continue. This page covers the case where **training finished cleanly and you want to add more training**.
 
 Examples:
 - 3 epochs done → look at the results, want 3 more epochs.
 - Trained at batch_size 16384 → realised the 4090 has VRAM headroom, want to switch to 32768.
-- Have a trained `nn.bin` → want to fine-tune on a **different teacher**.
+- Have saved weights → want to continue with a **different teacher**.
 - Want to lower the LR and polish for a bit.
 
 ## 5.5.1 The simple rule: same `--tag` resumes
@@ -28,7 +28,7 @@ Continued training works with the same auto-resume mechanism as §5: **same `--t
     --lr-schedule step --lr-min 0.00001
 ```
 
-On the second invocation:
+On the second launch:
 - Detects the output dir `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-round1/`.
 - Loads the latest `0018/state.bin` (weights + Ranger optimizer state).
 - New saves start at `0019/`.
@@ -36,9 +36,9 @@ On the second invocation:
 
 Total effective epochs trained: 3 + 3 = 6.
 
-⚠️ `--max-epochs` is **"epochs to do in this invocation"**, not "total epochs target". It does not see the previous run.
+⚠️ `--max-epochs` means **"epochs to run in this launch"**, not "total epochs to reach."
 
-## 5.5.2 What you can / can't change between invocations
+## 5.5.2 What you can / can't change between launches
 
 ### ✅ Safe to change
 
@@ -48,23 +48,23 @@ Total effective epochs trained: 3 + 3 = 6.
 | `--positions-per-superbatch` | Changes sb size. The effective value is rounded down to a multiple of `batch_size`. |
 | `--lr` | Start LR for `step`; lr_max for `geometric` / `cos`. |
 | `--lr-min` | LR floor. |
-| `--lr-schedule` (`step` / `geometric` / `cos` / `plateau`) | Changes the LR trajectory. The bullet-shogi-compatible default is `step`. |
-| `--max-epochs` | How many epochs in this invocation. |
+| `--lr-schedule` (`step` / `geometric` / `cos` / `plateau`) | Changes how LR moves. Default is `step`. |
+| `--max-epochs` | How many epochs in this launch. |
 | `--superbatches` | LR cycle length for `geometric` / `cos`; per-epoch processing cap for `step`. |
 | `--save-rate` | Changes checkpoint frequency only. If reusing an existing checkpoint, pass `--resume` explicitly. |
-| `--validation-rate` | Changes held-out accuracy/loss frequency only. If reusing an existing checkpoint, pass `--resume` explicitly. |
+| `--validation-rate` | Changes validation frequency only. If reusing saved data, pass `--resume` explicitly. |
 | `--lambda` | Teacher-target blend. |
-| `--teacher` | Teacher-change detection triggers; dataloader reads new teacher from the start. See the LR note in [§5.5.4](#554-fine-tune-on-a-different-teacher). |
+| `--teacher` | BulletOu detects the teacher change and reads the new teacher from the start. See the LR note in [§5.5.4](#554-continue-with-a-different-teacher). |
 | `--test-teacher` | Validation set swap. |
-| `--sfnn-factorizer` | Changes which SFNN residual factorizer terms are active (`shared`, `none`, `axis`, or mixed forms such as `king=axis,hand=shared`). `axis` is shorthand for enabling every bucket axis available in the architecture; for example, `hand1024_k3k3` is treated like `king=axis,hand=axis`. If reusing an existing checkpoint, pass `--resume` explicitly. `state.bin` keeps all available factorizer tensors; validation and `nn.bin` fold only the terms active for the current invocation. |
+| `--sfnn-factorizer` | Changes how SFNN shares common components between buckets. If reusing saved data, pass `--resume` explicitly. |
 
 ### ❌ Don't change (model topology)
 
 | Flag | Why |
 |---|---|
-| `--arch` | Changes the target family or NN topology (feature set / FT / L1 / L2 dims) → state.bin tensor shapes mismatch. |
-| `--arch` LayerStack suffix (SFNN family) | Number of LayerStacks affects the final layer dim. |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | Compatibility aliases for `--sfnn-factorizer shared` / `--sfnn-factorizer none`. Prefer `--sfnn-factorizer` for new runs. |
+| `--arch` | Changes the evaluation function or layer sizes, so saved weights no longer match. |
+| `--arch` LayerStack part, such as `k3k3` or `hand1024` | Changes the number of SFNN branches, so saved weights no longer match. |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | Short forms for `--sfnn-factorizer shared` / `--sfnn-factorizer none`. Prefer `--sfnn-factorizer`. |
 | `--tag` | Changing this lands you in a different output dir = fresh training. (Useful only when starting a new experiment.) |
 
 To change any of these, pass a different `--tag` and run as a separate experiment.
@@ -94,11 +94,11 @@ Changing `--batch-size` can slightly change the rounded effective sb_size. If yo
 
 ### Optimizer state is slightly out of sync
 
-A 2× larger batch reduces gradient noise by ~√2. Adam's second-moment estimate was tuned to the previous noise level, so the first 1-2 sb may be very slightly over- or under-shooting. In practice this is invisible in the loss curve; don't panic if the first save looks slightly different.
+Changing `--batch-size` keeps the weights reusable, but the optimizer has internal statistics from earlier updates. The first 1–2 sb may look slightly different. If the loss recovers quickly, this is not a problem.
 
-## 5.5.4 Fine-tune on a different teacher
+## 5.5.4 Continue with a different teacher
 
-A common workflow: distill on a large weaker corpus, then fine-tune on a small strong corpus:
+A common workflow: train on a large weaker corpus, then continue on a smaller stronger corpus:
 
 ```powershell
 # Distill on bulk teacher for 3 epochs
@@ -108,7 +108,7 @@ A common workflow: distill on a large weaker corpus, then fine-tune on a small s
     --max-epochs 3 --superbatches 6 `
     --lr-schedule step --lr-min 0.00001
 
-# Fine-tune on strong teacher with a smaller LR
+# Continue on strong teacher with a smaller LR
 .\bulletou.exe --teacher c:\shogi\teacher\strong\ `
     --arch NNUE_kp_256x2_32_32 `
     --tag distill `
@@ -123,7 +123,7 @@ Teacher-change handling:
 - Resets `dataloader_pos.txt`.
 - Adjusts the displayed sb counter (`cb_ctx.sb_offset`) so the log row stays monotonic.
 
-For `step` / `geometric` / `cos`, every epoch starts a new LR cycle from `--lr`. When changing teachers for fine-tuning, pass explicit `--lr` / `--lr-min` values as needed, and use a different `--tag` when you want a separate experiment.
+For `step` / `geometric` / `cos`, every epoch starts from `--lr`. When changing teachers, pass explicit `--lr` / `--lr-min` values as needed, and use a different `--tag` when you want a separate experiment.
 
 ## 5.5.5 Cooling down with a smaller LR
 
@@ -143,24 +143,24 @@ After a near-converged run, a final polish at 1/10 the LR is a classic move:
     --lr-schedule step ...
 ```
 
-This is the textbook LR-annealing-for-fine-tuning pattern: small final step, no big swings.
+This is a simple final low-LR polish: small final step, no big swings.
 
-## 5.5.6 Multiple invocations vs one long run
+## 5.5.6 Multiple launches vs one long run
 
-Splitting 6 epochs into 2 × 3-epoch invocations is **functionally equivalent** to one 6-epoch invocation:
+Splitting 6 epochs into two 3-epoch launches is **functionally close** to one 6-epoch launch:
 
-| Aspect | 2 invocations | 1 invocation |
+| Aspect | 2 launches | 1 launch |
 |---|---|---|
 | Total weight updates | Same | Same |
 | LR cycles | `step` / `geometric` / `cos` restart from `--lr` at each epoch. | Same |
-| CUDA JIT compile | Twice (once per invocation; the *first* invocation is the slow one) | Once |
+| CUDA initialization | Happens for each launch | Once |
 | Intermediate checkpoints | Same (per-sb save) | Same |
-| Interruption tolerance | Higher (each invocation is a clean unit) | One long process |
+| Interruption tolerance | Higher (each launch ends cleanly) | One long process |
 
-In practice, breaking the training into 2-3-epoch chunks is recommended: the CUDA cache is warm after the first run, so subsequent invocations start fast, and you get natural checkpoints to adjust settings or kill cleanly.
+In practice, 2–3 epoch chunks are often convenient: you get regular points to inspect results, adjust settings, or stop cleanly.
 
 ---
 
-Next: [6. Tune the training](6-tune.md) — what `--lr` / `--superbatches` / `--lambda` actually mean.
+Next: [6. Adjust training settings](6-tune.md) — what `--lr` / `--superbatches` / `--lambda` actually mean.
 
 Previous: [5. Interrupt & resume](5-resume.md)

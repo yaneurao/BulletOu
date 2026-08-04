@@ -13,9 +13,9 @@ Step-by-step guide for users who are new to BulletOu. Read these pages in order.
 | 4 | [Run the training](4-train.md) | Invoke `bulletou` (arch / teacher) |
 | 5 | [Stop and resume](5-resume.md) | Auto-resume by re-running with the same `--output` |
 | 5.5 | [Continued training](5b-additional-training.md) | Add more epochs to a finished run; swap teacher, batch_size, LR, etc. |
-| 6 | [Tune the training](6-tune.md) | Adjust the schedule (`--lr`, `--superbatches`) and `--lambda` (optional) |
+| 6 | [Adjust training settings](6-tune.md) | Adjust LR, save frequency, validation frequency, loss, and `--lambda` |
 | 7 | [Inspect the result](7-result.md) | Output layout and reading `learn.log` |
 | 8 | [Load into an engine](8-engine.md) | Verify the trained weights in YaneuraOu |
-| 9 | [LayerStack](9-layerstack.md) | Using per-position bucket-selected sub-networks (applies to the SFNN family) |
+| 9 | [LayerStack](9-layerstack.md) | Using SFNN models that switch later layers by position type |
 
 After finishing the tutorial, the [Reference docs](../) cover specifications and design details (data formats, network output formats, etc.).

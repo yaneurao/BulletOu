@@ -16,7 +16,7 @@ After training finishes the output directory (e.g. `checkpoints/NNUE_HALFKP-NNUE
 checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── summary-learn.log                  ← top-level cumulative sb-level log across runs/resumes
 ├── 0001/
-│   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
+│   ├── nn.bin                         ← NNUE binary loadable by YaneuraOu / Stockfish
 │   ├── state.bin                      ← resume data (weights + Ranger optimizer state)
 │   └── learn.log                      ← snapshot of the training log at this save point
 ├── 0002/
@@ -33,18 +33,18 @@ For KPPT / KPP_KKPT, instead of `nn.bin` each numbered dir contains the three fi
 
 ## 7.2 Reading the training log (`learn.log`)
 
-The loss trajectory of every run, both during training and afterwards, is recorded in `<output>/summary-learn.log` (cumulative) and `<output>/0NNN/learn.log` (per-save snapshot). The files have different granularities: `summary-learn.log` has one row per validated/saved superbatch, while each `0NNN/learn.log` is a per-batch snapshot for a saved checkpoint.
+Training loss and validation results are recorded in `<output>/summary-learn.log` and each `<output>/0NNN/learn.log`. Usually read `summary-learn.log`; it has one row per validated or saved superbatch.
 
-`--validation-rate` controls how often held-out accuracy/loss are computed. It defaults to `--save-rate`, but you can set a smaller value (for example `--validation-rate 1 --save-rate 20`) to validate every superbatch while saving checkpoints less often. Validation-only summary rows do not have a matching numbered checkpoint directory; if training is interrupted, rows after the latest complete checkpoint are trimmed on resume because that unsaved model state cannot be restored.
+`--validation-rate` controls how often validation accuracy/loss are computed. It defaults to `--save-rate`, but you can set a smaller value (for example `--validation-rate 1 --save-rate 20`) to validate every superbatch while saving less often. Validation-only rows do not have a matching numbered checkpoint directory. If training is interrupted, rows after the latest complete checkpoint are trimmed on resume because that unsaved model state cannot be restored.
 
-By default, when `--test-positions` is omitted, validation uses all fixed-record positions in `--test-teacher`, so repeated runs use the same held-out set. If you pass `--test-positions N` to use a smaller subset, pass an explicit non-zero `--test-seed` (for example `--test-seed 1`) or use `--test-sample sequential` for reproducible comparisons. With sampled validation, the default `--test-seed 0` uses a time-based random sample, so two runs can report slightly different accuracy/loss even with the same training controls.
+By default, when `--test-positions` is omitted, validation uses all fixed-record positions in `--test-teacher`, so repeated runs use the same validation set. If you pass `--test-positions N` to use a smaller subset, pass an explicit non-zero `--test-seed` (for example `--test-seed 1`) or use `--test-sample sequential` for reproducible comparisons. With sampled validation, the default `--test-seed 0` uses a time-based random sample, so two runs can report slightly different accuracy/loss even with the same training controls.
 
 ### Which one to look at
 
 - **Top-level `<output>/summary-learn.log`** — the **cumulative** file across all runs/resumes. Use this as the default.
 - **Per-save `0NNN/learn.log`** — a snapshot up to that save point. Use this when you want to see "what did things look like at save 0005?".
 
-The per-save `learn.log` keeps the 12-column per-batch schema shown below. The top-level `summary-learn.log` omits `curr_batch` and appends a rightmost `test_teacher` column so each validation accuracy/loss row records which `--test-teacher` file produced it.
+`learn.log` and `summary-learn.log` are CSV files. `summary-learn.log` adds a rightmost `test_teacher` column so each validation accuracy/loss row records which `--test-teacher` file produced it.
 
 ### Sample CSV
 
@@ -64,7 +64,7 @@ Bullet writes **one row every 32 batches**. With the default (`--positions-per-s
 
 | Column | Meaning | Example |
 |---|---|---|
-| `eval` | mirror of the output-dir name (`<target>[-<arch>]`) plus a `/<component>` suffix for multi-component (KPPT-family) rows | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` / `KPPT/kkp` / `KPPT/kpp` |
+| `eval` | Evaluation-function name. KPPT rows add the component name, such as `KPPT/kk` | `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` / `KPPT/kk` |
 | `epoch` | within-run epoch (1-indexed) | `1` |
 | `superbatch` | within-epoch superbatch (1-indexed). +1 every effective `--positions-per-superbatch` positions | `1`, `2`, ... |
 | `curr_batch` | within-superbatch batch (1-indexed). Bullet logs every 32 batches | `32`, `64`, ..., `1525` |
@@ -109,7 +109,7 @@ A healthy training run typically shows:
    - `--lr-schedule step` (default): multiply lr by `gamma` once per superbatch, floor at `--lr-min`, and restart to `--lr` at epoch boundaries. `gamma` is either explicit or auto-computed from one epoch's length.
    - `--lr-schedule geometric`: geometric (= log-linear) decay from `--lr` (lr_max) to `--lr-min` over one epoch (= `--superbatches × sb_size` positions), warm-restarting back to lr_max at each epoch boundary.
    - `--lr-schedule cos`: cosine annealing sweeping `--lr` (lr_max) → `--lr-min` over one epoch (= `--superbatches × sb_size` positions), then warm-restarts to `--lr` at each epoch boundary.
-   - If it isn't moving as expected, double-check the LR flags ([§6.1 Training schedule](6-tune.md#61-training-schedule)).
+   - If it isn't moving as expected, double-check the LR flags ([§6.3 Learning-rate schedules](6-tune.md#63-learning-rate-schedules)).
 
 3. **`positions` is monotonically increasing** (within a run and across resumes)
    - One completed superbatch ≒ 100M (= `--positions-per-superbatch` rounded down to a multiple of `--batch-size`)
@@ -118,7 +118,7 @@ A healthy training run typically shows:
 4. **`superbatch` advances as expected**
    - With a teacher smaller than 100M positions, `superbatch` stays at 1 for the whole run (fallback save fires once at the end). That's by design.
    - With a larger teacher, `superbatch` should increment every time `curr_batch` reaches the final batch in the effective superbatch.
-   - If `superbatch` is stuck at 1 and `curr_batch` plateaus far below the final batch in the effective superbatch, the dataloader may be cut short (e.g. the old HCPE polarity bug).
+   - If `superbatch` is stuck at 1 and `curr_batch` stays far below the final batch in the effective superbatch, the dataloader may be cut short.
 
 ### Quick plot
 
@@ -158,7 +158,7 @@ df["component"] = df["component"].fillna("nnue")   # NNUE rows have no slash
 After a resume, the new run's rows are appended verbatim. In the new run:
 - `epoch` restarts at 1
 - `superbatch` restarts at 1
-- **`positions` continues from the previous run's max**
+- **`positions` continues from the saved maximum**
 
 Using `positions` as the time axis gives you a continuous loss curve across resume boundaries (the plotting snippet above already does this).
 
@@ -170,9 +170,9 @@ Using `positions` as the time axis gives you a continuous loss curve across resu
 - [Reference: NNUE HalfKP Training](../shogi/halfkp.md) — `nn.bin` binary layout, quantisation, resume details
 - [Reference: NNUE K-P Training](../shogi/kp.md) — comparison vs HalfKP, input feature structure
 - [Reference: NNUE HalfKPE9 Training](../shogi/halfkpe9.md) — HalfKP with attacker-count buckets
-- [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — legacy YaneuraOu evals
+- [Reference: KPPT / KPP_KKPT Training](../shogi/kppt.md) — KPPT / KPP_KKPT evals
 - [Specifications: spec/](../../spec/) — target matrix, binary layout, hash derivations, `learn.log` format
 
 ---
 
-Previous: [6. Tune the training](6-tune.md)
+Previous: [6. Adjust training settings](6-tune.md)

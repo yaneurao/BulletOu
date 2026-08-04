@@ -26,11 +26,11 @@ Currently `bulletou` can train these four targets:
 | `NNUE_kp_256x2_32_32` | Same 4-layer ClippedReLU network as HalfKP but with the K and P features kept separate — lighter input. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
 | `NNUE_ka2_256x2_32_32` | Same 4-layer ClippedReLU network as K-P but with A2 (kings included, v2 collapse) instead of P. Both kings appear inside the piece feature too. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
 | `NNUE_halfkpe9_256x2_32_32` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2 clipped, 9 combos; 1,128,492 dims = HalfKP × 9). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
-| `NNUE_halfkpvm_256x2_32_32` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4; 69,660 dims = HalfKP × ~½). | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP variant that mirrors king-position files 6-9 to the 1-4 side (69,660 dims = HalfKP × ~½). | `nn.bin` |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | YaneuraOu NNUEwoSQPT1536-build LayerStacks evaluation (HalfKA_hm2 input). Full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md); user-level usage in [§9 LayerStack](9-layerstack.md). | `nn.bin` |
 | `SFNN_halfkahm1_1536_15_32_k3k3` | Same as above but with HalfKA_hm1 (v1) for ablation. | `nn.bin` |
 | `SFNN_ka2_1536_15_32_k3k3` | Same SFNN-1536 LayerStacks topology as the others, but input is `K + A2` (1791 dims). Lightweight ablation; loss plateaus higher than HalfKA_hm2 because the input layer no longer encodes king × piece interactions. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
-| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPPT` | Three-file KK + KKP + KPP evaluation in elmo(WCSC27) format. See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only the KPP file changes (no turn channel, ~half size) | Same three files, KPP in a different layout |
 
 Coming later (the input-feature Rust code exists but isn't wired into `bulletou` yet): HalfKA / HalfKA_hm / Threat / HandThreat / HandThreatDefensive / HandCount / SFNN + ls9 (NNUEwoSQPT1536), etc.
@@ -78,8 +78,8 @@ The rest of the tutorial:
 - [4. Run the training](4-train.md) — invoking `bulletou`
 - [5. Stop and resume](5-resume.md) — auto-resume by re-running with the same `--output`
 - [5.5 Continued training](5b-additional-training.md) — add more epochs to a finished run, swap batch_size or teacher
-- [6. Tune the training](6-tune.md) — adjust the schedule and `--lambda` (optional)
+- [6. Adjust training settings](6-tune.md) — adjust LR, save frequency, validation frequency, loss, and `--lambda`
 - [7. Inspect the result](7-result.md) — output layout and reading `learn.log`
 - [8. Load into an engine](8-engine.md) — verify in YaneuraOu
-- [9. LayerStack](9-layerstack.md) — bucket-selected per-position sub-networks (applies to the SFNN family)
-- [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train legacy YaneuraOu evals (reference)
+- [9. LayerStack](9-layerstack.md) — SFNN models that switch later layers by position type
+- [KPPT / KPP_KKPT Training](../shogi/kppt.md) — how to train KPPT / KPP_KKPT evals (reference)

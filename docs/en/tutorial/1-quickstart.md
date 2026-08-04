@@ -70,7 +70,7 @@ Build the maintained BulletOu trainer backend:
 cargo build --release --features cuda-cpp-backend --example bulletou
 ```
 
-On Windows, make sure the CUDA Toolkit and a compatible Visual Studio C++ toolchain are available in the build environment.
+On Windows, make sure the CUDA Toolkit and a matching Visual Studio C++ toolchain are available in the build environment.
 
 The first build will take several minutes. If it succeeds without errors, you're ready.
 
@@ -78,7 +78,7 @@ The first build will take several minutes. If it succeeds without errors, you're
 
 - **`CUDA_PATH is not defined`** — set the environment variable to your CUDA install path (e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x` or `/usr/local/cuda`).
 - **`nvcc` / MSVC build errors on Windows** — install the CUDA Toolkit and Visual Studio C++ build tools, then run from a shell where both are visible.
-- **Linker error mentioning CUDA runtime libraries** — the CUDA version may be too old. Use 12.x or newer.
+- **Linker error mentioning CUDA runtime libraries** — use CUDA Toolkit 12.x or newer.
 
 ## 1.4 Run a smoke-test training
 

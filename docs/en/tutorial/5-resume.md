@@ -6,7 +6,7 @@ Stop mid-training (Ctrl+C, machine reboot, whatever) and **re-run the exact same
 
 ```
 checkpoints/.../
-├── 0001/             ← from the previous run
+├── 0001/             ← first saved checkpoint
 ├── 0002/
 ├── 0003/             ← latest save when training was interrupted
 ├── 0004/             ← the resumed run writes from here
@@ -17,15 +17,15 @@ How it works:
 - On startup, `bulletou` looks under `--output` for numbered dirs containing `state.bin`.
 - The highest-numbered `state.bin` is loaded, restoring weights and Ranger optimizer state.
 - New saves continue numbering from one past the existing maximum (`0004/` here).
-- The cumulative `summary-learn.log` keeps appending CSV rows for the resumed run. The superbatch counter resets to 1, but the `positions` column continues from the previous run's max (read off the existing `summary-learn.log` at startup). For `step` / `geometric` / `cos`, the LR cycle restarts from `--lr` at epoch boundaries.
+- `summary-learn.log` keeps appending CSV rows after resume. The superbatch counter resets to 1, but the `positions` column keeps increasing from the saved maximum. For `step` / `geometric` / `cos`, LR restarts from `--lr` at epoch boundaries.
 
-This behaviour is identical for every target family (KPPT / KPP_KKPT / NNUE_HALFKP / NNUE_KP / NNUE_HALFKPE9 — all share the same mechanism). To start fresh, point `--output` at a different directory or delete the existing one.
+This works the same way for KPPT / KPP_KKPT / NNUE / SFNN. To start fresh, point `--output` at a different directory or delete the output directory you no longer need.
 
 ---
 
 Next:
 - [5.5 Continued training](5b-additional-training.md) — add more epochs to a finished run, or change settings mid-stream
-- [6. Tune the training](6-tune.md) — adjust `--lambda`, `--lr`, `--superbatches`, etc. (optional)
+- [6. Adjust training settings](6-tune.md) — adjust `--lambda`, `--lr`, `--superbatches`, etc. (optional)
 - If you already have a trained model, jump to [7. Inspect the result](7-result.md)
 
 Previous: [4. Run the training](4-train.md)

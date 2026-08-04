@@ -18,18 +18,18 @@ We use **NNUE HalfKP as the running example** in this tutorial, but the same com
 | `NNUE_kp_256x2_32_32` | Same network as HalfKP, but the input keeps K and P as independent features. See [NNUE K-P Training](../shogi/kp.md). | `nn.bin` |
 | `NNUE_ka2_256x2_32_32` | Same network as K-P, but with K+A2 input. See [NNUE K-A2 Training](../shogi/ka2.md). | `nn.bin` |
 | `NNUE_halfkpe9_256x2_32_32` | HalfKP augmented with per-square attacker-count info (own/opp 0/1/2, 9 combos). See [NNUE HalfKPE9 Training](../shogi/halfkpe9.md). | `nn.bin` |
-| `NNUE_halfkpvm_256x2_32_32` | HalfKP with king-position file-mirror folding (files 6-9 mirrored to 1-4). Input dim is ~half of HalfKP. | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP variant that mirrors king-position files 6-9 to the 1-4 side. Input dim is ~half of HalfKP. | `nn.bin` |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | LayerStacks evaluation for YaneuraOu's `YANEURAOU_ENGINE_SFNN1536` build. Usage in [§9 LayerStack](9-layerstack.md); full spec in the [SFNN-1536 reference](../shogi/sfnn-1536.md). | `nn.bin` |
 | `SFNN_halfkahm1_1536_15_32_k3k3` | v1 ablation of the above. | `nn.bin` |
 | `SFNN_ka2_1536_15_32_k3k3` | Same SFNN-1536 topology, but with lightweight K+A2 input. | `nn.bin` |
-| `KPPT` | Legacy three-file evaluation (elmo(WCSC27)-compatible). See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPPT` | Three-file KK + KKP + KPP evaluation in elmo(WCSC27) format. See [KPPT / KPP_KKPT Training](../shogi/kppt.md). | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT's factorised variant — only KPP changes (no turn channel, ~half size) | Same three files, only KPP layout differs |
 
 Architecture size variants such as `NNUE_halfkp_1024x2_8_64` or `SFNN_ka2_8192_7_64_c0_s1024x8_k3k3` are accepted for experiments when the matching YaneuraOu architecture exists.
 
 ## 3.2 Get training data
 
-You need a `.pack`, `.hcpe`, `.hcpe3`, `.psv`, or PSV-compatible `.bin` file.
+You need a `.pack`, `.hcpe`, `.hcpe3`, `.psv`, or `.bin` file. A `.bin` file is read as PSV-style teacher data.
 
 - **Generate your own** — `.pack` is produced by the `gensfen` script in [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection); `.hcpe` / `.hcpe3` come from dlshogi-style generators. For this tutorial, 10–100 million positions is enough.
 - **Use a shared dataset** — the shogi community shares files in all formats.
@@ -52,9 +52,9 @@ teachers/
 `gensfen` and dlshogi-style generators usually emit positions **grouped by game** (positions from one game are contiguous). If you train on such files directly, nearby positions from the same game dominate consecutive mini-batches, and loss / plateau decisions become sensitive to local teacher bias.
 
 How to shuffle:
-- **`.hcpe` / `.psv` / `.bin`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It bucket-distributes huge teacher folders and writes shuffled split files without loading everything into memory.
+- **`.hcpe` / `.psv` / `.bin`**: use `teacher/shuffle_split_teacher_external.py` from [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection). It shuffles huge teacher folders and writes split files without loading everything into memory.
 - **`.hcpe3` / `.pack`**: these are variable-length game formats, so record-level shuffling is not straightforward. Shuffle at generation time, or convert to a fixed-position format such as `.psv` / `.hcpe` and shuffle that.
-- **In-trainer shuffle**: enabled by default. For example, with `batch_size=65536` and `positions-per-superbatch=40000000`, the effective `batches_per_superbatch` is `610`, so the default window is `610` batches. One window is about 1.5 GiB for 40-byte PSV/HCPE-compatible records, so the double buffer uses about 3.0 GiB of CPU memory. The exact allocation is printed at startup. Use `--teacher-shuffle-buffer-sbs 4` if you want a 4-superbatch window.
+- **In-trainer shuffle**: enabled by default. For example, with `batch_size=65536` and `positions-per-superbatch=40000000`, one sb is 610 batches. One sb of 40-byte PSV/HCPE records is about 1.5 GiB, and BulletOu keeps two such buffers to avoid read stalls, so this uses about 3.0 GiB of CPU memory. The exact allocation is printed at startup. Use `--teacher-shuffle-buffer-sbs 4` if you want a 4-superbatch buffer.
 
 Example: shuffle/split an HCPE or PSV folder into 10M-position files:
 
@@ -69,7 +69,7 @@ Outputs are named like `shuffled-00001.hcpe`, `shuffled-00002.hcpe`, ... . For m
 
 ### Trying with a small subset first
 
-Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--positions-per-superbatch` so each superbatch consumes less data (see [§6.1 Training schedule](6-tune.md#61-training-schedule)).
+Before running on a huge dataset, you can try a smaller subset by generating a smaller file from `gensfen`, or by limiting `--positions-per-superbatch` so each superbatch consumes less data (see [§6.1 Units used in the logs](6-tune.md#61-units-used-in-the-logs)).
 
 ---
 

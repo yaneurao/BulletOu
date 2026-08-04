@@ -33,7 +33,7 @@ The trade-off is teacher density. More buckets give the model more capacity, but
 
 BulletOu's SFNN LayerStack selection is the product of three independent axes.
 
-| Axis | What it looks at | Accepted tokens | Bucket count |
+| Split | What it looks at | Architecture-name parts | Bucket count |
 |---|---|---|---:|
 | hand | side-to-move / non-side hand pieces | omitted, `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 1 / 4 / 16 / 64 / 64 / 256 / 1024 |
 | king | side-to-move / non-side king positions | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
@@ -74,7 +74,7 @@ idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 
 ## 9.3 Architecture names
 
-LayerStack tokens may be written in any order, but BulletOu canonicalizes saved names as `hand → king → progress`.
+The `hand256`, `k3k3`, and `progress8` parts may be written in any order. BulletOu organizes output directory names as `hand → king → progress`.
 
 | Accepted input | Canonical name |
 |---|---|
@@ -82,7 +82,7 @@ LayerStack tokens may be written in any order, but BulletOu canonicalizes saved 
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | unchanged |
 
-No suffix is also valid:
+You may also omit all of these parts:
 
 ```text
 SFNN_halfka2_1024_7_64
@@ -90,7 +90,7 @@ SFNN_halfka2_1024_7_64
 
 This means LayerStacks=1: no split by king position, hand pieces, or progress.
 
-Grouped SFNN / common+shard L1 notation can be combined with the same suffixes.
+Split-L1 SFNN names can be combined with the same LayerStack parts.
 
 ```text
 SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
@@ -431,7 +431,7 @@ When `progressN` is used, the exported `nn.bin` includes a Progress section.
 
 The hand / king / progress axes multiply, so combinations can become huge quickly.
 
-| Architecture suffix | LayerStacks | Comment |
+| Architecture-name part | LayerStacks | Comment |
 |---|---:|---|
 | none | 1 | no LayerStack split |
 | `k3k3` | 9 | smallest king bucket |
@@ -447,7 +447,7 @@ The hand / king / progress axes multiply, so combinations can become huge quickl
 | `hand256_k13k13z` | 43264 | watch teacher data, VRAM, and checkpoint size |
 | `hand1024_k29k29` | 861184 | extremely heavy |
 
-Large suffixes affect not only training speed, but also checkpoint size, validation time, and teacher density per stack.
+Large choices affect not only training speed, but also save size, validation time, and teacher density per stack.
 
 ## 9.13 Choosing a bucket scheme
 
@@ -455,7 +455,7 @@ These are practical starting points, not universal rules.
 
 | Goal | Candidate | Comment |
 |---|---|---|
-| quick sanity check | no suffix / `k3k3` | small and easy to debug |
+| quick sanity check | no extra part / `k3k3` | small and easy to debug |
 | finer than `k3k3` | `k9k9` | plain rank split |
 | keep 81 stacks but add home-rank file zones | `k9k9z` | same size as `k9k9`, different budget |
 | `k9k9z` is too coarse | `k13k13z` | keeps ranks 1-7 and zones ranks 8-9 |
@@ -508,7 +508,7 @@ Combine hand, king, and progress:
     --teacher teachers/
 ```
 
-When loading the exported `nn.bin`, build YaneuraOu with the same architecture suffix.
+When loading the exported `nn.bin`, build YaneuraOu with the same architecture name.
 
 ---
 
