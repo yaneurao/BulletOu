@@ -24,7 +24,7 @@ Windows の場合、生成されるバイナリは `.\target\release\examples\bu
     --teacher teachers/
 ```
 
-これだけで動く。`--output` を省略した場合、checkpoint は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる。この名前は `--arch` から自動生成される。別の場所に出力したい場合は `--output checkpoints/my-halfkp` のように明示する。
+これだけで動く。`--output` を省略した場合、学習結果は `checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/` 配下に書かれる。この名前は `--arch` から自動生成される。別の場所に出力したい場合は `--output checkpoints/my-halfkp` のように明示する。
 
 ## 4.3 `--arch` を指定する
 
@@ -32,7 +32,7 @@ Windows の場合、生成されるバイナリは `.\target\release\examples\bu
 
 たとえば HalfKP の 256x2-32-32 は `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 は `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。短縮形 `256x2-32-32` は受け付けない。
 
-NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごとの accumulator サイズで、FT SIMD padding の都合により 32 の正の倍数である必要がある。`L2` / `L3` は正の整数なら受け付ける。よく使う例は次の通り。
+NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。ざっくり言うと、`L1` が最初の大きな層、`L2` / `L3` が後段の小さな層です。`L1` は 32 の正の倍数にする必要があります。よく使う例は次の通り。
 
 | サイズ・arch例 | L1 / FT | L2 | L3 | 備考 |
 |---|---:|---:|---:|---|
@@ -43,7 +43,7 @@ NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごと�
 | `1024x2-8-32` | 1024 | 8 | 32 | 大型。推論コストは増える |
 | `1024x2-8-64` | 1024 | 8 | 64 | 大型 |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | 1536 | 15 | 32 | k3k3 (king3-by-king3) LayerStack の SFNN-1536 |
-| `SFNN_halfka2_1024_7_64` | 1024 | 7 | 64 | bucket suffix なしの single stack SFNN (`LayerStacks = 1`) |
+| `SFNN_halfka2_1024_7_64` | 1024 | 7 | 64 | 局面で分岐しない SFNN (`LayerStacks = 1`) |
 | `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3` | 4096 | 3 | 64 | grouped SFNN L1。4096 を 4 group に分け、各 group が 1024 -> 1 |
 | `SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3` | 8192 | 3 | 64 | grouped SFNN L1。8192 を 4 group に分け、各 group が 2048 -> 1 |
 | `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3` | 4096 | 7 | 64 | grouped SFNN L1。4096 を 4 group に分ける |
@@ -61,7 +61,7 @@ NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごと�
 | `SFNN_halfka2_1024_7_64_hand256_k3k3` | 1024 | 7 | 64 | hand256 × k3k3 LayerStack bucket (2304 stacks。非常に大きい) |
 | `SFNN_halfka2_1024_7_64_hand1024` | 1024 | 7 | 64 | hand1024 の手駒有無 LayerStack bucket (1024 stacks) |
 | `SFNN_halfka2_1024_7_64_hand1024_k3k3` | 1024 | 7 | 64 | hand1024 × k3k3 LayerStack bucket (9216 stacks。巨大) |
-| `SFNN_halfka2_1024_7_64_progress8` | 1024 | 7 | 64 | progress8 LayerStack bucket。進行度 axis のみ |
+| `SFNN_halfka2_1024_7_64_progress8` | 1024 | 7 | 64 | 進行度だけで 8 分岐する SFNN |
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1024 | 7 | 64 | k3k3 × progress8 LayerStack bucket (72 stacks) |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` | 1024 | 7 | 64 | hand256 × k3k3 × progress16 LayerStack bucket (36864 stacks) |
 | `SFNN_ka2_4096_15_64_c0_s256x16_k3k3` | 4096 | 15 | 64 | 軽量な KA2 入力を使う grouped SFNN |
@@ -74,13 +74,13 @@ NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごと�
     --teacher teachers/
 ```
 
-`--arch` は学習対象と内部 target family の single source of truth なので、通常の学習では必須。表にないサイズも実験用途では受け付けるが、学習結果の `nn.bin` を読み込めるのは、同じ architecture header で build したやねうら王だけ。対応する edition 名を `make` に渡してビルドする。詳しくは [§8 Engine](8-engine.md) を参照。
+`--arch` は「何の評価関数を学習するか」を決める一番重要な指定です。学習結果の `nn.bin` をやねうら王で読むには、やねうら王側も同じ名前の architecture でビルドする必要があります。対応する edition 名を `make` に渡してビルドしてください。詳しくは [§8 Engine](8-engine.md) を参照。
 
-grouped SFNN は、任意の LayerStack suffix の前に `_cN_sMxG` を置いて表現できる。たとえば `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は、`FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 1024 channel × 8 shard に分割` という意味。
+SFNN の L1 層を分割したい場合は、名前の途中に `_cN_sMxG` を入れます。たとえば `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3` は、`FT=8192`, `L1 hidden=7`, `L2=64`, `L1 を 1024 channel × 8 個に分ける` という意味です。
 
-common 部分が非ゼロの common+shard L1 も同じ形式。たとえば `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は、1024 common channel + 256 channel × 8 shard。suffix を省略すると single stack (`LayerStacks = 1`) になる。
+共通部分を持たせる場合も同じ形式です。たとえば `SFNN_ka2_3072_7_64_c1024_s256x8_k3k3` は、全分岐で共有する 1024 channel と、256 channel × 8 個の分割部分を持つという意味です。`k3k3` などを省略すると、局面で分岐しない `LayerStacks = 1` になります。
 
-suffix を付ける場合は、独立した `hand64/hand256/hand1024`, `k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29`, `progress2/3/4/8/16/32` axis を組み合わせられる。例: `hand256_k3k3_progress16`。parser はこれらの token を任意順で受け付け、内部では `hand`, `king`, `progress` の順に canonicalize する。`ka2` / `halfka2` などの feature token から内部 target は自動的に決まる。
+`hand64/hand256/hand1024` は持ち駒、`k3k3/k9k9/k21k21/k29k29` などは玉位置、`progress2/3/4/8/16/32` は進行度で分岐する指定です。これらは組み合わせられます。例: `hand256_k3k3_progress16`。指定順は `hand256_k3k3_progress16` でも `k3k3_hand256_progress16` でも受け付けますが、出力ディレクトリ名では `hand → king → progress` の順に整理されます。`ka2` / `halfka2` などの入力特徴名から、BulletOu が必要な内部設定を自動で選びます。
 
 ## 4.4 SFNN-1536 (やねうら王 NNUEwoSQPT1536) を学習する
 
@@ -92,11 +92,11 @@ suffix を付ける場合は、独立した `hand64/hand256/hand1024`, `k3k3/k9k
     --teacher teachers/
 ```
 
-通常の NNUE と違い、SFNN は局面ごとに選択される複数の sub-network を使う。`--arch` の `k3k3` suffix は、やねうら王の LayerStack 方式を選ぶ指定。使い方は [§9 LayerStack](9-layerstack.md)、architecture / 量子化 / `nn.bin` layout の仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md) を参照。
+通常の NNUE と違い、SFNN は局面の種類ごとに後段ネットワークを切り替えます。`--arch` の `k3k3` は、玉位置で 3×3 に分ける指定です。使い方は [§9 LayerStack](9-layerstack.md)、量子化や `nn.bin` の詳細は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md) を参照。
 
 ## 4.5 KPPT を学習する
 
-KPPT 系では固定 target 名を `--arch` に指定する。
+KPPT 系では、`--arch KPPT` または `--arch KPP_KKPT` を指定する。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -104,7 +104,7 @@ KPPT 系では固定 target 名を `--arch` に指定する。
     --teacher teachers/
 ```
 
-デフォルト出力先は `checkpoints/KPPT/`。factorised 版にしたければ `--arch KPP_KKPT` に変えるだけでよい。
+デフォルト出力先は `checkpoints/KPPT/`。KPP を小さくした形式で学習したい場合は `--arch KPP_KKPT` に変えるだけでよい。
 
 ## 4.6 教師データの渡し方
 
@@ -116,16 +116,16 @@ KPPT 系では固定 target 名を `--arch` に指定する。
 
 ## 4.7 学習はどこまで走るか
 
-`--superbatches` と `--max-epochs` を省略すると、教師データを1周するまで、つまり dataloader が EOF を返すまで学習する。複数 epoch 回したい場合は、`--superbatches` で epoch 長を決めたうえで `--max-epochs N` を指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
+`--superbatches` と `--max-epochs` を省略すると、教師データを1周するまで学習する。複数 epoch 回したい場合は、`--superbatches` で「1 epoch は何 sb か」を決めたうえで `--max-epochs N` を指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
 
-教師サイズが事前にわかっているなら、`--superbatches N` で「1 epoch = N sb」を明示できる。詳しくは [§6.1 学習スケジュール](6-tune.md#61-学習スケジュール) を参照。教師の総局面数は `--count-teacher` で確認できる。
+教師サイズが事前にわかっているなら、`--superbatches N` で「1 epoch = N sb」を明示できる。詳しくは [§6.1 まず覚える単位](6-tune.md#61-まず覚える単位) を参照。教師の総局面数は `--count-teacher` で確認できる。
 
 ```bash
 ./target/release/examples/bulletou --count-teacher --teacher teachers/
 # -> "Total: 461373440 positions, suggested --superbatches 4"
 ```
 
-`--lr-schedule cos` を使うときは特に重要。1 cycle が 1 epoch と一致するように `--superbatches` を選ぶと、各 epoch 末で `lr_min` に着地し、次 epoch の先頭で `lr_max` に warm restart するきれいな周期になる。このモードでも、教師データ自体は epoch 境界では先頭に戻らない。教師 EOF に到達したときだけ先頭に戻る cyclic stream として扱われる。
+`--lr-schedule cos` を使うときは特に重要です。`--superbatches` を決めておくと、各 epoch 末で `lr_min` に着地し、次 epoch の先頭で `--lr` に戻ります。なお、教師データ自体は epoch 境界では先頭に戻りません。教師ファイルの末尾に到達したときだけ先頭に戻ります。
 
 ## 4.8 期待される出力
 
@@ -142,16 +142,16 @@ Positions / Superbatch : 99942400
   cuda-cpp loss progress log = checkpoints/.../cuda-cpp-progress.log (checkpoint/validation/final only)
   [save]  epoch 1  sb 1/36  this-sb=... pos (...)  total=... pos  sb_time=...s  pos/s=...
   [valid]  epoch 1 sb 1  test_value_accuracy=..., test_value_loss=..., elapsed=...
-  cuda-cpp SFNN direct train = ok: steps=..., positions=..., train_elapsed=...s, elapsed=...s, throughput=... pos/s, ...
+  cuda-cpp SFNN direct train = ok: steps=..., positions=..., train_elapsed=...s, elapsed=...s, pos/s=...
 ```
 
-cuda-cpp backend の stdout に出る `pos/s` は、checkpoint file save / validation / loss readback / progress-log write の時間を除外した純粋な学習 throughput。デフォルトでは、loss は checkpoint / validation / final のタイミングだけ readback される。細かい batch loss を診断したい場合だけ `--cuda-cpp-loss-readback-interval N` を指定する。
+stdout に出る `pos/s` は、保存・検証・ログ書き込みの時間を除いた学習速度です。デフォルトでは、loss は保存・検証・終了時だけ取得します。細かい batch loss を診断したい場合だけ `--cuda-cpp-loss-readback-interval N` を指定します。
 
 `pos/s` は 1秒あたりに処理した局面数で、学習速度の目安。RTX 4090 なら構成によって数百万〜数千万 pos/s 程度が目安。低位 GPU では比例して低下する。
 
 ## 4.9 書き出した `nn.bin` の量子化 accuracy を測る
 
-学習中の validation は基本的に f32 weight の forward で測る。一方、やねうら王で実際に使うのは checkpoint に書き出された量子化済み `nn.bin` なので、量子化後の符号一致率を確認したいときは `quantized-test` を使う。
+学習中の検証は、基本的に f32 の重みで測ります。一方、やねうら王で実際に使うのは、保存時に整数化された `nn.bin` です。整数化後の符号一致率を確認したいときは `quantized-test` を使います。
 
 ```powershell
 .\target\release\examples\bulletou.exe quantized-test `
@@ -162,14 +162,14 @@ cuda-cpp backend の stdout に出る `pos/s` は、checkpoint file save / valid
 
 `--test-positions` を省略すると検証ファイルの全局面を使う。`--test-positions N` を指定した場合は、`--test-sample sequential` / `random` と `--test-seed` でサンプル方法を選べる。
 
-出力される `accuracy` は、やねうら王の `test eval_accuracy` と同じく、draw を除外した W/L の符号一致率。SFNN の量子化 forward を CPU で再現するため、学習中 validation より遅いが、たまに確認する用途なら十分。
+出力される `accuracy` は、やねうら王の `test eval_accuracy` と同じく、引き分けを除外した勝ち負けの符号一致率です。SFNN の整数化後計算を CPU で再現するため、学習中の検証より遅いですが、たまに確認する用途なら十分です。
 
 ---
 
 次へ:
 
 - 学習を中断したり再開したい場合は [5. 中断・再開](5-resume.md)
-- 学習スケジュールや教師ターゲットを調整したい場合は [6. 学習をチューニング](6-tune.md)
+- 学習率・保存頻度・loss を調整したい場合は [6. 学習設定を調整する](6-tune.md)
 - 学習済みモデルを確認したい場合は [7. 結果を確認](7-result.md)
 
 前へ: [3. 教師データを用意する](3-data.md)

@@ -2,11 +2,20 @@
 
 <a href="../../en/tutorial/9-layerstack.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-通常の NNUE は、どの局面でも同じ後段ネットワークを使って評価値を出します。SFNN の LayerStack は、FeatureTransformer までは共有し、その後ろの小さな MLP stack を局面の種類ごとに切り替える仕組みです。
+通常の NNUE は、どの局面でも同じ後段ネットワークを使って評価値を出します。SFNN の LayerStack は、入力側の大きな変換部分は共有し、その後ろの小さなネットワークを局面の種類ごとに切り替える仕組みです。
 
-たとえば `k3k3` なら玉位置の粗い分類で 9 個の stack を持ち、局面ごとにそのうち 1 つを使います。`hand256_k3k3` なら、持ち駒分類 256 通りと玉位置分類 9 通りを掛け合わせて、`256 * 9 = 2304` 個の stack を持ちます。
+たとえば `k3k3` なら玉位置の粗い分類で 9 個の後段ネットワークを持ち、局面ごとにそのうち 1 つを使います。`hand256_k3k3` なら、持ち駒分類 256 通りと玉位置分類 9 通りを掛け合わせて、`256 * 9 = 2304` 個の後段ネットワークを持ちます。
 
-重要なのは、BulletOu と やねうら王 が同じ局面に対して完全に同じ LayerStack index を計算することです。ここが 1 つでもずれると、学習した `nn.bin` をエンジン側で読めても、別の stack を参照してしまいます。
+重要なのは、BulletOu と やねうら王が同じ局面に対して同じ番号を選ぶことです。ここが 1 つでもずれると、学習した `nn.bin` をエンジン側で読めても、別の後段ネットワークを参照してしまいます。
+
+この章では、次の言葉を使います。
+
+| 言葉 | この章での意味 |
+|---|---|
+| LayerStack | 局面ごとに切り替える後段ネットワークの集まり |
+| stack | LayerStack の中の 1 個の後段ネットワーク |
+| bucket | 玉位置・持ち駒・進行度などで局面を分類した番号 |
+| `k3k3` / `hand256` など | architecture 名に付ける「分け方」の指定 |
 
 ## 9.1 LayerStack が何をしているか
 
@@ -15,9 +24,9 @@ LayerStack は「入力特徴量を変える」仕組みではありません。
 | 部分 | LayerStack で共有されるか | 説明 |
 |---|---|---|
 | 入力特徴量 | 共有 | `halfka2` / `ka2` などは変わらない |
-| FeatureTransformer | 共有 | L0 の重みは全 stack 共通 |
-| 後段 MLP | stack ごとに別 | L1/L2/L3 相当の小さなネットワークを bucket ごとに持つ |
-| 出力値 | 局面ごとに 1 stack だけ使う | bucket index で選ばれた stack の出力を評価値にする |
+| FeatureTransformer | 共有 | 入力特徴量を最初に変換する大きな部分。L0 の重みは全 stack 共通 |
+| 後段ネットワーク | stack ごとに別 | L1/L2/L3 相当の小さなネットワークを bucket ごとに持つ |
+| 出力値 | 局面ごとに 1 stack だけ使う | 選ばれた stack の出力を評価値にする |
 
 直感的には、次のような分業です。
 
@@ -33,7 +42,7 @@ LayerStack は「入力特徴量を変える」仕組みではありません。
 
 BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせます。
 
-| 軸 | 何を見るか | 指定できる token | bucket 数 |
+| 分け方 | 何を見るか | architecture 名に付ける文字列 | bucket 数 |
 |---|---|---|---:|
 | hand | 手番側/非手番側の持ち駒 | 省略, `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 1 / 4 / 16 / 64 / 64 / 256 / 1024 |
 | king | 手番側玉/非手番側玉の位置 | 省略, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
@@ -58,7 +67,7 @@ BulletOu の SFNN LayerStack は、次の3つの軸を独立に組み合わせ�
 | `SFNN_halfka2_1024_7_64_k3k3_progress8` | 1 | 9 | 8 | 72 |
 | `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` | 256 | 9 | 16 | 36864 |
 
-index の合成順は、やねうら王と同じく `hand → king → progress` です。
+最終番号を作る順番は、やねうら王と同じく `hand → king → progress` です。
 
 ```text
 idx = hand_bucket
@@ -76,15 +85,15 @@ idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 
 ## 9.3 architecture 名の書き方
 
-LayerStack token は任意の順番で書けますが、BulletOu は保存名では `hand → king → progress` の順に正規化します。
+`hand256` や `k3k3` などの指定は任意の順番で書けます。ただし BulletOu は、出力ディレクトリ名では `hand → king → progress` の順に整理します。
 
-| 入力として許可される名前 | BulletOu が扱う正規名 |
+| 入力として許可される名前 | 出力ディレクトリ名で使われる名前 |
 |---|---|
 | `SFNN_halfka2_1024_7_64_k3k3_hand256_progress16` | `SFNN_halfka2_1024_7_64_hand256_k3k3_progress16` |
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | そのまま |
 
-suffix なしも有効です。
+`k3k3` や `hand256` などを何も付けない名前も有効です。
 
 ```text
 SFNN_halfka2_1024_7_64
@@ -92,13 +101,13 @@ SFNN_halfka2_1024_7_64
 
 この場合は LayerStacks=1、つまり玉位置・持ち駒・進行度で分けません。
 
-grouped SFNN / common+shard L1 とも組み合わせられます。
+L1 層を分割する指定とも組み合わせられます。
 
 ```text
 SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k3k3_progress16
 ```
 
-この例は、`ka2` 入力、FT=3072、L1 は 1024 common + 256 x 8 shard、LayerStack は `hand256 × k3k3 × progress16` です。
+この例は、`ka2` 入力、FT=3072、L1 は共有 1024 channel + 256 channel × 8 個、LayerStack は `hand256 × k3k3 × progress16` です。
 
 ## 9.4 king bucket を読む前の座標ルール
 
@@ -135,7 +144,7 @@ king_bucket = stm_king29 * 29 + non_stm_king29
 
 king bucket は「玉位置をどれくらい細かく見るか」を決めます。
 
-| token | 1玉あたり | 両玉の組み合わせ | 何を重視するか |
+| 指定 | 1玉あたり | 両玉の組み合わせ | 何を重視するか |
 |---|---:|---:|---|
 | 省略 | 1 | 1 | 玉位置で分けない |
 | `k3k3` | 3 | 9 | 玉の大まかな段だけを見る |
@@ -147,7 +156,7 @@ king bucket は「玉位置をどれくらい細かく見るか」を決めま�
 
 `k9k9z` / `k13k13z` の `z` は zone の意味です。単純な rank 分割ではなく、重要そうな領域に解像度を寄せる bucket です。
 
-long alias も使えます。たとえば `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, `king29_by_king29` などです。
+長い名前でも指定できます。たとえば `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, `king29_by_king29` などです。
 
 ## 9.6 `k3k3` — まず試す粗い玉 bucket
 
@@ -173,7 +182,7 @@ long alias も使えます。たとえば `king9_by_king9`, `king9z_by_king9z`, 
 
 `k9k9` と `k9k9z` は、どちらも 1玉あたり 9 bucket、両玉で `9 * 9 = 81` stacks です。違いは、9 bucket の使い方です。
 
-| token | 9 bucket の使い方 | 向いている狙い |
+| 指定 | 9 bucket の使い方 | 向いている狙い |
 |---|---|---|
 | `k9k9` | rank 1〜9 をそのまま 9 分割 | 玉の段を素直に見たい |
 | `k9k9z` | 遠い段を粗くまとめ、自陣 rank 8〜9 の筋を3分割 | 同じ 81 stacks のまま、自陣深部の横位置を見たい |
@@ -306,7 +315,7 @@ rank 7〜9 の 3段 x 9筋 = 27マスをそのまま区別し、rank 1〜3 と r
 
 hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucket を組み合わせます。
 
-| token | 片側の bucket 数 | 最終 hand buckets | 見ているもの |
+| 指定 | 片側の bucket 数 | 最終 hand buckets | 見ているもの |
 |---|---:|---:|---|
 | 省略 | 1 | 1 | 持ち駒を見ない |
 | `hand4` | 2 | 4 | 角を持っているか |
@@ -322,7 +331,7 @@ hand bucket は、手番側の持ち駒 bucket と非手番側の持ち駒 bucke
 
 `hand4` / `hand16` は、軽い hand bucket です。片側の bucket を作り、最後に手番側と非手番側を掛け合わせます。
 
-| token | 片側 bucket の作り方 | 最終 bucket |
+| 指定 | 片側 bucket の作り方 | 最終 bucket |
 |---|---|---|
 | `hand4` | `角を持つ ? 1 : 0` | `stm_1bit * 2 + non_stm_1bit` |
 | `hand16` | bit0=`歩を持つ`, bit1=`角を持つ` | `stm_2bit * 4 + non_stm_2bit` |
@@ -385,7 +394,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `hand256` / `hand1024` は、持ち駒の有無を bit で表します。
 
-| token | bit | 意味 |
+| 指定 | bit | 意味 |
 |---|---:|---|
 | `hand256` | bit0 | 歩/香/桂を持つ |
 | `hand256` | bit1 | 銀/金を持つ |
@@ -397,7 +406,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 | `hand1024` | bit3 | 角を持つ |
 | `hand1024` | bit4 | 飛を持つ |
 
-| token | 片側 bucket | 最終 bucket |
+| 指定 | 片側 bucket | 最終 bucket |
 |---|---|---|
 | `hand256` | 4bit, 0〜15 | `stm_4bit * 16 + non_stm_4bit` |
 | `hand1024` | 5bit, 0〜31 | `stm_5bit * 32 + non_stm_5bit` |
@@ -408,11 +417,11 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `progressN` は、局面から `0..255` の進行度値を計算し、それを N 個の bucket に割り当てる仕組みです。
 
-architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3軸として progress bucket が合成されます。`progressN` に必要な Progress section は、BulletOu が `nn.bin` の一部として出力します。
+architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3の分け方として progress bucket が使われます。必要な進行度情報は、BulletOu が `nn.bin` の一部として出力します。
 
-BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を使います。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
+BulletOu は、手駒量と大駒成りをもとに進行度を計算します。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
 
-| token | progress buckets |
+| 指定 | progress buckets |
 |---|---:|
 | `progress2` | 2 |
 | `progress3` | 3 |
@@ -430,22 +439,22 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 たとえば `progress8` なら、進行度 `0..255` をほぼ 32 刻みで 8 個に分けます。`progress16` なら 16 刻みです。
 
-`progressN` を使うと、export される `nn.bin` には Progress section が入ります。
+`progressN` を使うと、出力される `nn.bin` には進行度計算用のデータも入ります。
 
-| section | 内容 |
+| `nn.bin` 内の部分 | 内容 |
 |---|---|
 | header | NNUE/SFNN header |
 | FeatureTransformer | L0 bias/weight |
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
-`progressN` は `king=axis` / `hand=axis` factorizer と併用できます。この場合、progress 軸そのものは factorizer 対象にせず、hand / king 軸だけを分解します。たとえば `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` には `--sfnn-factorizer king=axis,hand=axis` を指定できます。
+`progressN` は `king=axis` / `hand=axis` factorizer と併用できます。この場合、factorizer は hand / king の分け方にだけ掛かります。progress 方向には掛かりません。たとえば `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` には `--sfnn-factorizer king=axis,hand=axis` を指定できます。
 
 ## 9.12 組み合わせるとどれくらい大きくなるか
 
 hand / king / progress は掛け算なので、少し足しただけで急に大きくなります。
 
-| architecture suffix | LayerStacks | コメント |
+| architecture 名に付ける指定 | LayerStacks | コメント |
 |---|---:|---|
 | なし | 1 | LayerStack なし |
 | `k3k3` | 9 | 最小の king bucket |
@@ -461,7 +470,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | `hand256_k13k13z` | 43264 | 教師量・VRAM・保存サイズに注意 |
 | `hand1024_k29k29` | 861184 | 実験としては非常に重い |
 
-大きい suffix は、学習速度だけでなく、checkpoint サイズ、validation 時間、1 stack あたりの教師密度にも効きます。
+大きい指定は、学習速度だけでなく、保存サイズ、検証時間、1 stack あたりの教師密度にも効きます。
 
 ## 9.13 どれを選ぶべきか
 
@@ -469,7 +478,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 
 | 目的 | 候補 | コメント |
 |---|---|---|
-| まず動作確認したい | suffix なし / `k3k3` | 軽く、失敗時の切り分けが楽 |
+| まず動作確認したい | 何も付けない / `k3k3` | 軽く、失敗時の切り分けが楽 |
 | `k3k3` より細かくしたい | `k9k9` | 素直な rank 分割 |
 | 81 stacks のまま自陣深部の筋を見たい | `k9k9z` | `k9k9` と同じ大きさだが予算配分が違う |
 | `k9k9z` では粗すぎる | `k13k13z` | rank 1〜7 を保持し、8〜9段だけ zone 化 |
@@ -478,7 +487,7 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 | 持ち駒で局面を分けたい | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | king bucket と掛け合わせると急激に巨大化する |
 | 序盤/中盤/終盤で分けたい | `progress8`, `progress16` | hand / king と独立した第3軸として使える |
 
-大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、checkpoint サイズ、学習速度も合わせて見てください。
+大きい bucket ほど「最初の accuracy の上がり」は遅く見えることがあります。これは必ずしもバグではなく、1 stack あたりの学習サンプルが減るためです。比較するときは、同じ教師量での短期 accuracy だけでなく、十分回した後の loss、実対局、保存サイズ、学習速度も合わせて見てください。
 
 ## 9.14 使用例
 
@@ -522,7 +531,7 @@ hand / king / progress を全部組み合わせる例:
     --teacher teachers/
 ```
 
-出力された `nn.bin` をやねうら王で読むときは、やねうら王側も同じ architecture suffix で build してください。
+出力された `nn.bin` をやねうら王で読むときは、やねうら王側も同じ architecture 名で build してください。
 
 ---
 

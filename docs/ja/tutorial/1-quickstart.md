@@ -10,7 +10,7 @@
 
 以下が必要:
 
-- **NVIDIA GPU** (CUDA 対応のもの)。CPU だけでの学習はサポートされていない (保守対象 backend は CUDA 前提)
+- **NVIDIA GPU** (CUDA 対応のもの)。CPU だけでの学習はサポートされていない (学習処理は CUDA 前提)
 - **Rust ツールチェーン** (stable、1.87 以降)。OS 別の具体手順は §1.1.1 を参照
 - **CUDA Toolkit 12.x**
 - ビルドとテストデータ用に **10 GB 程度の空きディスク**
@@ -63,7 +63,7 @@ cd BulletOu
 
 ## 1.3 ビルド
 
-BulletOu の学習 backend をビルドする:
+BulletOu の学習コマンドをビルドする:
 
 ```bash
 # NVIDIA GPU (CUDA 12.x)
