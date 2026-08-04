@@ -3216,20 +3216,21 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
     wrm_nnue2score: f32,
 
-    /// Number of teacher-prefix positions used to estimate WRM target-side
-    /// score->win-rate parameters from `(teacher_score, game_result)`.
-    /// Default is 100k positions. Set to `0` to use the fixed legacy
-    /// WRM target parameters, or pass `--wrm-target-offset` and
+    /// Number of teacher-prefix positions used to estimate the target-side
+    /// score->win-rate sigmoid scale from `(teacher_score, game_result)`.
+    /// Default is 100k positions. Set to `0` to skip estimation and use the
+    /// built-in fixed WRM target curve, or pass `--wrm-target-offset` and
     /// `--wrm-target-scaling` for an explicit fixed target transform.
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS)]
     wrm_target_calibration_positions: usize,
 
-    /// Explicit WRM target-side offset. Must be used together with
-    /// `--wrm-target-scaling`; disables automatic target calibration.
+    /// Explicit target-side offset. Must be used together with
+    /// `--wrm-target-scaling`; disables automatic sigmoid target calibration.
+    /// Use `0` for a plain sigmoid target with a manually chosen scaling.
     #[arg(long)]
     wrm_target_offset: Option<f32>,
 
-    /// Explicit WRM target-side scaling. Must be finite and > 0, and must be
+    /// Explicit target-side scaling. Must be finite and > 0, and must be
     /// used together with `--wrm-target-offset`.
     #[arg(long)]
     wrm_target_scaling: Option<f32>,
@@ -3782,13 +3783,13 @@ fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, St
     }
 
     let params = if let Some(params) = explicit_wrm_target_params(args) {
-        print_startup_kv("WRM target", format!("fixed: offset={:.3}, scaling={:.3}", params.offset, params.scaling));
+        print_startup_kv("target curve", format!("fixed: offset={:.3}, scaling={:.3}", params.offset, params.scaling));
         params
     } else if args.wrm_target_calibration_positions == 0 {
         let params = WinRateModelTargetParams::DEFAULT;
         print_startup_kv(
-            "WRM target",
-            format!("fixed legacy: offset={:.3}, scaling={:.3}", params.offset, params.scaling),
+            "target curve",
+            format!("fixed built-in: offset={:.3}, scaling={:.3}", params.offset, params.scaling),
         );
         params
     } else {
@@ -3799,7 +3800,7 @@ fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, St
             loader_threads: cuda_cpp_effective_loader_threads(args),
             score_drop_abs: if args.score_drop_abs == 0 { None } else { Some(args.score_drop_abs) },
         })
-        .map_err(|err| format!("failed to estimate WRM target parameters from teacher prefix: {err}"))?;
+        .map_err(|err| format!("failed to estimate target sigmoid scale from teacher prefix: {err}"))?;
         print_wrm_target_calibration_report(report);
         report.params
     };
@@ -3812,7 +3813,7 @@ fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, St
 fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
     let value = if report.fitted {
         format!(
-            "auto: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, decisive={}, draws={}, filtered={}, bce={:.6}",
+            "auto sigmoid: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, decisive={}, draws={}, filtered={}, bce={:.6}",
             report.params.offset,
             report.params.scaling,
             format_count(report.observed_positions),
@@ -3825,7 +3826,7 @@ fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
         )
     } else {
         format!(
-            "auto fallback: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, filtered={}",
+            "auto sigmoid fallback: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, filtered={}",
             report.params.offset,
             report.params.scaling,
             format_count(report.observed_positions),
@@ -3834,7 +3835,7 @@ fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
             format_count(report.filtered_positions),
         )
     };
-    print_startup_kv("WRM target", value);
+    print_startup_kv("target curve", value);
 }
 
 #[cfg(feature = "cuda-cpp-backend")]

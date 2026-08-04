@@ -406,7 +406,7 @@ pub fn estimate_wrm_target_from_teacher_prefix(
     }
 
     let (params, bce_loss, fitted) =
-        fit_wrm_target_params(&bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
+        fit_sigmoid_target_params(&bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
     let fitted_positions = decisive_positions + drawn_positions;
     Ok(WrmTargetCalibrationReport {
         params,
@@ -419,6 +419,11 @@ pub fn estimate_wrm_target_from_teacher_prefix(
         bce_loss,
         fitted,
     })
+}
+
+fn fit_sigmoid_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTargetParams, f64, bool)> {
+    let (scale, bce_loss, fitted) = fit_sigmoid_target_scale(bins)?;
+    Some((WinRateModelTargetParams { offset: 0.0, scaling: scale }, bce_loss, fitted))
 }
 
 pub fn analyze_score_winrate_from_teacher(
@@ -3165,6 +3170,25 @@ mod tests {
             wrm_metrics.bce <= sigmoid_metrics.bce + 1.0e-7,
             "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}, wrm_params={wrm_params:?}"
         );
+    }
+
+    #[test]
+    fn default_target_fit_uses_plain_sigmoid_params() {
+        let expected_scale = 1800.0f32;
+        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        for score in (-1200..=1200).step_by(25) {
+            let p = sigmoid_score_probability(score as f32, expected_scale);
+            let count = 2000u32;
+            let wins = (p * count as f32).round() as u32;
+            let losses = count - wins;
+            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+        }
+
+        let (params, _, fitted) = fit_sigmoid_target_params(&bins).unwrap();
+
+        assert!(fitted);
+        assert_eq!(params.offset, 0.0);
+        assert!((params.scaling - expected_scale).abs() <= 2.0, "params={params:?}");
     }
 
     #[test]

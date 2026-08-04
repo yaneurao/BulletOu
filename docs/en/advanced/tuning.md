@@ -179,12 +179,10 @@ WRM changes three things:
 
 ### Coefficients for teacher-score → win-rate-label conversion
 
-Converting teacher scores to win-rate labels needs coefficients that match the teacher’s score scale. By default, BulletOu estimates them from the first 100,000 teacher positions.
+Converting teacher scores to win-rate labels needs a coefficient that matches the teacher’s score scale. By default, BulletOu estimates the plain-sigmoid `scale` from the first 100,000 teacher positions.
 
 ```text
-Look at teacher_score and game_result,
-then estimate how many score points correspond to how much win probability
-for this teacher data.
+target = sigmoid(teacher_score / scale)
 ```
 
 Change the sample size with `--wrm-target-calibration-positions`.
@@ -194,16 +192,22 @@ Change the sample size with `--wrm-target-calibration-positions`.
 --wrm-target-calibration-positions 300000
 ```
 
-Use `0` only when you do not want estimation.
+Use `0` only for comparison experiments where you want the built-in fixed curve.
 
 ```bash
 --wrm-target-calibration-positions 0
 ```
 
-That uses the built-in coefficients `offset=270`, `scaling=380`. If you must set the values explicitly for a controlled experiment, pass both:
+That uses the built-in coefficients `offset=270`, `scaling=380`. If you must set the values explicitly, pass both:
 
 ```bash
 --wrm-target-offset 270 --wrm-target-scaling 380
+```
+
+To manually keep a plain sigmoid target, set `offset=0`:
+
+```bash
+--wrm-target-offset 0 --wrm-target-scaling 6000
 ```
 
 For normal training, do not pass these options. Use the default estimation.
