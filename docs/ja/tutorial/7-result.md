@@ -16,7 +16,7 @@
 checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32/
 ├── summary-learn.log                  ← 全 run / resume を連結した sb 単位の累積ログ
 ├── 0001/
-│   ├── nn.bin                         ← やねうら王 / Stockfish 互換 NNUE バイナリ
+│   ├── nn.bin                         ← やねうら王 / Stockfish が読み込める NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Ranger optimizer state
 │   └── learn.log                      ← この save 時点の学習ログ snapshot
 ├── 0002/
@@ -117,7 +117,7 @@ CSV header 付きなので `pd.read_csv` で列名は自動取得される。
 4. **`superbatch` がきちんと進んでいるか**
    - 教師局面数が 1 億未満だと 1 周回しても `superbatch` は 1 のまま終わる (fallback save で 1 度だけ保存)。これは仕様
    - 大きな教師なら `curr_batch` が実効superbatch内の最終batchに到達するごとに `superbatch` が +1 されているはず
-   - `superbatch` がいつまでも 1 のままで `curr_batch` も実効superbatch内の最終batchよりかなり小さい値で止まっているなら、loader が打ち切られている可能性 (旧 HCPE loader 極性バグ等)
+   - `superbatch` がいつまでも 1 のままで `curr_batch` も実効superbatch内の最終batchよりかなり小さい値で止まっているなら、loader が打ち切られている可能性
 
 ### 簡単なプロット
 
@@ -169,7 +169,7 @@ resume すると新 run の行が学習ログにそのまま追記される。�
 - [リファレンス: NNUE HalfKP 学習](../shogi/halfkp.md) — `nn.bin` のバイナリレイアウト、量子化、resume の詳細
 - [リファレンス: NNUE K-P 学習](../shogi/kp.md) — HalfKP との比較、入力 feature の構造
 - [リファレンス: NNUE HalfKPE9 学習](../shogi/halfkpe9.md) — 利き数情報拡張版
-- [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — 旧評価関数の学習
+- [リファレンス: KPPT / KPP_KKPT 学習](../shogi/kppt.md) — KPPT / KPP_KKPT の学習
 - [仕様: spec/](../../spec/) — target 一覧 / バイナリレイアウト / hash 計算式 / `learn.log` フォーマット
 
 ---

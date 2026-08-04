@@ -223,7 +223,7 @@ long alias も使えます。たとえば `king9_by_king9`, `king9z_by_king9z`, 
 
 つまり `k9k9z` は、bucket 数を増やさずに「自陣深部の玉の横位置」を見たいときの設計です。たとえば、同じ rank 9 でも玉が端にいるか中央にいるかで評価の癖を変えたい、という狙いです。
 
-逆に、rank 1〜6 の差をかなり潰すので、そこが効く教師・局面集合では `k9k9` より悪くなる可能性もあります。`k9k9z` は常に上位互換ではなく、81 stacks の予算配分を変えるものです。
+逆に、rank 1〜6 の差をかなり潰すので、そこが効く教師・局面集合では `k9k9` より悪くなる可能性もあります。`k9k9z` は 81 stacks の予算配分を変える指定であり、常に `k9k9` より良いとは限りません。
 
 ## 9.8 `k13k13z` — rank 情報を残しつつ自陣深部だけ zone 化する
 
@@ -410,7 +410,7 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3軸として progress bucket が合成されます。`progressN` に必要な Progress section は、BulletOu が `nn.bin` の一部として出力します。
 
-現在の BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を使います。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
+BulletOu は、手駒量と大駒成りをもとにした deterministic な material-progress parameter を使います。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
 
 | token | progress buckets |
 |---|---:|

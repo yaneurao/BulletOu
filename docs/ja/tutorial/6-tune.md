@@ -12,7 +12,7 @@
 
 | フラグ | 意味 | デフォルト |
 |---|---|---|
-| `--backend` | 学習 backend。現行は Windows-native `cuda-cpp` のみ対応。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
+| `--backend` | 学習 backend。対応 backend は Windows-native `cuda-cpp`。公開 eval type はすべて `cuda-cpp` で学習可能 | `cuda-cpp` |
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | 1 superbatch あたりの目標局面数。実際には `--batch-size` の倍数へ切り捨て | 100000000 |
 | `--teacher-shuffle-buffer-sbs` | 学習時 teacher shuffle window を superbatch 単位で指定する。`4` なら 4 superbatch 分の CPU window を 2 個確保する。`0` で無効。通常はこちらを使う | 1 |
@@ -29,7 +29,7 @@
 | `--test-batch-size` | `--test-teacher` 検証時の GPU batch size。大きいほど validation の分割 overhead が減るが VRAM を使う。cudaMalloc になる場合だけ下げる | 65536 |
 | `--save-epoch-end` / `--no-save-epoch-end` | 各 epoch 最後の superbatch を暗黙に保存するかどうか | on |
 | `--lr` | 初期学習率 (lr_max。1 cycle の頭の値) | 0.000875 |
-| `--optimizer` | optimizer。現行は `ranger` のみ対応。`ranger` は BulletOu 既存の RAdam+Lookahead で、Ranger21 完全互換ではない | `ranger` |
+| `--optimizer` | optimizer。対応 optimizer は `ranger`。`ranger` は BulletOu の RAdam+Lookahead 実装で、Ranger21 と同一実装ではない | `ranger` |
 | `--lr-schedule` | `step` (= 階段状 StepLR)、`geometric` (= 対数線形)、`cos` (= cosine annealing)、`plateau` (= validation 指標が改善しないときだけ LR を下げる) | `step` |
 | `--lr-min` | 最小 lr。`step` / `plateau` では下限、`geometric` / `cos` では cycle 末で到達する値 | 0.00001 |
 | `--lr-step-gamma` | `step` で LR に掛ける係数。省略時、`--superbatches` があれば 1 epoch 内で `--lr` から `--lr-min` へ届く値を自動計算する。epoch 長が決まらない場合は `0.992` | 自動 / 0.992 |
@@ -38,15 +38,15 @@
 | `--lr-plateau-min-delta` | `plateau` で改善とみなす最小 loss 差 | 0.0 |
 | `--lr-plateau-monitor` | `plateau` で採用判定に使う指標。`loss` / `accuracy` / `loss_or_accuracy` | `loss_or_accuracy` |
 | `--lambda` | 教師 eval と対局結果 (WDL) のブレンド比 ([§6.2](#62-教師ターゲット-lambda) 参照) | 1.0 (= 純 eval) |
-| `--scale` | 従来の sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
-| `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照)。現在は KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network でデフォルト有効 | on |
-| `--loss-sigmoid-mse` | WRM ではなく従来の `sigmoid(model_output)` MSE loss を使う | off |
+| `--scale` | sigmoid-MSE target で使う eval-to-score sigmoid scale | 290 |
+| `--win-rate-model` | WRM (win-rate-model) の target 変換と loss を使う ([§6.2](#wrm-win-rate-model-loss) 参照)。KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network でデフォルト有効 | on |
+| `--loss-sigmoid-mse` | WRM ではなく `sigmoid(model_output)` MSE loss を使う | off |
 | `--loss-pow-exp` | WRM の誤差項 `|prediction - target|^p` の指数。デフォルト WRM loss で使われる | 2.0 |
 | `--wrm-nnue2score` | WRM で network output を score 空間へ戻す倍率。`prediction = wrm(model_output × wrm_nnue2score)` の `wrm_nnue2score` | 600 |
-| `--wrm-target-calibration-positions` | 教師データ先頭 N 局面の `(teacher_score, game_result)` から、WRM target 側の score 変換係数を推定する。`0` なら従来固定値を使う | 100000 |
+| `--wrm-target-calibration-positions` | 教師データ先頭 N 局面の `(teacher_score, game_result)` から、WRM target 側の score 変換係数を推定する。`0` なら固定値 (`offset=270`, `out_scaling=380`) を使う | 100000 |
 | `--wrm-target-offset` / `--wrm-target-scaling` | WRM target 側の固定係数を明示指定する。両方指定すると自動推定を使わない | 省略 |
-| `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は従来の stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて、その arch に存在する bucket axis factorizer をすべて有効化する。たとえば `hand1024_k3k3` なら `king=axis,hand=axis` 相当、`k3k3` だけなら `king=axis` 相当。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 | on |
+| `--sfnn-factorizer` | SFNN の residual factorizer を選ぶ。`shared` は stack 共有 factorizer、`none` は全factorizer無効、`axis` は共有項に加えて、その arch に存在する bucket axis factorizer をすべて有効化する。たとえば `hand1024_k3k3` なら `king=axis,hand=axis` 相当、`k3k3` だけなら `king=axis` 相当。`king=axis,hand=shared` のような混合指定も可能 | `shared` |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | 短縮alias。基本形は `--sfnn-factorizer shared` / `--sfnn-factorizer none` | on |
 | `--optimizer-weight-decay` | 選択中 optimizer の weight decay | 0.0 |
 | `--optimizer-epsilon` | 選択中 optimizer の epsilon を上書き。省略時は optimizer 固有の既定値 | 省略 |
 | `--optimizer-beta1` | 選択中 optimizer の beta1 を上書き。省略時は optimizer 固有の既定値 | 省略 |
@@ -107,7 +107,7 @@
 
 #### tatara / bullet-shogi / nnue-pytorch の StepLR 条件
 
-`--lr-schedule step` は、指定局面数ごとに `lr *= gamma` する階段状のスケジューラです。旧 BulletOu の滑らかな `step` は `geometric` に改名されています。現行の `step` は 1 epoch ごとに `--lr` へ戻ります。
+`--lr-schedule step` は、指定局面数ごとに `lr *= gamma` する階段状のスケジューラです。滑らかな指数減衰を使いたい場合は `geometric` を指定します。`step` は 1 epoch ごとに `--lr` へ戻ります。
 
 tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら、次のように書けます:
 
@@ -151,7 +151,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 
 | 値 | 採用条件 |
 |---|---|
-| `loss` | `test_value_loss` が下がった場合だけ採用する。従来どおりの ReduceLROnPlateau |
+| `loss` | `test_value_loss` が下がった場合だけ採用する。loss 監視型の ReduceLROnPlateau |
 | `accuracy` | `test_value_accuracy` が上がった場合だけ採用する |
 | `loss_or_accuracy` | loss が下がるか、accuracy が上がった場合に採用する。デフォルト |
 
@@ -163,7 +163,7 @@ tatara / bullet-shogi と同じ固定 `gamma=0.992` 条件を明示するなら�
 
 監視指標が改善しなかった attempt は正式な checkpoint (`000N/`) には残さない。最後の `lr_min` run も例外ではなく、改善しなければ破棄される。checkpoint と `summary-learn.log` に残るのは、採用された更新だけ。
 
-既存の checkpoint がある `--tag` で `--superbatches` を付けたり外したりすると、BulletOu は設定変更として扱い、auto resume を拒否する。古い checkpoint を意図して引き継ぐ場合だけ `--resume` を付ける。新しい実験として始めたい場合は `--tag` / `--output` を変える。
+checkpoint がある `--tag` で `--superbatches` を付けたり外したりすると、BulletOu は設定変更として扱い、auto resume を拒否する。その checkpoint を意図して引き継ぐ場合だけ `--resume` を付ける。別実験として始めたい場合は `--tag` / `--output` を変える。
 
 制約:
 
@@ -252,7 +252,7 @@ Suggested `--superbatches`: 4 (= use 4 full sb per epoch; ~61M positions leftove
 
 `--max-epochs N` を指定すると epoch を最大 N 回実行する。`step` / `geometric` / `cos` では「LR cycle を N 回繰り返す」の意味になる。`plateau` では教師を複数周しながら `lr_min` 到達まで同じ epoch を続けるので、「plateau 学習を最大 N 回繰り返す」の意味になる。省略した場合は、どの schedule でも epoch 数の固定上限は置かない。`--test-teacher` があれば前 epoch より最終 validation 指標が改善しなくなるまで続ける。`--test-teacher` がなければ、非 plateau schedule は中断されるまで epoch を繰り返す。
 
-各 epoch 開始時に superbatch 表示と LR cycle はリセットされるが、`--superbatches` 指定時の教師位置はリセットされない。教師は cyclic stream として継続し、EOF した時点でだけ先頭へ戻る。`--superbatches` 未指定の非 plateau だけは従来通り「教師EOF = epoch終了」として扱われ、次 epoch は教師先頭から始まる。
+各 epoch 開始時に superbatch 表示と LR cycle はリセットされるが、`--superbatches` 指定時の教師位置はリセットされない。教師は cyclic stream として継続し、EOF した時点でだけ先頭へ戻る。`--superbatches` 未指定の非 plateau では「教師EOF = epoch終了」として扱われ、次 epoch は教師先頭から始まる。
 
 各 epoch ごとに lr が再下降するので、長時間学習で局所最適から脱出させたいときに使う。`cos` schedule で `--superbatches N` を指定すれば cycle = epoch で自動的に揃う (= 典型的な SGDR-style 用法)。`--test-teacher` が指定されている場合、どの schedule でも epoch 末の validation 指標を前 epoch 末と比較し、`test_value_loss` が下がらず、かつ `test_value_accuracy` も上がらなければ、`--max-epochs` に到達していなくてもそこで停止する。`plateau` では `--superbatches` で cycle を揃える必要はない。
 
@@ -282,13 +282,13 @@ target = λ × 教師eval + (1 − λ) × 対局結果
 
 ### WRM (win-rate-model) loss
 
-現在の BulletOu は、KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network で WRM 形式の target 変換と loss をデフォルトで使う。これは、以前 `--win-rate-model` を付けていた設定と同じ。
+BulletOu は、KPPT / KPP_KKPT / NNUE / SFNN などの scalar value network で WRM 形式の target 変換と loss をデフォルトで使う。
 
-従来の `sigmoid(model_output)` に対する MSE で比較したい場合は、`--loss-sigmoid-mse` を指定する。
+`sigmoid(model_output)` に対する MSE で比較したい場合は、`--loss-sigmoid-mse` を指定する。
 
 起動時に、教師データ先頭 `--wrm-target-calibration-positions` 局面（デフォルト 100,000）を使い、教師 score と実際の game_result の対応から WRM target 側の `offset` / `scaling` を推定する。推定した target 変換は、学習 target と `test_value_loss` の両方で使われる。
 
-従来の固定 target 変換（`offset=270`, `out_scaling=380`）に戻したい場合は `--wrm-target-calibration-positions 0` を指定する。完全に固定したい実験では、`--wrm-target-offset` と `--wrm-target-scaling` を両方指定できる。
+固定 target 変換（`offset=270`, `out_scaling=380`）を使いたい場合は `--wrm-target-calibration-positions 0` を指定する。値を明示したい実験では、`--wrm-target-offset` と `--wrm-target-scaling` を両方指定できる。
 
 変わるものは次の通り。
 
@@ -308,11 +308,11 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --wrm-nnue2score 600
 ```
 
-`--loss-pow-exp` と `--wrm-nnue2score` は WRM loss に効く。WRM run の `test_value_loss` は従来の sigmoid-MSE とは式が違うので、古い run の loss 数値とそのまま横比較しない。同じ WRM 設定同士で比較するか、accuracy / 実戦棋力で見る。
+`--loss-pow-exp` と `--wrm-nnue2score` は WRM loss に効く。WRM run の `test_value_loss` は sigmoid-MSE とは式が違うので、loss 定義が違う run の数値とそのまま横比較しない。同じ WRM 設定同士で比較するか、accuracy / 実戦棋力で見る。
 
 ### Optimizer の選択
 
-`--optimizer` は現在 `ranger` のみを受け付ける。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
+`--optimizer` は `ranger` を受け付ける。デフォルトは `bullet-shogi` の将棋用 example に合わせて `ranger`。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -322,7 +322,7 @@ target = λ × 教師eval + (1 − λ) × 対局結果
     --optimizer ranger
 ```
 
-`ranger` は BulletOu 既存の RAdam+Lookahead 実装で、nodchip 版 nnue-pytorch の Ranger21 完全互換ではない。Ranger21との差を調べるための ablation として使う。nnue-pytorch 条件に寄せるなら、まず次のようにする。
+`ranger` は BulletOu の RAdam+Lookahead 実装で、nodchip 版 nnue-pytorch の Ranger21 と同一実装ではない。Ranger21との差を調べるための ablation として使う。nnue-pytorch 条件に寄せるなら、まず次のようにする。
 
 ```bash
 ./target/release/examples/bulletou \

@@ -2,13 +2,13 @@
 
 <a href="../../en/tutorial/4-train.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-ゴール: 用意した教師データから、やねうら王互換エンジンが読み込める評価関数バイナリを学習する。
+ゴール: 用意した教師データから、やねうら王エンジンが読み込める評価関数バイナリを学習する。
 
 このページは [3. 教師データを用意する](3-data.md) を完了している前提です。教師ファイル (`.pack` / `.hcpe` / `.hcpe3` / `.psv`) が用意され、教師局面が事前シャッフル済み、または `--teacher-shuffle-buffer-sbs` で学習時にシャッフルされる状態を想定する。
 
 ## 4.1 ビルドする
 
-まず `bulletou` をビルドする。ソースを変更していなければ初回だけで十分だが、BulletOu のソースを更新した直後は既存の `.\target\release\examples\bulletou.exe` が古いままなので、必ず再ビルドする。
+まず `bulletou` をビルドする。ソースを変更していなければ初回だけで十分だが、BulletOu のソースを更新した直後は `.\target\release\examples\bulletou.exe` に更新が反映されていないので、必ず再ビルドする。
 
 ```bash
 cargo build --release --features cuda-cpp-backend --example bulletou
@@ -30,7 +30,7 @@ Windows の場合、生成されるバイナリは `.\target\release\examples\bu
 
 学習対象は `--arch` だけで指定する。KPPT 系なら `KPPT` または `KPP_KKPT`、NNUE / SFNN 系なら、やねうら王の Makefile edition 名から `YANEURAOU_ENGINE_` を取り除いた名前を指定する。
 
-たとえば HalfKP の 256x2-32-32 は `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 は `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。古い短縮形 `256x2-32-32` は受け付けない。
+たとえば HalfKP の 256x2-32-32 は `NNUE_halfkp_256x2_32_32`、K-P の 256x2-32-32 は `NNUE_kp_256x2_32_32`、SFNN なら `SFNN_halfka2_1024_7_64_k3k3` のように書く。短縮形 `256x2-32-32` は受け付けない。
 
 NNUE 名のサイズ部分は `<L1>x2_<L2>_<L3>`。`L1` は perspective ごとの accumulator サイズで、FT SIMD padding の都合により 32 の正の倍数である必要がある。`L2` / `L3` は正の整数なら受け付ける。よく使う例は次の通り。
 
@@ -92,7 +92,7 @@ suffix を付ける場合は、独立した `hand64/hand256/hand1024`, `k3k3/k9k
     --teacher teachers/
 ```
 
-通常の NNUE と違い、SFNN は局面ごとに選択される複数の sub-network を使う。`--arch` の `k3k3` suffix は、やねうら王互換の LayerStack 方式を選ぶ指定。使い方は [§9 LayerStack](9-layerstack.md)、architecture / 量子化 / `nn.bin` layout の仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md) を参照。
+通常の NNUE と違い、SFNN は局面ごとに選択される複数の sub-network を使う。`--arch` の `k3k3` suffix は、やねうら王の LayerStack 方式を選ぶ指定。使い方は [§9 LayerStack](9-layerstack.md)、architecture / 量子化 / `nn.bin` layout の仕様は [リファレンス: SFNN-1536](../shogi/sfnn-1536.md) を参照。
 
 ## 4.5 KPPT を学習する
 

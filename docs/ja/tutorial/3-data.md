@@ -18,11 +18,11 @@
 | `NNUE_kp_256x2_32_32` | HalfKP と同じ NN だが入力が K + P の独立特徴。詳細は [NNUE K-P 学習](../shogi/kp.md) | `nn.bin` |
 | `NNUE_ka2_256x2_32_32` | K+A2 入力の NNUE。詳細は [NNUE K-A2 学習](../shogi/ka2.md) | `nn.bin` |
 | `NNUE_halfkpe9_256x2_32_32` | HalfKP に利き数情報 (自軍/敵軍 0/1/2 の 9 通り) を多重化した拡張版。詳細は [NNUE HalfKPE9 学習](../shogi/halfkpe9.md) | `nn.bin` |
-| `NNUE_halfkpvm_256x2_32_32` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋以前にミラー)。入力次元は HalfKP の約 1/2 | `nn.bin` |
+| `NNUE_halfkpvm_256x2_32_32` | HalfKP の玉位置を左右対称に折り畳んだ版 (6 筋以降を 4 筋側にミラー)。入力次元は HalfKP の約 1/2 | `nn.bin` |
 | `SFNN_halfkahm2_1536_15_32_k3k3` | やねうら王 `YANEURAOU_ENGINE_SFNN1536` ビルド用の LayerStacks 系。使い方は [§9 LayerStack](9-layerstack.md)、仕様詳細は [SFNN-1536 リファレンス](../shogi/sfnn-1536.md) | `nn.bin` |
 | `SFNN_halfkahm1_1536_15_32_k3k3` | ↑ の v1 アブレーション版 | `nn.bin` |
 | `SFNN_ka2_1536_15_32_k3k3` | 軽量な K+A2 入力の SFNN | `nn.bin` |
-| `KPPT` | 旧来の KK + KKP + KPP 3 ファイル組 (elmo(WCSC27) 互換)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
+| `KPPT` | KK + KKP + KPP 3 ファイル構成 (elmo(WCSC27) 形式)。詳細は [KPPT / KPP_KKPT 学習](../shogi/kppt.md) | `KK_synthesized.bin` + `KKP_synthesized.bin` + `KPP_synthesized.bin` |
 | `KPP_KKPT` | KPPT の factorised 版 (KPP のみ手番チャンネルなし、サイズ半減) | 同上 (KPP layout のみ違う) |
 
 `NNUE_halfkp_1024x2_8_64` や `SFNN_ka2_8192_7_64_c0_s1024x8_k3k3` のようなサイズ違いも、対応するやねうら王 architecture があれば実験用途で受け付ける。
@@ -54,7 +54,7 @@ teachers/
 対策:
 - **`.hcpe` / `.psv`**: [YaneuraOu-ScriptCollection](https://github.com/yaneurao/YaneuraOu-ScriptCollection) の `teacher/shuffle_split_teacher_external.py` を使う。巨大な教師フォルダでも全体をメモリに載せず、bucket 分配してから出力ファイルへ分割できる。
 - **`.hcpe3` / `.pack`**: 棋譜単位の可変長形式なので単純な固定長レコード shuffle には向かない。生成時点で局面順を混ぜる、または `.psv` / `.hcpe` のような固定長局面形式に変換してからシャッフルする。
-- **学習時 shuffle**: デフォルトで有効。たとえば `batch_size=65536`, `positions-per-superbatch=40000000` なら実効 `batches_per_superbatch=610` なので、デフォルト window は `610` batches になる。40 byte の PSV/HCPE 互換 record として 1 window は約 1.5 GiB、double buffer なので合計約 3.0 GiB の CPU メモリを使う。実際の確保量は学習開始時に表示される。4 superbatch 分にしたい場合は `--teacher-shuffle-buffer-sbs 4` のように指定する。
+- **学習時 shuffle**: デフォルトで有効。たとえば `batch_size=65536`, `positions-per-superbatch=40000000` なら実効 `batches_per_superbatch=610` なので、デフォルト window は `610` batches になる。PSV/HCPE と同じ 40 byte record として 1 window は約 1.5 GiB、double buffer なので合計約 3.0 GiB の CPU メモリを使う。実際の確保量は学習開始時に表示される。4 superbatch 分にしたい場合は `--teacher-shuffle-buffer-sbs 4` のように指定する。
 
 HCPE/PSVフォルダを 1000 万局面ごとにシャッフル分割する例:
 

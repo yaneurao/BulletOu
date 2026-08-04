@@ -46,18 +46,18 @@
 
 | フラグ | 注意点 |
 |---|---|
-| `--batch-size` | state.bin は batch_size 非依存。Ranger optimizer state も per-parameter なので互換 |
+| `--batch-size` | state.bin は batch_size 非依存。Ranger optimizer state も per-parameter なので継続しやすい |
 | `--positions-per-superbatch` | 1 superbatch の局面数が変わる。実効値は `batch_size` の倍数へ切り捨て |
 | `--lr` | `step` では StepLR の開始値、`geometric` / `cos` では lr_max |
 | `--lr-min` | LR の下限 |
 | `--lr-schedule` (`step` / `geometric` / `cos` / `plateau`) | LR の動きが変わる。bullet-shogi 寄せの既定値は `step` |
 | `--max-epochs` | この invocation の epoch 数 |
 | `--superbatches` | `geometric` / `cos` では LR cycle 長、`step` では epoch 内の処理上限 |
-| `--save-rate` | checkpoint 保存頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
-| `--validation-rate` | `--test-teacher` の accuracy/loss 計測頻度だけが変わる。既存 checkpoint を引き継ぐなら `--resume` を明示する |
+| `--save-rate` | checkpoint 保存頻度だけが変わる。保存済み checkpoint を引き継ぐなら `--resume` を明示する |
+| `--validation-rate` | `--test-teacher` の accuracy/loss 計測頻度だけが変わる。保存済み checkpoint を引き継ぐなら `--resume` を明示する |
 | `--lambda` | 教師ターゲットの混合比 |
 | `--test-teacher` | 検証セットの差し替え |
-| `--sfnn-factorizer` | SFNN residual factorizer の有効項を変える。`shared` / `none` / `axis`、または `king=axis,hand=shared` のような混合指定が可能。`axis` は arch に存在する bucket axis をまとめて有効化する shorthand で、`hand1024_k3k3` なら `king=axis,hand=axis` 相当。既存 checkpoint を引き継ぐなら `--resume` を明示する。`state.bin` は利用可能なfactorizer tensorを保持し、validation と `nn.bin` export では現在の invocation で有効な項だけをfoldする |
+| `--sfnn-factorizer` | SFNN residual factorizer の有効項を変える。`shared` / `none` / `axis`、または `king=axis,hand=shared` のような混合指定が可能。`axis` は arch に存在する bucket axis をまとめて有効化する shorthand で、`hand1024_k3k3` なら `king=axis,hand=axis` 相当。保存済み checkpoint を引き継ぐなら `--resume` を明示する。`state.bin` は利用可能なfactorizer tensorを保持し、validation と `nn.bin` export では今回の invocation で有効な項だけをfoldする |
 
 これらはモデル構造とは無関係なので、重みと Ranger optimizer state 自体は継続できる。ただし学習制御が変わるため、BulletOu は勝手には auto resume しない。続けるなら `--resume` を付ける。
 
@@ -69,7 +69,7 @@
 |---|---|
 | `--arch` | target family や NN topology (feature set / FT / L1 / L2 dims) が変わる = state.bin の tensor shape が合わない |
 | `--arch` の LayerStack suffix (SFNN 系) | LayerStack 数が変わると最終層の dim が変わる |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | 互換用alias。新しいコマンドでは `--sfnn-factorizer shared` / `--sfnn-factorizer none` を推奨 |
+| `--sfnn-factorized` / `--no-sfnn-factorized` | 短縮alias。基本形は `--sfnn-factorizer shared` / `--sfnn-factorizer none` |
 | `--tag` | これを変えると別 dir = 新規学習に分岐 (= 別実験を作る目的でのみ使う) |
 
 これらを変えるなら **`--tag` を変えて別 run として起動** してください。`--resume` を付けても tensor shape が合わないので復元できない。

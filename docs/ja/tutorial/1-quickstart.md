@@ -10,7 +10,7 @@
 
 以下が必要:
 
-- **NVIDIA GPU** (新しめのもの)。CPU だけでの学習はサポートされていない (現在の保守 backend は CUDA 前提)
+- **NVIDIA GPU** (CUDA 対応のもの)。CPU だけでの学習はサポートされていない (保守対象 backend は CUDA 前提)
 - **Rust ツールチェーン** (stable、1.87 以降)。OS 別の具体手順は §1.1.1 を参照
 - **CUDA Toolkit 12.x**
 - ビルドとテストデータ用に **10 GB 程度の空きディスク**
@@ -29,7 +29,7 @@ Windows の場合、Cargo を実行する shell から MSVC C++ build tools も�
    - `Default toolchain: stable`
    - `Profile: default`
 3. もし「MSVC C++ Build Tools が見つからない」とメッセージが出たら、誘導されるリンクから **Visual Studio Build Tools** をインストールし、「**C++ によるデスクトップ開発**」ワークロードにチェックを入れる
-4. **PowerShell / cmd を一度開き直す** (PATH の更新を反映させるため。古いシェルでは `cargo` がまだ見えない)
+4. **PowerShell / cmd を一度開き直す** (PATH の更新を反映させるため。開き直す前のシェルでは `cargo` がまだ見えない)
 
 PowerShell からの 1 行インストール (上記と等価):
 
@@ -63,7 +63,7 @@ cd BulletOu
 
 ## 1.3 ビルド
 
-現在の BulletOu 学習 backend をビルドする:
+BulletOu の学習 backend をビルドする:
 
 ```bash
 # NVIDIA GPU (CUDA 12.x)
