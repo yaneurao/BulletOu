@@ -59,6 +59,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use bulletou_lib::value::nnue_save_sfnn1536::{
     FT_HASH_SFNN, KHASH_SFNN, NETWORK_HASH_SFNN, QA as SFNN_QA, QB as SFNN_QB,
 };
+
+#[cfg(feature = "cuda-cpp-backend")]
+const FT_HASH_SFNN_LEGACY_SUISHO11PLUS: u32 = 0x5F1348B8;
+
+#[cfg(feature = "cuda-cpp-backend")]
+const NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS: u32 = 0x633376A4;
 use bulletou_lib::{
     game::inputs::{
         ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
@@ -3922,9 +3928,9 @@ fn collect_sfnn_l3b_offsets(bytes: &[u8], arch: NnueArch, layerstack: LayerStack
     for stack in 0..stack_count {
         let mut pos = network_base + stack * stack_bytes;
         let hash = read_u32_le(bytes, pos, "SFNN network hash")?;
-        if hash != NETWORK_HASH_SFNN {
+        if hash != NETWORK_HASH_SFNN && hash != NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS {
             return Err(format!(
-                "SFNN stack {stack} network hash mismatch: expected 0x{NETWORK_HASH_SFNN:08X}, got 0x{hash:08X}"
+                "SFNN stack {stack} network hash mismatch: expected 0x{NETWORK_HASH_SFNN:08X} or legacy 0x{NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS:08X}, got 0x{hash:08X}"
             ));
         }
         pos += 4; // network hash
@@ -4260,11 +4266,17 @@ fn parse_quantized_sfnn_nn_bin(
     let arch_desc = String::from_utf8_lossy(desc_bytes).to_string();
     let ft_hash_pos = desc_end;
     let ft_hash = read_u32_le(&bytes, ft_hash_pos, "FeatureTransformer hash")?;
-    if ft_hash != FT_HASH_SFNN {
+    if ft_hash != FT_HASH_SFNN && ft_hash != FT_HASH_SFNN_LEGACY_SUISHO11PLUS {
         return Err(format!(
-            "{}: FeatureTransformer hash mismatch: expected 0x{FT_HASH_SFNN:08X}, got 0x{ft_hash:08X}",
+            "{}: FeatureTransformer hash mismatch: expected 0x{FT_HASH_SFNN:08X} or legacy 0x{FT_HASH_SFNN_LEGACY_SUISHO11PLUS:08X}, got 0x{ft_hash:08X}",
             path.display()
         ));
+    }
+    if ft_hash == FT_HASH_SFNN_LEGACY_SUISHO11PLUS {
+        eprintln!(
+            "  WARN: accepting legacy SFNN FeatureTransformer hash 0x{ft_hash:08X} in {}",
+            path.display()
+        );
     }
     let wants_progress = layerstack.progress_bucket_count() > 1;
     let expected_hash = if wants_progress { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
@@ -4332,11 +4344,17 @@ fn parse_quantized_sfnn_nn_bin(
     let mut l3w = Vec::with_capacity(num_stacks * l3_pad_in);
     for stack in 0..num_stacks {
         let hash = read_u32_le(&bytes, pos, "SFNN network hash")?;
-        if hash != NETWORK_HASH_SFNN {
+        if hash != NETWORK_HASH_SFNN && hash != NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS {
             return Err(format!(
-                "{}: SFNN stack {stack} network hash mismatch: expected 0x{NETWORK_HASH_SFNN:08X}, got 0x{hash:08X}",
+                "{}: SFNN stack {stack} network hash mismatch: expected 0x{NETWORK_HASH_SFNN:08X} or legacy 0x{NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS:08X}, got 0x{hash:08X}",
                 path.display()
             ));
+        }
+        if hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS && stack == 0 {
+            eprintln!(
+                "  WARN: accepting legacy SFNN network hash 0x{hash:08X} in {}",
+                path.display()
+            );
         }
         pos += 4;
         let (chunk, next) = read_i32_vec_le(&bytes, pos, l1_out, "SFNN l1 biases")?;
