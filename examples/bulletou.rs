@@ -2430,10 +2430,38 @@ fn print_cuda_cpp_validation_summary_elapsed(
 
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     if max_epochs == usize::MAX {
-        eprintln!("\n{}", paint(format!("=== epoch {epoch} / unlimited ==="), ConsoleColor::BoldCyan));
-    } else if max_epochs > 1 {
-        eprintln!("\n{}", paint(format!("=== epoch {epoch} / {max_epochs} ==="), ConsoleColor::BoldCyan));
+        eprintln!(
+            "\n  {} {}",
+            paint_log_tag("[epoch]", ConsoleColor::Magenta),
+            paint(format!("start epoch {epoch}/unlimited"), ConsoleColor::BoldCyan)
+        );
+    } else {
+        eprintln!(
+            "\n  {} {}",
+            paint_log_tag("[epoch]", ConsoleColor::Magenta),
+            paint(format!("start epoch {epoch}/{max_epochs}"), ConsoleColor::BoldCyan)
+        );
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_epoch_banner_for_progress(
+    last_reported_epoch: &mut Option<usize>,
+    progress: Option<CudaCppScheduleProgress>,
+    max_epochs: Option<usize>,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if progress.superbatch != 1 || progress.batch_in_superbatch != 1 {
+        return;
+    }
+    if *last_reported_epoch == Some(progress.epoch) {
+        return;
+    }
+
+    print_epoch_banner(progress.epoch, max_epochs.unwrap_or(usize::MAX));
+    *last_reported_epoch = Some(progress.epoch);
 }
 
 /// Which LR schedule the trainer should follow. `Step` is the
@@ -6728,6 +6756,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut progress_meter = CudaCppProgressMeter::default();
+    let mut last_epoch_banner = None;
     let teacher_options = CudaCppNnueTeacherOptions {
         batch_size,
         batch_index: 0,
@@ -6741,6 +6770,8 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     for_each_cuda_cpp_kppt_teacher_batch(args, component, teacher_options, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
+        let progress_for_step = schedule.progress_for_step(seen_steps);
+        print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         let optimizer_step = completed_step_offset + seen_steps;
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
@@ -7826,9 +7857,12 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
     let mut deferred_direct_checkpoint = None;
+    let mut last_epoch_banner = None;
     for_each_cuda_cpp_nnue_teacher_batch(args, feature_kind, teacher_options, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
+        let progress_for_step = schedule.progress_for_step(seen_steps);
+        print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         let optimizer_step = completed_step_offset + seen_steps;
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
@@ -9077,10 +9111,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
     let mut deferred_direct_checkpoint = None;
+    let mut last_epoch_banner = None;
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
         let progress_for_step = schedule.progress_for_step(seen_steps);
+        print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
         let optimizer_step = optimizer_step_offset + seen_steps;
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
