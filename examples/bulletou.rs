@@ -4194,11 +4194,23 @@ impl QuantizedTestReport {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Debug)]
+struct QuantizedScaleEstimate {
+    samples: usize,
+    fv_scale: f64,
+    score_offset: f64,
+    current_fv_score_offset: f64,
+    rmse: f64,
+    r2: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Debug)]
 struct QuantizedCalibrationReport {
     input: PathBuf,
     output: PathBuf,
     records: usize,
     stacks: usize,
+    scale_estimate: Option<QuantizedScaleEstimate>,
     offset: i32,
     raw_delta: i32,
     before: QuantizedTestReport,
@@ -4793,6 +4805,91 @@ fn quantized_test_report_from_outputs(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn estimate_quantized_fv_scale_from_outputs(
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    outputs: &[QuantizedSfnnForwardOutput],
+    args: &QuantizedTestArgs,
+) -> Result<Option<QuantizedScaleEstimate>, String> {
+    if positions.len() != outputs.len() {
+        return Err(format!("positions/output length mismatch: {} vs {}", positions.len(), outputs.len()));
+    }
+
+    let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+    let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
+    let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
+    let sample_mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
+    if sample_mask.loss_indices.len() < 2 {
+        return Ok(None);
+    }
+
+    // Fit the engine-scale mapping
+    //
+    //   teacher_score ~= slope * raw_output + intercept
+    //
+    // and report it in YaneuraOu's form:
+    //
+    //   engine_score ~= raw_output / FV_SCALE + offset
+    //
+    // This is deliberately a score-scale estimate, not a WRM probability
+    // fit.  FV_SCALE is the engine-side conversion from the quantized NNUE
+    // integer output to Value, so the least-surprising estimate is obtained
+    // in the same score units as the teacher data.
+    let mut n = 0.0_f64;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_xx = 0.0_f64;
+    let mut sum_xy = 0.0_f64;
+    let mut sum_yy = 0.0_f64;
+    for &i in &sample_mask.loss_indices {
+        let x = f64::from(outputs[i].raw);
+        let y = f64::from(teacher_scores[i]);
+        n += 1.0;
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+        sum_yy += y * y;
+    }
+
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() <= f64::EPSILON {
+        return Ok(None);
+    }
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+    if !(slope.is_finite() && slope > 0.0) {
+        return Ok(None);
+    }
+    let intercept = (sum_y - slope * sum_x) / n;
+    let fv_scale = 1.0 / slope;
+    if !(fv_scale.is_finite() && fv_scale > 0.0) {
+        return Ok(None);
+    }
+
+    let mean_y = sum_y / n;
+    let current_fv = f64::from(args.fv_scale);
+    let current_fv_score_offset = mean_y - (sum_x / n) / current_fv;
+
+    let mut ss_res = 0.0_f64;
+    for &i in &sample_mask.loss_indices {
+        let predicted = slope * f64::from(outputs[i].raw) + intercept;
+        let residual = f64::from(teacher_scores[i]) - predicted;
+        ss_res += residual * residual;
+    }
+    let ss_tot = sum_yy - n * mean_y * mean_y;
+    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { f64::NAN };
+    let rmse = (ss_res / n).sqrt();
+
+    Ok(Some(QuantizedScaleEstimate {
+        samples: n as usize,
+        fv_scale,
+        score_offset: intercept,
+        current_fv_score_offset,
+        rmse,
+        r2,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn quantized_test_positions(
     weights: &QuantizedSfnnWeights,
     positions: &[bulletou_lib::shogi::PackedSfenValue],
@@ -4938,6 +5035,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
 
     let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
     let outputs = quantized_sfnn_forward_outputs(&weights, &batch, &test_args)?;
+    let scale_estimate = estimate_quantized_fv_scale_from_outputs(&positions, &outputs, &test_args)?;
     let mut before = quantized_test_report_from_outputs(&positions, &outputs, &test_args, 0)?;
     let before_loss = before
         .engine_scale
@@ -4987,6 +5085,23 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
 
     best_report.elapsed = started.elapsed();
     before.elapsed = started.elapsed();
+    if let Some(est) = &scale_estimate {
+        eprintln!(
+            "  estimated FV_SCALE = {:.3}  score ~= raw/{:.3} {:+.3}  samples={}  rmse={:.3}  r2={:.5}",
+            est.fv_scale,
+            est.fv_scale,
+            est.score_offset,
+            format_count(est.samples),
+            est.rmse,
+            est.r2,
+        );
+        eprintln!(
+            "  current FV offset  = {:+.3} Value by score-MSE fit at FV_SCALE={}",
+            est.current_fv_score_offset, args.fv_scale,
+        );
+    } else {
+        eprintln!("  estimated FV_SCALE = unavailable (not enough score variation in validation subset)");
+    }
     eprintln!(
         "  selected offset   = {:+} Value  raw_delta={:+}  loss {:.8} -> {:.8}",
         best_offset, best_raw_delta, before_loss, best_loss
@@ -5002,6 +5117,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
         output: args.output.clone(),
         records: positions.len(),
         stacks: weights.num_stacks,
+        scale_estimate,
         offset: best_offset,
         raw_delta: best_raw_delta,
         before,
@@ -5034,6 +5150,19 @@ fn main() {
                     println!("  stacks            = {}", format_count(report.stacks));
                     println!("  searched_offsets  = {}", format_count(report.searched_offsets));
                     println!("  fv_scale          = {}", args.fv_scale);
+                    if let Some(est) = &report.scale_estimate {
+                        println!(
+                            "  estimated_fv_scale= {:.3}  score ~= raw/{:.3} {:+.3}",
+                            est.fv_scale, est.fv_scale, est.score_offset
+                        );
+                        println!(
+                            "  scale_fit         = samples {}  rmse {:.3}  r2 {:.5}  current_fv_offset {:+.3}",
+                            format_count(est.samples),
+                            est.rmse,
+                            est.r2,
+                            est.current_fv_score_offset
+                        );
+                    }
                     println!("  selected_offset   = {:+} Value", report.offset);
                     println!("  folded_raw_delta  = {:+} l3b", report.raw_delta);
                     println!(
