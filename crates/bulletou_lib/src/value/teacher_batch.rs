@@ -314,6 +314,12 @@ struct ScoreWinrateObservedCounts {
     filtered: usize,
 }
 
+const SCORE_WINRATE_SIGMOID_SCALE_MIN: i32 = 50;
+const SCORE_WINRATE_SIGMOID_SCALE_MAX: i32 = 20_000;
+const SCORE_WINRATE_WRM_OFFSET_MAX: i32 = 10_000;
+const SCORE_WINRATE_WRM_SCALING_MIN: i32 = 20;
+const SCORE_WINRATE_WRM_SCALING_MAX: i32 = 20_000;
+
 pub fn estimate_wrm_target_from_teacher_prefix(
     config: &WrmTargetCalibrationConfig<'_>,
 ) -> Result<WrmTargetCalibrationReport, TeacherBatchError> {
@@ -592,11 +598,22 @@ fn fit_wrm_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTa
         return None;
     }
 
-    let mut best = WinRateModelTargetParams::DEFAULT;
+    let mut best_candidates = vec![WinRateModelTargetParams::DEFAULT];
+    if let Some((scale, _, _)) = fit_sigmoid_target_scale(bins) {
+        best_candidates.push(WinRateModelTargetParams { offset: 0.0, scaling: scale });
+    }
+    let mut best = best_candidates[0];
     let mut best_loss = wrm_target_bce_loss(&samples, best);
+    for params in best_candidates.into_iter().skip(1) {
+        let loss = wrm_target_bce_loss(&samples, params);
+        if loss < best_loss {
+            best = params;
+            best_loss = loss;
+        }
+    }
 
-    for offset in (0..=800).step_by(20) {
-        for scaling in (80..=1200).step_by(20) {
+    for offset in (0..=SCORE_WINRATE_WRM_OFFSET_MAX).step_by(40) {
+        for scaling in (SCORE_WINRATE_WRM_SCALING_MIN..=SCORE_WINRATE_WRM_SCALING_MAX).step_by(40) {
             let params = WinRateModelTargetParams { offset: offset as f32, scaling: scaling as f32 };
             let loss = wrm_target_bce_loss(&samples, params);
             if loss < best_loss {
@@ -606,12 +623,12 @@ fn fit_wrm_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTa
         }
     }
 
-    for step in [10i32, 5, 2, 1] {
+    for step in [20i32, 10, 5, 2, 1] {
         let span = step * 6;
         let offset_min = ((best.offset as i32) - span).max(0);
-        let offset_max = ((best.offset as i32) + span).min(1200);
-        let scaling_min = ((best.scaling as i32) - span).max(20);
-        let scaling_max = ((best.scaling as i32) + span).min(2000);
+        let offset_max = ((best.offset as i32) + span).min(SCORE_WINRATE_WRM_OFFSET_MAX);
+        let scaling_min = ((best.scaling as i32) - span).max(SCORE_WINRATE_WRM_SCALING_MIN);
+        let scaling_max = ((best.scaling as i32) + span).min(SCORE_WINRATE_WRM_SCALING_MAX);
         let mut offset = offset_min;
         while offset <= offset_max {
             let mut scaling = scaling_min;
@@ -665,7 +682,7 @@ fn fit_sigmoid_target_scale(bins: &[WrmTargetOutcomeBin]) -> Option<(f32, f64, b
     let mut best = 600.0f32;
     let mut best_loss = sigmoid_target_bce_loss(&samples, best);
 
-    for scale in (50..=2000).step_by(10) {
+    for scale in (SCORE_WINRATE_SIGMOID_SCALE_MIN..=SCORE_WINRATE_SIGMOID_SCALE_MAX).step_by(10) {
         let scale = scale as f32;
         let loss = sigmoid_target_bce_loss(&samples, scale);
         if loss < best_loss {
@@ -676,8 +693,8 @@ fn fit_sigmoid_target_scale(bins: &[WrmTargetOutcomeBin]) -> Option<(f32, f64, b
 
     for step in [5i32, 2, 1] {
         let span = step * 10;
-        let scale_min = ((best as i32) - span).max(1);
-        let scale_max = ((best as i32) + span).min(4000);
+        let scale_min = ((best as i32) - span).max(SCORE_WINRATE_SIGMOID_SCALE_MIN);
+        let scale_max = ((best as i32) + span).min(SCORE_WINRATE_SIGMOID_SCALE_MAX);
         let mut scale = scale_min;
         while scale <= scale_max {
             let candidate = scale as f32;
@@ -3123,6 +3140,31 @@ mod tests {
         assert!((wrm_params.offset - expected.offset).abs() <= 2.0, "wrm_params={wrm_params:?}");
         assert!((wrm_params.scaling - expected.scaling).abs() <= 2.0, "wrm_params={wrm_params:?}");
         assert!(wrm_metrics.bce < sigmoid_metrics.bce, "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}");
+    }
+
+    #[test]
+    fn score_winrate_wrm_fit_can_fall_back_to_plain_sigmoid_shape() {
+        let expected_scale = 2400.0f32;
+        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        for score in (-1800..=1800).step_by(25) {
+            let p = sigmoid_score_probability(score as f32, expected_scale);
+            let count = 2000u32;
+            let wins = (p * count as f32).round() as u32;
+            let losses = count - wins;
+            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+        }
+
+        let (sigmoid_scale, _, _) = fit_sigmoid_target_scale(&bins).unwrap();
+        let (wrm_params, _, _) = fit_wrm_target_params(&bins).unwrap();
+        let sigmoid_metrics =
+            score_winrate_metrics(&bins, |score| sigmoid_score_probability(score, sigmoid_scale)).unwrap();
+        let wrm_metrics = score_winrate_metrics(&bins, |score| wrm_params.probability(score)).unwrap();
+
+        assert!((sigmoid_scale - expected_scale).abs() <= 2.0, "sigmoid_scale={sigmoid_scale}");
+        assert!(
+            wrm_metrics.bce <= sigmoid_metrics.bce + 1.0e-7,
+            "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}, wrm_params={wrm_params:?}"
+        );
     }
 
     #[test]
