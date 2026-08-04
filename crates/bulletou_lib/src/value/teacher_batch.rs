@@ -2,6 +2,7 @@
 //! fast backend trainers.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     sync::{atomic::Ordering, mpsc},
@@ -220,11 +221,97 @@ pub struct WrmTargetCalibrationReport {
     pub fitted: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreWinrateAnalysisConfig<'a> {
+    pub teacher: &'a str,
+    /// Number of teacher-prefix positions used to fit the score->win-rate curves.
+    pub fit_positions: usize,
+    /// Number of positions after the fit prefix used for held-out evaluation.
+    pub eval_positions: usize,
+    /// Score bucket width used only for the printed/CSV calibration table.
+    pub bin_size: u16,
+    pub buffer_mb: usize,
+    pub loader_threads: usize,
+    pub score_drop_abs: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreWinrateModelMetrics {
+    pub bce: f64,
+    pub brier: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreWinrateAnalysisReport {
+    pub sigmoid_scale: f32,
+    pub sigmoid_fitted: bool,
+    pub sigmoid_fit: ScoreWinrateModelMetrics,
+    pub sigmoid_eval: ScoreWinrateModelMetrics,
+    pub wrm_params: WinRateModelTargetParams,
+    pub wrm_fitted: bool,
+    pub wrm_fit: ScoreWinrateModelMetrics,
+    pub wrm_eval: ScoreWinrateModelMetrics,
+    pub requested_fit_positions: usize,
+    pub observed_fit_positions: usize,
+    pub used_fit_positions: usize,
+    pub decisive_fit_positions: usize,
+    pub drawn_fit_positions: usize,
+    pub filtered_fit_positions: usize,
+    pub requested_eval_positions: usize,
+    pub observed_eval_positions: usize,
+    pub used_eval_positions: usize,
+    pub decisive_eval_positions: usize,
+    pub drawn_eval_positions: usize,
+    pub filtered_eval_positions: usize,
+    pub bin_size: u16,
+    pub bins: Vec<ScoreWinrateBinReport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreWinrateBinReport {
+    pub score_min: i32,
+    pub score_max: i32,
+    pub count: usize,
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+    pub empirical: f64,
+    pub sigmoid: f64,
+    pub wrm: f64,
+}
+
 #[derive(Clone, Copy, Default)]
 struct WrmTargetOutcomeBin {
     wins: u32,
     losses: u32,
     draws: u32,
+}
+
+impl WrmTargetOutcomeBin {
+    fn count(self) -> usize {
+        self.wins as usize + self.losses as usize + self.draws as usize
+    }
+
+    fn add_result(&mut self, result: i8) {
+        match result {
+            r if r > 0 => self.wins += 1,
+            r if r < 0 => self.losses += 1,
+            _ => self.draws += 1,
+        }
+    }
+
+    fn positives_negatives(self) -> (f64, f64) {
+        (f64::from(self.wins) + 0.5 * f64::from(self.draws), f64::from(self.losses) + 0.5 * f64::from(self.draws))
+    }
+}
+
+#[derive(Default)]
+struct ScoreWinrateObservedCounts {
+    observed: usize,
+    used: usize,
+    decisive: usize,
+    draws: usize,
+    filtered: usize,
 }
 
 pub fn estimate_wrm_target_from_teacher_prefix(
@@ -328,6 +415,150 @@ pub fn estimate_wrm_target_from_teacher_prefix(
     })
 }
 
+pub fn analyze_score_winrate_from_teacher(
+    config: &ScoreWinrateAnalysisConfig<'_>,
+) -> Result<ScoreWinrateAnalysisReport, TeacherBatchError> {
+    if config.fit_positions == 0 {
+        return Err(TeacherBatchError::invalid_input("--fit-positions must be > 0"));
+    }
+    if config.eval_positions == 0 {
+        return Err(TeacherBatchError::invalid_input("--analyze-positions must be > 0"));
+    }
+    if config.bin_size == 0 {
+        return Err(TeacherBatchError::invalid_input("--bin-size must be > 0"));
+    }
+
+    let total_limit = config
+        .fit_positions
+        .checked_add(config.eval_positions)
+        .ok_or_else(|| TeacherBatchError::invalid_input("--fit-positions + --analyze-positions overflowed usize"))?;
+    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
+
+    let mut fit_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+    let mut eval_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+    let mut fit_counts = ScoreWinrateObservedCounts::default();
+    let mut eval_counts = ScoreWinrateObservedCounts::default();
+    let mut observe = |chunk: &[PackedSfenValue]| {
+        for pos in chunk {
+            if fit_counts.observed < config.fit_positions {
+                observe_score_winrate_position(pos, config.score_drop_abs, &mut fit_bins, &mut fit_counts);
+            } else if eval_counts.observed < config.eval_positions {
+                observe_score_winrate_position(pos, config.score_drop_abs, &mut eval_bins, &mut eval_counts);
+            } else {
+                return true;
+            }
+        }
+        fit_counts.observed >= config.fit_positions && eval_counts.observed >= config.eval_positions
+    };
+
+    match format {
+        DataFormat::Hcpe => {
+            let loader = HcpeDataLoader::new_concat_multiple(
+                &data_files_ref,
+                config.buffer_mb,
+                (|_| true) as fn(&PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(total_limit.min(65_536).max(1))
+            .with_loader_threads(config.loader_threads)
+            .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, total_limit, &mut observe);
+        }
+        DataFormat::Hcpe3 => {
+            let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(total_limit.min(65_536).max(1))
+                .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, total_limit, &mut observe);
+        }
+        DataFormat::Pack => {
+            let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
+                .with_buffer_records(total_limit.min(65_536).max(1))
+                .with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, total_limit, &mut observe);
+        }
+        DataFormat::Psv => {
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
+            scan_packed_teacher_prefix(&loader, total_limit, &mut observe);
+        }
+    }
+
+    if fit_counts.used == 0 {
+        return Err(TeacherBatchError::invalid_input(
+            "teacher did not yield usable fit positions; lower --fit-positions or --score-drop-abs",
+        ));
+    }
+    if eval_counts.used == 0 {
+        return Err(TeacherBatchError::invalid_input(
+            "teacher did not yield usable held-out analysis positions; lower --fit-positions/--analyze-positions or --score-drop-abs",
+        ));
+    }
+
+    let (wrm_params, _, wrm_fitted) =
+        fit_wrm_target_params(&fit_bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
+    let (sigmoid_scale, _, sigmoid_fitted) = fit_sigmoid_target_scale(&fit_bins).unwrap_or((600.0, 0.0, false));
+
+    let sigmoid_fit = score_winrate_metrics(&fit_bins, |score| sigmoid_score_probability(score, sigmoid_scale))
+        .ok_or_else(|| TeacherBatchError::invalid_input("fit set has no usable score/result samples"))?;
+    let sigmoid_eval = score_winrate_metrics(&eval_bins, |score| sigmoid_score_probability(score, sigmoid_scale))
+        .ok_or_else(|| TeacherBatchError::invalid_input("held-out set has no usable score/result samples"))?;
+    let wrm_fit = score_winrate_metrics(&fit_bins, |score| wrm_params.probability(score))
+        .ok_or_else(|| TeacherBatchError::invalid_input("fit set has no usable score/result samples"))?;
+    let wrm_eval = score_winrate_metrics(&eval_bins, |score| wrm_params.probability(score))
+        .ok_or_else(|| TeacherBatchError::invalid_input("held-out set has no usable score/result samples"))?;
+    let bins = score_winrate_bin_reports(&eval_bins, config.bin_size, sigmoid_scale, wrm_params);
+
+    Ok(ScoreWinrateAnalysisReport {
+        sigmoid_scale,
+        sigmoid_fitted,
+        sigmoid_fit,
+        sigmoid_eval,
+        wrm_params,
+        wrm_fitted,
+        wrm_fit,
+        wrm_eval,
+        requested_fit_positions: config.fit_positions,
+        observed_fit_positions: fit_counts.observed,
+        used_fit_positions: fit_counts.used,
+        decisive_fit_positions: fit_counts.decisive,
+        drawn_fit_positions: fit_counts.draws,
+        filtered_fit_positions: fit_counts.filtered,
+        requested_eval_positions: config.eval_positions,
+        observed_eval_positions: eval_counts.observed,
+        used_eval_positions: eval_counts.used,
+        decisive_eval_positions: eval_counts.decisive,
+        drawn_eval_positions: eval_counts.draws,
+        filtered_eval_positions: eval_counts.filtered,
+        bin_size: config.bin_size,
+        bins,
+    })
+}
+
+fn observe_score_winrate_position(
+    pos: &PackedSfenValue,
+    score_drop_abs: Option<u16>,
+    bins: &mut [WrmTargetOutcomeBin],
+    counts: &mut ScoreWinrateObservedCounts,
+) {
+    counts.observed += 1;
+    if let Some(cap) = score_drop_abs {
+        if pos.score().unsigned_abs() >= cap {
+            counts.filtered += 1;
+            return;
+        }
+    }
+    let score = pos.score();
+    let result = pos.game_result();
+    let bin = &mut bins[(i32::from(score) - i32::from(i16::MIN)) as usize];
+    bin.add_result(result);
+    counts.used += 1;
+    if result == 0 {
+        counts.draws += 1;
+    } else {
+        counts.decisive += 1;
+    }
+}
+
 fn scan_packed_teacher_prefix<D, F>(loader: &D, limit: usize, f: &mut F)
 where
     D: DataLoader<PackedSfenValue>,
@@ -408,6 +639,164 @@ fn wrm_target_bce_loss(samples: &[(f32, f64, f64)], params: WinRateModelTargetPa
         loss -= positives * p.ln() + negatives * (1.0 - p).ln();
     }
     loss
+}
+
+fn fit_sigmoid_target_scale(bins: &[WrmTargetOutcomeBin]) -> Option<(f32, f64, bool)> {
+    let mut samples = Vec::new();
+    let mut fitted_positions = 0usize;
+    let mut total_pos = 0.0f64;
+    let mut total_neg = 0.0f64;
+    for (idx, bin) in bins.iter().enumerate() {
+        let count = bin.count();
+        if count == 0 {
+            continue;
+        }
+        let score = (idx as i32 + i32::from(i16::MIN)) as f32;
+        let (positives, negatives) = bin.positives_negatives();
+        samples.push((score, positives, negatives));
+        fitted_positions += count;
+        total_pos += positives;
+        total_neg += negatives;
+    }
+    if fitted_positions == 0 || total_pos <= 0.0 || total_neg <= 0.0 {
+        return None;
+    }
+
+    let mut best = 600.0f32;
+    let mut best_loss = sigmoid_target_bce_loss(&samples, best);
+
+    for scale in (50..=2000).step_by(10) {
+        let scale = scale as f32;
+        let loss = sigmoid_target_bce_loss(&samples, scale);
+        if loss < best_loss {
+            best = scale;
+            best_loss = loss;
+        }
+    }
+
+    for step in [5i32, 2, 1] {
+        let span = step * 10;
+        let scale_min = ((best as i32) - span).max(1);
+        let scale_max = ((best as i32) + span).min(4000);
+        let mut scale = scale_min;
+        while scale <= scale_max {
+            let candidate = scale as f32;
+            let loss = sigmoid_target_bce_loss(&samples, candidate);
+            if loss < best_loss {
+                best = candidate;
+                best_loss = loss;
+            }
+            scale += step;
+        }
+    }
+
+    let total = total_pos + total_neg;
+    Some((best, best_loss / total, true))
+}
+
+fn sigmoid_target_bce_loss(samples: &[(f32, f64, f64)], scale: f32) -> f64 {
+    let mut loss = 0.0f64;
+    for &(score, positives, negatives) in samples {
+        let p = f64::from(sigmoid_score_probability(score, scale)).clamp(1.0e-6, 1.0 - 1.0e-6);
+        loss -= positives * p.ln() + negatives * (1.0 - p).ln();
+    }
+    loss
+}
+
+fn sigmoid_score_probability(score: f32, scale: f32) -> f32 {
+    logistic_f64(f64::from(score) / f64::from(scale.max(f32::MIN_POSITIVE))) as f32
+}
+
+fn logistic_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
+
+fn score_winrate_metrics<F>(bins: &[WrmTargetOutcomeBin], mut probability: F) -> Option<ScoreWinrateModelMetrics>
+where
+    F: FnMut(f32) -> f32,
+{
+    let mut total = 0usize;
+    let mut bce = 0.0f64;
+    let mut brier = 0.0f64;
+    for (idx, bin) in bins.iter().enumerate() {
+        let count = bin.count();
+        if count == 0 {
+            continue;
+        }
+        let score = (idx as i32 + i32::from(i16::MIN)) as f32;
+        let p = f64::from(probability(score)).clamp(1.0e-6, 1.0 - 1.0e-6);
+        let (positives, negatives) = bin.positives_negatives();
+        bce -= positives * p.ln() + negatives * (1.0 - p).ln();
+        brier += f64::from(bin.wins) * (1.0 - p).powi(2);
+        brier += f64::from(bin.losses) * p.powi(2);
+        brier += f64::from(bin.draws) * (0.5 - p).powi(2);
+        total += count;
+    }
+
+    (total > 0).then_some(ScoreWinrateModelMetrics { bce: bce / total as f64, brier: brier / total as f64 })
+}
+
+#[derive(Default)]
+struct ScoreWinrateDisplayBin {
+    outcome: WrmTargetOutcomeBin,
+    sigmoid_sum: f64,
+    wrm_sum: f64,
+}
+
+fn score_winrate_bin_reports(
+    exact_bins: &[WrmTargetOutcomeBin],
+    bin_size: u16,
+    sigmoid_scale: f32,
+    wrm_params: WinRateModelTargetParams,
+) -> Vec<ScoreWinrateBinReport> {
+    let mut grouped: BTreeMap<i32, ScoreWinrateDisplayBin> = BTreeMap::new();
+    for (idx, bin) in exact_bins.iter().enumerate() {
+        let count = bin.count();
+        if count == 0 {
+            continue;
+        }
+        let score = (idx as i32 + i32::from(i16::MIN)) as i16;
+        let lower = score_bin_lower(score, bin_size);
+        let entry = grouped.entry(lower).or_default();
+        entry.outcome.wins += bin.wins;
+        entry.outcome.losses += bin.losses;
+        entry.outcome.draws += bin.draws;
+        entry.sigmoid_sum += f64::from(sigmoid_score_probability(score as f32, sigmoid_scale)) * count as f64;
+        entry.wrm_sum += f64::from(wrm_params.probability(score as f32)) * count as f64;
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(score_min, bin)| {
+            let count = bin.outcome.count();
+            if count == 0 {
+                return None;
+            }
+            let (positives, _) = bin.outcome.positives_negatives();
+            Some(ScoreWinrateBinReport {
+                score_min,
+                score_max: score_min + i32::from(bin_size) - 1,
+                count,
+                wins: bin.outcome.wins as usize,
+                losses: bin.outcome.losses as usize,
+                draws: bin.outcome.draws as usize,
+                empirical: positives / count as f64,
+                sigmoid: bin.sigmoid_sum / count as f64,
+                wrm: bin.wrm_sum / count as f64,
+            })
+        })
+        .collect()
+}
+
+fn score_bin_lower(score: i16, bin_size: u16) -> i32 {
+    let bin_size = i32::from(bin_size);
+    i32::from(score).div_euclid(bin_size) * bin_size
 }
 
 pub fn load_halfkp_teacher_fast_batch(
@@ -2705,6 +3094,45 @@ mod tests {
             teacher_shuffle_seed: 0,
             profile_prepare: false,
         }
+    }
+
+    fn score_bin_index(score: i16) -> usize {
+        (i32::from(score) - i32::from(i16::MIN)) as usize
+    }
+
+    #[test]
+    fn score_winrate_wrm_fit_beats_plain_sigmoid_on_wrm_shaped_data() {
+        let expected = WinRateModelTargetParams { offset: 260.0, scaling: 360.0 };
+        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        for score in (-1200..=1200).step_by(25) {
+            let p = expected.probability(score as f32);
+            let count = 2000u32;
+            let wins = (p * count as f32).round() as u32;
+            let losses = count - wins;
+            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+        }
+
+        let (sigmoid_scale, _, sigmoid_fitted) = fit_sigmoid_target_scale(&bins).unwrap();
+        let (wrm_params, _, wrm_fitted) = fit_wrm_target_params(&bins).unwrap();
+        let sigmoid_metrics =
+            score_winrate_metrics(&bins, |score| sigmoid_score_probability(score, sigmoid_scale)).unwrap();
+        let wrm_metrics = score_winrate_metrics(&bins, |score| wrm_params.probability(score)).unwrap();
+
+        assert!(sigmoid_fitted);
+        assert!(wrm_fitted);
+        assert!((wrm_params.offset - expected.offset).abs() <= 2.0, "wrm_params={wrm_params:?}");
+        assert!((wrm_params.scaling - expected.scaling).abs() <= 2.0, "wrm_params={wrm_params:?}");
+        assert!(wrm_metrics.bce < sigmoid_metrics.bce, "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}");
+    }
+
+    #[test]
+    fn score_winrate_bin_lower_uses_mathematical_floor_for_negative_scores() {
+        assert_eq!(score_bin_lower(-1, 50), -50);
+        assert_eq!(score_bin_lower(-50, 50), -50);
+        assert_eq!(score_bin_lower(-51, 50), -100);
+        assert_eq!(score_bin_lower(0, 50), 0);
+        assert_eq!(score_bin_lower(49, 50), 0);
+        assert_eq!(score_bin_lower(50, 50), 50);
     }
 
     #[test]

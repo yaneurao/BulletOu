@@ -210,6 +210,32 @@ WRM で変わるのは次の 3 つです。
 
 通常の学習では、これらを指定しないでください。デフォルトの自動推定を使うのが基本です。
 
+### 教師データ上で score→勝率の形を確認する
+
+教師評価値と勝敗結果の関係は、教師データごとに少し違います。次の診断コマンドで、単純な sigmoid と WRM のどちらが実データに合っているかを見られます。
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ \
+    --analyze-score-winrate \
+    --fit-positions 100000 \
+    --analyze-positions 1000000 \
+    --bin-size 50 \
+    --score-winrate-csv score-winrate.csv
+```
+
+このコマンドは学習しません。先頭 `--fit-positions` 局面で係数を推定し、その直後の `--analyze-positions` 局面で BCE / Brier score と score bucket ごとの実測勝率を出します。
+
+| 出力 | 意味 |
+|---|---|
+| `sigmoid(score/s)` | `score` を 1 つの scale だけで 0〜1 に変換する形 |
+| `WRM(offset,scale)` | `offset` と `scale` を使い、評価値 0 付近を少し平らにできる形 |
+| `heldout_bce` | 小さいほど、勝敗結果の統計に合っている |
+| `heldout_brier` | 小さいほど、予測確率として合っている |
+| `empirical` | その score bucket での `(勝ち + 0.5 * 引き分け) / 局面数` |
+
+`delta(WRM - sigmoid)` が負なら、その教師データでは WRM のほうが勝敗結果の統計に合っています。正なら、単純な sigmoid のほうが合っています。
+
 ### `--wrm-nnue2score`
 
 `--wrm-nnue2score` は、network output を評価値スケールに戻す倍率です。デフォルトは `600` です。tatara と条件を揃えるときや、明確に比較実験をするとき以外は変更しません。

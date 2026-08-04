@@ -208,6 +208,32 @@ That uses the built-in coefficients `offset=270`, `scaling=380`. If you must set
 
 For normal training, do not pass these options. Use the default estimation.
 
+### Check the score→win-rate shape on your teacher data
+
+The relation between teacher score and game result can differ by dataset. This diagnostic command compares a plain sigmoid with WRM on the actual `(score, game_result)` statistics.
+
+```bash
+./target/release/examples/bulletou \
+    --teacher teachers/ \
+    --analyze-score-winrate \
+    --fit-positions 100000 \
+    --analyze-positions 1000000 \
+    --bin-size 50 \
+    --score-winrate-csv score-winrate.csv
+```
+
+This command does not train. It fits both curves on the first `--fit-positions` positions, then reports BCE / Brier score and per-score-bucket empirical win rate on the following `--analyze-positions` positions.
+
+| Output | Meaning |
+|---|---|
+| `sigmoid(score/s)` | Converts `score` to 0–1 with one scale parameter |
+| `WRM(offset,scale)` | Uses offset and scale, allowing a flatter region near score 0 |
+| `heldout_bce` | Lower is a better fit to game-result statistics |
+| `heldout_brier` | Lower is a better probability prediction |
+| `empirical` | `(wins + 0.5 * draws) / positions` in that score bucket |
+
+If `delta(WRM - sigmoid)` is negative, WRM fits that teacher data better. If it is positive, the plain sigmoid fits better.
+
 ### `--wrm-nnue2score`
 
 `--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`. Change it only for explicit comparison experiments, for example when matching tatara settings.

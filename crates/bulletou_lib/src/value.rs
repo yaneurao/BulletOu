@@ -35,8 +35,9 @@ pub use fast_sfnn::{
 pub use loader::WinRateModelTargetParams;
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
-    KpptTeacherBatchConfig, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
-    TeacherDataloaderPos, WrmTargetCalibrationConfig, WrmTargetCalibrationReport,
+    KpptTeacherBatchConfig, ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, ScoreWinrateBinReport,
+    ScoreWinrateModelMetrics, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
+    TeacherDataloaderPos, WrmTargetCalibrationConfig, WrmTargetCalibrationReport, analyze_score_winrate_from_teacher,
     estimate_wrm_target_from_teacher_prefix, for_each_halfkp_teacher_fast_batch, for_each_kp_teacher_fast_batch,
     for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch, for_each_sfnn_teacher_fast_batch,
     load_halfkp_teacher_fast_batch,

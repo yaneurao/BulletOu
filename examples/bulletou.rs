@@ -84,8 +84,8 @@ use bulletou_lib::{
         read_teacher_positions_prefix,
     },
     value::{
-        WinRateModelTargetParams, WrmTargetCalibrationConfig, WrmTargetCalibrationReport,
-        estimate_wrm_target_from_teacher_prefix,
+        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, WinRateModelTargetParams, WrmTargetCalibrationConfig,
+        WrmTargetCalibrationReport, analyze_score_winrate_from_teacher, estimate_wrm_target_from_teacher_prefix,
         nnue_save::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
             network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
@@ -2520,6 +2520,8 @@ const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS: usize = 100_000;
+const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
+const DEFAULT_SCORE_WINRATE_BIN_SIZE: u16 = 50;
 
 fn effective_batch_size(args: &Args) -> usize {
     args.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
@@ -2910,7 +2912,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf              Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test    Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin  Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf              Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test    Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin  Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Compare score->win-rate curves on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -2993,6 +2995,32 @@ struct Args {
     /// annealing, period auto-aligns to `--superbatches`.
     #[arg(long)]
     count_teacher: bool,
+
+    /// Analyze whether a simple score sigmoid or WRM offset+scaling curve
+    /// fits the teacher's `(score, game_result)` statistics better. The first
+    /// `--fit-positions` records fit both curves; the following
+    /// `--analyze-positions` records are held out for reporting.
+    #[arg(long)]
+    analyze_score_winrate: bool,
+
+    /// Number of teacher-prefix positions used to fit the score->win-rate
+    /// curves for `--analyze-score-winrate`.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS)]
+    fit_positions: usize,
+
+    /// Number of held-out positions, immediately after `--fit-positions`, used
+    /// by `--analyze-score-winrate` to compare sigmoid vs WRM.
+    #[arg(long, default_value_t = DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS)]
+    analyze_positions: usize,
+
+    /// Score bucket width for the `--analyze-score-winrate` table.
+    #[arg(long, alias = "score-bin-size", default_value_t = DEFAULT_SCORE_WINRATE_BIN_SIZE)]
+    bin_size: u16,
+
+    /// Optional CSV output for the `--analyze-score-winrate` per-score-bin
+    /// calibration table.
+    #[arg(long, alias = "analyze-output")]
+    score_winrate_csv: Option<PathBuf>,
 
     /// Checkpoint output directory. Defaults to an auto-derived per-target path.
     #[arg(long)]
@@ -3456,7 +3484,7 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
-        if self.count_teacher || self.cuda_cpp_smoke {
+        if self.count_teacher || self.analyze_score_winrate || self.cuda_cpp_smoke {
             return Ok(());
         }
 
@@ -3931,6 +3959,164 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
         remainder as f64 / 1.0e6,
     );
 
+    Ok(())
+}
+
+// ----- score->win-rate diagnostics --------------------------------------
+
+fn run_analyze_score_winrate(args: &Args) -> Result<(), String> {
+    if args.fit_positions == 0 {
+        return Err("--fit-positions must be > 0".to_string());
+    }
+    if args.analyze_positions == 0 {
+        return Err("--analyze-positions must be > 0".to_string());
+    }
+    if args.bin_size == 0 {
+        return Err("--bin-size must be > 0".to_string());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    let loader_threads = cuda_cpp_effective_loader_threads(args);
+    #[cfg(not(feature = "cuda-cpp-backend"))]
+    let loader_threads = if args.loader_threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        args.loader_threads
+    };
+
+    println!("  {}", paint("score->win-rate analysis", ConsoleColor::BoldGreen));
+    println!("  {} = {}", paint_startup_label("teacher"), &args.teacher);
+    println!(
+        "  {} = {}",
+        paint_startup_label("sample"),
+        format!(
+            "fit={} positions, heldout={} positions, bin={} score points",
+            format_count(args.fit_positions),
+            format_count(args.analyze_positions),
+            args.bin_size,
+        ),
+    );
+    if args.score_drop_abs == 0 {
+        println!("  {} = disabled", paint_startup_label("score filter"));
+    } else {
+        println!("  {} = drop |score| >= {}", paint_startup_label("score filter"), args.score_drop_abs);
+    }
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+
+    let report = analyze_score_winrate_from_teacher(&ScoreWinrateAnalysisConfig {
+        teacher: &args.teacher,
+        fit_positions: args.fit_positions,
+        eval_positions: args.analyze_positions,
+        bin_size: args.bin_size,
+        buffer_mb: args.buffer_mb,
+        loader_threads,
+        score_drop_abs: if args.score_drop_abs == 0 { None } else { Some(args.score_drop_abs) },
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_score_winrate_analysis_report(&report);
+
+    if let Some(path) = &args.score_winrate_csv {
+        write_score_winrate_csv(path, &report)?;
+        println!("csv: {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn print_score_winrate_analysis_report(report: &ScoreWinrateAnalysisReport) {
+    println!(
+        "fit:     observed={} used={} decisive={} draws={} filtered={}",
+        format_count(report.observed_fit_positions),
+        format_count(report.used_fit_positions),
+        format_count(report.decisive_fit_positions),
+        format_count(report.drawn_fit_positions),
+        format_count(report.filtered_fit_positions),
+    );
+    println!(
+        "heldout: observed={} used={} decisive={} draws={} filtered={}",
+        format_count(report.observed_eval_positions),
+        format_count(report.used_eval_positions),
+        format_count(report.decisive_eval_positions),
+        format_count(report.drawn_eval_positions),
+        format_count(report.filtered_eval_positions),
+    );
+    println!();
+    println!("{:<18} {:>13} {:>13} {:>13} {:>13}", "model", "parameter", "fit_bce", "heldout_bce", "heldout_brier");
+    println!(
+        "{:<18} {:>13} {:>13.8} {:>13.8} {:>13.8}",
+        "sigmoid(score/s)",
+        format!("s={:.1}", report.sigmoid_scale),
+        report.sigmoid_fit.bce,
+        report.sigmoid_eval.bce,
+        report.sigmoid_eval.brier,
+    );
+    println!(
+        "{:<18} {:>13} {:>13.8} {:>13.8} {:>13.8}",
+        "WRM(offset,scale)",
+        format!("o={:.1},s={:.1}", report.wrm_params.offset, report.wrm_params.scaling),
+        report.wrm_fit.bce,
+        report.wrm_eval.bce,
+        report.wrm_eval.brier,
+    );
+    println!(
+        "delta(WRM - sigmoid): heldout_bce={:+.8}, heldout_brier={:+.8}",
+        report.wrm_eval.bce - report.sigmoid_eval.bce,
+        report.wrm_eval.brier - report.sigmoid_eval.brier,
+    );
+    if !report.sigmoid_fitted || !report.wrm_fitted {
+        println!("note: fit sample did not contain both win and loss outcomes; one or more defaults were used.");
+    }
+    println!();
+    println!(
+        "per-score-bin calibration (heldout, bin={} score points; empirical=(wins+0.5*draws)/count):",
+        report.bin_size
+    );
+    println!(
+        "{:>13} {:>10} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11}",
+        "score", "count", "wins", "losses", "draws", "empirical", "sigmoid", "wrm"
+    );
+    for bin in &report.bins {
+        println!(
+            "{:>6}..{:<6} {:>10} {:>10} {:>10} {:>10} {:>11.6} {:>11.6} {:>11.6}",
+            bin.score_min,
+            bin.score_max,
+            format_count(bin.count),
+            format_count(bin.wins),
+            format_count(bin.losses),
+            format_count(bin.draws),
+            bin.empirical,
+            bin.sigmoid,
+            bin.wrm,
+        );
+    }
+}
+
+fn write_score_winrate_csv(path: &Path, report: &ScoreWinrateAnalysisReport) -> Result<(), String> {
+    let mut file = std::fs::File::create(path)
+        .map_err(|err| format!("failed to create score-winrate CSV {}: {err}", path.display()))?;
+    use std::io::Write as _;
+    writeln!(file, "score_min,score_max,count,wins,losses,draws,empirical,sigmoid,wrm")
+        .map_err(|err| format!("failed to write score-winrate CSV {}: {err}", path.display()))?;
+    for bin in &report.bins {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{:.9},{:.9},{:.9}",
+            bin.score_min,
+            bin.score_max,
+            bin.count,
+            bin.wins,
+            bin.losses,
+            bin.draws,
+            bin.empirical,
+            bin.sigmoid,
+            bin.wrm,
+        )
+        .map_err(|err| format!("failed to write score-winrate CSV {}: {err}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -5623,6 +5809,15 @@ fn main() {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("error: --count-teacher failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if args.analyze_score_winrate {
+        match run_analyze_score_winrate(&args) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: --analyze-score-winrate failed: {e}");
                 std::process::exit(2);
             }
         }
@@ -19491,6 +19686,34 @@ mod tests {
         ]);
 
         assert!(old.is_err());
+    }
+
+    #[test]
+    fn analyze_score_winrate_is_standalone_without_arch() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--teacher",
+            "/dev/null",
+            "--analyze-score-winrate",
+            "--fit-positions",
+            "1000",
+            "--analyze-positions",
+            "2000",
+            "--bin-size",
+            "25",
+            "--score-winrate-csv",
+            "score-winrate.csv",
+        ])
+        .unwrap();
+
+        assert!(args.analyze_score_winrate);
+        assert_eq!(args.fit_positions, 1000);
+        assert_eq!(args.analyze_positions, 2000);
+        assert_eq!(args.bin_size, 25);
+        assert!(args.score_winrate_csv.is_some());
+        assert!(args.validate_arch_flags().is_ok());
     }
 
     #[test]
