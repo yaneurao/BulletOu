@@ -82,6 +82,17 @@ The `hand256`, `k3k3`, and `progress8` parts may be written in any order. Bullet
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | unchanged |
 
+For SFNN, the middle number `H1` also decides whether the L1 PSQT shortcut is present.
+
+| Example | fc0 outputs | Shortcut |
+|---|---:|---|
+| `SFNN_halfka2_1024_7_64_k3k3` | 8 (`7 + 1`) | yes |
+| `SFNN_halfka2_1024_8_64_k3k3` | 8 | no |
+| `SFNN_halfka2_1024_15_64_k3k3` | 16 (`15 + 1`) | yes |
+| `SFNN_halfka2_1024_16_64_k3k3` | 16 | no |
+
+In short, `H1 = 8n - 1` uses one extra shortcut output, while `H1 = 8n` does not. Split-L1 names such as `c0_s1024x4` divide the actual fc0 output count, so `4096_7_64_c0_s1024x4` divides 8 outputs into 4 groups, and `4096_8_64_c0_s1024x4` also divides 8 outputs into 4 groups.
+
 You may also omit all of these parts:
 
 ```text

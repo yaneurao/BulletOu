@@ -116,9 +116,9 @@ YaneuraOu-compatible LayerStack bucket algorithm:
 `_cN_sMxG` enables common+shard L1: the first `N` FT
 channels are common to every L1 output group, then `G` shard blocks of `M`
 channels follow. `N` may be `0`; for example `c0_s1024x8` is equivalent to a
-pure 8-way grouped L1. It requires `N + M * G == FT`, `(H1 + 1) % G == 0`,
-and both `N` and `M` to be multiples of 64. The `+1` is the PSQT shortcut
-neuron added after H1.
+pure 8-way grouped L1. It requires `N + M * G == FT`, the actual `fc0` output
+count to be divisible by `G`, and both `N` and `M` to be multiples of 64.
+For SFNN, `H1 = 8n - 1` adds one PSQT shortcut output, while `H1 = 8n` does not.
 
 For `_cN_sMxG_`, BulletOu keeps `l1w` compact in `state.bin` and
 optimizer state, then expands the L1 matrix to the dense YaneuraOu `fc_0`
@@ -128,8 +128,8 @@ Examples currently used for experiments:
 
 - `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3`
 - `SFNN_halfka2_1024_7_64`
-- `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3`
-- `SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3`
+- `SFNN_halfka2_4096_8_64_c0_s1024x4_k3k3`
+- `SFNN_halfka2_8192_8_64_c0_s2048x4_k3k3`
 - `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
 - `SFNN_halfka2_8192_7_64_c0_s1024x8`
 - `SFNN_halfka2_4096_15_64_c0_s256x16_k3k3`

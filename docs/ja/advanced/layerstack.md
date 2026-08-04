@@ -93,6 +93,17 @@ idx = (hand256_bucket * 9 + k3k3_bucket) * 16 + progress16_bucket
 | `SFNN_halfka2_1024_7_64_progress8_k9k9z` | `SFNN_halfka2_1024_7_64_k9k9z_progress8` |
 | `SFNN_ka2_3072_7_64_c1024_s256x8_hand256_k13k13z` | そのまま |
 
+SFNN では、中央の `H1` の値で L1 の shortcut の有無も決まります。
+
+| 例 | fc0 の出力数 | shortcut |
+|---|---:|---|
+| `SFNN_halfka2_1024_7_64_k3k3` | 8 (`7 + 1`) | あり |
+| `SFNN_halfka2_1024_8_64_k3k3` | 8 | なし |
+| `SFNN_halfka2_1024_15_64_k3k3` | 16 (`15 + 1`) | あり |
+| `SFNN_halfka2_1024_16_64_k3k3` | 16 | なし |
+
+つまり、`H1 = 8n - 1` の形では shortcut 用の出力が 1 つ追加され、`H1 = 8n` の形では追加されません。`c0_s1024x4` のような L1 分割は、実際の fc0 出力数を分割します。そのため `4096_7_64_c0_s1024x4` は 8 出力を 4 分割し、`4096_8_64_c0_s1024x4` も 8 出力を 4 分割します。
+
 `k3k3` や `hand256` などを何も付けない名前も有効です。
 
 ```text

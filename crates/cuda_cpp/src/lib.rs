@@ -798,6 +798,11 @@ pub struct SfnnForwardShape {
     pub input_size: usize,
     pub ft_size: usize,
     pub l1_hidden: usize,
+    /// Whether the first SFNN affine layer has one extra linear output that is
+    /// added directly to the final scalar output. BulletOu architecture names
+    /// derive this automatically: H1=7/15/31/... uses the skip connection,
+    /// while H1=8/16/32/... does not.
+    pub l1_skip: bool,
     pub l2_size: usize,
     pub num_stacks: usize,
     /// `1` means normal dense stacked L1 unless the common+shard fields
@@ -826,8 +831,12 @@ pub struct SfnnForwardShape {
 }
 
 impl SfnnForwardShape {
+    pub fn has_l1_skip(self) -> bool {
+        self.l1_skip
+    }
+
     pub fn l1_out(self) -> usize {
-        self.l1_hidden + 1
+        self.l1_hidden + usize::from(self.l1_skip)
     }
 
     pub fn l2_in(self) -> usize {
@@ -1576,6 +1585,7 @@ fn sfnn_forward_device_with_factorizer_impl(
             shape.input_size,
             shape.ft_size,
             shape.l1_hidden,
+            i32::from(shape.l1_skip),
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
@@ -2746,6 +2756,7 @@ pub fn sfnn_backward_train_profile_device_with_factorizer(
             shape.input_size,
             shape.ft_size,
             shape.l1_hidden,
+            i32::from(shape.l1_skip),
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
@@ -2921,6 +2932,7 @@ fn sfnn_backward_device_impl(
                 shape.input_size,
                 shape.ft_size,
                 shape.l1_hidden,
+                i32::from(shape.l1_skip),
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
@@ -2993,6 +3005,7 @@ fn sfnn_backward_device_impl(
                 shape.input_size,
                 shape.ft_size,
                 shape.l1_hidden,
+                i32::from(shape.l1_skip),
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
@@ -6232,6 +6245,7 @@ mod ffi {
             input_size: usize,
             ft_size: usize,
             l1_hidden: usize,
+            l1_skip: i32,
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
@@ -6286,6 +6300,7 @@ mod ffi {
             input_size: usize,
             ft_size: usize,
             l1_hidden: usize,
+            l1_skip: i32,
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
@@ -6356,6 +6371,7 @@ mod ffi {
             input_size: usize,
             ft_size: usize,
             l1_hidden: usize,
+            l1_skip: i32,
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
@@ -6427,6 +6443,7 @@ mod ffi {
             input_size: usize,
             ft_size: usize,
             l1_hidden: usize,
+            l1_skip: i32,
             l2_size: usize,
             num_stacks: usize,
             l1_group_count: usize,
@@ -6601,6 +6618,7 @@ mod tests {
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 3,
             num_stacks: 2,
             l1_group_count: 1,
@@ -6627,6 +6645,7 @@ mod tests {
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 3,
             num_stacks: 64 * 9 * 2,
             l1_group_count: 1,
@@ -6651,6 +6670,7 @@ mod tests {
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 3,
             num_stacks: 2,
             l1_group_count: 1,
@@ -6688,6 +6708,7 @@ mod tests {
             input_size: 133578,
             ft_size: 8192,
             l1_hidden: 15,
+            l1_skip: true,
             l2_size: 64,
             num_stacks: 9,
             l1_group_count: 16,
@@ -6713,6 +6734,7 @@ mod tests {
             input_size: 1791,
             ft_size: 3072,
             l1_hidden: 7,
+            l1_skip: true,
             l2_size: 64,
             num_stacks: 9,
             l1_group_count: 8,
@@ -6735,6 +6757,7 @@ mod tests {
             input_size: 133578,
             ft_size: 8192,
             l1_hidden: 7,
+            l1_skip: true,
             l2_size: 64,
             num_stacks: 9,
             l1_group_count: 8,
@@ -7197,6 +7220,7 @@ mod tests {
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
@@ -7307,7 +7331,7 @@ mod tests {
                     }
                 }
             }
-            let psqt = l1[shape.l1_hidden];
+            let psqt = if shape.has_l1_skip() { l1[shape.l1_hidden] } else { 0.0 };
             let mut l2_input = vec![0.0; shape.l2_in()];
             for col in 0..shape.l2_in() {
                 let value = l1[col % shape.l1_hidden];
@@ -7503,7 +7527,10 @@ mod tests {
             l2.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
             let l2_base = sample * shape.l2_size;
             trace.l2[l2_base..l2_base + shape.l2_size].copy_from_slice(&l2);
-            let mut value = weights.l3b[stack] + trace.l1[l1_base + shape.l1_hidden];
+            let mut value = weights.l3b[stack];
+            if shape.has_l1_skip() {
+                value += trace.l1[l1_base + shape.l1_hidden];
+            }
             if let Some(l3fb) = weights.l3fb {
                 value += l3fb[0];
             }
@@ -7549,7 +7576,9 @@ mod tests {
             if weights.l3fb.is_some() {
                 l3fb_gradients[0] += output_gradient;
             }
-            l1_gradients[sample * shape.l1_out() + shape.l1_hidden] = output_gradient;
+            if shape.has_l1_skip() {
+                l1_gradients[sample * shape.l1_out() + shape.l1_hidden] = output_gradient;
+            }
             for row in 0..shape.l2_size {
                 let mut weight = weights.l3w[stack * shape.l2_size + row];
                 if let Some(l3fw) = weights.l3fw {

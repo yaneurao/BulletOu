@@ -590,7 +590,7 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
 /// - `SFNN_halfka2_1024_7_64_hand1024_k9k9`
 /// - `SFNN_halfka2_1024_7_64_hand1024_k21k21`
 /// - `SFNN_halfka2_1024_7_64_hand1024_k29k29`
-/// - `SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3`
+/// - `SFNN_halfka2_4096_8_64_c0_s1024x4_k3k3`
 /// - `SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3`
 /// - `SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3`
 /// - `SFNN_halfka2_8192_15_64_c0_s512x16_k3k3`
@@ -682,6 +682,14 @@ impl NnueArch {
         self.has_common_shard_sfnn_l1()
     }
 
+    fn sfnn_l1_skip(self) -> bool {
+        self.family == NnueArchFamily::Sfnn && self.l2 % 8 == 7
+    }
+
+    fn sfnn_l1_out(self) -> usize {
+        self.l2 + usize::from(self.sfnn_l1_skip())
+    }
+
     /// The arch's canonical CLI value.
     fn cli_name(self) -> String {
         match self.family {
@@ -763,7 +771,7 @@ impl NnueArch {
                     "invalid arch `{original}`: common+shard SFNN L1 requires cN and sMxG with N>=0, M>0, and G>1"
                 ));
             }
-            let l1_out = self.l2 + 1;
+            let l1_out = self.sfnn_l1_out();
             if common_size + shard_size * group_count != self.l1 {
                 return Err(format!(
                     "invalid arch `{original}`: common+shard SFNN L1 requires common + shard * group == FT"
@@ -771,7 +779,7 @@ impl NnueArch {
             }
             if l1_out % group_count != 0 {
                 return Err(format!(
-                    "invalid arch `{original}`: common+shard SFNN L1 requires H1+1 to be divisible by group count"
+                    "invalid arch `{original}`: common+shard SFNN L1 requires the fc0 output count to be divisible by group count"
                 ));
             }
             if common_size % 64 != 0 || shard_size % 64 != 0 {
@@ -4271,6 +4279,7 @@ struct QuantizedSfnnWeights {
     input_size: usize,
     ft_size: usize,
     l1_hidden: usize,
+    l1_skip: bool,
     l2_size: usize,
     num_stacks: usize,
     l1_pad_in: usize,
@@ -4285,6 +4294,13 @@ struct QuantizedSfnnWeights {
     l2w: Vec<i8>,
     l3b: Vec<i32>,
     l3w: Vec<i8>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedSfnnWeights {
+    fn l1_out(&self) -> usize {
+        self.l1_hidden + usize::from(self.l1_skip)
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4570,7 +4586,8 @@ fn parse_quantized_sfnn_nn_bin(
         return Err(format!("SFNN ft_size must be even for quantized element-wise multiply, got {ft_size}"));
     }
     let num_stacks = layerstack.num_stacks();
-    let l1_out = l1_hidden + 1;
+    let l1_skip = arch.sfnn_l1_skip();
+    let l1_out = l1_hidden + usize::from(l1_skip);
     let l2_in = l1_hidden * 2;
     let l1_pad_in = nnue_pad32(ft_size);
     let l2_pad_in = nnue_pad32(l2_in);
@@ -4666,6 +4683,7 @@ fn parse_quantized_sfnn_nn_bin(
         input_size,
         ft_size,
         l1_hidden,
+        l1_skip,
         l2_size,
         num_stacks,
         l1_pad_in,
@@ -4697,7 +4715,7 @@ impl QuantizedSfnnThreadState {
     fn new(weights: &QuantizedSfnnWeights) -> Self {
         Self {
             ft: vec![0; weights.ft_size],
-            l1: vec![0; weights.l1_hidden + 1],
+            l1: vec![0; weights.l1_out()],
             l2_input: vec![0; weights.l1_hidden * 2],
             l2: vec![0; weights.l2_size],
         }
@@ -4819,7 +4837,7 @@ fn quantized_sfnn_forward_sample(
         state.ft[pairwise + j] = quantized_sfnn_ft_pair_value(nstm0, nstm1, ft_shift, ft_round);
     }
 
-    let l1_out = weights.l1_hidden + 1;
+    let l1_out = weights.l1_out();
     let l1b_base = stack * l1_out;
     let l1w_base = stack * l1_out * weights.l1_pad_in;
     for out in 0..l1_out {
@@ -4852,7 +4870,9 @@ fn quantized_sfnn_forward_sample(
     for i in 0..weights.l2_size {
         output += i32::from(state.l2[i]) * i32::from(weights.l3w[l3w_base + i]);
     }
-    output += state.l1[weights.l1_hidden];
+    if weights.l1_skip {
+        output += state.l1[weights.l1_hidden];
+    }
 
     Ok(QuantizedSfnnForwardOutput { raw: output })
 }
@@ -5146,11 +5166,7 @@ fn build_quantized_calibration_prepared(
     let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
     let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
     let mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
-    let accuracy_indices = mask
-        .accuracy_indices
-        .iter()
-        .map(|&i| (i, teacher_results[i] > 0))
-        .collect::<Vec<_>>();
+    let accuracy_indices = mask.accuracy_indices.iter().map(|&i| (i, teacher_results[i] > 0)).collect::<Vec<_>>();
 
     let blend = 1.0 - args.lambda;
     let inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 0.0025 };
@@ -5296,10 +5312,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     eprintln!("  layerstack        = {} ({} stack(s))", layerstack.cli_name(), format_count(weights.num_stacks));
     eprintln!("  fv_scale          = {}", args.fv_scale.cli_label());
     if matches!(args.fv_scale, QuantizedCalibrateFvScale::Auto) {
-        eprintln!(
-            "  fv_scale search   = {}..={} step {}",
-            args.fv_scale_min, args.fv_scale_max, args.fv_scale_step
-        );
+        eprintln!("  fv_scale search   = {}..={} step {}", args.fv_scale_min, args.fv_scale_max, args.fv_scale_step);
     }
     if let Some(offset) = args.engine_score_offset {
         eprintln!("  offset            = {offset} (explicit)");
@@ -5372,9 +5385,9 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
             candidate_args.fv_scale = fv_scale;
             let report =
                 quantized_calibration_engine_report_from_outputs(&prepared, &outputs, &candidate_args, raw_delta)?;
-            let loss = report
-                .test_loss
-                .ok_or_else(|| "engine-scale loss is unavailable; validation teacher must include game results".to_string())?;
+            let loss = report.test_loss.ok_or_else(|| {
+                "engine-scale loss is unavailable; validation teacher must include game results".to_string()
+            })?;
             if !loss.is_finite() {
                 return Err(format!("non-finite calibration loss for FV_SCALE={fv_scale}, offset={offset}: {loss}"));
             }
@@ -8541,10 +8554,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "arch",
             format!(
-                "{} (factorized {} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={})",
+                "{} (factorized {} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l1_skip={}, l2={l2_size}, stacks={})",
                 paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
                 feature_kind.source_label(),
                 format_count(initial_weights.shape.input_size),
+                if initial_weights.shape.has_l1_skip() { "on" } else { "off" },
                 format_count(num_stacks)
             ),
         );
@@ -8552,10 +8566,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "arch",
             format!(
-                "{} ({} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l2={l2_size}, stacks={})",
+                "{} ({} input {}, ft={ft_size}, l1_hidden={l1_hidden}, l1_skip={}, l2={l2_size}, stacks={})",
                 paint(args.arch().cli_name(), ConsoleColor::BoldYellow),
                 feature_kind.source_label(),
                 format_count(initial_weights.shape.input_size),
+                if initial_weights.shape.has_l1_skip() { "on" } else { "off" },
                 format_count(num_stacks)
             ),
         );
@@ -11214,6 +11229,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         input_size,
         ft_size,
         l1_hidden,
+        l1_skip: args.arch().sfnn_l1_skip(),
         l2_size,
         num_stacks,
         l1_group_count: args.arch().sfnn_l1_group_count(),
@@ -11332,6 +11348,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         input_size: feature_kind.training_input_size(),
         ft_size,
         l1_hidden,
+        l1_skip: args.arch().sfnn_l1_skip(),
         l2_size,
         num_stacks: layerstack.num_stacks(),
         l1_group_count: args.arch().sfnn_l1_group_count(),
@@ -15552,10 +15569,13 @@ mod tests {
         assert_eq!(c0_x4.dims(), (4096, 7, 64));
         assert_eq!(c0_x4.sfnn_l1_group_count(), 4);
         assert_eq!(c0_x4.cli_name(), "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3");
-        let c0_x4_h1_3 = NnueArch::from_str("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3").unwrap();
-        assert_eq!(c0_x4_h1_3.dims(), (4096, 3, 64));
-        assert_eq!(c0_x4_h1_3.sfnn_l1_group_count(), 4);
-        assert_eq!(c0_x4_h1_3.cli_name(), "SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3");
+        assert!(c0_x4.sfnn_l1_skip());
+        assert_eq!(c0_x4.sfnn_l1_out(), 8);
+        let h1_8 = NnueArch::from_str("SFNN_halfka2_1024_8_64_k3k3").unwrap();
+        assert_eq!(h1_8.dims(), (1024, 8, 64));
+        assert!(!h1_8.sfnn_l1_skip());
+        assert_eq!(h1_8.sfnn_l1_out(), 8);
+        assert!(NnueArch::from_str("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3").is_err());
         let c0_x16 = NnueArch::from_str("SFNN_halfka2_8192_15_64_c0_s512x16_k3k3").unwrap();
         assert_eq!(c0_x16.dims(), (8192, 15, 64));
         assert_eq!(c0_x16.sfnn_l1_group_count(), 16);
@@ -15749,8 +15769,8 @@ mod tests {
             "SFNN_halfka2_1024_7_64_k13k13z",
             "SFNN_halfka2_1024_7_64_k21k21",
             "SFNN_halfka2_1024_7_64_k29k29",
-            "SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3",
-            "SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3",
+            "SFNN_halfka2_4096_8_64_c0_s1024x4_k3k3",
+            "SFNN_halfka2_8192_8_64_c0_s2048x4_k3k3",
             "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3",
             "SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3",
             "SFNN_halfka2_4096_7_64_c0_s512x8_k3k3",
@@ -17388,6 +17408,7 @@ mod tests {
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 3,
             num_stacks: 64 * 9 * 2,
             l1_group_count: 1,
@@ -18352,16 +18373,16 @@ mod tests {
     fn cuda_cpp_sfnn_grouped_arches_use_compact_l1_shape() {
         use clap::Parser as _;
 
-        for (arch, ft_size, l1_out, group_count, group_input, group_output) in [
-            ("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3", 4096, 4, 4, 1024, 1),
-            ("SFNN_halfka2_8192_3_64_c0_s2048x4_k3k3", 8192, 4, 4, 2048, 1),
-            ("SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3", 4096, 8, 4, 1024, 2),
-            ("SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3", 8192, 8, 8, 1024, 1),
-            ("SFNN_halfka2_4096_7_64_c0_s512x8_k3k3", 4096, 8, 8, 512, 1),
-            ("SFNN_halfka2_4096_15_64_c0_s256x16_k3k3", 4096, 16, 16, 256, 1),
-            ("SFNN_halfka2_8192_15_64_c0_s512x16_k3k3", 8192, 16, 16, 512, 1),
-            ("SFNN_halfka2_4096_31_64_c0_s128x32_k3k3", 4096, 32, 32, 128, 1),
-            ("SFNN_halfka2_2048_31_64_c0_s128x16_k3k3", 2048, 32, 16, 128, 2),
+        for (arch, ft_size, l1_hidden, l1_skip, group_count, group_input, group_output) in [
+            ("SFNN_halfka2_4096_8_64_c0_s1024x4_k3k3", 4096, 8, false, 4, 1024, 2),
+            ("SFNN_halfka2_8192_8_64_c0_s2048x4_k3k3", 8192, 8, false, 4, 2048, 2),
+            ("SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3", 4096, 7, true, 4, 1024, 2),
+            ("SFNN_halfka2_8192_7_64_c0_s1024x8_k3k3", 8192, 7, true, 8, 1024, 1),
+            ("SFNN_halfka2_4096_7_64_c0_s512x8_k3k3", 4096, 7, true, 8, 512, 1),
+            ("SFNN_halfka2_4096_15_64_c0_s256x16_k3k3", 4096, 15, true, 16, 256, 1),
+            ("SFNN_halfka2_8192_15_64_c0_s512x16_k3k3", 8192, 15, true, 16, 512, 1),
+            ("SFNN_halfka2_4096_31_64_c0_s128x32_k3k3", 4096, 31, true, 32, 128, 1),
+            ("SFNN_halfka2_2048_31_64_c0_s128x16_k3k3", 2048, 31, true, 16, 128, 2),
         ] {
             let args = Args::try_parse_from([
                 "bulletou",
@@ -18379,7 +18400,8 @@ mod tests {
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
                 input_size: CudaCppSfnnFeatureKind::Halfka2.training_input_size(),
                 ft_size,
-                l1_hidden: l1_out - 1,
+                l1_hidden,
+                l1_skip,
                 l2_size: 64,
                 num_stacks: 9,
                 l1_group_count: args.arch().sfnn_l1_group_count(),
@@ -18401,6 +18423,8 @@ mod tests {
                 "{arch}"
             );
         }
+
+        assert!(NnueArch::from_str("SFNN_halfka2_4096_3_64_c0_s1024x4_k3k3").is_err());
 
         let args = Args::try_parse_from([
             "bulletou",
@@ -18448,6 +18472,7 @@ mod tests {
                 input_size: feature_kind.training_input_size(),
                 ft_size,
                 l1_hidden: 7,
+                l1_skip: true,
                 l2_size: 64,
                 num_stacks: 9,
                 l1_group_count: args.arch().sfnn_l1_group_count(),
@@ -18478,6 +18503,7 @@ mod tests {
             input_size: feature_kind.training_input_size(),
             ft_size: 4,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 2,
             num_stacks: 4,
             l1_group_count: 2,
@@ -18567,6 +18593,7 @@ mod tests {
                 input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
                 ft_size,
                 l1_hidden: l1_out - 1,
+                l1_skip: true,
                 l2_size,
                 num_stacks: 9,
                 l1_group_count: args.arch().sfnn_l1_group_count(),
@@ -18820,6 +18847,7 @@ mod tests {
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
@@ -18995,6 +19023,7 @@ mod tests {
             input_size: 4,
             ft_size: 3,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
@@ -19037,6 +19066,7 @@ mod tests {
             input_size: 4,
             ft_size: 3,
             l1_hidden: 2,
+            l1_skip: true,
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
@@ -19089,6 +19119,7 @@ mod tests {
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 1,
             num_stacks: 4,
             l1_group_count: 1,
@@ -19127,6 +19158,7 @@ mod tests {
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 1,
             num_stacks: 4,
             l1_group_count: 1,
@@ -19253,6 +19285,7 @@ mod tests {
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
+            l1_skip: true,
             l2_size: 1,
             num_stacks: 4,
             l1_group_count: 1,

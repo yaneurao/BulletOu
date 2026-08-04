@@ -2,7 +2,7 @@
 //!
 //! This mirrors the `SFNN_halfka2_1024_7_64_k3k3` forward path built in
 //! `examples/bulletou.rs`: sparse FT, CReLU, pairwise multiplication,
-//! LayerStack-selected L1/L2/L3, and the SFNN PSQT shortcut.
+//! LayerStack-selected L1/L2/L3, and the optional SFNN PSQT shortcut.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -20,6 +20,7 @@ pub struct SfnnForwardShape {
     pub input_size: usize,
     pub ft_size: usize,
     pub l1_hidden: usize,
+    pub l1_skip: bool,
     pub l2_size: usize,
     pub num_stacks: usize,
     pub l1_group_count: usize,
@@ -29,6 +30,7 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
     input_size: HALFKA2_DIMENSIONS,
     ft_size: 1024,
     l1_hidden: 7,
+    l1_skip: true,
     l2_size: 64,
     num_stacks: 9,
     l1_group_count: 1,
@@ -37,8 +39,12 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
 
 impl SfnnForwardShape {
+    pub fn has_l1_skip(self) -> bool {
+        self.l1_skip
+    }
+
     pub fn l1_out(self) -> usize {
-        self.l1_hidden + 1
+        self.l1_hidden + usize::from(self.l1_skip)
     }
 
     pub fn l2_in(self) -> usize {
@@ -378,7 +384,7 @@ impl<'a> SfnnForwardWeights<'a> {
             let l1 = &mut trace.l1[l1_start..l1_end];
             affine_sfnn_l1(self.l1w, self.l1b, combined, shape, stack, l1);
 
-            let l1_skip = l1[shape.l1_hidden];
+            let l1_skip = if shape.has_l1_skip() { l1[shape.l1_hidden] } else { 0.0 };
             fill_l2_input(l1, shape.l1_hidden, &mut trace.l2_input[l2_input_start..l2_input_end]);
 
             let l2_input = &trace.l2_input[l2_input_start..l2_input_end];
@@ -546,8 +552,15 @@ mod tests {
 
     #[test]
     fn workspace_layout_counts_forward_activations() {
-        let shape =
-            SfnnForwardShape { input_size: 4, ft_size: 6, l1_hidden: 2, l2_size: 3, num_stacks: 2, l1_group_count: 1 };
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 6,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 3,
+            num_stacks: 2,
+            l1_group_count: 1,
+        };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
         assert_eq!(layout.l0_len(), 30);
@@ -662,8 +675,15 @@ mod tests {
 
     #[test]
     fn shape_validation_requires_even_ft_size() {
-        let shape =
-            SfnnForwardShape { input_size: 4, ft_size: 3, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 };
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 3,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+        };
 
         let err = shape.validate().unwrap_err();
 
@@ -671,7 +691,15 @@ mod tests {
     }
 
     fn tiny_shape() -> SfnnForwardShape {
-        SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l2_size: 2, num_stacks: 2, l1_group_count: 1 }
+        SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+        }
     }
 
     fn tiny_batch() -> FastBatchHost {

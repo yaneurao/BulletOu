@@ -654,21 +654,27 @@ bool sfnn_is_common_shard_l1_shape(size_t l1_common_size, size_t l1_shard_size) 
     return l1_common_size != 0 || l1_shard_size != 0;
 }
 
+__host__ __device__ inline size_t sfnn_l1_out_for_shape(size_t l1_hidden, int l1_skip) {
+    return l1_hidden + (l1_skip != 0 ? 1 : 0);
+}
+
 size_t sfnn_l1w_len_for_shape(
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t num_stacks,
     size_t l1_group_count,
     size_t l1_common_size,
     size_t l1_shard_size) {
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     if (sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size)) {
         (void)ft_size;
-        return num_stacks * (l1_hidden + 1) * (l1_common_size + l1_shard_size);
+        return num_stacks * l1_out * (l1_common_size + l1_shard_size);
     }
     if (sfnn_is_grouped_l1_shape(l1_group_count)) {
-        return num_stacks * l1_group_count * ((l1_hidden + 1) / l1_group_count) * (ft_size / l1_group_count);
+        return num_stacks * l1_group_count * (l1_out / l1_group_count) * (ft_size / l1_group_count);
     }
-    return num_stacks * (l1_hidden + 1) * ft_size;
+    return num_stacks * l1_out * ft_size;
 }
 
 __device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_size, size_t* out_feature) {
@@ -1049,7 +1055,7 @@ __global__ void sfnn_common_shard_l1_kernel(
     output[tid] = sum;
 }
 
-__global__ void sfnn_l2_input_kernel(const float* l1, float* output, size_t batch, size_t l1_hidden) {
+__global__ void sfnn_l2_input_kernel(const float* l1, float* output, size_t batch, size_t l1_hidden, int l1_skip) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t l2_input_dim = l1_hidden * 2;
     size_t total = batch * l2_input_dim;
@@ -1060,7 +1066,7 @@ __global__ void sfnn_l2_input_kernel(const float* l1, float* output, size_t batc
     size_t col = tid % l2_input_dim;
     size_t sample = tid / l2_input_dim;
     size_t source_col = col % l1_hidden;
-    size_t l1_out = l1_hidden + 1;
+    size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     float value = l1[sample * l1_out + source_col];
     if (col < l1_hidden) {
         float abs_value = fabsf(value);
@@ -1154,6 +1160,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
     size_t batch,
     size_t input_dim,
     size_t l1_hidden,
+    int l1_skip,
     size_t num_stacks,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
@@ -1204,7 +1211,10 @@ __global__ void sfnn_stacked_l3_output_kernel(
         }
         sum += input[input_base + in_col] * weight;
     }
-    output[sample] = sum + l1[sample * (l1_hidden + 1) + l1_hidden];
+    if (l1_skip != 0) {
+        sum += l1[sample * sfnn_l1_out_for_shape(l1_hidden, l1_skip) + l1_hidden];
+    }
+    output[sample] = sum;
 }
 
 __device__ float loss_sigmoid(float value) {
@@ -1546,6 +1556,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     size_t batch,
     size_t input_dim,
     size_t l1_out,
+    int l1_skip,
     size_t num_stacks,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
@@ -1605,7 +1616,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     if (tid < l1_gradient_len) {
         size_t sample = tid / l1_out;
         size_t col = tid - sample * l1_out;
-        l1_gradients[tid] = (col + 1 == l1_out) ? output_gradients[sample] : 0.0f;
+        l1_gradients[tid] = (l1_skip != 0 && col + 1 == l1_out) ? output_gradients[sample] : 0.0f;
     }
 
     if (compute_parameter_gradients != 0 && tid < batch) {
@@ -1780,9 +1791,10 @@ __global__ void sfnn_l2_input_backward_kernel(
     const float* l2_input_gradients,
     float* l1_gradients,
     size_t batch,
-    size_t l1_hidden) {
+    size_t l1_hidden,
+    int l1_skip) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t l1_out = l1_hidden + 1;
+    size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     size_t total = batch * l1_out;
     if (tid >= total) {
         return;
@@ -3266,6 +3278,7 @@ int validate_sfnn_shape(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -3281,16 +3294,17 @@ int validate_sfnn_shape(
     if ((ft_size % 2) != 0) {
         return fail_message("SFNN ft_size must be even");
     }
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     if (common_shard_l1 &&
         (l1_shard_size == 0 || l1_group_count <= 1 ||
             l1_common_size + l1_shard_size * l1_group_count != ft_size ||
-            ((l1_hidden + 1) % l1_group_count) != 0 ||
+            (l1_out % l1_group_count) != 0 ||
             (l1_common_size % 64) != 0 || (l1_shard_size % 64) != 0)) {
-        return fail_message("SFNN common+shard L1 requires common + shard * group == ft_size, H1+1 divisible by group, shard > 0, and common/shard multiples of 64");
+        return fail_message("SFNN common+shard L1 requires common + shard * group == ft_size, fc0 output count divisible by group, shard > 0, and common/shard multiples of 64");
     }
-    if (!common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count) && (ft_size % l1_group_count != 0 || ((l1_hidden + 1) % l1_group_count) != 0)) {
-        return fail_message("SFNN grouped L1 requires ft_size and l1_hidden+1 to be divisible by l1_group_count");
+    if (!common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count) && (ft_size % l1_group_count != 0 || (l1_out % l1_group_count) != 0)) {
+        return fail_message("SFNN grouped L1 requires ft_size and fc0 output count to be divisible by l1_group_count");
     }
     if (factorizer_king_axis_dim != 0 && factorizer_king_axis_dim > SIZE_MAX / factorizer_king_axis_dim) {
         return fail_message("SFNN king axis bucket count overflow");
@@ -3474,6 +3488,7 @@ int launch_sfnn_forward_kernels(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -3526,6 +3541,7 @@ int launch_sfnn_forward_kernels(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -3544,7 +3560,7 @@ int launch_sfnn_forward_kernels(
     constexpr int threads = 256;
     int blocks = 0;
     const size_t pairwise = ft_size / 2;
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
@@ -3666,7 +3682,7 @@ int launch_sfnn_forward_kernels(
     if (block_count_1d(batch * l2_in, threads, &blocks, "sfnn_l2_input_kernel") != 0) {
         return -1;
     }
-    sfnn_l2_input_kernel<<<blocks, threads, 0, ctx->stream>>>(l1, l2_input, batch, l1_hidden);
+    sfnn_l2_input_kernel<<<blocks, threads, 0, ctx->stream>>>(l1, l2_input, batch, l1_hidden, l1_skip);
     if (check_kernel_launch("sfnn_l2_input_kernel launch") != 0) {
         return -1;
     }
@@ -3715,6 +3731,7 @@ int launch_sfnn_forward_kernels(
         batch,
         l2_size,
         l1_hidden,
+        l1_skip,
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
@@ -3750,6 +3767,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -3778,11 +3796,11 @@ int launch_zero_sfnn_backward_parameter_gradients(
     float* l3axw_gradients,
     float* l3axb_gradients,
     int zero_l0w_gradients) {
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = 2 * factorizer_king_axis_dim + 2 * factorizer_hand_axis_dim;
     const size_t l1w_len =
-        sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
+        sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     if (zero_l0w_gradients != 0 &&
         launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0) {
         return -1;
@@ -4172,6 +4190,7 @@ int launch_sfnn_backward_kernels(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -4244,6 +4263,7 @@ int launch_sfnn_backward_kernels(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -4259,7 +4279,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
@@ -4285,6 +4305,7 @@ int launch_sfnn_backward_kernels(
                 input_size,
                 ft_size,
                 l1_hidden,
+                l1_skip,
                 l2_size,
                 num_stacks,
                 l1_group_count,
@@ -4343,6 +4364,7 @@ int launch_sfnn_backward_kernels(
         batch,
         l2_size,
         l1_out,
+        l1_skip,
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
@@ -4462,7 +4484,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
     sfnn_l2_input_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden);
+        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip);
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
         return -1;
     }
@@ -5957,6 +5979,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -6005,17 +6028,18 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     BulletOuCudaCppF32Buffer* l2_input,
     BulletOuCudaCppF32Buffer* l2,
     BulletOuCudaCppF32Buffer* output) {
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = 2 * factorizer_king_axis_dim + 2 * factorizer_hand_axis_dim;
     const size_t l1w_len =
-        sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
+        sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
     if (validate_sfnn_shape(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -6109,6 +6133,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -6772,6 +6797,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -6836,17 +6862,18 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     BulletOuCudaCppF32Buffer* l3fb_gradients,
     BulletOuCudaCppF32Buffer* l3axw_gradients,
     BulletOuCudaCppF32Buffer* l3axb_gradients) {
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = 2 * factorizer_king_axis_dim + 2 * factorizer_hand_axis_dim;
     const size_t l1w_len =
-        sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
+        sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
     if (validate_sfnn_shape(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -6953,6 +6980,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -7032,6 +7060,7 @@ int sfnn_backward_train_device_impl(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -7099,17 +7128,18 @@ int sfnn_backward_train_device_impl(
     int zero_parameter_gradients,
     float* profile_ms,
     size_t profile_ms_len) {
-    const size_t l1_out = l1_hidden + 1;
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = 2 * factorizer_king_axis_dim + 2 * factorizer_hand_axis_dim;
     const size_t l1w_len =
-        sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
+        sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
     if (validate_sfnn_shape(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -7216,6 +7246,7 @@ int sfnn_backward_train_device_impl(
             input_size,
             ft_size,
             l1_hidden,
+            l1_skip,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -7295,6 +7326,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -7365,6 +7397,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         input_size,
         ft_size,
         l1_hidden,
+        l1_skip,
         l2_size,
         num_stacks,
         l1_group_count,
@@ -7439,6 +7472,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     size_t input_size,
     size_t ft_size,
     size_t l1_hidden,
+    int l1_skip,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -7511,6 +7545,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         input_size,
         ft_size,
         l1_hidden,
+        l1_skip,
         l2_size,
         num_stacks,
         l1_group_count,

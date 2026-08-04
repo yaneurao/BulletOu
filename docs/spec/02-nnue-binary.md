@@ -194,7 +194,7 @@ bulletou は file を行優先で出力するだけで OK。padding (in ≥ in_d
 
 1. **FT は LEB128 圧縮** (`USE_ELEMENT_WISE_MULTIPLY` 経路、`nnue_feature_transformer.h:180-182`)。SFNN ビルドで自動 enable される
 2. **Network は 9 個の独立した stack** (`LayerStacks = 9`、`sfnnwop-1536.h:29`)
-3. **PSQT shortcut neuron** (`fc_0` の出力次元 = `kHidden1Dims + 1`、最後の 1 neuron は活性化を通さず `fc_2_out[0]` に直接加算)
+3. **PSQT shortcut neuron** (`kHidden1Dims = 8n - 1` の SFNN では `fc_0` の出力次元 = `kHidden1Dims + 1`、最後の 1 neuron は活性化を通さず `fc_2_out[0]` に直接加算。`kHidden1Dims = 8n` の SFNN では shortcut なし)
 4. **SqrCReLU + CReLU pair** (`fc_0` 出力を CReLU と SqrCReLU の両方に通して結合 → `fc_1` 入力)
 5. **3 種の hash 値はやねうら王側でハードコード固定値**
 

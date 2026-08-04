@@ -311,6 +311,7 @@ fn tiny_sfnn_shape() -> SfnnForwardShape {
         input_size: 4,
         ft_size: 4,
         l1_hidden: 2,
+        l1_skip: true,
         l2_size: 2,
         num_stacks: 2,
         l1_group_count: 1,
@@ -425,7 +426,7 @@ fn cpu_tiny_sfnn_forward(batch: SfnnForwardHostBatch<'_>, weights: SfnnForwardHo
             }
         }
 
-        let psqt = l1[shape.l1_hidden];
+        let psqt = if shape.has_l1_skip() { l1[shape.l1_hidden] } else { 0.0 };
         let mut l2_input = vec![0.0; shape.l2_in()];
         for col in 0..shape.l2_in() {
             let value = l1[col % shape.l1_hidden];
