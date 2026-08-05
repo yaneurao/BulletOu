@@ -40,7 +40,7 @@ The options you are most likely to change:
 | Save less often | `--save-rate` | `--save-rate 9999` usually leaves only epoch-end saves |
 | Validate every sb | `--validation-rate` | `--validation-rate 1` |
 | Use tatara-style StepLR | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
-| Change WRM loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
+| Try WRM loss | `--win-rate-model` | `--win-rate-model --loss-pow-exp 2.5` |
 | Disable SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
 Fuller option table:
@@ -69,12 +69,14 @@ Fuller option table:
 | `--lr-step-gamma` | Multiplicative factor for `step` schedule | auto / 0.992 |
 | `--lr-step-positions` | Positions between LR drops. Omitted means one drop per sb | omitted |
 | `--lambda` | Blend between teacher score and game result | 1.0 |
-| `--win-rate-model` | Convert teacher score to a win-rate label and train in that space | on |
-| `--loss-sigmoid-mse` | Use MSE on `sigmoid(model_output)` instead of WRM, for comparison experiments | off |
+| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu estimates it from the teacher data | omitted |
+| `--scale-calibration-positions` | Number of teacher-prefix positions used to estimate `--scale`. `0` uses the built-in fallback | 100000 |
+| `--loss-sigmoid-mse` | Explicitly select sigmoid-MSE. This is also the normal default | on |
+| `--win-rate-model` | Use WRM loss for comparison experiments | off |
 | `--loss-pow-exp` | Exponent in WRM loss. `2.0` is squared error; `2.5` is also a useful experiment | 2.0 |
 | `--wrm-nnue2score` | Multiplier that maps network output back to score scale for WRM prediction | 600 |
-| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate teacher-score → win-rate-label coefficients. `0` uses built-in coefficients without estimation | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | Manually set teacher-score → win-rate-label coefficients. Usually do not pass these | omitted |
+| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate WRM teacher-score → win-rate-label coefficients | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | Manually set WRM teacher-score → win-rate-label coefficients. Usually do not pass these | omitted |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets. Usually `shared` | `shared` |
 | `--optimizer` | Optimizer. Usually leave as `ranger` | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
@@ -154,63 +156,64 @@ training label = λ × label from teacher score + (1 - λ) × label from game re
 
 Start with `1.0`. Try values such as `0.5` or `0.7` only when you intentionally want game results to affect the training label.
 
-## 5. WRM loss
+## 5. Loss and score scale
 
-WRM means win-rate model. BulletOu does not feed teacher scores directly into the loss. It first converts a teacher score such as `+300` into a 0–1 win-rate-like label, converts the network output into the same 0–1 space, then compares them. This is the default loss.
+Normal training uses sigmoid-MSE. BulletOu converts the teacher score to a 0–1 label, converts the network output to 0–1, and minimizes squared error.
 
-WRM changes three things:
+```text
+target     = sigmoid(teacher_score / scale)
+prediction = sigmoid(network_output)
+loss       = (prediction - target)^2
+```
 
-| Item | What happens |
-|---|---|
-| Teacher score | Converted to a win-rate label |
-| Network output | Converted to a win-rate prediction |
-| Loss | Uses `abs(label - prediction)^p` |
+`scale` controls how teacher scores are mapped into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from the first 100,000 teacher positions.
 
-`p` is `--loss-pow-exp`.
+```bash
+# Estimate scale automatically
+./target/release/examples/bulletou \
+    --teacher teachers/ \
+    --test-teacher test.hcpe \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --tag sigmoid-auto-scale
+```
+
+Use `--scale-calibration-positions` to change the prefix size used for estimation.
+
+```bash
+--scale-calibration-positions 300000
+```
+
+Set `--scale` only when you intentionally want a fixed scale for a comparison experiment.
+
+```bash
+--scale 6000
+```
+
+### Trying WRM loss
+
+WRM means win-rate model. It still compares values in a 0–1 space, but it uses a WRM curve for the network-output side.
+
+Pass `--win-rate-model` to use WRM. `--loss-pow-exp` is the exponent applied to the WRM error term.
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --win-rate-model \
     --loss-pow-exp 2.5 \
     --tag wrm-pow25
 ```
 
-### Coefficients for teacher-score → win-rate-label conversion
-
-Converting teacher scores to win-rate labels needs a coefficient that matches the teacher’s score scale. By default, BulletOu estimates the plain-sigmoid `scale` from the first 100,000 teacher positions.
-
-```text
-target = sigmoid(teacher_score / scale)
-```
-
-Change the sample size with `--wrm-target-calibration-positions`.
+The WRM teacher-score → win-rate-label coefficients are used only when `--win-rate-model` is selected. Usually, do not pass these options.
 
 ```bash
-# Estimate from the first 300,000 positions
+# Change the prefix size used to estimate WRM coefficients
 --wrm-target-calibration-positions 300000
-```
 
-Use `0` only for comparison experiments where you want the built-in fixed curve.
-
-```bash
---wrm-target-calibration-positions 0
-```
-
-That uses the built-in coefficients `offset=270`, `scaling=380`. If you must set the values explicitly, pass both:
-
-```bash
+# Manually fix WRM coefficients
 --wrm-target-offset 270 --wrm-target-scaling 380
 ```
-
-To manually keep a plain sigmoid target, set `offset=0`:
-
-```bash
---wrm-target-offset 0 --wrm-target-scaling 6000
-```
-
-For normal training, do not pass these options. Use the default estimation.
 
 ### Check the score→win-rate shape on your teacher data
 
@@ -242,9 +245,9 @@ If `delta(WRM - sigmoid)` is negative, WRM fits that teacher data better. If it 
 
 `--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`. Change it only for explicit comparison experiments, for example when matching tatara settings.
 
-### Comparing with sigmoid-MSE
+### Explicitly selecting sigmoid-MSE
 
-To train with MSE on `sigmoid(model_output)` instead of WRM, pass:
+This is normally unnecessary, but you can pass the flag when you want logs or scripts to state the loss explicitly.
 
 ```bash
 --loss-sigmoid-mse

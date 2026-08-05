@@ -1200,13 +1200,12 @@ struct QuantizedTestArgs {
     #[arg(long, default_value = "290")]
     scale: u32,
 
-    /// Use tatara-style win-rate-model validation loss. This is the default
-    /// for quantized SFNN testing; the flag is accepted for command-line
-    /// parity with training runs.
+    /// Use tatara-style win-rate-model validation loss for quantized SFNN
+    /// testing. The default is sigmoid-MSE.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use the legacy sigmoid(model_output)-MSE validation loss.
+    /// Use sigmoid-MSE validation loss. This is the default.
     #[arg(long)]
     loss_sigmoid_mse: bool,
 
@@ -1382,12 +1381,12 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "290")]
     scale: u32,
 
-    /// Use tatara-style win-rate-model validation loss. This is the default
-    /// for quantized SFNN calibration.
+    /// Use tatara-style win-rate-model validation loss for quantized SFNN
+    /// calibration. The default is sigmoid-MSE.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use the legacy sigmoid(model_output)-MSE validation loss.
+    /// Use sigmoid-MSE validation loss. This is the default.
     #[arg(long)]
     loss_sigmoid_mse: bool,
 
@@ -2518,6 +2517,8 @@ const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
+const DEFAULT_SIGMOID_SCALE: f32 = 290.0;
+const DEFAULT_SCALE_CALIBRATION_POSITIONS: usize = 100_000;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
@@ -3173,7 +3174,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "loss_or_accuracy")]
     lr_plateau_monitor: PlateauMonitor,
 
-    /// Lambda  Eweight on the teacher's evaluation score (vs the actual
+    /// Lambda: weight on the teacher's evaluation score (vs the actual
     /// game result) in the loss target. Matches YaneuraOu's built-in
     /// trainer convention:
     ///
@@ -3190,23 +3191,30 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale.
-    #[arg(long, default_value = "290")]
-    scale: u32,
+    /// Eval-to-score sigmoid scale for sigmoid-MSE. If omitted, BulletOu
+    /// estimates it from a teacher-data prefix.
+    #[arg(long)]
+    scale: Option<f32>,
 
-    /// Use tatara-style win-rate-model target conversion and WRM loss for
-    /// scalar value networks. This is the default; the flag is kept for
-    /// tatara-compatible explicitness.
+    /// Number of teacher-prefix positions used to estimate `--scale` when
+    /// sigmoid-MSE is selected and `--scale` is omitted. Set to `0` to use
+    /// the built-in fallback scale.
+    #[arg(long, default_value_t = DEFAULT_SCALE_CALIBRATION_POSITIONS)]
+    scale_calibration_positions: usize,
+
+    /// Use tatara-style win-rate-model prediction conversion and WRM loss for
+    /// scalar value networks. The default is sigmoid-MSE with an automatically
+    /// estimated sigmoid scale.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use the legacy sigmoid(model_output)-MSE value loss instead of the
-    /// default win-rate-model loss.
+    /// Use sigmoid-MSE value loss. This is the default;
+    /// the flag is kept so scripts can state the loss explicitly.
     #[arg(long)]
     loss_sigmoid_mse: bool,
 
     /// Exponent of the WRM error term `|prediction - target|^p`.
-    /// Used by the default WRM loss unless `--loss-sigmoid-mse` is selected.
+    /// Used only when `--win-rate-model` is selected.
     /// The tatara default is 2.0; nnue-pytorch-style experiments commonly use 2.5.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
@@ -3582,6 +3590,11 @@ impl Args {
         if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
             return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
         }
+        if let Some(scale) = self.scale {
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err(format!("--scale must be finite and > 0 (got {scale})"));
+            }
+        }
         match (self.wrm_target_offset, self.wrm_target_scaling) {
             (Some(offset), Some(scaling)) => {
                 if WinRateModelTargetParams::new(offset, scaling).is_none() {
@@ -3747,7 +3760,7 @@ fn effective_win_rate_model(args: &Args) -> bool {
     if args.loss_sigmoid_mse {
         return false;
     }
-    args.win_rate_model || args.eval_type().supports_win_rate_model()
+    args.win_rate_model
 }
 
 fn effective_loss_pow_exp(args: &Args) -> f32 {
@@ -3758,7 +3771,12 @@ fn effective_wrm_nnue2score(args: &Args) -> f32 {
     if effective_win_rate_model(args) { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
 }
 
+static RUNTIME_SIGMOID_SCALE: OnceLock<f32> = OnceLock::new();
 static RUNTIME_WRM_TARGET_PARAMS: OnceLock<WinRateModelTargetParams> = OnceLock::new();
+
+fn effective_scale(args: &Args) -> f32 {
+    args.scale.or_else(|| RUNTIME_SIGMOID_SCALE.get().copied()).unwrap_or(DEFAULT_SIGMOID_SCALE)
+}
 
 fn explicit_wrm_target_params(args: &Args) -> Option<WinRateModelTargetParams> {
     match (args.wrm_target_offset, args.wrm_target_scaling) {
@@ -3780,6 +3798,9 @@ fn effective_wrm_target_params(args: &Args) -> WinRateModelTargetParams {
 fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, String> {
     if !effective_win_rate_model(args) {
         return Ok(WinRateModelTargetParams::DEFAULT);
+    }
+    if let Some(params) = RUNTIME_WRM_TARGET_PARAMS.get().copied() {
+        return Ok(params);
     }
 
     let params = if let Some(params) = explicit_wrm_target_params(args) {
@@ -3839,6 +3860,75 @@ fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
+    if let Some(scale) = RUNTIME_SIGMOID_SCALE.get().copied() {
+        return Ok(scale);
+    }
+
+    let scale = if let Some(scale) = args.scale {
+        print_startup_kv("sigmoid scale", format!("fixed: {:.3}", scale));
+        scale
+    } else if args.scale_calibration_positions == 0 {
+        print_startup_kv("sigmoid scale", format!("fixed built-in: {:.3}", DEFAULT_SIGMOID_SCALE));
+        DEFAULT_SIGMOID_SCALE
+    } else {
+        let report = estimate_wrm_target_from_teacher_prefix(&WrmTargetCalibrationConfig {
+            teacher: &args.teacher,
+            positions: args.scale_calibration_positions,
+            buffer_mb: args.buffer_mb,
+            loader_threads: cuda_cpp_effective_loader_threads(args),
+            score_drop_abs: if args.score_drop_abs == 0 { None } else { Some(args.score_drop_abs) },
+        })
+        .map_err(|err| format!("failed to estimate sigmoid scale from teacher prefix: {err}"))?;
+        print_sigmoid_scale_calibration_report(report);
+        report.params.scaling
+    };
+
+    let _ = RUNTIME_SIGMOID_SCALE.set(scale);
+    Ok(scale)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_sigmoid_scale_calibration_report(report: WrmTargetCalibrationReport) {
+    let value = if report.fitted {
+        format!(
+            "auto: scale={:.3}, sampled={}/{}, fitted={}, decisive={}, draws={}, filtered={}, bce={:.6}",
+            report.params.scaling,
+            format_count(report.observed_positions),
+            format_count(report.requested_positions),
+            format_count(report.fitted_positions),
+            format_count(report.decisive_positions),
+            format_count(report.drawn_positions),
+            format_count(report.filtered_positions),
+            report.bce_loss,
+        )
+    } else {
+        format!(
+            "auto fallback: scale={:.3}, sampled={}/{}, fitted={}, filtered={}",
+            report.params.scaling,
+            format_count(report.observed_positions),
+            format_count(report.requested_positions),
+            format_count(report.fitted_positions),
+            format_count(report.filtered_positions),
+        )
+    };
+    print_startup_kv("sigmoid scale", value);
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
+    if effective_win_rate_model(args) {
+        if let Some(scale) = args.scale {
+            let _ = RUNTIME_SIGMOID_SCALE.set(scale);
+        }
+        resolve_wrm_target_params(args)?;
+    } else {
+        resolve_sigmoid_scale(args)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
     if effective_win_rate_model(args) {
         bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
@@ -3861,7 +3951,7 @@ fn value_loss_label(args: &Args) -> String {
             wrm_target.scaling
         )
     } else {
-        "sigmoid-mse".to_string()
+        format!("sigmoid-mse(scale={:.3})", effective_scale(args))
     }
 }
 
@@ -4572,7 +4662,7 @@ fn quantized_sfnn_raw_output_scale() -> f32 {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_test_uses_wrm(args: &QuantizedTestArgs) -> bool {
-    !args.loss_sigmoid_mse
+    args.win_rate_model
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5959,6 +6049,12 @@ fn main() {
         eprintln!("error: --wrm-nnue2score must be finite and > 0 (got {}).", args.wrm_nnue2score);
         std::process::exit(2);
     }
+    if let Some(scale) = args.scale {
+        if !(scale.is_finite() && scale > 0.0) {
+            eprintln!("error: --scale must be finite and > 0 (got {}).", scale);
+            std::process::exit(2);
+        }
+    }
     let teacher_shuffle_boundary_batches = args.cuda_cpp_train_steps.unwrap_or(batches_per_superbatch);
     if let Err(e) = validate_teacher_shuffle_buffer(&args, teacher_shuffle_boundary_batches) {
         eprintln!("error: {e}");
@@ -5999,6 +6095,11 @@ fn main() {
         }
     }
     if let Err(e) = args.validate_backend_flags() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    if let Err(e) = resolve_value_loss_runtime_params(&args) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
@@ -6447,7 +6548,7 @@ where
                 threads: options.teacher_threads,
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
-                scale: args.scale as f32,
+                scale: effective_scale(args),
                 win_rate_model: effective_win_rate_model(args),
                 wrm_target: effective_wrm_target_params(args),
                 ft_factorize: false,
@@ -6477,7 +6578,7 @@ where
                 threads: options.teacher_threads,
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
-                scale: args.scale as f32,
+                scale: effective_scale(args),
                 win_rate_model: effective_win_rate_model(args),
                 wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -6506,7 +6607,7 @@ where
                 threads: options.teacher_threads,
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
-                scale: args.scale as f32,
+                scale: effective_scale(args),
                 win_rate_model: effective_win_rate_model(args),
                 wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -6541,7 +6642,7 @@ where
                 threads: options.teacher_threads,
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
-                scale: args.scale as f32,
+                scale: effective_scale(args),
                 win_rate_model: effective_win_rate_model(args),
                 wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -6576,7 +6677,7 @@ where
                 threads: options.teacher_threads,
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
-                scale: args.scale as f32,
+                scale: effective_scale(args),
                 win_rate_model: effective_win_rate_model(args),
                 wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -6699,7 +6800,7 @@ where
         threads: options.teacher_threads,
         queue_depth: options.queue_depth,
         lambda: args.lambda,
-        scale: args.scale as f32,
+        scale: effective_scale(args),
         win_rate_model: effective_win_rate_model(args),
         wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -8570,7 +8671,7 @@ fn run_cuda_cpp_sfnn_teacher_prepare_benchmark(args: &Args) -> Result<(), String
         threads: teacher_threads,
         queue_depth: batch_queue_size,
         lambda: args.lambda,
-        scale: args.scale as f32,
+        scale: effective_scale(args),
         win_rate_model: effective_win_rate_model(args),
         wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -8956,7 +9057,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         threads: teacher_threads,
         queue_depth: batch_queue_size,
         lambda: args.lambda,
-        scale: args.scale as f32,
+        scale: effective_scale(args),
         win_rate_model: effective_win_rate_model(args),
         wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -9015,7 +9116,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     threads: teacher_threads,
                     queue_depth: batch_queue_size,
                     lambda: args.lambda,
-                    scale: args.scale as f32,
+                    scale: effective_scale(args),
                     win_rate_model: effective_win_rate_model(args),
                     wrm_target: effective_wrm_target_params(args),
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
@@ -14263,7 +14364,8 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_min_delta={:.9}", args.lr_plateau_min_delta),
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
-        format!("scale={}", args.scale),
+        format!("scale={:.6}", effective_scale(args)),
+        format!("scale_calibration_positions={}", args.scale_calibration_positions),
         format!("win_rate_model={}", effective_win_rate_model(args)),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
@@ -15727,7 +15829,7 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
         &cache.teacher_results,
         &cache.sample_mask,
         args.lambda,
-        args.scale as f32,
+        effective_scale(args),
         1.0,
         validation_loss_kind(args),
     );
@@ -19622,13 +19724,13 @@ mod tests {
     }
 
     #[test]
-    fn win_rate_model_loss_pow_exp_replaces_old_wrm_flag() {
+    fn win_rate_model_is_explicit_and_loss_pow_exp_replaces_old_wrm_flag() {
         use clap::Parser as _;
 
         let default_args =
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
-        assert!(effective_win_rate_model(&default_args));
-        assert!(value_loss_label(&default_args).contains("win-rate-model"));
+        assert!(!effective_win_rate_model(&default_args));
+        assert_eq!(value_loss_label(&default_args), format!("sigmoid-mse(scale={:.3})", DEFAULT_SIGMOID_SCALE));
 
         let sigmoid_args = Args::try_parse_from([
             "bulletou",
@@ -19640,10 +19742,10 @@ mod tests {
         ])
         .unwrap();
         assert!(!effective_win_rate_model(&sigmoid_args));
-        assert_eq!(value_loss_label(&sigmoid_args), "sigmoid-mse");
+        assert_eq!(value_loss_label(&sigmoid_args), format!("sigmoid-mse(scale={:.3})", DEFAULT_SIGMOID_SCALE));
 
         let kppt_default = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
-        assert!(effective_win_rate_model(&kppt_default));
+        assert!(!effective_win_rate_model(&kppt_default));
 
         let conflict = Args::try_parse_from([
             "bulletou",
@@ -20015,7 +20117,9 @@ mod tests {
         assert!(!auto);
         assert_eq!(args.lr_step_positions, None);
         assert_eq!(args.optimizer_weight_decay, 0.0);
-        assert_eq!(args.scale, 290);
+        assert_eq!(args.scale, None);
+        assert_eq!(args.scale_calibration_positions, DEFAULT_SCALE_CALIBRATION_POSITIONS);
+        assert_eq!(effective_scale(&args), DEFAULT_SIGMOID_SCALE);
         assert_eq!(args.save_rate, None);
         assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);
         assert_eq!(args.validation_rate, None);

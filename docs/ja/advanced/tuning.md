@@ -40,7 +40,7 @@ BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。�
 | checkpoint 保存を減らす | `--save-rate` | `--save-rate 9999` なら epoch 末だけ保存しやすい |
 | accuracy/loss は毎 sb 見る | `--validation-rate` | `--validation-rate 1` |
 | tatara と同じように LR を落とす | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
-| WRM loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
+| WRM loss を試す | `--win-rate-model` | `--win-rate-model --loss-pow-exp 2.5` |
 | SFNN の factorizer を切る | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
 詳細な一覧です。
@@ -69,12 +69,14 @@ BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。�
 | `--lr-step-gamma` | `step` で学習率に掛ける倍率 | 自動 / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は 1 sb ごと | 省略 |
 | `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
-| `--win-rate-model` | 教師評価値を勝率に直して loss を計算する。デフォルトで有効 | on |
-| `--loss-sigmoid-mse` | WRM ではなく `sigmoid(model_output)` の MSE で学習する比較用設定 | off |
+| `--scale` | 教師評価値を `sigmoid(score / scale)` に変換するときの scale。省略時は教師データから推定 | 省略 |
+| `--scale-calibration-positions` | `--scale` 省略時、教師先頭何局面から scale を推定するか。`0` なら内蔵値を使う | 100000 |
+| `--loss-sigmoid-mse` | sigmoid-MSE を明示する。指定しなくても通常はこの loss | on |
+| `--win-rate-model` | WRM loss を使う比較実験用設定 | off |
 | `--loss-pow-exp` | WRM loss の指数。`2.0` は二乗誤差、`2.5` も試験候補 | 2.0 |
-| `--wrm-nnue2score` | network output を評価値スケールへ戻す倍率 | 600 |
-| `--wrm-target-calibration-positions` | 教師評価値→勝率ラベルの係数を、教師先頭何局面から推定するか。`0` なら推定せず既定係数を使う | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | 教師評価値→勝率ラベルの係数を手で指定する。通常は指定しない | 省略 |
+| `--wrm-nnue2score` | WRM で network output を評価値スケールへ戻す倍率 | 600 |
+| `--wrm-target-calibration-positions` | WRM の教師評価値→勝率ラベル係数を、教師先頭何局面から推定するか | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | WRM の教師評価値→勝率ラベル係数を手で指定する。通常は指定しない | 省略 |
 | `--sfnn-factorizer` | SFNN の bucket 間で共通成分を共有する方法。通常は `shared` | `shared` |
 | `--optimizer` | optimizer。通常は `ranger` のままでよい | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
@@ -154,65 +156,64 @@ tatara と同じように `gamma=0.992` を明示するなら、こう書きま�
 
 通常は `1.0` から始めます。勝敗結果も混ぜたい実験だけ `0.5` や `0.7` などを試してください。
 
-## 5. WRM loss
+## 5. loss と score scale
 
-WRM は win-rate-model の略です。BulletOu では、教師評価値をそのまま loss に入れるのではなく、まず「勝率っぽい 0〜1 の値」に変換してから学習します。これがデフォルトです。
+通常の学習では sigmoid-MSE を使います。教師評価値を 0〜1 のラベルに直し、network output も 0〜1 に直して、その二乗誤差を loss にします。
 
-たとえば `+300` の教師評価値を「だいたい勝ちやすい局面」として 0〜1 の値に直し、network output も同じ 0〜1 の値に直して、その差を loss にします。
+```text
+target     = sigmoid(teacher_score / scale)
+prediction = sigmoid(network_output)
+loss       = (prediction - target)^2
+```
 
-WRM で変わるのは次の 3 つです。
+`scale` は教師評価値の大きさを 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭 100,000 局面からこの値を推定します。
 
-| 対象 | 何をするか |
-|---|---|
-| 教師評価値 | 勝率ラベルに変換する |
-| network output | 勝率予測に変換する |
-| loss | `abs(勝率ラベル - 勝率予測)^p` を使う |
+```bash
+# scale を自動推定する
+./target/release/examples/bulletou \
+    --teacher teachers/ \
+    --test-teacher test.hcpe \
+    --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --tag sigmoid-auto-scale
+```
 
-この `p` が `--loss-pow-exp` です。
+推定に使う局面数を変える場合は `--scale-calibration-positions` を使います。
+
+```bash
+--scale-calibration-positions 300000
+```
+
+比較実験で scale を固定したい場合だけ `--scale` を指定します。
+
+```bash
+--scale 6000
+```
+
+### WRM loss を試す
+
+WRM は win-rate-model の略です。sigmoid-MSE と同じく 0〜1 の空間で比較しますが、network output の勝率変換に WRM の曲線を使います。
+
+WRM を使う場合は `--win-rate-model` を明示します。`--loss-pow-exp` は WRM の誤差に使う指数です。
 
 ```bash
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
+    --win-rate-model \
     --loss-pow-exp 2.5 \
     --tag wrm-pow25
 ```
 
-### 教師評価値→勝率ラベルの係数
-
-教師評価値を勝率ラベルに変換するには、評価値スケールに合った係数が必要です。BulletOu はデフォルトで、教師データ先頭 100,000 局面を見て、単純 sigmoid の `scale` を推定します。
-
-```text
-target = sigmoid(teacher_score / scale)
-```
-
-この推定に使う局面数は `--wrm-target-calibration-positions` で変えられます。
+WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定したときだけ使われます。通常は指定しません。
 
 ```bash
-# 先頭 300,000 局面で係数を推定する
+# WRM の係数推定に使う局面数を変える
 --wrm-target-calibration-positions 300000
-```
 
-推定を使わず、内蔵の固定曲線を使いたい比較実験だけ `0` を指定します。
-
-```bash
---wrm-target-calibration-positions 0
-```
-
-この場合は `offset=270`, `scaling=380` を使います。値を手で固定したい場合だけ、次のように明示できます。
-
-```bash
+# WRM の係数を手で固定する
 --wrm-target-offset 270 --wrm-target-scaling 380
 ```
-
-単純 sigmoid のまま scale を手で固定したい場合は、`offset=0` を指定します。
-
-```bash
---wrm-target-offset 0 --wrm-target-scaling 6000
-```
-
-通常の学習では、これらを指定しないでください。デフォルトの自動推定を使うのが基本です。
 
 ### 教師データ上で score→勝率の形を確認する
 
@@ -244,15 +245,15 @@ target = sigmoid(teacher_score / scale)
 
 `--wrm-nnue2score` は、network output を評価値スケールに戻す倍率です。デフォルトは `600` です。tatara と条件を揃えるときや、明確に比較実験をするとき以外は変更しません。
 
-### WRM ではない loss で比較したい場合
+### sigmoid-MSE を明示したい場合
 
-WRM を使わず、`sigmoid(model_output)` に対する MSE で比較したい場合は、次を指定します。
+通常は指定不要ですが、実験ログやスクリプト上で loss を明示したい場合は次を指定できます。
 
 ```bash
 --loss-sigmoid-mse
 ```
 
-WRM と sigmoid-MSE では loss の式が違うので、数値をそのまま横比較しないでください。同じ loss 設定同士で比較します。
+WRM と sigmoid-MSE では loss の式が違うので、loss の数値は同じ設定同士で比較してください。
 
 ## 6. SFNN factorizer
 
