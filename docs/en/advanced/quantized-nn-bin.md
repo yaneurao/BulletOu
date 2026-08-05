@@ -53,7 +53,7 @@ Example:
   --fv-scale auto
 ```
 
-If `--fv-scale` is omitted, BulletOu measures with `FV_SCALE=40`. This is the natural counterpart of the default training scale `203`.
+If `--fv-scale` is omitted, BulletOu measures with `FV_SCALE=40`. This matches the training default: `--scale 600` for the teacher win-rate target and `--fv-scale 40` for the NNUE/SFNN output range.
 
 `--fv-scale auto` searches integer `FV_SCALE` values in `16..=40` by default. Use `--fv-scale-min`, `--fv-scale-max`, and `--fv-scale-step` to change that range.
 

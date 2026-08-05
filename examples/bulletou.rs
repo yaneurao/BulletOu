@@ -1195,8 +1195,8 @@ struct QuantizedTestArgs {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale used by the validation loss target.
-    #[arg(long, default_value = "203")]
+    /// Teacher eval-score to win-rate sigmoid scale used by the validation loss target.
+    #[arg(long, default_value = "600")]
     scale: u32,
 
     /// Exponent of the probability-space error term `|prediction - target|^p`.
@@ -1357,8 +1357,8 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale used by the validation loss target.
-    #[arg(long, default_value = "203")]
+    /// Teacher eval-score to win-rate sigmoid scale used by the validation loss target.
+    #[arg(long, default_value = "600")]
     scale: u32,
 
     /// Exponent of the probability-space error term `|prediction - target|^p`.
@@ -2478,7 +2478,9 @@ const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
-const DEFAULT_SIGMOID_SCALE: f32 = 203.0;
+const DEFAULT_SIGMOID_SCALE: f32 = 600.0;
+const DEFAULT_FV_SCALE: f32 = 40.0;
+const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
 const DEFAULT_SCORE_WINRATE_FIT_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_BIN_SIZE: u16 = 50;
@@ -3150,10 +3152,23 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale for the default sigmoid loss. If omitted,
-    /// BulletOu uses the fixed built-in scale.
+    /// Teacher eval-score to win-rate sigmoid scale. If omitted,
+    /// BulletOu uses 600.
     #[arg(long)]
     scale: Option<f32>,
+
+    /// YaneuraOu FV_SCALE assumed for NNUE/SFNN output-range training.
+    ///
+    /// `--scale` controls how teacher eval scores are converted to win-rate
+    /// targets. `--fv-scale` controls how the f32 network output is interpreted
+    /// as an engine score after NNUE quantization. For NNUE/SFNN targets,
+    /// prediction is:
+    ///
+    ///     sigmoid((network_output * QA * QB / FV_SCALE) / scale)
+    ///
+    /// with `QA * QB = 8128`. KPPT-family targets ignore this option.
+    #[arg(long)]
+    fv_scale: Option<f32>,
 
     /// Exponent of the probability-space error term `|prediction - target|^p`.
     /// `2.0` is squared error; `1.5`, `2.5`, etc. are experiment knobs.
@@ -3509,6 +3524,11 @@ impl Args {
                 return Err(format!("--scale must be finite and > 0 (got {scale})"));
             }
         }
+        if let Some(fv_scale) = self.fv_scale {
+            if !(fv_scale.is_finite() && fv_scale > 0.0) {
+                return Err(format!("--fv-scale must be finite and > 0 (got {fv_scale})"));
+            }
+        }
         if let Some(batches) = self.bench_teacher_prepare_batches {
             if batches == 0 {
                 return Err("--bench-teacher-prepare-batches must be > 0".to_string());
@@ -3652,6 +3672,36 @@ fn effective_scale(args: &Args) -> f32 {
     args.scale.unwrap_or(DEFAULT_SIGMOID_SCALE)
 }
 
+fn effective_fv_scale(args: &Args) -> f32 {
+    args.fv_scale.unwrap_or(DEFAULT_FV_SCALE)
+}
+
+fn eval_type_uses_nnue_output_scale(eval_type: EvalType) -> bool {
+    eval_type.uses_arch()
+}
+
+fn nnue_model_output_scale(eval_scale: f32, fv_scale: f32) -> f32 {
+    eval_scale * fv_scale / DEFAULT_NNUE_RAW_OUTPUT_SCALE
+}
+
+fn model_output_scale_for_eval_type(eval_type: EvalType, eval_scale: f32, fv_scale: f32) -> f32 {
+    if eval_type_uses_nnue_output_scale(eval_type) {
+        nnue_model_output_scale(eval_scale, fv_scale)
+    } else {
+        1.0
+    }
+}
+
+fn effective_model_output_scale(args: &Args) -> f32 {
+    model_output_scale_for_eval_type(args.eval_type(), effective_scale(args), effective_fv_scale(args))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn effective_output_inv_scale(args: &Args) -> f32 {
+    let model_output_scale = effective_model_output_scale(args);
+    if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 }
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
     let scale = if let Some(scale) = args.scale {
@@ -3661,6 +3711,14 @@ fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
         print_startup_kv("sigmoid scale", format!("fixed built-in: {:.3}", DEFAULT_SIGMOID_SCALE));
         DEFAULT_SIGMOID_SCALE
     };
+    if eval_type_uses_nnue_output_scale(args.eval_type()) {
+        let fv_scale = effective_fv_scale(args);
+        let output_score_scale = DEFAULT_NNUE_RAW_OUTPUT_SCALE / fv_scale;
+        print_startup_kv(
+            "FV_SCALE",
+            format!("{:.3} (network_output * {:.3} Value before sigmoid target scale)", fv_scale, output_score_scale),
+        );
+    }
     Ok(scale)
 }
 
@@ -3676,10 +3734,35 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
 }
 
 fn value_loss_label(args: &Args) -> String {
-    sigmoid_loss_label(effective_loss_pow_exp(args), effective_scale(args))
+    let pow_exp = effective_loss_pow_exp(args);
+    let scale = effective_scale(args);
+    let eval_type = args.eval_type();
+    if eval_type_uses_nnue_output_scale(eval_type) {
+        sigmoid_loss_label(
+            pow_exp,
+            scale,
+            effective_fv_scale(args),
+            model_output_scale_for_eval_type(eval_type, scale, effective_fv_scale(args)),
+        )
+    } else {
+        sigmoid_loss_label_plain(pow_exp, scale)
+    }
 }
 
-fn sigmoid_loss_label(pow_exp: f32, scale: f32) -> String {
+fn sigmoid_loss_label(pow_exp: f32, scale: f32, fv_scale: f32, model_output_scale: f32) -> String {
+    let output_score_scale = if model_output_scale > 0.0 { scale / model_output_scale } else { f32::NAN };
+    if (pow_exp - 2.0).abs() <= 1.0e-6 {
+        format!(
+            "sigmoid-mse(pow_exp={pow_exp:.3}, scale={scale:.3}, fv_scale={fv_scale:.3}, output_score_scale={output_score_scale:.3})"
+        )
+    } else {
+        format!(
+            "sigmoid-pow(pow_exp={pow_exp:.3}, scale={scale:.3}, fv_scale={fv_scale:.3}, output_score_scale={output_score_scale:.3})"
+        )
+    }
+}
+
+fn sigmoid_loss_label_plain(pow_exp: f32, scale: f32) -> String {
     if (pow_exp - 2.0).abs() <= 1.0e-6 {
         format!("sigmoid-mse(pow_exp={pow_exp:.3}, scale={scale:.3})")
     } else {
@@ -4382,8 +4465,7 @@ fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossK
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_model_output_scale(args: &QuantizedTestArgs) -> f32 {
-    let _ = args;
-    1.0
+    nnue_model_output_scale(args.scale as f32, args.fv_scale as f32)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5057,7 +5139,15 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
         args.quant_sqrcrelu_round.cli_name(),
         args.quant_final_div_round.cli_name(),
     );
-    eprintln!("  loss              = {}", sigmoid_loss_label(args.loss_pow_exp, args.scale as f32));
+    eprintln!(
+        "  loss              = {}",
+        sigmoid_loss_label(
+            args.loss_pow_exp,
+            args.scale as f32,
+            args.fv_scale as f32,
+            quantized_train_scale_model_output_scale(args)
+        )
+    );
     eprintln!(
         "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
         quantized_sfnn_raw_output_scale(),
@@ -7408,9 +7498,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     );
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
-    // Bullet's scalar value loss applies sigmoid directly to the model output;
-    // `--scale` is used only while preparing the teacher target.
-    let output_inv_scale = 1.0_f32;
+    // Interpret f32 NNUE output through the same engine score scale that
+    // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
+    let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
     let mut reported_loss_sum = 0.0_f64;
     let mut reported_loss_count = 0usize;
@@ -8619,9 +8709,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
-    // Bullet's scalar value loss applies sigmoid directly to the model output;
-    // `--scale` is used only while preparing the teacher target.
-    let output_inv_scale = 1.0_f32;
+    // Interpret f32 SFNN output through the same engine score scale that
+    // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
+    let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
     let mut reported_loss_sum = 0.0_f64;
     let mut reported_loss_count = 0usize;
@@ -13958,7 +14048,13 @@ fn resume_signature(args: &Args) -> String {
     let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or(1);
     let lr_step_gamma =
         effective_lr_step_gamma(args, batches_per_superbatch).map(|(gamma, _)| gamma).unwrap_or(DEFAULT_LR_STEP_GAMMA);
-    let arch = if args.eval_type().uses_arch() { args.arch().cli_name() } else { "-".to_string() };
+    let eval_type = args.eval_type();
+    let arch = if eval_type.uses_arch() { args.arch().cli_name() } else { "-".to_string() };
+    let fv_scale_signature = if eval_type_uses_nnue_output_scale(eval_type) {
+        format!("{:.6}", effective_fv_scale(args))
+    } else {
+        "ignored".to_string()
+    };
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
@@ -13968,7 +14064,7 @@ fn resume_signature(args: &Args) -> String {
     [
         "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
-        format!("eval_type={}", args.eval_type().cli_name()),
+        format!("eval_type={}", eval_type.cli_name()),
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", effective_batch_size(args)),
@@ -13993,6 +14089,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={:.6}", effective_scale(args)),
+        format!("fv_scale={fv_scale_signature}"),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!(
@@ -15430,7 +15527,7 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
         &cache.sample_mask,
         args.lambda,
         effective_scale(args),
-        1.0,
+        effective_model_output_scale(args),
         validation_loss_kind(args),
     );
     let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
@@ -19331,7 +19428,18 @@ mod tests {
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
         assert_eq!(
             value_loss_label(&default_args),
-            format!("sigmoid-mse(pow_exp=2.000, scale={:.3})", DEFAULT_SIGMOID_SCALE)
+            format!(
+                "sigmoid-mse(pow_exp=2.000, scale={:.3}, fv_scale={:.3}, output_score_scale={:.3})",
+                DEFAULT_SIGMOID_SCALE,
+                DEFAULT_FV_SCALE,
+                DEFAULT_NNUE_RAW_OUTPUT_SCALE / DEFAULT_FV_SCALE
+            )
+        );
+        assert!(
+            (effective_model_output_scale(&default_args)
+                - (DEFAULT_SIGMOID_SCALE * DEFAULT_FV_SCALE / DEFAULT_NNUE_RAW_OUTPUT_SCALE))
+                .abs()
+                < 1.0e-6
         );
 
         let sigmoid_pow_args = Args::try_parse_from([
@@ -19347,7 +19455,12 @@ mod tests {
         assert_eq!(effective_loss_pow_exp(&sigmoid_pow_args), 1.5);
         assert_eq!(
             value_loss_label(&sigmoid_pow_args),
-            format!("sigmoid-pow(pow_exp=1.500, scale={:.3})", DEFAULT_SIGMOID_SCALE)
+            format!(
+                "sigmoid-pow(pow_exp=1.500, scale={:.3}, fv_scale={:.3}, output_score_scale={:.3})",
+                DEFAULT_SIGMOID_SCALE,
+                DEFAULT_FV_SCALE,
+                DEFAULT_NNUE_RAW_OUTPUT_SCALE / DEFAULT_FV_SCALE
+            )
         );
 
         for removed in ["--loss-sigmoid-mse"] {
@@ -19444,6 +19557,7 @@ mod tests {
         assert!(sig.contains("optimizer_beta1=0.850000024"));
         assert!(sig.contains("optimizer_beta2=0.995000005"));
         assert!(sig.contains("validation_rate=20"));
+        assert!(sig.contains("fv_scale=40.000000"));
     }
 
     #[test]

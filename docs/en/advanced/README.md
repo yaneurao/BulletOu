@@ -9,6 +9,7 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | Page | Topic |
 | --- | --- |
 | [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, loss, and SFNN factorizer |
+| [`--scale` and `--fv-scale`](scale-and-fv-scale.md) | How teacher win-rate scale and NNUE/SFNN output range fit together |
 | [Continued training](additional-training.md) | Add epochs after a finished run, or continue with a new teacher or LR |
 | [LayerStack](layerstack.md) | SFNN hand / king / progress buckets |
 | [Quantized `nn.bin` checks](quantized-nn-bin.md) | `quantized-test` and `calibrate-nn-bin` |

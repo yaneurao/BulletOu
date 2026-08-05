@@ -65,7 +65,8 @@ Fuller option table:
 | `--lr-step-gamma` | Multiplicative factor for `step` schedule | auto / 0.992 |
 | `--lr-step-positions` | Positions between LR drops. Omitted means one drop per sb | omitted |
 | `--lambda` | Blend between teacher score and game result | 1.0 |
-| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu uses the fixed value 203 | omitted |
+| `--scale` | Target scale used in `sigmoid(teacher_score / scale)`. If omitted, BulletOu uses 600 | omitted |
+| `--fv-scale` | Engine-side `FV_SCALE` assumed when mapping NNUE/SFNN network output back to an eval score | 40 |
 | `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p`. `2.0` is squared error | 2.0 |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--optimizer` | Optimizer | `ranger` |
@@ -121,13 +122,19 @@ training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_g
 
 ## 5. Loss and score scale
 
-BulletOu uses sigmoid probability loss:
+BulletOu uses sigmoid probability loss. `--scale` controls how the teacher
+score is converted back to a win-rate label. `--fv-scale` controls the
+NNUE/SFNN output range that will be used by YaneuraOu after quantization.
 
 ```text
 target     = sigmoid(teacher_score / scale)
-prediction = sigmoid(network_output)
+prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
 loss       = |prediction - target|^p
 ```
+
+`8128` is `QA * QB` for the NNUE/SFNN export path (`QA=127`, `QB=64`).
+For KPPT-family targets, `--fv-scale` is ignored because those targets use
+their own `--yaneuraou-quant-scale` export path.
 
 `p` is controlled by `--loss-pow-exp`. The default is `2.0`, which is squared error in sigmoid space.
 
@@ -140,23 +147,30 @@ loss       = |prediction - target|^p
 --loss-pow-exp 2.5
 ```
 
-`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu uses the fixed value `203`. With the SFNN quantization constants `QA * QB = 8128`, this approximately corresponds to `FV_SCALE=40` on the YaneuraOu side.
+If your teacher scores were created from a win-rate model with `scale=600`,
+leave BulletOu's `--scale` at the default `600`. If you also want the exported
+`nn.bin` to run with `FV_SCALE=40`, leave `--fv-scale` at the default `40`.
+This keeps the target win rate as `sigmoid(score / 600)` while training a
+wider NNUE/SFNN network output range suitable for `FV_SCALE=40`.
+
+For the derivation and worked examples, see [`--scale` and `--fv-scale`](scale-and-fv-scale.md).
 
 BulletOu does not estimate the training scale from game-result labels. Those labels are not always trustworthy: for example, a dataset may come from games between weak players and then be re-scored by a stronger deep-learning engine. In that case, game result is not a reliable calibration target for the teacher score.
 
 ```bash
-# Train with fixed scale 203
+# Train with the default target scale 600 and FV_SCALE 40
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-scale203
+    --tag sigmoid-scale600-fv40
 ```
 
-Set a fixed scale for a comparison experiment:
+Set fixed values explicitly for a comparison experiment:
 
 ```bash
 --scale 600
+--fv-scale 40
 ```
 
 ## 6. Checking the score-to-result shape in teacher data

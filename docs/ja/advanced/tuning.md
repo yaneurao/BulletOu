@@ -65,7 +65,8 @@ BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を使います�
 | `--lr-step-gamma` | `step` で学習率に掛ける係数 | auto / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は1 sbごと | 省略 |
 | `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
-| `--scale` | `sigmoid(score / scale)` の scale。省略時は固定値 203 | 省略 |
+| `--scale` | `sigmoid(teacher_score / scale)` で教師評価値を勝率ラベルへ戻す係数。省略時は 600 | 省略 |
+| `--fv-scale` | NNUE/SFNN の network output をやねうら王側の評価値へ戻すときに想定する `FV_SCALE` | 40 |
 | `--loss-pow-exp` | `|prediction - target|^p` の `p`。`2.0` は二乗誤差 | 2.0 |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
 | `--optimizer` | optimizer | `ranger` |
@@ -121,13 +122,15 @@ training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_g
 
 ## 5. loss と score scale
 
-BulletOu の学習lossは sigmoid probability loss です。
+BulletOu の学習lossは sigmoid probability loss です。`--scale` は教師評価値を勝率ラベルへ戻す係数で、`--fv-scale` は量子化後にやねうら王で使う NNUE/SFNN の出力レンジを決める係数です。
 
 ```text
 target     = sigmoid(teacher_score / scale)
-prediction = sigmoid(network_output)
+prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
 loss       = |prediction - target|^p
 ```
+
+`8128` は NNUE/SFNN の `nn.bin` 書き出しで使う `QA * QB` です (`QA=127`, `QB=64`)。KPPT系は別の `--yaneuraou-quant-scale` で書き出すため、`--fv-scale` は使いません。
 
 `p` は `--loss-pow-exp` で指定します。デフォルトは `2.0` なので、このときはsigmoid空間での二乗誤差です。
 
@@ -140,23 +143,28 @@ loss       = |prediction - target|^p
 --loss-pow-exp 2.5
 ```
 
-`scale` は教師評価値を 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は固定値 `203` を使います。SFNNの量子化定数 `QA * QB = 8128` では、これはやねうら王側の `FV_SCALE=40` にほぼ対応します。
+教師評価値が rshogi などで `scale=600` の勝率モデルから作られているなら、BulletOu の `--scale` はデフォルトの `600` のままで構いません。同時に、書き出した `nn.bin` をやねうら王で `FV_SCALE=40` として使いたい場合は、`--fv-scale` もデフォルトの `40` のままで構いません。
+
+この組み合わせでは、教師targetは `sigmoid(score / 600)` のまま保ちつつ、NNUE/SFNN の network output は `FV_SCALE=40` に合う広い範囲で学習されます。
+
+式の導出と具体例は [`--scale` と `--fv-scale`](scale-and-fv-scale.md) を参照してください。
 
 教師データに含まれる勝敗結果は、常に教師評価値の較正に使えるとは限りません。たとえば、弱い対局者の棋譜を別エンジンでre-scoreした教師では、勝敗結果と教師評価値の関係が学習したい評価関数の性質を表していない場合があります。そのため、BulletOu は学習時に勝敗結果から `scale` を自動推定しません。
 
 ```bash
-# 固定scale 203で学習する
+# デフォルトの target scale 600 / FV_SCALE 40 で学習する
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-scale203
+    --tag sigmoid-scale600-fv40
 ```
 
-比較実験でscaleを固定したい場合:
+比較実験で明示指定したい場合:
 
 ```bash
 --scale 600
+--fv-scale 40
 ```
 
 ## 6. 教師評価値と勝敗結果の関係を確認する
