@@ -84,8 +84,8 @@ use bulletou_lib::{
         read_teacher_positions_prefix,
     },
     value::{
-        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, WinRateModelTargetParams, WrmTargetCalibrationConfig,
-        WrmTargetCalibrationReport, analyze_score_winrate_from_teacher, estimate_wrm_target_from_teacher_prefix,
+        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, WinRateModelTargetParams,
+        analyze_score_winrate_from_teacher,
         nnue_save::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
             network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
@@ -2508,10 +2508,9 @@ const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
 const DEFAULT_SIGMOID_SCALE: f32 = 290.0;
-const DEFAULT_SCALE_CALIBRATION_POSITIONS: usize = 100_000;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
-const DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
+const DEFAULT_SCORE_WINRATE_FIT_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_BIN_SIZE: u16 = 50;
 
 fn effective_batch_size(args: &Args) -> usize {
@@ -2996,7 +2995,7 @@ struct Args {
 
     /// Number of teacher-prefix positions used to fit the score->win-rate
     /// curves for `--analyze-score-winrate`.
-    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS)]
+    #[arg(long, default_value_t = DEFAULT_SCORE_WINRATE_FIT_POSITIONS)]
     fit_positions: usize,
 
     /// Number of held-out positions, immediately after `--fit-positions`, used
@@ -3181,20 +3180,14 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale for the default sigmoid loss. If omitted, BulletOu
-    /// estimates it from a teacher-data prefix.
+    /// Eval-to-score sigmoid scale for the default sigmoid loss. If omitted,
+    /// BulletOu uses the fixed built-in scale.
     #[arg(long)]
     scale: Option<f32>,
 
-    /// Number of teacher-prefix positions used to estimate `--scale` when
-    /// sigmoid loss is selected and `--scale` is omitted. Set to `0` to use
-    /// the built-in fallback scale.
-    #[arg(long, default_value_t = DEFAULT_SCALE_CALIBRATION_POSITIONS)]
-    scale_calibration_positions: usize,
-
     /// Use tatara-style win-rate-model prediction conversion and WRM loss for
-    /// scalar value networks. The default is sigmoid probability loss with an automatically
-    /// estimated sigmoid scale.
+    /// scalar value networks. The default is sigmoid probability loss with a
+    /// fixed sigmoid scale.
     #[arg(long)]
     win_rate_model: bool,
 
@@ -3208,25 +3201,6 @@ struct Args {
     /// Used only with `--win-rate-model`. The tatara default is 600.
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
     wrm_nnue2score: f32,
-
-    /// Number of teacher-prefix positions used to estimate the target-side
-    /// score->win-rate sigmoid scale from `(teacher_score, game_result)`.
-    /// Default is 100k positions. Set to `0` to skip estimation and use the
-    /// built-in fixed WRM target curve, or pass `--wrm-target-offset` and
-    /// `--wrm-target-scaling` for an explicit fixed target transform.
-    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_CALIBRATION_POSITIONS)]
-    wrm_target_calibration_positions: usize,
-
-    /// Explicit target-side offset. Must be used together with
-    /// `--wrm-target-scaling`; disables automatic sigmoid target calibration.
-    /// Use `0` for a plain sigmoid target with a manually chosen scaling.
-    #[arg(long)]
-    wrm_target_offset: Option<f32>,
-
-    /// Explicit target-side scaling. Must be finite and > 0, and must be
-    /// used together with `--wrm-target-offset`.
-    #[arg(long)]
-    wrm_target_scaling: Option<f32>,
 
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
@@ -3580,18 +3554,6 @@ impl Args {
                 return Err(format!("--scale must be finite and > 0 (got {scale})"));
             }
         }
-        match (self.wrm_target_offset, self.wrm_target_scaling) {
-            (Some(offset), Some(scaling)) => {
-                if WinRateModelTargetParams::new(offset, scaling).is_none() {
-                    return Err(format!(
-                        "--wrm-target-offset/--wrm-target-scaling must be finite and scaling > 0 (got offset={offset}, scaling={scaling})"
-                    ));
-                }
-            }
-            (Some(_), None) => return Err("--wrm-target-offset requires --wrm-target-scaling".to_string()),
-            (None, Some(_)) => return Err("--wrm-target-scaling requires --wrm-target-offset".to_string()),
-            (None, None) => {}
-        }
         if effective_win_rate_model(self) && !eval_type.supports_win_rate_model() {
             return Err("--win-rate-model currently applies to scalar value eval types only".to_string());
         }
@@ -3750,27 +3712,15 @@ fn effective_wrm_nnue2score(args: &Args) -> f32 {
     if effective_win_rate_model(args) { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
 }
 
-static RUNTIME_SIGMOID_SCALE: OnceLock<f32> = OnceLock::new();
-static RUNTIME_WRM_TARGET_PARAMS: OnceLock<WinRateModelTargetParams> = OnceLock::new();
-
 fn effective_scale(args: &Args) -> f32 {
-    args.scale.or_else(|| RUNTIME_SIGMOID_SCALE.get().copied()).unwrap_or(DEFAULT_SIGMOID_SCALE)
-}
-
-fn explicit_wrm_target_params(args: &Args) -> Option<WinRateModelTargetParams> {
-    match (args.wrm_target_offset, args.wrm_target_scaling) {
-        (Some(offset), Some(scaling)) => WinRateModelTargetParams::new(offset, scaling),
-        _ => None,
-    }
+    args.scale.unwrap_or(DEFAULT_SIGMOID_SCALE)
 }
 
 fn effective_wrm_target_params(args: &Args) -> WinRateModelTargetParams {
     if !effective_win_rate_model(args) {
         return WinRateModelTargetParams::DEFAULT;
     }
-    explicit_wrm_target_params(args)
-        .or_else(|| RUNTIME_WRM_TARGET_PARAMS.get().copied())
-        .unwrap_or(WinRateModelTargetParams::DEFAULT)
+    WinRateModelTargetParams::DEFAULT
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3778,126 +3728,29 @@ fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, St
     if !effective_win_rate_model(args) {
         return Ok(WinRateModelTargetParams::DEFAULT);
     }
-    if let Some(params) = RUNTIME_WRM_TARGET_PARAMS.get().copied() {
-        return Ok(params);
-    }
-
-    let params = if let Some(params) = explicit_wrm_target_params(args) {
-        print_startup_kv("target curve", format!("fixed: offset={:.3}, scaling={:.3}", params.offset, params.scaling));
-        params
-    } else if args.wrm_target_calibration_positions == 0 {
-        let params = WinRateModelTargetParams::DEFAULT;
-        print_startup_kv(
-            "target curve",
-            format!("fixed built-in: offset={:.3}, scaling={:.3}", params.offset, params.scaling),
-        );
-        params
-    } else {
-        let report = estimate_wrm_target_from_teacher_prefix(&WrmTargetCalibrationConfig {
-            teacher: &args.teacher,
-            positions: args.wrm_target_calibration_positions,
-            buffer_mb: args.buffer_mb,
-            loader_threads: cuda_cpp_effective_loader_threads(args),
-            score_drop_abs: if args.score_drop_abs == 0 { None } else { Some(args.score_drop_abs) },
-        })
-        .map_err(|err| format!("failed to estimate target sigmoid scale from teacher prefix: {err}"))?;
-        print_wrm_target_calibration_report(report);
-        report.params
-    };
-
-    let _ = RUNTIME_WRM_TARGET_PARAMS.set(params);
+    let params = WinRateModelTargetParams::DEFAULT;
+    print_startup_kv(
+        "target curve",
+        format!("fixed built-in: offset={:.3}, scaling={:.3}", params.offset, params.scaling),
+    );
     Ok(params)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
-    let value = if report.fitted {
-        format!(
-            "auto sigmoid: offset={:.3}, scaling={:.3}, sampled={}/{}, fit_decisive={}, draws_ignored={}, filtered={}, bce={:.6}",
-            report.params.offset,
-            report.params.scaling,
-            format_count(report.observed_positions),
-            format_count(report.requested_positions),
-            format_count(report.fitted_positions),
-            format_count(report.drawn_positions),
-            format_count(report.filtered_positions),
-            report.bce_loss,
-        )
-    } else {
-        format!(
-            "auto sigmoid fallback: offset={:.3}, scaling={:.3}, sampled={}/{}, fit_decisive={}, filtered={}",
-            report.params.offset,
-            report.params.scaling,
-            format_count(report.observed_positions),
-            format_count(report.requested_positions),
-            format_count(report.fitted_positions),
-            format_count(report.filtered_positions),
-        )
-    };
-    print_startup_kv("target curve", value);
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
-    if let Some(scale) = RUNTIME_SIGMOID_SCALE.get().copied() {
-        return Ok(scale);
-    }
-
     let scale = if let Some(scale) = args.scale {
         print_startup_kv("sigmoid scale", format!("fixed: {:.3}", scale));
         scale
-    } else if args.scale_calibration_positions == 0 {
+    } else {
         print_startup_kv("sigmoid scale", format!("fixed built-in: {:.3}", DEFAULT_SIGMOID_SCALE));
         DEFAULT_SIGMOID_SCALE
-    } else {
-        let report = estimate_wrm_target_from_teacher_prefix(&WrmTargetCalibrationConfig {
-            teacher: &args.teacher,
-            positions: args.scale_calibration_positions,
-            buffer_mb: args.buffer_mb,
-            loader_threads: cuda_cpp_effective_loader_threads(args),
-            score_drop_abs: if args.score_drop_abs == 0 { None } else { Some(args.score_drop_abs) },
-        })
-        .map_err(|err| format!("failed to estimate sigmoid scale from teacher prefix: {err}"))?;
-        print_sigmoid_scale_calibration_report(report);
-        report.params.scaling
     };
-
-    let _ = RUNTIME_SIGMOID_SCALE.set(scale);
     Ok(scale)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn print_sigmoid_scale_calibration_report(report: WrmTargetCalibrationReport) {
-    let value = if report.fitted {
-        format!(
-            "auto: scale={:.3}, sampled={}/{}, fit_decisive={}, draws_ignored={}, filtered={}, bce={:.6}",
-            report.params.scaling,
-            format_count(report.observed_positions),
-            format_count(report.requested_positions),
-            format_count(report.fitted_positions),
-            format_count(report.drawn_positions),
-            format_count(report.filtered_positions),
-            report.bce_loss,
-        )
-    } else {
-        format!(
-            "auto fallback: scale={:.3}, sampled={}/{}, fit_decisive={}, filtered={}",
-            report.params.scaling,
-            format_count(report.observed_positions),
-            format_count(report.requested_positions),
-            format_count(report.fitted_positions),
-            format_count(report.filtered_positions),
-        )
-    };
-    print_startup_kv("sigmoid scale", value);
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     if effective_win_rate_model(args) {
-        if let Some(scale) = args.scale {
-            let _ = RUNTIME_SIGMOID_SCALE.set(scale);
-        }
         resolve_wrm_target_params(args)?;
     } else {
         resolve_sigmoid_scale(args)?;
@@ -14346,19 +14199,9 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={:.6}", effective_scale(args)),
-        format!("scale_calibration_positions={}", args.scale_calibration_positions),
         format!("win_rate_model={}", effective_win_rate_model(args)),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
-        format!("wrm_target_calibration_positions={}", args.wrm_target_calibration_positions),
-        format!(
-            "wrm_target_offset={}",
-            args.wrm_target_offset.map(|v| format!("{v:.9}")).unwrap_or_else(|| "auto".to_string())
-        ),
-        format!(
-            "wrm_target_scaling={}",
-            args.wrm_target_scaling.map(|v| format!("{v:.9}")).unwrap_or_else(|| "auto".to_string())
-        ),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!(
             "optimizer_epsilon={}",
@@ -14420,6 +14263,14 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
             out.push(format!("win_rate_model={enabled}"));
             out.push(format!("loss_pow_exp={:.9}", if enabled { 2.5_f32 } else { 2.0_f32 }));
             out.push(format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
+        } else if line.starts_with("scale_calibration_positions=")
+            || line.starts_with("wrm_target_calibration_positions=")
+            || line.starts_with("wrm_target_offset=")
+            || line.starts_with("wrm_target_scaling=")
+        {
+            // These options used unreliable game-result fitting and were removed
+            // from the training path. Ignore old resume-config rows so existing
+            // checkpoints can still be resumed with the fixed target curves.
         } else {
             out.push(line.to_string());
         }
@@ -19726,6 +19577,24 @@ mod tests {
         ]);
         assert!(removed_sigmoid_flag.is_err());
 
+        for removed in [
+            "--scale-calibration-positions",
+            "--wrm-target-calibration-positions",
+            "--wrm-target-offset",
+            "--wrm-target-scaling",
+        ] {
+            let parsed = Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "NNUE_halfkp_256x2_32_32",
+                "--teacher",
+                "/dev/null",
+                removed,
+                "100",
+            ]);
+            assert!(parsed.is_err(), "{removed} should be removed from the training CLI");
+        }
+
         let sigmoid_pow_args = Args::try_parse_from([
             "bulletou",
             "--arch",
@@ -20098,7 +19967,6 @@ mod tests {
         assert_eq!(args.lr_step_positions, None);
         assert_eq!(args.optimizer_weight_decay, 0.0);
         assert_eq!(args.scale, None);
-        assert_eq!(args.scale_calibration_positions, DEFAULT_SCALE_CALIBRATION_POSITIONS);
         assert_eq!(effective_scale(&args), DEFAULT_SIGMOID_SCALE);
         assert_eq!(args.save_rate, None);
         assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);

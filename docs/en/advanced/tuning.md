@@ -66,13 +66,10 @@ Fuller option table:
 | `--lr-step-gamma` | Multiplicative factor for `step` schedule | auto / 0.992 |
 | `--lr-step-positions` | Positions between LR drops. Omitted means one drop per sb | omitted |
 | `--lambda` | Blend between teacher score and game result | 1.0 |
-| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu estimates it from the teacher data | omitted |
-| `--scale-calibration-positions` | Number of teacher-prefix positions used to estimate `--scale`. `0` uses the built-in fallback | 100000 |
+| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu uses the fixed value 290 | omitted |
 | `--win-rate-model` | Use the WRM curve on the prediction side | off |
 | `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p`. `2.0` is squared error | 2.0 |
 | `--wrm-nnue2score` | Multiplier that maps network output back to score scale for WRM prediction | 600 |
-| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate the WRM target curve | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | Manually set the WRM target curve | omitted |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
@@ -146,21 +143,17 @@ loss       = |prediction - target|^p
 --loss-pow-exp 2.5
 ```
 
-`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from a teacher-data prefix. The estimator uses only decisive win/loss records and ignores draws.
+`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu uses the fixed value `290`.
+
+BulletOu does not estimate the training scale from game-result labels. Those labels are not always trustworthy: for example, a dataset may come from games between weak players and then be re-scored by a stronger deep-learning engine. In that case, the game result is not a reliable calibration target for the teacher score.
 
 ```bash
-# Estimate scale automatically
+# Train with fixed scale 290
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-auto-scale
-```
-
-Change the prefix size:
-
-```bash
---scale-calibration-positions 300000
+    --tag sigmoid-scale290
 ```
 
 Fix scale for a comparison experiment:
@@ -191,7 +184,7 @@ loss = |prediction - target|^p
 
 `--loss-pow-exp` applies to both sigmoid loss and WRM loss.
 
-`--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`.
+`--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`. WRM uses the built-in fixed target curve; BulletOu does not estimate the WRM target curve from game-result labels during training.
 
 ## 7. Check the score → win-rate shape on your teacher data
 

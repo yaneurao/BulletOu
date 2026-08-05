@@ -67,13 +67,10 @@ BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を分けて扱�
 | `--lr-step-gamma` | `step` で学習率に掛ける係数 | auto / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は 1 sb ごと | 省略 |
 | `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
-| `--scale` | `sigmoid(score / scale)` の scale。省略時は教師データから推定 | 省略 |
-| `--scale-calibration-positions` | `--scale` 推定に使う教師先頭局面数。`0` なら内蔵値を使う | 100000 |
+| `--scale` | `sigmoid(score / scale)` の scale。省略時は固定値 290 | 省略 |
 | `--win-rate-model` | prediction 側に WRM 曲線を使う | off |
 | `--loss-pow-exp` | `|prediction - target|^p` の `p`。`2.0` は二乗誤差 | 2.0 |
 | `--wrm-nnue2score` | WRM で network output を評価値 scale に戻す係数 | 600 |
-| `--wrm-target-calibration-positions` | WRM target 曲線の推定に使う教師先頭局面数 | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | WRM target 曲線を手で指定する | 省略 |
 | `--sfnn-factorizer` | SFNN の bucket 間で共通成分を共有する方法 | `shared` |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
@@ -147,21 +144,17 @@ loss       = |prediction - target|^p
 --loss-pow-exp 2.5
 ```
 
-`scale` は教師評価値を 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭局面から推定します。推定では勝ち・負けが付いている局面だけを使い、引き分け局面は使いません。
+`scale` は教師評価値を 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は固定値 `290` を使います。
+
+教師データに含まれる勝敗項が必ずしも信用できるとは限らないため、学習時に勝敗項から `scale` を自動推定することはしません。弱い対局者の棋譜を別エンジンで re-score した教師データでは、勝敗項と教師評価値の関係が学習したい評価関数の性質を表していないことがあります。
 
 ```bash
-# scale を自動推定する
+# 固定 scale 290 で学習する
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-auto-scale
-```
-
-推定に使う局面数を変える場合:
-
-```bash
---scale-calibration-positions 300000
+    --tag sigmoid-scale290
 ```
 
 比較実験で scale を固定したい場合:
@@ -192,7 +185,7 @@ loss = |prediction - target|^p
 
 `--loss-pow-exp` は sigmoid loss と WRM loss の両方に効きます。
 
-`--wrm-nnue2score` は network output を評価値 scale に戻す係数です。デフォルトは `600` です。
+`--wrm-nnue2score` は network output を評価値 scale に戻す係数です。デフォルトは `600` です。WRM の target 曲線は built-in の固定値を使います。勝敗項から WRM target 曲線を自動推定することはしません。
 
 ## 7. 教師データ上の score → winrate を確認する
 
