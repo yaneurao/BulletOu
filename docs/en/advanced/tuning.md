@@ -166,7 +166,7 @@ prediction = sigmoid(network_output)
 loss       = (prediction - target)^2
 ```
 
-`scale` controls how teacher scores are mapped into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from the first 100,000 teacher positions.
+`scale` controls how teacher scores are mapped into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from the first 100,000 teacher positions. The estimate uses only decisive win/loss records; drawn games are ignored.
 
 ```bash
 # Estimate scale automatically
@@ -205,7 +205,7 @@ Pass `--win-rate-model` to use WRM. `--loss-pow-exp` is the exponent applied to 
     --tag wrm-pow25
 ```
 
-The WRM teacher-score → win-rate-label coefficients are used only when `--win-rate-model` is selected. Usually, do not pass these options.
+The WRM teacher-score → win-rate-label coefficients are used only when `--win-rate-model` is selected. Automatic estimation uses only decisive win/loss records; drawn games are ignored. Usually, do not pass these options.
 
 ```bash
 # Change the prefix size used to estimate WRM coefficients
@@ -229,7 +229,7 @@ The relation between teacher score and game result can differ by dataset. This d
     --score-winrate-csv score-winrate.csv
 ```
 
-This command does not train. It fits both curves on the first `--fit-positions` positions, then reports BCE / Brier score and per-score-bucket empirical win rate on the following `--analyze-positions` positions.
+This command does not train. It fits both curves on the first `--fit-positions` positions, then reports BCE / Brier score and per-score-bucket empirical win rate on the following `--analyze-positions` positions. Fitting and BCE / Brier score use only decisive win/loss records.
 
 | Output | Meaning |
 |---|---|
@@ -237,7 +237,7 @@ This command does not train. It fits both curves on the first `--fit-positions` 
 | `WRM(offset,scale)` | Uses offset and scale, allowing a flatter region near score 0 |
 | `heldout_bce` | Lower is a better fit to game-result statistics |
 | `heldout_brier` | Lower is a better probability prediction |
-| `empirical` | `(wins + 0.5 * draws) / positions` in that score bucket |
+| `empirical` | `wins / (wins + losses)` in that score bucket. Draws are displayed but ignored |
 
 If `delta(WRM - sigmoid)` is negative, WRM fits that teacher data better. If it is positive, the plain sigmoid fits better.
 

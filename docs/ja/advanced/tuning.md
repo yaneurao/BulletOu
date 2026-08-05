@@ -166,7 +166,7 @@ prediction = sigmoid(network_output)
 loss       = (prediction - target)^2
 ```
 
-`scale` は教師評価値の大きさを 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭 100,000 局面からこの値を推定します。
+`scale` は教師評価値の大きさを 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭 100,000 局面からこの値を推定します。推定では勝ち・負けが付いている局面だけを使い、引き分けの対局は使いません。
 
 ```bash
 # scale を自動推定する
@@ -205,7 +205,7 @@ WRM を使う場合は `--win-rate-model` を明示します。`--loss-pow-exp` 
     --tag wrm-pow25
 ```
 
-WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定したときだけ使われます。通常は指定しません。
+WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定したときだけ使われます。自動推定では勝ち・負けが付いている局面だけを使い、引き分けの対局は使いません。通常は係数を手で指定しません。
 
 ```bash
 # WRM の係数推定に使う局面数を変える
@@ -229,7 +229,7 @@ WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定
     --score-winrate-csv score-winrate.csv
 ```
 
-このコマンドは学習しません。先頭 `--fit-positions` 局面で係数を推定し、その直後の `--analyze-positions` 局面で BCE / Brier score と score bucket ごとの実測勝率を出します。
+このコマンドは学習しません。先頭 `--fit-positions` 局面で係数を推定し、その直後の `--analyze-positions` 局面で BCE / Brier score と score bucket ごとの実測勝率を出します。係数推定と BCE / Brier score は勝ち・負けが付いている局面だけで計算します。
 
 | 出力 | 意味 |
 |---|---|
@@ -237,7 +237,7 @@ WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定
 | `WRM(offset,scale)` | `offset` と `scale` を使い、評価値 0 付近を少し平らにできる形 |
 | `heldout_bce` | 小さいほど、勝敗結果の統計に合っている |
 | `heldout_brier` | 小さいほど、予測確率として合っている |
-| `empirical` | その score bucket での `(勝ち + 0.5 * 引き分け) / 局面数` |
+| `empirical` | その score bucket での `勝ち / (勝ち + 負け)`。引き分けは表示だけして計算には使わない |
 
 `delta(WRM - sigmoid)` が負なら、その教師データでは WRM のほうが勝敗結果の統計に合っています。正なら、単純な sigmoid のほうが合っています。
 

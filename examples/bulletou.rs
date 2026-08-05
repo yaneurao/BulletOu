@@ -3834,20 +3834,19 @@ fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, St
 fn print_wrm_target_calibration_report(report: WrmTargetCalibrationReport) {
     let value = if report.fitted {
         format!(
-            "auto sigmoid: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, decisive={}, draws={}, filtered={}, bce={:.6}",
+            "auto sigmoid: offset={:.3}, scaling={:.3}, sampled={}/{}, fit_decisive={}, draws_ignored={}, filtered={}, bce={:.6}",
             report.params.offset,
             report.params.scaling,
             format_count(report.observed_positions),
             format_count(report.requested_positions),
             format_count(report.fitted_positions),
-            format_count(report.decisive_positions),
             format_count(report.drawn_positions),
             format_count(report.filtered_positions),
             report.bce_loss,
         )
     } else {
         format!(
-            "auto sigmoid fallback: offset={:.3}, scaling={:.3}, sampled={}/{}, fitted={}, filtered={}",
+            "auto sigmoid fallback: offset={:.3}, scaling={:.3}, sampled={}/{}, fit_decisive={}, filtered={}",
             report.params.offset,
             report.params.scaling,
             format_count(report.observed_positions),
@@ -3892,19 +3891,18 @@ fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
 fn print_sigmoid_scale_calibration_report(report: WrmTargetCalibrationReport) {
     let value = if report.fitted {
         format!(
-            "auto: scale={:.3}, sampled={}/{}, fitted={}, decisive={}, draws={}, filtered={}, bce={:.6}",
+            "auto: scale={:.3}, sampled={}/{}, fit_decisive={}, draws_ignored={}, filtered={}, bce={:.6}",
             report.params.scaling,
             format_count(report.observed_positions),
             format_count(report.requested_positions),
             format_count(report.fitted_positions),
-            format_count(report.decisive_positions),
             format_count(report.drawn_positions),
             format_count(report.filtered_positions),
             report.bce_loss,
         )
     } else {
         format!(
-            "auto fallback: scale={:.3}, sampled={}/{}, fitted={}, filtered={}",
+            "auto fallback: scale={:.3}, sampled={}/{}, fit_decisive={}, filtered={}",
             report.params.scaling,
             format_count(report.observed_positions),
             format_count(report.requested_positions),
@@ -4163,7 +4161,7 @@ fn print_score_winrate_analysis_report(report: &ScoreWinrateAnalysisReport) {
     }
     println!();
     println!(
-        "per-score-bin calibration (heldout, bin={} score points; empirical=(wins+0.5*draws)/count):",
+        "per-score-bin calibration (heldout, bin={} score points; empirical=wins/(wins+losses), draws ignored):",
         report.bin_size
     );
     println!(

@@ -300,8 +300,12 @@ impl WrmTargetOutcomeBin {
         }
     }
 
-    fn positives_negatives(self) -> (f64, f64) {
-        (f64::from(self.wins) + 0.5 * f64::from(self.draws), f64::from(self.losses) + 0.5 * f64::from(self.draws))
+    fn decisive_count(self) -> usize {
+        self.wins as usize + self.losses as usize
+    }
+
+    fn decisive_positives_negatives(self) -> (f64, f64) {
+        (f64::from(self.wins), f64::from(self.losses))
     }
 }
 
@@ -407,7 +411,11 @@ pub fn estimate_wrm_target_from_teacher_prefix(
 
     let (params, bce_loss, fitted) =
         fit_sigmoid_target_params(&bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
-    let fitted_positions = decisive_positions + drawn_positions;
+    // Drawn games are observed and reported, but they are intentionally
+    // excluded from target-curve fitting. Treating many draws as 0.5 makes
+    // the best curve artificially flat and can produce an unusably large
+    // sigmoid/WRM scale.
+    let fitted_positions = decisive_positions;
     Ok(WrmTargetCalibrationReport {
         params,
         requested_positions: config.positions,
@@ -587,13 +595,12 @@ fn fit_wrm_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTa
     let mut total_pos = 0.0f64;
     let mut total_neg = 0.0f64;
     for (idx, bin) in bins.iter().enumerate() {
-        let count = bin.wins as usize + bin.losses as usize + bin.draws as usize;
+        let count = bin.decisive_count();
         if count == 0 {
             continue;
         }
         let score = (idx as i32 + i32::from(i16::MIN)) as f32;
-        let positives = f64::from(bin.wins) + 0.5 * f64::from(bin.draws);
-        let negatives = f64::from(bin.losses) + 0.5 * f64::from(bin.draws);
+        let (positives, negatives) = bin.decisive_positives_negatives();
         samples.push((score, positives, negatives));
         fitted_positions += count;
         total_pos += positives;
@@ -669,12 +676,12 @@ fn fit_sigmoid_target_scale(bins: &[WrmTargetOutcomeBin]) -> Option<(f32, f64, b
     let mut total_pos = 0.0f64;
     let mut total_neg = 0.0f64;
     for (idx, bin) in bins.iter().enumerate() {
-        let count = bin.count();
+        let count = bin.decisive_count();
         if count == 0 {
             continue;
         }
         let score = (idx as i32 + i32::from(i16::MIN)) as f32;
-        let (positives, negatives) = bin.positives_negatives();
+        let (positives, negatives) = bin.decisive_positives_negatives();
         samples.push((score, positives, negatives));
         fitted_positions += count;
         total_pos += positives;
@@ -747,17 +754,16 @@ where
     let mut bce = 0.0f64;
     let mut brier = 0.0f64;
     for (idx, bin) in bins.iter().enumerate() {
-        let count = bin.count();
+        let count = bin.decisive_count();
         if count == 0 {
             continue;
         }
         let score = (idx as i32 + i32::from(i16::MIN)) as f32;
         let p = f64::from(probability(score)).clamp(1.0e-6, 1.0 - 1.0e-6);
-        let (positives, negatives) = bin.positives_negatives();
+        let (positives, negatives) = bin.decisive_positives_negatives();
         bce -= positives * p.ln() + negatives * (1.0 - p).ln();
         brier += f64::from(bin.wins) * (1.0 - p).powi(2);
         brier += f64::from(bin.losses) * p.powi(2);
-        brier += f64::from(bin.draws) * (0.5 - p).powi(2);
         total += count;
     }
 
@@ -796,21 +802,23 @@ fn score_winrate_bin_reports(
     grouped
         .into_iter()
         .filter_map(|(score_min, bin)| {
-            let count = bin.outcome.count();
-            if count == 0 {
+            let total_count = bin.outcome.count();
+            if total_count == 0 {
                 return None;
             }
-            let (positives, _) = bin.outcome.positives_negatives();
+            let decisive_count = bin.outcome.decisive_count();
+            let empirical =
+                if decisive_count == 0 { f64::NAN } else { f64::from(bin.outcome.wins) / decisive_count as f64 };
             Some(ScoreWinrateBinReport {
                 score_min,
                 score_max: score_min + i32::from(bin_size) - 1,
-                count,
+                count: total_count,
                 wins: bin.outcome.wins as usize,
                 losses: bin.outcome.losses as usize,
                 draws: bin.outcome.draws as usize,
-                empirical: positives / count as f64,
-                sigmoid: bin.sigmoid_sum / count as f64,
-                wrm: bin.wrm_sum / count as f64,
+                empirical,
+                sigmoid: bin.sigmoid_sum / total_count as f64,
+                wrm: bin.wrm_sum / total_count as f64,
             })
         })
         .collect()
@@ -3189,6 +3197,35 @@ mod tests {
         assert!(fitted);
         assert_eq!(params.offset, 0.0);
         assert!((params.scaling - expected_scale).abs() <= 2.0, "params={params:?}");
+    }
+
+    #[test]
+    fn target_fit_ignores_draws() {
+        let expected_scale = 1000.0f32;
+        let mut decisive_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        let mut draw_heavy_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        for score in (-2000..=2000).step_by(25) {
+            let p = sigmoid_score_probability(score as f32, expected_scale);
+            let count = 2000u32;
+            let wins = (p * count as f32).round() as u32;
+            let losses = count - wins;
+            let idx = score_bin_index(score as i16);
+            decisive_bins[idx] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+            // These draws would flatten the fitted curve badly if they were
+            // treated as 0.5 labels. They must not affect target fitting.
+            draw_heavy_bins[idx] = WrmTargetOutcomeBin { wins, losses, draws: 20_000 };
+        }
+
+        let (decisive_scale, decisive_bce, _) = fit_sigmoid_target_scale(&decisive_bins).unwrap();
+        let (draw_heavy_scale, draw_heavy_bce, _) = fit_sigmoid_target_scale(&draw_heavy_bins).unwrap();
+        let (decisive_wrm, decisive_wrm_bce, _) = fit_wrm_target_params(&decisive_bins).unwrap();
+        let (draw_heavy_wrm, draw_heavy_wrm_bce, _) = fit_wrm_target_params(&draw_heavy_bins).unwrap();
+
+        assert!((decisive_scale - expected_scale).abs() <= 2.0, "decisive_scale={decisive_scale}");
+        assert_eq!(draw_heavy_scale, decisive_scale);
+        assert_eq!(draw_heavy_bce, decisive_bce);
+        assert_eq!(draw_heavy_wrm, decisive_wrm);
+        assert_eq!(draw_heavy_wrm_bce, decisive_wrm_bce);
     }
 
     #[test]
