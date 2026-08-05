@@ -57,25 +57,7 @@ With `scale=600`, the mapping is approximately:
 
 So if rshogi created teacher eval scores using `scale=600`, the natural way to turn those scores back into win-rate labels is also `scale=600`.
 
-## 2. What goes wrong with only `--scale 203`
-
-If the teacher scores were created with `scale=600`, but BulletOu trains with `--scale 203`, the target labels become sharper than the original win rates.
-
-For a teacher score of `+600`:
-
-```text
-Correct conversion:
-  sigmoid(600 / 600) = sigmoid(1.0) = 0.731
-
-With --scale 203:
-  sigmoid(600 / 203) = sigmoid(2.956) = 0.950
-```
-
-The teacher intended `+600` to mean about `73.1%`, but `--scale 203` reads it as about `95.0%`.
-
-That is what it means to distort the teacher win-rate labels.
-
-## 3. Why `--fv-scale` is needed
+## 2. Where `203.2` comes from when `FV_SCALE=40`
 
 NNUE/SFNN networks are shallow, so it can be useful for the network output range to be wider. If the exported network will be used by YaneuraOu with `FV_SCALE=40`, the saved `nn.bin` should satisfy:
 
@@ -116,7 +98,45 @@ engine_score ≒ network_output * 8128 / 40
              ≒ network_output * 203.2
 ```
 
-So to produce an engine eval score of `+600`, the network output should be about `+600 / 203.2 = +2.95`.
+The `203.2` here comes from:
+
+```text
+8128 / 40 = 203.2
+```
+
+It is the coefficient that maps `network_output` back to the YaneuraOu eval score. It is not the same thing as `--scale`, which maps teacher scores back to win-rate labels.
+
+So to produce an engine eval score of `+600`, the network output should be:
+
+```text
+network_output ≒ 600 / 203.2
+               ≒ 2.95
+```
+
+## 3. Why `--scale 203` is not the answer
+
+After seeing `203.2`, it is tempting to train with `--scale 203`. That is not what we want. `--scale` controls the teacher-score to win-rate conversion, so putting `203` there changes the target labels.
+
+If the teacher scores were created with `scale=600`, a teacher score of `+600` means:
+
+```text
+sigmoid(600 / 600) = sigmoid(1.0) = 0.731
+```
+
+But if BulletOu reads it with `--scale 203`, it becomes:
+
+```text
+sigmoid(600 / 203) = sigmoid(2.956) = 0.950
+```
+
+The teacher intended `+600` to mean about `73.1%`, but `--scale 203` reads it as about `95.0%`. That is what it means to distort the teacher win-rate labels.
+
+This is why BulletOu keeps the two settings separate.
+
+```text
+--scale 600    # convert teacher scores back to win rates
+--fv-scale 40  # train the network output range for FV_SCALE=40
+```
 
 ## 4. BulletOu's loss formula
 
