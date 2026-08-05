@@ -1,14 +1,13 @@
 # Quantized `nn.bin` checks
 
-<a href="../../ja/advanced/quantized-nn-bin.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/advanced/quantized-nn-bin.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-Training-time validation normally uses the f32 weights in memory.
-The engine, however, plays with the exported quantized `nn.bin`.
+Training-time validation normally uses the f32 weights in memory. The engine, however, plays with the exported quantized `nn.bin`.
 
 This page covers two commands for inspecting an exported `nn.bin` directly.
 
 | Command | Use |
-| --- | --- |
+|---|---|
 | `quantized-test` | Measure quantized accuracy / loss |
 | `calibrate-nn-bin` | Inspect output scale and fold an offset into the final bias |
 
@@ -38,7 +37,7 @@ So the same `FV_SCALE` can produce a different score range for different exporte
 Use `calibrate-nn-bin` to run quantized forward on a validation set and choose `FV_SCALE` plus an offset.
 
 | Item | Meaning |
-| --- | --- |
+|---|---|
 | `estimated_fv_scale` | Diagnostic linear-fit scale between raw output and teacher score |
 | `selected_fv_scale` | `FV_SCALE` with the lowest validation loss |
 | `selected_offset` | Score offset with the lowest validation loss under the selected `FV_SCALE` |
@@ -79,7 +78,7 @@ after             = acc 62.8638%  loss_engine 0.07186714
 teacher_score ~= raw / FV_SCALE + offset
 ```
 
-It is a diagnostic value, not necessarily the loss-minimizing `FV_SCALE`. WRM loss is nonlinear, so use `selected_fv_scale` for the actual selected candidate.
+It is a diagnostic value, not necessarily the loss-minimizing `FV_SCALE`. Use `selected_fv_scale` for the actual selected candidate.
 
 `selected_offset` is the loss-reducing score offset under `selected_fv_scale`. The command writes that offset into the output `nn.bin` by adding `selected_offset * selected_fv_scale` to every final LayerStack bias.
 

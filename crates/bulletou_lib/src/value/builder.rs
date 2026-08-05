@@ -29,7 +29,6 @@ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     loss_fn: Option<LossFn>,
     factorised: Vec<String>,
     wdl_output: bool,
-    use_win_rate_model: bool,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// 設定すると `entry_weights * loss` が有効化される（weight_getter 未設定でも）。
     score_drop_abs: Option<u16>,
@@ -51,7 +50,6 @@ where
             weight_getter: None,
             loss_fn: None,
             wdl_output: false,
-            use_win_rate_model: false,
             score_drop_abs: None,
             factorised: Vec::new(),
             print_ir: false,
@@ -117,11 +115,6 @@ where
         self
     }
 
-    pub fn use_win_rate_model(mut self) -> Self {
-        self.use_win_rate_model = true;
-        self
-    }
-
     /// `|score| >= cap` の局面を loss から除外する（weight を 0 にする）。
     /// `cap = 0` を設定するとほぼ全レコードが除外されるので注意。
     /// 典型用途: dlshogi 系教師の `±32000` mate-stamp を除く ablation 実験。
@@ -170,7 +163,6 @@ where
                 output_getter: buckets,
                 blend_getter: self.blend_getter,
                 weight_getter: self.weight_getter,
-                use_win_rate_model: self.use_win_rate_model,
                 wdl: self.wdl_output,
                 saved_format,
                 score_drop_abs: self.score_drop_abs,
@@ -256,7 +248,6 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
-            use_win_rate_model: self.use_win_rate_model,
             score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }
@@ -285,7 +276,6 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
-            use_win_rate_model: self.use_win_rate_model,
             score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }

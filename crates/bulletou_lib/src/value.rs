@@ -32,15 +32,13 @@ pub use fast_sfnn::{
     FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape, SfnnForwardTrace,
     SfnnForwardWeights, SfnnForwardWorkspaceLayout,
 };
-pub use loader::WinRateModelTargetParams;
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
     KpptTeacherBatchConfig, ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, ScoreWinrateBinReport,
     ScoreWinrateModelMetrics, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
-    TeacherDataloaderPos, WrmTargetCalibrationConfig, WrmTargetCalibrationReport, analyze_score_winrate_from_teacher,
-    estimate_wrm_target_from_teacher_prefix, for_each_halfkp_teacher_fast_batch, for_each_kp_teacher_fast_batch,
-    for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch, for_each_sfnn_teacher_fast_batch,
-    load_halfkp_teacher_fast_batch,
+    TeacherDataloaderPos, analyze_score_winrate_from_teacher, for_each_halfkp_teacher_fast_batch,
+    for_each_kp_teacher_fast_batch, for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch,
+    for_each_sfnn_teacher_fast_batch, load_halfkp_teacher_fast_batch,
 };
 
 use crate::{
@@ -99,7 +97,6 @@ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
     blend_getter: B<Inp>,
     weight_getter: Option<Wgt<Inp>>,
     saved_format: Vec<SavedFormat>,
-    use_win_rate_model: bool,
     wdl: bool,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// builder の `score_drop_abs(cap)` で設定。
@@ -124,14 +121,12 @@ where
             self.output_getter,
             self.blend_getter,
             self.weight_getter,
-            self.use_win_rate_model,
             self.wdl,
             batch,
             threads,
             blend,
             scale,
             self.score_drop_abs,
-            None,
         ))
     }
 }
@@ -174,7 +169,6 @@ where
             self.state.output_getter,
             self.state.blend_getter,
             self.state.weight_getter,
-            self.state.use_win_rate_model,
             self.state.wdl,
             schedule.eval_scale,
             self.state.score_drop_abs,
@@ -333,7 +327,6 @@ where
             self.state.output_getter,
             self.state.blend_getter,
             self.state.weight_getter,
-            self.state.use_win_rate_model,
             self.state.wdl,
             schedule.eval_scale,
             self.state.score_drop_abs,

@@ -41,10 +41,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
 use crate::teacher_path::{DataFormat, expand_teacher, infer_data_format};
-use crate::value::loader::{
-    WinRateModelTargetParams,
-    hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record},
-};
+use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
 
 const PSV_RECORD_SIZE: usize = std::mem::size_of::<PackedSfenValue>();
 
@@ -137,23 +134,11 @@ pub enum ValidationLossKind {
     /// `model_output_scale=1` gives the historical logit-style behaviour and
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidPow { pow_exp: f32 },
-    /// Win-rate-model value loss with shogi WRM transforms:
-    /// configurable `nnue2score`, prediction WRM offset=270 / scaling=340,
-    /// target-side WRM parameters, and configurable
-    /// `abs(prediction - target)^pow_exp`.
-    WinRateModel { pow_exp: f32, nnue2score: f32, target: WinRateModelTargetParams },
 }
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-#[inline]
-fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
-    let q = (score - offset) / scaling;
-    let qm = (-score - offset) / scaling;
-    0.5 * (1.0 + sigmoid(q) - sigmoid(qm))
 }
 
 /// Compute sign-agreement accuracy AND the matching test-set loss
@@ -319,19 +304,12 @@ pub fn compute_sign_accuracy_with_loss(
                 -1 => 0.0,
                 _ => 0.5,
             };
-            let score_norm = match loss_kind {
-                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
-            };
+            let score_norm = sigmoid(inv_scale * f32::from(s));
             let target = blend * result_norm + (1.0 - blend) * score_norm;
-            let model_p = match loss_kind {
-                ValidationLossKind::SigmoidPow { .. } => sigmoid(*m * model_inv_scale),
-                ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(*m * nnue2score, 270.0, 340.0),
-            };
+            let model_p = sigmoid(*m * model_inv_scale);
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
-                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
             report.loss_sampled += 1;
         }
@@ -424,19 +402,12 @@ pub fn compute_sign_accuracy_with_loss_masked(
                 -1 => 0.0,
                 _ => 0.5,
             };
-            let score_norm = match loss_kind {
-                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
-            };
+            let score_norm = sigmoid(inv_scale * f32::from(s));
             let target = blend * result_norm + (1.0 - blend) * score_norm;
-            let model_p = match loss_kind {
-                ValidationLossKind::SigmoidPow { .. } => sigmoid(m * model_inv_scale),
-                ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(m * nnue2score, 270.0, 340.0),
-            };
+            let model_p = sigmoid(m * model_inv_scale);
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
-                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
         }
         if report.loss_sampled > 0 {
@@ -844,31 +815,6 @@ mod tests {
         let loss = r.test_loss.expect("loss requested");
         // expected: ((0.5 - 0.731)^2 + (0.5 - 0.269)^2) / 2 ≈ 0.0533
         assert!((loss - 0.0533).abs() < 1e-3, "loss={loss}");
-    }
-
-    #[test]
-    fn test_loss_can_use_win_rate_model_pow_loss() {
-        let m = [0.0, 0.0];
-        let t = [400i16, -400];
-        let r = compute_sign_accuracy_with_loss(
-            &m,
-            &t,
-            &[1, -1],
-            None,
-            1.0,
-            400.0,
-            1.0,
-            ValidationLossKind::WinRateModel {
-                pow_exp: 2.5,
-                nnue2score: 600.0,
-                target: WinRateModelTargetParams::DEFAULT,
-            },
-        );
-        assert_eq!(r.compared, 2);
-        let loss = r.test_loss.expect("loss requested");
-        assert!(loss.is_finite());
-        assert!(loss > 0.0);
-        assert!((loss - 0.0533).abs() > 1e-3, "wrm loss should differ from sigmoid MSE, loss={loss}");
     }
 
     #[test]

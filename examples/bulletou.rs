@@ -84,8 +84,7 @@ use bulletou_lib::{
         read_teacher_positions_prefix,
     },
     value::{
-        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, WinRateModelTargetParams,
-        analyze_score_winrate_from_teacher,
+        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, analyze_score_winrate_from_teacher,
         nnue_save::{
             Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
             network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
@@ -1200,20 +1199,10 @@ struct QuantizedTestArgs {
     #[arg(long, default_value = "290")]
     scale: u32,
 
-    /// Use tatara-style win-rate-model validation loss for quantized SFNN
-    /// testing. The default is sigmoid probability loss.
-    #[arg(long)]
-    win_rate_model: bool,
-
     /// Exponent of the probability-space error term `|prediction - target|^p`.
     /// With the default sigmoid loss, `2.0` is sigmoid-MSE.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
-
-    /// WRM prediction-side scale for the train-scale quantized loss:
-    /// `scorenet = (raw_output / (QA * QB)) * wrm_nnue2score`.
-    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
-    wrm_nnue2score: f32,
 
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
@@ -1259,9 +1248,6 @@ impl QuantizedTestArgs {
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
-        }
-        if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
-            return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
         }
         if !(self.lambda.is_finite() && (0.0..=1.0).contains(&self.lambda)) {
             return Err(format!("--lambda must be finite and in [0, 1] (got {})", self.lambda));
@@ -1375,19 +1361,10 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "290")]
     scale: u32,
 
-    /// Use tatara-style win-rate-model validation loss for quantized SFNN
-    /// calibration. The default is sigmoid probability loss.
-    #[arg(long)]
-    win_rate_model: bool,
-
     /// Exponent of the probability-space error term `|prediction - target|^p`.
     /// With the default sigmoid loss, `2.0` is sigmoid-MSE.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
-
-    /// WRM prediction-side scale for train-scale diagnostics.
-    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
-    wrm_nnue2score: f32,
 
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
@@ -1446,9 +1423,7 @@ impl QuantizedCalibrateArgs {
             sfnn_ft_shift: self.sfnn_ft_shift,
             lambda: self.lambda,
             scale: self.scale,
-            win_rate_model: self.win_rate_model,
             loss_pow_exp: self.loss_pow_exp,
-            wrm_nnue2score: self.wrm_nnue2score,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
             quant_sqrcrelu_round: self.quant_sqrcrelu_round,
@@ -1573,10 +1548,6 @@ impl EvalType {
             | EvalType::SfnnHalfka2
             | EvalType::SfnnKa2 => true,
         }
-    }
-
-    fn supports_win_rate_model(self) -> bool {
-        true
     }
 
     /// Does this eval type use LayerStacks? Only the SFNN family
@@ -2508,7 +2479,6 @@ const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
 const DEFAULT_SIGMOID_SCALE: f32 = 290.0;
-const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
 const DEFAULT_SCORE_WINRATE_FIT_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_BIN_SIZE: u16 = 50;
@@ -2902,7 +2872,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf              Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test    Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin  Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Compare score->win-rate curves on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf              Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test    Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin  Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -2986,20 +2956,20 @@ struct Args {
     #[arg(long)]
     count_teacher: bool,
 
-    /// Analyze whether a simple score sigmoid or WRM offset+scaling curve
-    /// fits the teacher's `(score, game_result)` statistics better. The first
-    /// `--fit-positions` records fit both curves; the following
-    /// `--analyze-positions` records are held out for reporting.
+    /// Analyze how a simple score sigmoid fits the teacher's
+    /// `(score, game_result)` statistics. The first `--fit-positions` records
+    /// fit the scale; the following `--analyze-positions` records are held out
+    /// for reporting.
     #[arg(long)]
     analyze_score_winrate: bool,
 
     /// Number of teacher-prefix positions used to fit the score->win-rate
-    /// curves for `--analyze-score-winrate`.
+    /// sigmoid curve for `--analyze-score-winrate`.
     #[arg(long, default_value_t = DEFAULT_SCORE_WINRATE_FIT_POSITIONS)]
     fit_positions: usize,
 
     /// Number of held-out positions, immediately after `--fit-positions`, used
-    /// by `--analyze-score-winrate` to compare sigmoid vs WRM.
+    /// by `--analyze-score-winrate`.
     #[arg(long, default_value_t = DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS)]
     analyze_positions: usize,
 
@@ -3185,22 +3155,10 @@ struct Args {
     #[arg(long)]
     scale: Option<f32>,
 
-    /// Use tatara-style win-rate-model prediction conversion and WRM loss for
-    /// scalar value networks. The default is sigmoid probability loss with a
-    /// fixed sigmoid scale.
-    #[arg(long)]
-    win_rate_model: bool,
-
     /// Exponent of the probability-space error term `|prediction - target|^p`.
-    /// Applies to both the default sigmoid loss and `--win-rate-model`.
     /// `2.0` is squared error; `1.5`, `2.5`, etc. are experiment knobs.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
-
-    /// WRM prediction-side scale: `scorenet = model_output * wrm_nnue2score`.
-    /// Used only with `--win-rate-model`. The tatara default is 600.
-    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
-    wrm_nnue2score: f32,
 
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
@@ -3546,16 +3504,10 @@ impl Args {
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
         }
-        if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
-            return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
-        }
         if let Some(scale) = self.scale {
             if !(scale.is_finite() && scale > 0.0) {
                 return Err(format!("--scale must be finite and > 0 (got {scale})"));
             }
-        }
-        if effective_win_rate_model(self) && !eval_type.supports_win_rate_model() {
-            return Err("--win-rate-model currently applies to scalar value eval types only".to_string());
         }
         if let Some(batches) = self.bench_teacher_prepare_batches {
             if batches == 0 {
@@ -3689,51 +3641,15 @@ impl Args {
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
-    if effective_win_rate_model(args) {
-        ValidationLossKind::WinRateModel {
-            pow_exp: effective_loss_pow_exp(args),
-            nnue2score: effective_wrm_nnue2score(args),
-            target: effective_wrm_target_params(args),
-        }
-    } else {
-        ValidationLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
-    }
-}
-
-fn effective_win_rate_model(args: &Args) -> bool {
-    args.win_rate_model
+    ValidationLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
 }
 
 fn effective_loss_pow_exp(args: &Args) -> f32 {
     args.loss_pow_exp
 }
 
-fn effective_wrm_nnue2score(args: &Args) -> f32 {
-    if effective_win_rate_model(args) { args.wrm_nnue2score } else { DEFAULT_WRM_NNUE2SCORE }
-}
-
 fn effective_scale(args: &Args) -> f32 {
     args.scale.unwrap_or(DEFAULT_SIGMOID_SCALE)
-}
-
-fn effective_wrm_target_params(args: &Args) -> WinRateModelTargetParams {
-    if !effective_win_rate_model(args) {
-        return WinRateModelTargetParams::DEFAULT;
-    }
-    WinRateModelTargetParams::DEFAULT
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn resolve_wrm_target_params(args: &Args) -> Result<WinRateModelTargetParams, String> {
-    if !effective_win_rate_model(args) {
-        return Ok(WinRateModelTargetParams::DEFAULT);
-    }
-    let params = WinRateModelTargetParams::DEFAULT;
-    print_startup_kv(
-        "target curve",
-        format!("fixed built-in: offset={:.3}, scaling={:.3}", params.offset, params.scaling),
-    );
-    Ok(params)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3750,39 +3666,17 @@ fn resolve_sigmoid_scale(args: &Args) -> Result<f32, String> {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
-    if effective_win_rate_model(args) {
-        resolve_wrm_target_params(args)?;
-    } else {
-        resolve_sigmoid_scale(args)?;
-    }
+    resolve_sigmoid_scale(args)?;
     Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
-    if effective_win_rate_model(args) {
-        bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
-            pow_exp: effective_loss_pow_exp(args),
-            nnue2score: effective_wrm_nnue2score(args),
-        }
-    } else {
-        bulletou_cuda_cpp::ScalarLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
-    }
+    bulletou_cuda_cpp::ScalarLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
 }
 
 fn value_loss_label(args: &Args) -> String {
-    if effective_win_rate_model(args) {
-        let wrm_target = effective_wrm_target_params(args);
-        format!(
-            "win-rate-model(pow_exp={:.3}, nnue2score={:.3}, target={:.1}/{:.1})",
-            effective_loss_pow_exp(args),
-            effective_wrm_nnue2score(args),
-            wrm_target.offset,
-            wrm_target.scaling
-        )
-    } else {
-        sigmoid_loss_label(effective_loss_pow_exp(args), effective_scale(args))
-    }
+    sigmoid_loss_label(effective_loss_pow_exp(args), effective_scale(args))
 }
 
 fn sigmoid_loss_label(pow_exp: f32, scale: f32) -> String {
@@ -3983,21 +3877,8 @@ fn print_score_winrate_analysis_report(report: &ScoreWinrateAnalysisReport) {
         report.sigmoid_eval.bce,
         report.sigmoid_eval.brier,
     );
-    println!(
-        "{:<18} {:>13} {:>13.8} {:>13.8} {:>13.8}",
-        "WRM(offset,scale)",
-        format!("o={:.1},s={:.1}", report.wrm_params.offset, report.wrm_params.scaling),
-        report.wrm_fit.bce,
-        report.wrm_eval.bce,
-        report.wrm_eval.brier,
-    );
-    println!(
-        "delta(WRM - sigmoid): heldout_bce={:+.8}, heldout_brier={:+.8}",
-        report.wrm_eval.bce - report.sigmoid_eval.bce,
-        report.wrm_eval.brier - report.sigmoid_eval.brier,
-    );
-    if !report.sigmoid_fitted || !report.wrm_fitted {
-        println!("note: fit sample did not contain both win and loss outcomes; one or more defaults were used.");
+    if !report.sigmoid_fitted {
+        println!("note: fit sample did not contain both win and loss outcomes; the default scale was used.");
     }
     println!();
     println!(
@@ -4005,12 +3886,12 @@ fn print_score_winrate_analysis_report(report: &ScoreWinrateAnalysisReport) {
         report.bin_size
     );
     println!(
-        "{:>13} {:>10} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11}",
-        "score", "count", "wins", "losses", "draws", "empirical", "sigmoid", "wrm"
+        "{:>13} {:>10} {:>10} {:>10} {:>10} {:>11} {:>11}",
+        "score", "count", "wins", "losses", "draws", "empirical", "sigmoid"
     );
     for bin in &report.bins {
         println!(
-            "{:>6}..{:<6} {:>10} {:>10} {:>10} {:>10} {:>11.6} {:>11.6} {:>11.6}",
+            "{:>6}..{:<6} {:>10} {:>10} {:>10} {:>10} {:>11.6} {:>11.6}",
             bin.score_min,
             bin.score_max,
             format_count(bin.count),
@@ -4019,7 +3900,6 @@ fn print_score_winrate_analysis_report(report: &ScoreWinrateAnalysisReport) {
             format_count(bin.draws),
             bin.empirical,
             bin.sigmoid,
-            bin.wrm,
         );
     }
 }
@@ -4028,21 +3908,13 @@ fn write_score_winrate_csv(path: &Path, report: &ScoreWinrateAnalysisReport) -> 
     let mut file = std::fs::File::create(path)
         .map_err(|err| format!("failed to create score-winrate CSV {}: {err}", path.display()))?;
     use std::io::Write as _;
-    writeln!(file, "score_min,score_max,count,wins,losses,draws,empirical,sigmoid,wrm")
+    writeln!(file, "score_min,score_max,count,wins,losses,draws,empirical,sigmoid")
         .map_err(|err| format!("failed to write score-winrate CSV {}: {err}", path.display()))?;
     for bin in &report.bins {
         writeln!(
             file,
-            "{},{},{},{},{},{},{:.9},{:.9},{:.9}",
-            bin.score_min,
-            bin.score_max,
-            bin.count,
-            bin.wins,
-            bin.losses,
-            bin.draws,
-            bin.empirical,
-            bin.sigmoid,
-            bin.wrm,
+            "{},{},{},{},{},{},{:.9},{:.9}",
+            bin.score_min, bin.score_max, bin.count, bin.wins, bin.losses, bin.draws, bin.empirical, bin.sigmoid,
         )
         .map_err(|err| format!("failed to write score-winrate CSV {}: {err}", path.display()))?;
     }
@@ -4499,44 +4371,24 @@ fn quantized_sfnn_raw_output_scale() -> f32 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn quantized_test_uses_wrm(args: &QuantizedTestArgs) -> bool {
-    args.win_rate_model
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    if quantized_test_uses_wrm(args) {
-        ValidationLossKind::WinRateModel {
-            pow_exp: args.loss_pow_exp,
-            nnue2score: args.wrm_nnue2score,
-            target: WinRateModelTargetParams::DEFAULT,
-        }
-    } else {
-        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
-    }
+    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    if quantized_test_uses_wrm(args) {
-        ValidationLossKind::WinRateModel {
-            pow_exp: args.loss_pow_exp,
-            nnue2score: 1.0,
-            target: WinRateModelTargetParams::DEFAULT,
-        }
-    } else {
-        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
-    }
+    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_model_output_scale(args: &QuantizedTestArgs) -> f32 {
-    if quantized_test_uses_wrm(args) { 1.0 } else { 1.0 }
+    let _ = args;
+    1.0
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_engine_scale_model_output_scale(args: &QuantizedTestArgs) -> f32 {
-    if quantized_test_uses_wrm(args) { 1.0 } else { args.scale as f32 }
+    args.scale as f32
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5108,8 +4960,7 @@ fn estimate_quantized_fv_scale_from_outputs(
     //
     //   engine_score ~= raw_output / FV_SCALE + offset
     //
-    // This is deliberately a score-scale estimate, not a WRM probability
-    // fit.  FV_SCALE is the engine-side conversion from the quantized NNUE
+    // This is deliberately a score-scale estimate.  FV_SCALE is the engine-side conversion from the quantized NNUE
     // integer output to Value, so the least-surprising estimate is obtained
     // in the same score units as the teacher data.
     let mut n = 0.0_f64;
@@ -5206,14 +5057,7 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
         args.quant_sqrcrelu_round.cli_name(),
         args.quant_final_div_round.cli_name(),
     );
-    if quantized_test_uses_wrm(args) {
-        eprintln!(
-            "  loss              = win-rate-model(pow_exp={:.3}, train_scale_nnue2score={:.3}, engine_scale_nnue2score=1.000)",
-            args.loss_pow_exp, args.wrm_nnue2score,
-        );
-    } else {
-        eprintln!("  loss              = {}", sigmoid_loss_label(args.loss_pow_exp, args.scale as f32));
-    }
+    eprintln!("  loss              = {}", sigmoid_loss_label(args.loss_pow_exp, args.scale as f32));
     eprintln!(
         "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
         quantized_sfnn_raw_output_scale(),
@@ -5266,13 +5110,6 @@ fn quantized_calibration_sigmoid(value: f32) -> f32 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn quantized_calibration_wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
-    let q = (score - offset) / scaling;
-    let qm = (-score - offset) / scaling;
-    0.5 * (1.0 + quantized_calibration_sigmoid(q) - quantized_calibration_sigmoid(qm))
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn build_quantized_calibration_prepared(
     positions: &[bulletou_lib::shogi::PackedSfenValue],
     args: &QuantizedTestArgs,
@@ -5298,7 +5135,6 @@ fn build_quantized_calibration_prepared(
             let score = f32::from(teacher_scores[i]);
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => quantized_calibration_sigmoid(inv_scale * score),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(score),
             };
             (i, blend * result_norm + (1.0 - blend) * score_norm)
         })
@@ -5350,27 +5186,15 @@ fn quantized_calibration_engine_report_from_outputs(
 
     if !prepared.loss_targets.is_empty() {
         let mut loss_sum = 0.0f32;
-        if quantized_test_uses_wrm(args) {
-            for &(i, target) in &prepared.loss_targets {
-                let raw = outputs[i]
-                    .raw
-                    .checked_add(raw_delta)
-                    .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
-                let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
-                let model_p = quantized_calibration_wrm_probability(model_score, 270.0, 340.0);
-                loss_sum += (model_p - target).abs().powf(args.loss_pow_exp);
-            }
-        } else {
-            let model_inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 1.0 };
-            for &(i, target) in &prepared.loss_targets {
-                let raw = outputs[i]
-                    .raw
-                    .checked_add(raw_delta)
-                    .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
-                let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
-                let diff = quantized_calibration_sigmoid(model_score * model_inv_scale) - target;
-                loss_sum += diff.abs().powf(args.loss_pow_exp);
-            }
+        let model_inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 1.0 };
+        for &(i, target) in &prepared.loss_targets {
+            let raw = outputs[i]
+                .raw
+                .checked_add(raw_delta)
+                .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
+            let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
+            let diff = quantized_calibration_sigmoid(model_score * model_inv_scale) - target;
+            loss_sum += diff.abs().powf(args.loss_pow_exp);
         }
         report.test_loss = Some(loss_sum / report.loss_sampled as f32);
     }
@@ -5871,16 +5695,8 @@ fn main() {
             }
         }
     }
-    if effective_win_rate_model(&args) && !args.eval_type().supports_win_rate_model() {
-        eprintln!("error: --win-rate-model currently applies to scalar value eval types only.");
-        std::process::exit(2);
-    }
     if !(args.loss_pow_exp.is_finite() && args.loss_pow_exp >= 1.0) {
         eprintln!("error: --loss-pow-exp must be finite and >= 1 (got {}).", args.loss_pow_exp);
-        std::process::exit(2);
-    }
-    if !(args.wrm_nnue2score.is_finite() && args.wrm_nnue2score > 0.0) {
-        eprintln!("error: --wrm-nnue2score must be finite and > 0 (got {}).", args.wrm_nnue2score);
         std::process::exit(2);
     }
     if let Some(scale) = args.scale {
@@ -6383,8 +6199,6 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: effective_scale(args),
-                win_rate_model: effective_win_rate_model(args),
-                wrm_target: effective_wrm_target_params(args),
                 ft_factorize: false,
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
@@ -6413,8 +6227,6 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: effective_scale(args),
-                win_rate_model: effective_win_rate_model(args),
-                wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6442,8 +6254,6 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: effective_scale(args),
-                win_rate_model: effective_win_rate_model(args),
-                wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6477,8 +6287,6 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: effective_scale(args),
-                win_rate_model: effective_win_rate_model(args),
-                wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6512,8 +6320,6 @@ where
                 queue_depth: options.queue_depth,
                 lambda: args.lambda,
                 scale: effective_scale(args),
-                win_rate_model: effective_win_rate_model(args),
-                wrm_target: effective_wrm_target_params(args),
                 score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                 teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
                 teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6635,8 +6441,6 @@ where
         queue_depth: options.queue_depth,
         lambda: args.lambda,
         scale: effective_scale(args),
-        win_rate_model: effective_win_rate_model(args),
-        wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches: options.teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -6770,7 +6574,6 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
         return Ok(());
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
-    let _wrm_target = resolve_wrm_target_params(args)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
@@ -7496,7 +7299,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         return Ok(());
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
-    let _wrm_target = resolve_wrm_target_params(args)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -8472,7 +8274,6 @@ fn run_cuda_cpp_sfnn_teacher_prepare_benchmark(args: &Args) -> Result<(), String
     let teacher_threads = cuda_cpp_effective_teacher_threads(args);
     let loader_threads = cuda_cpp_effective_loader_threads(args);
     let batch_queue_size = cuda_cpp_effective_batch_queue_size(args);
-    let _wrm_target = resolve_wrm_target_params(args)?;
     let total_positions = batch_size.saturating_mul(batch_count);
 
     eprintln!(
@@ -8506,8 +8307,6 @@ fn run_cuda_cpp_sfnn_teacher_prepare_benchmark(args: &Args) -> Result<(), String
         queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: effective_scale(args),
-        win_rate_model: effective_win_rate_model(args),
-        wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -8634,7 +8433,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         return Ok(());
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
-    let _wrm_target = resolve_wrm_target_params(args)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
@@ -8892,8 +8690,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         queue_depth: batch_queue_size,
         lambda: args.lambda,
         scale: effective_scale(args),
-        win_rate_model: effective_win_rate_model(args),
-        wrm_target: effective_wrm_target_params(args),
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -8951,8 +8747,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     queue_depth: batch_queue_size,
                     lambda: args.lambda,
                     scale: effective_scale(args),
-                    win_rate_model: effective_win_rate_model(args),
-                    wrm_target: effective_wrm_target_params(args),
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                     teacher_shuffle_buffer_batches,
                     teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -14199,9 +13993,7 @@ fn resume_signature(args: &Args) -> String {
         format!("lr_plateau_monitor={}", args.lr_plateau_monitor.cli_name()),
         format!("lambda={:.9}", args.lambda),
         format!("scale={:.6}", effective_scale(args)),
-        format!("win_rate_model={}", effective_win_rate_model(args)),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
-        format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!(
             "optimizer_epsilon={}",
@@ -14255,31 +14047,14 @@ fn resume_signature_without_line(signature: &str, prefix: &str) -> String {
     out
 }
 
-fn resume_signature_normalize_loss_flags(signature: &str) -> String {
+fn resume_signature_normalize_defaults(signature: &str) -> String {
     let mut out = Vec::new();
     for line in signature.lines() {
-        if let Some(value) = line.strip_prefix("nnue_pytorch_wrm_loss=") {
-            let enabled = value.trim() == "true";
-            out.push(format!("win_rate_model={enabled}"));
-            out.push(format!("loss_pow_exp={:.9}", if enabled { 2.5_f32 } else { 2.0_f32 }));
-            out.push(format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
-        } else if line.starts_with("scale_calibration_positions=")
-            || line.starts_with("wrm_target_calibration_positions=")
-            || line.starts_with("wrm_target_offset=")
-            || line.starts_with("wrm_target_scaling=")
-        {
-            // These options used unreliable game-result fitting and were removed
-            // from the training path. Ignore old resume-config rows so existing
-            // checkpoints can still be resumed with the fixed target curves.
-        } else {
-            out.push(line.to_string());
-        }
+        out.push(line.to_string());
     }
     let has_loss_pow_exp = out.iter().any(|line| line.starts_with("loss_pow_exp="));
-    let has_wrm_nnue2score = out.iter().any(|line| line.starts_with("wrm_nnue2score="));
     let has_teacher_shuffle_buffer_batches = out.iter().any(|line| line.starts_with("teacher_shuffle_buffer_batches="));
     let has_teacher_shuffle_seed = out.iter().any(|line| line.starts_with("teacher_shuffle_seed="));
-    let has_win_rate_model = out.iter().position(|line| line.starts_with("win_rate_model="));
     if !has_teacher_shuffle_buffer_batches {
         if let Some(index) = out.iter().position(|line| line.starts_with("positions_per_superbatch=")) {
             out.insert(index + 1, "teacher_shuffle_buffer_batches=0".to_string());
@@ -14291,15 +14066,8 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
         }
     }
     if !has_loss_pow_exp {
-        if let Some(index) = has_win_rate_model {
+        if let Some(index) = out.iter().position(|line| line.starts_with("scale=")) {
             out.insert(index + 1, "loss_pow_exp=2.000000000".to_string());
-        }
-    }
-    if !has_wrm_nnue2score {
-        if let Some(index) = out.iter().position(|line| line.starts_with("loss_pow_exp=")) {
-            out.insert(index + 1, format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
-        } else if let Some(index) = has_win_rate_model {
-            out.insert(index + 1, format!("wrm_nnue2score={DEFAULT_WRM_NNUE2SCORE:.9}"));
         }
     }
     let mut normalized = out.join("\n");
@@ -14308,7 +14076,7 @@ fn resume_signature_normalize_loss_flags(signature: &str) -> String {
 }
 
 fn resume_signature_for_match(signature: &str) -> String {
-    let signature = resume_signature_normalize_loss_flags(signature);
+    let signature = resume_signature_normalize_defaults(signature);
     resume_signature_without_line(&signature, "test_batch_size=")
 }
 
@@ -19556,44 +19324,15 @@ mod tests {
     }
 
     #[test]
-    fn win_rate_model_is_explicit_and_loss_pow_exp_replaces_old_wrm_flag() {
+    fn value_loss_is_sigmoid_only_and_removed_loss_flags_are_rejected() {
         use clap::Parser as _;
 
         let default_args =
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
-        assert!(!effective_win_rate_model(&default_args));
         assert_eq!(
             value_loss_label(&default_args),
             format!("sigmoid-mse(pow_exp=2.000, scale={:.3})", DEFAULT_SIGMOID_SCALE)
         );
-
-        let removed_sigmoid_flag = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--loss-sigmoid-mse",
-        ]);
-        assert!(removed_sigmoid_flag.is_err());
-
-        for removed in [
-            "--scale-calibration-positions",
-            "--wrm-target-calibration-positions",
-            "--wrm-target-offset",
-            "--wrm-target-scaling",
-        ] {
-            let parsed = Args::try_parse_from([
-                "bulletou",
-                "--arch",
-                "NNUE_halfkp_256x2_32_32",
-                "--teacher",
-                "/dev/null",
-                removed,
-                "100",
-            ]);
-            assert!(parsed.is_err(), "{removed} should be removed from the training CLI");
-        }
 
         let sigmoid_pow_args = Args::try_parse_from([
             "bulletou",
@@ -19605,46 +19344,23 @@ mod tests {
             "1.5",
         ])
         .unwrap();
-        assert!(!effective_win_rate_model(&sigmoid_pow_args));
         assert_eq!(effective_loss_pow_exp(&sigmoid_pow_args), 1.5);
         assert_eq!(
             value_loss_label(&sigmoid_pow_args),
             format!("sigmoid-pow(pow_exp=1.500, scale={:.3})", DEFAULT_SIGMOID_SCALE)
         );
 
-        let kppt_default = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
-        assert!(!effective_win_rate_model(&kppt_default));
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--win-rate-model",
-            "--loss-pow-exp",
-            "2.5",
-            "--wrm-nnue2score",
-            "512",
-        ])
-        .unwrap();
-
-        assert!(args.win_rate_model);
-        assert!(effective_win_rate_model(&args));
-        assert_eq!(args.loss_pow_exp, 2.5);
-        assert_eq!(args.wrm_nnue2score, 512.0);
-        assert!(value_loss_label(&args).contains("nnue2score=512.000"));
-
-        let old = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--nnue-pytorch-wrm-loss",
-        ]);
-
-        assert!(old.is_err());
+        for removed in ["--loss-sigmoid-mse"] {
+            let parsed = Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "NNUE_halfkp_256x2_32_32",
+                "--teacher",
+                "/dev/null",
+                removed,
+            ]);
+            assert!(parsed.is_err(), "{removed} should be removed from the training CLI");
+        }
     }
 
     #[test]
@@ -19831,36 +19547,6 @@ mod tests {
         ])
         .unwrap();
         assert!(!resume_signature_matches(&resume_signature(&old), &changed_positions));
-    }
-
-    #[test]
-    fn resume_signature_accepts_old_wrm_loss_key() {
-        use clap::Parser as _;
-
-        let no_wrm =
-            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
-        let old_no_wrm = resume_signature(&no_wrm).replace(
-            "win_rate_model=false\nloss_pow_exp=2.000000000\nwrm_nnue2score=600.000000000\n",
-            "nnue_pytorch_wrm_loss=false\n",
-        );
-        assert!(resume_signature_matches(&old_no_wrm, &no_wrm));
-
-        let wrm = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--win-rate-model",
-            "--loss-pow-exp",
-            "2.5",
-        ])
-        .unwrap();
-        let old_wrm = resume_signature(&wrm).replace(
-            "win_rate_model=true\nloss_pow_exp=2.500000000\nwrm_nnue2score=600.000000000\n",
-            "nnue_pytorch_wrm_loss=true\n",
-        );
-        assert!(resume_signature_matches(&old_wrm, &wrm));
     }
 
     #[test]

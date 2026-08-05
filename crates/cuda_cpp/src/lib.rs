@@ -1641,28 +1641,18 @@ fn sfnn_forward_device_with_factorizer_impl(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarLossKind {
     SigmoidPow { pow_exp: f32 },
-    WinRateModel { pow_exp: f32, nnue2score: f32 },
 }
 
 impl ScalarLossKind {
     fn as_ffi(self) -> i32 {
         match self {
             Self::SigmoidPow { .. } => 0,
-            Self::WinRateModel { .. } => 1,
         }
     }
 
     fn loss_pow_exp(self) -> f32 {
         match self {
             Self::SigmoidPow { pow_exp } => pow_exp,
-            Self::WinRateModel { pow_exp, .. } => pow_exp,
-        }
-    }
-
-    fn wrm_nnue2score(self) -> f32 {
-        match self {
-            Self::SigmoidPow { .. } => 600.0,
-            Self::WinRateModel { nnue2score, .. } => nnue2score,
         }
     }
 }
@@ -1828,7 +1818,7 @@ pub fn scalar_loss_host(
             kind.as_ffi(),
             output_inv_scale,
             kind.loss_pow_exp(),
-            kind.wrm_nnue2score(),
+            0.0,
             batch_size,
             batch.outputs.as_ptr(),
             batch.targets.as_ptr(),
@@ -1916,7 +1906,7 @@ fn scalar_loss_device_from_buffers_with_finalize(
             kind.as_ffi(),
             output_inv_scale,
             kind.loss_pow_exp(),
-            kind.wrm_nnue2score(),
+            0.0,
             batch_size,
             outputs.as_ptr(),
             targets.as_ptr(),
@@ -6124,7 +6114,7 @@ mod ffi {
             kind: i32,
             output_inv_scale: f32,
             loss_pow_exp: f32,
-            wrm_nnue2score: f32,
+            unused_loss_param: f32,
             batch: usize,
             outputs: *mut BulletOuCudaCppF32Buffer,
             targets: *mut BulletOuCudaCppF32Buffer,
@@ -6140,7 +6130,7 @@ mod ffi {
             kind: i32,
             output_inv_scale: f32,
             loss_pow_exp: f32,
-            wrm_nnue2score: f32,
+            unused_loss_param: f32,
             batch: usize,
             outputs: *const f32,
             targets: *const f32,
@@ -6846,17 +6836,6 @@ mod tests {
         );
         assert_close("device weighted_sum", device.weighted_sum, host.weighted_sum, 1.0e-6);
         assert_close("device mean", device.mean, host.mean, 1.0e-6);
-
-        let wrm_pow2 =
-            scalar_loss_host(0, ScalarLossKind::WinRateModel { pow_exp: 2.0, nnue2score: 600.0 }, 1.0, batch).unwrap();
-        let wrm_pow25 =
-            scalar_loss_host(0, ScalarLossKind::WinRateModel { pow_exp: 2.5, nnue2score: 600.0 }, 1.0, batch).unwrap();
-        let wrm_scale300 =
-            scalar_loss_host(0, ScalarLossKind::WinRateModel { pow_exp: 2.0, nnue2score: 300.0 }, 1.0, batch).unwrap();
-        assert!(wrm_pow2.mean.is_finite());
-        assert!(wrm_pow25.mean.is_finite());
-        assert!((wrm_pow2.mean - wrm_pow25.mean).abs() > 1.0e-6);
-        assert!((wrm_pow2.mean - wrm_scale300.mean).abs() > 1.0e-6);
     }
 
     #[test]

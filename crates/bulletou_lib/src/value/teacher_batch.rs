@@ -25,8 +25,7 @@ use crate::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
-            teacher_shuffle_window_records, win_rate_model_score_from_table, win_rate_model_score_table,
+            ShogiPackLoader, load_and_map_shuffled_batches_with_prefetch, teacher_shuffle_window_records,
         },
     },
 };
@@ -57,10 +56,6 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub lambda: f32,
     /// Eval-to-score sigmoid scale used while preparing teacher targets.
     pub scale: f32,
-    /// Use win-rate-model target conversion while preparing teacher targets.
-    pub win_rate_model: bool,
-    /// WRM target-side score-to-probability parameters.
-    pub wrm_target: WinRateModelTargetParams,
     /// Add tatara-style HalfKP piece-input virtual rows to the FT input.
     pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
@@ -92,8 +87,6 @@ pub struct KpTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub win_rate_model: bool,
-    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -120,8 +113,6 @@ pub struct KpptTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub win_rate_model: bool,
-    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -149,8 +140,6 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
-    pub win_rate_model: bool,
-    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -200,28 +189,6 @@ impl fmt::Display for TeacherBatchError {
 impl Error for TeacherBatchError {}
 
 #[derive(Debug, Clone, Copy)]
-pub struct WrmTargetCalibrationConfig<'a> {
-    pub teacher: &'a str,
-    pub positions: usize,
-    pub buffer_mb: usize,
-    pub loader_threads: usize,
-    pub score_drop_abs: Option<u16>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct WrmTargetCalibrationReport {
-    pub params: WinRateModelTargetParams,
-    pub requested_positions: usize,
-    pub observed_positions: usize,
-    pub fitted_positions: usize,
-    pub decisive_positions: usize,
-    pub drawn_positions: usize,
-    pub filtered_positions: usize,
-    pub bce_loss: f64,
-    pub fitted: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct ScoreWinrateAnalysisConfig<'a> {
     pub teacher: &'a str,
     /// Number of teacher-prefix positions used to fit the score->win-rate curves.
@@ -247,10 +214,6 @@ pub struct ScoreWinrateAnalysisReport {
     pub sigmoid_fitted: bool,
     pub sigmoid_fit: ScoreWinrateModelMetrics,
     pub sigmoid_eval: ScoreWinrateModelMetrics,
-    pub wrm_params: WinRateModelTargetParams,
-    pub wrm_fitted: bool,
-    pub wrm_fit: ScoreWinrateModelMetrics,
-    pub wrm_eval: ScoreWinrateModelMetrics,
     pub requested_fit_positions: usize,
     pub observed_fit_positions: usize,
     pub used_fit_positions: usize,
@@ -277,17 +240,16 @@ pub struct ScoreWinrateBinReport {
     pub draws: usize,
     pub empirical: f64,
     pub sigmoid: f64,
-    pub wrm: f64,
 }
 
 #[derive(Clone, Copy, Default)]
-struct WrmTargetOutcomeBin {
+struct ScoreWinrateOutcomeBin {
     wins: u32,
     losses: u32,
     draws: u32,
 }
 
-impl WrmTargetOutcomeBin {
+impl ScoreWinrateOutcomeBin {
     fn count(self) -> usize {
         self.wins as usize + self.losses as usize + self.draws as usize
     }
@@ -320,119 +282,6 @@ struct ScoreWinrateObservedCounts {
 
 const SCORE_WINRATE_SIGMOID_SCALE_MIN: i32 = 50;
 const SCORE_WINRATE_SIGMOID_SCALE_MAX: i32 = 20_000;
-const SCORE_WINRATE_WRM_OFFSET_MAX: i32 = 10_000;
-const SCORE_WINRATE_WRM_SCALING_MIN: i32 = 20;
-const SCORE_WINRATE_WRM_SCALING_MAX: i32 = 20_000;
-
-pub fn estimate_wrm_target_from_teacher_prefix(
-    config: &WrmTargetCalibrationConfig<'_>,
-) -> Result<WrmTargetCalibrationReport, TeacherBatchError> {
-    if config.positions == 0 {
-        return Ok(WrmTargetCalibrationReport {
-            params: WinRateModelTargetParams::DEFAULT,
-            requested_positions: 0,
-            observed_positions: 0,
-            fitted_positions: 0,
-            decisive_positions: 0,
-            drawn_positions: 0,
-            filtered_positions: 0,
-            bce_loss: 0.0,
-            fitted: false,
-        });
-    }
-
-    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
-    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
-    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
-    let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
-    let mut observed_positions = 0usize;
-    let mut filtered_positions = 0usize;
-    let mut decisive_positions = 0usize;
-    let mut drawn_positions = 0usize;
-    let mut observe = |chunk: &[PackedSfenValue]| {
-        let remaining = config.positions.saturating_sub(observed_positions);
-        let take = remaining.min(chunk.len());
-        for pos in &chunk[..take] {
-            observed_positions += 1;
-            if let Some(cap) = config.score_drop_abs {
-                if pos.score().unsigned_abs() >= cap {
-                    filtered_positions += 1;
-                    continue;
-                }
-            }
-            let bin = &mut bins[(i32::from(pos.score()) - i32::from(i16::MIN)) as usize];
-            match pos.game_result() {
-                r if r > 0 => {
-                    bin.wins += 1;
-                    decisive_positions += 1;
-                }
-                r if r < 0 => {
-                    bin.losses += 1;
-                    decisive_positions += 1;
-                }
-                _ => {
-                    bin.draws += 1;
-                    drawn_positions += 1;
-                }
-            }
-        }
-        observed_positions >= config.positions
-    };
-
-    match format {
-        DataFormat::Hcpe => {
-            let loader = HcpeDataLoader::new_concat_multiple(
-                &data_files_ref,
-                config.buffer_mb,
-                (|_| true) as fn(&PackedSfenValue) -> bool,
-            )
-            .with_buffer_records(config.positions.min(65_536).max(1))
-            .with_loader_threads(config.loader_threads)
-            .with_single_epoch(true);
-            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
-        }
-        DataFormat::Hcpe3 => {
-            let loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
-                .with_buffer_records(config.positions.min(65_536).max(1))
-                .with_single_epoch(true);
-            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
-        }
-        DataFormat::Pack => {
-            let loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
-                .with_buffer_records(config.positions.min(65_536).max(1))
-                .with_single_epoch(true);
-            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
-        }
-        DataFormat::Psv => {
-            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(true);
-            scan_packed_teacher_prefix(&loader, config.positions, &mut observe);
-        }
-    }
-
-    let (params, bce_loss, fitted) =
-        fit_sigmoid_target_params(&bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
-    // Drawn games are observed and reported, but they are intentionally
-    // excluded from target-curve fitting. Treating many draws as 0.5 makes
-    // the best curve artificially flat and can produce an unusably large
-    // sigmoid/WRM scale.
-    let fitted_positions = decisive_positions;
-    Ok(WrmTargetCalibrationReport {
-        params,
-        requested_positions: config.positions,
-        observed_positions,
-        fitted_positions,
-        decisive_positions,
-        drawn_positions,
-        filtered_positions,
-        bce_loss,
-        fitted,
-    })
-}
-
-fn fit_sigmoid_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTargetParams, f64, bool)> {
-    let (scale, bce_loss, fitted) = fit_sigmoid_target_scale(bins)?;
-    Some((WinRateModelTargetParams { offset: 0.0, scaling: scale }, bce_loss, fitted))
-}
 
 pub fn analyze_score_winrate_from_teacher(
     config: &ScoreWinrateAnalysisConfig<'_>,
@@ -455,8 +304,8 @@ pub fn analyze_score_winrate_from_teacher(
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
     let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
 
-    let mut fit_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
-    let mut eval_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+    let mut fit_bins = vec![ScoreWinrateOutcomeBin::default(); usize::from(u16::MAX) + 1];
+    let mut eval_bins = vec![ScoreWinrateOutcomeBin::default(); usize::from(u16::MAX) + 1];
     let mut fit_counts = ScoreWinrateObservedCounts::default();
     let mut eval_counts = ScoreWinrateObservedCounts::default();
     let mut observe = |chunk: &[PackedSfenValue]| {
@@ -513,29 +362,19 @@ pub fn analyze_score_winrate_from_teacher(
         ));
     }
 
-    let (wrm_params, _, wrm_fitted) =
-        fit_wrm_target_params(&fit_bins).unwrap_or((WinRateModelTargetParams::DEFAULT, 0.0, false));
     let (sigmoid_scale, _, sigmoid_fitted) = fit_sigmoid_target_scale(&fit_bins).unwrap_or((600.0, 0.0, false));
 
     let sigmoid_fit = score_winrate_metrics(&fit_bins, |score| sigmoid_score_probability(score, sigmoid_scale))
         .ok_or_else(|| TeacherBatchError::invalid_input("fit set has no usable score/result samples"))?;
     let sigmoid_eval = score_winrate_metrics(&eval_bins, |score| sigmoid_score_probability(score, sigmoid_scale))
         .ok_or_else(|| TeacherBatchError::invalid_input("held-out set has no usable score/result samples"))?;
-    let wrm_fit = score_winrate_metrics(&fit_bins, |score| wrm_params.probability(score))
-        .ok_or_else(|| TeacherBatchError::invalid_input("fit set has no usable score/result samples"))?;
-    let wrm_eval = score_winrate_metrics(&eval_bins, |score| wrm_params.probability(score))
-        .ok_or_else(|| TeacherBatchError::invalid_input("held-out set has no usable score/result samples"))?;
-    let bins = score_winrate_bin_reports(&eval_bins, config.bin_size, sigmoid_scale, wrm_params);
+    let bins = score_winrate_bin_reports(&eval_bins, config.bin_size, sigmoid_scale);
 
     Ok(ScoreWinrateAnalysisReport {
         sigmoid_scale,
         sigmoid_fitted,
         sigmoid_fit,
         sigmoid_eval,
-        wrm_params,
-        wrm_fitted,
-        wrm_fit,
-        wrm_eval,
         requested_fit_positions: config.fit_positions,
         observed_fit_positions: fit_counts.observed,
         used_fit_positions: fit_counts.used,
@@ -556,7 +395,7 @@ pub fn analyze_score_winrate_from_teacher(
 fn observe_score_winrate_position(
     pos: &PackedSfenValue,
     score_drop_abs: Option<u16>,
-    bins: &mut [WrmTargetOutcomeBin],
+    bins: &mut [ScoreWinrateOutcomeBin],
     counts: &mut ScoreWinrateObservedCounts,
 ) {
     counts.observed += 1;
@@ -589,88 +428,7 @@ where
     loader.map_chunks(0, |chunk| f(chunk));
 }
 
-fn fit_wrm_target_params(bins: &[WrmTargetOutcomeBin]) -> Option<(WinRateModelTargetParams, f64, bool)> {
-    let mut samples = Vec::new();
-    let mut fitted_positions = 0usize;
-    let mut total_pos = 0.0f64;
-    let mut total_neg = 0.0f64;
-    for (idx, bin) in bins.iter().enumerate() {
-        let count = bin.decisive_count();
-        if count == 0 {
-            continue;
-        }
-        let score = (idx as i32 + i32::from(i16::MIN)) as f32;
-        let (positives, negatives) = bin.decisive_positives_negatives();
-        samples.push((score, positives, negatives));
-        fitted_positions += count;
-        total_pos += positives;
-        total_neg += negatives;
-    }
-    if fitted_positions == 0 || total_pos <= 0.0 || total_neg <= 0.0 {
-        return None;
-    }
-
-    let mut best_candidates = vec![WinRateModelTargetParams::DEFAULT];
-    if let Some((scale, _, _)) = fit_sigmoid_target_scale(bins) {
-        best_candidates.push(WinRateModelTargetParams { offset: 0.0, scaling: scale });
-    }
-    let mut best = best_candidates[0];
-    let mut best_loss = wrm_target_bce_loss(&samples, best);
-    for params in best_candidates.into_iter().skip(1) {
-        let loss = wrm_target_bce_loss(&samples, params);
-        if loss < best_loss {
-            best = params;
-            best_loss = loss;
-        }
-    }
-
-    for offset in (0..=SCORE_WINRATE_WRM_OFFSET_MAX).step_by(40) {
-        for scaling in (SCORE_WINRATE_WRM_SCALING_MIN..=SCORE_WINRATE_WRM_SCALING_MAX).step_by(40) {
-            let params = WinRateModelTargetParams { offset: offset as f32, scaling: scaling as f32 };
-            let loss = wrm_target_bce_loss(&samples, params);
-            if loss < best_loss {
-                best = params;
-                best_loss = loss;
-            }
-        }
-    }
-
-    for step in [20i32, 10, 5, 2, 1] {
-        let span = step * 6;
-        let offset_min = ((best.offset as i32) - span).max(0);
-        let offset_max = ((best.offset as i32) + span).min(SCORE_WINRATE_WRM_OFFSET_MAX);
-        let scaling_min = ((best.scaling as i32) - span).max(SCORE_WINRATE_WRM_SCALING_MIN);
-        let scaling_max = ((best.scaling as i32) + span).min(SCORE_WINRATE_WRM_SCALING_MAX);
-        let mut offset = offset_min;
-        while offset <= offset_max {
-            let mut scaling = scaling_min;
-            while scaling <= scaling_max {
-                let params = WinRateModelTargetParams { offset: offset as f32, scaling: scaling as f32 };
-                let loss = wrm_target_bce_loss(&samples, params);
-                if loss < best_loss {
-                    best = params;
-                    best_loss = loss;
-                }
-                scaling += step;
-            }
-            offset += step;
-        }
-    }
-
-    let total = total_pos + total_neg;
-    Some((best, best_loss / total, true))
-}
-
-fn wrm_target_bce_loss(samples: &[(f32, f64, f64)], params: WinRateModelTargetParams) -> f64 {
-    let mut loss = 0.0f64;
-    for &(score, positives, negatives) in samples {
-        let p = f64::from(params.probability(score)).clamp(1.0e-6, 1.0 - 1.0e-6);
-        loss -= positives * p.ln() + negatives * (1.0 - p).ln();
-    }
-    loss
-}
-
-fn fit_sigmoid_target_scale(bins: &[WrmTargetOutcomeBin]) -> Option<(f32, f64, bool)> {
+fn fit_sigmoid_target_scale(bins: &[ScoreWinrateOutcomeBin]) -> Option<(f32, f64, bool)> {
     let mut samples = Vec::new();
     let mut fitted_positions = 0usize;
     let mut total_pos = 0.0f64;
@@ -746,7 +504,7 @@ fn logistic_f64(x: f64) -> f64 {
     }
 }
 
-fn score_winrate_metrics<F>(bins: &[WrmTargetOutcomeBin], mut probability: F) -> Option<ScoreWinrateModelMetrics>
+fn score_winrate_metrics<F>(bins: &[ScoreWinrateOutcomeBin], mut probability: F) -> Option<ScoreWinrateModelMetrics>
 where
     F: FnMut(f32) -> f32,
 {
@@ -772,16 +530,14 @@ where
 
 #[derive(Default)]
 struct ScoreWinrateDisplayBin {
-    outcome: WrmTargetOutcomeBin,
+    outcome: ScoreWinrateOutcomeBin,
     sigmoid_sum: f64,
-    wrm_sum: f64,
 }
 
 fn score_winrate_bin_reports(
-    exact_bins: &[WrmTargetOutcomeBin],
+    exact_bins: &[ScoreWinrateOutcomeBin],
     bin_size: u16,
     sigmoid_scale: f32,
-    wrm_params: WinRateModelTargetParams,
 ) -> Vec<ScoreWinrateBinReport> {
     let mut grouped: BTreeMap<i32, ScoreWinrateDisplayBin> = BTreeMap::new();
     for (idx, bin) in exact_bins.iter().enumerate() {
@@ -796,7 +552,6 @@ fn score_winrate_bin_reports(
         entry.outcome.losses += bin.losses;
         entry.outcome.draws += bin.draws;
         entry.sigmoid_sum += f64::from(sigmoid_score_probability(score as f32, sigmoid_scale)) * count as f64;
-        entry.wrm_sum += f64::from(wrm_params.probability(score as f32)) * count as f64;
     }
 
     grouped
@@ -818,7 +573,6 @@ fn score_winrate_bin_reports(
                 draws: bin.outcome.draws as usize,
                 empirical,
                 sigmoid: bin.sigmoid_sum / total_count as f64,
-                wrm: bin.wrm_sum / total_count as f64,
             })
         })
         .collect()
@@ -1633,7 +1387,6 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
-    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1648,7 +1401,6 @@ fn validate_kp_config(config: &KpTeacherBatchConfig<'_>) -> Result<(), TeacherBa
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
-    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1663,7 +1415,6 @@ fn validate_kppt_config(config: &KpptTeacherBatchConfig<'_>) -> Result<(), Teach
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
-    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1677,17 +1428,6 @@ fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), Teach
     }
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
-    }
-    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
-    Ok(())
-}
-
-fn validate_wrm_target(enabled: bool, params: WinRateModelTargetParams) -> Result<(), TeacherBatchError> {
-    if enabled && WinRateModelTargetParams::new(params.offset, params.scaling).is_none() {
-        return Err(TeacherBatchError::invalid_input(format!(
-            "WRM target parameters must be finite and scaling > 0 (offset={}, scaling={})",
-            params.offset, params.scaling
-        )));
     }
     Ok(())
 }
@@ -1759,7 +1499,6 @@ fn prepare_halfkp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
-    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1786,15 +1525,7 @@ fn prepare_halfkp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = if config.win_rate_model {
-                win_rate_model_score_from_table(
-                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
-                    pos.score(),
-                )
-            } else {
-                let score = f32::from(pos.score());
-                1.0 / (1.0 + (-rscale * score).exp())
-            };
+            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -1856,7 +1587,6 @@ fn prepare_kp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
-    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1883,15 +1613,7 @@ fn prepare_kp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = if config.win_rate_model {
-                win_rate_model_score_from_table(
-                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
-                    pos.score(),
-                )
-            } else {
-                let score = f32::from(pos.score());
-                1.0 / (1.0 + (-rscale * score).exp())
-            };
+            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -2357,13 +2079,11 @@ where
         NoOutputBuckets,
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
         loader,
     )
-    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2534,13 +2254,11 @@ where
         NoOutputBuckets,
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
         loader,
     )
-    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2712,13 +2430,11 @@ where
         ShogiSfnnLayerStackBucket::new(config.layerstack_bucket),
         (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
         None,
-        config.win_rate_model,
         false,
         config.scale,
         config.score_drop_abs,
         loader,
     )
-    .with_win_rate_model_target(config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2941,7 +2657,6 @@ fn prepare_sfnn_fast_batch_from_board_features(
     let target_blend = 1.0 - config.lambda;
     let rscale = 1.0 / config.scale;
     let layerstack_bucket = config.layerstack_bucket;
-    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
 
     let fill_chunk = |chunk_index: usize,
                       data_chunk: &[PackedSfenValue],
@@ -2984,15 +2699,7 @@ fn prepare_sfnn_fast_batch_from_board_features(
             }
             weights_chunk[i] = weight;
 
-            let score = if config.win_rate_model {
-                win_rate_model_score_from_table(
-                    wrm_score_table.as_deref().expect("WRM score table must be initialised"),
-                    pos.score(),
-                )
-            } else {
-                let score = f32::from(pos.score());
-                1.0 / (1.0 + (-(rscale * score)).exp())
-            };
+            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -3094,8 +2801,6 @@ mod tests {
             queue_depth: 1,
             lambda: 1.0,
             scale: 400.0,
-            win_rate_model: false,
-            wrm_target: WinRateModelTargetParams::DEFAULT,
             ft_factorize: false,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
@@ -3117,8 +2822,6 @@ mod tests {
             queue_depth: 2,
             lambda: 1.0,
             scale: 400.0,
-            win_rate_model: false,
-            wrm_target: WinRateModelTargetParams::DEFAULT,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
             teacher_shuffle_seed: 0,
@@ -3131,101 +2834,46 @@ mod tests {
     }
 
     #[test]
-    fn score_winrate_wrm_fit_beats_plain_sigmoid_on_wrm_shaped_data() {
-        let expected = WinRateModelTargetParams { offset: 260.0, scaling: 360.0 };
-        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
-        for score in (-1200..=1200).step_by(25) {
-            let p = expected.probability(score as f32);
-            let count = 2000u32;
-            let wins = (p * count as f32).round() as u32;
-            let losses = count - wins;
-            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
-        }
-
-        let (sigmoid_scale, _, sigmoid_fitted) = fit_sigmoid_target_scale(&bins).unwrap();
-        let (wrm_params, _, wrm_fitted) = fit_wrm_target_params(&bins).unwrap();
-        let sigmoid_metrics =
-            score_winrate_metrics(&bins, |score| sigmoid_score_probability(score, sigmoid_scale)).unwrap();
-        let wrm_metrics = score_winrate_metrics(&bins, |score| wrm_params.probability(score)).unwrap();
-
-        assert!(sigmoid_fitted);
-        assert!(wrm_fitted);
-        assert!((wrm_params.offset - expected.offset).abs() <= 2.0, "wrm_params={wrm_params:?}");
-        assert!((wrm_params.scaling - expected.scaling).abs() <= 2.0, "wrm_params={wrm_params:?}");
-        assert!(wrm_metrics.bce < sigmoid_metrics.bce, "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}");
-    }
-
-    #[test]
-    fn score_winrate_wrm_fit_can_fall_back_to_plain_sigmoid_shape() {
-        let expected_scale = 2400.0f32;
-        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
-        for score in (-1800..=1800).step_by(25) {
-            let p = sigmoid_score_probability(score as f32, expected_scale);
-            let count = 2000u32;
-            let wins = (p * count as f32).round() as u32;
-            let losses = count - wins;
-            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
-        }
-
-        let (sigmoid_scale, _, _) = fit_sigmoid_target_scale(&bins).unwrap();
-        let (wrm_params, _, _) = fit_wrm_target_params(&bins).unwrap();
-        let sigmoid_metrics =
-            score_winrate_metrics(&bins, |score| sigmoid_score_probability(score, sigmoid_scale)).unwrap();
-        let wrm_metrics = score_winrate_metrics(&bins, |score| wrm_params.probability(score)).unwrap();
-
-        assert!((sigmoid_scale - expected_scale).abs() <= 2.0, "sigmoid_scale={sigmoid_scale}");
-        assert!(
-            wrm_metrics.bce <= sigmoid_metrics.bce + 1.0e-7,
-            "wrm={wrm_metrics:?}, sigmoid={sigmoid_metrics:?}, wrm_params={wrm_params:?}"
-        );
-    }
-
-    #[test]
     fn default_target_fit_uses_plain_sigmoid_params() {
         let expected_scale = 1800.0f32;
-        let mut bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        let mut bins = vec![ScoreWinrateOutcomeBin::default(); usize::from(u16::MAX) + 1];
         for score in (-1200..=1200).step_by(25) {
             let p = sigmoid_score_probability(score as f32, expected_scale);
             let count = 2000u32;
             let wins = (p * count as f32).round() as u32;
             let losses = count - wins;
-            bins[score_bin_index(score as i16)] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+            bins[score_bin_index(score as i16)] = ScoreWinrateOutcomeBin { wins, losses, draws: 0 };
         }
 
-        let (params, _, fitted) = fit_sigmoid_target_params(&bins).unwrap();
+        let (scale, _, fitted) = fit_sigmoid_target_scale(&bins).unwrap();
 
         assert!(fitted);
-        assert_eq!(params.offset, 0.0);
-        assert!((params.scaling - expected_scale).abs() <= 2.0, "params={params:?}");
+        assert!((scale - expected_scale).abs() <= 2.0, "scale={scale}");
     }
 
     #[test]
     fn target_fit_ignores_draws() {
         let expected_scale = 1000.0f32;
-        let mut decisive_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
-        let mut draw_heavy_bins = vec![WrmTargetOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        let mut decisive_bins = vec![ScoreWinrateOutcomeBin::default(); usize::from(u16::MAX) + 1];
+        let mut draw_heavy_bins = vec![ScoreWinrateOutcomeBin::default(); usize::from(u16::MAX) + 1];
         for score in (-2000..=2000).step_by(25) {
             let p = sigmoid_score_probability(score as f32, expected_scale);
             let count = 2000u32;
             let wins = (p * count as f32).round() as u32;
             let losses = count - wins;
             let idx = score_bin_index(score as i16);
-            decisive_bins[idx] = WrmTargetOutcomeBin { wins, losses, draws: 0 };
+            decisive_bins[idx] = ScoreWinrateOutcomeBin { wins, losses, draws: 0 };
             // These draws would flatten the fitted curve badly if they were
             // treated as 0.5 labels. They must not affect target fitting.
-            draw_heavy_bins[idx] = WrmTargetOutcomeBin { wins, losses, draws: 20_000 };
+            draw_heavy_bins[idx] = ScoreWinrateOutcomeBin { wins, losses, draws: 20_000 };
         }
 
         let (decisive_scale, decisive_bce, _) = fit_sigmoid_target_scale(&decisive_bins).unwrap();
         let (draw_heavy_scale, draw_heavy_bce, _) = fit_sigmoid_target_scale(&draw_heavy_bins).unwrap();
-        let (decisive_wrm, decisive_wrm_bce, _) = fit_wrm_target_params(&decisive_bins).unwrap();
-        let (draw_heavy_wrm, draw_heavy_wrm_bce, _) = fit_wrm_target_params(&draw_heavy_bins).unwrap();
 
         assert!((decisive_scale - expected_scale).abs() <= 2.0, "decisive_scale={decisive_scale}");
         assert_eq!(draw_heavy_scale, decisive_scale);
         assert_eq!(draw_heavy_bce, decisive_bce);
-        assert_eq!(draw_heavy_wrm, decisive_wrm);
-        assert_eq!(draw_heavy_wrm_bce, decisive_wrm_bce);
     }
 
     #[test]
