@@ -86,7 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_close_slice("sfnn_d", &sfnn_device, &sfnn_expected, 1.0e-5);
 
     let loss_batch = tiny_loss_batch();
-    let loss_host = bulletou_cuda_cpp::scalar_loss_host(device, ScalarLossKind::SigmoidMse, 1.0, loss_batch)?;
+    let loss_host =
+        bulletou_cuda_cpp::scalar_loss_host(device, ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0, loss_batch)?;
     println!("  loss_h: mean={} weighted_sum={}", loss_host.mean, loss_host.weighted_sum);
     assert_close_slice("loss_h per_sample", &loss_host.per_sample, &[0.014209336, 0.0, 0.028418668], 1.0e-6);
     assert_close_slice(
@@ -100,7 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let loss_device_batch = ScalarLossDeviceBatch::from_host(&ctx, loss_batch)?;
     let loss_workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(loss_batch.batch_size()))?;
-    bulletou_cuda_cpp::scalar_loss_device(&ctx, ScalarLossKind::SigmoidMse, 1.0, &loss_device_batch, &loss_workspace)?;
+    bulletou_cuda_cpp::scalar_loss_device(
+        &ctx,
+        ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+        1.0,
+        &loss_device_batch,
+        &loss_workspace,
+    )?;
     let loss_device = loss_workspace.download(&ctx)?;
     println!("  loss_d: mean={} weighted_sum={}", loss_device.mean, loss_device.weighted_sum);
     assert_close_slice("loss_d per_sample", &loss_device.per_sample, &loss_host.per_sample, 1.0e-6);
@@ -120,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nnue_loss_workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size))?;
     bulletou_cuda_cpp::scalar_loss_device_from_buffers(
         &ctx,
-        ScalarLossKind::SigmoidMse,
+        ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
         1.0,
         batch.batch_size,
         &workspace.output,
@@ -180,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let train_loss = train_runner.step(
         &ctx,
         train_params,
-        ScalarLossKind::SigmoidMse,
+        ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
         1.0,
         bulletou_cuda_cpp::NnueTrainStepHostBatch {
             stm_indices: batch.stm_indices,

@@ -1232,13 +1232,14 @@ __device__ float sign_f32(float value) {
     return 0.0f;
 }
 
-__global__ void loss_sigmoid_mse_reduce_kernel(
+__global__ void loss_sigmoid_pow_reduce_kernel(
     const float* outputs,
     const float* targets,
     const float* entry_weights,
     float* per_sample,
     float* mean_output_gradients,
     float output_inv_scale,
+    float loss_pow_exp,
     size_t batch) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= batch) {
@@ -1247,8 +1248,11 @@ __global__ void loss_sigmoid_mse_reduce_kernel(
 
     float prediction = loss_sigmoid(outputs[idx] * output_inv_scale);
     float error = prediction - targets[idx];
-    float weighted = entry_weights[idx] * error * error;
-    float gradient = 2.0f * error * prediction * (1.0f - prediction) * output_inv_scale;
+    float abs_error = fabsf(error);
+    float loss = powf(abs_error, loss_pow_exp);
+    float loss_gradient = abs_error == 0.0f ? 0.0f : loss_pow_exp * sign_f32(error) * powf(abs_error, loss_pow_exp - 1.0f);
+    float gradient = loss_gradient * prediction * (1.0f - prediction) * output_inv_scale;
+    float weighted = entry_weights[idx] * loss;
     per_sample[idx] = weighted;
     mean_output_gradients[idx] = entry_weights[idx] * gradient / static_cast<float>(batch);
 }
@@ -1282,7 +1286,7 @@ __global__ void loss_win_rate_model_reduce_kernel(
     float q_prime = q * (1.0f - q);
     float qm_prime = qm * (1.0f - qm);
     float prediction_gradient = 0.5f * (wrm_nnue2score / IN_SCALING) * (q_prime + qm_prime);
-    float loss_gradient = loss_pow_exp * sign_f32(error) * powf(abs_error, loss_pow_exp - 1.0f);
+    float loss_gradient = abs_error == 0.0f ? 0.0f : loss_pow_exp * sign_f32(error) * powf(abs_error, loss_pow_exp - 1.0f);
     per_sample[idx] = entry_weights[idx] * loss;
     mean_output_gradients[idx] = entry_weights[idx] * loss_gradient * prediction_gradient / static_cast<float>(batch);
 }
@@ -4735,7 +4739,7 @@ int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp, float wrm_n
         return fail_message("scalar loss batch size must be greater than zero");
     }
     if (kind != 0 && kind != 1) {
-        return fail_message("scalar loss kind must be 0 (sigmoid-mse) or 1 (win-rate-model)");
+        return fail_message("scalar loss kind must be 0 (sigmoid-pow) or 1 (win-rate-model)");
     }
     if (!(std::isfinite(loss_pow_exp) && loss_pow_exp >= 1.0f)) {
         return fail_message("loss_pow_exp must be finite and >= 1");
@@ -4775,15 +4779,16 @@ int launch_scalar_loss_kernels(
     }
 
     if (kind == 0) {
-        loss_sigmoid_mse_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        loss_sigmoid_pow_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
             outputs,
             targets,
             entry_weights,
             per_sample,
             mean_output_gradients,
             output_inv_scale,
+            loss_pow_exp,
             batch);
-        if (check_kernel_launch("loss_sigmoid_mse_reduce_kernel launch") != 0) {
+        if (check_kernel_launch("loss_sigmoid_pow_reduce_kernel launch") != 0) {
             return -1;
         }
     } else {

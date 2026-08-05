@@ -1201,15 +1201,12 @@ struct QuantizedTestArgs {
     scale: u32,
 
     /// Use tatara-style win-rate-model validation loss for quantized SFNN
-    /// testing. The default is sigmoid-MSE.
+    /// testing. The default is sigmoid probability loss.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use sigmoid-MSE validation loss. This is the default.
-    #[arg(long)]
-    loss_sigmoid_mse: bool,
-
-    /// Exponent of the WRM error term `|prediction - target|^p`.
+    /// Exponent of the probability-space error term `|prediction - target|^p`.
+    /// With the default sigmoid loss, `2.0` is sigmoid-MSE.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
@@ -1259,9 +1256,6 @@ impl QuantizedTestArgs {
         }
         if self.fv_scale < 0 {
             return Err("--fv-scale must be > 0".to_string());
-        }
-        if self.win_rate_model && self.loss_sigmoid_mse {
-            return Err("--win-rate-model and --loss-sigmoid-mse are mutually exclusive".to_string());
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
@@ -1382,15 +1376,12 @@ struct QuantizedCalibrateArgs {
     scale: u32,
 
     /// Use tatara-style win-rate-model validation loss for quantized SFNN
-    /// calibration. The default is sigmoid-MSE.
+    /// calibration. The default is sigmoid probability loss.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use sigmoid-MSE validation loss. This is the default.
-    #[arg(long)]
-    loss_sigmoid_mse: bool,
-
-    /// Exponent of the WRM error term `|prediction - target|^p`.
+    /// Exponent of the probability-space error term `|prediction - target|^p`.
+    /// With the default sigmoid loss, `2.0` is sigmoid-MSE.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
@@ -1456,7 +1447,6 @@ impl QuantizedCalibrateArgs {
             lambda: self.lambda,
             scale: self.scale,
             win_rate_model: self.win_rate_model,
-            loss_sigmoid_mse: self.loss_sigmoid_mse,
             loss_pow_exp: self.loss_pow_exp,
             wrm_nnue2score: self.wrm_nnue2score,
             quant_ft_round: self.quant_ft_round,
@@ -3191,31 +3181,26 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     lambda: f32,
 
-    /// Eval-to-score sigmoid scale for sigmoid-MSE. If omitted, BulletOu
+    /// Eval-to-score sigmoid scale for the default sigmoid loss. If omitted, BulletOu
     /// estimates it from a teacher-data prefix.
     #[arg(long)]
     scale: Option<f32>,
 
     /// Number of teacher-prefix positions used to estimate `--scale` when
-    /// sigmoid-MSE is selected and `--scale` is omitted. Set to `0` to use
+    /// sigmoid loss is selected and `--scale` is omitted. Set to `0` to use
     /// the built-in fallback scale.
     #[arg(long, default_value_t = DEFAULT_SCALE_CALIBRATION_POSITIONS)]
     scale_calibration_positions: usize,
 
     /// Use tatara-style win-rate-model prediction conversion and WRM loss for
-    /// scalar value networks. The default is sigmoid-MSE with an automatically
+    /// scalar value networks. The default is sigmoid probability loss with an automatically
     /// estimated sigmoid scale.
     #[arg(long)]
     win_rate_model: bool,
 
-    /// Use sigmoid-MSE value loss. This is the default;
-    /// the flag is kept so scripts can state the loss explicitly.
-    #[arg(long)]
-    loss_sigmoid_mse: bool,
-
-    /// Exponent of the WRM error term `|prediction - target|^p`.
-    /// Used only when `--win-rate-model` is selected.
-    /// The tatara default is 2.0; nnue-pytorch-style experiments commonly use 2.5.
+    /// Exponent of the probability-space error term `|prediction - target|^p`.
+    /// Applies to both the default sigmoid loss and `--win-rate-model`.
+    /// `2.0` is squared error; `1.5`, `2.5`, etc. are experiment knobs.
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
@@ -3607,9 +3592,6 @@ impl Args {
             (None, Some(_)) => return Err("--wrm-target-scaling requires --wrm-target-offset".to_string()),
             (None, None) => {}
         }
-        if self.win_rate_model && self.loss_sigmoid_mse {
-            return Err("--win-rate-model and --loss-sigmoid-mse cannot be used together".to_string());
-        }
         if effective_win_rate_model(self) && !eval_type.supports_win_rate_model() {
             return Err("--win-rate-model currently applies to scalar value eval types only".to_string());
         }
@@ -3752,19 +3734,16 @@ fn validation_loss_kind(args: &Args) -> ValidationLossKind {
             target: effective_wrm_target_params(args),
         }
     } else {
-        ValidationLossKind::SigmoidMse
+        ValidationLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
     }
 }
 
 fn effective_win_rate_model(args: &Args) -> bool {
-    if args.loss_sigmoid_mse {
-        return false;
-    }
     args.win_rate_model
 }
 
 fn effective_loss_pow_exp(args: &Args) -> f32 {
-    if effective_win_rate_model(args) { args.loss_pow_exp } else { 2.0 }
+    args.loss_pow_exp
 }
 
 fn effective_wrm_nnue2score(args: &Args) -> f32 {
@@ -3934,7 +3913,7 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
             nnue2score: effective_wrm_nnue2score(args),
         }
     } else {
-        bulletou_cuda_cpp::ScalarLossKind::SigmoidMse
+        bulletou_cuda_cpp::ScalarLossKind::SigmoidPow { pow_exp: effective_loss_pow_exp(args) }
     }
 }
 
@@ -3949,7 +3928,15 @@ fn value_loss_label(args: &Args) -> String {
             wrm_target.scaling
         )
     } else {
-        format!("sigmoid-mse(scale={:.3})", effective_scale(args))
+        sigmoid_loss_label(effective_loss_pow_exp(args), effective_scale(args))
+    }
+}
+
+fn sigmoid_loss_label(pow_exp: f32, scale: f32) -> String {
+    if (pow_exp - 2.0).abs() <= 1.0e-6 {
+        format!("sigmoid-mse(pow_exp={pow_exp:.3}, scale={scale:.3})")
+    } else {
+        format!("sigmoid-pow(pow_exp={pow_exp:.3}, scale={scale:.3})")
     }
 }
 
@@ -4672,7 +4659,7 @@ fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKi
             target: WinRateModelTargetParams::DEFAULT,
         }
     } else {
-        ValidationLossKind::SigmoidMse
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
     }
 }
 
@@ -4685,7 +4672,7 @@ fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossK
             target: WinRateModelTargetParams::DEFAULT,
         }
     } else {
-        ValidationLossKind::SigmoidMse
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
     }
 }
 
@@ -5372,7 +5359,7 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
             args.loss_pow_exp, args.wrm_nnue2score,
         );
     } else {
-        eprintln!("  loss              = sigmoid-mse");
+        eprintln!("  loss              = {}", sigmoid_loss_label(args.loss_pow_exp, args.scale as f32));
     }
     eprintln!(
         "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
@@ -5457,7 +5444,7 @@ fn build_quantized_calibration_prepared(
             };
             let score = f32::from(teacher_scores[i]);
             let score_norm = match loss_kind {
-                ValidationLossKind::SigmoidMse => quantized_calibration_sigmoid(inv_scale * score),
+                ValidationLossKind::SigmoidPow { .. } => quantized_calibration_sigmoid(inv_scale * score),
                 ValidationLossKind::WinRateModel { target, .. } => target.probability(score),
             };
             (i, blend * result_norm + (1.0 - blend) * score_norm)
@@ -5529,7 +5516,7 @@ fn quantized_calibration_engine_report_from_outputs(
                     .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
                 let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
                 let diff = quantized_calibration_sigmoid(model_score * model_inv_scale) - target;
-                loss_sum += diff * diff;
+                loss_sum += diff.abs().powf(args.loss_pow_exp);
             }
         }
         report.test_loss = Some(loss_sum / report.loss_sampled as f32);
@@ -6030,10 +6017,6 @@ fn main() {
                 std::process::exit(2);
             }
         }
-    }
-    if args.win_rate_model && args.loss_sigmoid_mse {
-        eprintln!("error: --win-rate-model and --loss-sigmoid-mse cannot be used together.");
-        std::process::exit(2);
     }
     if effective_win_rate_model(&args) && !args.eval_type().supports_win_rate_model() {
         eprintln!("error: --win-rate-model currently applies to scalar value eval types only.");
@@ -19728,34 +19711,40 @@ mod tests {
         let default_args =
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
         assert!(!effective_win_rate_model(&default_args));
-        assert_eq!(value_loss_label(&default_args), format!("sigmoid-mse(scale={:.3})", DEFAULT_SIGMOID_SCALE));
+        assert_eq!(
+            value_loss_label(&default_args),
+            format!("sigmoid-mse(pow_exp=2.000, scale={:.3})", DEFAULT_SIGMOID_SCALE)
+        );
 
-        let sigmoid_args = Args::try_parse_from([
+        let removed_sigmoid_flag = Args::try_parse_from([
             "bulletou",
             "--arch",
             "NNUE_halfkp_256x2_32_32",
             "--teacher",
             "/dev/null",
             "--loss-sigmoid-mse",
+        ]);
+        assert!(removed_sigmoid_flag.is_err());
+
+        let sigmoid_pow_args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--loss-pow-exp",
+            "1.5",
         ])
         .unwrap();
-        assert!(!effective_win_rate_model(&sigmoid_args));
-        assert_eq!(value_loss_label(&sigmoid_args), format!("sigmoid-mse(scale={:.3})", DEFAULT_SIGMOID_SCALE));
+        assert!(!effective_win_rate_model(&sigmoid_pow_args));
+        assert_eq!(effective_loss_pow_exp(&sigmoid_pow_args), 1.5);
+        assert_eq!(
+            value_loss_label(&sigmoid_pow_args),
+            format!("sigmoid-pow(pow_exp=1.500, scale={:.3})", DEFAULT_SIGMOID_SCALE)
+        );
 
         let kppt_default = Args::try_parse_from(["bulletou", "--arch", "KPPT", "--teacher", "/dev/null"]).unwrap();
         assert!(!effective_win_rate_model(&kppt_default));
-
-        let conflict = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--win-rate-model",
-            "--loss-sigmoid-mse",
-        ])
-        .unwrap();
-        assert!(conflict.validate_backend_flags().is_err());
 
         let args = Args::try_parse_from([
             "bulletou",
@@ -19979,15 +19968,8 @@ mod tests {
     fn resume_signature_accepts_old_wrm_loss_key() {
         use clap::Parser as _;
 
-        let no_wrm = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--loss-sigmoid-mse",
-        ])
-        .unwrap();
+        let no_wrm =
+            Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
         let old_no_wrm = resume_signature(&no_wrm).replace(
             "win_rate_model=false\nloss_pow_exp=2.000000000\nwrm_nnue2score=600.000000000\n",
             "nnue_pytorch_wrm_loss=false\n",

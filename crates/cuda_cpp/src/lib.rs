@@ -1640,28 +1640,28 @@ fn sfnn_forward_device_with_factorizer_impl(
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarLossKind {
-    SigmoidMse,
+    SigmoidPow { pow_exp: f32 },
     WinRateModel { pow_exp: f32, nnue2score: f32 },
 }
 
 impl ScalarLossKind {
     fn as_ffi(self) -> i32 {
         match self {
-            Self::SigmoidMse => 0,
+            Self::SigmoidPow { .. } => 0,
             Self::WinRateModel { .. } => 1,
         }
     }
 
     fn loss_pow_exp(self) -> f32 {
         match self {
-            Self::SigmoidMse => 2.0,
+            Self::SigmoidPow { pow_exp } => pow_exp,
             Self::WinRateModel { pow_exp, .. } => pow_exp,
         }
     }
 
     fn wrm_nnue2score(self) -> f32 {
         match self {
-            Self::SigmoidMse => 600.0,
+            Self::SigmoidPow { .. } => 600.0,
             Self::WinRateModel { nnue2score, .. } => nnue2score,
         }
     }
@@ -6819,7 +6819,7 @@ mod tests {
         let entry_weights = [1.0, 0.5, 2.0];
         let batch = ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &entry_weights };
 
-        let host = scalar_loss_host(0, ScalarLossKind::SigmoidMse, 1.0, batch).unwrap();
+        let host = scalar_loss_host(0, ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0, batch).unwrap();
 
         assert_close_slice("per_sample", &host.per_sample, &[0.014209336, 0.0, 0.028418668], 1.0e-6);
         assert_close_slice(
@@ -6834,7 +6834,7 @@ mod tests {
         let ctx = Context::new(0).unwrap();
         let device_batch = ScalarLossDeviceBatch::from_host(&ctx, batch).unwrap();
         let workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size())).unwrap();
-        scalar_loss_device(&ctx, ScalarLossKind::SigmoidMse, 1.0, &device_batch, &workspace).unwrap();
+        scalar_loss_device(&ctx, ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0, &device_batch, &workspace).unwrap();
         let device = workspace.download(&ctx).unwrap();
 
         assert_close_slice("device per_sample", &device.per_sample, &host.per_sample, 1.0e-6);
@@ -6912,7 +6912,7 @@ mod tests {
         let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size)).unwrap();
         scalar_loss_device_from_buffers(
             &ctx,
-            ScalarLossKind::SigmoidMse,
+            ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
             1.0,
             batch.batch_size,
             &forward.output,
@@ -7000,7 +7000,7 @@ mod tests {
             .step(
                 &ctx,
                 params,
-                ScalarLossKind::SigmoidMse,
+                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
                 1.0,
                 SfnnTrainStepHostBatch {
                     stm_indices: batch.stm_indices,
@@ -7068,7 +7068,7 @@ mod tests {
                 &ctx,
                 &upload_ctx,
                 params,
-                ScalarLossKind::SigmoidMse,
+                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
                 1.0,
                 SfnnTrainStepHostBatch {
                     stm_indices: batch.stm_indices,

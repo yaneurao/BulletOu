@@ -131,11 +131,12 @@ impl ValidationSampleMask {
 /// Loss formula used for `test_value_loss`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationLossKind {
-    /// BulletOu's historical sigmoid MSE:
-    /// `(sigmoid(model_output / model_output_scale) - target)^2`, where
+    /// Sigmoid probability-space value loss:
+    /// `abs(sigmoid(model_output / model_output_scale) - target)^pow_exp`, where
+    /// `pow_exp=2` is MSE,
     /// `model_output_scale=1` gives the historical logit-style behaviour and
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
-    SigmoidMse,
+    SigmoidPow { pow_exp: f32 },
     /// Win-rate-model value loss with shogi WRM transforms:
     /// configurable `nnue2score`, prediction WRM offset=270 / scaling=340,
     /// target-side WRM parameters, and configurable
@@ -159,7 +160,7 @@ fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
 /// from parallel arrays.
 ///
 /// `model_outputs[i]` is the raw network output for position `i`. For
-/// [`ValidationLossKind::SigmoidMse`], `model_output_scale` controls whether
+/// [`ValidationLossKind::SigmoidPow`], `model_output_scale` controls whether
 /// that output is interpreted as a logit (`1.0`) or a centipawn-like value
 /// (`eval_scale`-style).
 /// `teacher_results[i]` is the actual game outcome from the position's
@@ -220,7 +221,7 @@ pub fn compute_sign_accuracy(
         lambda,
         eval_scale,
         1.0,
-        ValidationLossKind::SigmoidMse,
+        ValidationLossKind::SigmoidPow { pow_exp: 2.0 },
     )
 }
 
@@ -319,17 +320,17 @@ pub fn compute_sign_accuracy_with_loss(
                 _ => 0.5,
             };
             let score_norm = match loss_kind {
-                ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
                 ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
-                ValidationLossKind::SigmoidMse => sigmoid(*m * model_inv_scale),
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(*m * model_inv_scale),
                 ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(*m * nnue2score, 270.0, 340.0),
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
-                ValidationLossKind::SigmoidMse => diff * diff,
+                ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
             report.loss_sampled += 1;
@@ -424,17 +425,17 @@ pub fn compute_sign_accuracy_with_loss_masked(
                 _ => 0.5,
             };
             let score_norm = match loss_kind {
-                ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
                 ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
-                ValidationLossKind::SigmoidMse => sigmoid(m * model_inv_scale),
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(m * model_inv_scale),
                 ValidationLossKind::WinRateModel { nnue2score, .. } => wrm_probability(m * nnue2score, 270.0, 340.0),
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
-                ValidationLossKind::SigmoidMse => diff * diff,
+                ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
         }

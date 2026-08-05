@@ -8,7 +8,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarValueLossKind {
-    SigmoidMse,
+    SigmoidPow { pow_exp: f32 },
     WinRateModel { pow_exp: f32, nnue2score: f32 },
 }
 
@@ -58,12 +58,11 @@ pub fn scalar_value_loss_trace(
     let inv_batch = 1.0_f32 / outputs.len() as f32;
     for ((&output, &target), &entry_weight) in outputs.iter().zip(targets).zip(entry_weights) {
         let (loss, output_gradient) = match kind {
-            ScalarValueLossKind::SigmoidMse => {
+            ScalarValueLossKind::SigmoidPow { pow_exp } => {
                 let prediction = sigmoid(output);
                 let error = prediction - target;
-                let loss = error * error;
-                let gradient = 2.0 * error * prediction * (1.0 - prediction);
-                (loss, gradient)
+                let (loss, loss_gradient) = pow_loss_and_gradient(error, pow_exp);
+                (loss, loss_gradient * prediction * (1.0 - prediction))
             }
             ScalarValueLossKind::WinRateModel { pow_exp, nnue2score } => {
                 win_rate_model_loss_and_gradient(output, target, pow_exp, nnue2score)
@@ -91,6 +90,13 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+fn pow_loss_and_gradient(error: f32, pow_exp: f32) -> (f32, f32) {
+    let abs_error = error.abs();
+    let loss = abs_error.powf(pow_exp);
+    let gradient = if abs_error == 0.0 { 0.0 } else { pow_exp * error.signum() * abs_error.powf(pow_exp - 1.0) };
+    (loss, gradient)
+}
+
 fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32, nnue2score: f32) -> (f32, f32) {
     const IN_OFFSET: f32 = 270.0;
     const IN_SCALING: f32 = 340.0;
@@ -100,12 +106,10 @@ fn win_rate_model_loss_and_gradient(output: f32, target: f32, pow_exp: f32, nnue
     let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
     let prediction = (1.0 + q - qm) * 0.5;
     let error = prediction - target;
-    let abs_error = error.abs();
-    let loss = abs_error.powf(pow_exp);
+    let (loss, loss_gradient) = pow_loss_and_gradient(error, pow_exp);
     let q_prime = q * (1.0 - q);
     let qm_prime = qm * (1.0 - qm);
     let prediction_gradient = 0.5 * (nnue2score / IN_SCALING) * (q_prime + qm_prime);
-    let loss_gradient = pow_exp * error.signum() * abs_error.powf(pow_exp - 1.0);
     (loss, loss_gradient * prediction_gradient)
 }
 
@@ -119,9 +123,10 @@ mod tests {
         let targets = [0.0, 0.5, 1.0];
         let weights = [1.0, 0.5, 2.0];
 
-        let trace = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &outputs, &targets, &weights).unwrap();
+        let kind = ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 };
+        let trace = scalar_value_loss_trace(kind, &outputs, &targets, &weights).unwrap();
 
-        assert_eq!(trace.kind, ScalarValueLossKind::SigmoidMse);
+        assert_eq!(trace.kind, kind);
         assert_close_slice("per_sample", &trace.per_sample, &[0.014209336, 0.0, 0.028418668]);
         assert_close_slice("mean_output_gradients", &trace.mean_output_gradients, &[0.008343695, 0.0, -0.01668739]);
         assert_close("weighted_sum", trace.weighted_sum, 0.042628005);
@@ -134,10 +139,30 @@ mod tests {
         let targets = [0.0, 1.0];
         let weights = [0.0, 1.0];
 
-        let trace = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &outputs, &targets, &weights).unwrap();
+        let trace =
+            scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 }, &outputs, &targets, &weights)
+                .unwrap();
 
         assert_eq!(trace.per_sample[0], 0.0);
         assert!(trace.per_sample[1] > 0.999);
+    }
+
+    #[test]
+    fn sigmoid_pow_loss_changes_exponent() {
+        let outputs = [-2.0, 0.0, 2.0];
+        let targets = [0.0, 0.25, 1.0];
+        let weights = [1.0, 1.0, 1.0];
+
+        let mse =
+            scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 }, &outputs, &targets, &weights)
+                .unwrap();
+        let pow15 =
+            scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 1.5 }, &outputs, &targets, &weights)
+                .unwrap();
+
+        assert!(mse.mean.is_finite());
+        assert!(pow15.mean.is_finite());
+        assert_ne!(mse.mean, pow15.mean);
     }
 
     #[test]
@@ -167,14 +192,15 @@ mod tests {
 
     #[test]
     fn reports_length_mismatch() {
-        let err = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &[0.0], &[], &[1.0]).unwrap_err();
+        let err =
+            scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 }, &[0.0], &[], &[1.0]).unwrap_err();
 
         assert_eq!(err, FastLossError::LengthMismatch { name: "targets", expected: 1, actual: 0 });
     }
 
     #[test]
     fn rejects_empty_batch() {
-        let err = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &[], &[], &[]).unwrap_err();
+        let err = scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 }, &[], &[], &[]).unwrap_err();
 
         assert_eq!(err, FastLossError::EmptyBatch);
     }
@@ -186,11 +212,13 @@ mod tests {
         let outputs = [-2.0, 0.0, 2.0];
         let targets = [0.0, 0.5, 1.0];
         let weights = [1.0, 0.5, 2.0];
-        let cpu = scalar_value_loss_trace(ScalarValueLossKind::SigmoidMse, &outputs, &targets, &weights).unwrap();
+        let cpu =
+            scalar_value_loss_trace(ScalarValueLossKind::SigmoidPow { pow_exp: 2.0 }, &outputs, &targets, &weights)
+                .unwrap();
 
         let gpu = bulletou_cuda_cpp::scalar_loss_host(
             0,
-            bulletou_cuda_cpp::ScalarLossKind::SigmoidMse,
+            bulletou_cuda_cpp::ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
             1.0,
             bulletou_cuda_cpp::ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &weights },
         )

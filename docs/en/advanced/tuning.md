@@ -1,12 +1,12 @@
 # Adjust training settings
 
-<a href="../../ja/advanced/tuning.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-2563EB?style=flat-square"></a>
+<a href="../../ja/advanced/tuning.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-Read this after the command in [Tutorial §3 Run the training](../tutorial/3-train.md) works. For a first run, keep the defaults. Come back here when you want to change speed, save frequency, validation frequency, learning-rate schedule, loss, or SFNN factorizer settings.
+Read this after the command in [Tutorial 3: Run training](../tutorial/3-train.md) works. For a first run, keep the defaults. Come back here when you want to adjust speed, save frequency, validation frequency, learning rate, loss, or SFNN factorizer settings.
 
 ## 1. Units used in the logs
 
-BulletOu logs use `batch`, `superbatch`, and `epoch`. Keep these separate; many training-control flags are defined in terms of one of them.
+BulletOu logs use `batch`, `superbatch`, and `epoch`.
 
 | Name | Meaning |
 |---|---|
@@ -14,7 +14,7 @@ BulletOu logs use `batch`, `superbatch`, and `epoch`. Keep these separate; many 
 | superbatch / sb | Progress, validation, and save unit. Its size is controlled by `--positions-per-superbatch` |
 | epoch | A group of `--superbatches` superbatches. Learning rate returns to `--lr` at the epoch start |
 | checkpoint | Saved files for resuming (`state.bin`) and for the engine (`nn.bin`) |
-| validation | Accuracy/loss measured on `--test-teacher`, which should be separate from the training teacher |
+| validation | Accuracy/loss measured on `--test-teacher` |
 
 Example:
 
@@ -24,13 +24,9 @@ Example:
 --superbatches 36
 ```
 
-Here, one sb is `65536 × 610 = 39,976,960` positions. One epoch is 36 sb, or about 1.44 billion positions.
-
-When `--superbatches` is set, an epoch is not “one pass over the teacher.” It is the boundary where learning rate, saving, and validation comparison are grouped. The teacher stream rewinds only when it reaches EOF.
+Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or about 1.44 billion positions.
 
 ## 2. Common options
-
-The options you are most likely to change:
 
 | Goal | Option | Example |
 |---|---|---|
@@ -41,21 +37,22 @@ The options you are most likely to change:
 | Validate every sb | `--validation-rate` | `--validation-rate 1` |
 | Use tatara-style StepLR | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | Try WRM loss | `--win-rate-model` | `--win-rate-model --loss-pow-exp 2.5` |
-| Disable SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
+| Change the sigmoid loss exponent | `--loss-pow-exp` | `--loss-pow-exp 1.5` |
+| Change SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
 Fuller option table:
 
 | Flag | What it changes | Default |
 |---|---|---|
-| `--backend` | Training implementation. Usually leave this as `cuda-cpp` | `cuda-cpp` |
-| `--batch-size` | Positions per weight update. Larger batches use more VRAM and give a steadier gradient | 65536 |
+| `--backend` | Training backend. Usually leave this as `cuda-cpp` | `cuda-cpp` |
+| `--batch-size` | Positions per weight update | 65536 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |
-| `--teacher-shuffle-buffer-sbs` | How many sb of teacher positions to shuffle in RAM. `4` means two 4-sb buffers. `0` disables in-training shuffle | 1 |
+| `--teacher-shuffle-buffer-sbs` | How many sb of teacher positions to shuffle in RAM. `4` means two 4-sb buffers | 1 |
 | `--teacher-shuffle-buffer-batches` | Same shuffle buffer size, specified in batches. Usually use `--teacher-shuffle-buffer-sbs` instead | omitted |
 | `--teacher-shuffle-seed` | Seed for in-training teacher shuffle | 0 |
-| `--threads` | CPU workers for preparing positions. Set explicitly if CPU scheduling becomes a bottleneck | auto |
+| `--threads` | CPU workers for preparing positions | auto |
 | `--loader-threads` | CPU workers for loading/decoding teacher files | auto |
-| `--cuda-cpp-diagnostics-rate` | How often to write diagnostic timing logs for speed investigation | 1 |
+| `--cuda-cpp-diagnostics-rate` | How often to write diagnostic timing logs | 1 |
 | `--superbatches` | Number of sb in one epoch | omitted |
 | `--max-epochs` | Maximum epochs to run | omitted |
 | `--save-rate` | Save a checkpoint every N sb | 20 |
@@ -71,26 +68,25 @@ Fuller option table:
 | `--lambda` | Blend between teacher score and game result | 1.0 |
 | `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu estimates it from the teacher data | omitted |
 | `--scale-calibration-positions` | Number of teacher-prefix positions used to estimate `--scale`. `0` uses the built-in fallback | 100000 |
-| `--loss-sigmoid-mse` | Explicitly select sigmoid-MSE. This is also the normal default | on |
-| `--win-rate-model` | Use WRM loss for comparison experiments | off |
-| `--loss-pow-exp` | Exponent in WRM loss. `2.0` is squared error; `2.5` is also a useful experiment | 2.0 |
+| `--win-rate-model` | Use the WRM curve on the prediction side | off |
+| `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p`. `2.0` is squared error | 2.0 |
 | `--wrm-nnue2score` | Multiplier that maps network output back to score scale for WRM prediction | 600 |
-| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate WRM teacher-score → win-rate-label coefficients | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | Manually set WRM teacher-score → win-rate-label coefficients. Usually do not pass these | omitted |
-| `--sfnn-factorizer` | How SFNN shares common components between buckets. Usually `shared` | `shared` |
-| `--optimizer` | Optimizer. Usually leave as `ranger` | `ranger` |
+| `--wrm-target-calibration-positions` | Number of teacher-prefix positions used to estimate the WRM target curve | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | Manually set the WRM target curve | omitted |
+| `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
+| `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
-| `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients for controlled experiments | omitted |
+| `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients | omitted |
 
 ## 3. Learning-rate schedules
 
-`--lr-schedule step` is the default. It applies:
+`--lr-schedule step` applies:
 
 ```text
 lr = lr * gamma
 ```
 
-at a fixed interval. If `--lr-step-positions` is omitted, the interval is one sb. At the next epoch, LR returns to `--lr`.
+If `--lr-step-positions` is omitted, the interval is one sb. At the next epoch, LR returns to `--lr`.
 
 To use tatara-style `gamma=0.992`, write:
 
@@ -108,44 +104,19 @@ To use tatara-style `gamma=0.992`, write:
 
 If you omit `--lr-step-gamma` and set `--superbatches`, BulletOu computes a gamma that reaches `--lr-min` within one epoch.
 
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --positions-per-superbatch 40000000 \
-    --superbatches 36 \
-    --max-epochs 3 \
-    --lr 0.000875 \
-    --lr-min 0.00001 \
-    --lr-schedule step \
-    --tag step-auto-gamma
-```
-
-In this example, each epoch’s 36 sb move from `--lr` toward `--lr-min`, then epoch 2 starts from `--lr` again.
-
-`geometric` and `cos` are smooth schedules. Start with `step` unless you explicitly want to compare schedules.
-
-| Value | Behavior |
-|---|---|
-| `step` | Drops LR in stairs every sb or every configured position interval |
-| `geometric` | Drops LR by a tiny constant multiplier every batch |
-| `cos` | Uses a cosine curve from `--lr` to `--lr-min` |
-| `plateau` | Repeats the same teacher interval at a lower LR when validation does not improve |
-
 ## 4. Turning teacher data into training labels
 
 Teacher files usually contain two useful pieces of information:
 
 | Data | Meaning |
 |---|---|
-| Teacher score | The teacher engine’s numeric evaluation for the position |
-| Game result | Whether the game eventually ended as win/draw/loss |
+| Teacher score | The teacher engine's numeric evaluation for the position |
+| Game result | Whether the game ended as win/draw/loss |
 
 `--lambda` controls how these two sources are blended.
 
 ```text
-training label = λ × label from teacher score + (1 - λ) × label from game result
+training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_game_result
 ```
 
 | `--lambda` | Meaning |
@@ -154,19 +125,28 @@ training label = λ × label from teacher score + (1 - λ) × label from game re
 | `0.5` | Mix teacher score and game result evenly |
 | `0.0` | Use only game result |
 
-Start with `1.0`. Try values such as `0.5` or `0.7` only when you intentionally want game results to affect the training label.
-
 ## 5. Loss and score scale
 
-Normal training uses sigmoid-MSE. BulletOu converts the teacher score to a 0–1 label, converts the network output to 0–1, and minimizes squared error.
+When no loss family is specified, BulletOu uses sigmoid probability loss:
 
 ```text
 target     = sigmoid(teacher_score / scale)
 prediction = sigmoid(network_output)
-loss       = (prediction - target)^2
+loss       = |prediction - target|^p
 ```
 
-`scale` controls how teacher scores are mapped into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from the first 100,000 teacher positions. The estimate uses only decisive win/loss records; drawn games are ignored.
+`p` is controlled by `--loss-pow-exp`. The default is `2.0`, which is sigmoid-MSE.
+
+```bash
+# sigmoid-MSE
+--loss-pow-exp 2.0
+
+# experiments with a different error exponent
+--loss-pow-exp 1.5
+--loss-pow-exp 2.5
+```
+
+`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu estimates it from a teacher-data prefix. The estimator uses only decisive win/loss records and ignores draws.
 
 ```bash
 # Estimate scale automatically
@@ -177,23 +157,21 @@ loss       = (prediction - target)^2
     --tag sigmoid-auto-scale
 ```
 
-Use `--scale-calibration-positions` to change the prefix size used for estimation.
+Change the prefix size:
 
 ```bash
 --scale-calibration-positions 300000
 ```
 
-Set `--scale` only when you intentionally want a fixed scale for a comparison experiment.
+Fix scale for a comparison experiment:
 
 ```bash
---scale 6000
+--scale 600
 ```
 
-### Trying WRM loss
+## 6. Trying WRM loss
 
-WRM means win-rate model. It still compares values in a 0–1 space, but it uses a WRM curve for the network-output side.
-
-Pass `--win-rate-model` to use WRM. `--loss-pow-exp` is the exponent applied to the WRM error term.
+WRM means win-rate model. It still computes loss in 0–1 probability space, but it uses a WRM curve on the prediction side.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -205,17 +183,17 @@ Pass `--win-rate-model` to use WRM. `--loss-pow-exp` is the exponent applied to 
     --tag wrm-pow25
 ```
 
-The WRM teacher-score → win-rate-label coefficients are used only when `--win-rate-model` is selected. Automatic estimation uses only decisive win/loss records; drawn games are ignored. Usually, do not pass these options.
+WRM also uses:
 
-```bash
-# Change the prefix size used to estimate WRM coefficients
---wrm-target-calibration-positions 300000
-
-# Manually fix WRM coefficients
---wrm-target-offset 270 --wrm-target-scaling 380
+```text
+loss = |prediction - target|^p
 ```
 
-### Check the score→win-rate shape on your teacher data
+`--loss-pow-exp` applies to both sigmoid loss and WRM loss.
+
+`--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`.
+
+## 7. Check the score → win-rate shape on your teacher data
 
 The relation between teacher score and game result can differ by dataset. This diagnostic command compares a plain sigmoid with WRM on the actual `(score, game_result)` statistics.
 
@@ -234,38 +212,22 @@ This command does not train. It fits both curves on the first `--fit-positions` 
 | Output | Meaning |
 |---|---|
 | `sigmoid(score/s)` | Converts `score` to 0–1 with one scale parameter |
-| `WRM(offset,scale)` | Uses offset and scale, allowing a flatter region near score 0 |
+| `WRM(offset,scale)` | Uses offset and scale |
 | `heldout_bce` | Lower is a better fit to game-result statistics |
 | `heldout_brier` | Lower is a better probability prediction |
-| `empirical` | `wins / (wins + losses)` in that score bucket. Draws are displayed but ignored |
+| `empirical` | `wins / (wins + losses)` in that score bucket |
 
-If `delta(WRM - sigmoid)` is negative, WRM fits that teacher data better. If it is positive, the plain sigmoid fits better.
-
-### `--wrm-nnue2score`
-
-`--wrm-nnue2score` maps network output back to score scale before WRM prediction. The default is `600`. Change it only for explicit comparison experiments, for example when matching tatara settings.
-
-### Explicitly selecting sigmoid-MSE
-
-This is normally unnecessary, but you can pass the flag when you want logs or scripts to state the loss explicitly.
-
-```bash
---loss-sigmoid-mse
-```
-
-WRM and sigmoid-MSE use different formulas, so compare raw loss values only between runs with the same loss setting.
-
-## 6. SFNN factorizer
+## 8. SFNN factorizer
 
 SFNN architectures such as `k3k3` or `hand1024` create many buckets. More buckets give more expressive power, but fewer teacher positions reach each bucket.
 
-The factorizer lets buckets share common components instead of making every bucket completely independent. This can reduce overfitting and make training more stable when teacher density is low.
+The factorizer lets buckets share common components instead of making every bucket completely independent.
 
 | Setting | Meaning |
 |---|---|
 | `--sfnn-factorizer shared` | Share a common component across buckets. Default |
 | `--sfnn-factorizer none` | Disable factorizer |
-| `--sfnn-factorizer axis` | Enable every available bucket direction in the architecture. Example: `hand1024_k3k3` enables both king and hand |
+| `--sfnn-factorizer axis` | Enable every available bucket direction in the architecture |
 | `--sfnn-factorizer king=axis,hand=axis` | Specify directions explicitly |
 | `--sfnn-factorizer king=axis,hand=shared` | Use direction-specific sharing for king and only common sharing for hand |
 
@@ -280,29 +242,25 @@ Example:
     --tag k29-axis
 ```
 
-If you change factorizer settings while continuing from saved data, pass `--resume` explicitly. BulletOu stops automatic resume when training settings change, so accidental continuation does not happen silently.
+## 9. Save and validation frequency
 
-## 7. Save and validation frequency
-
-Saving and validation are separate:
+Save and validation frequency are independent:
 
 ```bash
 --save-rate 20 --validation-rate 1
 ```
 
-This means “save every 20 sb, but validate every sb.”
+This means "save a checkpoint every 20 sb, but measure accuracy/loss every sb."
 
-Epoch-end saving is enabled by default. If one epoch is 36 sb and you want only epoch-end saves, use a large save rate:
+Epoch-end saving is on by default. If you want only epoch-end saves, set `--save-rate` to a value that will not be reached inside one epoch.
 
 ```bash
 --save-rate 9999
 ```
 
-The save rate is never reached inside the 36-sb epoch, so the epoch-end save is the one that remains.
+## 10. Reading speed logs
 
-## 8. Reading training speed
-
-Look at stdout `[train]` rows:
+Use the `[train]` line:
 
 ```text
 [train]  epoch 1  sb 12/36  this-sb=39,976,960 pos (...)  wall=...s  train=...s  pos/s=...
@@ -310,59 +268,8 @@ Look at stdout `[train]` rows:
 
 | Field | Meaning |
 |---|---|
-| `wall` | Real elapsed time for that sb, including validation and saving |
+| `wall` | Real time for that sb, including validation and saving |
 | `train` | Training time only, excluding validation and saving |
-| `pos/s` | Training speed computed from `train` |
+| `pos/s` | Training throughput computed from `train` |
 
-If the GPU is idle but `pos/s` is low, teacher loading, decoding, or shuffling may be the bottleneck. Check:
-
-- Whether teacher data is on slow storage
-- Whether `--teacher-shuffle-buffer-sbs` is too large
-- Whether `--threads` / `--loader-threads` are oversubscribing the CPU
-- Whether `cuda-cpp-diagnostics.log` shows large teacher queue wait time
-
-## 9. Optimizer
-
-Usually leave `--optimizer ranger` and `--optimizer-weight-decay 0.0`.
-
-When changing optimizer coefficients, change one condition at a time.
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --optimizer ranger \
-    --optimizer-weight-decay 0.0 \
-    --optimizer-beta1 0.9 \
-    --optimizer-beta2 0.999 \
-    --optimizer-epsilon 0.0000001 \
-    --tag optimizer-test
-```
-
-## 10. A good starting command
-
-This SFNN example uses 36 sb per epoch, validates every sb, and keeps only epoch-end saves.
-
-```powershell
-.\target\release\examples\bulletou.exe `
-  --backend cuda-cpp `
-  --teacher C:\shogi\teacher\sojo `
-  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --positions-per-superbatch 40000000 `
-  --superbatches 36 `
-  --max-epochs 1 `
-  --lr 0.000875 `
-  --lr-min 0.000030 `
-  --lr-schedule step `
-  --optimizer ranger `
-  --optimizer-weight-decay 0.0 `
-  --save-rate 9999 `
-  --validation-rate 1 `
-  --tag sfnn-sojo-36sb
-```
-
-Next: [Continued training](additional-training.md)
-
-Previous: [Advanced guide](README.md)
+If GPU utilization is low and `pos/s` is low, teacher loading, decoding, or shuffling may be the bottleneck. Check `cuda-cpp-diagnostics.log` for teacher queue wait time.

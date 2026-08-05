@@ -96,7 +96,7 @@ checkpoints/my-halfkp/
 | `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰。詳細は [応用編: 学習設定を調整する](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
-| `--scale` | sigmoid-MSE target で使う eval-to-score sigmoid scale。省略時は教師データから推定 | 省略 |
+| `--scale` | sigmoid loss の target で使う eval-to-score sigmoid scale。省略時は教師データから推定 | 省略 |
 | `--scale-calibration-positions` | `--scale` 省略時、教師先頭何局面から scale を推定するか | 100000 |
 
 loss は `sigmoid(eval).squared_error(target)` に固定。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。必要になったら CLI フラグ化する余地はある。

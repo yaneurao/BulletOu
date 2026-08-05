@@ -2,19 +2,20 @@
 
 <a href="../../en/advanced/tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-[チュートリアル §3 学習を走らせる](../tutorial/3-train.md) のコマンドで動くことを確認したあとに読むページです。最初はデフォルトのままで構いません。速度が出ない、保存頻度を変えたい、tatara と条件を揃えたい、loss を変えて試したい、という段階になってから触ってください。
+[チュートリアル 3: 学習を走らせる](../tutorial/3-train.md) のコマンドが動いたあとに読むページです。
+最初はデフォルトのままで構いません。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer を変えたいときに参照してください。
 
-## 1. まず覚える単位
+## 1. ログに出てくる単位
 
-BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。ここが混ざると設定を読み違えます。
+BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を分けて扱います。
 
 | 名前 | 意味 |
 |---|---|
-| batch | GPU で 1 回重みを更新する局面数。デフォルトは `--batch-size 65536` |
-| superbatch / sb | 進捗表示、検証、保存の単位。`--positions-per-superbatch` で決まる |
-| epoch | `--superbatches` 個の superbatch をまとめた学習の区切り。学習率は epoch の先頭で `--lr` に戻る |
-| checkpoint | 再開用の `state.bin` と、エンジンで使う `nn.bin` を保存したもの |
-| validation / 検証 | `--test-teacher` の局面で accuracy と loss を測ること。学習用教師とは別ファイルを使う |
+| batch | GPU で 1 回の重み更新に使う局面数。デフォルトは `--batch-size 65536` |
+| superbatch / sb | 進捗表示、検証、保存の単位。サイズは `--positions-per-superbatch` で決まる |
+| epoch | `--superbatches` 個の sb をまとめた区切り。epoch 開始時に学習率が `--lr` に戻る |
+| checkpoint | 再開用の `state.bin` と、エンジン用の `nn.bin` を保存したもの |
+| validation / 検証 | `--test-teacher` の局面で accuracy と loss を測ること |
 
 例:
 
@@ -24,75 +25,71 @@ BulletOu のログには `batch`、`superbatch`、`epoch` が出てきます。�
 --superbatches 36
 ```
 
-この場合、1 sb は `65536 × 610 = 39,976,960` 局面です。1 epoch は 36 sb なので、約 14.4 億局面です。
-
-`--superbatches` を指定した場合、epoch は「教師データを 1 周した」という意味ではありません。学習率を戻す区切り、保存する区切り、検証結果を比較する区切りです。教師データは、EOF に到達したときだけ先頭へ戻ります。
+この場合、1 sb は `65536 x 610 = 39,976,960` 局面です。1 epoch は 36 sb なので約 14.4 億局面です。
 
 ## 2. よく変更するオプション
 
-まず触ることが多いものだけを先にまとめます。
-
-| 目的 | 指定するもの | 例 |
+| 目的 | オプション | 例 |
 |---|---|---|
 | 1 epoch を何 sb にするか決める | `--superbatches` | `--superbatches 36` |
 | 1 sb の局面数を決める | `--positions-per-superbatch` | `--positions-per-superbatch 40000000` |
 | 何 epoch 学習するか決める | `--max-epochs` | `--max-epochs 3` |
 | checkpoint 保存を減らす | `--save-rate` | `--save-rate 9999` なら epoch 末だけ保存しやすい |
-| accuracy/loss は毎 sb 見る | `--validation-rate` | `--validation-rate 1` |
-| tatara と同じように LR を落とす | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
+| accuracy/loss を毎 sb 見る | `--validation-rate` | `--validation-rate 1` |
+| tatara 風の StepLR に寄せる | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | WRM loss を試す | `--win-rate-model` | `--win-rate-model --loss-pow-exp 2.5` |
-| SFNN の factorizer を切る | `--sfnn-factorizer` | `--sfnn-factorizer none` |
+| sigmoid loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 1.5` |
+| SFNN の factorizer を変える | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
-詳細な一覧です。
+詳しい一覧です。
 
 | フラグ | 何を変えるか | デフォルト |
 |---|---|---|
-| `--backend` | 学習処理。通常は `cuda-cpp` のままでよい | `cuda-cpp` |
-| `--batch-size` | 1 回の重み更新に使う局面数。大きいほど 1 回の勾配は安定するが VRAM を使う | 65536 |
-| `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に切り捨てられる | 100000000 |
-| `--teacher-shuffle-buffer-sbs` | 学習時に教師局面を何 sb 分まとめてシャッフルするか。`4` なら 4 sb 分の読み込み領域を 2 個使う。`0` で無効 | 1 |
-| `--teacher-shuffle-buffer-batches` | シャッフル領域を batch 数で細かく指定する。通常は `--teacher-shuffle-buffer-sbs` を使えばよい | 省略 |
-| `--teacher-shuffle-seed` | 学習時シャッフルの seed | 0 |
-| `--threads` | 教師局面の変換に使う CPU worker 数。CPU が詰まるなら明示する | auto |
-| `--loader-threads` | 教師ファイル読み込み・decode 側の CPU worker 数。GPU への供給が遅いときに調整する | auto |
-| `--cuda-cpp-diagnostics-rate` | 速度低下の原因調査用ログを出す頻度。通常はそのままでよい | 1 |
-| `--superbatches` | 1 epoch を何 sb にするか | 省略時は教師EOFなどで決まる |
-| `--max-epochs` | 最大何 epoch 学習するか | 省略時は自動停止まで |
+| `--backend` | 学習 backend。通常は `cuda-cpp` | `cuda-cpp` |
+| `--batch-size` | 1 回の重み更新に使う局面数 | 65536 |
+| `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に丸められる | 100000000 |
+| `--teacher-shuffle-buffer-sbs` | 教師局面を何 sb 分まとめて shuffle するか。`4` なら 4 sb 分の buffer を 2 本使う | 1 |
+| `--teacher-shuffle-buffer-batches` | shuffle buffer を batch 数で指定する。通常は `--teacher-shuffle-buffer-sbs` を使う | 省略 |
+| `--teacher-shuffle-seed` | 教師 shuffle の seed | 0 |
+| `--threads` | 局面変換に使う CPU worker 数 | auto |
+| `--loader-threads` | 教師ファイル読み込み・decode 側の CPU worker 数 | auto |
+| `--cuda-cpp-diagnostics-rate` | 速度調査用の診断ログを出す頻度 | 1 |
+| `--superbatches` | 1 epoch の sb 数 | 省略 |
+| `--max-epochs` | 最大 epoch 数 | 省略 |
 | `--save-rate` | 何 sb ごとに checkpoint を保存するか | 20 |
 | `--validation-rate` | 何 sb ごとに検証するか。保存頻度とは独立 | `--save-rate` と同じ |
-| `--test-positions` | 検証に使う局面数。省略時は検証ファイルの全局面 | 全件 |
-| `--test-batch-size` | 検証時の GPU batch size。VRAM 不足時だけ下げる | 65536 |
-| `--save-epoch-end` / `--no-save-epoch-end` | epoch 末を保存するか | on |
-| `--lr` | epoch 先頭の学習率 | 0.000875 |
+| `--test-positions` | 検証に使う局面数。省略すると検証ファイルの全局面を使う | 全件 |
+| `--test-batch-size` | 検証時の GPU batch size。VRAM が足りないときだけ下げる | 65536 |
+| `--save-epoch-end` / `--no-save-epoch-end` | epoch 末に保存するか | on |
+| `--lr` | epoch 開始時の学習率 | 0.000875 |
 | `--lr-min` | 学習率の下限 | 0.00001 |
-| `--lr-schedule` | 学習率の下げ方。通常は `step` | `step` |
-| `--lr-step-gamma` | `step` で学習率に掛ける倍率 | 自動 / 0.992 |
+| `--lr-schedule` | 学習率 schedule。まずは `step` でよい | `step` |
+| `--lr-step-gamma` | `step` で学習率に掛ける係数 | auto / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は 1 sb ごと | 省略 |
 | `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
-| `--scale` | 教師評価値を `sigmoid(score / scale)` に変換するときの scale。省略時は教師データから推定 | 省略 |
-| `--scale-calibration-positions` | `--scale` 省略時、教師先頭何局面から scale を推定するか。`0` なら内蔵値を使う | 100000 |
-| `--loss-sigmoid-mse` | sigmoid-MSE を明示する。指定しなくても通常はこの loss | on |
-| `--win-rate-model` | WRM loss を使う比較実験用設定 | off |
-| `--loss-pow-exp` | WRM loss の指数。`2.0` は二乗誤差、`2.5` も試験候補 | 2.0 |
-| `--wrm-nnue2score` | WRM で network output を評価値スケールへ戻す倍率 | 600 |
-| `--wrm-target-calibration-positions` | WRM の教師評価値→勝率ラベル係数を、教師先頭何局面から推定するか | 100000 |
-| `--wrm-target-offset` / `--wrm-target-scaling` | WRM の教師評価値→勝率ラベル係数を手で指定する。通常は指定しない | 省略 |
-| `--sfnn-factorizer` | SFNN の bucket 間で共通成分を共有する方法。通常は `shared` | `shared` |
-| `--optimizer` | optimizer。通常は `ranger` のままでよい | `ranger` |
+| `--scale` | `sigmoid(score / scale)` の scale。省略時は教師データから推定 | 省略 |
+| `--scale-calibration-positions` | `--scale` 推定に使う教師先頭局面数。`0` なら内蔵値を使う | 100000 |
+| `--win-rate-model` | prediction 側に WRM 曲線を使う | off |
+| `--loss-pow-exp` | `|prediction - target|^p` の `p`。`2.0` は二乗誤差 | 2.0 |
+| `--wrm-nnue2score` | WRM で network output を評価値 scale に戻す係数 | 600 |
+| `--wrm-target-calibration-positions` | WRM target 曲線の推定に使う教師先頭局面数 | 100000 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | WRM target 曲線を手で指定する | 省略 |
+| `--sfnn-factorizer` | SFNN の bucket 間で共通成分を共有する方法 | `shared` |
+| `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
-| `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizer の細かい係数。比較実験用 | 省略 |
+| `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizer の詳細パラメータ | 省略 |
 
-## 3. 学習率をどう下げるか
+## 3. 学習率 schedule
 
-`--lr-schedule step` がデフォルトです。`step` は、一定間隔で
+`--lr-schedule step` では、一定間隔で
 
 ```text
 lr = lr * gamma
 ```
 
-と学習率を下げます。`--lr-step-positions` を省略すると、1 sb ごとに下がります。epoch の先頭では `--lr` に戻ります。
+のように学習率を下げます。`--lr-step-positions` を省略すると 1 sb ごとに下がります。次の epoch の sb 1 では `--lr` に戻ります。
 
-tatara と同じように `gamma=0.992` を明示するなら、こう書きます。
+tatara 風に `gamma=0.992` を指定する例です。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -106,46 +103,21 @@ tatara と同じように `gamma=0.992` を明示するなら、こう書きま�
     --tag step-gamma-0992
 ```
 
-`--lr-step-gamma` を書かずに `--superbatches` を指定すると、1 epoch の中で `--lr` から `--lr-min` へ届くように BulletOu が `gamma` を計算します。
+`--lr-step-gamma` を省略して `--superbatches` を指定すると、1 epoch の中で `--lr` から `--lr-min` へ届くように BulletOu が gamma を計算します。
 
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --positions-per-superbatch 40000000 \
-    --superbatches 36 \
-    --max-epochs 3 \
-    --lr 0.000875 \
-    --lr-min 0.00001 \
-    --lr-schedule step \
-    --tag step-auto-gamma
-```
+## 4. 教師データから学習ラベルを作る
 
-この例では、各 epoch の 36 sb で `--lr` から `--lr-min` へ下がり、次の epoch の sb 1 で `--lr` に戻ります。
-
-`geometric` と `cos` は、1 epoch をかけて滑らかに下げる方式です。まずは `step` だけで十分です。
-
-| 値 | 動き |
-|---|---|
-| `step` | sb ごと、または指定局面数ごとに階段状に下げる |
-| `geometric` | 毎 batch 少しずつ一定倍率で下げる |
-| `cos` | cosine カーブで滑らかに下げる |
-| `plateau` | 検証 loss / accuracy が改善しないときだけ学習率を下げて同じ区間をやり直す |
-
-## 4. 教師評価値を学習用ラベルにする
-
-教師データには、主に次の 2 種類の情報があります。
+教師データには主に次の 2 つがあります。
 
 | 情報 | 意味 |
 |---|---|
 | 教師評価値 | 教師エンジンがその局面を何点と見たか |
-| 勝敗結果 | その対局が最終的に勝ち・負け・引き分けのどれになったか |
+| 勝敗結果 | その対局が最終的に勝ち・引き分け・負けのどれになったか |
 
-`--lambda` は、この 2 つをどれだけ混ぜるかを決めます。
+`--lambda` は、この 2 つをどう混ぜるかを決めます。
 
 ```text
-学習ラベル = λ × 教師評価値由来のラベル + (1 - λ) × 勝敗結果由来のラベル
+training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_game_result
 ```
 
 | `--lambda` | 意味 |
@@ -154,19 +126,28 @@ tatara と同じように `gamma=0.992` を明示するなら、こう書きま�
 | `0.5` | 教師評価値と勝敗結果を半分ずつ混ぜる |
 | `0.0` | 勝敗結果だけを見る |
 
-通常は `1.0` から始めます。勝敗結果も混ぜたい実験だけ `0.5` や `0.7` などを試してください。
-
 ## 5. loss と score scale
 
-通常の学習では sigmoid-MSE を使います。教師評価値を 0〜1 のラベルに直し、network output も 0〜1 に直して、その二乗誤差を loss にします。
+何も指定しない場合、BulletOu は sigmoid probability loss を使います。
 
 ```text
 target     = sigmoid(teacher_score / scale)
 prediction = sigmoid(network_output)
-loss       = (prediction - target)^2
+loss       = |prediction - target|^p
 ```
 
-`scale` は教師評価値の大きさを 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭 100,000 局面からこの値を推定します。推定では勝ち・負けが付いている局面だけを使い、引き分けの対局は使いません。
+`p` は `--loss-pow-exp` で指定します。デフォルトは `2.0` なので、このときは sigmoid-MSE です。
+
+```bash
+# sigmoid-MSE
+--loss-pow-exp 2.0
+
+# 誤差の小さい/大きい局面への重み付けを変える実験
+--loss-pow-exp 1.5
+--loss-pow-exp 2.5
+```
+
+`scale` は教師評価値を 0〜1 のラベルへ写すための係数です。`--scale` を省略すると、BulletOu は教師データの先頭局面から推定します。推定では勝ち・負けが付いている局面だけを使い、引き分け局面は使いません。
 
 ```bash
 # scale を自動推定する
@@ -177,23 +158,21 @@ loss       = (prediction - target)^2
     --tag sigmoid-auto-scale
 ```
 
-推定に使う局面数を変える場合は `--scale-calibration-positions` を使います。
+推定に使う局面数を変える場合:
 
 ```bash
 --scale-calibration-positions 300000
 ```
 
-比較実験で scale を固定したい場合だけ `--scale` を指定します。
+比較実験で scale を固定したい場合:
 
 ```bash
---scale 6000
+--scale 600
 ```
 
-### WRM loss を試す
+## 6. WRM loss を試す
 
-WRM は win-rate-model の略です。sigmoid-MSE と同じく 0〜1 の空間で比較しますが、network output の勝率変換に WRM の曲線を使います。
-
-WRM を使う場合は `--win-rate-model` を明示します。`--loss-pow-exp` は WRM の誤差に使う指数です。
+WRM は win-rate model の略です。loss は同じ 0〜1 の空間で計算しますが、prediction 側の勝率変換に WRM 曲線を使います。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -205,19 +184,19 @@ WRM を使う場合は `--win-rate-model` を明示します。`--loss-pow-exp` 
     --tag wrm-pow25
 ```
 
-WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定したときだけ使われます。自動推定では勝ち・負けが付いている局面だけを使い、引き分けの対局は使いません。通常は係数を手で指定しません。
+WRM でも loss は次の形です。
 
-```bash
-# WRM の係数推定に使う局面数を変える
---wrm-target-calibration-positions 300000
-
-# WRM の係数を手で固定する
---wrm-target-offset 270 --wrm-target-scaling 380
+```text
+loss = |prediction - target|^p
 ```
 
-### 教師データ上で score→勝率の形を確認する
+`--loss-pow-exp` は sigmoid loss と WRM loss の両方に効きます。
 
-教師評価値と勝敗結果の関係は、教師データごとに少し違います。次の診断コマンドで、単純な sigmoid と WRM のどちらが実データに合っているかを見られます。
+`--wrm-nnue2score` は network output を評価値 scale に戻す係数です。デフォルトは `600` です。
+
+## 7. 教師データ上の score → winrate を確認する
+
+教師評価値と勝敗結果の関係は、教師データによって変わります。次の診断コマンドで、単純 sigmoid と WRM のどちらが実データに合っているかを確認できます。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -229,37 +208,21 @@ WRM の教師評価値→勝率ラベル係数は、`--win-rate-model` を指定
     --score-winrate-csv score-winrate.csv
 ```
 
-このコマンドは学習しません。先頭 `--fit-positions` 局面で係数を推定し、その直後の `--analyze-positions` 局面で BCE / Brier score と score bucket ごとの実測勝率を出します。係数推定と BCE / Brier score は勝ち・負けが付いている局面だけで計算します。
+このコマンドは学習しません。先頭 `--fit-positions` 局面で曲線を推定し、その後の `--analyze-positions` 局面で BCE / Brier score と score bucket ごとの実測勝率を出します。推定と BCE / Brier score では、勝ち・負けが付いている局面だけを使います。
 
 | 出力 | 意味 |
 |---|---|
-| `sigmoid(score/s)` | `score` を 1 つの scale だけで 0〜1 に変換する形 |
-| `WRM(offset,scale)` | `offset` と `scale` を使い、評価値 0 付近を少し平らにできる形 |
-| `heldout_bce` | 小さいほど、勝敗結果の統計に合っている |
-| `heldout_brier` | 小さいほど、予測確率として合っている |
-| `empirical` | その score bucket での `勝ち / (勝ち + 負け)`。引き分けは表示だけして計算には使わない |
+| `sigmoid(score/s)` | `score` を 1 つの scale で 0〜1 に変換する形 |
+| `WRM(offset,scale)` | offset と scale を使う形 |
+| `heldout_bce` | 小さいほど勝敗統計に合っている |
+| `heldout_brier` | 小さいほど確率予測として合っている |
+| `empirical` | その score bucket での `wins / (wins + losses)` |
 
-`delta(WRM - sigmoid)` が負なら、その教師データでは WRM のほうが勝敗結果の統計に合っています。正なら、単純な sigmoid のほうが合っています。
+## 8. SFNN factorizer
 
-### `--wrm-nnue2score`
+SFNN では `k3k3` や `hand1024` のように bucket を増やせます。bucket が多いほど表現力は上がりますが、1 bucket あたりの教師局面は減ります。
 
-`--wrm-nnue2score` は、network output を評価値スケールに戻す倍率です。デフォルトは `600` です。tatara と条件を揃えるときや、明確に比較実験をするとき以外は変更しません。
-
-### sigmoid-MSE を明示したい場合
-
-通常は指定不要ですが、実験ログやスクリプト上で loss を明示したい場合は次を指定できます。
-
-```bash
---loss-sigmoid-mse
-```
-
-WRM と sigmoid-MSE では loss の式が違うので、loss の数値は同じ設定同士で比較してください。
-
-## 6. SFNN factorizer
-
-SFNN では、`k3k3` や `hand1024` のように bucket を増やすと、bucket ごとに別の後段ネットワークを持ちます。bucket が多いほど表現力は増えますが、各 bucket に届く教師局面は減ります。
-
-factorizer は、bucket ごとに完全に別々の重みを持つのではなく、bucket 間で共通しやすい成分を別枠で持つ仕組みです。過学習を抑えたり、少ない教師量でも学習を安定させたりする目的で使います。
+factorizer は、bucket ごとに完全に別の重みを持つのではなく、bucket 間で共通成分を共有する仕組みです。教師密度が足りないときの過学習を抑えたり、学習を安定させたりする目的で使います。
 
 | 指定 | 意味 |
 |---|---|
@@ -267,7 +230,7 @@ factorizer は、bucket ごとに完全に別々の重みを持つのではな�
 | `--sfnn-factorizer none` | factorizer を使わない |
 | `--sfnn-factorizer axis` | arch に存在する軸をまとめて有効化する。例: `hand1024_k3k3` なら king と hand の両方 |
 | `--sfnn-factorizer king=axis,hand=axis` | 軸ごとに明示する |
-| `--sfnn-factorizer king=axis,hand=shared` | king は軸方向、hand は共有成分だけにする |
+| `--sfnn-factorizer king=axis,hand=shared` | king は軸方向、hand は共通成分だけにする |
 
 例:
 
@@ -280,9 +243,7 @@ factorizer は、bucket ごとに完全に別々の重みを持つのではな�
     --tag k29-axis
 ```
 
-途中で factorizer 設定を変えて再開する場合、必ず `--resume` を明示してください。BulletOu は設定変更を検出して、意図しない再開を止めます。
-
-## 7. 保存と検証の頻度
+## 9. 保存と検証の頻度
 
 保存と検証は別々に指定できます。
 
@@ -290,17 +251,15 @@ factorizer は、bucket ごとに完全に別々の重みを持つのではな�
 --save-rate 20 --validation-rate 1
 ```
 
-これは「checkpoint は 20 sb ごとに保存するが、accuracy/loss は毎 sb 測る」という意味です。
+これは「checkpoint は 20 sb ごとに保存し、accuracy/loss は毎 sb 測る」という意味です。
 
-epoch 末の保存はデフォルトで有効です。1 epoch が 36 sb で、epoch 末だけ保存したい場合は、次のように大きな `--save-rate` を指定します。
+epoch 末の保存はデフォルトで有効です。epoch 末だけ保存したい場合は、1 epoch 内で到達しない大きな `--save-rate` を指定します。
 
 ```bash
 --save-rate 9999
 ```
 
-この場合、36 sb の中では `save-rate` に到達しないので、epoch 末保存だけが残ります。
-
-## 8. 速度が遅いときに見るところ
+## 10. 速度を見るときのログ
 
 速度を見るときは stdout の `[train]` 行を見ます。
 
@@ -314,55 +273,4 @@ epoch 末の保存はデフォルトで有効です。1 epoch が 36 sb で、ep
 | `train` | 学習処理そのものの時間。検証・保存は含まない |
 | `pos/s` | `train` から計算した学習速度 |
 
-GPU が空いているのに `pos/s` が低い場合は、教師局面の読み込み・decode・シャッフルが詰まっている可能性があります。まず次を確認します。
-
-- 教師データが遅いストレージにないか
-- `--teacher-shuffle-buffer-sbs` が大きすぎないか
-- `--threads` / `--loader-threads` が CPU を使い切っていないか
-- `cuda-cpp-diagnostics.log` で teacher queue wait が大きくないか
-
-## 9. optimizer
-
-通常は `--optimizer ranger` のままで構いません。`--optimizer-weight-decay` もデフォルト `0.0` のままで始めます。
-
-optimizer の細かい係数を変える場合は、他の条件を動かさず 1 つずつ比較してください。
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --optimizer ranger \
-    --optimizer-weight-decay 0.0 \
-    --optimizer-beta1 0.9 \
-    --optimizer-beta2 0.999 \
-    --optimizer-epsilon 0.0000001 \
-    --tag optimizer-test
-```
-
-## 10. 迷ったときの基本形
-
-SFNN で 1 epoch = 36 sb、毎 sb 検証、epoch 末だけ保存する例です。
-
-```powershell
-.\target\release\examples\bulletou.exe `
-  --backend cuda-cpp `
-  --teacher C:\shogi\teacher\sojo `
-  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --positions-per-superbatch 40000000 `
-  --superbatches 36 `
-  --max-epochs 1 `
-  --lr 0.000875 `
-  --lr-min 0.000030 `
-  --lr-schedule step `
-  --optimizer ranger `
-  --optimizer-weight-decay 0.0 `
-  --save-rate 9999 `
-  --validation-rate 1 `
-  --tag sfnn-sojo-36sb
-```
-
-次へ: [追加学習](additional-training.md)
-
-前へ: [応用編トップ](README.md)
+GPU が空いているのに `pos/s` が低い場合は、教師局面の読み込み、decode、shuffle が詰まっている可能性があります。`cuda-cpp-diagnostics.log` の teacher queue wait も見てください。
