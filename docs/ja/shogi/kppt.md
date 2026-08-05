@@ -129,7 +129,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 | `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = tatara/bullet-shogi 互換 StepLR、`geometric` = geometric、`cos` = cosine。詳細は [応用編: 学習設定を調整する](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
-| `--scale` | sigmoid loss の target で使う eval-to-score sigmoid scale。省略時は固定値 290 | 省略 |
+| `--scale` | sigmoid loss の target で使う eval-to-score sigmoid scale。省略時は固定値 203 | 省略 |
 | `--yaneuraou-quant-scale` | f32 → i{16,32} 量子化スケール | 4000 (KK/KKP), 400 (KPP) |
 | `--score-drop-abs` | `|score| >= N` の局面を除外 (詰み手スコア対策) | 32000 |
 

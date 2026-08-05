@@ -53,9 +53,11 @@ Example:
   --fv-scale auto
 ```
 
+If `--fv-scale` is omitted, BulletOu measures with `FV_SCALE=40`. This is the natural counterpart of the default training scale `203`.
+
 `--fv-scale auto` searches integer `FV_SCALE` values in `16..=40` by default. Use `--fv-scale-min`, `--fv-scale-max`, and `--fv-scale-step` to change that range.
 
-If you pass an integer such as `--fv-scale 28`, BulletOu keeps that `FV_SCALE` fixed and searches only the offset.
+If you pass an integer such as `--fv-scale 40`, BulletOu keeps that `FV_SCALE` fixed and searches only the offset.
 
 Example output:
 

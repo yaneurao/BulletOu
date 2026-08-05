@@ -1183,7 +1183,7 @@ struct QuantizedTestArgs {
     score_drop_abs: u16,
 
     /// YaneuraOu FV_SCALE applied before the final sign test.
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value = "40")]
     fv_scale: i32,
 
     /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
@@ -1196,7 +1196,7 @@ struct QuantizedTestArgs {
     lambda: f32,
 
     /// Eval-to-score sigmoid scale used by the validation loss target.
-    #[arg(long, default_value = "290")]
+    #[arg(long, default_value = "203")]
     scale: u32,
 
     /// Exponent of the probability-space error term `|prediction - target|^p`.
@@ -1334,7 +1334,7 @@ struct QuantizedCalibrateArgs {
 
     /// YaneuraOu FV_SCALE used by the target engine, or `auto` to search
     /// `--fv-scale-min..=--fv-scale-max`.
-    #[arg(long, default_value = "16", value_name = "FV_SCALE|auto", value_parser = parse_quantized_calibrate_fv_scale)]
+    #[arg(long, default_value = "40", value_name = "FV_SCALE|auto", value_parser = parse_quantized_calibrate_fv_scale)]
     fv_scale: QuantizedCalibrateFvScale,
 
     /// Minimum FV_SCALE to try when `--fv-scale auto` is used.
@@ -1358,7 +1358,7 @@ struct QuantizedCalibrateArgs {
     lambda: f32,
 
     /// Eval-to-score sigmoid scale used by the validation loss target.
-    #[arg(long, default_value = "290")]
+    #[arg(long, default_value = "203")]
     scale: u32,
 
     /// Exponent of the probability-space error term `|prediction - target|^p`.
@@ -2478,7 +2478,7 @@ const DEFAULT_LR_STEP_GAMMA: f32 = 0.992;
 const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
-const DEFAULT_SIGMOID_SCALE: f32 = 290.0;
+const DEFAULT_SIGMOID_SCALE: f32 = 203.0;
 const DEFAULT_SCORE_WINRATE_ANALYSIS_POSITIONS: usize = 1_000_000;
 const DEFAULT_SCORE_WINRATE_FIT_POSITIONS: usize = 100_000;
 const DEFAULT_SCORE_WINRATE_BIN_SIZE: u16 = 50;

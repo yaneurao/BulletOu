@@ -65,7 +65,7 @@ Fuller option table:
 | `--lr-step-gamma` | Multiplicative factor for `step` schedule | auto / 0.992 |
 | `--lr-step-positions` | Positions between LR drops. Omitted means one drop per sb | omitted |
 | `--lambda` | Blend between teacher score and game result | 1.0 |
-| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu uses the fixed value 290 | omitted |
+| `--scale` | Scale used in `sigmoid(score / scale)`. If omitted, BulletOu uses the fixed value 203 | omitted |
 | `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p`. `2.0` is squared error | 2.0 |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--optimizer` | Optimizer | `ranger` |
@@ -140,17 +140,17 @@ loss       = |prediction - target|^p
 --loss-pow-exp 2.5
 ```
 
-`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu uses the fixed value `290`.
+`scale` maps teacher scores into the 0–1 label space. If you omit `--scale`, BulletOu uses the fixed value `203`. With the SFNN quantization constants `QA * QB = 8128`, this approximately corresponds to `FV_SCALE=40` on the YaneuraOu side.
 
 BulletOu does not estimate the training scale from game-result labels. Those labels are not always trustworthy: for example, a dataset may come from games between weak players and then be re-scored by a stronger deep-learning engine. In that case, game result is not a reliable calibration target for the teacher score.
 
 ```bash
-# Train with fixed scale 290
+# Train with fixed scale 203
 ./target/release/examples/bulletou \
     --teacher teachers/ \
     --test-teacher test.hcpe \
     --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-scale290
+    --tag sigmoid-scale203
 ```
 
 Set a fixed scale for a comparison experiment:

@@ -53,9 +53,11 @@ engine_score = raw / FV_SCALE
   --fv-scale auto
 ```
 
-`--fv-scale auto` は、デフォルトで `16..=40` の整数 `FV_SCALE` を探索します。範囲を変える場合は `--fv-scale-min`、`--fv-scale-max`、`--fv-scale-step` を指定します。
+`--fv-scale` を省略した場合、BulletOu は `FV_SCALE=40` として計測します。これはデフォルトの学習scale `203` と自然に対応する値です。
 
-`--fv-scale 28` のように整数を指定した場合は、その `FV_SCALE` に固定してoffsetだけを探します。
+`--fv-scale auto` を指定すると、デフォルトで `16..=40` の整数 `FV_SCALE` を探索します。範囲を変える場合は `--fv-scale-min`、`--fv-scale-max`、`--fv-scale-step` を指定します。
+
+`--fv-scale 40` のように整数を指定した場合は、その `FV_SCALE` に固定してoffsetだけを探します。
 
 出力例:
 
