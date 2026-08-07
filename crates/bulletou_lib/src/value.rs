@@ -32,6 +32,7 @@ pub use fast_sfnn::{
     FastSfnnError, SFNN_HALFKA2_1024_7_64_K3K3, SfnnForwardOwnedWeights, SfnnForwardShape, SfnnForwardTrace,
     SfnnForwardWeights, SfnnForwardWorkspaceLayout,
 };
+pub use loader::WinRateModelTargetParams;
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
     KpptTeacherBatchConfig, ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, ScoreWinrateBinReport,

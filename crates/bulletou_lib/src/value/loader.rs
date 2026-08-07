@@ -19,7 +19,10 @@ pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
 use bulletformat::BulletFormat;
 use rayon::prelude::*;
-use std::{sync::mpsc, thread};
+use std::{
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    thread,
+};
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 
@@ -77,6 +80,9 @@ pub struct DefaultDataLoader<I: SparseInputType, O, D> {
     weight_getter: Option<Wgt<I>>,
     wdl: bool,
     scale: f32,
+    use_win_rate_model: bool,
+    wrm_target: WinRateModelTargetParams,
+    wrm_score_table: Option<Arc<[f32]>>,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外（weight を 0 にする）。
     /// 特徴量デコードはそのまま走るが GPU 側で勾配寄与ゼロ。
     score_drop_abs: Option<u16>,
@@ -107,11 +113,21 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
             weight_getter,
             wdl,
             scale,
+            use_win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
+            wrm_score_table: None,
             score_drop_abs,
             teacher_shuffle_buffer_batches: 0,
             teacher_shuffle_seed: 0,
             loader,
         }
+    }
+
+    pub fn with_win_rate_model_target(mut self, enabled: bool, params: WinRateModelTargetParams) -> Self {
+        self.use_win_rate_model = enabled;
+        self.wrm_target = params;
+        self.wrm_score_table = (enabled && !self.wdl).then(|| win_rate_model_score_table(params));
+        self
     }
 
     pub fn with_teacher_shuffle(mut self, buffer_batches: usize, seed: u64) -> Self {
@@ -205,7 +221,7 @@ where
     }
 
     pub fn prepare(&self, data: &[I::RequiredDataType], threads: usize, blend: f32) -> PreparedData<I, O> {
-        PreparedData::new(
+        PreparedData::new_with_pool_internal(
             self.input_getter.clone(),
             self.output_getter,
             self.blend_getter,
@@ -216,6 +232,8 @@ where
             blend,
             self.scale,
             self.score_drop_abs,
+            self.wrm_score_table.clone(),
+            None,
         )
     }
 
@@ -226,7 +244,7 @@ where
         threads: usize,
         blend: f32,
     ) -> PreparedData<I, O> {
-        PreparedData::new_with_pool(
+        PreparedData::new_with_pool_internal(
             self.input_getter.clone(),
             self.output_getter,
             self.blend_getter,
@@ -237,6 +255,7 @@ where
             blend,
             self.scale,
             self.score_drop_abs,
+            self.wrm_score_table.clone(),
             Some(pool),
         )
     }
@@ -305,6 +324,37 @@ where
         blend: f32,
         scale: f32,
         score_drop_abs: Option<u16>,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Self {
+        Self::new_with_pool_internal(
+            input_getter,
+            output_getter,
+            blend_getter,
+            weight_getter,
+            wdl,
+            data,
+            threads,
+            blend,
+            scale,
+            score_drop_abs,
+            None,
+            pool,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_pool_internal(
+        input_getter: I,
+        output_getter: O,
+        blend_getter: B<I>,
+        weight_getter: Option<Wgt<I>>,
+        wdl: bool,
+        data: &[I::RequiredDataType],
+        threads: usize,
+        blend: f32,
+        scale: f32,
+        score_drop_abs: Option<u16>,
+        wrm_score_table: Option<Arc<[f32]>>,
         pool: Option<&rayon::ThreadPool>,
     ) -> Self {
         let rscale = 1.0 / scale;
@@ -387,7 +437,11 @@ where
                                 if wdl {
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
                                 } else {
-                                    let score = sigmoid(rscale * f32::from(pos.score()));
+                                    let score = if let Some(table) = wrm_score_table.as_deref() {
+                                        win_rate_model_score_from_table(table, pos.score())
+                                    } else {
+                                        sigmoid(rscale * f32::from(pos.score()))
+                                    };
                                     let result = f32::from(pos.result() as u8) / 2.0;
                                     let blend = blend_getter(pos, blend);
                                     assert!((0.0..=1.0).contains(&blend), "WDL proportion must be in [0, 1]");
@@ -425,6 +479,7 @@ where
                     )| {
                         let inp = &prep.input_getter;
                         let out = &prep.output_getter;
+                        let wrm_score_table = wrm_score_table.clone();
                         s.spawn(move || {
                             let chunk_len = data_chunk.len();
                             let mut hand_count_chunk = hand_count_chunk;
@@ -480,7 +535,11 @@ where
                                 if wdl {
                                     results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
                                 } else {
-                                    let score = sigmoid(rscale * f32::from(pos.score()));
+                                    let score = if let Some(table) = wrm_score_table.as_deref() {
+                                        win_rate_model_score_from_table(table, pos.score())
+                                    } else {
+                                        sigmoid(rscale * f32::from(pos.score()))
+                                    };
                                     let result = f32::from(pos.result() as u8) / 2.0;
                                     let blend = blend_getter(pos, blend);
                                     assert!((0.0..=1.0).contains(&blend), "WDL proportion must be in [0, 1]");
@@ -498,6 +557,64 @@ where
 
 fn sigmoid(x: f32) -> f32 {
     1. / (1. + (-x).exp())
+}
+
+pub const DEFAULT_WRM_TARGET_OFFSET: f32 = 270.0;
+pub const DEFAULT_WRM_TARGET_SCALING: f32 = 380.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinRateModelTargetParams {
+    pub offset: f32,
+    pub scaling: f32,
+}
+
+impl WinRateModelTargetParams {
+    pub const DEFAULT: Self = Self { offset: DEFAULT_WRM_TARGET_OFFSET, scaling: DEFAULT_WRM_TARGET_SCALING };
+
+    pub fn new(offset: f32, scaling: f32) -> Option<Self> {
+        (offset.is_finite() && scaling.is_finite() && scaling > 0.0).then_some(Self { offset, scaling })
+    }
+
+    pub fn probability(self, score: f32) -> f32 {
+        let p = (score - self.offset) / self.scaling;
+        let pm = (-score - self.offset) / self.scaling;
+        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+    }
+}
+
+impl Default for WinRateModelTargetParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+fn build_win_rate_model_score_table(params: WinRateModelTargetParams) -> Box<[f32]> {
+    let mut values = Vec::with_capacity(usize::from(u16::MAX) + 1);
+    for raw_score in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+        values.push(params.probability(raw_score as f32));
+    }
+    values.into_boxed_slice()
+}
+
+static WIN_RATE_MODEL_SCORE_TABLE_CACHE: OnceLock<Mutex<Vec<(WinRateModelTargetParams, Arc<[f32]>)>>> = OnceLock::new();
+
+pub(crate) fn win_rate_model_score_table(params: WinRateModelTargetParams) -> Arc<[f32]> {
+    let cache = WIN_RATE_MODEL_SCORE_TABLE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((_, table)) = guard.iter().find(|(cached, _)| *cached == params) {
+            return Arc::clone(table);
+        }
+        let table: Arc<[f32]> = Arc::from(build_win_rate_model_score_table(params));
+        guard.push((params, Arc::clone(&table)));
+        table
+    } else {
+        Arc::from(build_win_rate_model_score_table(params))
+    }
+}
+
+pub(crate) fn win_rate_model_score_from_table(table: &[f32], score: i16) -> f32 {
+    let index = (i32::from(score) - i32::from(i16::MIN)) as usize;
+    table[index]
 }
 
 pub(crate) fn teacher_shuffle_window_records(batch_size: usize, buffer_batches: usize) -> Option<usize> {

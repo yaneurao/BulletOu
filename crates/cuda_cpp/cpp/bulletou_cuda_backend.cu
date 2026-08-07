@@ -1257,6 +1257,36 @@ __global__ void loss_sigmoid_pow_reduce_kernel(
     mean_output_gradients[idx] = entry_weights[idx] * gradient / static_cast<float>(batch);
 }
 
+__global__ void loss_win_rate_model_reduce_kernel(
+    const float* outputs,
+    const float* targets,
+    const float* entry_weights,
+    float* per_sample,
+    float* mean_output_gradients,
+    float loss_pow_exp,
+    float wrm_output_scale,
+    float wrm_in_offset_over_scaling,
+    size_t batch) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) {
+        return;
+    }
+
+    float score_scaled = outputs[idx] * wrm_output_scale;
+    float q = loss_sigmoid(score_scaled - wrm_in_offset_over_scaling);
+    float qm = loss_sigmoid(-score_scaled - wrm_in_offset_over_scaling);
+    float prediction = (1.0f + q - qm) * 0.5f;
+    float error = prediction - targets[idx];
+    float abs_error = fabsf(error);
+    float loss = powf(abs_error, loss_pow_exp);
+    float q_prime = q * (1.0f - q);
+    float qm_prime = qm * (1.0f - qm);
+    float prediction_gradient = 0.5f * wrm_output_scale * (q_prime + qm_prime);
+    float loss_gradient = abs_error == 0.0f ? 0.0f : loss_pow_exp * sign_f32(error) * powf(abs_error, loss_pow_exp - 1.0f);
+    per_sample[idx] = entry_weights[idx] * loss;
+    mean_output_gradients[idx] = entry_weights[idx] * loss_gradient * prediction_gradient / static_cast<float>(batch);
+}
+
 __global__ void loss_finalize_from_per_sample_kernel(
     const float* per_sample,
     float* weighted_sum,
@@ -4700,16 +4730,18 @@ int launch_sfnn_backward_kernels(
     return 0;
 }
 
-int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp, float unused_loss_param) {
-    (void)unused_loss_param;
+int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp, float loss_param) {
     if (batch == 0) {
         return fail_message("scalar loss batch size must be greater than zero");
     }
-    if (kind != 0) {
-        return fail_message("scalar loss kind must be 0 (sigmoid-pow)");
+    if (kind != 0 && kind != 1) {
+        return fail_message("scalar loss kind must be 0 (sigmoid-pow) or 1 (win-rate-model)");
     }
     if (!(std::isfinite(loss_pow_exp) && loss_pow_exp >= 1.0f)) {
         return fail_message("loss_pow_exp must be finite and >= 1");
+    }
+    if (kind == 1 && !std::isfinite(loss_param)) {
+        return fail_message("WRM loss parameter must be finite");
     }
     return 0;
 }
@@ -4719,7 +4751,7 @@ int launch_scalar_loss_kernels(
     int kind,
     float output_inv_scale,
     float loss_pow_exp,
-    float unused_loss_param,
+    float loss_param,
     size_t batch,
     const float* outputs,
     const float* targets,
@@ -4729,7 +4761,7 @@ int launch_scalar_loss_kernels(
     float* weighted_sum,
     float* mean,
     int finalize_loss) {
-    if (validate_scalar_loss(batch, kind, loss_pow_exp, unused_loss_param) != 0) {
+    if (validate_scalar_loss(batch, kind, loss_pow_exp, loss_param) != 0) {
         return -1;
     }
     if (set_context_device(ctx) != 0) {
@@ -4742,17 +4774,33 @@ int launch_scalar_loss_kernels(
         return -1;
     }
 
-    loss_sigmoid_pow_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        outputs,
-        targets,
-        entry_weights,
-        per_sample,
-        mean_output_gradients,
-        output_inv_scale,
-        loss_pow_exp,
-        batch);
-    if (check_kernel_launch("loss_sigmoid_pow_reduce_kernel launch") != 0) {
-        return -1;
+    if (kind == 0) {
+        loss_sigmoid_pow_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            outputs,
+            targets,
+            entry_weights,
+            per_sample,
+            mean_output_gradients,
+            output_inv_scale,
+            loss_pow_exp,
+            batch);
+        if (check_kernel_launch("loss_sigmoid_pow_reduce_kernel launch") != 0) {
+            return -1;
+        }
+    } else {
+        loss_win_rate_model_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            outputs,
+            targets,
+            entry_weights,
+            per_sample,
+            mean_output_gradients,
+            loss_pow_exp,
+            output_inv_scale,
+            loss_param,
+            batch);
+        if (check_kernel_launch("loss_win_rate_model_reduce_kernel launch") != 0) {
+            return -1;
+        }
     }
 
     if (finalize_loss != 0) {
@@ -6286,7 +6334,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     int kind,
     float output_inv_scale,
     float loss_pow_exp,
-    float unused_loss_param,
+    float loss_param,
     size_t batch,
     const BulletOuCudaCppF32Buffer* outputs,
     const BulletOuCudaCppF32Buffer* targets,
@@ -6296,7 +6344,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     BulletOuCudaCppF32Buffer* weighted_sum,
     BulletOuCudaCppF32Buffer* mean,
     int finalize_loss) {
-    if (validate_scalar_loss(batch, kind, loss_pow_exp, unused_loss_param) != 0 ||
+    if (validate_scalar_loss(batch, kind, loss_pow_exp, loss_param) != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(outputs), batch, "outputs") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(targets), batch, "targets") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(entry_weights), batch, "entry_weights") != 0 ||
@@ -6312,7 +6360,7 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
             kind,
             output_inv_scale,
             loss_pow_exp,
-            unused_loss_param,
+            loss_param,
             batch,
             outputs->ptr,
             targets->ptr,

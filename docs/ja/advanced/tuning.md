@@ -2,17 +2,17 @@
 
 <a href="../../en/advanced/tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-[チュートリアル 3: 学習を走らせる](../tutorial/3-train.md) のコマンドが動いたあとに読むページです。最初の学習ではデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer を調整したくなったら、このページを参照してください。
+[チュートリアル 3: 学習を走らせる](../tutorial/3-train.md) のコマンドが動いたあとに読むページです。
+
+最初の学習では、まずデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer を変えたくなったときに、このページを参照してください。
 
 ## 1. ログに出てくる単位
 
-BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を使います。
-
 | 名前 | 意味 |
-|---|---|
+| --- | --- |
 | batch | GPUで1回の重み更新に使う局面数。デフォルトは `--batch-size 65536` |
-| superbatch / sb | 進捗表示、検証、保存の単位。サイズは `--positions-per-superbatch` で指定 |
-| epoch | `--superbatches` 個の sb をまとめた区切り。epoch開始時に学習率は `--lr` に戻る |
+| superbatch / sb | 進捗表示、検証、保存の単位。大きさは `--positions-per-superbatch` で決まる |
+| epoch | `--superbatches` 個の sb をまとめた単位。epoch 開始時に学習率は `--lr` に戻る |
 | checkpoint | 再開用の `state.bin` と、エンジン用の `nn.bin` |
 | validation / 検証 | `--test-teacher` の局面で accuracy と loss を測ること |
 
@@ -24,25 +24,25 @@ BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を使います�
 --superbatches 36
 ```
 
-この場合、1 sb は `65536 x 610 = 39,976,960` 局面です。1 epoch は 36 sb なので、約 14.4 億局面です。
+この場合、1 sb は `65536 x 610 = 39,976,960` 局面です。1 epoch は 36 sb なので、約14.4億局面です。
 
-## 2. よく変更するオプション
+## 2. よく変えるオプション
 
 | 目的 | オプション | 例 |
-|---|---|---|
+| --- | --- | --- |
 | 1 epoch を何 sb にするか決める | `--superbatches` | `--superbatches 36` |
 | 1 sb の局面数を決める | `--positions-per-superbatch` | `--positions-per-superbatch 40000000` |
 | 何 epoch 学習するか決める | `--max-epochs` | `--max-epochs 3` |
-| checkpoint保存を減らす | `--save-rate` | `--save-rate 9999` ならepoch末保存だけにしやすい |
+| checkpoint 保存を減らす | `--save-rate` | `--save-rate 9999` なら epoch 末保存だけにしやすい |
 | accuracy/loss を毎 sb 測る | `--validation-rate` | `--validation-rate 1` |
-| StepLRの減衰率を指定する | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
-| sigmoid loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 1.5` |
+| StepLR の減衰率を指定する | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
+| loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | SFNN の factorizer を変える | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
 主なオプション一覧:
 
 | フラグ | 何を変えるか | デフォルト |
-|---|---|---|
+| --- | --- | --- |
 | `--backend` | 学習backend。通常は `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | 1回の重み更新に使う局面数 | 65536 |
 | `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に丸められる | 100000000 |
@@ -65,9 +65,13 @@ BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を使います�
 | `--lr-step-gamma` | `step` で学習率に掛ける係数 | auto / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は1 sbごと | 省略 |
 | `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
-| `--scale` | `sigmoid(teacher_score / scale)` で教師評価値を勝率ラベルへ戻す係数。省略時は 600 | 省略 |
-| `--fv-scale` | NNUE/SFNN の network output をやねうら王側の評価値へ戻すときに想定する `FV_SCALE` | 40 |
-| `--loss-pow-exp` | `|prediction - target|^p` の `p`。`2.0` は二乗誤差 | 2.0 |
+| `--loss-pow-exp` | `|prediction - target|^p` の `p` | 2.0 |
+| `--wrm-nnue2score` | WRM lossで `network_output` をscoreへ戻す係数 | 600 |
+| `--wrm-in-offset` / `--wrm-in-scaling` | WRM lossのprediction側カーブ | 270 / 340 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | WRM lossのteacher側カーブ | 270 / 380 |
+| `--loss-sigmoid-mse` | WRMではなく単純 sigmoid loss を使う | off |
+| `--scale` | `--loss-sigmoid-mse` の target scale | 600 |
+| `--fv-scale` | `nn.bin` の量子化検証・書き出しで想定する `FV_SCALE` | 40 |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
@@ -81,9 +85,9 @@ BulletOu の学習ログでは `batch`、`superbatch`、`epoch` を使います�
 lr = lr * gamma
 ```
 
-`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。次のepochのsb 1では `--lr` に戻ります。
+`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。次の epoch の sb 1 では `--lr` に戻ります。
 
-`gamma=0.992` を明示する例:
+例:
 
 ```bash
 ./target/release/examples/bulletou \
@@ -97,79 +101,74 @@ lr = lr * gamma
     --tag step-gamma-0992
 ```
 
-`--lr-step-gamma` を省略して `--superbatches` を指定すると、1 epoch の中で `--lr` から `--lr-min` へ近づくように BulletOu が gamma を計算します。
+`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch 内で `--lr` から `--lr-min` へ近づくように gamma を計算します。
 
 ## 4. 教師データから学習ラベルを作る
 
-教師データには主に次の2つが入っています。
+教師データには主に次の2つがあります。
 
 | 情報 | 意味 |
-|---|---|
+| --- | --- |
 | 教師評価値 | 教師エンジンがその局面を何点と見たか |
 | 勝敗結果 | その対局が最終的に勝ち・引き分け・負けのどれになったか |
 
 `--lambda` は、この2つをどう混ぜるかを決めます。
 
 ```text
-training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_game_result
+training_label = lambda * label_from_teacher_score
+               + (1 - lambda) * label_from_game_result
 ```
 
 | `--lambda` | 意味 |
-|---|---|
+| --- | --- |
 | `1.0` | 教師評価値だけを見る。デフォルト |
 | `0.5` | 教師評価値と勝敗結果を半分ずつ混ぜる |
 | `0.0` | 勝敗結果だけを見る |
 
-## 5. loss と score scale
+re-scoreした教師データでは、勝敗結果が教師評価値の信頼できる較正情報とは限りません。まずは `--lambda 1.0` を推奨します。
 
-BulletOu の学習lossは sigmoid probability loss です。`--scale` は教師評価値を勝率ラベルへ戻す係数で、`--fv-scale` は量子化後にやねうら王で使う NNUE/SFNN の出力レンジを決める係数です。
+## 5. loss
+
+デフォルトは WRM loss です。明示しなくても使われます。
 
 ```text
-target     = sigmoid(teacher_score / scale)
-prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
-loss       = |prediction - target|^p
+score_net  = network_output * wrm_nnue2score
+prediction = wrm(score_net;     wrm_in_offset,     wrm_in_scaling)
+target     = wrm(teacher_score; wrm_target_offset, wrm_target_scaling)
+loss       = |prediction - target|^loss_pow_exp
 ```
 
-`8128` は NNUE/SFNN の `nn.bin` 書き出しで使う `QA * QB` です (`QA=127`, `QB=64`)。KPPT系は別の `--yaneuraou-quant-scale` で書き出すため、`--fv-scale` は使いません。
-
-`p` は `--loss-pow-exp` で指定します。デフォルトは `2.0` なので、このときはsigmoid空間での二乗誤差です。
+デフォルト値:
 
 ```bash
-# 二乗誤差
+--wrm-nnue2score 600
+--wrm-in-offset 270
+--wrm-in-scaling 340
+--wrm-target-offset 270
+--wrm-target-scaling 380
 --loss-pow-exp 2.0
-
-# 誤差の大きさに対する重み付けを変える実験
---loss-pow-exp 1.5
---loss-pow-exp 2.5
 ```
 
-教師評価値が rshogi などで `scale=600` の勝率モデルから作られているなら、BulletOu の `--scale` はデフォルトの `600` のままで構いません。同時に、書き出した `nn.bin` をやねうら王で `FV_SCALE=40` として使いたい場合は、`--fv-scale` もデフォルトの `40` のままで構いません。
-
-この組み合わせでは、教師targetは `sigmoid(score / 600)` のまま保ちつつ、NNUE/SFNN の network output は `FV_SCALE=40` に合う広い範囲で学習されます。
-
-式の導出と具体例は [`--scale` と `--fv-scale`](scale-and-fv-scale.md) を参照してください。
-
-教師データに含まれる勝敗結果は、常に教師評価値の較正に使えるとは限りません。たとえば、弱い対局者の棋譜を別エンジンでre-scoreした教師では、勝敗結果と教師評価値の関係が学習したい評価関数の性質を表していない場合があります。そのため、BulletOu は学習時に勝敗結果から `scale` を自動推定しません。
+offsetなしWRMと比較したい場合:
 
 ```bash
-# デフォルトの target scale 600 / FV_SCALE 40 で学習する
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-scale600-fv40
+--wrm-in-offset 0
+--wrm-target-offset 0
 ```
 
-比較実験で明示指定したい場合:
+単純 sigmoid loss を使う場合:
 
 ```bash
+--loss-sigmoid-mse
 --scale 600
 --fv-scale 40
 ```
 
+lossの式と `FV_SCALE` の関係は [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) を参照してください。
+
 ## 6. 教師評価値と勝敗結果の関係を確認する
 
-学習には使いませんが、教師データの性質を調べたいときは、次の診断コマンドを使えます。
+これは診断コマンドです。学習はしません。
 
 ```bash
 ./target/release/examples/bulletou \
@@ -181,23 +180,25 @@ loss       = |prediction - target|^p
     --score-winrate-csv score-winrate.csv
 ```
 
-このコマンドは学習しません。先頭 `--fit-positions` 局面で `sigmoid(score / scale)` のscaleを推定し、その後の `--analyze-positions` 局面で BCE / Brier score とscore bucketごとの実測勝率を出力します。推定とBCE / Brier scoreには、勝ち・負けが付いている局面だけを使います。
+出力の意味:
 
 | 出力 | 意味 |
-|---|---|
+| --- | --- |
 | `sigmoid(score/s)` | `score` を1つのscaleで0〜1へ変換する形 |
 | `heldout_bce` | 小さいほど勝敗統計に合っている |
 | `heldout_brier` | 小さいほど確率予測として合っている |
 | `empirical` | そのscore bucketでの `wins / (wins + losses)` |
 
+re-score教師では、勝敗結果が古い対局者の強さに引っ張られることがあります。この診断結果を、そのまま学習targetの自動設定に使うとは限りません。
+
 ## 7. SFNN factorizer
 
 SFNNでは、`k3k3` や `hand1024` のようにbucketを増やせます。bucketが多いほど表現力は上がりますが、bucketあたりの教師局面は減ります。
 
-factorizerは、bucketごとに完全に別の重みを持つのではなく、bucket間で共通成分を共有する仕組みです。教師密度が足りないときの過学習を抑えたり、学習を安定させたりする目的で使います。
+factorizerは、bucket間で共通成分を共有する仕組みです。教師密度が足りないときの過学習を抑えたり、学習を安定させたりする目的で使います。
 
 | 指定 | 意味 |
-|---|---|
+| --- | --- |
 | `--sfnn-factorizer shared` | bucket全体で共通成分を持つ。デフォルト |
 | `--sfnn-factorizer none` | factorizerを使わない |
 | `--sfnn-factorizer axis` | archに存在する軸をまとめて有効化する。例: `hand1024_k3k3` なら king と hand |
@@ -231,7 +232,7 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 --save-rate 9999
 ```
 
-## 9. 速度を見るときのログ
+## 9. 速度を見るログ
 
 速度を見るときは stdout の `[train]` 行を見ます。
 
@@ -240,7 +241,7 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 ```
 
 | 表示 | 意味 |
-|---|---|
+| --- | --- |
 | `wall` | その sb の実時間。検証や保存も含む |
 | `train` | 学習処理そのものの時間。検証・保存は含まない |
 | `pos/s` | `train` から計算した学習速度 |

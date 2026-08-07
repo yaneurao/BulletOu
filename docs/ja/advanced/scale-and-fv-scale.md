@@ -1,17 +1,120 @@
-# `--scale` と `--fv-scale`
+# loss の scale と `FV_SCALE`
 
 <a href="../../en/advanced/scale-and-fv-scale.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-このページでは、BulletOu の `--scale` と `--fv-scale` の意味を説明します。
+このページでは、学習中の score scale と、やねうら王で使う `FV_SCALE` の関係を説明します。
 
-結論から言うと、NNUE/SFNN の学習ではこの2つを分けて考える必要があります。
+結論から言うと、通常の学習では `FV_SCALE` は loss の式には入りません。`FV_SCALE` は書き出した `nn.bin` を量子化後にどう評価値へ戻すか、また量子化後の検証をどう測るかに使います。
 
-| オプション | 役割 | デフォルト |
-| --- | --- | --- |
-| `--scale` | 教師評価値を勝率ラベルへ戻す係数 | `600` |
-| `--fv-scale` | 量子化後にやねうら王側で使う `FV_SCALE` を想定した出力レンジ | `40` |
+## 1. デフォルトの loss
 
-たとえば、rshogi の `rescore_psv` で `scale=600` を使って教師評価値を作った場合、BulletOu でも `--scale 600` を使うのが自然です。一方、やねうら王側で `FV_SCALE=40` として使いたいなら、BulletOu の学習時にも `--fv-scale 40` を指定します。どちらもデフォルトなので、通常は省略できます。
+BulletOu のデフォルト loss は tatara と同じ形の WRM です。
+
+| オプション | デフォルト | 意味 |
+| --- | ---: | --- |
+| `--wrm-nnue2score` | `600` | `network_output` を評価値スケールへ戻す係数 |
+| `--wrm-in-offset` | `270` | prediction 側 WRM の offset |
+| `--wrm-in-scaling` | `340` | prediction 側 WRM の scaling |
+| `--wrm-target-offset` | `270` | teacher 側 WRM の offset |
+| `--wrm-target-scaling` | `380` | teacher 側 WRM の scaling |
+| `--loss-pow-exp` | `2.0` | `|prediction - target|^p` の `p` |
+
+WRM 関数は次の形です。
+
+```text
+wrm(score; offset, scaling)
+  = 0.5 * (1
+           + sigmoid(( score - offset) / scaling)
+           - sigmoid((-score - offset) / scaling))
+```
+
+`sigmoid(x)` は次の関数です。
+
+```text
+sigmoid(x) = 1 / (1 + exp(-x))
+```
+
+デフォルト loss は次のようになります。
+
+```text
+score_net  = network_output * wrm_nnue2score
+
+prediction = wrm(score_net;
+                 wrm_in_offset,
+                 wrm_in_scaling)
+
+target     = wrm(teacher_score;
+                 wrm_target_offset,
+                 wrm_target_scaling)
+
+loss       = |prediction - target|^loss_pow_exp
+```
+
+`teacher_score` は教師データに入っている評価値です。教師データの勝敗項は、`--lambda 1.0` のときは学習targetに使いません。
+
+## 2. offset を 0 にして比較する
+
+WRM の offset が必要かどうかを比較したい場合は、offset だけを 0 にします。
+
+```powershell
+--wrm-in-offset 0 `
+--wrm-target-offset 0
+```
+
+この指定では scaling はそのままです。
+
+```text
+prediction = wrm(network_output * 600; 0, 340)
+target     = wrm(teacher_score;        0, 380)
+```
+
+比較実験では、`--tag` を変えて別の checkpoint フォルダにしてください。
+
+## 3. `--scale` はいつ使うか
+
+`--scale` は、WRM を使わずに単純 sigmoid loss で学習するときの値です。
+
+```powershell
+--loss-sigmoid-mse `
+--scale 600
+```
+
+このときの式は次のようになります。
+
+```text
+target     = sigmoid(teacher_score / scale)
+prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
+loss       = |prediction - target|^loss_pow_exp
+```
+
+単純 sigmoid loss では `--fv-scale` が prediction 側の出力レンジに関係します。WRM loss では `--fv-scale` は loss の式には入りません。
+
+## 4. `FV_SCALE` は何をしているか
+
+やねうら王側では、量子化後の整数出力 `raw` を `FV_SCALE` で割って評価値にします。
+
+```text
+engine_score = raw / FV_SCALE
+```
+
+NNUE/SFNN の `nn.bin` 書き出しでは、おおよそ次の関係になります。
+
+```text
+raw ≒ network_output * 8128
+```
+
+そのため、`FV_SCALE=40` なら、
+
+```text
+engine_score ≒ network_output * 8128 / 40
+             ≒ network_output * 203.2
+```
+
+ここで出てくる `203.2` は、量子化後の `nn.bin` をやねうら王で動かしたときの出力スケールです。WRM loss の `--wrm-nnue2score 600` とは別の値です。
+
+## 5. 何を指定すればよいか
+
+まずはデフォルトの WRM で十分です。
 
 ```powershell
 .\target\release\examples\bulletou.exe `
@@ -21,215 +124,26 @@
   --arch SFNN_halfka2_1024_7_64_k3k3 `
   --superbatches 324 `
   --max-epochs 28 `
-  --tag sfnn-example
+  --tag sfnn-wrm-default
 ```
 
-このコマンドは、明示的に書けば次と同じ意味です。
+offset なしWRMと比較するなら、次だけ追加します。
 
 ```powershell
+  --wrm-in-offset 0 `
+  --wrm-target-offset 0
+```
+
+単純 sigmoid loss を試すなら、次を追加します。
+
+```powershell
+  --loss-sigmoid-mse `
   --scale 600 `
   --fv-scale 40
 ```
 
-## 1. 教師評価値と勝率
+## 6. 量子化後の確認
 
-教師データの評価値は、内部的には「勝率のlogit」として扱えます。
+学習中の `test_value_loss` は f32 weight に対する loss です。実際にやねうら王で使う `nn.bin` は量子化されています。
 
-```text
-winrate = sigmoid(score / scale)
-```
-
-`sigmoid(x)` は次の関数です。
-
-```text
-sigmoid(x) = 1 / (1 + exp(-x))
-```
-
-たとえば `scale=600` なら、評価値と勝率はおおよそ次の対応になります。
-
-| 教師評価値 | `score / 600` | 勝率ラベル |
-| ---: | ---: | ---: |
-| `-1200` | `-2.0` | `11.9%` |
-| `-600` | `-1.0` | `26.9%` |
-| `0` | `0.0` | `50.0%` |
-| `+600` | `+1.0` | `73.1%` |
-| `+1200` | `+2.0` | `88.1%` |
-
-つまり、rshogi が `scale=600` で勝率から評価値を作ったなら、その評価値を勝率に戻すときも `scale=600` を使うのが筋です。
-
-## 2. `FV_SCALE=40` から出てくる `203.2`
-
-NNUE/SFNN は層が浅いため、network output の範囲をある程度大きく取ったほうがよいことがあります。やねうら王側で `FV_SCALE=40` として使いたい場合、学習後の `nn.bin` は次の関係を満たしてほしいです。
-
-```text
-engine_score ≒ teacher_score
-```
-
-SFNN/NNUE の `nn.bin` 書き出しでは、f32 の network output は量子化によっておおよそ `QA * QB` 倍されます。
-
-```text
-QA = 127
-QB = 64
-QA * QB = 8128
-```
-
-そのため、やねうら王側の整数NNUE出力を `raw` とすると、
-
-```text
-raw ≒ network_output * 8128
-```
-
-やねうら王側では最後に `FV_SCALE` で割って評価値にします。
-
-```text
-engine_score = raw / FV_SCALE
-```
-
-したがって、学習中の f32 network output と、やねうら王側の評価値は次のように対応します。
-
-```text
-engine_score ≒ network_output * 8128 / FV_SCALE
-```
-
-`FV_SCALE=40` なら、
-
-```text
-engine_score ≒ network_output * 8128 / 40
-             ≒ network_output * 203.2
-```
-
-ここで出てくる `203.2` は、
-
-```text
-8128 / 40 = 203.2
-```
-
-という「network output をやねうら王側の評価値へ戻すための係数」です。教師評価値を勝率ラベルへ戻すための `--scale` とは役割が違います。
-
-つまり、評価値 `+600` を出したいなら、network output はだいたい次の値になります。
-
-```text
-network_output ≒ 600 / 203.2
-               ≒ 2.95
-```
-
-## 3. なぜ `--scale 203` ではだめなのか
-
-前節の `203.2` を見て、「では `--scale 203` で学習すればよいのでは？」と思うかもしれません。しかし、`--scale` は教師評価値を勝率ラベルへ戻す係数なので、ここに `203` を入れると教師の勝率ラベルが変わってしまいます。
-
-教師評価値が `scale=600` で作られている場合、教師評価値 `+600` は次の勝率を意味します。
-
-```text
-sigmoid(600 / 600) = sigmoid(1.0) = 0.731
-```
-
-しかし、BulletOuで `--scale 203` として読むと、
-
-```text
-sigmoid(600 / 203) = sigmoid(2.956) = 0.950
-```
-
-になります。
-
-元の教師は「勝率73.1%」のつもりで `+600` と書いているのに、`--scale 203` で読むと「勝率95.0%」として扱ってしまいます。これが「教師データの勝率を歪める」という意味です。
-
-そのため、BulletOuでは `--scale` と `--fv-scale` を分けています。
-
-```text
---scale 600    # 教師評価値を勝率へ戻す
---fv-scale 40  # network outputをFV_SCALE=40向けの範囲にする
-```
-
-## 4. BulletOu のloss式
-
-BulletOu は、教師側とprediction側を次のように揃えます。
-
-```text
-target     = sigmoid(teacher_score / scale)
-prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
-loss       = |prediction - target|^p
-```
-
-`p` は `--loss-pow-exp` です。デフォルトは `2.0` なので、sigmoid空間での二乗誤差です。
-
-この式の意味は次の通りです。
-
-1. `teacher_score / scale` で、教師評価値を勝率のlogitへ戻す
-2. `network_output * 8128 / fv_scale` で、network outputをやねうら王側の評価値へ戻す
-3. その評価値をさらに `/ scale` して、教師と同じ勝率空間へ戻す
-4. 2つの勝率の差をlossにする
-
-`--scale 600 --fv-scale 40` のとき、教師評価値 `+600` に対してlossが最小になる条件を見てみます。
-
-```text
-target = sigmoid(600 / 600)
-
-prediction = sigmoid((network_output * 8128 / 40) / 600)
-```
-
-lossが最小になるのは、sigmoidの中身が一致するときです。
-
-```text
-(network_output * 8128 / 40) / 600 = 600 / 600
-```
-
-両辺を整理すると、
-
-```text
-network_output * 8128 / 40 = 600
-network_output = 600 * 40 / 8128
-network_output ≒ 2.95
-```
-
-このとき、量子化後のやねうら王側では、
-
-```text
-raw ≒ 2.95 * 8128 ≒ 24000
-engine_score = raw / 40 ≒ 600
-```
-
-となります。
-
-つまり、`--scale 600 --fv-scale 40` は次の2つを同時に満たします。
-
-- 教師評価値の勝率ラベルは `scale=600` として正しく読む
-- network output は `FV_SCALE=40` で運用しやすい範囲に広げる
-
-## 5. `--scale` と `--fv-scale` の選び方
-
-基本方針はシンプルです。
-
-| 目的 | 指定 |
-| --- | --- |
-| 教師データが `scale=600` で作られている | `--scale 600` |
-| やねうら王で `FV_SCALE=40` として使う | `--fv-scale 40` |
-| やねうら王で `FV_SCALE=32` として使う | `--fv-scale 32` |
-| 教師データが別のscaleで作られている | そのscaleを `--scale` に指定する |
-
-`--fv-scale` は、学習後にやねうら王で使う `FV_SCALE` と同じ値にしてください。学習時と実行時で違う値にすると、評価値のスケールがずれます。
-
-## 6. `--lambda` を使う場合
-
-`--lambda` を `1.0` 以外にすると、教師評価値から作るラベルと、勝敗結果から作るラベルを混ぜます。
-
-```text
-eval_label   = sigmoid(teacher_score / scale)
-result_label = win ? 1.0 : draw ? 0.5 : 0.0
-
-target = lambda * eval_label + (1 - lambda) * result_label
-```
-
-prediction側は同じです。
-
-```text
-prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
-```
-
-通常のre-score教師では、勝敗結果が教師評価値の較正に使えるとは限りません。そのため、まずはデフォルトの `--lambda 1.0`、つまり教師評価値だけを見る設定を推奨します。
-
-## 7. 注意点
-
-- `QA` と `QB` は `nn.bin` 書き出し用の量子化定数です。通常、ユーザーが変更する値ではありません。
-- `--fv-scale` は NNUE/SFNN 用です。KPPT系は `--yaneuraou-quant-scale` を使います。
-- `--scale` は教師の勝率モデルに合わせる値です。network outputを広げたいからといって `--scale` を小さくすると、教師の勝率ラベルが変わってしまいます。
-- network outputの範囲を変えたい場合は、`--scale` ではなく `--fv-scale` を調整してください。
+量子化後の accuracy / loss や、適切な `FV_SCALE` を見たい場合は、応用編の [`nn.bin` の量子化検証](quantized-nn-bin.md) を使います。

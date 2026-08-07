@@ -41,7 +41,10 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use crate::shogi::PackedSfenValue;
 use crate::teacher_path::{DataFormat, expand_teacher, infer_data_format};
-use crate::value::loader::hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record};
+use crate::value::loader::{
+    WinRateModelTargetParams,
+    hcpe::{HCPE_RECORD_SIZE, decode_hcpe_record},
+};
 
 const PSV_RECORD_SIZE: usize = std::mem::size_of::<PackedSfenValue>();
 
@@ -134,11 +137,20 @@ pub enum ValidationLossKind {
     /// `model_output_scale=1` gives the historical logit-style behaviour and
     /// the score component is `sigmoid(teacher_score / eval_scale)`.
     SigmoidPow { pow_exp: f32 },
+    /// Win-rate-model value loss with shogi WRM transforms.
+    WinRateModel { pow_exp: f32, nnue2score: f32, in_offset: f32, in_scaling: f32, target: WinRateModelTargetParams },
 }
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
+    let q = (score - offset) / scaling;
+    let qm = (-score - offset) / scaling;
+    0.5 * (1.0 + sigmoid(q) - sigmoid(qm))
 }
 
 /// Compute sign-agreement accuracy AND the matching test-set loss
@@ -304,12 +316,21 @@ pub fn compute_sign_accuracy_with_loss(
                 -1 => 0.0,
                 _ => 0.5,
             };
-            let score_norm = sigmoid(inv_scale * f32::from(s));
+            let score_norm = match loss_kind {
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
+            };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
-            let model_p = sigmoid(*m * model_inv_scale);
+            let model_p = match loss_kind {
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(*m * model_inv_scale),
+                ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
+                    wrm_probability(*m * nnue2score, in_offset, in_scaling)
+                }
+            };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
+                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
             report.loss_sampled += 1;
         }
@@ -402,12 +423,21 @@ pub fn compute_sign_accuracy_with_loss_masked(
                 -1 => 0.0,
                 _ => 0.5,
             };
-            let score_norm = sigmoid(inv_scale * f32::from(s));
+            let score_norm = match loss_kind {
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
+                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
+            };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
-            let model_p = sigmoid(m * model_inv_scale);
+            let model_p = match loss_kind {
+                ValidationLossKind::SigmoidPow { .. } => sigmoid(m * model_inv_scale),
+                ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
+                    wrm_probability(m * nnue2score, in_offset, in_scaling)
+                }
+            };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
+                ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
         }
         if report.loss_sampled > 0 {

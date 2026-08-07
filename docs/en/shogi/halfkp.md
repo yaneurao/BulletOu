@@ -94,9 +94,11 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--save-rate` | Save every N superbatches; epoch end is also saved by default | 20 |
 | `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit epoch-end save | on |
-| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = tatara/bullet-shogi-compatible StepLR, `geometric` = geometric, `cos` = cosine; see [Advanced: Adjust training settings](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
+| `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = StepLR, `geometric` = geometric, `cos` = cosine; see [Advanced: Adjust training settings](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
-| `--scale` | Eval-to-score sigmoid scale for the sigmoid-loss target. If omitted, BulletOu uses 600 | omitted |
-| `--fv-scale` | Engine-side `FV_SCALE` assumed when mapping NNUE/SFNN network output back to an eval score | 40 |
+| `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p` | 2.0 |
+| `--wrm-nnue2score` | WRM loss coefficient that maps `network_output` to score scale | 600 |
+| `--loss-sigmoid-mse` / `--scale` | Use plain sigmoid loss instead of WRM | off / 600 |
+| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
 
-Loss function is fixed to `sigmoid(eval).squared_error(target)`. Activation is fixed to ClippedReLU (matching the original 2018 architecture). These can be added as flags later if needed.
+For the loss details, see [Advanced: Loss scale and `FV_SCALE`](../advanced/scale-and-fv-scale.md). Activation is fixed to ClippedReLU (matching the original 2018 architecture).

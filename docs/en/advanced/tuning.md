@@ -2,14 +2,14 @@
 
 <a href="../../ja/advanced/tuning.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-Read this page after the command in [Tutorial 3: Run training](../tutorial/3-train.md) works. For a first run, keep the defaults. Come back here when you want to adjust speed, save frequency, validation frequency, learning rate, loss, or SFNN factorizer settings.
+Read this page after the command in [Tutorial 3: Run training](../tutorial/3-train.md) works.
+
+For a first run, keep the defaults. Come back here when you want to adjust speed, save frequency, validation frequency, learning rate, loss, or SFNN factorizer settings.
 
 ## 1. Units used in the logs
 
-BulletOu logs use `batch`, `superbatch`, and `epoch`.
-
 | Name | Meaning |
-|---|---|
+| --- | --- |
 | batch | Positions used for one GPU weight update. Default: `--batch-size 65536` |
 | superbatch / sb | Progress, validation, and save unit. Its size is controlled by `--positions-per-superbatch` |
 | epoch | A group of `--superbatches` superbatches. Learning rate returns to `--lr` at the epoch start |
@@ -29,20 +29,20 @@ Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or abo
 ## 2. Common options
 
 | Goal | Option | Example |
-|---|---|---|
+| --- | --- | --- |
 | Choose how many sb make one epoch | `--superbatches` | `--superbatches 36` |
 | Choose positions per sb | `--positions-per-superbatch` | `--positions-per-superbatch 40000000` |
 | Choose how many epochs to run | `--max-epochs` | `--max-epochs 3` |
 | Save less often | `--save-rate` | `--save-rate 9999` usually leaves only epoch-end saves |
 | Validate every sb | `--validation-rate` | `--validation-rate 1` |
 | Set StepLR decay | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
-| Change the sigmoid loss exponent | `--loss-pow-exp` | `--loss-pow-exp 1.5` |
+| Change the loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | Change SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 
 Fuller option table:
 
 | Flag | What it changes | Default |
-|---|---|---|
+| --- | --- | --- |
 | `--backend` | Training backend. Usually leave this as `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | Positions per weight update | 65536 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |
@@ -65,9 +65,13 @@ Fuller option table:
 | `--lr-step-gamma` | Multiplicative factor for `step` schedule | auto / 0.992 |
 | `--lr-step-positions` | Positions between LR drops. Omitted means one drop per sb | omitted |
 | `--lambda` | Blend between teacher score and game result | 1.0 |
-| `--scale` | Target scale used in `sigmoid(teacher_score / scale)`. If omitted, BulletOu uses 600 | omitted |
-| `--fv-scale` | Engine-side `FV_SCALE` assumed when mapping NNUE/SFNN network output back to an eval score | 40 |
-| `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p`. `2.0` is squared error | 2.0 |
+| `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p` | 2.0 |
+| `--wrm-nnue2score` | WRM loss coefficient that maps `network_output` to score scale | 600 |
+| `--wrm-in-offset` / `--wrm-in-scaling` | Prediction-side WRM curve | 270 / 340 |
+| `--wrm-target-offset` / `--wrm-target-scaling` | Teacher-side WRM curve | 270 / 380 |
+| `--loss-sigmoid-mse` | Use plain sigmoid loss instead of WRM | off |
+| `--scale` | Target scale for `--loss-sigmoid-mse` | 600 |
+| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
@@ -104,78 +108,67 @@ If you omit `--lr-step-gamma` and set `--superbatches`, BulletOu computes a gamm
 Teacher files usually contain two useful pieces of information:
 
 | Data | Meaning |
-|---|---|
+| --- | --- |
 | Teacher score | The teacher engine's numeric evaluation for the position |
 | Game result | Whether the game ended as win/draw/loss |
 
 `--lambda` controls how these two sources are blended.
 
 ```text
-training label = lambda * label_from_teacher_score + (1 - lambda) * label_from_game_result
+training_label = lambda * label_from_teacher_score
+               + (1 - lambda) * label_from_game_result
 ```
 
 | `--lambda` | Meaning |
-|---|---|
+| --- | --- |
 | `1.0` | Use only teacher score. Default |
 | `0.5` | Mix teacher score and game result evenly |
 | `0.0` | Use only game result |
 
-## 5. Loss and score scale
+For re-scored teacher data, game results are not always reliable calibration information for the teacher score. Start with `--lambda 1.0`.
 
-BulletOu uses sigmoid probability loss. `--scale` controls how the teacher
-score is converted back to a win-rate label. `--fv-scale` controls the
-NNUE/SFNN output range that will be used by YaneuraOu after quantization.
+## 5. Loss
+
+The default is WRM loss. You do not need to pass a flag to enable it.
 
 ```text
-target     = sigmoid(teacher_score / scale)
-prediction = sigmoid((network_output * 8128 / fv_scale) / scale)
-loss       = |prediction - target|^p
+score_net  = network_output * wrm_nnue2score
+prediction = wrm(score_net;     wrm_in_offset,     wrm_in_scaling)
+target     = wrm(teacher_score; wrm_target_offset, wrm_target_scaling)
+loss       = |prediction - target|^loss_pow_exp
 ```
 
-`8128` is `QA * QB` for the NNUE/SFNN export path (`QA=127`, `QB=64`).
-For KPPT-family targets, `--fv-scale` is ignored because those targets use
-their own `--yaneuraou-quant-scale` export path.
-
-`p` is controlled by `--loss-pow-exp`. The default is `2.0`, which is squared error in sigmoid space.
+Default values:
 
 ```bash
-# squared error
+--wrm-nnue2score 600
+--wrm-in-offset 270
+--wrm-in-scaling 340
+--wrm-target-offset 270
+--wrm-target-scaling 380
 --loss-pow-exp 2.0
-
-# experiments with a different error exponent
---loss-pow-exp 1.5
---loss-pow-exp 2.5
 ```
 
-If your teacher scores were created from a win-rate model with `scale=600`,
-leave BulletOu's `--scale` at the default `600`. If you also want the exported
-`nn.bin` to run with `FV_SCALE=40`, leave `--fv-scale` at the default `40`.
-This keeps the target win rate as `sigmoid(score / 600)` while training a
-wider NNUE/SFNN network output range suitable for `FV_SCALE=40`.
-
-For the derivation and worked examples, see [`--scale` and `--fv-scale`](scale-and-fv-scale.md).
-
-BulletOu does not estimate the training scale from game-result labels. Those labels are not always trustworthy: for example, a dataset may come from games between weak players and then be re-scored by a stronger deep-learning engine. In that case, game result is not a reliable calibration target for the teacher score.
+For a zero-offset WRM comparison:
 
 ```bash
-# Train with the default target scale 600 and FV_SCALE 40
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --tag sigmoid-scale600-fv40
+--wrm-in-offset 0
+--wrm-target-offset 0
 ```
 
-Set fixed values explicitly for a comparison experiment:
+For the plain sigmoid loss:
 
 ```bash
+--loss-sigmoid-mse
 --scale 600
 --fv-scale 40
 ```
 
+For the loss formula and how `FV_SCALE` fits in, see [Loss scale and `FV_SCALE`](scale-and-fv-scale.md).
+
 ## 6. Checking the score-to-result shape in teacher data
 
-This is a diagnostic command. It does not affect training.
+This is a diagnostic command. It does not train.
 
 ```bash
 ./target/release/examples/bulletou \
@@ -187,23 +180,25 @@ This is a diagnostic command. It does not affect training.
     --score-winrate-csv score-winrate.csv
 ```
 
-The command fits the scale in `sigmoid(score / scale)` on the first `--fit-positions` positions, then reports BCE / Brier score and per-score-bucket empirical win rate on the following `--analyze-positions` positions. Fitting and BCE / Brier score use only decisive win/loss records.
+Output fields:
 
 | Output | Meaning |
-|---|---|
+| --- | --- |
 | `sigmoid(score/s)` | Converts `score` to 0–1 with one scale parameter |
 | `heldout_bce` | Lower is a better fit to game-result statistics |
 | `heldout_brier` | Lower is a better probability prediction |
 | `empirical` | `wins / (wins + losses)` in that score bucket |
 
+For re-scored teacher data, game result may reflect the original players more than the re-scoring engine. Do not automatically turn this diagnostic result into a training target.
+
 ## 7. SFNN factorizer
 
 SFNN architectures such as `k3k3` or `hand1024` create many buckets. More buckets give more expressive power, but fewer teacher positions reach each bucket.
 
-The factorizer lets buckets share common components instead of making every bucket completely independent.
+The factorizer lets buckets share common components. It can reduce overfitting and stabilize training when teacher density per bucket is low.
 
 | Setting | Meaning |
-|---|---|
+| --- | --- |
 | `--sfnn-factorizer shared` | Share a common component across buckets. Default |
 | `--sfnn-factorizer none` | Disable factorizer |
 | `--sfnn-factorizer axis` | Enable every available bucket direction in the architecture |
@@ -246,7 +241,7 @@ Use the `[train]` line:
 ```
 
 | Field | Meaning |
-|---|---|
+| --- | --- |
 | `wall` | Real time for that sb, including validation and saving |
 | `train` | Training time only, excluding validation and saving |
 | `pos/s` | Training throughput computed from `train` |

@@ -25,7 +25,8 @@ use crate::{
         FastBatchHost, FastBatchLayout, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, load_and_map_shuffled_batches_with_prefetch, teacher_shuffle_window_records,
+            ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
+            teacher_shuffle_window_records, win_rate_model_score_from_table, win_rate_model_score_table,
         },
     },
 };
@@ -56,6 +57,10 @@ pub struct HalfkpTeacherBatchConfig<'a> {
     pub lambda: f32,
     /// Eval-to-score sigmoid scale used while preparing teacher targets.
     pub scale: f32,
+    /// Use win-rate-model target conversion while preparing teacher targets.
+    pub win_rate_model: bool,
+    /// WRM target-side score-to-probability parameters.
+    pub wrm_target: WinRateModelTargetParams,
     /// Add tatara-style HalfKP piece-input virtual rows to the FT input.
     pub ft_factorize: bool,
     /// Drop positions whose absolute teacher score is at least this value.
@@ -87,6 +92,8 @@ pub struct KpTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
+    pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -113,6 +120,8 @@ pub struct KpptTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
+    pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -140,6 +149,8 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub queue_depth: usize,
     pub lambda: f32,
     pub scale: f32,
+    pub win_rate_model: bool,
+    pub wrm_target: WinRateModelTargetParams,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -1387,6 +1398,7 @@ fn validate_config(config: &HalfkpTeacherBatchConfig<'_>) -> Result<(), TeacherB
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1401,6 +1413,7 @@ fn validate_kp_config(config: &KpTeacherBatchConfig<'_>) -> Result<(), TeacherBa
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1415,6 +1428,7 @@ fn validate_kppt_config(config: &KpptTeacherBatchConfig<'_>) -> Result<(), Teach
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
     }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
     Ok(())
 }
 
@@ -1428,6 +1442,17 @@ fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), Teach
     }
     if !(config.scale.is_finite() && config.scale > 0.0) {
         return Err(TeacherBatchError::invalid_input("--scale must be finite and > 0"));
+    }
+    validate_wrm_target(config.win_rate_model, config.wrm_target)?;
+    Ok(())
+}
+
+fn validate_wrm_target(enabled: bool, params: WinRateModelTargetParams) -> Result<(), TeacherBatchError> {
+    if enabled && WinRateModelTargetParams::new(params.offset, params.scaling).is_none() {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "WRM target parameters must be finite and scaling > 0 (offset={}, scaling={})",
+            params.offset, params.scaling
+        )));
     }
     Ok(())
 }
@@ -1499,6 +1524,7 @@ fn prepare_halfkp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1525,7 +1551,11 @@ fn prepare_halfkp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
+            let score = if let Some(table) = wrm_score_table.as_deref() {
+                win_rate_model_score_from_table(table, pos.score())
+            } else {
+                1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp())
+            };
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -1587,6 +1617,7 @@ fn prepare_kp_direct_fast_batch(
     let result_blend = 1.0 - config.lambda;
     let score_blend = config.lambda;
     let rscale = 1.0 / config.scale;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
     let fill_chunk = |data_chunk: &[PackedSfenValue],
                       stm_chunk: &mut [i32],
                       nstm_chunk: &mut [i32],
@@ -1613,7 +1644,11 @@ fn prepare_kp_direct_fast_batch(
             }
             weights[i] = weight;
 
-            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
+            let score = if let Some(table) = wrm_score_table.as_deref() {
+                win_rate_model_score_from_table(table, pos.score())
+            } else {
+                1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp())
+            };
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -2084,6 +2119,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.win_rate_model, config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2259,6 +2295,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.win_rate_model, config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2435,6 +2472,7 @@ where
         config.score_drop_abs,
         loader,
     )
+    .with_win_rate_model_target(config.win_rate_model, config.wrm_target)
     .with_teacher_shuffle(config.teacher_shuffle_buffer_batches, config.teacher_shuffle_seed);
 
     if config.queue_depth > 1 && !config.profile_prepare {
@@ -2657,6 +2695,7 @@ fn prepare_sfnn_fast_batch_from_board_features(
     let target_blend = 1.0 - config.lambda;
     let rscale = 1.0 / config.scale;
     let layerstack_bucket = config.layerstack_bucket;
+    let wrm_score_table = config.win_rate_model.then(|| win_rate_model_score_table(config.wrm_target));
 
     let fill_chunk = |chunk_index: usize,
                       data_chunk: &[PackedSfenValue],
@@ -2699,7 +2738,11 @@ fn prepare_sfnn_fast_batch_from_board_features(
             }
             weights_chunk[i] = weight;
 
-            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
+            let score = if let Some(table) = wrm_score_table.as_deref() {
+                win_rate_model_score_from_table(table, pos.score())
+            } else {
+                1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp())
+            };
             let result = match pos.game_result() {
                 r if r > 0 => 1.0,
                 r if r < 0 => 0.0,
@@ -2801,6 +2844,8 @@ mod tests {
             queue_depth: 1,
             lambda: 1.0,
             scale: 400.0,
+            win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
             ft_factorize: false,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
@@ -2822,6 +2867,8 @@ mod tests {
             queue_depth: 2,
             lambda: 1.0,
             scale: 400.0,
+            win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
             teacher_shuffle_seed: 0,
