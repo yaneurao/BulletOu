@@ -5152,6 +5152,27 @@ impl SfnnTrainStepRunner {
         batch: SfnnTrainStepHostBatch<'_>,
         finalize_loss: bool,
     ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize_and_update(
+            ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            true,
+        )
+    }
+
+    pub fn step_no_readback_with_loss_finalize_and_update(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
+    ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
@@ -5195,7 +5216,10 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace,
             self.factorizer,
         )?;
-        self.update_weights(ctx, params)
+        if update_weights {
+            self.update_weights(ctx, params)?;
+        }
+        Ok(())
     }
 
     pub fn step_pipelined_no_readback(
@@ -5227,6 +5251,29 @@ impl SfnnTrainStepRunner {
         output_inv_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
         finalize_loss: bool,
+    ) -> Result<()> {
+        self.step_pipelined_no_readback_with_loss_finalize_and_update(
+            ctx,
+            upload_ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            true,
+        )
+    }
+
+    pub fn step_pipelined_no_readback_with_loss_finalize_and_update(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
     ) -> Result<()> {
         self.validate()?;
         batch.validate()?;
@@ -5278,7 +5325,9 @@ impl SfnnTrainStepRunner {
                 self.factorizer,
             )?;
         }
-        self.update_weights(ctx, params)?;
+        if update_weights {
+            self.update_weights(ctx, params)?;
+        }
         self.upload_slots[slot_idx].record_compute_done(ctx)
     }
 
@@ -5289,6 +5338,18 @@ impl SfnnTrainStepRunner {
         loss_kind: ScalarLossKind,
         output_inv_scale: f32,
         batch: SfnnTrainStepHostBatch<'_>,
+    ) -> Result<SfnnTrainStepProfile> {
+        self.step_profiled_no_readback_with_update(ctx, params, loss_kind, output_inv_scale, batch, true)
+    }
+
+    pub fn step_profiled_no_readback_with_update(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        update_weights: bool,
     ) -> Result<SfnnTrainStepProfile> {
         self.validate()?;
         batch.validate()?;
@@ -5344,7 +5405,9 @@ impl SfnnTrainStepRunner {
             self.factorizer,
         )?;
         after_backward.record(ctx)?;
-        self.update_weights(ctx, params)?;
+        if update_weights {
+            self.update_weights(ctx, params)?;
+        }
         stop.record(ctx)?;
         stop.synchronize()?;
 

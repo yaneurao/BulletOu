@@ -45,6 +45,7 @@ Fuller option table:
 | --- | --- | --- |
 | `--backend` | Training backend. Usually leave this as `cuda-cpp` | `cuda-cpp` |
 | `--batch-size` | Positions per weight update | 65536 |
+| `--grad-accum-batches` | Accumulate N mini-batch gradients before one optimizer update | 1 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |
 | `--teacher-shuffle-buffer-sbs` | How many sb of teacher positions to shuffle in RAM. `4` means two 4-sb buffers | 1 |
 | `--teacher-shuffle-buffer-batches` | Same shuffle buffer size, specified in batches. Usually use `--teacher-shuffle-buffer-sbs` instead | omitted |
@@ -247,3 +248,31 @@ Use the `[train]` line:
 | `pos/s` | Training throughput computed from `train` |
 
 If GPU utilization is low and `pos/s` is low, teacher loading, decoding, or shuffling may be the bottleneck. Check `cuda-cpp-diagnostics.log` for teacher queue wait time.
+
+## 10. Gradient accumulation
+
+Use `--grad-accum-batches N` when VRAM forces a smaller `--batch-size`, but you still want the optimizer to use a larger virtual batch.
+
+Example:
+
+```bash
+--batch-size 16384
+--grad-accum-batches 4
+```
+
+This reads four 16,384-position mini-batches, adds their gradients, and then applies one Ranger update. The optimizer sees a virtual batch of:
+
+```text
+16384 x 4 = 65536 positions
+```
+
+This is not the same as making each CUDA forward/backward pass as large as 65,536 positions, so it will not recover all throughput. It does reduce optimizer-update overhead and gives the optimizer a larger, less noisy gradient.
+
+`--grad-accum-batches` must divide the number of mini-batches in one superbatch. For example, with:
+
+```text
+--positions-per-superbatch 40000000
+--batch-size 16384
+```
+
+one superbatch is 2,440 mini-batches, so `--grad-accum-batches 4`, `5`, `8`, or `10` are valid choices.

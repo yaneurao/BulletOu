@@ -3014,6 +3014,13 @@ struct Args {
     #[arg(long)]
     batch_size: Option<usize>,
 
+    /// Accumulate this many mini-batch gradients before one optimizer update.
+    /// This is useful when VRAM forces a smaller `--batch-size` but you want
+    /// the optimizer to see a larger virtual batch. Default 1 means update
+    /// every mini-batch.
+    #[arg(long, default_value_t = 1)]
+    grad_accum_batches: usize,
+
     /// Target positions consumed per superbatch. The actual value is rounded
     /// down to a multiple of `--batch-size` because the trainer advances in
     /// whole mini-batches. Default = 100M positions.
@@ -3640,6 +3647,24 @@ impl Args {
 
         if effective_batch_size(self) == 0 {
             return Err("--batch-size must be > 0 for --backend cuda-cpp".to_string());
+        }
+        if self.grad_accum_batches == 0 {
+            return Err("--grad-accum-batches must be > 0".to_string());
+        }
+        if self.grad_accum_batches > 1 {
+            if !eval_type.uses_layerstack() {
+                return Err("--grad-accum-batches > 1 is currently supported for SFNN architectures only".to_string());
+            }
+            if self.lr_schedule == LrScheduleKind::Plateau {
+                return Err("--grad-accum-batches > 1 cannot be combined with --lr-schedule plateau yet".to_string());
+            }
+            let train_steps_for_accum = self.cuda_cpp_train_steps.unwrap_or(effective_batches_per_superbatch(self)?);
+            if train_steps_for_accum % self.grad_accum_batches != 0 {
+                return Err(format!(
+                    "--grad-accum-batches {} must divide the number of mini-batches in a training boundary ({train_steps_for_accum})",
+                    self.grad_accum_batches
+                ));
+            }
         }
         let shuffle_boundary_batches = if let Some(train_steps) = self.cuda_cpp_train_steps {
             train_steps
@@ -8713,6 +8738,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
+    if args.grad_accum_batches > 1 {
+        print_startup_kv(
+            "gradient accumulation",
+            format!(
+                "{} mini-batches/update (virtual batch = {} positions)",
+                paint(format_count(args.grad_accum_batches), ConsoleColor::BoldYellow),
+                paint(format_count(batch_size.saturating_mul(args.grad_accum_batches)), ConsoleColor::BoldYellow)
+            ),
+        );
+    }
     if feature_kind.virtual_rows() > 0 {
         print_startup_kv(
             "arch",
@@ -8857,6 +8892,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
+    let mut optimizer_updates = 0usize;
     let mut reported_loss_sum = 0.0_f64;
     let mut reported_loss_count = 0usize;
     let mut last_loss = 0.0_f32;
@@ -8877,6 +8913,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut sfnn_diagnostics = CudaCppSfnnDiagnostics::default();
     let completed_step_offset = initial_state.completed_steps;
     let optimizer_step_offset = initial_state.optimizer_steps;
+    if args.grad_accum_batches > 1 && completed_step_offset % args.grad_accum_batches != 0 {
+        return Err(format!(
+            "cannot resume with --grad-accum-batches {} from completed_steps {} because it is not on an accumulation boundary",
+            args.grad_accum_batches, completed_step_offset
+        ));
+    }
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut progress_meter = CudaCppProgressMeter::default();
@@ -9296,17 +9338,24 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let progress_for_step = schedule.progress_for_step(seen_steps);
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
-        let optimizer_step = optimizer_step_offset + seen_steps;
+        let grad_accum_batches = args.grad_accum_batches;
+        let is_optimizer_step = seen_steps % grad_accum_batches == 0;
+        let optimizer_step = optimizer_step_offset + optimizer_updates + usize::from(is_optimizer_step);
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
-            let step_index = seen_steps.saturating_sub(1);
+            let step_index = if is_optimizer_step {
+                seen_steps.saturating_sub(grad_accum_batches)
+            } else {
+                seen_steps.saturating_sub(1)
+            };
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
+                    gradient_factor: 1.0 / grad_accum_batches as f32,
                     learning_rate,
                     decay: ranger.decay,
                     beta1: ranger.beta1,
@@ -9336,7 +9385,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             !explicit_profile_step && cuda_cpp_should_profile_sfnn_diagnostics(args, progress_for_step);
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
-                .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
+                .step_profiled_no_readback_with_update(
+                    &ctx,
+                    params,
+                    loss_kind,
+                    output_inv_scale,
+                    batch,
+                    is_optimizer_step,
+                )
                 .map_err(|e| e.to_string())?;
             sfnn_diagnostics.observe_profile(&profile);
             if explicit_profile_step {
@@ -9375,7 +9431,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             }
         } else {
             runner
-                .step_pipelined_no_readback_with_loss_finalize(
+                .step_pipelined_no_readback_with_loss_finalize_and_update(
                     &ctx,
                     &upload_ctx,
                     params,
@@ -9383,8 +9439,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     output_inv_scale,
                     batch,
                     should_report,
+                    is_optimizer_step,
                 )
                 .map_err(|e| e.to_string())?;
+        }
+        if is_optimizer_step {
+            optimizer_updates += 1;
         }
         if should_report {
             ctx.synchronize().map_err(|e| e.to_string())?;
@@ -9455,7 +9515,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         &trained_weights,
                         &trained_optimizer_states,
                         completed_step_offset + seen_steps,
-                        optimizer_step_offset + seen_steps,
+                        optimizer_step_offset + optimizer_updates,
                         sfnn_progress_params.as_ref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
@@ -9671,7 +9731,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     let completed_steps = completed_step_offset + seen_steps;
-    let optimizer_steps = optimizer_step_offset + seen_steps;
+    let optimizer_steps = optimizer_step_offset + optimizer_updates;
     if args.cuda_cpp_skip_final_output {
         if let Some((chunk, _)) = deferred_direct_checkpoint {
             if let Some((metrics, validation_elapsed)) = {
@@ -14216,6 +14276,7 @@ fn resume_signature(args: &Args) -> String {
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", effective_batch_size(args)),
+        format!("grad_accum_batches={}", args.grad_accum_batches),
         format!("positions_per_superbatch={positions_per_superbatch}"),
         format!(
             "teacher_shuffle_buffer_batches={}",
@@ -14328,6 +14389,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         }
     }
 
+    ensure_line_after(&mut out, "grad_accum_batches=", "batch_size=", "grad_accum_batches=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
     ensure_line_after(&mut out, "loss_pow_exp=", "win_rate_model=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");

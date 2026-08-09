@@ -4,15 +4,15 @@
 
 [チュートリアル 3: 学習を走らせる](../tutorial/3-train.md) のコマンドが動いたあとに読むページです。
 
-最初の学習では、まずデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer を変えたくなったときに、このページを参照してください。
+最初の学習では、まずデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer などを調整したくなったら、このページを見てください。
 
 ## 1. ログに出てくる単位
 
 | 名前 | 意味 |
 | --- | --- |
-| batch | GPUで1回の重み更新に使う局面数。デフォルトは `--batch-size 65536` |
+| batch | GPUで1回処理する局面数。デフォルトは `--batch-size 65536` |
 | superbatch / sb | 進捗表示、検証、保存の単位。大きさは `--positions-per-superbatch` で決まる |
-| epoch | `--superbatches` 個の sb をまとめた単位。epoch 開始時に学習率は `--lr` に戻る |
+| epoch | `--superbatches` 個の sb をまとめた単位 |
 | checkpoint | 再開用の `state.bin` と、エンジン用の `nn.bin` |
 | validation / 検証 | `--test-teacher` の局面で accuracy と loss を測ること |
 
@@ -24,9 +24,9 @@
 --superbatches 36
 ```
 
-この場合、1 sb は `65536 x 610 = 39,976,960` 局面です。1 epoch は 36 sb なので、約14.4億局面です。
+この場合、1 sb は `65536 x 610 = 39,976,960` 局面です。1 epoch は36 sbなので、約14.4億局面です。
 
-## 2. よく変えるオプション
+## 2. よく調整するオプション
 
 | 目的 | オプション | 例 |
 | --- | --- | --- |
@@ -43,10 +43,11 @@
 
 | フラグ | 何を変えるか | デフォルト |
 | --- | --- | --- |
-| `--backend` | 学習backend。通常は `cuda-cpp` | `cuda-cpp` |
-| `--batch-size` | 1回の重み更新に使う局面数 | 65536 |
+| `--backend` | 学習 backend。通常は `cuda-cpp` | `cuda-cpp` |
+| `--batch-size` | 1回のmini-batchで処理する局面数 | 65536 |
+| `--grad-accum-batches` | N mini-batchぶんの勾配を足してから1回だけoptimizer更新する | 1 |
 | `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に丸められる | 100000000 |
-| `--teacher-shuffle-buffer-sbs` | 何 sb 分の教師局面をRAM上でshuffleするか。`4`なら4 sb分のbufferを2本使う | 1 |
+| `--teacher-shuffle-buffer-sbs` | 何 sb 分の教師局面をRAM上でshuffleするか | 1 |
 | `--teacher-shuffle-buffer-batches` | shuffle bufferをbatch数で指定する。通常は `--teacher-shuffle-buffer-sbs` を使う | 省略 |
 | `--teacher-shuffle-seed` | 学習中shuffleのseed | 0 |
 | `--threads` | 局面変換に使うCPU worker数 | auto |
@@ -59,17 +60,17 @@
 | `--test-positions` | 検証に使う局面数。省略すると検証ファイルの全局面を使う | 全件 |
 | `--test-batch-size` | 検証時のGPU batch size。VRAM不足のときだけ下げる | 65536 |
 | `--save-epoch-end` / `--no-save-epoch-end` | epoch末に保存するか | on |
-| `--lr` | epoch開始時の学習率 | 0.000875 |
+| `--lr` | 学習率の開始値 | 0.000875 |
 | `--lr-min` | 学習率の下限 | 0.00001 |
 | `--lr-schedule` | 学習率schedule。まずは `step` でよい | `step` |
 | `--lr-step-gamma` | `step` で学習率に掛ける係数 | auto / 0.992 |
 | `--lr-step-positions` | 何局面ごとに学習率を下げるか。省略時は1 sbごと | 省略 |
-| `--lambda` | 教師評価値と勝敗結果を混ぜる比率 | 1.0 |
+| `--lambda` | 教師評価値と勝敗項を混ぜる比率 | 1.0 |
 | `--loss-pow-exp` | `|prediction - target|^p` の `p` | 2.0 |
 | `--wrm-nnue2score` | WRM lossで `network_output` をscoreへ戻す係数 | 600 |
 | `--wrm-in-offset` / `--wrm-in-scaling` | WRM lossのprediction側カーブ | 270 / 340 |
 | `--wrm-target-offset` / `--wrm-target-scaling` | WRM lossのteacher側カーブ | 270 / 380 |
-| `--loss-sigmoid-mse` | WRMではなく単純 sigmoid loss を使う | off |
+| `--loss-sigmoid-mse` | WRMではなく単純なsigmoid lossを使う | off |
 | `--scale` | `--loss-sigmoid-mse` の target scale | 600 |
 | `--fv-scale` | `nn.bin` の量子化検証・書き出しで想定する `FV_SCALE` | 40 |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
@@ -85,9 +86,9 @@
 lr = lr * gamma
 ```
 
-`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。次の epoch の sb 1 では `--lr` に戻ります。
+`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch 内で `--lr` から `--lr-min` へ近づくように gamma を計算します。
 
-例:
+明示的に `gamma=0.992` を指定する例:
 
 ```bash
 ./target/release/examples/bulletou \
@@ -101,31 +102,33 @@ lr = lr * gamma
     --tag step-gamma-0992
 ```
 
-`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch 内で `--lr` から `--lr-min` へ近づくように gamma を計算します。
+## 4. 勾配accumulation
 
-## 4. 教師データから学習ラベルを作る
+VRAMの都合で `--batch-size` を小さくする必要があるが、optimizerには大きなbatch相当の勾配を渡したい場合は `--grad-accum-batches N` を使います。
 
-教師データには主に次の2つがあります。
+例:
 
-| 情報 | 意味 |
-| --- | --- |
-| 教師評価値 | 教師エンジンがその局面を何点と見たか |
-| 勝敗結果 | その対局が最終的に勝ち・引き分け・負けのどれになったか |
-
-`--lambda` は、この2つをどう混ぜるかを決めます。
-
-```text
-training_label = lambda * label_from_teacher_score
-               + (1 - lambda) * label_from_game_result
+```bash
+--batch-size 16384
+--grad-accum-batches 4
 ```
 
-| `--lambda` | 意味 |
-| --- | --- |
-| `1.0` | 教師評価値だけを見る。デフォルト |
-| `0.5` | 教師評価値と勝敗結果を半分ずつ混ぜる |
-| `0.0` | 勝敗結果だけを見る |
+この指定では、16,384局面のmini-batchを4回流し、その4回分の勾配を足してから、Rangerの更新を1回だけ行います。optimizerから見ると、仮想batch sizeは次のようになります。
 
-re-scoreした教師データでは、勝敗結果が教師評価値の信頼できる較正情報とは限りません。まずは `--lambda 1.0` を推奨します。
+```text
+16384 x 4 = 65536 局面
+```
+
+これはCUDAのforward/backward自体を65,536局面で1回だけ実行するのと完全に同じ速度にはなりません。ただし、optimizer updateの回数を減らし、勾配のノイズを小さくできます。
+
+`--grad-accum-batches` は、1 superbatch内のmini-batch数を割り切る値にしてください。たとえば、
+
+```text
+--positions-per-superbatch 40000000
+--batch-size 16384
+```
+
+なら、1 superbatchは2,440 mini-batchなので、`--grad-accum-batches 4`、`5`、`8`、`10` などが使えます。
 
 ## 5. loss
 
@@ -156,7 +159,7 @@ offsetなしWRMと比較したい場合:
 --wrm-target-offset 0
 ```
 
-単純 sigmoid loss を使う場合:
+単純なsigmoid lossを使う場合:
 
 ```bash
 --loss-sigmoid-mse
@@ -166,32 +169,7 @@ offsetなしWRMと比較したい場合:
 
 lossの式と `FV_SCALE` の関係は [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) を参照してください。
 
-## 6. 教師評価値と勝敗結果の関係を確認する
-
-これは診断コマンドです。学習はしません。
-
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --analyze-score-winrate \
-    --fit-positions 100000 \
-    --analyze-positions 1000000 \
-    --bin-size 50 \
-    --score-winrate-csv score-winrate.csv
-```
-
-出力の意味:
-
-| 出力 | 意味 |
-| --- | --- |
-| `sigmoid(score/s)` | `score` を1つのscaleで0〜1へ変換する形 |
-| `heldout_bce` | 小さいほど勝敗統計に合っている |
-| `heldout_brier` | 小さいほど確率予測として合っている |
-| `empirical` | そのscore bucketでの `wins / (wins + losses)` |
-
-re-score教師では、勝敗結果が古い対局者の強さに引っ張られることがあります。この診断結果を、そのまま学習targetの自動設定に使うとは限りません。
-
-## 7. SFNN factorizer
+## 6. SFNN factorizer
 
 SFNNでは、`k3k3` や `hand1024` のようにbucketを増やせます。bucketが多いほど表現力は上がりますが、bucketあたりの教師局面は減ります。
 
@@ -201,7 +179,7 @@ factorizerは、bucket間で共通成分を共有する仕組みです。教師�
 | --- | --- |
 | `--sfnn-factorizer shared` | bucket全体で共通成分を持つ。デフォルト |
 | `--sfnn-factorizer none` | factorizerを使わない |
-| `--sfnn-factorizer axis` | archに存在する軸をまとめて有効化する。例: `hand1024_k3k3` なら king と hand |
+| `--sfnn-factorizer axis` | archに存在する軸をまとめて有効化する |
 | `--sfnn-factorizer king=axis,hand=axis` | 軸ごとに明示する |
 | `--sfnn-factorizer king=axis,hand=shared` | kingは軸方向、handは共通成分だけにする |
 
@@ -216,7 +194,7 @@ factorizerは、bucket間で共通成分を共有する仕組みです。教師�
     --tag k29-axis
 ```
 
-## 8. 保存と検証の頻度
+## 7. 保存と検証の頻度
 
 保存と検証は別々に指定できます。
 
@@ -232,7 +210,7 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 --save-rate 9999
 ```
 
-## 9. 速度を見るログ
+## 8. 速度を見るログ
 
 速度を見るときは stdout の `[train]` 行を見ます。
 
@@ -246,4 +224,4 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 | `train` | 学習処理そのものの時間。検証・保存は含まない |
 | `pos/s` | `train` から計算した学習速度 |
 
-GPUが空いているのに `pos/s` が低い場合は、教師局面の読み込み、decode、shuffleが詰まっている可能性があります。`cuda-cpp-diagnostics.log` の teacher queue wait を見てください。
+GPUが空いているのに `pos/s` が低い場合は、教師局面の読み込み、decode、shuffle が詰まっている可能性があります。`cuda-cpp-diagnostics.log` の teacher queue wait を見てください。
