@@ -38,6 +38,7 @@
 | StepLR の減衰率を指定する | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | SFNN の factorizer を変える | `--sfnn-factorizer` | `--sfnn-factorizer none` |
+| SFNN の factorizer の効き具合を変える | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
 
 主なオプション一覧:
 
@@ -74,6 +75,7 @@
 | `--scale` | `--loss-sigmoid-mse` の target scale | 600 |
 | `--fv-scale` | `nn.bin` の量子化検証・書き出しで想定する `FV_SCALE` | 40 |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
+| `--sfnn-factorizer-alpha` | factorizer成分をどれだけ効かせるか | 1.0 |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizerの詳細パラメータ | 省略 |
@@ -175,6 +177,14 @@ SFNNでは、`k3k3` や `hand1024` のようにbucketを増やせます。bucket
 
 factorizerは、bucket間で共通成分を共有する仕組みです。教師密度が足りないときの過学習を抑えたり、学習を安定させたりする目的で使います。
 
+学習中の有効な重みは、概念的には次の形になります。
+
+```text
+W_effective = W_base + W_shared + W_axis
+```
+
+`W_base` は各bucketが個別に持つ重みです。`W_shared` は全bucketで共有する成分、`W_axis` は king bucket や hand bucket の軸ごとに共有する成分です。
+
 | 指定 | 意味 |
 | --- | --- |
 | `--sfnn-factorizer shared` | bucket全体で共通成分を持つ。デフォルト |
@@ -193,6 +203,40 @@ factorizerは、bucket間で共通成分を共有する仕組みです。教師�
     --sfnn-factorizer king=axis \
     --tag k29-axis
 ```
+
+factorizerを少し弱めたい場合は `--sfnn-factorizer-alpha` を使います。
+
+```text
+W_effective = W_base
+            + alpha_shared * W_shared
+            + alpha_king   * W_king_axis
+            + alpha_hand   * W_hand_axis
+```
+
+たとえば、king bucket の axis factorizer だけを90%の強さで使う場合:
+
+```bash
+--sfnn-factorizer king=axis
+--sfnn-factorizer-alpha king=0.90
+```
+
+king と hand を別々に弱める場合:
+
+```bash
+--sfnn-factorizer king=axis,hand=axis
+--sfnn-factorizer-alpha king=0.90,hand=0.80
+```
+
+全factorizer成分を同じ強さにする場合:
+
+```bash
+--sfnn-factorizer axis
+--sfnn-factorizer-alpha 0.90
+```
+
+`alpha=1.0` が通常の状態です。`alpha=0.0` にすると、そのfactorizer成分はforwardに足されず、その成分への勾配も0になります。これは「保存済みのfactorizer tensorをbase weightへ畳み込む」操作ではありません。factorizerを完全に外した状態で追加学習したい場合は `--sfnn-factorizer none` を使います。
+
+`nn.bin` を書き出すときは、上の `W_effective` の形に畳み込まれます。そのため `--sfnn-factorizer-alpha king=0.90` で保存した `nn.bin` には、king axis成分が90%で反映されます。
 
 ## 7. 保存と検証の頻度
 

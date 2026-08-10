@@ -38,6 +38,7 @@ Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or abo
 | Set StepLR decay | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | Change the loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | Change SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
+| Change SFNN factorizer strength | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
 
 Fuller option table:
 
@@ -74,6 +75,7 @@ Fuller option table:
 | `--scale` | Target scale for `--loss-sigmoid-mse` | 600 |
 | `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
+| `--sfnn-factorizer-alpha` | How strongly factorizer components contribute | 1.0 |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients | omitted |
@@ -198,6 +200,14 @@ SFNN architectures such as `k3k3` or `hand1024` create many buckets. More bucket
 
 The factorizer lets buckets share common components. It can reduce overfitting and stabilize training when teacher density per bucket is low.
 
+Conceptually, training uses an effective weight like this:
+
+```text
+W_effective = W_base + W_shared + W_axis
+```
+
+`W_base` is owned by each bucket. `W_shared` is shared by all buckets. `W_axis` is shared along a bucket axis such as king bucket or hand bucket.
+
 | Setting | Meaning |
 | --- | --- |
 | `--sfnn-factorizer shared` | Share a common component across buckets. Default |
@@ -216,6 +226,40 @@ Example:
     --sfnn-factorizer king=axis \
     --tag k29-axis
 ```
+
+Use `--sfnn-factorizer-alpha` when you want factorizer terms to contribute less strongly.
+
+```text
+W_effective = W_base
+            + alpha_shared * W_shared
+            + alpha_king   * W_king_axis
+            + alpha_hand   * W_hand_axis
+```
+
+For example, to use only 90% of the king-axis factorizer:
+
+```bash
+--sfnn-factorizer king=axis
+--sfnn-factorizer-alpha king=0.90
+```
+
+To set king and hand separately:
+
+```bash
+--sfnn-factorizer king=axis,hand=axis
+--sfnn-factorizer-alpha king=0.90,hand=0.80
+```
+
+To set every factorizer term to the same strength:
+
+```bash
+--sfnn-factorizer axis
+--sfnn-factorizer-alpha 0.90
+```
+
+`alpha=1.0` is the normal setting. With `alpha=0.0`, that factorizer term is not added in forward, and its gradient is also zero. This does not fold stored factorizer tensors into the base weights. If you want to continue training without factorizer terms, use `--sfnn-factorizer none`.
+
+When BulletOu writes `nn.bin`, it folds weights using the `W_effective` formula above. So an `nn.bin` saved with `--sfnn-factorizer-alpha king=0.90` contains the king-axis contribution at 90% strength.
 
 ## 8. Save and validation frequency
 

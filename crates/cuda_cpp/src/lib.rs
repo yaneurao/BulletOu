@@ -1009,6 +1009,28 @@ impl SfnnFactorizerActive {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SfnnFactorizerAlpha {
+    pub shared: f32,
+    pub king_axis: f32,
+    pub hand_axis: f32,
+}
+
+impl SfnnFactorizerAlpha {
+    pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
+
+    fn validate(self) -> Result<()> {
+        for (name, value) in [("shared", self.shared), ("king-axis", self.king_axis), ("hand-axis", self.hand_axis)] {
+            if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+                return Err(CudaCppError::message(format!(
+                    "SFNN factorizer alpha for {name} must be finite and in [0, 1]"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SfnnForwardHostBatch<'a> {
     pub stm_indices: &'a [i32],
@@ -1481,7 +1503,18 @@ pub fn sfnn_forward_device_with_factorizer(
     workspace: &SfnnForwardWorkspace,
     factorizer: SfnnFactorizerActive,
 ) -> Result<()> {
-    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, None)
+    sfnn_forward_device_with_factorizer_and_alpha(ctx, batch, weights, workspace, factorizer, SfnnFactorizerAlpha::ONE)
+}
+
+pub fn sfnn_forward_device_with_factorizer_and_alpha(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    workspace: &SfnnForwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+) -> Result<()> {
+    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, factorizer_alpha, None)
 }
 
 fn sfnn_forward_train_device_with_factorizer(
@@ -1490,9 +1523,18 @@ fn sfnn_forward_train_device_with_factorizer(
     weights: &SfnnForwardDeviceWeights,
     workspace: &SfnnForwardWorkspace,
     factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
     folded_l0w_scratch: &F32Buffer,
 ) -> Result<()> {
-    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, Some(folded_l0w_scratch))
+    sfnn_forward_device_with_factorizer_impl(
+        ctx,
+        batch,
+        weights,
+        workspace,
+        factorizer,
+        factorizer_alpha,
+        Some(folded_l0w_scratch),
+    )
 }
 
 fn sfnn_forward_device_with_factorizer_impl(
@@ -1501,12 +1543,14 @@ fn sfnn_forward_device_with_factorizer_impl(
     weights: &SfnnForwardDeviceWeights,
     workspace: &SfnnForwardWorkspace,
     factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
     folded_l0w_scratch: Option<&F32Buffer>,
 ) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
     workspace.validate()?;
     factorizer.validate_for_shape(weights.shape)?;
+    factorizer_alpha.validate()?;
     if workspace.layout.batch_size != batch.batch_size {
         return Err(CudaCppError::message(format!(
             "SFNN workspace batch mismatch: workspace={} batch={}",
@@ -1627,6 +1671,9 @@ fn sfnn_forward_device_with_factorizer_impl(
             has_l3ax,
             i32::from(factorizer.king_axis),
             i32::from(factorizer.hand_axis),
+            factorizer_alpha.shared,
+            factorizer_alpha.king_axis,
+            factorizer_alpha.hand_axis,
             workspace.stm_l0.as_ptr(),
             workspace.nstm_l0.as_ptr(),
             workspace.combined.as_ptr(),
@@ -2609,7 +2656,29 @@ pub fn sfnn_backward_device_with_factorizer(
     backward: &SfnnBackwardWorkspace,
     factorizer: SfnnFactorizerActive,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false, factorizer)
+    sfnn_backward_device_with_factorizer_and_alpha(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        factorizer,
+        SfnnFactorizerAlpha::ONE,
+    )
+}
+
+pub fn sfnn_backward_device_with_factorizer_and_alpha(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false, factorizer, factorizer_alpha)
 }
 
 pub fn sfnn_backward_train_device(
@@ -2640,7 +2709,29 @@ pub fn sfnn_backward_train_device_with_factorizer(
     backward: &SfnnBackwardWorkspace,
     factorizer: SfnnFactorizerActive,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true, factorizer)
+    sfnn_backward_train_device_with_factorizer_and_alpha(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        factorizer,
+        SfnnFactorizerAlpha::ONE,
+    )
+}
+
+pub fn sfnn_backward_train_device_with_factorizer_and_alpha(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+) -> Result<()> {
+    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true, factorizer, factorizer_alpha)
 }
 
 pub fn sfnn_backward_train_profile_device(
@@ -2671,12 +2762,35 @@ pub fn sfnn_backward_train_profile_device_with_factorizer(
     backward: &SfnnBackwardWorkspace,
     factorizer: SfnnFactorizerActive,
 ) -> Result<SfnnBackwardStageProfile> {
+    sfnn_backward_train_profile_device_with_factorizer_and_alpha(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        factorizer,
+        SfnnFactorizerAlpha::ONE,
+    )
+}
+
+pub fn sfnn_backward_train_profile_device_with_factorizer_and_alpha(
+    ctx: &Context,
+    batch: &SfnnForwardDeviceBatch,
+    weights: &SfnnForwardDeviceWeights,
+    forward: &SfnnForwardWorkspace,
+    loss: &ScalarLossWorkspace,
+    backward: &SfnnBackwardWorkspace,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+) -> Result<SfnnBackwardStageProfile> {
     batch.validate()?;
     weights.validate()?;
     forward.validate()?;
     loss.validate()?;
     backward.validate()?;
     factorizer.validate_for_shape(weights.shape)?;
+    factorizer_alpha.validate()?;
     let shape = weights.shape;
     if forward.layout.shape != shape || backward.layout.shape != shape {
         return Err(CudaCppError::message(format!(
@@ -2792,6 +2906,9 @@ pub fn sfnn_backward_train_profile_device_with_factorizer(
             has_l3ax,
             i32::from(factorizer.king_axis),
             i32::from(factorizer.hand_axis),
+            factorizer_alpha.shared,
+            factorizer_alpha.king_axis,
+            factorizer_alpha.hand_axis,
             loss.mean_output_gradients.as_ptr(),
             backward.l2_gradients.as_ptr(),
             backward.l1_gradients.as_ptr(),
@@ -2846,6 +2963,7 @@ fn sfnn_backward_device_impl(
     backward: &SfnnBackwardWorkspace,
     use_train_entry: bool,
     factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
 ) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
@@ -2853,6 +2971,7 @@ fn sfnn_backward_device_impl(
     loss.validate()?;
     backward.validate()?;
     factorizer.validate_for_shape(weights.shape)?;
+    factorizer_alpha.validate()?;
     let shape = weights.shape;
     if forward.layout.shape != shape || backward.layout.shape != shape {
         return Err(CudaCppError::message(format!(
@@ -2968,6 +3087,9 @@ fn sfnn_backward_device_impl(
                 has_l3ax,
                 i32::from(factorizer.king_axis),
                 i32::from(factorizer.hand_axis),
+                factorizer_alpha.shared,
+                factorizer_alpha.king_axis,
+                factorizer_alpha.hand_axis,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -3041,6 +3163,9 @@ fn sfnn_backward_device_impl(
                 has_l3ax,
                 i32::from(factorizer.king_axis),
                 i32::from(factorizer.hand_axis),
+                factorizer_alpha.shared,
+                factorizer_alpha.king_axis,
+                factorizer_alpha.hand_axis,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -5007,6 +5132,7 @@ pub struct SfnnTrainStepRunner {
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
+    pub factorizer_alpha: SfnnFactorizerAlpha,
     pub forward_workspace: SfnnForwardWorkspace,
     pub loss_workspace: ScalarLossWorkspace,
     pub backward_workspace: SfnnBackwardWorkspace,
@@ -5049,7 +5175,7 @@ impl SfnnTrainStepRunner {
         max_active: usize,
     ) -> Result<Self> {
         let factorizer = SfnnFactorizerActive::from_host(initial_weights);
-        Self::new_with_factorizer(ctx, initial_weights, batch_size, max_active, factorizer)
+        Self::new_with_factorizer(ctx, initial_weights, batch_size, max_active, factorizer, SfnnFactorizerAlpha::ONE)
     }
 
     pub fn new_with_factorizer(
@@ -5058,9 +5184,18 @@ impl SfnnTrainStepRunner {
         batch_size: usize,
         max_active: usize,
         factorizer: SfnnFactorizerActive,
+        factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<Self> {
         let optimizer_states = SfnnRangerOptimizerStates::from_host_weights(ctx, initial_weights)?;
-        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active, factorizer)
+        Self::with_device_optimizer_states(
+            ctx,
+            initial_weights,
+            optimizer_states,
+            batch_size,
+            max_active,
+            factorizer,
+            factorizer_alpha,
+        )
     }
 
     pub fn with_optimizer_states(
@@ -5078,6 +5213,7 @@ impl SfnnTrainStepRunner {
             batch_size,
             max_active,
             factorizer,
+            SfnnFactorizerAlpha::ONE,
         )
     }
 
@@ -5088,10 +5224,19 @@ impl SfnnTrainStepRunner {
         batch_size: usize,
         max_active: usize,
         factorizer: SfnnFactorizerActive,
+        factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<Self> {
         let optimizer_states =
             SfnnRangerOptimizerStates::from_host_states(ctx, initial_weights.shape, optimizer_states)?;
-        Self::with_device_optimizer_states(ctx, initial_weights, optimizer_states, batch_size, max_active, factorizer)
+        Self::with_device_optimizer_states(
+            ctx,
+            initial_weights,
+            optimizer_states,
+            batch_size,
+            max_active,
+            factorizer,
+            factorizer_alpha,
+        )
     }
 
     fn with_device_optimizer_states(
@@ -5101,9 +5246,11 @@ impl SfnnTrainStepRunner {
         batch_size: usize,
         max_active: usize,
         factorizer: SfnnFactorizerActive,
+        factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<Self> {
         initial_weights.validate()?;
         factorizer.validate_for_shape(initial_weights.shape)?;
+        factorizer_alpha.validate()?;
         if batch_size == 0 {
             return Err(CudaCppError::message("SFNN train-step batch_size must be greater than zero"));
         }
@@ -5139,6 +5286,7 @@ impl SfnnTrainStepRunner {
             weights,
             optimizer_states,
             factorizer,
+            factorizer_alpha,
             forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
             loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
             backward_workspace,
@@ -5245,6 +5393,7 @@ impl SfnnTrainStepRunner {
             &self.weights,
             &self.forward_workspace,
             self.factorizer,
+            self.factorizer_alpha,
             &self.backward_workspace.l0w_gradients,
         )?;
         scalar_loss_device_from_buffers_with_finalize(
@@ -5258,7 +5407,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
             finalize_loss,
         )?;
-        sfnn_backward_train_device_with_factorizer(
+        sfnn_backward_train_device_with_factorizer_and_alpha(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -5266,6 +5415,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
             &self.backward_workspace,
             self.factorizer,
+            self.factorizer_alpha,
         )?;
         if update_weights {
             self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
@@ -5379,6 +5529,7 @@ impl SfnnTrainStepRunner {
                 &self.weights,
                 &self.forward_workspace,
                 self.factorizer,
+                self.factorizer_alpha,
                 &self.backward_workspace.l0w_gradients,
             )?;
             scalar_loss_device_from_buffers_with_finalize(
@@ -5392,7 +5543,7 @@ impl SfnnTrainStepRunner {
                 &self.loss_workspace,
                 finalize_loss,
             )?;
-            sfnn_backward_train_device_with_factorizer(
+            sfnn_backward_train_device_with_factorizer_and_alpha(
                 ctx,
                 &slot.device_batch,
                 &self.weights,
@@ -5400,6 +5551,7 @@ impl SfnnTrainStepRunner {
                 &self.loss_workspace,
                 &self.backward_workspace,
                 self.factorizer,
+                self.factorizer_alpha,
             )?;
         }
         if update_weights {
@@ -5480,6 +5632,7 @@ impl SfnnTrainStepRunner {
             &self.weights,
             &self.forward_workspace,
             self.factorizer,
+            self.factorizer_alpha,
             &self.backward_workspace.l0w_gradients,
         )?;
         after_forward.record(ctx)?;
@@ -5494,7 +5647,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
-        let backward_stages = sfnn_backward_train_profile_device_with_factorizer(
+        let backward_stages = sfnn_backward_train_profile_device_with_factorizer_and_alpha(
             ctx,
             &self.device_batch,
             &self.weights,
@@ -5502,6 +5655,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
             &self.backward_workspace,
             self.factorizer,
+            self.factorizer_alpha,
         )?;
         after_backward.record(ctx)?;
         if update_weights {
@@ -5533,7 +5687,15 @@ impl SfnnTrainStepRunner {
     ) -> Result<()> {
         self.weights.validate()?;
         self.factorizer.validate_for_shape(self.shape)?;
-        sfnn_forward_device_with_factorizer(ctx, batch, &self.weights, workspace, self.factorizer)
+        self.factorizer_alpha.validate()?;
+        sfnn_forward_device_with_factorizer_and_alpha(
+            ctx,
+            batch,
+            &self.weights,
+            workspace,
+            self.factorizer,
+            self.factorizer_alpha,
+        )
     }
 
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
@@ -5569,6 +5731,8 @@ impl SfnnTrainStepRunner {
         validate_sfnn_shape(self.shape)?;
         self.device_batch.validate()?;
         self.weights.validate()?;
+        self.factorizer.validate_for_shape(self.shape)?;
+        self.factorizer_alpha.validate()?;
         self.optimizer_states.validate(self.shape)?;
         self.validate_optional_factorized_state_matches_weights()?;
         self.forward_workspace.validate()?;
@@ -6566,6 +6730,9 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
             stm_l0: *mut BulletOuCudaCppF32Buffer,
             nstm_l0: *mut BulletOuCudaCppF32Buffer,
             combined: *mut BulletOuCudaCppF32Buffer,
@@ -6615,6 +6782,9 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -6686,6 +6856,9 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -6758,6 +6931,9 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
