@@ -5192,6 +5192,42 @@ fn quantized_test_report_from_outputs(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_engine_metrics_from_cached_outputs(
+    cache: &TestPositionsCache,
+    outputs: &[QuantizedSfnnForwardOutput],
+    args: &QuantizedTestArgs,
+    raw_delta: i32,
+) -> Result<TestMetrics, String> {
+    if cache.positions.len() != outputs.len() {
+        return Err(format!("positions/output length mismatch: {} vs {}", cache.positions.len(), outputs.len()));
+    }
+    let mut engine_outputs = Vec::with_capacity(outputs.len());
+    for out in outputs {
+        let raw = out
+            .raw
+            .checked_add(raw_delta)
+            .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
+        engine_outputs.push(
+            quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32 + args.engine_score_offset,
+        );
+    }
+
+    let report = compute_sign_accuracy_with_loss_masked(
+        &engine_outputs,
+        &cache.teacher_scores,
+        &cache.teacher_results,
+        &cache.sample_mask,
+        args.lambda,
+        args.scale as f32,
+        quantized_engine_scale_model_output_scale(args),
+        quantized_engine_scale_loss_kind(args),
+    );
+    let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
+    let loss = report.test_loss.unwrap_or(f32::NAN);
+    Ok(TestMetrics { accuracy, loss })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn estimate_quantized_fv_scale_from_outputs(
     positions: &[bulletou_lib::shogi::PackedSfenValue],
     outputs: &[QuantizedSfnnForwardOutput],
@@ -5289,11 +5325,6 @@ fn quantized_test_positions(
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
     run_quantized_test_impl(args, true)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn run_quantized_test_quiet(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
-    run_quantized_test_impl(args, false)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5472,15 +5503,66 @@ fn update_summary_log_quantized_metrics(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn maybe_run_epoch_end_sfnn_quantized_validation(
+struct CudaCppSfnnQuantizedValidationCache {
+    cache: Arc<TestPositionsCache>,
+    batch: bulletou_lib::value::FastBatchHost,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CudaCppSfnnQuantizedValidationCache {
+    fn try_new(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<Option<Self>, String> {
+        if !matches!(
+            args.eval_type(),
+            EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
+        ) {
+            return Ok(None);
+        }
+        let Some(cache) = TestPositionsCache::try_load(args) else {
+            return Ok(None);
+        };
+        if cache.positions.is_empty() {
+            return Ok(None);
+        }
+        let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+        let started = std::time::Instant::now();
+        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &cache.positions)?;
+        let elapsed = started.elapsed();
+        let sparse_positions = batch.layout.batch_size;
+        let sparse_bytes = batch
+            .stm
+            .len()
+            .saturating_add(batch.nstm.len())
+            .saturating_add(batch.buckets.len())
+            .saturating_mul(std::mem::size_of::<i32>());
+        eprintln!(
+            "  quantized validation cache = cpu-sparse: positions={}, max_active={}, memory={}, prepared={}",
+            format_count(sparse_positions),
+            format_count(batch.layout.max_active),
+            format_bytes(sparse_bytes as u64),
+            format_duration_secs(elapsed),
+        );
+        Ok(Some(Self { cache, batch }))
+    }
+
+    fn run(&self, args: &QuantizedTestArgs) -> Result<TestMetrics, String> {
+        let layerstack = args.effective_layerstack();
+        let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
+        if let Some(params) = &weights.progress_params {
+            set_shogi_sfnn_progress_q16_params(params.clone())?;
+        }
+        let outputs = quantized_sfnn_forward_outputs(&weights, &self.batch, args)?;
+        quantized_engine_metrics_from_cached_outputs(&self.cache, &outputs, args, 0)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn maybe_run_saved_sfnn_quantized_validation(
     args: &Args,
     checkpoint_dir: &std::path::Path,
     epoch: usize,
     superbatch: usize,
+    cache: &mut Option<CudaCppSfnnQuantizedValidationCache>,
 ) -> Result<Option<(TestMetrics, std::time::Duration)>, String> {
-    if args.superbatches != Some(superbatch) {
-        return Ok(None);
-    }
     let nn_bin = checkpoint_dir.join("nn.bin");
     if !nn_bin.is_file() {
         return Ok(None);
@@ -5489,12 +5571,15 @@ fn maybe_run_epoch_end_sfnn_quantized_validation(
         return Ok(None);
     };
     let started = std::time::Instant::now();
-    let report = run_quantized_test_quiet(&test_args)?;
-    let elapsed = started.elapsed();
-    let Some(loss) = report.engine_scale.test_loss else {
+    if cache.is_none() {
+        *cache =
+            CudaCppSfnnQuantizedValidationCache::try_new(args, cuda_cpp_sfnn_feature_kind_from_arch(args.arch())?)?;
+    }
+    let Some(cache) = cache.as_ref() else {
         return Ok(None);
     };
-    let metrics = TestMetrics { accuracy: (report.accuracy_percent() / 100.0) as f32, loss };
+    let metrics = cache.run(&test_args)?;
+    let elapsed = started.elapsed();
     update_summary_log_quantized_metrics(&args.output_dir(), epoch, superbatch, metrics)?;
     Ok(Some((metrics, elapsed)))
 }
@@ -9144,6 +9229,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut sfnn_resident_validation_cache =
         CudaCppSfnnResidentValidationCache::try_new(args, feature_kind, &ctx, cuda_shape)?;
     excluded_elapsed = excluded_elapsed.saturating_add(validation_cache_started.elapsed());
+    let mut sfnn_quantized_validation_cache: Option<CudaCppSfnnQuantizedValidationCache> = None;
 
     if schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
         let mut current_resume_pos = dataloader_resume_pos;
@@ -9354,11 +9440,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             checkpoint_elapsed,
                         )),
                     );
-                    if let Some((metrics, elapsed)) = maybe_run_epoch_end_sfnn_quantized_validation(
+                    if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
                         args,
                         &checkpoint_dir,
                         chunk.epoch,
                         chunk.superbatch,
+                        &mut sfnn_quantized_validation_cache,
                     )? {
                         excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
                         print_cuda_cpp_quantized_validation_summary(
@@ -9753,11 +9840,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             Some(validation_elapsed),
                         );
                     }
-                    if let Some((metrics, elapsed)) = maybe_run_epoch_end_sfnn_quantized_validation(
+                    if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
                         args,
                         &checkpoint_dir,
                         chunk.epoch,
                         chunk.superbatch,
+                        &mut sfnn_quantized_validation_cache,
                     )? {
                         excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
                         print_cuda_cpp_quantized_validation_summary(
@@ -10035,9 +10123,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 Some(validation_elapsed),
             );
         }
-        if let Some((metrics, elapsed)) =
-            maybe_run_epoch_end_sfnn_quantized_validation(args, &checkpoint_dir, chunk.epoch, chunk.superbatch)?
-        {
+        if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
+            args,
+            &checkpoint_dir,
+            chunk.epoch,
+            chunk.superbatch,
+            &mut sfnn_quantized_validation_cache,
+        )? {
             print_cuda_cpp_quantized_validation_summary(
                 chunk.epoch,
                 chunk.superbatch,
