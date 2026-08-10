@@ -6,7 +6,7 @@ If training stops, rerun the same command with the same settings. BulletOu conti
 
 ## 4.1 Basic rule
 
-Use the same `--tag` or the same `--output`, and rerun the command.
+Use the same `--tag` or the same `--output`, and rerun the command. If you used `--output-folder` to put checkpoints on another drive, pass the same folder again.
 
 ```powershell
 .\target\release\examples\bulletou.exe `
@@ -16,6 +16,22 @@ Use the same `--tag` or the same `--output`, and rerun the command.
 ```
 
 When BulletOu finds `checkpoints/.../000N/state.bin`, it loads it automatically.
+
+To put checkpoints on the D: drive, specify only the parent folder with `--output-folder`. `--tag` still works.
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --teacher D:\sojoteam_datasets `
+  --output-folder D:\checkpoints `
+  --tag sfnn-test
+```
+
+This writes to:
+
+```text
+D:\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3-sfnn-test
+```
 
 ```text
 checkpoints/.../

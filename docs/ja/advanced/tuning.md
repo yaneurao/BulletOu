@@ -34,6 +34,7 @@
 | 1 sb の局面数を決める | `--positions-per-superbatch` | `--positions-per-superbatch 40000000` |
 | 何 epoch 学習するか決める | `--max-epochs` | `--max-epochs 3` |
 | checkpoint 保存を減らす | `--save-rate` | `--save-rate 9999` なら epoch 末保存だけにしやすい |
+| checkpointを別ドライブに置く | `--output-folder` | `--output-folder D:\checkpoints` |
 | accuracy/loss を毎 sb 測る | `--validation-rate` | `--validation-rate 1` |
 | StepLR の減衰率を指定する | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
@@ -45,6 +46,8 @@
 | フラグ | 何を変えるか | デフォルト |
 | --- | --- | --- |
 | `--backend` | 学習 backend。通常は `cuda-cpp` | `cuda-cpp` |
+| `--output-folder` | checkpointの親フォルダ。自動ディレクトリ名と `--tag` はそのまま使う | `checkpoints` |
+| `--output` | checkpoint保存先を完全指定する。`--tag` は使わない | 省略 |
 | `--batch-size` | 1回のmini-batchで処理する局面数 | 65536 |
 | `--grad-accum-batches` | N mini-batchぶんの勾配を足してから1回だけoptimizer更新する | 1 |
 | `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に丸められる | 100000000 |

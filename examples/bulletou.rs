@@ -3258,9 +3258,16 @@ struct Args {
     #[arg(long, alias = "analyze-output")]
     score_winrate_csv: Option<PathBuf>,
 
-    /// Checkpoint output directory. Defaults to an auto-derived per-target path.
-    #[arg(long)]
+    /// Checkpoint output directory. This is an exact path and bypasses the
+    /// auto-derived name, so `--tag` does not affect it.
+    #[arg(long, conflicts_with = "output_folder")]
     output: Option<PathBuf>,
+
+    /// Parent directory for auto-derived checkpoint names. Unlike `--output`,
+    /// this keeps the default `<target>-<arch>[-<tag>]` directory name under
+    /// the specified folder.
+    #[arg(long, value_name = "DIR", conflicts_with = "output")]
+    output_folder: Option<PathBuf>,
 
     /// Suffix appended to the auto-derived output directory name. Useful
     /// for running multiple experiments with the same network /
@@ -3678,8 +3685,11 @@ impl Args {
     /// Resolve the checkpoint output directory.
     ///
     /// - `--output PATH` honours the user's choice as-is.
-    /// - Otherwise the default is `checkpoints/<target>-<arch>` for NNUE/SFNN
-    ///   targets, and `checkpoints/<target>` for the KPPT family.
+    /// - `--output-folder DIR` changes only the root folder; the auto-derived
+    ///   name and `--tag` are still used below it.
+    /// - Otherwise the default root is `checkpoints`, with
+    ///   `checkpoints/<target>-<arch>` for NNUE/SFNN targets and
+    ///   `checkpoints/<target>` for the KPPT family.
     ///
     /// `<target>` is the internal target inferred from `--arch`, so directory
     /// names stay compatible with previous BulletOu checkpoints.
@@ -3689,7 +3699,7 @@ impl Args {
             // user-provided path verbatim.
             return p.clone();
         }
-        let mut path = PathBuf::from("checkpoints");
+        let mut path = self.output_folder.clone().unwrap_or_else(|| PathBuf::from("checkpoints"));
         let mut name = self.eval_type().cli_name().to_string();
         if self.eval_type().uses_arch() {
             name.push('-');
@@ -17490,8 +17500,9 @@ mod tests {
     }
 
     /// Verify that `--tag` appends `-<tag>` to the auto-generated output
-    /// directory name, and that an explicit `--output` path takes precedence
-    /// over `--tag`.
+    /// directory name, that `--output-folder` changes only the parent
+    /// directory, and that an explicit `--output` path takes precedence over
+    /// `--tag`.
     #[test]
     fn output_dir_applies_tag_suffix() {
         use clap::Parser as _;
@@ -17526,6 +17537,40 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.output_dir(), std::path::PathBuf::from("checkpoints/SFNN_KA2-SFNN_ka2_1536_15_32_k3k3-exp7"),);
+
+        // --output-folder changes the root but keeps the auto-derived name and tag.
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--output-folder",
+            "D:/checkpoints",
+            "--tag",
+            "alpha-test",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.output_dir(),
+            std::path::PathBuf::from("D:/checkpoints/SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3-alpha-test"),
+        );
+
+        // The exact path mode and folder-root mode are intentionally exclusive.
+        assert!(
+            Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "NNUE_kp_256x2_32_32",
+                "--teacher",
+                "/dev/null",
+                "--output",
+                "/custom/path",
+                "--output-folder",
+                "D:/checkpoints",
+            ])
+            .is_err()
+        );
 
         // Explicit --output wins; --tag is ignored.
         let args = Args::try_parse_from([

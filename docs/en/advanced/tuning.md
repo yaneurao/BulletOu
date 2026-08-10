@@ -34,6 +34,7 @@ Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or abo
 | Choose positions per sb | `--positions-per-superbatch` | `--positions-per-superbatch 40000000` |
 | Choose how many epochs to run | `--max-epochs` | `--max-epochs 3` |
 | Save less often | `--save-rate` | `--save-rate 9999` usually leaves only epoch-end saves |
+| Put checkpoints on another drive | `--output-folder` | `--output-folder D:\checkpoints` |
 | Validate every sb | `--validation-rate` | `--validation-rate 1` |
 | Set StepLR decay | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | Change the loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
@@ -45,6 +46,8 @@ Fuller option table:
 | Flag | What it changes | Default |
 | --- | --- | --- |
 | `--backend` | Training backend. Usually leave this as `cuda-cpp` | `cuda-cpp` |
+| `--output-folder` | Parent folder for checkpoints. Auto-derived directory names and `--tag` are still used | `checkpoints` |
+| `--output` | Exact checkpoint directory. `--tag` is not used | omitted |
 | `--batch-size` | Positions per weight update | 65536 |
 | `--grad-accum-batches` | Accumulate N mini-batch gradients before one optimizer update | 1 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |

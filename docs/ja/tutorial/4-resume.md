@@ -6,7 +6,7 @@
 
 ## 4.1 基本
 
-同じ `--tag` または同じ `--output` で、同じコマンドをもう一度実行します。
+同じ `--tag` または同じ `--output` で、同じコマンドをもう一度実行します。`--output-folder` で保存先ドライブを変えている場合は、それも同じ値を指定します。
 
 ```powershell
 .\target\release\examples\bulletou.exe `
@@ -16,6 +16,22 @@
 ```
 
 `checkpoints/.../000N/state.bin` が見つかると、BulletOu が自動で読み込みます。
+
+checkpointをDドライブに置きたい場合は、`--output-folder` で親フォルダだけを指定できます。`--tag` はそのまま使えます。
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --teacher D:\sojoteam_datasets `
+  --output-folder D:\checkpoints `
+  --tag sfnn-test
+```
+
+この場合、保存先は次のようになります。
+
+```text
+D:\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3-sfnn-test
+```
 
 ```text
 checkpoints/.../
