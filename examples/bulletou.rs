@@ -1228,6 +1228,71 @@ struct QuantizedTestArgs {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou average-sfnn-state")]
+#[command(about = "Average multiple cuda-cpp SFNN state.bin files and export one quantized nn.bin")]
+struct AverageSfnnStateArgs {
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed, e.g.
+    /// `SFNN_halfka2_1024_7_64_k3k3`.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// Input cuda-cpp SFNN state.bin. Specify this option multiple times.
+    #[arg(long = "state-bin", required = true)]
+    state_bins: Vec<PathBuf>,
+
+    /// Output YaneuraOu-compatible quantized `nn.bin`.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Factorizer interpretation used while loading/exporting the state.
+    /// Default `none` folds existing factorizer tensors into base weights
+    /// before averaging, which is usually what you want when the output is
+    /// only an engine nn.bin.
+    #[arg(long = "sfnn-factorizer", default_value = "none")]
+    sfnn_factorizer: String,
+
+    /// Overwrite output if it already exists.
+    #[arg(long)]
+    force: bool,
+
+    /// Optional held-out test set. When set, BulletOu also runs quantized-test
+    /// on the averaged nn.bin and prints accuracy/loss.
+    #[arg(long = "test-teacher")]
+    test_teacher: Option<PathBuf>,
+
+    /// Number of positions to test. If omitted, all positions in the
+    /// fixed-record validation teacher are used.
+    #[arg(long)]
+    test_positions: Option<usize>,
+
+    /// How to choose validation positions when `--test-positions` is set.
+    #[arg(long, value_enum, default_value = "sequential")]
+    test_sample: TestSampleMode,
+
+    /// Seed for random validation sampling.
+    #[arg(long, default_value = "0")]
+    test_seed: u64,
+
+    /// Drop positions whose |score| >= this. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+
+    /// YaneuraOu FV_SCALE applied before the final sign test.
+    #[arg(long, default_value = "40")]
+    fv_scale: i32,
+
+    /// Teacher eval-score to win-rate sigmoid scale used by the validation loss target.
+    #[arg(long, default_value = "600")]
+    scale: u32,
+
+    /// Exponent of the probability-space error term `|prediction - target|^p`.
+    #[arg(long, default_value = "2.0")]
+    loss_pow_exp: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 impl QuantizedTestArgs {
     fn effective_layerstack(&self) -> LayerStackMode {
         self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
@@ -1259,6 +1324,69 @@ impl QuantizedTestArgs {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl AverageSfnnStateArgs {
+    fn validate(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!("--arch {} is not an SFNN architecture", self.arch.cli_name()));
+        }
+        if self.state_bins.len() < 2 {
+            return Err("--state-bin must be specified at least twice for averaging".to_string());
+        }
+        let _ = self.sfnn_factorizer.parse::<SfnnFactorizerSpec>()?;
+        if self.output.exists() && !self.force {
+            return Err(format!("{} already exists; pass --force to overwrite", self.output.display()));
+        }
+        if self.fv_scale <= 0 {
+            return Err("--fv-scale must be > 0".to_string());
+        }
+        if self.scale == 0 {
+            return Err("--scale must be > 0".to_string());
+        }
+        if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
+            return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
+        }
+        Ok(())
+    }
+
+    fn training_args(&self) -> Result<Args, String> {
+        let raw = vec![
+            "bulletou".to_string(),
+            "--backend".to_string(),
+            "cuda-cpp".to_string(),
+            "--teacher".to_string(),
+            "-".to_string(),
+            "--arch".to_string(),
+            self.arch.cli_name(),
+            "--sfnn-factorizer".to_string(),
+            self.sfnn_factorizer.clone(),
+        ];
+        Args::try_parse_from(raw).map_err(|err| err.to_string())
+    }
+
+    fn as_quantized_test_args(&self) -> Option<QuantizedTestArgs> {
+        Some(QuantizedTestArgs {
+            arch: self.arch,
+            nn_bin: self.output.clone(),
+            test_teacher: self.test_teacher.clone()?,
+            test_positions: self.test_positions,
+            test_sample: self.test_sample,
+            test_seed: self.test_seed,
+            score_drop_abs: self.score_drop_abs,
+            fv_scale: self.fv_scale,
+            sfnn_ft_shift: 7,
+            lambda: 1.0,
+            scale: self.scale,
+            loss_pow_exp: self.loss_pow_exp,
+            quant_ft_round: QuantizedRoundMode::Floor,
+            quant_crelu_round: QuantizedRoundMode::Floor,
+            quant_sqrcrelu_round: QuantizedRoundMode::Floor,
+            quant_final_div_round: QuantizedRoundMode::Floor,
+            engine_score_offset: 0.0,
+        })
     }
 }
 
@@ -2896,7 +3024,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf              Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test    Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin  Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test      Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin    Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state  Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -5228,6 +5356,193 @@ fn quantized_engine_metrics_from_cached_outputs(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug)]
+struct AverageSfnnStateReport {
+    output: PathBuf,
+    averaged: usize,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    quantized: Option<QuantizedTestReport>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn add_average_vec(acc: &mut [f32], rhs: &[f32], name: &str, path: &Path) -> Result<(), String> {
+    if acc.len() != rhs.len() {
+        return Err(format!(
+            "{name} length mismatch while averaging {}: got {}, expected {}",
+            path.display(),
+            rhs.len(),
+            acc.len()
+        ));
+    }
+    for (a, &b) in acc.iter_mut().zip(rhs.iter()) {
+        *a += b;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn add_average_opt_vec(
+    acc: &mut Option<Vec<f32>>,
+    rhs: &Option<Vec<f32>>,
+    name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    match (acc.as_mut(), rhs.as_ref()) {
+        (Some(a), Some(b)) => add_average_vec(a, b, name, path),
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(format!("{name} is missing in {} but present in previous states", path.display())),
+        (None, Some(_)) => Err(format!("{name} is present in {} but missing in previous states", path.display())),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn scale_average_vec(values: &mut [f32], inv_count: f32) {
+    for value in values {
+        *value *= inv_count;
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn scale_average_opt_vec(values: &mut Option<Vec<f32>>, inv_count: f32) {
+    if let Some(values) = values {
+        scale_average_vec(values, inv_count);
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn add_sfnn_weights_for_average(
+    acc: &mut CudaCppSfnnInitialWeights,
+    rhs: &CudaCppSfnnInitialWeights,
+    path: &Path,
+) -> Result<(), String> {
+    if acc.shape != rhs.shape {
+        return Err(format!(
+            "SFNN shape mismatch while averaging {}: got {:?}, expected {:?}",
+            path.display(),
+            rhs.shape,
+            acc.shape
+        ));
+    }
+    add_average_vec(&mut acc.l0w, &rhs.l0w, "l0w", path)?;
+    add_average_vec(&mut acc.l0b, &rhs.l0b, "l0b", path)?;
+    add_average_vec(&mut acc.l1w, &rhs.l1w, "l1w", path)?;
+    add_average_vec(&mut acc.l1b, &rhs.l1b, "l1b", path)?;
+    add_average_opt_vec(&mut acc.l1fw, &rhs.l1fw, "l1fw", path)?;
+    add_average_opt_vec(&mut acc.l1fb, &rhs.l1fb, "l1fb", path)?;
+    add_average_opt_vec(&mut acc.l1axw, &rhs.l1axw, "l1axw", path)?;
+    add_average_opt_vec(&mut acc.l1axb, &rhs.l1axb, "l1axb", path)?;
+    add_average_vec(&mut acc.l2w, &rhs.l2w, "l2w", path)?;
+    add_average_vec(&mut acc.l2b, &rhs.l2b, "l2b", path)?;
+    add_average_opt_vec(&mut acc.l2fw, &rhs.l2fw, "l2fw", path)?;
+    add_average_opt_vec(&mut acc.l2fb, &rhs.l2fb, "l2fb", path)?;
+    add_average_opt_vec(&mut acc.l2axw, &rhs.l2axw, "l2axw", path)?;
+    add_average_opt_vec(&mut acc.l2axb, &rhs.l2axb, "l2axb", path)?;
+    add_average_vec(&mut acc.l3w, &rhs.l3w, "l3w", path)?;
+    add_average_vec(&mut acc.l3b, &rhs.l3b, "l3b", path)?;
+    add_average_opt_vec(&mut acc.l3fw, &rhs.l3fw, "l3fw", path)?;
+    add_average_opt_vec(&mut acc.l3fb, &rhs.l3fb, "l3fb", path)?;
+    add_average_opt_vec(&mut acc.l3axw, &rhs.l3axw, "l3axw", path)?;
+    add_average_opt_vec(&mut acc.l3axb, &rhs.l3axb, "l3axb", path)?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn scale_sfnn_weights_for_average(weights: &mut CudaCppSfnnInitialWeights, inv_count: f32) {
+    scale_average_vec(&mut weights.l0w, inv_count);
+    scale_average_vec(&mut weights.l0b, inv_count);
+    scale_average_vec(&mut weights.l1w, inv_count);
+    scale_average_vec(&mut weights.l1b, inv_count);
+    scale_average_opt_vec(&mut weights.l1fw, inv_count);
+    scale_average_opt_vec(&mut weights.l1fb, inv_count);
+    scale_average_opt_vec(&mut weights.l1axw, inv_count);
+    scale_average_opt_vec(&mut weights.l1axb, inv_count);
+    scale_average_vec(&mut weights.l2w, inv_count);
+    scale_average_vec(&mut weights.l2b, inv_count);
+    scale_average_opt_vec(&mut weights.l2fw, inv_count);
+    scale_average_opt_vec(&mut weights.l2fb, inv_count);
+    scale_average_opt_vec(&mut weights.l2axw, inv_count);
+    scale_average_opt_vec(&mut weights.l2axb, inv_count);
+    scale_average_vec(&mut weights.l3w, inv_count);
+    scale_average_vec(&mut weights.l3b, inv_count);
+    scale_average_opt_vec(&mut weights.l3fw, inv_count);
+    scale_average_opt_vec(&mut weights.l3fb, inv_count);
+    scale_average_opt_vec(&mut weights.l3axw, inv_count);
+    scale_average_opt_vec(&mut weights.l3axb, inv_count);
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_initial_weights_into_readback(
+    weights: CudaCppSfnnInitialWeights,
+) -> bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+    bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+        l0w: weights.l0w,
+        l0b: weights.l0b,
+        l1w: weights.l1w,
+        l1b: weights.l1b,
+        l1fw: weights.l1fw,
+        l1fb: weights.l1fb,
+        l1axw: weights.l1axw,
+        l1axb: weights.l1axb,
+        l2w: weights.l2w,
+        l2b: weights.l2b,
+        l2fw: weights.l2fw,
+        l2fb: weights.l2fb,
+        l2axw: weights.l2axw,
+        l2axb: weights.l2axb,
+        l3w: weights.l3w,
+        l3b: weights.l3b,
+        l3fw: weights.l3fw,
+        l3fb: weights.l3fb,
+        l3axw: weights.l3axw,
+        l3axb: weights.l3axb,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_average_sfnn_state(args: &AverageSfnnStateArgs) -> Result<AverageSfnnStateReport, String> {
+    args.validate()?;
+    let train_args = args.training_args()?;
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
+    let mut averaged: Option<CudaCppSfnnInitialWeights> = None;
+    for path in &args.state_bins {
+        let state = load_cuda_cpp_sfnn_initial_state(path, &train_args, feature_kind)?;
+        match averaged.as_mut() {
+            Some(acc) => add_sfnn_weights_for_average(acc, &state.weights, path)?,
+            None => averaged = Some(state.weights),
+        }
+    }
+    let mut averaged = averaged.ok_or_else(|| "no state bins were loaded".to_string())?;
+    let count = args.state_bins.len();
+    scale_sfnn_weights_for_average(&mut averaged, 1.0 / count as f32);
+    averaged.validate()?;
+
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create output dir {}: {err}", parent.display()))?;
+        }
+    }
+    let shape = averaged.shape;
+    let readback = sfnn_initial_weights_into_readback(averaged);
+    let layerstack = args.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3);
+    let progress_params = sfnn_progress_params_for_layerstack(layerstack);
+    write_cuda_cpp_sfnn_nn_bin(
+        &args.output,
+        feature_kind,
+        shape,
+        &readback,
+        effective_sfnn_factorizer_spec(&train_args),
+        progress_params.as_ref(),
+    )?;
+
+    let quantized = match args.as_quantized_test_args() {
+        Some(test_args) => Some(run_quantized_test(&test_args)?),
+        None => None,
+    };
+    Ok(AverageSfnnStateReport { output: args.output.clone(), averaged: count, shape, quantized })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn estimate_quantized_fv_scale_from_outputs(
     positions: &[bulletou_lib::shogi::PackedSfenValue],
     outputs: &[QuantizedSfnnForwardOutput],
@@ -5963,6 +6278,48 @@ fn main() {
         #[cfg(not(feature = "cuda-cpp-backend"))]
         {
             eprintln!("error: calibrate-nn-bin requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("average-sfnn-state")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou average-sfnn-state");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = AverageSfnnStateArgs::parse_from(raw_args);
+            match run_average_sfnn_state(&args) {
+                Ok(report) => {
+                    println!("average-sfnn-state complete:");
+                    println!("  arch              = {}", args.arch);
+                    println!("  factorizer        = {}", args.sfnn_factorizer);
+                    println!("  averaged          = {} state.bin file(s)", format_count(report.averaged));
+                    println!("  shape             = {:?}", report.shape);
+                    println!("  output            = {}", report.output.display());
+                    if let Some(quantized) = report.quantized {
+                        println!(
+                            "  quant_accuracy    = {:.4}% ({}/{} decisive; draws={} excluded; mate={} filtered)",
+                            quantized.accuracy_percent(),
+                            quantized.engine_scale.sign_matches,
+                            quantized.engine_scale.compared,
+                            quantized.engine_scale.drawn_games,
+                            quantized.engine_scale.filtered_by_score_cap
+                        );
+                        println!("  quant_loss_engine = {:.8}", quantized.engine_scale.test_loss.unwrap_or(f32::NAN));
+                        println!("  quant_elapsed     = {:.3}s", quantized.elapsed.as_secs_f64());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: average-sfnn-state failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: average-sfnn-state requires building with --features cuda-cpp-backend");
             std::process::exit(2);
         }
         return;
