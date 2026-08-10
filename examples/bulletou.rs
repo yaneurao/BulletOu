@@ -2396,6 +2396,23 @@ fn print_cuda_cpp_validation_summary_elapsed(
     }
 }
 
+fn print_cuda_cpp_quantized_validation_summary(
+    epoch: usize,
+    superbatch: usize,
+    accuracy: f32,
+    loss: f32,
+    elapsed: std::time::Duration,
+) {
+    eprintln!(
+        "  {}  {}  {}, {}, {}",
+        paint_log_tag("[qvalid]", ConsoleColor::Cyan),
+        paint(format!("epoch {epoch} sb {superbatch}"), ConsoleColor::BoldYellow),
+        colored_metric("quantized_value_accuracy", accuracy, 7),
+        colored_metric("quantized_value_loss", loss, 8),
+        paint(format!("elapsed={}", format_duration_secs(elapsed)), ConsoleColor::BoldCyan),
+    );
+}
+
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
     if max_epochs == usize::MAX {
         eprintln!(
@@ -2930,6 +2947,14 @@ struct Args {
     /// probes where writing multi-GB optimizer state would dominate disk use.
     #[arg(long)]
     cuda_cpp_skip_final_output: bool,
+
+    /// Keep SFNN Ranger optimizer state when disabling/folding factorizer
+    /// tensors during initial state migration. By default BulletOu resets
+    /// optimizer state when the SFNN parameterization changes. This flag is an
+    /// experiment knob for A/B tests; it folds momentum/velocity/slow tensors
+    /// into the remaining base tensors using the same mapping as weights.
+    #[arg(long)]
+    sfnn_keep_optimizer_state_on_factorizer_change: bool,
 
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
@@ -5263,6 +5288,16 @@ fn quantized_test_positions(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
+    run_quantized_test_impl(args, true)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_quantized_test_quiet(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
+    run_quantized_test_impl(args, false)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<QuantizedTestReport, String> {
     args.validate_arch_flags()?;
     let layerstack = args.effective_layerstack();
     let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
@@ -5270,40 +5305,42 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
     if let Some(params) = &weights.progress_params {
         set_shogi_sfnn_progress_q16_params(params.clone())?;
     }
-    eprintln!("quantized-test:");
-    eprintln!("  arch              = {}", args.arch);
-    eprintln!("  nn_bin            = {}", args.nn_bin.display());
-    eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
-    eprintln!("  feature           = {}", weights.feature_kind.source_label());
-    eprintln!(
-        "  layerstack        = {} ({} stack(s))",
-        weights.layerstack.cli_name(),
-        format_count(weights.num_stacks)
-    );
-    eprintln!("  fv_scale          = {}", args.fv_scale);
-    eprintln!("  sfnn_ft_shift     = {}", args.sfnn_ft_shift);
-    eprintln!(
-        "  quant_rounding    = ft:{}, crelu:{}, sqrcrelu:{}, final_div:{}",
-        args.quant_ft_round.cli_name(),
-        args.quant_crelu_round.cli_name(),
-        args.quant_sqrcrelu_round.cli_name(),
-        args.quant_final_div_round.cli_name(),
-    );
-    eprintln!(
-        "  loss              = {}",
-        sigmoid_loss_label(
-            args.loss_pow_exp,
-            args.scale as f32,
-            args.fv_scale as f32,
-            quantized_train_scale_model_output_scale(args)
-        )
-    );
-    eprintln!(
-        "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
-        quantized_sfnn_raw_output_scale(),
-    );
-    if args.engine_score_offset != 0.0 {
-        eprintln!("  engine offset     = {:+.3}", args.engine_score_offset);
+    if verbose {
+        eprintln!("quantized-test:");
+        eprintln!("  arch              = {}", args.arch);
+        eprintln!("  nn_bin            = {}", args.nn_bin.display());
+        eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
+        eprintln!("  feature           = {}", weights.feature_kind.source_label());
+        eprintln!(
+            "  layerstack        = {} ({} stack(s))",
+            weights.layerstack.cli_name(),
+            format_count(weights.num_stacks)
+        );
+        eprintln!("  fv_scale          = {}", args.fv_scale);
+        eprintln!("  sfnn_ft_shift     = {}", args.sfnn_ft_shift);
+        eprintln!(
+            "  quant_rounding    = ft:{}, crelu:{}, sqrcrelu:{}, final_div:{}",
+            args.quant_ft_round.cli_name(),
+            args.quant_crelu_round.cli_name(),
+            args.quant_sqrcrelu_round.cli_name(),
+            args.quant_final_div_round.cli_name(),
+        );
+        eprintln!(
+            "  loss              = {}",
+            sigmoid_loss_label(
+                args.loss_pow_exp,
+                args.scale as f32,
+                args.fv_scale as f32,
+                quantized_train_scale_model_output_scale(args)
+            )
+        );
+        eprintln!(
+            "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
+            quantized_sfnn_raw_output_scale(),
+        );
+        if args.engine_score_offset != 0.0 {
+            eprintln!("  engine offset     = {:+.3}", args.engine_score_offset);
+        }
     }
 
     let teacher = args
@@ -5312,13 +5349,15 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
         .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
     let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
     let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
-    eprintln!(
-        "  loading test positions from {} (positions={}, sample={}, seed={})...",
-        args.test_teacher.display(),
-        positions_label,
-        sample_label,
-        if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
-    );
+    if verbose {
+        eprintln!(
+            "  loading test positions from {} (positions={}, sample={}, seed={})...",
+            args.test_teacher.display(),
+            positions_label,
+            sample_label,
+            if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
+        );
+    }
     let positions = match args.test_positions {
         None => read_all_teacher_positions(teacher),
         Some(n) => match args.test_sample {
@@ -5330,13 +5369,134 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
     if positions.is_empty() {
         return Err("validation teacher produced no positions".to_string());
     }
-    eprintln!("  ...{} positions ready", format_count(positions.len()));
+    if verbose {
+        eprintln!("  ...{} positions ready", format_count(positions.len()));
+    }
 
     let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
     let started = std::time::Instant::now();
     let mut report = quantized_test_positions(&weights, &positions, &batch, args)?;
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Result<Option<QuantizedTestArgs>, String> {
+    if !matches!(
+        args.eval_type(),
+        EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
+    ) {
+        return Ok(None);
+    }
+    let Some(test_teacher) = args.test_teacher.clone() else {
+        return Ok(None);
+    };
+    let fv_scale = effective_fv_scale(args);
+    if !(fv_scale.is_finite() && fv_scale > 0.0) {
+        return Err(format!("cannot run quantized validation with invalid --fv-scale {fv_scale}"));
+    }
+    let scale = effective_scale(args);
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!("cannot run quantized validation with invalid --scale {scale}"));
+    }
+    Ok(Some(QuantizedTestArgs {
+        arch: args.arch(),
+        nn_bin,
+        test_teacher,
+        test_positions: args.test_positions,
+        test_sample: args.test_sample,
+        test_seed: args.test_seed,
+        score_drop_abs: args.score_drop_abs,
+        fv_scale: fv_scale.round() as i32,
+        sfnn_ft_shift: 7,
+        lambda: args.lambda,
+        scale: scale.round() as u32,
+        loss_pow_exp: effective_loss_pow_exp(args),
+        quant_ft_round: QuantizedRoundMode::Floor,
+        quant_crelu_round: QuantizedRoundMode::Floor,
+        quant_sqrcrelu_round: QuantizedRoundMode::Floor,
+        quant_final_div_round: QuantizedRoundMode::Floor,
+        engine_score_offset: 0.0,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn summary_line_with_quantized_metrics(line: &str, accuracy: f32, loss: f32) -> String {
+    let mut fields = line.rsplitn(3, ',').collect::<Vec<_>>();
+    if fields.len() == 3 {
+        fields.reverse();
+        format!("{},{accuracy:.6},{loss:.8}", fields[0])
+    } else {
+        format!("{line},{accuracy:.6},{loss:.8}")
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn update_summary_log_quantized_metrics(
+    output_dir: &std::path::Path,
+    epoch: usize,
+    superbatch: usize,
+    metrics: TestMetrics,
+) -> Result<(), String> {
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
+    let content = std::fs::read_to_string(&top).map_err(|err| format!("failed to read {}: {err}", top.display()))?;
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut updated = false;
+    for line in lines.iter_mut().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("eval,") {
+            continue;
+        }
+        let head = trimmed.splitn(4, ',').collect::<Vec<_>>();
+        if head.len() < 3 {
+            continue;
+        }
+        let Ok(row_epoch) = head[1].parse::<usize>() else { continue };
+        let Ok(row_superbatch) = head[2].parse::<usize>() else { continue };
+        if row_epoch == epoch && row_superbatch == superbatch {
+            *line = summary_line_with_quantized_metrics(trimmed, metrics.accuracy, metrics.loss);
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        return Err(format!(
+            "failed to find summary row for epoch={epoch} superbatch={superbatch} in {}",
+            top.display()
+        ));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&top, out).map_err(|err| format!("failed to write {}: {err}", top.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn maybe_run_epoch_end_sfnn_quantized_validation(
+    args: &Args,
+    checkpoint_dir: &std::path::Path,
+    epoch: usize,
+    superbatch: usize,
+) -> Result<Option<(TestMetrics, std::time::Duration)>, String> {
+    if args.superbatches != Some(superbatch) {
+        return Ok(None);
+    }
+    let nn_bin = checkpoint_dir.join("nn.bin");
+    if !nn_bin.is_file() {
+        return Ok(None);
+    }
+    let Some(test_args) = quantized_test_args_from_training_args(args, nn_bin)? else {
+        return Ok(None);
+    };
+    let started = std::time::Instant::now();
+    let report = run_quantized_test_quiet(&test_args)?;
+    let elapsed = started.elapsed();
+    let Some(loss) = report.engine_scale.test_loss else {
+        return Ok(None);
+    };
+    let metrics = TestMetrics { accuracy: (report.accuracy_percent() / 100.0) as f32, loss };
+    update_summary_log_quantized_metrics(&args.output_dir(), epoch, superbatch, metrics)?;
+    Ok(Some((metrics, elapsed)))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9194,6 +9354,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             checkpoint_elapsed,
                         )),
                     );
+                    if let Some((metrics, elapsed)) = maybe_run_epoch_end_sfnn_quantized_validation(
+                        args,
+                        &checkpoint_dir,
+                        chunk.epoch,
+                        chunk.superbatch,
+                    )? {
+                        excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
+                        print_cuda_cpp_quantized_validation_summary(
+                            chunk.epoch,
+                            chunk.superbatch,
+                            metrics.accuracy,
+                            metrics.loss,
+                            elapsed,
+                        );
+                    }
                     last_checkpoint_metrics = Some(test_metrics);
                 }
 
@@ -9578,6 +9753,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             Some(validation_elapsed),
                         );
                     }
+                    if let Some((metrics, elapsed)) = maybe_run_epoch_end_sfnn_quantized_validation(
+                        args,
+                        &checkpoint_dir,
+                        chunk.epoch,
+                        chunk.superbatch,
+                    )? {
+                        excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
+                        print_cuda_cpp_quantized_validation_summary(
+                            chunk.epoch,
+                            chunk.superbatch,
+                            metrics.accuracy,
+                            metrics.loss,
+                            elapsed,
+                        );
+                    }
                     last_checkpoint_metrics = test_metrics;
                 } else if chunk.run_validation {
                     ctx.synchronize().map_err(|e| e.to_string())?;
@@ -9843,6 +10033,17 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 metrics.accuracy,
                 metrics.loss,
                 Some(validation_elapsed),
+            );
+        }
+        if let Some((metrics, elapsed)) =
+            maybe_run_epoch_end_sfnn_quantized_validation(args, &checkpoint_dir, chunk.epoch, chunk.superbatch)?
+        {
+            print_cuda_cpp_quantized_validation_summary(
+                chunk.epoch,
+                chunk.superbatch,
+                metrics.accuracy,
+                metrics.loss,
+                elapsed,
             );
         }
         last_checkpoint_metrics = test_metrics;
@@ -10477,7 +10678,7 @@ fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog) -> St
     };
     let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
-        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher}\n",
+        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher},-,-\n",
         eval = eval_field,
         epoch = log.epoch,
         superbatch = log.superbatch,
@@ -11342,6 +11543,19 @@ fn build_sfnn_initial_state_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_optimizer_state_from_path(
+    path: &Path,
+    weights: &CudaCppSfnnInitialWeights,
+) -> Result<Option<CudaCppSfnnOptimizerState>, String> {
+    let mut optimizer_sections =
+        load_cuda_cpp_component_state_sections(path, "nnue", &["momentum", "velocity", "slow"], false)?;
+    let momentum = optimizer_sections.remove("momentum").unwrap_or_default();
+    let velocity = optimizer_sections.remove("velocity").unwrap_or_default();
+    let slow = optimizer_sections.remove("slow").unwrap_or_default();
+    load_cuda_cpp_sfnn_optimizer_state_from_sections(weights, &momentum, &velocity, &slow)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_is_common_shard_l1_shape(shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
     shape.has_common_shard_l1()
 }
@@ -11668,6 +11882,12 @@ fn load_cuda_cpp_sfnn_initial_state(
             path.display()
         ));
     }
+    let keep_optimizer_state_on_factorizer_change = args.sfnn_keep_optimizer_state_on_factorizer_change;
+    let mut pre_migration_optimizer_states = if keep_optimizer_state_on_factorizer_change {
+        load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
+    } else {
+        None
+    };
     let extracted_new_factorizers = extract_cuda_cpp_sfnn_new_factorizers_from_base(
         &mut weights,
         effective_sfnn_factorizer_spec(args),
@@ -11690,17 +11910,40 @@ fn load_cuda_cpp_sfnn_initial_state(
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_steps(&step_ranger, &weights)?;
     let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers {
-        eprintln!(
-            "  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration"
-        );
-        None
+        if keep_optimizer_state_on_factorizer_change && !extracted_new_factorizers {
+            if let Some(mut optimizer_states) = pre_migration_optimizer_states.take() {
+                fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
+                    &mut optimizer_states,
+                    weights.shape,
+                    effective_sfnn_factorizer_spec(args),
+                )?;
+                eprintln!(
+                    "  initial optimizer state = kept by --sfnn-keep-optimizer-state-on-factorizer-change; folded inactive factorizer optimizer tensors into base tensors"
+                );
+                Some(optimizer_states)
+            } else {
+                eprintln!(
+                    "  initial optimizer state = reset because no Ranger optimizer records were present to preserve"
+                );
+                None
+            }
+        } else {
+            if keep_optimizer_state_on_factorizer_change && extracted_new_factorizers {
+                eprintln!(
+                    "  initial optimizer state = reset because newly enabled factorizer extraction cannot safely preserve Ranger optimizer state"
+                );
+            } else {
+                eprintln!(
+                    "  initial optimizer state = reset because the SFNN parameterization changed during factorizer migration"
+                );
+            }
+            None
+        }
     } else {
-        let mut optimizer_sections =
-            load_cuda_cpp_component_state_sections(path, "nnue", &["momentum", "velocity", "slow"], false)?;
-        let momentum = optimizer_sections.remove("momentum").unwrap_or_default();
-        let velocity = optimizer_sections.remove("velocity").unwrap_or_default();
-        let slow = optimizer_sections.remove("slow").unwrap_or_default();
-        load_cuda_cpp_sfnn_optimizer_state_from_sections(&weights, &momentum, &velocity, &slow)?
+        match pre_migration_optimizer_states.take() {
+            Some(optimizer_states) => Some(optimizer_states),
+            None => load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?,
+        }
     };
     let optimizer_steps = if optimizer_states.is_some() {
         stored_optimizer_steps
@@ -11930,6 +12173,341 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
     }
 
     weights.validate()?;
+    Ok(folded_any)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l1f_optimizer_into_stacked_l1(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l1w: &mut CudaCppRangerGroupState,
+    l1b: &mut CudaCppRangerGroupState,
+    l1fw: Option<CudaCppRangerGroupState>,
+    l1fb: Option<CudaCppRangerGroupState>,
+) -> Result<(), String> {
+    let l1fw = l1fw.as_ref();
+    let l1fb = l1fb.as_ref();
+    fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+        shape,
+        &mut l1w.momentum,
+        &mut l1b.momentum,
+        l1fw.map(|state| state.momentum.as_slice()),
+        l1fb.map(|state| state.momentum.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+        shape,
+        &mut l1w.velocity,
+        &mut l1b.velocity,
+        l1fw.map(|state| state.velocity.as_slice()),
+        l1fb.map(|state| state.velocity.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+        shape,
+        &mut l1w.slow_params,
+        &mut l1b.slow_params,
+        l1fw.map(|state| state.slow_params.as_slice()),
+        l1fb.map(|state| state.slow_params.as_slice()),
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l2f_optimizer_into_stacked_l2(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l2w: &mut CudaCppRangerGroupState,
+    l2b: &mut CudaCppRangerGroupState,
+    l2fw: Option<CudaCppRangerGroupState>,
+    l2fb: Option<CudaCppRangerGroupState>,
+) -> Result<(), String> {
+    let l2fw = l2fw.as_ref();
+    let l2fb = l2fb.as_ref();
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w.momentum,
+        &mut l2b.momentum,
+        l2fw.map(|state| state.momentum.as_slice()),
+        l2fb.map(|state| state.momentum.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w.velocity,
+        &mut l2b.velocity,
+        l2fw.map(|state| state.velocity.as_slice()),
+        l2fb.map(|state| state.velocity.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w.slow_params,
+        &mut l2b.slow_params,
+        l2fw.map(|state| state.slow_params.as_slice()),
+        l2fb.map(|state| state.slow_params.as_slice()),
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l3f_optimizer_into_stacked_l3(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l3w: &mut CudaCppRangerGroupState,
+    l3b: &mut CudaCppRangerGroupState,
+    l3fw: Option<CudaCppRangerGroupState>,
+    l3fb: Option<CudaCppRangerGroupState>,
+) -> Result<(), String> {
+    let l3fw = l3fw.as_ref();
+    let l3fb = l3fb.as_ref();
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w.momentum,
+        &mut l3b.momentum,
+        l3fw.map(|state| state.momentum.as_slice()),
+        l3fb.map(|state| state.momentum.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w.velocity,
+        &mut l3b.velocity,
+        l3fw.map(|state| state.velocity.as_slice()),
+        l3fb.map(|state| state.velocity.as_slice()),
+    )?;
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w.slow_params,
+        &mut l3b.slow_params,
+        l3fw.map(|state| state.slow_params.as_slice()),
+        l3fb.map(|state| state.slow_params.as_slice()),
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l1_axis_optimizer_into_stacked_l1(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l1w: &mut CudaCppRangerGroupState,
+    l1b: &mut CudaCppRangerGroupState,
+    l1axw: Option<&CudaCppRangerGroupState>,
+    l1axb: Option<&CudaCppRangerGroupState>,
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+        shape,
+        &mut l1w.momentum,
+        &mut l1b.momentum,
+        l1axw.map(|state| state.momentum.as_slice()),
+        l1axb.map(|state| state.momentum.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+        shape,
+        &mut l1w.velocity,
+        &mut l1b.velocity,
+        l1axw.map(|state| state.velocity.as_slice()),
+        l1axb.map(|state| state.velocity.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+        shape,
+        &mut l1w.slow_params,
+        &mut l1b.slow_params,
+        l1axw.map(|state| state.slow_params.as_slice()),
+        l1axb.map(|state| state.slow_params.as_slice()),
+        factorizer,
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l2_axis_optimizer_into_stacked_l2(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l2w: &mut CudaCppRangerGroupState,
+    l2b: &mut CudaCppRangerGroupState,
+    l2axw: Option<&CudaCppRangerGroupState>,
+    l2axb: Option<&CudaCppRangerGroupState>,
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
+        shape,
+        &mut l2w.momentum,
+        &mut l2b.momentum,
+        l2axw.map(|state| state.momentum.as_slice()),
+        l2axb.map(|state| state.momentum.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
+        shape,
+        &mut l2w.velocity,
+        &mut l2b.velocity,
+        l2axw.map(|state| state.velocity.as_slice()),
+        l2axb.map(|state| state.velocity.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
+        shape,
+        &mut l2w.slow_params,
+        &mut l2b.slow_params,
+        l2axw.map(|state| state.slow_params.as_slice()),
+        l2axb.map(|state| state.slow_params.as_slice()),
+        factorizer,
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_l3_axis_optimizer_into_stacked_l3(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    l3w: &mut CudaCppRangerGroupState,
+    l3b: &mut CudaCppRangerGroupState,
+    l3axw: Option<&CudaCppRangerGroupState>,
+    l3axb: Option<&CudaCppRangerGroupState>,
+    factorizer: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
+        shape,
+        &mut l3w.momentum,
+        &mut l3b.momentum,
+        l3axw.map(|state| state.momentum.as_slice()),
+        l3axb.map(|state| state.momentum.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
+        shape,
+        &mut l3w.velocity,
+        &mut l3b.velocity,
+        l3axw.map(|state| state.velocity.as_slice()),
+        l3axb.map(|state| state.velocity.as_slice()),
+        factorizer,
+    )?;
+    fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
+        shape,
+        &mut l3w.slow_params,
+        &mut l3b.slow_params,
+        l3axw.map(|state| state.slow_params.as_slice()),
+        l3axb.map(|state| state.slow_params.as_slice()),
+        factorizer,
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn zero_cuda_cpp_sfnn_axis_factorizer_optimizer_slices(
+    optimizer: &mut CudaCppSfnnOptimizerState,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    axes_to_zero: SfnnFactorizerSpec,
+) -> Result<(), String> {
+    let axes = cuda_cpp_sfnn_factorizer_axis_indices(shape, axes_to_zero);
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l1axw.as_mut(), shape.ft_size * shape.l1_out(), &axes)?;
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l1axb.as_mut(), shape.l1_out(), &axes)?;
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l2axw.as_mut(), shape.l2_size * shape.l2_in(), &axes)?;
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l2axb.as_mut(), shape.l2_size, &axes)?;
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l3axw.as_mut(), shape.l2_size, &axes)?;
+    zero_cuda_cpp_sfnn_axis_optimizer_group_slices(optimizer.l3axb.as_mut(), 1, &axes)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn zero_cuda_cpp_sfnn_axis_optimizer_group_slices(
+    state: Option<&mut CudaCppRangerGroupState>,
+    axis_stride: usize,
+    axes: &[usize],
+) -> Result<(), String> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    zero_cuda_cpp_sfnn_axis_slices(Some(&mut state.momentum), axis_stride, axes)?;
+    zero_cuda_cpp_sfnn_axis_slices(Some(&mut state.velocity), axis_stride, axes)?;
+    zero_cuda_cpp_sfnn_axis_slices(Some(&mut state.slow_params), axis_stride, axes)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
+    optimizer: &mut CudaCppSfnnOptimizerState,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    active: SfnnFactorizerSpec,
+) -> Result<bool, String> {
+    let mut folded_any = false;
+
+    if !active.shared {
+        if optimizer.l1fw.is_some() || optimizer.l1fb.is_some() {
+            let l1fw = optimizer.l1fw.take();
+            let l1fb = optimizer.l1fb.take();
+            fold_cuda_cpp_sfnn_l1f_optimizer_into_stacked_l1(
+                shape,
+                &mut optimizer.l1w,
+                &mut optimizer.l1b,
+                l1fw,
+                l1fb,
+            )?;
+            folded_any = true;
+        }
+        if optimizer.l2fw.is_some() || optimizer.l2fb.is_some() {
+            let l2fw = optimizer.l2fw.take();
+            let l2fb = optimizer.l2fb.take();
+            fold_cuda_cpp_sfnn_l2f_optimizer_into_stacked_l2(
+                shape,
+                &mut optimizer.l2w,
+                &mut optimizer.l2b,
+                l2fw,
+                l2fb,
+            )?;
+            folded_any = true;
+        }
+        if optimizer.l3fw.is_some() || optimizer.l3fb.is_some() {
+            let l3fw = optimizer.l3fw.take();
+            let l3fb = optimizer.l3fb.take();
+            fold_cuda_cpp_sfnn_l3f_optimizer_into_stacked_l3(
+                shape,
+                &mut optimizer.l3w,
+                &mut optimizer.l3b,
+                l3fw,
+                l3fb,
+            )?;
+            folded_any = true;
+        }
+    }
+
+    let fold_axis = SfnnFactorizerSpec {
+        shared: true,
+        king_axis: !active.king_axis && shape.factorizer_king_axis_dim != 0,
+        hand_axis: !active.hand_axis && shape.factorizer_hand_axis_dim != 0,
+        explicit_king_axis: true,
+        explicit_hand_axis: true,
+    };
+    if (fold_axis.king_axis || fold_axis.hand_axis)
+        && (optimizer.l1axw.is_some()
+            || optimizer.l1axb.is_some()
+            || optimizer.l2axw.is_some()
+            || optimizer.l2axb.is_some()
+            || optimizer.l3axw.is_some()
+            || optimizer.l3axb.is_some())
+    {
+        fold_cuda_cpp_sfnn_l1_axis_optimizer_into_stacked_l1(
+            shape,
+            &mut optimizer.l1w,
+            &mut optimizer.l1b,
+            optimizer.l1axw.as_ref(),
+            optimizer.l1axb.as_ref(),
+            fold_axis,
+        )?;
+        fold_cuda_cpp_sfnn_l2_axis_optimizer_into_stacked_l2(
+            shape,
+            &mut optimizer.l2w,
+            &mut optimizer.l2b,
+            optimizer.l2axw.as_ref(),
+            optimizer.l2axb.as_ref(),
+            fold_axis,
+        )?;
+        fold_cuda_cpp_sfnn_l3_axis_optimizer_into_stacked_l3(
+            shape,
+            &mut optimizer.l3w,
+            &mut optimizer.l3b,
+            optimizer.l3axw.as_ref(),
+            optimizer.l3axb.as_ref(),
+            fold_axis,
+        )?;
+        if active.king_axis || active.hand_axis {
+            zero_cuda_cpp_sfnn_axis_factorizer_optimizer_slices(optimizer, shape, fold_axis)?;
+        } else {
+            optimizer.l1axw = None;
+            optimizer.l1axb = None;
+            optimizer.l2axw = None;
+            optimizer.l2axb = None;
+            optimizer.l3axw = None;
+            optimizer.l3axb = None;
+        }
+        folded_any = true;
+    }
+
     Ok(folded_any)
 }
 
@@ -14693,6 +15271,10 @@ const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accu
 /// teacher column was added.
 const SUMMARY_LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
+/// Legacy schema for `<output>/summary-learn.log` after `test_teacher`
+/// was added but before epoch-end quantized validation columns were added.
+const SUMMARY_LEARN_LOG_HEADER_V2: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher";
+
 /// Schema for the top-level `<output>/summary-learn.log`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
@@ -14701,7 +15283,13 @@ const SUMMARY_LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,test_value_accu
 /// rightmost `test_teacher` column records the validation filename
 /// specified by `--test-teacher` so the accuracy/loss columns remain
 /// attributable without making the log line as wide as a full path.
-const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher";
+///
+/// `quantized_value_accuracy` / `quantized_value_loss` are filled only for
+/// SFNN epoch-end checkpoints where an exported `nn.bin` exists. Other rows
+/// use `-`. Accuracy is stored as a 0..1 ratio, matching
+/// `test_value_accuracy`; the loss is the engine-scale quantized validation
+/// loss reported by `bulletou quantized-test`.
+const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,quantized_value_accuracy,quantized_value_loss";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
@@ -15264,9 +15852,13 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
     let Some(first_line) = lines.next() else {
         return Ok(());
     };
-    if first_line != SUMMARY_LEARN_LOG_HEADER_V1 {
+    let suffix = if first_line == SUMMARY_LEARN_LOG_HEADER_V1 {
+        ",-,-,-"
+    } else if first_line == SUMMARY_LEARN_LOG_HEADER_V2 {
+        ",-,-"
+    } else {
         return Ok(());
-    }
+    };
 
     let mut upgraded = String::new();
     upgraded.push_str(SUMMARY_LEARN_LOG_HEADER);
@@ -15276,7 +15868,8 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
             continue;
         }
         upgraded.push_str(line);
-        upgraded.push_str(",-\n");
+        upgraded.push_str(suffix);
+        upgraded.push('\n');
     }
     std::fs::write(top, upgraded)
 }
@@ -15315,7 +15908,7 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
                 }
             }
         }
-        if head_buf == SUMMARY_LEARN_LOG_HEADER_V1 {
+        if head_buf == SUMMARY_LEARN_LOG_HEADER_V1 || head_buf == SUMMARY_LEARN_LOG_HEADER_V2 {
             upgrade_summary_log_to_current_schema(&top)?;
         } else if !head_buf.is_empty() && head_buf != SUMMARY_LEARN_LOG_HEADER {
             return Err(std::io::Error::new(
@@ -15378,6 +15971,7 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
         }
         out.push(',');
         out.push_str(&test_teacher_csv);
+        out.push_str(",-,-");
         Some(out)
     };
     for (i, line) in lines.iter().enumerate() {
@@ -19604,6 +20198,110 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
+    fn cuda_cpp_sfnn_factorizer_none_migration_can_fold_optimizer_state() {
+        fn seq(len: usize, base: f32) -> Vec<f32> {
+            (0..len).map(|idx| base + idx as f32 * 0.01).collect()
+        }
+        fn group(len: usize, base: f32) -> CudaCppRangerGroupState {
+            CudaCppRangerGroupState {
+                momentum: seq(len, base),
+                velocity: seq(len, base + 100.0),
+                slow_params: seq(len, base + 200.0),
+            }
+        }
+
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 2,
+            l1_hidden: 1,
+            l1_skip: true,
+            l2_size: 1,
+            num_stacks: 4,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 2,
+            factorizer_hand_axis_dim: 1,
+        };
+        let axis_count = shape.factorizer_axis_count();
+        let l1_out = shape.l1_out();
+        let l2_in = shape.l2_in();
+        let optimizer = CudaCppSfnnOptimizerState {
+            l0w: group(shape.input_size * shape.ft_size, 0.0),
+            l0b: group(shape.ft_size, 1.0),
+            l1w: group(shape.num_stacks * l1_out * shape.ft_size, 2.0),
+            l1b: group(shape.num_stacks * l1_out, 3.0),
+            l1fw: Some(group(shape.ft_size * l1_out, 4.0)),
+            l1fb: Some(group(l1_out, 5.0)),
+            l1axw: Some(group(axis_count * shape.ft_size * l1_out, 6.0)),
+            l1axb: Some(group(axis_count * l1_out, 7.0)),
+            l2w: group(shape.num_stacks * shape.l2_size * l2_in, 8.0),
+            l2b: group(shape.num_stacks * shape.l2_size, 9.0),
+            l2fw: Some(group(shape.l2_size * l2_in, 10.0)),
+            l2fb: Some(group(shape.l2_size, 11.0)),
+            l2axw: Some(group(axis_count * shape.l2_size * l2_in, 12.0)),
+            l2axb: Some(group(axis_count * shape.l2_size, 13.0)),
+            l3w: group(shape.num_stacks * shape.l2_size, 14.0),
+            l3b: group(shape.num_stacks, 15.0),
+            l3fw: Some(group(shape.l2_size, 16.0)),
+            l3fb: Some(group(1, 17.0)),
+            l3axw: Some(group(axis_count * shape.l2_size, 18.0)),
+            l3axb: Some(group(axis_count, 19.0)),
+        };
+
+        let mut expected_weights = CudaCppSfnnInitialWeights {
+            shape,
+            l0w: optimizer.l0w.momentum.clone(),
+            l0b: optimizer.l0b.momentum.clone(),
+            l1w: optimizer.l1w.momentum.clone(),
+            l1b: optimizer.l1b.momentum.clone(),
+            l1fw: optimizer.l1fw.as_ref().map(|state| state.momentum.clone()),
+            l1fb: optimizer.l1fb.as_ref().map(|state| state.momentum.clone()),
+            l1axw: optimizer.l1axw.as_ref().map(|state| state.momentum.clone()),
+            l1axb: optimizer.l1axb.as_ref().map(|state| state.momentum.clone()),
+            l2w: optimizer.l2w.momentum.clone(),
+            l2b: optimizer.l2b.momentum.clone(),
+            l2fw: optimizer.l2fw.as_ref().map(|state| state.momentum.clone()),
+            l2fb: optimizer.l2fb.as_ref().map(|state| state.momentum.clone()),
+            l2axw: optimizer.l2axw.as_ref().map(|state| state.momentum.clone()),
+            l2axb: optimizer.l2axb.as_ref().map(|state| state.momentum.clone()),
+            l3w: optimizer.l3w.momentum.clone(),
+            l3b: optimizer.l3b.momentum.clone(),
+            l3fw: optimizer.l3fw.as_ref().map(|state| state.momentum.clone()),
+            l3fb: optimizer.l3fb.as_ref().map(|state| state.momentum.clone()),
+            l3axw: optimizer.l3axw.as_ref().map(|state| state.momentum.clone()),
+            l3axb: optimizer.l3axb.as_ref().map(|state| state.momentum.clone()),
+        };
+        assert!(
+            fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut expected_weights, SfnnFactorizerSpec::NONE).unwrap()
+        );
+
+        let mut migrated = optimizer;
+        assert!(
+            fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
+                &mut migrated,
+                shape,
+                SfnnFactorizerSpec::NONE
+            )
+            .unwrap()
+        );
+
+        assert_eq!(migrated.l1w.momentum, expected_weights.l1w);
+        assert_eq!(migrated.l1b.momentum, expected_weights.l1b);
+        assert_eq!(migrated.l2w.momentum, expected_weights.l2w);
+        assert_eq!(migrated.l2b.momentum, expected_weights.l2b);
+        assert_eq!(migrated.l3w.momentum, expected_weights.l3w);
+        assert_eq!(migrated.l3b.momentum, expected_weights.l3b);
+        assert!(migrated.l1fw.is_none());
+        assert!(migrated.l1axw.is_none());
+        assert!(migrated.l2fw.is_none());
+        assert!(migrated.l2axw.is_none());
+        assert!(migrated.l3fw.is_none());
+        assert!(migrated.l3axw.is_none());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
     fn cuda_cpp_sfnn_factorizer_activation_extracts_base_components_without_changing_effective_weights() {
         fn seq(len: usize, base: f32) -> Vec<f32> {
             (0..len).map(|idx| base + idx as f32 * 0.01).collect()
@@ -20233,18 +20931,22 @@ mod tests {
         // appended as the rightmost summary-only column.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 12, "summary row has 12 cols (no curr_batch + test_teacher)");
+        assert_eq!(cols1.len(), 14, "summary row has 14 cols (no curr_batch + test_teacher + quantized metrics)");
         assert_eq!(cols1[2], "1", "first kept row is sb=1");
         // Index 3 is now `test_value_accuracy` (was `curr_batch`).
         assert_eq!(cols1[3], "0.50", "col 3 is test_value_accuracy (curr_batch dropped)");
         assert_eq!(cols1[6], "0.001", "lr_start is preserved");
         assert_eq!(cols1[7], "0.0007", "lr_end is preserved");
         assert_eq!(cols1[11], "-", "no Args were passed, so test_teacher is unknown");
+        assert_eq!(cols1[12], "-", "quantized accuracy is unknown for a plain summary append");
+        assert_eq!(cols1[13], "-", "quantized loss is unknown for a plain summary append");
         let cols2: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(cols2.len(), 12);
+        assert_eq!(cols2.len(), 14);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
         assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
         assert_eq!(cols2[11], "-");
+        assert_eq!(cols2[12], "-");
+        assert_eq!(cols2[13], "-");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -20291,8 +20993,11 @@ mod tests {
         let top = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let lines: Vec<&str> = top.lines().collect();
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER);
-        assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-");
-        assert_eq!(lines[2], "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe");
+        assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-,-,-");
+        assert_eq!(
+            lines[2],
+            "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe,-,-"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -20369,7 +21074,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1],
-            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,0.250000,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe"
+            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,0.250000,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe,-,-"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -20554,9 +21259,9 @@ mod tests {
         let summary_lines = summary.lines().collect::<Vec<_>>();
         assert_eq!(summary_lines[0], SUMMARY_LEARN_LOG_HEADER);
         assert_eq!(summary_lines.len(), 2);
-        assert_eq!(summary_lines[1].split(',').count(), 12);
+        assert_eq!(summary_lines[1].split(',').count(), 14);
         assert!(summary_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,"));
-        assert!(summary_lines[1].ends_with(",validation.hcpe"));
+        assert!(summary_lines[1].ends_with(",validation.hcpe,-,-"));
 
         let dir2 = tmp.join("0002");
         std::fs::create_dir_all(&dir2).unwrap();
@@ -20591,6 +21296,8 @@ mod tests {
         let summary2_cols = summary2_lines[2].split(',').collect::<Vec<_>>();
         assert_eq!(summary2_cols[9], "25");
         assert_eq!(summary2_cols[11], "validation.hcpe");
+        assert_eq!(summary2_cols[12], "-");
+        assert_eq!(summary2_cols[13], "-");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
