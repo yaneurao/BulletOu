@@ -5014,6 +5014,33 @@ pub struct SfnnTrainStepRunner {
     pub next_upload_slot: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SfnnLayerLrMultipliers {
+    pub l0: f32,
+    pub l1: f32,
+    pub l2: f32,
+    pub l3: f32,
+}
+
+impl Default for SfnnLayerLrMultipliers {
+    fn default() -> Self {
+        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0 }
+    }
+}
+
+impl SfnnLayerLrMultipliers {
+    pub fn validate(self) -> Result<()> {
+        for (name, value) in [("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l3", self.l3)] {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(CudaCppError::message(format!(
+                    "SFNN {name} learning-rate multiplier must be finite and non-negative"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SfnnTrainStepRunner {
     pub fn new(
         ctx: &Context,
@@ -5173,7 +5200,31 @@ impl SfnnTrainStepRunner {
         finalize_loss: bool,
         update_weights: bool,
     ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize_update_and_lr_multipliers(
+            ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            update_weights,
+            SfnnLayerLrMultipliers::default(),
+        )
+    }
+
+    pub fn step_no_readback_with_loss_finalize_update_and_lr_multipliers(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+    ) -> Result<()> {
         self.validate()?;
+        lr_multipliers.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5217,7 +5268,7 @@ impl SfnnTrainStepRunner {
             self.factorizer,
         )?;
         if update_weights {
-            self.update_weights(ctx, params)?;
+            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
         }
         Ok(())
     }
@@ -5275,7 +5326,33 @@ impl SfnnTrainStepRunner {
         finalize_loss: bool,
         update_weights: bool,
     ) -> Result<()> {
+        self.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+            ctx,
+            upload_ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            update_weights,
+            SfnnLayerLrMultipliers::default(),
+        )
+    }
+
+    pub fn step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+    ) -> Result<()> {
         self.validate()?;
+        lr_multipliers.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5326,7 +5403,7 @@ impl SfnnTrainStepRunner {
             )?;
         }
         if update_weights {
-            self.update_weights(ctx, params)?;
+            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
         }
         self.upload_slots[slot_idx].record_compute_done(ctx)
     }
@@ -5351,7 +5428,29 @@ impl SfnnTrainStepRunner {
         batch: SfnnTrainStepHostBatch<'_>,
         update_weights: bool,
     ) -> Result<SfnnTrainStepProfile> {
+        self.step_profiled_no_readback_with_update_and_lr_multipliers(
+            ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            update_weights,
+            SfnnLayerLrMultipliers::default(),
+        )
+    }
+
+    pub fn step_profiled_no_readback_with_update_and_lr_multipliers(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+    ) -> Result<SfnnTrainStepProfile> {
         self.validate()?;
+        lr_multipliers.validate()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5406,7 +5505,7 @@ impl SfnnTrainStepRunner {
         )?;
         after_backward.record(ctx)?;
         if update_weights {
-            self.update_weights(ctx, params)?;
+            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
         }
         stop.record(ctx)?;
         stop.synchronize()?;
@@ -5545,39 +5644,63 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
-    fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
-        update_param_group(
+    fn update_weights_with_lr_multipliers(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        lr_multipliers: SfnnLayerLrMultipliers,
+    ) -> Result<()> {
+        lr_multipliers.validate()?;
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l0w_gradients,
             &self.weights.l0w,
             &self.optimizer_states.l0w,
+            lr_multipliers.l0,
         )?;
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l0b_gradients,
             &self.weights.l0b,
             &self.optimizer_states.l0b,
+            lr_multipliers.l0,
         )?;
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
+            lr_multipliers.l1,
         )?;
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l1b_gradients,
             &self.weights.l1b,
             &self.optimizer_states.l1b,
+            lr_multipliers.l1,
         )?;
         match (&self.weights.l1fw, &self.weights.l1fb, &self.optimizer_states.l1fw, &self.optimizer_states.l1fb) {
             (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
-                update_param_group(ctx, params, &self.backward_workspace.l1fw_gradients, l1fw, l1fw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l1fb_gradients, l1fb, l1fb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l1fw_gradients,
+                    l1fw,
+                    l1fw_state,
+                    lr_multipliers.l1,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l1fb_gradients,
+                    l1fb,
+                    l1fb_state,
+                    lr_multipliers.l1,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
@@ -5585,31 +5708,61 @@ impl SfnnTrainStepRunner {
         }
         match (&self.weights.l1axw, &self.weights.l1axb, &self.optimizer_states.l1axw, &self.optimizer_states.l1axb) {
             (Some(l1axw), Some(l1axb), Some(l1axw_state), Some(l1axb_state)) if self.factorizer.any_axis() => {
-                update_param_group(ctx, params, &self.backward_workspace.l1axw_gradients, l1axw, l1axw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l1axb_gradients, l1axb, l1axb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l1axw_gradients,
+                    l1axw,
+                    l1axw_state,
+                    lr_multipliers.l1,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l1axb_gradients,
+                    l1axb,
+                    l1axb_state,
+                    lr_multipliers.l1,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l1axw/l1axb optional groups mismatch")),
         }
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l2w_gradients,
             &self.weights.l2w,
             &self.optimizer_states.l2w,
+            lr_multipliers.l2,
         )?;
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l2b_gradients,
             &self.weights.l2b,
             &self.optimizer_states.l2b,
+            lr_multipliers.l2,
         )?;
         match (&self.weights.l2fw, &self.weights.l2fb, &self.optimizer_states.l2fw, &self.optimizer_states.l2fb) {
             (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) if self.factorizer.shared => {
-                update_param_group(ctx, params, &self.backward_workspace.l2fw_gradients, l2fw, l2fw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l2fb_gradients, l2fb, l2fb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l2fw_gradients,
+                    l2fw,
+                    l2fw_state,
+                    lr_multipliers.l2,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l2fb_gradients,
+                    l2fb,
+                    l2fb_state,
+                    lr_multipliers.l2,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
@@ -5617,31 +5770,61 @@ impl SfnnTrainStepRunner {
         }
         match (&self.weights.l2axw, &self.weights.l2axb, &self.optimizer_states.l2axw, &self.optimizer_states.l2axb) {
             (Some(l2axw), Some(l2axb), Some(l2axw_state), Some(l2axb_state)) if self.factorizer.any_axis() => {
-                update_param_group(ctx, params, &self.backward_workspace.l2axw_gradients, l2axw, l2axw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l2axb_gradients, l2axb, l2axb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l2axw_gradients,
+                    l2axw,
+                    l2axw_state,
+                    lr_multipliers.l2,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l2axb_gradients,
+                    l2axb,
+                    l2axb_state,
+                    lr_multipliers.l2,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l2axw/l2axb optional groups mismatch")),
         }
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l3w_gradients,
             &self.weights.l3w,
             &self.optimizer_states.l3w,
+            lr_multipliers.l3,
         )?;
-        update_param_group(
+        update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
+            lr_multipliers.l3,
         )?;
         match (&self.weights.l3fw, &self.weights.l3fb, &self.optimizer_states.l3fw, &self.optimizer_states.l3fb) {
             (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) if self.factorizer.shared => {
-                update_param_group(ctx, params, &self.backward_workspace.l3fw_gradients, l3fw, l3fw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l3fb_gradients, l3fb, l3fb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l3fw_gradients,
+                    l3fw,
+                    l3fw_state,
+                    lr_multipliers.l3,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l3fb_gradients,
+                    l3fb,
+                    l3fb_state,
+                    lr_multipliers.l3,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
@@ -5649,8 +5832,22 @@ impl SfnnTrainStepRunner {
         }
         match (&self.weights.l3axw, &self.weights.l3axb, &self.optimizer_states.l3axw, &self.optimizer_states.l3axb) {
             (Some(l3axw), Some(l3axb), Some(l3axw_state), Some(l3axb_state)) if self.factorizer.any_axis() => {
-                update_param_group(ctx, params, &self.backward_workspace.l3axw_gradients, l3axw, l3axw_state)?;
-                update_param_group(ctx, params, &self.backward_workspace.l3axb_gradients, l3axb, l3axb_state)?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l3axw_gradients,
+                    l3axw,
+                    l3axw_state,
+                    lr_multipliers.l3,
+                )?;
+                update_param_group_with_lr_multiplier(
+                    ctx,
+                    params,
+                    &self.backward_workspace.l3axb_gradients,
+                    l3axb,
+                    l3axb_state,
+                    lr_multipliers.l3,
+                )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
@@ -5667,6 +5864,25 @@ fn update_param_group(
     weights: &F32Buffer,
     state: &RangerParamState,
 ) -> Result<()> {
+    update_param_group_with_lr_multiplier(ctx, params, gradients, weights, state, 1.0)
+}
+
+fn update_param_group_with_lr_multiplier(
+    ctx: &Context,
+    params: RangerUpdateParams,
+    gradients: &F32Buffer,
+    weights: &F32Buffer,
+    state: &RangerParamState,
+    lr_multiplier: f32,
+) -> Result<()> {
+    if !(lr_multiplier.is_finite() && lr_multiplier >= 0.0) {
+        return Err(CudaCppError::message("SFNN learning-rate multiplier must be finite and non-negative"));
+    }
+    if lr_multiplier == 0.0 {
+        return gradients.fill(ctx, 0.0);
+    }
+    let mut params = params;
+    params.radam.learning_rate *= lr_multiplier;
     ranger_update_device(
         ctx,
         params,

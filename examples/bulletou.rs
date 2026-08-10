@@ -3084,6 +3084,20 @@ struct Args {
     #[arg(long)]
     sfnn_keep_optimizer_state_on_factorizer_change: bool,
 
+    /// SFNN L1-layer learning-rate multiplier. This scales updates for L1
+    /// base weights/biases and active L1 factorizer tensors only. Use values
+    /// below 1.0 when final fine-tuning without factorizer overfits or damages
+    /// quantized accuracy.
+    #[arg(long, default_value = "1.0")]
+    sfnn_l1_lr_mult: f32,
+
+    /// Freeze SFNN L1 updates for the first N superbatches of each epoch.
+    /// Frozen groups keep weights and Ranger state unchanged; their gradients
+    /// are cleared after backward. This is mainly for final fine-tuning A/B
+    /// tests after changing factorizer settings.
+    #[arg(long, default_value = "0")]
+    sfnn_freeze_l1_sbs: usize,
+
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
     /// for clearer per-batch timings, so use it only for diagnosis.
@@ -3709,6 +3723,14 @@ impl Args {
         }
         if self.sfnn_factorizer.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if !(self.sfnn_l1_lr_mult.is_finite() && self.sfnn_l1_lr_mult >= 0.0) {
+            return Err(format!("--sfnn-l1-lr-mult must be finite and non-negative (got {})", self.sfnn_l1_lr_mult));
+        }
+        if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1_sbs != 0) && !eval_type.uses_layerstack() {
+            return Err(
+                "--sfnn-l1-lr-mult / --sfnn-freeze-l1-sbs apply to SFNN / LayerStack eval types only".to_string()
+            );
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
@@ -9446,6 +9468,20 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
+    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1_sbs != 0 {
+        let freeze = if args.sfnn_freeze_l1_sbs == 0 {
+            paint("off", ConsoleColor::Dim)
+        } else {
+            paint(format!("first {} sb/epoch", args.sfnn_freeze_l1_sbs), ConsoleColor::BoldYellow)
+        };
+        print_startup_kv(
+            "SFNN layer LR",
+            format!(
+                "L1 multiplier={} freeze={freeze}",
+                paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow)
+            ),
+        );
+    }
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
     if profile_steps > 0 {
@@ -9677,14 +9713,20 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         max_active: fast.layout.max_active,
                     };
                     let finalize_loss = chunk_seen_steps == chunk.steps;
+                    let lr_multipliers = cuda_cpp_sfnn_layer_lr_multipliers(
+                        args,
+                        schedule.progress_for_step(accepted_steps_total + chunk_seen_steps),
+                    );
                     runner
-                        .step_no_readback_with_loss_finalize(
+                        .step_no_readback_with_loss_finalize_update_and_lr_multipliers(
                             &ctx,
                             params,
                             loss_kind,
                             output_inv_scale,
                             batch,
                             finalize_loss,
+                            true,
+                            lr_multipliers,
                         )
                         .map_err(|e| e.to_string())?;
                     Ok::<(), String>(())
@@ -10008,15 +10050,17 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let explicit_profile_step = seen_steps <= profile_steps;
         let diagnostic_profile_step =
             !explicit_profile_step && cuda_cpp_should_profile_sfnn_diagnostics(args, progress_for_step);
+        let lr_multipliers = cuda_cpp_sfnn_layer_lr_multipliers(args, progress_for_step);
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
-                .step_profiled_no_readback_with_update(
+                .step_profiled_no_readback_with_update_and_lr_multipliers(
                     &ctx,
                     params,
                     loss_kind,
                     output_inv_scale,
                     batch,
                     is_optimizer_step,
+                    lr_multipliers,
                 )
                 .map_err(|e| e.to_string())?;
             sfnn_diagnostics.observe_profile(&profile);
@@ -10056,7 +10100,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             }
         } else {
             runner
-                .step_pipelined_no_readback_with_loss_finalize_and_update(
+                .step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
                     &ctx,
                     &upload_ctx,
                     params,
@@ -10065,6 +10109,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     batch,
                     should_report,
                     is_optimizer_step,
+                    lr_multipliers,
                 )
                 .map_err(|e| e.to_string())?;
         }
@@ -14899,6 +14944,18 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_layer_lr_multipliers(
+    args: &Args,
+    progress: Option<CudaCppScheduleProgress>,
+) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
+    let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers { l1: args.sfnn_l1_lr_mult, ..Default::default() };
+    if args.sfnn_freeze_l1_sbs > 0 && progress.is_some_and(|progress| progress.superbatch <= args.sfnn_freeze_l1_sbs) {
+        multipliers.l1 = 0.0;
+    }
+    multipliers
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn append_cuda_cpp_sfnn_diagnostics_log(
     args: &Args,
     progress: CudaCppScheduleProgress,
@@ -15364,6 +15421,8 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorized_l1={}", effective_sfnn_factorized_l1(args)),
         format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
+        format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
+        format!("sfnn_freeze_l1_sbs={}", args.sfnn_freeze_l1_sbs),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
         format!("test_batch_size={}", args.test_batch_size),
@@ -15433,6 +15492,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "wrm_in_scaling=", "wrm_in_offset=", "wrm_in_scaling=340.000000000");
     ensure_line_after(&mut out, "wrm_target_offset=", "wrm_in_scaling=", "wrm_target_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_target_scaling=", "wrm_target_offset=", "wrm_target_scaling=380.000000000");
+    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer=", "sfnn_l1_lr_mult=1.000000000");
+    ensure_line_after(&mut out, "sfnn_freeze_l1_sbs=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1_sbs=0");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');
