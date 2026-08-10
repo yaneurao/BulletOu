@@ -59,6 +59,15 @@ engine_score = raw / FV_SCALE
 
 `--fv-scale 40` のように整数を指定した場合は、その `FV_SCALE` に固定してoffsetだけを探します。
 
+offset の選び方は `--objective` で指定できます。
+
+| 指定 | 意味 |
+|---|---|
+| `--objective loss` | 検証lossが最も小さいoffsetを選ぶ。デフォルト |
+| `--objective accuracy` | 符号一致accuracyが最も高いoffsetを選ぶ |
+
+棋力計測に出す候補を作る場合は、`loss` 版と `accuracy` 版を両方作って対局で比べるのが安全です。offset は全LayerStack共通の1パラメータだけなので、重い再学習なしに試せます。
+
 出力例:
 
 ```text

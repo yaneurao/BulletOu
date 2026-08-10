@@ -1494,6 +1494,10 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
+    /// Search objective used to choose the folded offset.
+    #[arg(long, value_enum, default_value = "loss")]
+    objective: QuantizedCalibrateObjective,
+
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
     quant_ft_round: QuantizedRoundMode,
@@ -1987,6 +1991,24 @@ impl QuantizedRoundMode {
         match self {
             QuantizedRoundMode::Floor => "floor",
             QuantizedRoundMode::Nearest => "nearest",
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "lowercase")]
+enum QuantizedCalibrateObjective {
+    Loss,
+    Accuracy,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedCalibrateObjective {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Loss => "loss",
+            Self::Accuracy => "accuracy",
         }
     }
 }
@@ -6164,15 +6186,31 @@ fn quantized_calibration_candidate_is_better(
     candidate: &QuantizedCalibrationCandidate,
     best: &QuantizedCalibrationCandidate,
     scale_estimate: Option<&QuantizedScaleEstimate>,
+    objective: QuantizedCalibrateObjective,
 ) -> bool {
-    if candidate.loss < best.loss {
-        return true;
-    }
-    if candidate.loss > best.loss {
-        return false;
-    }
-    if candidate.report.sign_matches != best.report.sign_matches {
-        return candidate.report.sign_matches > best.report.sign_matches;
+    match objective {
+        QuantizedCalibrateObjective::Loss => {
+            if candidate.loss < best.loss {
+                return true;
+            }
+            if candidate.loss > best.loss {
+                return false;
+            }
+            if candidate.report.sign_matches != best.report.sign_matches {
+                return candidate.report.sign_matches > best.report.sign_matches;
+            }
+        }
+        QuantizedCalibrateObjective::Accuracy => {
+            if candidate.report.sign_matches != best.report.sign_matches {
+                return candidate.report.sign_matches > best.report.sign_matches;
+            }
+            if candidate.loss < best.loss {
+                return true;
+            }
+            if candidate.loss > best.loss {
+                return false;
+            }
+        }
     }
     if candidate.offset.abs() != best.offset.abs() {
         return candidate.offset.abs() < best.offset.abs();
@@ -6206,6 +6244,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     eprintln!("  output            = {}", args.output.display());
     eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
     eprintln!("  layerstack        = {} ({} stack(s))", layerstack.cli_name(), format_count(weights.num_stacks));
+    eprintln!("  objective         = {}", args.objective.cli_name());
     eprintln!("  fv_scale          = {}", args.fv_scale.cli_label());
     if matches!(args.fv_scale, QuantizedCalibrateFvScale::Auto) {
         eprintln!("  fv_scale search   = {}..={} step {}", args.fv_scale_min, args.fv_scale_max, args.fv_scale_step);
@@ -6293,7 +6332,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     let best = candidates
         .into_iter()
         .reduce(|best, candidate| {
-            if quantized_calibration_candidate_is_better(&candidate, &best, scale_estimate.as_ref()) {
+            if quantized_calibration_candidate_is_better(&candidate, &best, scale_estimate.as_ref(), args.objective) {
                 candidate
             } else {
                 best
@@ -6382,6 +6421,7 @@ fn main() {
                     println!("  output            = {}", report.output.display());
                     println!("  arch              = {}", args.arch);
                     println!("  layerstack        = {}", args.effective_layerstack().cli_name());
+                    println!("  objective         = {}", args.objective.cli_name());
                     println!("  records           = {}", format_count(report.records));
                     println!("  stacks            = {}", format_count(report.stacks));
                     println!("  searched_fv_scales= {}", format_count(report.searched_fv_scales));

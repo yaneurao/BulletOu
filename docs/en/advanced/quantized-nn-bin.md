@@ -59,6 +59,15 @@ If `--fv-scale` is omitted, BulletOu measures with `FV_SCALE=40`. This is the in
 
 If you pass an integer such as `--fv-scale 40`, BulletOu keeps that `FV_SCALE` fixed and searches only the offset.
 
+Use `--objective` to choose how the offset is selected.
+
+| Setting | Meaning |
+|---|---|
+| `--objective loss` | Choose the offset with the lowest validation loss. Default |
+| `--objective accuracy` | Choose the offset with the highest sign-agreement accuracy |
+
+For engine-strength testing, it is useful to create both the `loss` version and the `accuracy` version and compare them by games. The offset is only one global parameter shared by all LayerStacks, so this is cheap to test without retraining.
+
 Example output:
 
 ```text
