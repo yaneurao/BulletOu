@@ -210,14 +210,14 @@ checkpoint directory. Those rows are observation logs, not resumable state;
 on resume, rows after the latest complete checkpoint are trimmed before
 schedule calculation.
 
-cuda-cpp batch-level loss progress is not streamed to stdout. It is appended to `<output>/cuda-cpp-progress.log` as CSV:
+cuda-cpp minibatch loss readback is disabled by default because it synchronises the GPU stream and the value is too noisy for training decisions. When `--cuda-cpp-loss-readback-interval N` is specified for diagnostics, the sampled minibatch loss is appended to `<output>/cuda-cpp-progress.log` as CSV:
 
 ```
 kind,step,total_steps,optimizer_step,epoch,superbatch,superbatches_per_epoch,batch,batches_per_superbatch,positions,train_elapsed_sec,pos_per_sec,loss_mean,source
 SFNN,5300,21960,5300,1,3,36,1220,610,86835200,12.345678,7034567,0.06564487,C:\shogi\teacher\tayayan\good-testpsv20260717.psv
 ```
 
-The cuda-cpp stdout `pos/s` and progress-log `pos_per_sec` exclude checkpoint file saving, validation, loss readback, and progress-log write time.
+The cuda-cpp stdout `pos/s` and progress-log `pos_per_sec` exclude checkpoint file saving, validation, optional loss readback, and progress-log write time.
 
 per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
 
@@ -231,7 +231,7 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 | `curr_batch` | (per-save 版のみ) 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
 | `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。sb 境界行のみ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
 | `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。sb 境界行のみ実値、それ以外は `-` |
-| `train_value_loss` | bullet が最後の 32 batch で観測した training loss (移動平均ではなく 32 batch ウィンドウの即値) |
+| `train_value_loss` | 予約列。現在の cuda-cpp direct trainer は `-` を書く。minibatch loss を診断したい場合は `--cuda-cpp-loss-readback-interval N` で `cuda-cpp-progress.log` に出力する |
 | `lr_start` | その行が表す区間の開始時点の学習率。summary 行ではその superbatch の開始 LR |
 | `lr_end` | その行が表す区間の最後の batch で使った学習率。summary 行ではその superbatch の終端側 LR |
 | `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |

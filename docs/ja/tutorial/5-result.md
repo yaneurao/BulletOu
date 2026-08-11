@@ -50,7 +50,7 @@ KPP_synthesized.bin
 | `superbatch` | epoch 内の何 sb 目か |
 | `test_value_accuracy` | 検証局面での符号一致率 |
 | `test_value_loss` | 検証局面での loss |
-| `train_value_loss` | 学習 batch 側の loss |
+| `train_value_loss` | 予約列。現在の cuda-cpp 学習では `-` |
 | `positions` | 累積で処理した局面数 |
 
 詳しい読み方やプロットは [応用編](../advanced/) を参照してください。

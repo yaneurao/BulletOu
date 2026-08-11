@@ -50,7 +50,7 @@ The main columns are:
 | `superbatch` | Current sb inside the epoch |
 | `test_value_accuracy` | Validation sign accuracy |
 | `test_value_loss` | Validation loss |
-| `train_value_loss` | Training-batch loss |
+| `train_value_loss` | Reserved column. Current cuda-cpp training writes `-` |
 | `positions` | Total processed positions |
 
 For deeper log analysis and plotting, see the [Advanced guide](../advanced/).

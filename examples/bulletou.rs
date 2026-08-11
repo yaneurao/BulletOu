@@ -3231,9 +3231,9 @@ struct Args {
     #[arg(long)]
     bench_teacher_prepare_batches: Option<usize>,
 
-    /// Read and print C++/CUDA direct-trainer loss every N steps. This
-    /// synchronises the compute stream. The default `0` reads loss only for
-    /// checkpoint/validation/final reporting; specify e.g. `10` for diagnosis.
+    /// Read and write C++/CUDA direct-trainer minibatch loss every N steps
+    /// for diagnostics. This synchronises the compute stream, so the default
+    /// `0` disables training-loss readback entirely.
     #[arg(long, default_value = "0")]
     cuda_cpp_loss_readback_interval: usize,
 
@@ -7631,14 +7631,7 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
-    print_startup_kv(
-        "loss progress log",
-        format!(
-            "{} ({})",
-            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
-            cuda_cpp_loss_progress_policy(args)
-        ),
-    );
+    print_cuda_cpp_loss_progress_log(args);
 
     for component in [CudaCppKpptComponent::Kk, CudaCppKpptComponent::Kkp, CudaCppKpptComponent::Kpp] {
         eprintln!();
@@ -7723,9 +7716,6 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
     let output_inv_scale = 1.0_f32;
     let mut seen_steps = 0usize;
-    let mut reported_loss_sum = 0.0_f64;
-    let mut reported_loss_count = 0usize;
-    let mut last_loss = 0.0_f32;
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_dataloader_pos = None;
     let dataloader_resume_pos =
@@ -7804,8 +7794,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        let should_report = is_checkpoint_step
-            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         runner
             .step_no_readback_with_loss_finalize(&ctx, params, loss_kind, output_inv_scale, batch, should_report)
             .map_err(|e| e.to_string())?;
@@ -7813,9 +7802,6 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             ctx.synchronize().map_err(|e| e.to_string())?;
             let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
-            last_loss = loss.mean;
-            reported_loss_sum += f64::from(loss.mean);
-            reported_loss_count += 1;
             let positions = seen_steps.saturating_mul(batch_size);
             let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
             let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
@@ -7857,7 +7843,6 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                     &trained_weights,
                     &trained_optimizer_states,
                     completed_step_offset + seen_steps,
-                    last_loss,
                     &chunk,
                     schedule.batches_per_superbatch,
                     dataloader_pos,
@@ -7923,10 +7908,9 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
         "  {} {} train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+         {}",
         paint("cuda-cpp", ConsoleColor::Dim),
         component.label(),
         paint("ok", ConsoleColor::BoldGreen),
@@ -8170,7 +8154,6 @@ fn write_cuda_cpp_kppt_component_checkpoint(
     weights: &bulletou_cuda_cpp::KpptTableTrainWeightsReadback,
     optimizer_states: &bulletou_cuda_cpp::KpptTableRangerOptimizerStatesReadback,
     completed_steps: usize,
-    train_loss: f32,
     chunk: &CudaCppScheduleChunk,
     curr_batch: usize,
     dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
@@ -8198,7 +8181,7 @@ fn write_cuda_cpp_kppt_component_checkpoint(
         optimizer_states,
         completed_steps,
     )?;
-    std::fs::write(dir.join("log.txt"), format!("{},{},{:.8}\n", chunk.superbatch, curr_batch, train_loss))
+    std::fs::write(dir.join("log.txt"), format!("{},{},-\n", chunk.superbatch, curr_batch))
         .map_err(|err| format!("failed to write {}: {err}", dir.join("log.txt").display()))?;
     std::fs::write(dir.join("teacher.txt"), format!("{}\n", args.teacher))
         .map_err(|err| format!("failed to write {}: {err}", dir.join("teacher.txt").display()))?;
@@ -8413,14 +8396,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     if profile_steps > 0 {
         print_startup_kv_colored("profile steps", format_count(profile_steps), ConsoleColor::Yellow);
     }
-    print_startup_kv(
-        "loss progress log",
-        format!(
-            "{} ({})",
-            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
-            cuda_cpp_loss_progress_policy(args)
-        ),
-    );
+    print_cuda_cpp_loss_progress_log(args);
 
     let cuda_shape = CudaNnueForwardShape {
         input_size: initial_weights.shape.input_size,
@@ -8465,9 +8441,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
-    let mut reported_loss_sum = 0.0_f64;
-    let mut reported_loss_count = 0usize;
-    let mut last_loss = 0.0_f32;
     let completed_step_offset = initial_state.completed_steps;
     let mut profile_upload_ms = 0.0_f64;
     let mut profile_forward_ms = 0.0_f64;
@@ -8622,10 +8595,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 let checkpoint_started = std::time::Instant::now();
                 let mut readback_elapsed = std::time::Duration::ZERO;
                 let readback_started = std::time::Instant::now();
-                let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
-                last_loss = loss.mean;
-                reported_loss_sum += f64::from(loss.mean);
-                reported_loss_count += 1;
                 let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                 let trained_optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
                 readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
@@ -8686,7 +8655,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: accepted_steps_total,
-                            train_loss: last_loss,
                             test_metrics: Some(test_metrics),
                             lr_start: plateau_state.current_lr,
                             lr_end: plateau_state.current_lr,
@@ -8824,12 +8792,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let elapsed = started.elapsed().as_secs_f64();
         let positions = accepted_steps_total.saturating_mul(batch_size);
         let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-        let reported_avg_loss =
-            if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
             "  {} plateau train = {}: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}, \
-             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}",
             paint("cuda-cpp", ConsoleColor::Dim),
             paint("ok", ConsoleColor::BoldGreen),
             colored_positions(positions),
@@ -8894,8 +8859,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        let should_report = is_checkpoint_step
-            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         if seen_steps <= profile_steps {
             let profile = runner
                 .step_profiled_no_readback(&ctx, params, loss_kind, output_inv_scale, batch)
@@ -8934,9 +8898,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             ctx.synchronize().map_err(|e| e.to_string())?;
             let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
-            last_loss = loss.mean;
-            reported_loss_sum += f64::from(loss.mean);
-            reported_loss_count += 1;
             let positions = seen_steps.saturating_mul(batch_size);
             let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
             let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
@@ -8996,7 +8957,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: seen_steps,
-                            train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
                             lr_end: chunk.lr_end,
@@ -9057,7 +9017,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: seen_steps,
-                            train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
                             lr_end: chunk.lr_end,
@@ -9120,10 +9079,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
         "  {} direct train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+         {}",
         paint("cuda-cpp", ConsoleColor::Dim),
         paint("ok", ConsoleColor::BoldGreen),
         colored_positions(positions),
@@ -9207,7 +9165,6 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 curr_batch: chunk.steps,
                 prior_positions: schedule.prior_positions,
                 train_steps: seen_steps,
-                train_loss: last_loss,
                 test_metrics,
                 lr_start: chunk.lr_start,
                 lr_end: chunk.lr_end,
@@ -9661,14 +9618,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if profile_steps > 0 {
         print_startup_kv_colored("profile steps", format_count(profile_steps), ConsoleColor::Yellow);
     }
-    print_startup_kv(
-        "loss progress log",
-        format!(
-            "{} ({})",
-            paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
-            cuda_cpp_loss_progress_policy(args)
-        ),
-    );
+    print_cuda_cpp_loss_progress_log(args);
     if args.cuda_cpp_diagnostics_rate > 0 {
         print_startup_kv(
             "diagnostics log",
@@ -9713,9 +9663,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
     let mut optimizer_updates = 0usize;
-    let mut reported_loss_sum = 0.0_f64;
-    let mut reported_loss_count = 0usize;
-    let mut last_loss = 0.0_f32;
     let mut profile_upload_ms = 0.0_f64;
     let mut profile_forward_ms = 0.0_f64;
     let mut profile_loss_ms = 0.0_f64;
@@ -9918,10 +9865,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 let checkpoint_started = std::time::Instant::now();
                 let mut readback_elapsed = std::time::Duration::ZERO;
                 let readback_started = std::time::Instant::now();
-                let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
-                last_loss = loss.mean;
-                reported_loss_sum += f64::from(loss.mean);
-                reported_loss_count += 1;
                 let trained_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
                 readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
                 let validation_started = std::time::Instant::now();
@@ -9986,7 +9929,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: accepted_steps_total,
-                            train_loss: last_loss,
                             test_metrics: Some(test_metrics),
                             lr_start: plateau_state.current_lr,
                             lr_end: plateau_state.current_lr,
@@ -10140,12 +10082,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let elapsed = started.elapsed().as_secs_f64();
         let positions = accepted_steps_total.saturating_mul(batch_size);
         let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-        let reported_avg_loss =
-            if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
         eprintln!(
             "  {} plateau train = {}: accepted_steps={accepted_steps_total}, attempted_steps={attempted_steps_total}, \
-             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}, \
-             reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+             {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, {}",
             paint("cuda-cpp SFNN", ConsoleColor::Dim),
             paint("ok", ConsoleColor::BoldGreen),
             colored_positions(positions),
@@ -10223,8 +10162,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
-        let should_report = is_checkpoint_step
-            || cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
+        let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         let explicit_profile_step = seen_steps <= profile_steps;
         let diagnostic_profile_step =
             !explicit_profile_step && cuda_cpp_should_profile_sfnn_diagnostics(args, progress_for_step);
@@ -10298,9 +10236,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ctx.synchronize().map_err(|e| e.to_string())?;
             let log_started = std::time::Instant::now();
             let loss = runner.read_loss(&ctx).map_err(|e| e.to_string())?;
-            last_loss = loss.mean;
-            reported_loss_sum += f64::from(loss.mean);
-            reported_loss_count += 1;
             let positions = seen_steps.saturating_mul(batch_size);
             let excluded_for_log = excluded_elapsed.saturating_add(log_started.elapsed());
             let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_for_log);
@@ -10371,7 +10306,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: seen_steps,
-                            train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
                             lr_end: chunk.lr_end,
@@ -10462,7 +10396,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             curr_batch: schedule.batches_per_superbatch,
                             prior_positions: schedule.prior_positions,
                             train_steps: seen_steps,
-                            train_loss: last_loss,
                             test_metrics,
                             lr_start: chunk.lr_start,
                             lr_end: chunk.lr_end,
@@ -10561,10 +10494,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
     let (train_elapsed_sec, positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
-    let reported_avg_loss = if reported_loss_count > 0 { reported_loss_sum / reported_loss_count as f64 } else { 0.0 };
     eprintln!(
         "  {} direct train = {}: steps={seen_steps}, {}, train_elapsed={train_elapsed_sec:.3}s, elapsed={elapsed:.3}s, \
-         {}, reported_avg_loss={reported_avg_loss:.8}, last_loss={last_loss:.8}",
+         {}",
         paint("cuda-cpp SFNN", ConsoleColor::Dim),
         paint("ok", ConsoleColor::BoldGreen),
         colored_positions(positions),
@@ -10669,7 +10601,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 curr_batch: chunk.steps,
                 prior_positions: schedule.prior_positions,
                 train_steps: seen_steps,
-                train_loss: last_loss,
                 test_metrics,
                 lr_start: chunk.lr_start,
                 lr_end: chunk.lr_end,
@@ -11216,7 +11147,6 @@ struct CudaCppCheckpointLog {
     curr_batch: usize,
     prior_positions: usize,
     train_steps: usize,
-    train_loss: f32,
     test_metrics: Option<TestMetrics>,
     lr_start: f32,
     lr_end: f32,
@@ -11326,12 +11256,11 @@ fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog) -> Stri
     };
     let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
-        "{eval},{epoch},{superbatch},{batch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher}\n",
+        "{eval},{epoch},{superbatch},{batch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher}\n",
         eval = eval_field,
         epoch = log.epoch,
         superbatch = log.superbatch,
         batch = log.curr_batch,
-        train_loss = log.train_loss,
         lr_start = log.lr_start,
         lr_end = log.lr_end,
         lambda = args.lambda,
@@ -11352,11 +11281,10 @@ fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog) -> St
     };
     let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
-        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},{train_loss:.6},{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher},-,-\n",
+        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher},-,-\n",
         eval = eval_field,
         epoch = log.epoch,
         superbatch = log.superbatch,
-        train_loss = log.train_loss,
         lr_start = log.lr_start,
         lr_end = log.lr_end,
         lambda = args.lambda,
@@ -15002,10 +14930,10 @@ fn cuda_cpp_tatara_uniform_fan_in_init(len: usize, seed: u64, fan_in: usize, ini
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_read_loss(step: usize, total_steps: usize, interval: usize) -> bool {
-    if step == total_steps {
-        true
-    } else if interval == 0 {
+    if interval == 0 {
         false
+    } else if step == total_steps {
+        true
     } else {
         step == 1 || step % interval == 0
     }
@@ -15161,9 +15089,25 @@ fn cuda_cpp_diagnostics_log_path(args: &Args) -> PathBuf {
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_loss_progress_policy(args: &Args) -> String {
     if args.cuda_cpp_loss_readback_interval == 0 {
-        "checkpoint/validation/final only".to_string()
+        "disabled".to_string()
     } else {
-        format!("step 1, every {} step(s), checkpoint, validation, final", args.cuda_cpp_loss_readback_interval)
+        format!("step 1, every {} step(s), final", args.cuda_cpp_loss_readback_interval)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_cuda_cpp_loss_progress_log(args: &Args) {
+    if args.cuda_cpp_loss_readback_interval == 0 {
+        print_startup_kv_colored("train loss readback", "disabled", ConsoleColor::Dim);
+    } else {
+        print_startup_kv(
+            "diagnostic loss log",
+            format!(
+                "{} ({})",
+                paint(cuda_cpp_loss_progress_log_path(args).display(), ConsoleColor::Cyan),
+                cuda_cpp_loss_progress_policy(args)
+            ),
+        );
     }
 }
 
@@ -16041,7 +15985,11 @@ fn prepare_resume_config_or_exit(args: &Args) {
 ///   96, ...). Combine with `superbatch` for
 ///   `(superbatch - 1) * effective_batches_per_superbatch + curr_batch` to get
 ///   the total batch count.
-/// - `value_loss`: bullet's per-32-batch loss value at that point.
+/// - `train_value_loss`: reserved training-loss column. The cuda-cpp
+///   trainer writes `-` because minibatch loss is noisy and reading it
+///   synchronises the GPU stream. For diagnosis, use
+///   `--cuda-cpp-loss-readback-interval N`, which writes minibatch loss to
+///   `cuda-cpp-progress.log` instead of the checkpoint/summary CSV.
 /// - `lr_start`: learning rate at the start of the row's interval.
 /// - `lr_end`: learning rate used by the last batch in the row's interval.
 /// - `lambda`: `--lambda` value at that point (constant per run), formatted
@@ -16083,8 +16031,8 @@ const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accurac
 /// the summary lives next to them so they don't shadow each other.
 const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
 
-/// Fine-grained cuda-cpp loss progress is intentionally written to a file
-/// instead of stdout; console output stays at checkpoint/validation granularity.
+/// Optional fine-grained cuda-cpp minibatch loss progress. Disabled by
+/// default; enabling it synchronises the GPU stream every configured interval.
 const CUDA_CPP_PROGRESS_LOG_NAME: &str = "cuda-cpp-progress.log";
 const CUDA_CPP_PROGRESS_LOG_HEADER: &str = "kind,step,total_steps,optimizer_step,epoch,superbatch,superbatches_per_epoch,batch,batches_per_superbatch,positions,train_elapsed_sec,pos_per_sec,loss_mean,source";
 const CUDA_CPP_DIAGNOSTICS_LOG_NAME: &str = "cuda-cpp-diagnostics.log";
@@ -16269,11 +16217,12 @@ impl From<TestMetrics> for PlateauMetrics {
 /// (= [`LEARN_LOG_HEADER`]) is the caller's responsibility, so the same
 /// body can be concatenated under a single header by `assemble_numbered_dirs`.
 ///
-/// The `train_value_loss` column carries bullet's loss (= the third field
-/// of `log.txt`, which is the running average of training-loss over the
-/// last 32 batches). `test_value_accuracy` and `test_value_loss` are the
-/// per-superbatch held-out validation result from `--test-teacher`; both
-/// are `-` when the caller passes `test_metrics = None`.
+/// For legacy raw bullet logs, the `train_value_loss` column carries the
+/// third field of `log.txt`. New cuda-cpp checkpoints write `-` there and
+/// keep minibatch loss only in the optional diagnostic progress log.
+/// `test_value_accuracy` and `test_value_loss` are the per-superbatch
+/// held-out validation result from `--test-teacher`; both are `-` when the
+/// caller passes `test_metrics = None`.
 fn enrich_bullet_log_to_csv(
     raw: &str,
     ctx: &LogContext,
@@ -19914,7 +19863,7 @@ mod tests {
 
         assert!(!cuda_cpp_should_read_loss(1, 50, 0));
         assert!(!cuda_cpp_should_read_loss(49, 50, 0));
-        assert!(cuda_cpp_should_read_loss(50, 50, 0));
+        assert!(!cuda_cpp_should_read_loss(50, 50, 0));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -22027,7 +21976,6 @@ mod tests {
                 curr_batch: 1,
                 prior_positions: 0,
                 train_steps: 3,
-                train_loss: 0.25,
                 test_metrics: Some(TestMetrics { accuracy: 0.625, loss: 0.125 }),
                 lr_start: args.lr,
                 lr_end: args.lr,
@@ -22042,7 +21990,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1],
-            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,0.250000,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe,-,-"
+            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,-,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe,-,-"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -22094,7 +22042,6 @@ mod tests {
                 curr_batch: 1,
                 prior_positions: 0,
                 train_steps: 3,
-                train_loss: 0.25,
                 test_metrics: Some(TestMetrics { accuracy: 0.625, loss: 0.125 }),
                 lr_start: args.lr,
                 lr_end: args.lr,
@@ -22205,7 +22152,6 @@ mod tests {
                 curr_batch: 3,
                 prior_positions: 0,
                 train_steps: 3,
-                train_loss: 0.25,
                 test_metrics: Some(metrics),
                 lr_start: args.lr,
                 lr_end: args.lr,
@@ -22220,7 +22166,7 @@ mod tests {
         let learn_lines = learn.lines().collect::<Vec<_>>();
         assert_eq!(learn_lines[0], LEARN_LOG_HEADER);
         assert!(learn_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,3,"));
-        assert!(learn_lines[1].contains(",0.625000,0.125000,0.250000,"));
+        assert!(learn_lines[1].contains(",0.625000,0.125000,-,"));
         assert!(learn_lines[1].contains(",15,teacher.psv"));
 
         let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
@@ -22244,7 +22190,6 @@ mod tests {
                 curr_batch: 2,
                 prior_positions: 0,
                 train_steps: 5,
-                train_loss: 0.5,
                 test_metrics: None,
                 lr_start: args.lr,
                 lr_end: args.lr,
