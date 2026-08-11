@@ -2817,6 +2817,7 @@ struct SfnnFactorizerAlphaSpec {
 }
 
 impl SfnnFactorizerAlphaSpec {
+    const MAX: f32 = 2.0;
     const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
 
     fn is_default(self) -> bool {
@@ -2836,9 +2837,10 @@ impl SfnnFactorizerAlphaSpec {
             .trim()
             .parse()
             .map_err(|_| format!("invalid SFNN factorizer alpha `{raw}`: `{token}` is not a number"))?;
-        if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+        if !(value.is_finite() && (0.0..=Self::MAX).contains(&value)) {
             return Err(format!(
-                "invalid SFNN factorizer alpha `{raw}`: value must be finite and in [0, 1] (got {value})"
+                "invalid SFNN factorizer alpha `{raw}`: value must be finite and in [0, {}] (got {value})",
+                Self::MAX
             ));
         }
         Ok(value)
@@ -3649,7 +3651,7 @@ struct Args {
     /// backward, validation, and `nn.bin` export. Accepted values:
     /// `0.95`, `all=0.95`, `shared=0.95`, `king=0.90`,
     /// `hand=0.90`, or comma-separated forms such as
-    /// `shared=0.95,king=0.90,hand=0.90`. Values must be in [0, 1].
+    /// `shared=0.95,king=1.05,hand=0.90`. Values must be in [0, 2].
     #[arg(long = "sfnn-factorizer-alpha")]
     sfnn_factorizer_alpha: Option<SfnnFactorizerAlphaSpec>,
 
@@ -19037,9 +19039,9 @@ mod tests {
         assert_eq!(scalar.hand_axis, 0.75);
         assert_eq!(scalar.config_string(), "shared=0.750000000,king_axis=0.750000000,hand_axis=0.750000000");
 
-        let per_axis: SfnnFactorizerAlphaSpec = "shared=0.95,king=0.80,hand=0.60".parse().unwrap();
+        let per_axis: SfnnFactorizerAlphaSpec = "shared=0.95,king=1.10,hand=0.60".parse().unwrap();
         assert_eq!(per_axis.shared, 0.95);
-        assert_eq!(per_axis.king_axis, 0.80);
+        assert_eq!(per_axis.king_axis, 1.10);
         assert_eq!(per_axis.hand_axis, 0.60);
 
         let all_then_override: SfnnFactorizerAlphaSpec = "all=0.50,king=0.90".parse().unwrap();
@@ -19050,7 +19052,7 @@ mod tests {
 
     #[test]
     fn sfnn_factorizer_alpha_rejects_out_of_range_and_none_factorizer() {
-        assert!("1.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
+        assert!("2.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("-0.1".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("king=nan".parse::<SfnnFactorizerAlphaSpec>().is_err());
 

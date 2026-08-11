@@ -1018,12 +1018,14 @@ pub struct SfnnFactorizerAlpha {
 
 impl SfnnFactorizerAlpha {
     pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
+    const MAX: f32 = 2.0;
 
     fn validate(self) -> Result<()> {
         for (name, value) in [("shared", self.shared), ("king-axis", self.king_axis), ("hand-axis", self.hand_axis)] {
-            if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+            if !(value.is_finite() && (0.0..=Self::MAX).contains(&value)) {
                 return Err(CudaCppError::message(format!(
-                    "SFNN factorizer alpha for {name} must be finite and in [0, 1]"
+                    "SFNN factorizer alpha for {name} must be finite and in [0, {}]",
+                    Self::MAX
                 )));
             }
         }
