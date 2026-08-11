@@ -207,7 +207,7 @@ W_effective = W_base + W_shared + W_axis
     --tag k29-axis
 ```
 
-factorizerを少し弱めたい場合は `--sfnn-factorizer-alpha` を使います。
+factorizerの効き具合を変えたい場合は `--sfnn-factorizer-alpha` を使います。
 
 ```text
 W_effective = W_base
@@ -238,6 +238,8 @@ king と hand を別々に弱める場合:
 ```
 
 `alpha=1.0` が通常の状態です。`alpha=0.0` にすると、そのfactorizer成分はforwardに足されず、その成分への勾配も0になります。これは「保存済みのfactorizer tensorをbase weightへ畳み込む」操作ではありません。factorizerを完全に外した状態で追加学習したい場合は `--sfnn-factorizer none` を使います。
+
+`alpha` は `1.0` より大きくすることもできます。指定可能範囲は `0.0` から `10.0` です。たとえば `king=2.0` は king-axis 成分を forward で2倍して足し、同時に king-axis tensor への勾配も2倍します。大きすぎる値は学習を不安定にする可能性があるため、実験用途として扱ってください。
 
 `nn.bin` を書き出すときは、上の `W_effective` の形に畳み込まれます。そのため `--sfnn-factorizer-alpha king=0.90` で保存した `nn.bin` には、king axis成分が90%で反映されます。
 

@@ -2817,7 +2817,7 @@ struct SfnnFactorizerAlphaSpec {
 }
 
 impl SfnnFactorizerAlphaSpec {
-    const MAX: f32 = 2.0;
+    const MAX: f32 = 10.0;
     const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
 
     fn is_default(self) -> bool {
@@ -3651,7 +3651,7 @@ struct Args {
     /// backward, validation, and `nn.bin` export. Accepted values:
     /// `0.95`, `all=0.95`, `shared=0.95`, `king=0.90`,
     /// `hand=0.90`, or comma-separated forms such as
-    /// `shared=0.95,king=1.05,hand=0.90`. Values must be in [0, 2].
+    /// `shared=0.95,king=1.50,hand=0.90`. Values must be in [0, 10].
     #[arg(long = "sfnn-factorizer-alpha")]
     sfnn_factorizer_alpha: Option<SfnnFactorizerAlphaSpec>,
 
@@ -19001,7 +19001,8 @@ mod tests {
 
     #[test]
     fn sfnn_factorizer_alpha_rejects_out_of_range_and_none_factorizer() {
-        assert!("2.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
+        assert!("10.0".parse::<SfnnFactorizerAlphaSpec>().is_ok());
+        assert!("10.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("-0.1".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("king=nan".parse::<SfnnFactorizerAlphaSpec>().is_err());
 

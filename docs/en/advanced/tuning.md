@@ -230,7 +230,7 @@ Example:
     --tag k29-axis
 ```
 
-Use `--sfnn-factorizer-alpha` when you want factorizer terms to contribute less strongly.
+Use `--sfnn-factorizer-alpha` when you want to change how strongly factorizer terms contribute.
 
 ```text
 W_effective = W_base
@@ -261,6 +261,8 @@ To set every factorizer term to the same strength:
 ```
 
 `alpha=1.0` is the normal setting. With `alpha=0.0`, that factorizer term is not added in forward, and its gradient is also zero. This does not fold stored factorizer tensors into the base weights. If you want to continue training without factorizer terms, use `--sfnn-factorizer none`.
+
+`alpha` can also be larger than `1.0`. The accepted range is `0.0` to `10.0`. For example, `king=2.0` adds the king-axis contribution at twice its stored value in forward, and the gradient into king-axis tensors is also doubled. Very large values can destabilize training, so treat this as an experimental tuning knob.
 
 When BulletOu writes `nn.bin`, it folds weights using the `W_effective` formula above. So an `nn.bin` saved with `--sfnn-factorizer-alpha king=0.90` contains the king-axis contribution at 90% strength.
 
