@@ -3171,17 +3171,17 @@ struct Args {
     #[arg(long)]
     cuda_cpp_smoke: bool,
 
-    /// Optional initial root-format NNUE weights/state stream for the Windows-native
-    /// C++/CUDA direct trainer. If Ranger optimizer records are present, they
-    /// are restored together with the weights.
+    /// Optional initial training state (`state.bin`) used to start a new
+    /// experiment from an existing checkpoint. If Ranger optimizer records are
+    /// present, they are restored together with the weights.
     #[arg(long)]
-    cuda_cpp_weights_bin: Option<PathBuf>,
+    initial_state: Option<PathBuf>,
 
     /// Explicit teacher dataloader position file used when branching a new
-    /// experiment from `--cuda-cpp-weights-bin`. Format is the same as
-    /// checkpoint `dataloader_pos.txt`: `<byte_offset>,<plies>`.
-    #[arg(long, requires = "cuda_cpp_weights_bin")]
-    teacher_start_pos_file: Option<PathBuf>,
+    /// experiment from `--initial-state`. Format is the same as checkpoint
+    /// `dataloader_pos.txt`: `<byte_offset>,<plies>`.
+    #[arg(long, requires = "initial_state")]
+    initial_dataloader_pos: Option<PathBuf>,
 
     /// Temporary Windows-native C++/CUDA direct-trainer batch count.
     /// This currently runs NNUE_HALFKP fixed-layout train steps without
@@ -3830,8 +3830,8 @@ impl Args {
             if self.cuda_cpp_train_steps.is_some() {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-train-steps cannot be used together".to_string());
             }
-            if self.cuda_cpp_weights_bin.is_some() {
-                return Err("--cuda-cpp-smoke and --cuda-cpp-weights-bin cannot be used together".to_string());
+            if self.initial_state.is_some() {
+                return Err("--cuda-cpp-smoke and --initial-state cannot be used together".to_string());
             }
             if self.cuda_cpp_profile_steps != 0 {
                 return Err("--cuda-cpp-smoke and --cuda-cpp-profile-steps cannot be used together".to_string());
@@ -4018,9 +4018,9 @@ impl Args {
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
-        if self.cuda_cpp_weights_bin.is_some() && (self.resume || self.no_resume) {
+        if self.initial_state.is_some() && (self.resume || self.no_resume) {
             return Err(
-                "--backend cuda-cpp: --cuda-cpp-weights-bin is an explicit initial state; do not combine it with --resume/--no-resume"
+                "--initial-state starts a new run from an explicit checkpoint state; do not combine it with --resume/--no-resume"
                     .to_string(),
             );
         }
@@ -7688,7 +7688,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
     eprintln!("  cuda-cpp {} input = dims={}, max_active={}", component.label(), input_size, max_active);
     let (mut runner, completed_step_offset) = {
         let initial_state = build_cuda_cpp_kppt_initial_state(args, component)?;
-        if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+        if let Some(path) = args.initial_state.as_deref() {
             let state_kind = if initial_state.optimizer_states.is_some() {
                 "weights + Ranger optimizer state"
             } else if initial_state.completed_steps > 0 {
@@ -7938,7 +7938,7 @@ fn build_cuda_cpp_kppt_initial_state(
     args: &Args,
     component: CudaCppKpptComponent,
 ) -> Result<CudaCppKpptInitialState, String> {
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+    if let Some(path) = args.initial_state.as_deref() {
         return load_cuda_cpp_kppt_initial_state(path, component);
     }
     if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
@@ -8352,7 +8352,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_nnue_initial_state_for_cuda_cpp(args, feature_kind)?;
     let initial_weights = &initial_state.weights;
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+    if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
             "weights + Ranger optimizer state"
         } else if initial_state.completed_steps > 0 {
@@ -9465,7 +9465,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let factorizer_spec = effective_sfnn_factorizer_spec(args);
     let factorizer_active = cuda_cpp_sfnn_factorizer_active(args);
     let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(args);
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+    if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
             "weights + Ranger optimizer state"
         } else if initial_state.completed_steps > 0 {
@@ -11005,7 +11005,7 @@ fn run_cuda_cpp_sfnn_resident_validation_cached(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_auto_resume_state_bin(args: &Args) -> Option<std::path::PathBuf> {
-    if args.cuda_cpp_weights_bin.is_some() {
+    if args.initial_state.is_some() {
         return None;
     }
     let output_dir = args.output_dir();
@@ -11019,10 +11019,10 @@ fn cuda_cpp_auto_resume_dataloader_pos(
     completed_steps: usize,
     component: &str,
 ) -> Result<Option<bulletou_lib::value::TeacherDataloaderPos>, String> {
-    if let Some(path) = args.teacher_start_pos_file.as_deref() {
+    if let Some(path) = args.initial_dataloader_pos.as_deref() {
         return read_dataloader_pos_file(path).map(Some);
     }
-    if args.cuda_cpp_weights_bin.is_some() {
+    if args.initial_state.is_some() {
         return Ok(None);
     }
     let output_dir = args.output_dir();
@@ -12156,7 +12156,7 @@ fn build_sfnn_initial_state_for_cuda_cpp(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
 ) -> Result<CudaCppSfnnInitialState, String> {
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+    if let Some(path) = args.initial_state.as_deref() {
         return load_cuda_cpp_sfnn_initial_state(path, args, feature_kind);
     }
     if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
@@ -13846,7 +13846,7 @@ fn build_nnue_initial_state_for_cuda_cpp(
     args: &Args,
     feature_kind: CudaCppNnueFeatureKind,
 ) -> Result<CudaCppHalfkpInitialState, String> {
-    if let Some(path) = args.cuda_cpp_weights_bin.as_deref() {
+    if let Some(path) = args.initial_state.as_deref() {
         return load_cuda_cpp_nnue_initial_state(path, args, feature_kind);
     }
     if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
@@ -16533,9 +16533,9 @@ fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usiz
 
 fn read_dataloader_pos_file(path: &std::path::Path) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
     let content = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read --teacher-start-pos-file {}: {err}", path.display()))?;
+        .map_err(|err| format!("failed to read --initial-dataloader-pos {}: {err}", path.display()))?;
     parse_dataloader_pos_text(&content)
-        .map_err(|err| format!("invalid --teacher-start-pos-file {}: {err}", path.display()))
+        .map_err(|err| format!("invalid --initial-dataloader-pos {}: {err}", path.display()))
 }
 
 fn parse_dataloader_pos_text(content: &str) -> Result<bulletou_lib::value::TeacherDataloaderPos, String> {
@@ -19575,11 +19575,11 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_weights_bin_can_take_explicit_teacher_start_pos() {
+    fn initial_state_can_take_explicit_initial_dataloader_pos() {
         use clap::Parser as _;
 
         let tmp = std::env::temp_dir().join(format!(
-            "bulletou-test-cuda-cpp-explicit-teacher-pos-{}-{}",
+            "bulletou-test-initial-dataloader-pos-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -19601,9 +19601,9 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--cuda-cpp-weights-bin",
+            "--initial-state",
             state_arg,
-            "--teacher-start-pos-file",
+            "--initial-dataloader-pos",
             pos_arg,
         ])
         .unwrap();
@@ -19643,7 +19643,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_cpp_backend_rejects_explicit_weights_with_resume_flags() {
+    fn cuda_cpp_backend_rejects_initial_state_with_resume_flags() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -19656,18 +19656,14 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--cuda-cpp-weights-bin",
-            "weights.bin",
+            "--initial-state",
+            "state.bin",
             "--resume",
         ])
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--cuda-cpp-weights-bin"
-        } else {
-            "cuda-cpp-backend"
-        }));
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "--initial-state" } else { "cuda-cpp-backend" }));
     }
 
     #[test]
@@ -19737,8 +19733,8 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--cuda-cpp-weights-bin",
-            "weights.bin",
+            "--initial-state",
+            "state.bin",
         ])
         .unwrap();
 
@@ -19992,8 +19988,8 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--cuda-cpp-weights-bin",
-            "weights.bin",
+            "--initial-state",
+            "state.bin",
         ])
         .unwrap();
 
@@ -20006,7 +20002,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_cpp_smoke_rejects_initial_weights() {
+    fn cuda_cpp_smoke_rejects_initial_state() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -20018,17 +20014,13 @@ mod tests {
             "--backend",
             "cuda-cpp",
             "--cuda-cpp-smoke",
-            "--cuda-cpp-weights-bin",
-            "weights.bin",
+            "--initial-state",
+            "state.bin",
         ])
         .unwrap();
 
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--cuda-cpp-weights-bin"
-        } else {
-            "cuda-cpp-backend"
-        }));
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") { "--initial-state" } else { "cuda-cpp-backend" }));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
