@@ -49,7 +49,7 @@
 | `--output-folder` | checkpointの親フォルダ。自動ディレクトリ名と `--tag` はそのまま使う | `checkpoints` |
 | `--output` | checkpoint保存先を完全指定する。`--tag` は使わない | 省略 |
 | `--batch-size` | 1回のmini-batchで処理する局面数 | 65536 |
-| `--grad-accum-batches` | N mini-batchぶんの勾配を足してから1回だけoptimizer更新する | 1 |
+| `--batches-per-update` | N mini-batchぶんの勾配を足してから1回だけoptimizer更新する | 1 |
 | `--positions-per-superbatch` | 1 sb の目標局面数。実際には `batch-size` の倍数に丸められる | 100000000 |
 | `--teacher-shuffle-buffer-sbs` | 何 sb 分の教師局面をRAM上でshuffleするか | 1 |
 | `--teacher-shuffle-buffer-batches` | shuffle bufferをbatch数で指定する。通常は `--teacher-shuffle-buffer-sbs` を使う | 省略 |
@@ -109,13 +109,13 @@ lr = lr * gamma
 
 ## 4. 勾配accumulation
 
-VRAMの都合で `--batch-size` を小さくする必要があるが、optimizerには大きなbatch相当の勾配を渡したい場合は `--grad-accum-batches N` を使います。
+VRAMの都合で `--batch-size` を小さくする必要があるが、optimizerには大きなbatch相当の勾配を渡したい場合は `--batches-per-update N` を使います。
 
 例:
 
 ```bash
 --batch-size 16384
---grad-accum-batches 4
+--batches-per-update 4
 ```
 
 この指定では、16,384局面のmini-batchを4回流し、その4回分の勾配を足してから、Rangerの更新を1回だけ行います。optimizerから見ると、仮想batch sizeは次のようになります。
@@ -126,14 +126,14 @@ VRAMの都合で `--batch-size` を小さくする必要があるが、optimizer
 
 これはCUDAのforward/backward自体を65,536局面で1回だけ実行するのと完全に同じ速度にはなりません。ただし、optimizer updateの回数を減らし、勾配のノイズを小さくできます。
 
-`--grad-accum-batches` は、1 superbatch内のmini-batch数を割り切る値にしてください。たとえば、
+`--batches-per-update` は、1 superbatch内のmini-batch数を割り切る値にしてください。たとえば、
 
 ```text
 --positions-per-superbatch 40000000
 --batch-size 16384
 ```
 
-なら、1 superbatchは2,440 mini-batchなので、`--grad-accum-batches 4`、`5`、`8`、`10` などが使えます。
+なら、1 superbatchは2,440 mini-batchなので、`--batches-per-update 4`、`5`、`8`、`10` などが使えます。
 
 ## 5. loss
 

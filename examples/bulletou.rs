@@ -3314,12 +3314,12 @@ struct Args {
     #[arg(long)]
     batch_size: Option<usize>,
 
-    /// Accumulate this many mini-batch gradients before one optimizer update.
+    /// Use this many mini-batches for one optimizer update.
     /// This is useful when VRAM forces a smaller `--batch-size` but you want
     /// the optimizer to see a larger virtual batch. Default 1 means update
     /// every mini-batch.
     #[arg(long, default_value_t = 1)]
-    grad_accum_batches: usize,
+    batches_per_update: usize,
 
     /// Target positions consumed per superbatch. The actual value is rounded
     /// down to a multiple of `--batch-size` because the trainer advances in
@@ -3976,21 +3976,21 @@ impl Args {
         if effective_batch_size(self) == 0 {
             return Err("--batch-size must be > 0 for --backend cuda-cpp".to_string());
         }
-        if self.grad_accum_batches == 0 {
-            return Err("--grad-accum-batches must be > 0".to_string());
+        if self.batches_per_update == 0 {
+            return Err("--batches-per-update must be > 0".to_string());
         }
-        if self.grad_accum_batches > 1 {
+        if self.batches_per_update > 1 {
             if !eval_type.uses_layerstack() {
-                return Err("--grad-accum-batches > 1 is currently supported for SFNN architectures only".to_string());
+                return Err("--batches-per-update > 1 is currently supported for SFNN architectures only".to_string());
             }
             if self.lr_schedule == LrScheduleKind::Plateau {
-                return Err("--grad-accum-batches > 1 cannot be combined with --lr-schedule plateau yet".to_string());
+                return Err("--batches-per-update > 1 cannot be combined with --lr-schedule plateau yet".to_string());
             }
             let train_steps_for_accum = self.cuda_cpp_train_steps.unwrap_or(effective_batches_per_superbatch(self)?);
-            if train_steps_for_accum % self.grad_accum_batches != 0 {
+            if train_steps_for_accum % self.batches_per_update != 0 {
                 return Err(format!(
-                    "--grad-accum-batches {} must divide the number of mini-batches in a training boundary ({train_steps_for_accum})",
-                    self.grad_accum_batches
+                    "--batches-per-update {} must divide the number of mini-batches in a training boundary ({train_steps_for_accum})",
+                    self.batches_per_update
                 ));
             }
         }
@@ -9492,13 +9492,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
-    if args.grad_accum_batches > 1 {
+    if args.batches_per_update > 1 {
         print_startup_kv(
-            "gradient accumulation",
+            "batches per update",
             format!(
                 "{} mini-batches/update (virtual batch = {} positions)",
-                paint(format_count(args.grad_accum_batches), ConsoleColor::BoldYellow),
-                paint(format_count(batch_size.saturating_mul(args.grad_accum_batches)), ConsoleColor::BoldYellow)
+                paint(format_count(args.batches_per_update), ConsoleColor::BoldYellow),
+                paint(format_count(batch_size.saturating_mul(args.batches_per_update)), ConsoleColor::BoldYellow)
             ),
         );
     }
@@ -10116,8 +10116,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let progress_for_step = schedule.progress_for_step(seen_steps);
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
-        let grad_accum_batches = args.grad_accum_batches;
-        let is_optimizer_step = seen_steps % grad_accum_batches == 0;
+        let batches_per_update = args.batches_per_update;
+        let is_optimizer_step = seen_steps % batches_per_update == 0;
         let optimizer_step = optimizer_step_offset + optimizer_updates + usize::from(is_optimizer_step);
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
@@ -10125,7 +10125,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
             let step_index = if is_optimizer_step {
-                seen_steps.saturating_sub(grad_accum_batches)
+                seen_steps.saturating_sub(batches_per_update)
             } else {
                 seen_steps.saturating_sub(1)
             };
@@ -10133,7 +10133,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             RangerUpdateParams {
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
-                    gradient_factor: 1.0 / grad_accum_batches as f32,
+                    gradient_factor: 1.0 / batches_per_update as f32,
                     learning_rate,
                     decay: ranger.decay,
                     beta1: ranger.beta1,
@@ -15566,7 +15566,7 @@ fn resume_signature(args: &Args) -> String {
         format!("arch={arch}"),
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", effective_batch_size(args)),
-        format!("grad_accum_batches={}", args.grad_accum_batches),
+        format!("batches_per_update={}", args.batches_per_update),
         format!("positions_per_superbatch={positions_per_superbatch}"),
         format!(
             "teacher_shuffle_buffer_batches={}",
@@ -15682,7 +15682,12 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         }
     }
 
-    ensure_line_after(&mut out, "grad_accum_batches=", "batch_size=", "grad_accum_batches=1");
+    for line in &mut out {
+        if let Some(value) = line.strip_prefix("grad_accum_batches=") {
+            *line = format!("batches_per_update={value}");
+        }
+    }
+    ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
     ensure_line_after(&mut out, "loss_pow_exp=", "win_rate_model=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");
@@ -21488,6 +21493,58 @@ mod tests {
         ]);
 
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn batches_per_update_replaces_old_grad_accum_cli_name() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--batches-per-update",
+            "4",
+            "--positions-per-superbatch",
+            "159907840",
+        ])
+        .unwrap();
+        assert_eq!(args.batches_per_update, 4);
+        assert!(resume_signature(&args).contains("batches_per_update=4"));
+
+        let old_name = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--grad-accum-batches",
+            "4",
+        ]);
+        assert!(old_name.is_err(), "--grad-accum-batches should not remain as a CLI alias");
+    }
+
+    #[test]
+    fn resume_signature_accepts_legacy_grad_accum_key() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--batches-per-update",
+            "4",
+            "--positions-per-superbatch",
+            "159907840",
+        ])
+        .unwrap();
+        let legacy = resume_signature(&args).replace("batches_per_update=4", "grad_accum_batches=4");
+
+        assert!(resume_signature_matches(&legacy, &args));
     }
 
     #[test]

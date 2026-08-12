@@ -49,7 +49,7 @@ Fuller option table:
 | `--output-folder` | Parent folder for checkpoints. Auto-derived directory names and `--tag` are still used | `checkpoints` |
 | `--output` | Exact checkpoint directory. `--tag` is not used | omitted |
 | `--batch-size` | Positions per weight update | 65536 |
-| `--grad-accum-batches` | Accumulate N mini-batch gradients before one optimizer update | 1 |
+| `--batches-per-update` | Accumulate N mini-batch gradients before one optimizer update | 1 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |
 | `--teacher-shuffle-buffer-sbs` | How many sb of teacher positions to shuffle in RAM. `4` means two 4-sb buffers | 1 |
 | `--teacher-shuffle-buffer-batches` | Same shuffle buffer size, specified in batches. Usually use `--teacher-shuffle-buffer-sbs` instead | omitted |
@@ -300,13 +300,13 @@ If GPU utilization is low and `pos/s` is low, teacher loading, decoding, or shuf
 
 ## 10. Gradient accumulation
 
-Use `--grad-accum-batches N` when VRAM forces a smaller `--batch-size`, but you still want the optimizer to use a larger virtual batch.
+Use `--batches-per-update N` when VRAM forces a smaller `--batch-size`, but you still want the optimizer to use a larger virtual batch.
 
 Example:
 
 ```bash
 --batch-size 16384
---grad-accum-batches 4
+--batches-per-update 4
 ```
 
 This reads four 16,384-position mini-batches, adds their gradients, and then applies one Ranger update. The optimizer sees a virtual batch of:
@@ -317,11 +317,11 @@ This reads four 16,384-position mini-batches, adds their gradients, and then app
 
 This is not the same as making each CUDA forward/backward pass as large as 65,536 positions, so it will not recover all throughput. It does reduce optimizer-update overhead and gives the optimizer a larger, less noisy gradient.
 
-`--grad-accum-batches` must divide the number of mini-batches in one superbatch. For example, with:
+`--batches-per-update` must divide the number of mini-batches in one superbatch. For example, with:
 
 ```text
 --positions-per-superbatch 40000000
 --batch-size 16384
 ```
 
-one superbatch is 2,440 mini-batches, so `--grad-accum-batches 4`, `5`, `8`, or `10` are valid choices.
+one superbatch is 2,440 mini-batches, so `--batches-per-update 4`, `5`, `8`, or `10` are valid choices.
