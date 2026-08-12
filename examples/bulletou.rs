@@ -3222,12 +3222,12 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     sfnn_l1_lr_mult: f32,
 
-    /// Freeze SFNN L1 updates for the first N superbatches of each epoch.
-    /// Frozen groups keep weights and Ranger state unchanged; their gradients
-    /// are cleared after backward. This is mainly for final fine-tuning A/B
-    /// tests after changing factorizer settings.
-    #[arg(long, default_value = "0")]
-    sfnn_freeze_l1_sbs: usize,
+    /// Freeze SFNN L1 updates for the whole run. Frozen groups keep weights
+    /// and Ranger state unchanged; their gradients are cleared after backward.
+    /// This is mainly for final fine-tuning A/B tests after changing
+    /// factorizer settings.
+    #[arg(long)]
+    sfnn_freeze_l1: bool,
 
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
@@ -3879,10 +3879,8 @@ impl Args {
         if !(self.sfnn_l1_lr_mult.is_finite() && self.sfnn_l1_lr_mult >= 0.0) {
             return Err(format!("--sfnn-l1-lr-mult must be finite and non-negative (got {})", self.sfnn_l1_lr_mult));
         }
-        if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1_sbs != 0) && !eval_type.uses_layerstack() {
-            return Err(
-                "--sfnn-l1-lr-mult / --sfnn-freeze-l1-sbs apply to SFNN / LayerStack eval types only".to_string()
-            );
+        if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1) && !eval_type.uses_layerstack() {
+            return Err("--sfnn-l1-lr-mult / --sfnn-freeze-l1 apply to SFNN / LayerStack eval types only".to_string());
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
@@ -9684,11 +9682,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
-    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1_sbs != 0 {
-        let freeze = if args.sfnn_freeze_l1_sbs == 0 {
-            paint("off", ConsoleColor::Dim)
+    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1 {
+        let freeze = if args.sfnn_freeze_l1 {
+            paint("on", ConsoleColor::BoldYellow)
         } else {
-            paint(format!("first {} sb/epoch", args.sfnn_freeze_l1_sbs), ConsoleColor::BoldYellow)
+            paint("off", ConsoleColor::Dim)
         };
         print_startup_kv(
             "SFNN layer LR",
@@ -15229,10 +15227,10 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_layer_lr_multipliers(
     args: &Args,
-    progress: Option<CudaCppScheduleProgress>,
+    _progress: Option<CudaCppScheduleProgress>,
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers { l1: args.sfnn_l1_lr_mult, ..Default::default() };
-    if args.sfnn_freeze_l1_sbs > 0 && progress.is_some_and(|progress| progress.superbatch <= args.sfnn_freeze_l1_sbs) {
+    if args.sfnn_freeze_l1 {
         multipliers.l1 = 0.0;
     }
     multipliers
@@ -15717,7 +15715,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
-        format!("sfnn_freeze_l1_sbs={}", args.sfnn_freeze_l1_sbs),
+        format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
         format!("test_batch_size={}", args.test_batch_size),
@@ -15783,6 +15781,11 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         if let Some(value) = line.strip_prefix("grad_accum_batches=") {
             *line = format!("batches_per_update={value}");
         }
+        if let Some(value) = line.strip_prefix("sfnn_freeze_l1_sbs=") {
+            if value.trim() == "0" {
+                *line = "sfnn_freeze_l1=false".to_string();
+            }
+        }
     }
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
@@ -15799,7 +15802,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000",
     );
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_alpha=", "sfnn_l1_lr_mult=1.000000000");
-    ensure_line_after(&mut out, "sfnn_freeze_l1_sbs=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1_sbs=0");
+    ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');
@@ -21813,6 +21816,47 @@ mod tests {
         let legacy = resume_signature(&args).replace("batches_per_update=4", "grad_accum_batches=4");
 
         assert!(resume_signature_matches(&legacy, &args));
+    }
+
+    #[test]
+    fn sfnn_freeze_l1_sbs_cli_is_removed() {
+        use clap::Parser as _;
+
+        let old_name = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-freeze-l1-sbs",
+            "27",
+        ]);
+        assert!(old_name.is_err(), "--sfnn-freeze-l1-sbs should not remain as a CLI alias");
+    }
+
+    #[test]
+    fn resume_signature_accepts_legacy_freeze_l1_sbs_zero_only() {
+        use clap::Parser as _;
+
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        let legacy_off = resume_signature(&args).replace("sfnn_freeze_l1=false", "sfnn_freeze_l1_sbs=0");
+
+        assert!(resume_signature_matches(&legacy_off, &args));
+
+        let frozen = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-freeze-l1",
+        ])
+        .unwrap();
+        let legacy_partial = resume_signature(&frozen).replace("sfnn_freeze_l1=true", "sfnn_freeze_l1_sbs=27");
+
+        assert!(!resume_signature_matches(&legacy_partial, &frozen));
     }
 
     #[test]
