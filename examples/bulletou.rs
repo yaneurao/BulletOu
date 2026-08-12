@@ -14978,6 +14978,7 @@ struct CudaCppRunSchedule {
     batches_per_superbatch: usize,
     superbatches_per_epoch: usize,
     prior_positions: usize,
+    lr_position_offset: usize,
     lr_period: u64,
     lr_step_gamma: f32,
     lr_step_positions: u64,
@@ -14992,7 +14993,7 @@ impl CudaCppRunSchedule {
                 args,
                 step_index,
                 batch_size,
-                self.prior_positions,
+                self.lr_position_offset,
                 self.lr_period,
                 self.lr_step_gamma,
                 self.lr_step_positions,
@@ -15293,6 +15294,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             batches_per_superbatch: train_steps,
             superbatches_per_epoch: 1,
             prior_positions: 0,
+            lr_position_offset: 0,
             lr_period: 0,
             lr_step_gamma: DEFAULT_LR_STEP_GAMMA,
             lr_step_positions: default_lr_step_positions,
@@ -15357,6 +15359,15 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     };
     let first_epoch_start_superbatch =
         if mid_epoch_resume { latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1) } else { 1usize };
+    let lr_position_offset = if mid_epoch_resume {
+        first_epoch_start_superbatch
+            .saturating_sub(1)
+            .checked_mul(batches_per_superbatch)
+            .and_then(|v| v.checked_mul(batch_size))
+            .ok_or_else(|| "cuda-cpp LR position offset overflow".to_string())?
+    } else {
+        0
+    };
     let prior_positions = if resume_enabled {
         let positions = read_prior_positions(&top_level_log);
         if matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt) {
@@ -15400,7 +15411,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 args,
                 chunk_start_step,
                 batch_size,
-                prior_positions,
+                lr_position_offset,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
@@ -15409,7 +15420,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 args,
                 chunk_end_step,
                 batch_size,
-                prior_positions,
+                lr_position_offset,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
@@ -15434,6 +15445,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         batches_per_superbatch,
         superbatches_per_epoch: superbatches,
         prior_positions,
+        lr_position_offset,
         lr_period,
         lr_step_gamma,
         lr_step_positions,
@@ -15446,12 +15458,12 @@ fn cuda_cpp_lr_at_step(
     args: &Args,
     step_index: usize,
     batch_size: usize,
-    prior_positions: usize,
+    position_offset: usize,
     lr_period: u64,
     lr_step_gamma: f32,
     lr_step_positions: u64,
 ) -> f32 {
-    let positions = (prior_positions as u64).saturating_add((step_index as u64).saturating_mul(batch_size as u64));
+    let positions = (position_offset as u64).saturating_add((step_index as u64).saturating_mul(batch_size as u64));
     match args.lr_schedule {
         LrScheduleKind::Step => {
             StepLR::lr_at_positions(args.lr, args.lr_min, lr_step_gamma, lr_step_positions, lr_period, positions)
@@ -18800,6 +18812,74 @@ mod tests {
         assert_eq!(schedule.chunks[2].epoch, 2);
         assert_eq!(schedule.chunks[2].superbatch, 3);
         assert!((schedule.chunks[0].lr_start - 0.1).abs() < 1e-6, "completed epoch should warm-restart LR");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_completed_epoch_lr_restart_survives_changed_superbatch_size() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-schedule-lr-restart-changed-sb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("0001")).unwrap();
+        let output = tmp.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "teacher.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "2",
+            "--save-rate",
+            "1",
+            "--batch-size",
+            "64",
+            "--positions-per-superbatch",
+            "128",
+            "--lr",
+            "0.1",
+            "--lr-min",
+            "0.01",
+            "--output",
+            output,
+            "--resume",
+        ])
+        .unwrap();
+        std::fs::write(tmp.join("0001").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001").join("dataloader_pos.txt"), "192,0\n").unwrap();
+        std::fs::write(
+            tmp.join("0001").join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,1,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\nNNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,3,-,-,0.1,0.1,0.1,1.000000,192,teacher.hcpe,-\n"
+        ))
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.prior_positions, 192);
+        assert_eq!(schedule.lr_position_offset, 0);
+        assert_eq!(schedule.chunks[0].epoch, 2);
+        assert_eq!(schedule.chunks[0].superbatch, 1);
+        assert!(
+            (schedule.chunks[0].lr_start - 0.1).abs() < 1e-6,
+            "completed epoch resume must restart LR even when the new run uses a different positions-per-superbatch"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
