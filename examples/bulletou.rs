@@ -9680,12 +9680,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut sfnn_diagnostics = CudaCppSfnnDiagnostics::default();
     let completed_step_offset = initial_state.completed_steps;
     let optimizer_step_offset = initial_state.optimizer_steps;
-    if args.grad_accum_batches > 1 && completed_step_offset % args.grad_accum_batches != 0 {
-        return Err(format!(
-            "cannot resume with --grad-accum-batches {} from completed_steps {} because it is not on an accumulation boundary",
-            args.grad_accum_batches, completed_step_offset
-        ));
-    }
     let started = std::time::Instant::now();
     let mut excluded_elapsed = std::time::Duration::from_secs(0);
     let mut progress_meter = CudaCppProgressMeter::default();
