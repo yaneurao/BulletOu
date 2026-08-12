@@ -3008,11 +3008,22 @@ fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
     if batch_size == 0 {
         return Err("--batch-size must be > 0.".to_string());
     }
-    let batches = args.positions_per_superbatch / batch_size;
+    let raw_batches = args.positions_per_superbatch / batch_size;
+    let batches_per_update = args.batches_per_update.max(1);
+    let batches = raw_batches - (raw_batches % batches_per_update);
     if batches == 0 {
+        if batches_per_update == 1 {
+            return Err(format!(
+                "--positions-per-superbatch ({}) must be >= --batch-size ({}).",
+                args.positions_per_superbatch, batch_size
+            ));
+        }
         return Err(format!(
-            "--positions-per-superbatch ({}) must be >= --batch-size ({}).",
-            args.positions_per_superbatch, batch_size
+            "--positions-per-superbatch ({}) must be >= --batch-size * --batches-per-update ({} * {} = {})",
+            args.positions_per_superbatch,
+            batch_size,
+            batches_per_update,
+            batch_size.saturating_mul(batches_per_update)
         ));
     }
     Ok(batches)
@@ -3986,12 +3997,13 @@ impl Args {
             if self.lr_schedule == LrScheduleKind::Plateau {
                 return Err("--batches-per-update > 1 cannot be combined with --lr-schedule plateau yet".to_string());
             }
-            let train_steps_for_accum = self.cuda_cpp_train_steps.unwrap_or(effective_batches_per_superbatch(self)?);
-            if train_steps_for_accum % self.batches_per_update != 0 {
-                return Err(format!(
-                    "--batches-per-update {} must divide the number of mini-batches in a training boundary ({train_steps_for_accum})",
-                    self.batches_per_update
-                ));
+            if let Some(train_steps) = self.cuda_cpp_train_steps {
+                if train_steps % self.batches_per_update != 0 {
+                    return Err(format!(
+                        "--cuda-cpp-train-steps {train_steps} must be divisible by --batches-per-update {}",
+                        self.batches_per_update
+                    ));
+                }
             }
         }
         let shuffle_boundary_batches = if let Some(train_steps) = self.cuda_cpp_train_steps {
@@ -17741,6 +17753,29 @@ mod tests {
 
         assert_eq!(effective_batches_per_superbatch(&args).unwrap(), 610);
         assert_eq!(effective_positions_per_superbatch(&args).unwrap(), 9_994_240);
+    }
+
+    #[test]
+    fn positions_per_superbatch_rounds_down_to_batches_per_update() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--positions-per-superbatch",
+            "40000000",
+            "--batch-size",
+            "65536",
+            "--batches-per-update",
+            "4",
+        ])
+        .unwrap();
+
+        assert_eq!(effective_batches_per_superbatch(&args).unwrap(), 608);
+        assert_eq!(effective_positions_per_superbatch(&args).unwrap(), 39_845_888);
     }
 
     #[test]

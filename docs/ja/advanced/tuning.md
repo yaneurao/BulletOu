@@ -126,14 +126,23 @@ VRAMの都合で `--batch-size` を小さくする必要があるが、optimizer
 
 これはCUDAのforward/backward自体を65,536局面で1回だけ実行するのと完全に同じ速度にはなりません。ただし、optimizer updateの回数を減らし、勾配のノイズを小さくできます。
 
-`--batches-per-update` は、1 superbatch内のmini-batch数を割り切る値にしてください。たとえば、
+`--positions-per-superbatch` は `--batch-size` の倍数に丸められます。たとえば、
 
 ```text
 --positions-per-superbatch 40000000
---batch-size 16384
+--batch-size 65536
 ```
 
-なら、1 superbatchは2,440 mini-batchなので、`--batches-per-update 4`、`5`、`8`、`10` などが使えます。
+`--batches-per-update 1` なら、実際には `610 * 65,536 = 39,976,960` 局面を1 sbとして扱います。
+
+`--batches-per-update` が2以上の場合は、さらにmini-batch数を `--batches-per-update` の倍数へ丸めます。たとえば `--batches-per-update 4` なら、610 batchではなく608 batchを1 sbとして扱います。
+
+```text
+608 * 65,536 = 39,845,888 局面
+608 / 4 = 152 optimizer updates
+```
+
+つまり、ユーザーは `--positions-per-superbatch 40000000` のような丸い値を指定すればよく、`39,845,888` のような端数を手で計算して指定する必要はありません。
 
 ## 5. loss
 

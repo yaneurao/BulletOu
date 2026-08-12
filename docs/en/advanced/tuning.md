@@ -317,11 +317,20 @@ This reads four 16,384-position mini-batches, adds their gradients, and then app
 
 This is not the same as making each CUDA forward/backward pass as large as 65,536 positions, so it will not recover all throughput. It does reduce optimizer-update overhead and gives the optimizer a larger, less noisy gradient.
 
-`--batches-per-update` must divide the number of mini-batches in one superbatch. For example, with:
+`--positions-per-superbatch` is rounded down to a multiple of `--batch-size`. For example, with:
 
 ```text
 --positions-per-superbatch 40000000
---batch-size 16384
+--batch-size 65536
 ```
 
-one superbatch is 2,440 mini-batches, so `--batches-per-update 4`, `5`, `8`, or `10` are valid choices.
+With `--batches-per-update 1`, BulletOu actually uses `610 * 65,536 = 39,976,960` positions for one sb.
+
+When `--batches-per-update` is 2 or larger, BulletOu also rounds the mini-batch count down to a multiple of `--batches-per-update`. For example, with `--batches-per-update 4`, one sb uses 608 batches instead of 610 batches.
+
+```text
+608 * 65,536 = 39,845,888 positions
+608 / 4 = 152 optimizer updates
+```
+
+This lets you keep user-facing commands simple, such as `--positions-per-superbatch 40000000`, without manually calculating values such as `39,845,888`.
