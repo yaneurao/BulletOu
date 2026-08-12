@@ -5950,13 +5950,85 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn summary_line_with_quantized_metrics(line: &str, accuracy: f32, loss: f32) -> String {
-    let mut fields = line.rsplitn(3, ',').collect::<Vec<_>>();
-    if fields.len() == 3 {
+    let mut fields = line.rsplitn(4, ',').collect::<Vec<_>>();
+    if fields.len() == 4 {
         fields.reverse();
-        format!("{},{accuracy:.6},{loss:.8}", fields[0])
+        format!("{},{accuracy:.6},{loss:.8},{}", fields[0], fields[3])
     } else {
         format!("{line},{accuracy:.6},{loss:.8}")
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn learn_line_with_quantized_metrics(line: &str, accuracy: f32, loss: f32) -> String {
+    let parts = line.splitn(14, ',').collect::<Vec<_>>();
+    if parts.len() >= 14 {
+        let mut out = String::with_capacity(line.len());
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            match i {
+                11 => out.push_str(&format!("{accuracy:.6}")),
+                12 => out.push_str(&format!("{loss:.8}")),
+                _ => out.push_str(part),
+            }
+        }
+        return out;
+    }
+
+    let old = line.splitn(12, ',').collect::<Vec<_>>();
+    if old.len() >= 12 {
+        let mut out = String::with_capacity(line.len() + 24);
+        for (i, part) in old.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(part);
+            if i == 10 {
+                out.push(',');
+                out.push_str(&format!("{accuracy:.6},{loss:.8}"));
+            }
+        }
+        return out;
+    }
+
+    format!("{line},{accuracy:.6},{loss:.8}")
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn update_checkpoint_learn_log_quantized_metrics(
+    checkpoint_dir: &std::path::Path,
+    metrics: TestMetrics,
+) -> Result<(), String> {
+    let path = checkpoint_dir.join("learn.log");
+    let content = std::fs::read_to_string(&path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut updated = false;
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == LEARN_LOG_HEADER {
+            continue;
+        }
+        if trimmed == LEARN_LOG_HEADER_V1 {
+            *line = LEARN_LOG_HEADER.to_string();
+            continue;
+        }
+        if trimmed.starts_with("eval,") {
+            continue;
+        }
+        *line = learn_line_with_quantized_metrics(trimmed, metrics.accuracy, metrics.loss);
+        updated = true;
+    }
+    if !updated {
+        return Err(format!("failed to find data row in {}", path.display()));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6077,6 +6149,7 @@ fn maybe_run_saved_sfnn_quantized_validation(
     };
     let metrics = cache.run(&test_args)?;
     let elapsed = started.elapsed();
+    update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
     update_summary_log_quantized_metrics(&args.output_dir(), epoch, superbatch, metrics)?;
     Ok(Some((metrics, elapsed)))
 }
@@ -11262,7 +11335,7 @@ fn cuda_cpp_direct_learn_log_row(args: &Args, log: CudaCppCheckpointLog) -> Stri
     };
     let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
-        "{eval},{epoch},{superbatch},{batch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher}\n",
+        "{eval},{epoch},{superbatch},{batch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},-,-,{teacher}\n",
         eval = eval_field,
         epoch = log.epoch,
         superbatch = log.superbatch,
@@ -11287,7 +11360,7 @@ fn cuda_cpp_direct_summary_log_row(args: &Args, log: CudaCppCheckpointLog) -> St
     };
     let positions = log.prior_positions.saturating_add(log.train_steps.saturating_mul(effective_batch_size(args)));
     format!(
-        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher},-,-\n",
+        "{eval},{epoch},{superbatch},{test_accuracy},{test_loss},-,{lr_start:.6},{lr_end:.6},{lambda:.6},{positions},{teacher},{test_teacher},-,-,-\n",
         eval = eval_field,
         epoch = log.epoch,
         superbatch = log.superbatch,
@@ -16020,10 +16093,14 @@ fn prepare_resume_config_or_exit(args: &Args) {
 /// - `positions`: cumulative number of teacher positions consumed so far
 ///   for this component, including positions from prior runs detected
 ///   in the existing top-level `summary-learn.log` (resume-aware).
+/// - `quantized_value_accuracy` / `quantized_value_loss`: quantized
+///   `nn.bin` validation metrics for saved SFNN checkpoints. They are `-`
+///   until quantized validation runs.
 /// - `teacher`: the user's `--teacher` CLI value verbatim, RFC-4180
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
-const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+const LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher";
+const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,quantized_value_accuracy,quantized_value_loss,teacher";
 
 /// Legacy schema for `<output>/summary-learn.log` before the validation
 /// teacher column was added.
@@ -16033,21 +16110,28 @@ const SUMMARY_LEARN_LOG_HEADER_V1: &str = "eval,epoch,superbatch,test_value_accu
 /// was added but before epoch-end quantized validation columns were added.
 const SUMMARY_LEARN_LOG_HEADER_V2: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher";
 
+/// Legacy schema for `<output>/summary-learn.log` after quantized validation
+/// columns were added but before the checkpoint-directory column was added.
+const SUMMARY_LEARN_LOG_HEADER_V3: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,quantized_value_accuracy,quantized_value_loss";
+
 /// Schema for the top-level `<output>/summary-learn.log`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
 /// (= the effective superbatch boundary) and conveys no info. The
-/// rightmost `test_teacher` column records the validation filename
-/// specified by `--test-teacher` so the accuracy/loss columns remain
-/// attributable without making the log line as wide as a full path.
+/// `test_teacher` records the validation filename specified by
+/// `--test-teacher` so the accuracy/loss columns remain attributable
+/// without making the log line as wide as a full path.
 ///
 /// `quantized_value_accuracy` / `quantized_value_loss` are filled only for
 /// SFNN epoch-end checkpoints where an exported `nn.bin` exists. Other rows
 /// use `-`. Accuracy is stored as a 0..1 ratio, matching
 /// `test_value_accuracy`; the loss is the engine-scale quantized validation
 /// loss reported by `bulletou quantized-test`.
-const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,quantized_value_accuracy,quantized_value_loss";
+///
+/// `checkpoint` is the numbered save directory name (`0033`, etc.) for rows
+/// that saved a checkpoint. Validation-only rows use `-`.
+const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,quantized_value_accuracy,quantized_value_loss,checkpoint";
 
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
@@ -16605,6 +16689,55 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
     last_teacher
 }
 
+fn summary_checkpoint_key_from_line(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.splitn(11, ',').collect();
+    if parts.len() < 10 {
+        return None;
+    }
+    Some(format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[9]))
+}
+
+fn learn_checkpoint_key_from_line(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.splitn(12, ',').collect();
+    if parts.len() < 11 || parts[0] == "eval" {
+        return None;
+    }
+    Some(format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[10]))
+}
+
+fn checkpoint_name_by_summary_key(
+    output_dir: &std::path::Path,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    if !output_dir.is_dir() {
+        return Ok(map);
+    }
+    let mut entries = std::fs::read_dir(output_dir)?.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if name.len() != 4 || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let learn_log = path.join("learn.log");
+        let Ok(content) = std::fs::read_to_string(&learn_log) else { continue };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == LEARN_LOG_HEADER || trimmed == LEARN_LOG_HEADER_V1 {
+                continue;
+            }
+            if let Some(key) = learn_checkpoint_key_from_line(trimmed) {
+                map.insert(key, name.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Result<()> {
     let content = std::fs::read_to_string(top)?;
     let mut lines = content.lines();
@@ -16612,12 +16745,15 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
         return Ok(());
     };
     let suffix = if first_line == SUMMARY_LEARN_LOG_HEADER_V1 {
-        ",-,-,-"
+        ",-,-,-,"
     } else if first_line == SUMMARY_LEARN_LOG_HEADER_V2 {
-        ",-,-"
+        ",-,-,"
+    } else if first_line == SUMMARY_LEARN_LOG_HEADER_V3 {
+        ","
     } else {
         return Ok(());
     };
+    let checkpoint_by_key = top.parent().map(checkpoint_name_by_summary_key).transpose()?.unwrap_or_default();
 
     let mut upgraded = String::new();
     upgraded.push_str(SUMMARY_LEARN_LOG_HEADER);
@@ -16626,8 +16762,12 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
         if line.trim().is_empty() {
             continue;
         }
+        let checkpoint = summary_checkpoint_key_from_line(line)
+            .and_then(|key| checkpoint_by_key.get(&key).cloned())
+            .unwrap_or_else(|| "-".to_string());
         upgraded.push_str(line);
         upgraded.push_str(suffix);
+        upgraded.push_str(&checkpoint);
         upgraded.push('\n');
     }
     std::fs::write(top, upgraded)
@@ -16667,7 +16807,10 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
                 }
             }
         }
-        if head_buf == SUMMARY_LEARN_LOG_HEADER_V1 || head_buf == SUMMARY_LEARN_LOG_HEADER_V2 {
+        if head_buf == SUMMARY_LEARN_LOG_HEADER_V1
+            || head_buf == SUMMARY_LEARN_LOG_HEADER_V2
+            || head_buf == SUMMARY_LEARN_LOG_HEADER_V3
+        {
             upgrade_summary_log_to_current_schema(&top)?;
         } else if !head_buf.is_empty() && head_buf != SUMMARY_LEARN_LOG_HEADER {
             return Err(std::io::Error::new(
@@ -16686,7 +16829,8 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
 
 fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: Option<&Args>) -> std::io::Result<()> {
     use std::io::Write;
-    let latest_log = output_dir.join(format!("{last_idx:04}")).join("learn.log");
+    let checkpoint_name = format!("{last_idx:04}");
+    let latest_log = output_dir.join(&checkpoint_name).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed = ensure_summary_log_schema(&top)?;
@@ -16695,6 +16839,7 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
     // header before filtering data rows.
     let body_no_header = body
         .strip_prefix(LEARN_LOG_HEADER)
+        .or_else(|| body.strip_prefix(LEARN_LOG_HEADER_V1))
         .and_then(|rest| rest.strip_prefix('\n').or(Some(rest)))
         .unwrap_or(body.as_str());
     if !top_existed {
@@ -16712,15 +16857,24 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
         Some((parts[0].to_string(), parts[2].to_string()))
     };
     let drop_curr_batch = |line: &str| -> Option<String> {
-        // Split with splitn(12, ',') so the trailing `teacher` field
-        // keeps any commas. Drop index 3 (`curr_batch`).
-        let parts: Vec<&str> = line.splitn(12, ',').collect();
-        if parts.len() < 12 {
-            return None;
-        }
+        // New per-dir learn.log keeps `teacher` as the trailing field so
+        // splitn(14, ',') preserves commas inside an escaped teacher path.
+        // Older learn.log files had 12 columns and no quantized metrics.
+        let new_parts: Vec<&str> = line.splitn(14, ',').collect();
+        let (parts, quantized_accuracy, quantized_loss, teacher_index) = if new_parts.len() >= 14 {
+            let quantized_accuracy = new_parts[11];
+            let quantized_loss = new_parts[12];
+            (new_parts, quantized_accuracy, quantized_loss, 13usize)
+        } else {
+            let old_parts: Vec<&str> = line.splitn(12, ',').collect();
+            if old_parts.len() < 12 {
+                return None;
+            }
+            (old_parts, "-", "-", 11usize)
+        };
         let mut out = String::with_capacity(line.len());
         for (i, p) in parts.iter().enumerate() {
-            if i == 3 {
+            if i == 3 || i == 11 || i == 12 || i == teacher_index {
                 continue;
             }
             if !out.is_empty() {
@@ -16729,8 +16883,15 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
             out.push_str(p);
         }
         out.push(',');
+        out.push_str(parts[teacher_index]);
+        out.push(',');
         out.push_str(&test_teacher_csv);
-        out.push_str(",-,-");
+        out.push(',');
+        out.push_str(quantized_accuracy);
+        out.push(',');
+        out.push_str(quantized_loss);
+        out.push(',');
+        out.push_str(&checkpoint_name);
         Some(out)
     };
     for (i, line) in lines.iter().enumerate() {
@@ -22004,10 +22165,14 @@ mod tests {
         // Two data rows: the sb=1 boundary row (b=96) and the sb=2
         // boundary row (b=64); intermediate rows dropped, and the
         // curr_batch column itself is also stripped. `test_teacher` is
-        // appended as the rightmost summary-only column.
+        // appended as summary-only columns.
         assert_eq!(lines.len(), 3, "header + one row per sb, got {lines:?}");
         let cols1: Vec<&str> = lines[1].split(',').collect();
-        assert_eq!(cols1.len(), 14, "summary row has 14 cols (no curr_batch + test_teacher + quantized metrics)");
+        assert_eq!(
+            cols1.len(),
+            15,
+            "summary row has 15 cols (no curr_batch + test_teacher + quantized metrics + checkpoint)"
+        );
         assert_eq!(cols1[2], "1", "first kept row is sb=1");
         // Index 3 is now `test_value_accuracy` (was `curr_batch`).
         assert_eq!(cols1[3], "0.50", "col 3 is test_value_accuracy (curr_batch dropped)");
@@ -22016,13 +22181,15 @@ mod tests {
         assert_eq!(cols1[11], "-", "no Args were passed, so test_teacher is unknown");
         assert_eq!(cols1[12], "-", "quantized accuracy is unknown for a plain summary append");
         assert_eq!(cols1[13], "-", "quantized loss is unknown for a plain summary append");
+        assert_eq!(cols1[14], "0001", "checkpoint folder name is appended");
         let cols2: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(cols2.len(), 14);
+        assert_eq!(cols2.len(), 15);
         assert_eq!(cols2[2], "2", "second kept row is sb=2");
         assert_eq!(cols2[3], "0.55", "col 3 is test_value_accuracy");
         assert_eq!(cols2[11], "-");
         assert_eq!(cols2[12], "-");
         assert_eq!(cols2[13], "-");
+        assert_eq!(cols2[14], "0001");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -22050,7 +22217,7 @@ mod tests {
             dir.join("learn.log"),
             format!(
                 "{LEARN_LOG_HEADER}\n\
-                 E,1,2,64,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe\n",
+                 E,1,2,64,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,-,-,new-teacher.hcpe\n",
             ),
         )
         .unwrap();
@@ -22069,10 +22236,10 @@ mod tests {
         let top = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let lines: Vec<&str> = top.lines().collect();
         assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER);
-        assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-,-,-");
+        assert_eq!(lines[1], "E,1,1,0.50,0.30,0.08,0.001,0.0007,1.000,1572864,old-teacher.hcpe,-,-,-,-");
         assert_eq!(
             lines[2],
-            "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe,-,-"
+            "E,1,2,0.55,0.28,0.06,0.001,0.0005,1.000,2621440,new-teacher.hcpe,validation-set.hcpe,-,-,0001"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -22149,7 +22316,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1],
-            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,-,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe,-,-"
+            "NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.625000,0.125000,-,0.000875,0.000875,1.000000,15,teacher.psv,validation.hcpe,-,-,-"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -22326,15 +22493,15 @@ mod tests {
         assert_eq!(learn_lines[0], LEARN_LOG_HEADER);
         assert!(learn_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,3,"));
         assert!(learn_lines[1].contains(",0.625000,0.125000,-,"));
-        assert!(learn_lines[1].contains(",15,teacher.psv"));
+        assert!(learn_lines[1].contains(",15,-,-,teacher.psv"));
 
         let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
         let summary_lines = summary.lines().collect::<Vec<_>>();
         assert_eq!(summary_lines[0], SUMMARY_LEARN_LOG_HEADER);
         assert_eq!(summary_lines.len(), 2);
-        assert_eq!(summary_lines[1].split(',').count(), 14);
+        assert_eq!(summary_lines[1].split(',').count(), 15);
         assert!(summary_lines[1].starts_with("SFNN_HALFKA2-SFNN_halfka2_1024_7_64_k3k3,1,1,"));
-        assert!(summary_lines[1].ends_with(",validation.hcpe,-,-"));
+        assert!(summary_lines[1].ends_with(",validation.hcpe,-,-,0001"));
 
         let dir2 = tmp.join("0002");
         std::fs::create_dir_all(&dir2).unwrap();
@@ -22370,6 +22537,38 @@ mod tests {
         assert_eq!(summary2_cols[11], "validation.hcpe");
         assert_eq!(summary2_cols[12], "-");
         assert_eq!(summary2_cols[13], "-");
+        assert_eq!(summary2_cols[14], "0002");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_metrics_update_checkpoint_learn_log() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-quantized-learn-log-update-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 E,1,27,2440,0.63,0.12,-,0.001,0.0008,1.000,159907840,-,-,teacher.psv\n"
+            ),
+        )
+        .unwrap();
+
+        update_checkpoint_learn_log_quantized_metrics(&tmp, TestMetrics { accuracy: 0.6412345, loss: 0.09876543 })
+            .unwrap();
+
+        let learn = std::fs::read_to_string(tmp.join("learn.log")).unwrap();
+        let lines = learn.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], LEARN_LOG_HEADER);
+        let cols = lines[1].split(',').collect::<Vec<_>>();
+        assert_eq!(cols[11], "0.641235");
+        assert_eq!(cols[12], "0.09876543");
+        assert_eq!(cols[13], "teacher.psv");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
