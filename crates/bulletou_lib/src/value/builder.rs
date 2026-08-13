@@ -10,7 +10,7 @@ use bullet_trainer::{
 use crate::{
     game::{inputs::SparseInputType, outputs::OutputBuckets},
     nn::{ExecutionContext, ModelBuilder, ModelNode, optimiser::OptimiserType},
-    value::ValueTrainerState,
+    value::{ValueTrainerState, loader::WinRateModelTargetParams},
 };
 
 use super::{B, ValueTrainer};
@@ -29,6 +29,8 @@ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     loss_fn: Option<LossFn>,
     factorised: Vec<String>,
     wdl_output: bool,
+    use_win_rate_model: bool,
+    wrm_target: WinRateModelTargetParams,
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// 設定すると `entry_weights * loss` が有効化される（weight_getter 未設定でも）。
     score_drop_abs: Option<u16>,
@@ -50,6 +52,8 @@ where
             weight_getter: None,
             loss_fn: None,
             wdl_output: false,
+            use_win_rate_model: false,
+            wrm_target: WinRateModelTargetParams::DEFAULT,
             score_drop_abs: None,
             factorised: Vec::new(),
             print_ir: false,
@@ -76,6 +80,17 @@ where
 
     pub fn wdl_output(mut self) -> Self {
         self.wdl_output = true;
+        self
+    }
+
+    pub fn use_win_rate_model(mut self) -> Self {
+        self.use_win_rate_model = true;
+        self
+    }
+
+    pub fn win_rate_model_target(mut self, params: WinRateModelTargetParams) -> Self {
+        self.use_win_rate_model = true;
+        self.wrm_target = params;
         self
     }
 
@@ -166,6 +181,8 @@ where
                 wdl: self.wdl_output,
                 saved_format,
                 score_drop_abs: self.score_drop_abs,
+                use_win_rate_model: self.use_win_rate_model,
+                wrm_target: self.wrm_target,
             },
         })
     }
@@ -248,6 +265,8 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
+            use_win_rate_model: self.use_win_rate_model,
+            wrm_target: self.wrm_target,
             score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }
@@ -276,6 +295,8 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
+            use_win_rate_model: self.use_win_rate_model,
+            wrm_target: self.wrm_target,
             score_drop_abs: self.score_drop_abs,
             print_ir: self.print_ir,
         }

@@ -102,6 +102,8 @@ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
     /// `Some(cap)` のとき `|score| >= cap` の局面を loss から除外。
     /// builder の `score_drop_abs(cap)` で設定。
     score_drop_abs: Option<u16>,
+    use_win_rate_model: bool,
+    wrm_target: WinRateModelTargetParams,
 }
 
 impl<Inp: SparseInputType, Out> ValueTrainerState<Inp, Out>
@@ -117,7 +119,7 @@ where
         blend: f32,
         scale: f32,
     ) -> PreparedBatchHost {
-        PreparedBatchHost::from(PreparedData::new(
+        PreparedBatchHost::from(PreparedData::new_with_win_rate_model_target(
             self.input_getter.clone(),
             self.output_getter,
             self.blend_getter,
@@ -128,6 +130,8 @@ where
             blend,
             scale,
             self.score_drop_abs,
+            self.use_win_rate_model,
+            self.wrm_target,
         ))
     }
 }
@@ -174,7 +178,8 @@ where
             schedule.eval_scale,
             self.state.score_drop_abs,
             dataloader.clone(),
-        );
+        )
+        .with_win_rate_model_target(self.state.use_win_rate_model, self.state.wrm_target);
 
         let _ = std::fs::create_dir(settings.output_directory);
 

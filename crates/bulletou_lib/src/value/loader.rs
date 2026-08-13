@@ -313,6 +313,38 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_with_win_rate_model_target(
+        input_getter: I,
+        output_getter: O,
+        blend_getter: B<I>,
+        weight_getter: Option<Wgt<I>>,
+        wdl: bool,
+        data: &[I::RequiredDataType],
+        threads: usize,
+        blend: f32,
+        scale: f32,
+        score_drop_abs: Option<u16>,
+        use_win_rate_model: bool,
+        wrm_target: WinRateModelTargetParams,
+    ) -> Self {
+        let wrm_score_table = (use_win_rate_model && !wdl).then(|| win_rate_model_score_table(wrm_target));
+        Self::new_with_pool_internal(
+            input_getter,
+            output_getter,
+            blend_getter,
+            weight_getter,
+            wdl,
+            data,
+            threads,
+            blend,
+            scale,
+            score_drop_abs,
+            wrm_score_table,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_pool(
         input_getter: I,
         output_getter: O,
