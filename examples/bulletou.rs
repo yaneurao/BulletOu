@@ -3709,6 +3709,14 @@ struct Args {
     #[arg(long = "sfnn-factorizer-alpha")]
     sfnn_factorizer_alpha: Option<SfnnFactorizerAlphaSpec>,
 
+    /// Extra Ranger weight decay applied only to SFNN base stack tensors
+    /// whose layer has an active shared/axis factorizer term. This treats
+    /// the base stack tensor as the bucket-specific residual and gently
+    /// shrinks it toward the factorized shared/axis structure. Default 0
+    /// keeps normal training.
+    #[arg(long = "sfnn-factorizer-residual-decay", default_value = "0.0")]
+    sfnn_factorizer_residual_decay: f32,
+
     /// Compatibility alias for `--sfnn-factorizer none`; disables all SFNN
     /// residual factorizer terms. Use this when resuming an older
     /// non-factorized SFNN experiment.
@@ -3919,6 +3927,15 @@ impl Args {
         if self.sfnn_factorizer_alpha.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer-alpha currently applies to SFNN / LayerStack eval types only".to_string());
         }
+        if !(self.sfnn_factorizer_residual_decay.is_finite() && self.sfnn_factorizer_residual_decay >= 0.0) {
+            return Err(format!(
+                "--sfnn-factorizer-residual-decay must be finite and non-negative (got {})",
+                self.sfnn_factorizer_residual_decay
+            ));
+        }
+        if self.sfnn_factorizer_residual_decay != 0.0 && !eval_type.uses_layerstack() {
+            return Err("--sfnn-factorizer-residual-decay applies to SFNN / LayerStack eval types only".to_string());
+        }
         if !(self.sfnn_l1_lr_mult.is_finite() && self.sfnn_l1_lr_mult >= 0.0) {
             return Err(format!("--sfnn-l1-lr-mult must be finite and non-negative (got {})", self.sfnn_l1_lr_mult));
         }
@@ -3988,6 +4005,14 @@ impl Args {
             && !effective_sfnn_factorizer_alpha(self).is_default()
         {
             return Err("--sfnn-factorizer-alpha has no effect when --sfnn-factorizer none is active".to_string());
+        }
+        if self.sfnn_factorizer_residual_decay != 0.0
+            && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
+        {
+            return Err(
+                "--sfnn-factorizer-residual-decay requires an active SFNN factorizer; use --sfnn-factorizer shared or axis"
+                    .to_string(),
+            );
         }
         if let Some(0) = self.cuda_cpp_train_steps {
             return Err("--cuda-cpp-train-steps must be > 0".to_string());
@@ -9668,6 +9693,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::Magenta,
         );
     }
+    if args.sfnn_factorizer_residual_decay != 0.0 {
+        print_startup_kv_colored(
+            "factorizer residual decay",
+            format!("{:.9} (base stack tensors only)", args.sfnn_factorizer_residual_decay),
+            ConsoleColor::Magenta,
+        );
+    }
     print_startup_kv(
         "stored factorizers",
         format!(
@@ -15279,6 +15311,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
+        factorizer_residual_decay: args.sfnn_factorizer_residual_decay,
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -15765,6 +15798,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
+        format!("sfnn_factorizer_residual_decay={:.9}", args.sfnn_factorizer_residual_decay),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -15853,7 +15887,13 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_factorizer=",
         "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000",
     );
-    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_alpha=", "sfnn_l1_lr_mult=1.000000000");
+    ensure_line_after(
+        &mut out,
+        "sfnn_factorizer_residual_decay=",
+        "sfnn_factorizer_alpha=",
+        "sfnn_factorizer_residual_decay=0.000000000",
+    );
+    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_residual_decay=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
 
@@ -19356,6 +19396,63 @@ mod tests {
         .unwrap();
         let err = args.validate_backend_flags().unwrap_err();
         assert!(err.contains("--sfnn-factorizer-alpha has no effect"), "{err}");
+    }
+
+    #[test]
+    fn sfnn_factorizer_residual_decay_requires_active_factorizer_and_is_signed() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "axis",
+            "--sfnn-factorizer-residual-decay",
+            "0.000001",
+        ])
+        .unwrap();
+        assert_eq!(args.sfnn_factorizer_residual_decay, 0.000001);
+        assert!(args.validate_backend_flags().is_ok());
+        assert!(resume_signature(&args).contains("sfnn_factorizer_residual_decay=0.000001000"));
+
+        let old_signature = resume_signature_without_line(&resume_signature(&args), "sfnn_factorizer_residual_decay=");
+        assert!(
+            !resume_signature_matches(&old_signature, &args),
+            "omitting the residual decay line must not match a non-zero decay run"
+        );
+
+        let defaulted =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        let old_default_signature =
+            resume_signature_without_line(&resume_signature(&defaulted), "sfnn_factorizer_residual_decay=");
+        assert!(resume_signature_matches(&old_default_signature, &defaulted));
+
+        let no_factorizer = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "none",
+            "--sfnn-factorizer-residual-decay",
+            "0.000001",
+        ])
+        .unwrap();
+        let err = no_factorizer.validate_backend_flags().unwrap_err();
+        assert!(err.contains("--sfnn-factorizer-residual-decay requires an active SFNN factorizer"), "{err}");
     }
 
     #[test]

@@ -5190,11 +5190,12 @@ pub struct SfnnLayerLrMultipliers {
     pub l2: f32,
     pub l3: f32,
     pub update_scope: SfnnUpdateScope,
+    pub factorizer_residual_decay: f32,
 }
 
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
-        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0, update_scope: SfnnUpdateScope::All }
+        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0, update_scope: SfnnUpdateScope::All, factorizer_residual_decay: 0.0 }
     }
 }
 
@@ -5206,6 +5207,9 @@ impl SfnnLayerLrMultipliers {
                     "SFNN {name} learning-rate multiplier must be finite and non-negative"
                 )));
             }
+        }
+        if !(self.factorizer_residual_decay.is_finite() && self.factorizer_residual_decay >= 0.0) {
+            return Err(CudaCppError::message("SFNN factorizer residual decay must be finite and non-negative"));
         }
         Ok(())
     }
@@ -5865,6 +5869,41 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    fn layer_has_active_factorizer(&self, layer: SfnnUpdateLayer) -> bool {
+        match layer {
+            SfnnUpdateLayer::L0 => false,
+            SfnnUpdateLayer::L1 => {
+                (self.factorizer.shared && self.weights.l1fw.is_some())
+                    || (self.factorizer.any_axis() && self.weights.l1axw.is_some())
+            }
+            SfnnUpdateLayer::L2 => {
+                (self.factorizer.shared && self.weights.l2fw.is_some())
+                    || (self.factorizer.any_axis() && self.weights.l2axw.is_some())
+            }
+            SfnnUpdateLayer::L3 => {
+                (self.factorizer.shared && self.weights.l3fw.is_some())
+                    || (self.factorizer.any_axis() && self.weights.l3axw.is_some())
+            }
+        }
+    }
+
+    fn params_with_residual_decay(
+        &self,
+        params: RangerUpdateParams,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        layer: SfnnUpdateLayer,
+    ) -> Result<RangerUpdateParams> {
+        if lr_multipliers.factorizer_residual_decay == 0.0 || !self.layer_has_active_factorizer(layer) {
+            return Ok(params);
+        }
+        let mut params = params;
+        params.radam.decay += lr_multipliers.factorizer_residual_decay;
+        if !params.radam.decay.is_finite() {
+            return Err(CudaCppError::message("SFNN factorizer residual decay overflowed Ranger decay"));
+        }
+        Ok(params)
+    }
+
     fn update_weights_with_lr_multipliers(
         &mut self,
         ctx: &Context,
@@ -5880,6 +5919,9 @@ impl SfnnTrainStepRunner {
         let l2b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias);
         let l3w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight);
         let l3b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias);
+        let l1_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L1)?;
+        let l2_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L2)?;
+        let l3_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L3)?;
         update_param_group_with_lr_multiplier(
             ctx,
             params,
@@ -5898,7 +5940,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l1_residual_params,
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
@@ -5906,7 +5948,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l1_residual_params,
             &self.backward_workspace.l1b_gradients,
             &self.weights.l1b,
             &self.optimizer_states.l1b,
@@ -5960,7 +6002,7 @@ impl SfnnTrainStepRunner {
         }
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l2_residual_params,
             &self.backward_workspace.l2w_gradients,
             &self.weights.l2w,
             &self.optimizer_states.l2w,
@@ -5968,7 +6010,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l2_residual_params,
             &self.backward_workspace.l2b_gradients,
             &self.weights.l2b,
             &self.optimizer_states.l2b,
@@ -6022,7 +6064,7 @@ impl SfnnTrainStepRunner {
         }
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l3_residual_params,
             &self.backward_workspace.l3w_gradients,
             &self.weights.l3w,
             &self.optimizer_states.l3w,
@@ -6030,7 +6072,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            l3_residual_params,
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
@@ -7178,6 +7220,12 @@ mod tests {
         assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight), 0.0);
         assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight), 1.0);
         assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias), 1.0);
+
+        let residual_decay = SfnnLayerLrMultipliers { factorizer_residual_decay: 0.000001, ..Default::default() };
+        assert!(residual_decay.validate().is_ok());
+
+        let invalid_decay = SfnnLayerLrMultipliers { factorizer_residual_decay: f32::NAN, ..Default::default() };
+        assert!(invalid_decay.validate().is_err());
     }
 
     #[test]
