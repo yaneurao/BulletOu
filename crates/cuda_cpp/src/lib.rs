@@ -5142,17 +5142,59 @@ pub struct SfnnTrainStepRunner {
     pub next_upload_slot: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SfnnUpdateScope {
+    All,
+    L2L3,
+    L3Only,
+    BiasOnly,
+    L3BiasOnly,
+}
+
+impl Default for SfnnUpdateScope {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SfnnUpdateLayer {
+    L0,
+    L1,
+    L2,
+    L3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SfnnUpdateParamKind {
+    Weight,
+    Bias,
+}
+
+impl SfnnUpdateScope {
+    fn allows(self, layer: SfnnUpdateLayer, kind: SfnnUpdateParamKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::L2L3 => matches!(layer, SfnnUpdateLayer::L2 | SfnnUpdateLayer::L3),
+            Self::L3Only => matches!(layer, SfnnUpdateLayer::L3),
+            Self::BiasOnly => matches!(kind, SfnnUpdateParamKind::Bias),
+            Self::L3BiasOnly => matches!(layer, SfnnUpdateLayer::L3) && matches!(kind, SfnnUpdateParamKind::Bias),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnLayerLrMultipliers {
     pub l0: f32,
     pub l1: f32,
     pub l2: f32,
     pub l3: f32,
+    pub update_scope: SfnnUpdateScope,
 }
 
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
-        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0 }
+        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0, update_scope: SfnnUpdateScope::All }
     }
 }
 
@@ -5166,6 +5208,19 @@ impl SfnnLayerLrMultipliers {
             }
         }
         Ok(())
+    }
+
+    fn layer_multiplier(self, layer: SfnnUpdateLayer) -> f32 {
+        match layer {
+            SfnnUpdateLayer::L0 => self.l0,
+            SfnnUpdateLayer::L1 => self.l1,
+            SfnnUpdateLayer::L2 => self.l2,
+            SfnnUpdateLayer::L3 => self.l3,
+        }
+    }
+
+    fn param_multiplier(self, layer: SfnnUpdateLayer, kind: SfnnUpdateParamKind) -> f32 {
+        if self.update_scope.allows(layer, kind) { self.layer_multiplier(layer) } else { 0.0 }
     }
 }
 
@@ -5817,13 +5872,21 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
     ) -> Result<()> {
         lr_multipliers.validate()?;
+        let l0w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
+        let l0b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias);
+        let l1w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight);
+        let l1b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias);
+        let l2w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight);
+        let l2b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias);
+        let l3w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight);
+        let l3b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias);
         update_param_group_with_lr_multiplier(
             ctx,
             params,
             &self.backward_workspace.l0w_gradients,
             &self.weights.l0w,
             &self.optimizer_states.l0w,
-            lr_multipliers.l0,
+            l0w_lr,
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
@@ -5831,7 +5894,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l0b_gradients,
             &self.weights.l0b,
             &self.optimizer_states.l0b,
-            lr_multipliers.l0,
+            l0b_lr,
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
@@ -5839,7 +5902,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
-            lr_multipliers.l1,
+            l1w_lr,
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
@@ -5847,7 +5910,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l1b_gradients,
             &self.weights.l1b,
             &self.optimizer_states.l1b,
-            lr_multipliers.l1,
+            l1b_lr,
         )?;
         match (&self.weights.l1fw, &self.weights.l1fb, &self.optimizer_states.l1fw, &self.optimizer_states.l1fb) {
             (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
@@ -5857,7 +5920,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l1fw_gradients,
                     l1fw,
                     l1fw_state,
-                    lr_multipliers.l1,
+                    l1w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -5865,7 +5928,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l1fb_gradients,
                     l1fb,
                     l1fb_state,
-                    lr_multipliers.l1,
+                    l1b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -5880,7 +5943,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l1axw_gradients,
                     l1axw,
                     l1axw_state,
-                    lr_multipliers.l1,
+                    l1w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -5888,7 +5951,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l1axb_gradients,
                     l1axb,
                     l1axb_state,
-                    lr_multipliers.l1,
+                    l1b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -5901,7 +5964,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l2w_gradients,
             &self.weights.l2w,
             &self.optimizer_states.l2w,
-            lr_multipliers.l2,
+            l2w_lr,
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
@@ -5909,7 +5972,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l2b_gradients,
             &self.weights.l2b,
             &self.optimizer_states.l2b,
-            lr_multipliers.l2,
+            l2b_lr,
         )?;
         match (&self.weights.l2fw, &self.weights.l2fb, &self.optimizer_states.l2fw, &self.optimizer_states.l2fb) {
             (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) if self.factorizer.shared => {
@@ -5919,7 +5982,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l2fw_gradients,
                     l2fw,
                     l2fw_state,
-                    lr_multipliers.l2,
+                    l2w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -5927,7 +5990,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l2fb_gradients,
                     l2fb,
                     l2fb_state,
-                    lr_multipliers.l2,
+                    l2b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -5942,7 +6005,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l2axw_gradients,
                     l2axw,
                     l2axw_state,
-                    lr_multipliers.l2,
+                    l2w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -5950,7 +6013,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l2axb_gradients,
                     l2axb,
                     l2axb_state,
-                    lr_multipliers.l2,
+                    l2b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -5963,7 +6026,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l3w_gradients,
             &self.weights.l3w,
             &self.optimizer_states.l3w,
-            lr_multipliers.l3,
+            l3w_lr,
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
@@ -5971,7 +6034,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
-            lr_multipliers.l3,
+            l3b_lr,
         )?;
         match (&self.weights.l3fw, &self.weights.l3fb, &self.optimizer_states.l3fw, &self.optimizer_states.l3fb) {
             (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) if self.factorizer.shared => {
@@ -5981,7 +6044,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l3fw_gradients,
                     l3fw,
                     l3fw_state,
-                    lr_multipliers.l3,
+                    l3w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -5989,7 +6052,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l3fb_gradients,
                     l3fb,
                     l3fb_state,
-                    lr_multipliers.l3,
+                    l3b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -6004,7 +6067,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l3axw_gradients,
                     l3axw,
                     l3axw_state,
-                    lr_multipliers.l3,
+                    l3w_lr,
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
@@ -6012,7 +6075,7 @@ impl SfnnTrainStepRunner {
                     &self.backward_workspace.l3axb_gradients,
                     l3axb,
                     l3axb_state,
-                    lr_multipliers.l3,
+                    l3b_lr,
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -7094,6 +7157,27 @@ mod tests {
         assert_eq!(layout.l2_input_len(), 20);
         assert_eq!(layout.l2_len(), 15);
         assert_eq!(layout.output_len(), 5);
+    }
+
+    #[test]
+    fn sfnn_update_scope_selects_expected_parameter_groups() {
+        let all = SfnnLayerLrMultipliers::default();
+        assert_eq!(all.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight), 1.0);
+        assert_eq!(all.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias), 1.0);
+
+        let l3_bias_only = SfnnLayerLrMultipliers { update_scope: SfnnUpdateScope::L3BiasOnly, ..Default::default() };
+        assert_eq!(l3_bias_only.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias), 1.0);
+        assert_eq!(l3_bias_only.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight), 0.0);
+        assert_eq!(l3_bias_only.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias), 0.0);
+
+        let bias_only = SfnnLayerLrMultipliers { update_scope: SfnnUpdateScope::BiasOnly, ..Default::default() };
+        assert_eq!(bias_only.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias), 1.0);
+        assert_eq!(bias_only.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight), 0.0);
+
+        let l2_l3 = SfnnLayerLrMultipliers { update_scope: SfnnUpdateScope::L2L3, ..Default::default() };
+        assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight), 0.0);
+        assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight), 1.0);
+        assert_eq!(l2_l3.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias), 1.0);
     }
 
     #[test]

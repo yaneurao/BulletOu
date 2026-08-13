@@ -189,6 +189,42 @@ impl BackendKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum SfnnUpdateScopeArg {
+    All,
+    #[value(name = "l2-l3")]
+    L2L3,
+    L3Only,
+    BiasOnly,
+    L3BiasOnly,
+}
+
+impl SfnnUpdateScopeArg {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::L2L3 => "l2-l3",
+            Self::L3Only => "l3-only",
+            Self::BiasOnly => "bias-only",
+            Self::L3BiasOnly => "l3-bias-only",
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl From<SfnnUpdateScopeArg> for bulletou_cuda_cpp::SfnnUpdateScope {
+    fn from(value: SfnnUpdateScopeArg) -> Self {
+        match value {
+            SfnnUpdateScopeArg::All => Self::All,
+            SfnnUpdateScopeArg::L2L3 => Self::L2L3,
+            SfnnUpdateScopeArg::L3Only => Self::L3Only,
+            SfnnUpdateScopeArg::BiasOnly => Self::BiasOnly,
+            SfnnUpdateScopeArg::L3BiasOnly => Self::L3BiasOnly,
+        }
+    }
+}
+
 /// LayerStack bucketing scheme for the SFNN family. Selects which
 /// per-position bucket index is used to choose the active MLP stack
 /// from the LayerStacks array, and implicitly determines the **stack
@@ -3229,6 +3265,13 @@ struct Args {
     #[arg(long)]
     sfnn_freeze_l1: bool,
 
+    /// Restrict which SFNN parameter groups receive optimizer updates.
+    /// Default `all` keeps normal training. Use `l3-only`, `bias-only`, or
+    /// `l3-bias-only` for conservative fine-tuning when quantized accuracy
+    /// rises briefly and then collapses.
+    #[arg(long, value_enum, default_value = "all")]
+    sfnn_update_scope: SfnnUpdateScopeArg,
+
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
     /// for clearer per-batch timings, so use it only for diagnosis.
@@ -3881,6 +3924,9 @@ impl Args {
         }
         if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1) && !eval_type.uses_layerstack() {
             return Err("--sfnn-l1-lr-mult / --sfnn-freeze-l1 apply to SFNN / LayerStack eval types only".to_string());
+        }
+        if self.sfnn_update_scope != SfnnUpdateScopeArg::All && !eval_type.uses_layerstack() {
+            return Err("--sfnn-update-scope applies to SFNN / LayerStack eval types only".to_string());
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
@@ -9682,7 +9728,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
-    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1 {
+    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1 || args.sfnn_update_scope != SfnnUpdateScopeArg::All {
         let freeze = if args.sfnn_freeze_l1 {
             paint("on", ConsoleColor::BoldYellow)
         } else {
@@ -9691,8 +9737,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "SFNN layer LR",
             format!(
-                "L1 multiplier={} freeze={freeze}",
-                paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow)
+                "L1 multiplier={} freeze={freeze}, update_scope={}",
+                paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow),
+                paint(args.sfnn_update_scope.cli_name(), ConsoleColor::BoldYellow)
             ),
         );
     }
@@ -15229,7 +15276,11 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     args: &Args,
     _progress: Option<CudaCppScheduleProgress>,
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
-    let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers { l1: args.sfnn_l1_lr_mult, ..Default::default() };
+    let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
+        l1: args.sfnn_l1_lr_mult,
+        update_scope: args.sfnn_update_scope.into(),
+        ..Default::default()
+    };
     if args.sfnn_freeze_l1 {
         multipliers.l1 = 0.0;
     }
@@ -15716,6 +15767,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
+        format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
         format!("test_batch_size={}", args.test_batch_size),
@@ -15803,6 +15855,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     );
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_alpha=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
+    ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');
@@ -21832,6 +21885,65 @@ mod tests {
             "27",
         ]);
         assert!(old_name.is_err(), "--sfnn-freeze-l1-sbs should not remain as a CLI alias");
+    }
+
+    #[test]
+    fn sfnn_update_scope_cli_feeds_resume_signature() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-update-scope",
+            "l3-bias-only",
+        ])
+        .unwrap();
+
+        assert_eq!(args.sfnn_update_scope, SfnnUpdateScopeArg::L3BiasOnly);
+        assert!(args.validate_backend_flags().is_ok());
+        assert!(resume_signature(&args).contains("sfnn_update_scope=l3-bias-only"));
+
+        let defaulted =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        assert!(resume_signature(&defaulted).contains("sfnn_update_scope=all"));
+    }
+
+    #[test]
+    fn sfnn_update_scope_rejects_non_sfnn_arch() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-update-scope",
+            "l3-only",
+        ])
+        .unwrap();
+
+        assert!(args.validate_backend_flags().is_err());
+    }
+
+    #[test]
+    fn resume_signature_accepts_old_configs_without_sfnn_update_scope() {
+        use clap::Parser as _;
+
+        let args =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        let old_signature = resume_signature_without_line(&resume_signature(&args), "sfnn_update_scope=");
+
+        assert!(resume_signature_matches(&old_signature, &args));
     }
 
     #[test]
