@@ -45,6 +45,12 @@ teachers/
 BulletOu はデフォルトで学習時 shuffle を行うので、初回は特に指定しなくて構いません。
 メモリ使用量や shuffle window を調整したくなったら [応用編](../advanced/) を見てください。
 
+## 2.4 score scale が違う教師データを混ぜる場合
+
+DL 系モデルで re-score した教師データ同士でも、勝率を評価値へ戻すときの係数が違うと、score の大きさがそろいません。
+
+最初の学習では気にしなくて構いません。複数の教師データを混ぜる段階になったら、応用編の [loss の scale と `FV_SCALE`](../advanced/scale-and-fv-scale.md) を見てください。
+
 ---
 
 次へ: [3. 学習を走らせる](3-train.md)

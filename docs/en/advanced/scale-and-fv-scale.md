@@ -147,3 +147,60 @@ For the plain sigmoid loss, add:
 Training `test_value_loss` is measured with f32 weights. The `nn.bin` used by YaneuraOu is quantized.
 
 To measure quantized accuracy/loss or inspect the best `FV_SCALE`, use [Quantized `nn.bin` checks](quantized-nn-bin.md).
+
+## 7. Matching a teacher score scale to an existing `nn.bin`
+
+When you mix multiple teacher datasets, make sure their score magnitudes mean the same thing.
+
+For example, two PSV datasets may both be produced by DL-based re-scoring, but if the DL win rate was converted back to eval scores with different coefficients, the same win rate will produce different `score` values. If you train on them as-is, “+100” and “+500” no longer mean the same thing across datasets.
+
+`fit-teacher-scale` samples positions from a teacher PSV file, evaluates the same positions with a reference `nn.bin`, and estimates a multiplier `a` for the teacher scores.
+
+```text
+nn_score ≒ a * teacher_score
+```
+
+The multiplier is fitted with least squares through the origin:
+
+```text
+a = Σ(teacher_score * nn_score) / Σ(teacher_score^2)
+```
+
+Here `nn_score` is the quantized `nn.bin` output converted back to an eval score with `--fv-scale`. That means the fitted multiplier depends on both the reference `nn.bin` and `--fv-scale`.
+
+Example:
+
+```powershell
+.\target\release\examples\bulletou.exe fit-teacher-scale `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
+  --nn-bin C:\path\to\sojo-trained\nn.bin `
+  --sample-positions 100000 `
+  --fv-scale 40
+```
+
+Example output:
+
+```text
+scale_multiplier = 0.094085538
+formula          = rescaled_score = round(teacher_score * 0.094085538)
+```
+
+This means: multiply the PSV scores by `0.094085538` to bring them closer to the reference `nn.bin` score scale.
+
+Use `rescale-psv` to write a converted PSV file:
+
+```powershell
+.\target\release\examples\bulletou.exe rescale-psv `
+  --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
+  --output D:\teacher\tayayan-rescaled.psv `
+  --scale-multiplier 0.094085538
+```
+
+`rescale-psv` changes only the PSV score field. The position, side to move, move, and game-result fields are preserved.
+
+By default, scores with `|score| >= 32000` are treated as mate-like special values and are copied without scaling. To scale every score, use:
+
+```powershell
+  --preserve-score-abs 0
+```

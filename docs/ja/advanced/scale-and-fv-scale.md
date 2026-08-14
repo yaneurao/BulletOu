@@ -147,3 +147,60 @@ offset なしWRMと比較するなら、次だけ追加します。
 学習中の `test_value_loss` は f32 weight に対する loss です。実際にやねうら王で使う `nn.bin` は量子化されています。
 
 量子化後の accuracy / loss や、適切な `FV_SCALE` を見たい場合は、応用編の [`nn.bin` の量子化検証](quantized-nn-bin.md) を使います。
+
+## 7. 教師データの score scale を既存 `nn.bin` に合わせる
+
+複数の教師データを混ぜるときは、score の絶対値が同じ意味になっているかを確認してください。
+
+たとえば、どちらも DL 系モデルで re-score した PSV であっても、DL の勝率を評価値へ戻すときの係数が違うと、同じ勝率の局面でも `score` の大きさが変わります。そのまま追加学習すると、教師データごとに「+100 点」「+500 点」の意味がずれてしまいます。
+
+`fit-teacher-scale` は、教師 PSV から局面をサンプリングし、指定した `nn.bin` で同じ局面を評価して、教師 score に掛ける係数 `a` を推定します。
+
+```text
+nn_score ≒ a * teacher_score
+```
+
+`a` は原点を通る最小二乗で求めます。
+
+```text
+a = Σ(teacher_score * nn_score) / Σ(teacher_score^2)
+```
+
+ここで `nn_score` は、指定した `nn.bin` の量子化後出力を `--fv-scale` で評価値へ戻したものです。つまり、この係数は参照する `nn.bin` と `--fv-scale` に依存します。
+
+例:
+
+```powershell
+.\target\release\examples\bulletou.exe fit-teacher-scale `
+  --arch SFNN_halfka2_1024_7_64_k3k3 `
+  --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
+  --nn-bin C:\path\to\sojo-trained\nn.bin `
+  --sample-positions 100000 `
+  --fv-scale 40
+```
+
+出力例:
+
+```text
+scale_multiplier = 0.094085538
+formula          = rescaled_score = round(teacher_score * 0.094085538)
+```
+
+この結果は、「この PSV の score を `0.094085538` 倍すると、指定した `nn.bin` の評価値 scale に近づく」という意味です。
+
+実際に PSV を変換するには `rescale-psv` を使います。
+
+```powershell
+.\target\release\examples\bulletou.exe rescale-psv `
+  --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
+  --output D:\teacher\tayayan-rescaled.psv `
+  --scale-multiplier 0.094085538
+```
+
+`rescale-psv` は PSV の score 欄だけを書き換えます。局面、手番、手、勝敗項などはそのままです。
+
+デフォルトでは、`|score| >= 32000` の値は mate などの特殊な印として扱い、倍率を掛けずに保存します。すべての score を変換したい場合だけ、次のように指定します。
+
+```powershell
+  --preserve-score-abs 0
+```

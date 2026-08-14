@@ -9,7 +9,7 @@
 | ページ | 内容 |
 | --- | --- |
 | [学習設定を調整する](tuning.md) | 学習率、保存頻度、検証頻度、loss、SFNN factorizer |
-| [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、単純 sigmoid loss、量子化後の出力scale |
+| [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、単純 sigmoid loss、量子化後の出力scale、教師 score scale 調整 |
 | [追加学習](additional-training.md) | 完走後にさらに epoch を足す、教師や学習率を変えて続ける |
 | [LayerStack](layerstack.md) | SFNN の hand / king / progress bucket |
 | [量子化後 `nn.bin` の検証](quantized-nn-bin.md) | `quantized-test` と `calibrate-nn-bin` |
