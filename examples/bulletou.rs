@@ -15779,25 +15779,29 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let output_dir = args.output_dir();
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let resume_enabled = resume_enabled(args, &output_dir);
-    let latest_superbatch = if resume_enabled { read_latest_saved_superbatch(&output_dir) } else { None };
+    let latest_checkpoint_progress =
+        if resume_enabled { latest_checkpoint_epoch_superbatch(&output_dir) } else { None };
+    let latest_checkpoint_epoch = latest_checkpoint_progress.map(|(epoch, _)| epoch).unwrap_or(0);
+    let latest_checkpoint_superbatch = latest_checkpoint_progress.map(|(_, superbatch)| superbatch);
     let prev_teacher = if resume_enabled { read_latest_saved_teacher(&output_dir) } else { None };
     let teacher_changed =
         prev_teacher.as_deref().is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
-    let prev_run_completed_epoch = latest_superbatch.map(|last_sb| last_sb >= superbatches).unwrap_or(false);
-    let max_epoch_in_log =
-        if resume_enabled { read_latest_epoch_in_top_level_log(&top_level_log).unwrap_or(0) } else { 0 };
-    let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_superbatch.is_some();
+    let prev_run_completed_epoch = latest_checkpoint_superbatch.map(|last_sb| last_sb >= superbatches).unwrap_or(false);
+    let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_checkpoint_progress.is_some();
     let start_epoch = if !resume_enabled {
         1
     } else if mid_epoch_resume {
-        max_epoch_in_log.max(1)
+        latest_checkpoint_epoch.max(1)
     } else if resume_enabled {
-        max_epoch_in_log.saturating_add(1).max(1)
+        latest_checkpoint_epoch.saturating_add(1).max(1)
     } else {
         1
     };
-    let first_epoch_start_superbatch =
-        if mid_epoch_resume { latest_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1) } else { 1usize };
+    let first_epoch_start_superbatch = if mid_epoch_resume {
+        latest_checkpoint_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1)
+    } else {
+        1usize
+    };
     let lr_position_offset = if mid_epoch_resume {
         first_epoch_start_superbatch
             .saturating_sub(1)
@@ -15808,11 +15812,24 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         0
     };
     let prior_positions = if resume_enabled {
-        let positions = read_prior_positions(&top_level_log);
         if matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt) {
-            ["kk", "kkp", "kpp"].iter().filter_map(|component| positions.get(*component).copied()).min().unwrap_or(0)
+            let checkpoint_positions = ["kk", "kkp", "kpp"]
+                .iter()
+                .filter_map(|component| read_latest_saved_positions(&output_dir, component))
+                .min();
+            checkpoint_positions.unwrap_or_else(|| {
+                let positions = read_prior_positions(&top_level_log);
+                ["kk", "kkp", "kpp"]
+                    .iter()
+                    .filter_map(|component| positions.get(*component).copied())
+                    .min()
+                    .unwrap_or(0)
+            })
         } else {
-            positions.get("nnue").copied().unwrap_or(0)
+            read_latest_saved_positions(&output_dir, "nnue").unwrap_or_else(|| {
+                let positions = read_prior_positions(&top_level_log);
+                positions.get("nnue").copied().unwrap_or(0)
+            })
         }
     } else {
         0
@@ -16880,6 +16897,7 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
 /// Returns `None` if the file does not exist or no row has a parseable
 /// epoch  - which collapses to "no previous epochs to carry forward" at
 /// the call site.
+#[cfg(test)]
 fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option<usize> {
     let content = std::fs::read_to_string(top_level_log).ok()?;
     let mut max_epoch: Option<usize> = None;
@@ -16933,6 +16951,7 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
 /// Returns `None` if there is no numbered dir, no `learn.log`, or no
 /// parseable sb column  - which collapses to "treat as a fresh run" by
 /// the caller.
+#[cfg(test)]
 fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     let content = numbered_checkpoint_dirs_desc(output_dir)
         .into_iter()
@@ -17046,6 +17065,11 @@ fn parse_dataloader_pos_text(content: &str) -> Result<bulletou_lib::value::Teach
     Ok(bulletou_lib::value::TeacherDataloaderPos { byte_offset, plies })
 }
 
+fn learn_log_metric_or_dash(value: &str) -> bool {
+    let value = value.trim();
+    value == "-" || value.parse::<f32>().is_ok()
+}
+
 /// Detect the teacher path recorded in the highest-numbered
 /// `<output_dir>/<NNNN>/learn.log`. Used to decide whether auto-resume's
 /// dataloader skip-ahead is safe: bullet's dataloader skips
@@ -17066,21 +17090,34 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
         .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
         .map(|(_, dir)| dir.join("learn.log"))
         .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
-    // Same 12-column layout as read_latest_saved_superbatch. teacher
-    // is the trailing field (index 11). splitn(12, ',') keeps any
-    // commas inside teacher (= comma-separated `--teacher` list)
-    // as a single CSV field.
+    // Current rows have quantized_value_accuracy/loss before the trailing
+    // teacher field:
+    //
+    //   ...,positions,quantized_value_accuracy,quantized_value_loss,teacher
+    //
+    // Older rows stored teacher directly after positions. Keep both forms
+    // readable and preserve comma-separated teacher lists by using splitn()
+    // with the schema's full column count.
     let mut last_teacher: Option<String> = None;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(12, ',').collect();
-        if parts.len() < 12 {
+
+        let current_parts: Vec<&str> = line.splitn(14, ',').collect();
+        if current_parts.len() == 14
+            && learn_log_metric_or_dash(current_parts[11])
+            && learn_log_metric_or_dash(current_parts[12])
+        {
+            last_teacher = Some(current_parts[13].trim().to_string());
             continue;
         }
-        last_teacher = Some(parts[11].trim().to_string());
+
+        let legacy_parts: Vec<&str> = line.splitn(12, ',').collect();
+        if legacy_parts.len() >= 12 {
+            last_teacher = Some(legacy_parts[11].trim().to_string());
+        }
     }
     last_teacher
 }
@@ -19300,6 +19337,82 @@ mod tests {
         assert_eq!(schedule.chunks[0].superbatch, 2);
         assert_eq!(schedule.chunks[1].epoch, 1);
         assert_eq!(schedule.chunks[1].superbatch, 3);
+        assert!(schedule.chunks[0].lr_start < 0.1, "mid-epoch resume should continue LR inside the epoch");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_resumes_from_checkpoint_epoch_even_if_summary_has_later_rows() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-schedule-checkpoint-epoch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("0004")).unwrap();
+        let output = tmp.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "teacher.hcpe",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "64",
+            "--max-epochs",
+            "4",
+            "--save-rate",
+            "1",
+            "--batch-size",
+            "64",
+            "--positions-per-superbatch",
+            "64",
+            "--lr",
+            "0.1",
+            "--lr-min",
+            "0.01",
+            "--output",
+            output,
+            "--resume",
+        ])
+        .unwrap();
+
+        std::fs::write(tmp.join("0004").join("state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0004").join("dataloader_pos.txt"), "128,0\n").unwrap();
+        std::fs::write(
+            tmp.join("0004").join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,3,2,1,0.6,0.1,-,0.1,0.1,1.000000,128,0.5,0.2,teacher.hcpe\n"
+            ),
+        )
+        .unwrap();
+
+        // Simulate stale top-level rows that survived from a failed or
+        // superseded resume attempt. The scheduler must not use this max
+        // epoch to decide the resume epoch.
+        std::fs::write(
+            tmp.join(SUMMARY_LEARN_LOG_NAME),
+            format!(
+                "{SUMMARY_LEARN_LOG_HEADER}\n\
+                 NNUE_HALFKP-NNUE_halfkp_256x2_32_32,4,2,0.7,0.09,-,0.1,0.1,1.000000,999,teacher.hcpe,0.6,0.1,0006\n"
+            ),
+        )
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.production);
+        assert_eq!(schedule.prior_positions, 128);
+        assert_eq!(schedule.chunks[0].epoch, 3);
+        assert_eq!(schedule.chunks[0].superbatch, 3);
+        assert_eq!(schedule.chunks[1].epoch, 3);
+        assert_eq!(schedule.chunks[1].superbatch, 4);
         assert!(schedule.chunks[0].lr_start < 0.1, "mid-epoch resume should continue LR inside the epoch");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -23929,9 +24042,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Verify that `read_latest_saved_teacher` reads the teacher column (the
-    /// final field of the 12-column row) from `<NNNN>/learn.log` so auto-resume
-    /// can detect teacher changes.
+    /// Verify that `read_latest_saved_teacher` reads the teacher column from
+    /// `<NNNN>/learn.log` so auto-resume can detect teacher changes.
     #[test]
     fn read_latest_saved_teacher_picks_last_teacher() {
         let tmp = std::env::temp_dir().join(format!(
@@ -23961,7 +24073,9 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
 
-        // If 0004 is followed by bar.hcpe, the newest checkpoint keeps that teacher path.
+        // If 0004 is followed by a current quantized-metrics row, the newest
+        // checkpoint keeps the trailing teacher field, including comma-separated
+        // teacher lists.
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
         std::fs::write(d4.join("state.bin"), b"state").unwrap();
@@ -23969,13 +24083,13 @@ mod tests {
         std::fs::write(
             d4.join("learn.log"),
             format!(
-                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.6,0.05,0.06,0.001,0.0008,1.000,2097152,bar.hcpe\n"
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,4,32,0.6,0.05,0.06,0.001,0.0008,1.000,2097152,0.59,0.04,bar.hcpe,baz.hcpe\n"
             ),
         )
         .unwrap();
-        assert_eq!(read_latest_saved_teacher(&tmp), Some("bar.hcpe".to_string()));
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("bar.hcpe,baz.hcpe".to_string()));
 
-        // 9-column legacy rows are ignored (parts.len() < 11).
+        // 9-column legacy rows are ignored.
         let d5 = tmp.join("0005");
         std::fs::create_dir(&d5).unwrap();
         std::fs::write(d5.join("state.bin"), b"state").unwrap();
