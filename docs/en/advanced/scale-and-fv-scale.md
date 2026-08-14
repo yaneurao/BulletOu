@@ -157,16 +157,22 @@ For example, two PSV datasets may both be produced by DL-based re-scoring, but i
 `fit-teacher-scale` samples positions from a teacher PSV file, evaluates the same positions with a reference `nn.bin`, and estimates a multiplier `a` for the teacher scores.
 
 ```text
-nn_score ≒ a * teacher_score
+reference_score ≒ a * teacher_score
 ```
 
 The multiplier is fitted with least squares through the origin:
 
 ```text
-a = Σ(teacher_score * nn_score) / Σ(teacher_score^2)
+a = Σ(teacher_score * reference_score) / Σ(teacher_score^2)
 ```
 
-Here `nn_score` is the quantized `nn.bin` output converted back to an eval score with `--fv-scale`. That means the fitted multiplier depends on both the reference `nn.bin` and `--fv-scale`.
+Here `reference_score` is the quantized raw output of the reference `nn.bin`, converted back to the training score scale:
+
+```text
+reference_score = raw / 8128 * wrm_nnue2score
+```
+
+The default `wrm_nnue2score` is `600`. If the reference network was trained with a different `--wrm-nnue2score`, pass the same value to `fit-teacher-scale`.
 
 Example:
 
@@ -175,18 +181,17 @@ Example:
   --arch SFNN_halfka2_1024_7_64_k3k3 `
   --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --nn-bin C:\path\to\sojo-trained\nn.bin `
-  --sample-positions 100000 `
-  --fv-scale 40
+  --sample-positions 100000
 ```
 
 Example output:
 
 ```text
-scale_multiplier = 0.094085538
-formula          = rescaled_score = round(teacher_score * 0.094085538)
+scale_multiplier = 0.277969165
+formula          = rescaled_score = round(teacher_score * 0.277969165)
 ```
 
-This means: multiply the PSV scores by `0.094085538` to bring them closer to the reference `nn.bin` score scale.
+This means: multiply the PSV scores by `0.277969165` to bring them closer to the training score scale of the reference `nn.bin`.
 
 Use `rescale-psv` to write a converted PSV file:
 
@@ -194,7 +199,7 @@ Use `rescale-psv` to write a converted PSV file:
 .\target\release\examples\bulletou.exe rescale-psv `
   --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --output D:\teacher\tayayan-rescaled.psv `
-  --scale-multiplier 0.094085538
+  --scale-multiplier 0.277969165
 ```
 
 `rescale-psv` changes only the PSV score field. The position, side to move, move, and game-result fields are preserved.

@@ -157,16 +157,22 @@ offset なしWRMと比較するなら、次だけ追加します。
 `fit-teacher-scale` は、教師 PSV から局面をサンプリングし、指定した `nn.bin` で同じ局面を評価して、教師 score に掛ける係数 `a` を推定します。
 
 ```text
-nn_score ≒ a * teacher_score
+reference_score ≒ a * teacher_score
 ```
 
 `a` は原点を通る最小二乗で求めます。
 
 ```text
-a = Σ(teacher_score * nn_score) / Σ(teacher_score^2)
+a = Σ(teacher_score * reference_score) / Σ(teacher_score^2)
 ```
 
-ここで `nn_score` は、指定した `nn.bin` の量子化後出力を `--fv-scale` で評価値へ戻したものです。つまり、この係数は参照する `nn.bin` と `--fv-scale` に依存します。
+ここで `reference_score` は、指定した `nn.bin` の量子化後 raw 出力を学習時の score scale に戻したものです。
+
+```text
+reference_score = raw / 8128 * wrm_nnue2score
+```
+
+デフォルトの `wrm_nnue2score` は `600` です。学習時に `--wrm-nnue2score` を変えていた場合だけ、`fit-teacher-scale` 側にも同じ値を指定してください。
 
 例:
 
@@ -175,18 +181,17 @@ a = Σ(teacher_score * nn_score) / Σ(teacher_score^2)
   --arch SFNN_halfka2_1024_7_64_k3k3 `
   --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --nn-bin C:\path\to\sojo-trained\nn.bin `
-  --sample-positions 100000 `
-  --fv-scale 40
+  --sample-positions 100000
 ```
 
 出力例:
 
 ```text
-scale_multiplier = 0.094085538
-formula          = rescaled_score = round(teacher_score * 0.094085538)
+scale_multiplier = 0.277969165
+formula          = rescaled_score = round(teacher_score * 0.277969165)
 ```
 
-この結果は、「この PSV の score を `0.094085538` 倍すると、指定した `nn.bin` の評価値 scale に近づく」という意味です。
+この結果は、「この PSV の score を `0.277969165` 倍すると、指定した `nn.bin` を学習したときの score scale に近づく」という意味です。
 
 実際に PSV を変換するには `rescale-psv` を使います。
 
@@ -194,7 +199,7 @@ formula          = rescaled_score = round(teacher_score * 0.094085538)
 .\target\release\examples\bulletou.exe rescale-psv `
   --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --output D:\teacher\tayayan-rescaled.psv `
-  --scale-multiplier 0.094085538
+  --scale-multiplier 0.277969165
 ```
 
 `rescale-psv` は PSV の score 欄だけを書き換えます。局面、手番、手、勝敗項などはそのままです。

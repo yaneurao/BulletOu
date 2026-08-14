@@ -49,7 +49,7 @@ BulletOu はデフォルトで学習時 shuffle を行うので、初回は特�
 
 DL 系モデルで re-score した教師データ同士でも、勝率を評価値へ戻すときの係数が違うと、score の大きさがそろいません。
 
-最初の学習では気にしなくて構いません。複数の教師データを混ぜる段階になったら、応用編の [loss の scale と `FV_SCALE`](../advanced/scale-and-fv-scale.md) を見てください。
+最初の学習では気にしなくて構いません。複数の教師データを混ぜる段階になったら、応用編の [score scale の説明](../advanced/scale-and-fv-scale.md) を見てください。
 
 ---
 

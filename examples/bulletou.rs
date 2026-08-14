@@ -1266,7 +1266,7 @@ struct QuantizedTestArgs {
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou fit-teacher-scale")]
-#[command(about = "Fit a multiplier that maps PSV teacher scores onto a quantized SFNN nn.bin score scale")]
+#[command(about = "Fit a multiplier that maps PSV teacher scores onto a reference SFNN nn.bin training score scale")]
 struct FitTeacherScaleArgs {
     /// Network architecture in YaneuraOu Makefile form with the
     /// `YANEURAOU_ENGINE_` prefix removed, e.g.
@@ -1298,9 +1298,11 @@ struct FitTeacherScaleArgs {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
-    /// YaneuraOu FV_SCALE used to interpret the quantized nn.bin output as a score.
-    #[arg(long, default_value = "40")]
-    fv_scale: i32,
+    /// Training-side score scale used to interpret the quantized raw nn.bin output.
+    ///
+    /// The default matches BulletOu's WRM loss: `score_net = network_output * 600`.
+    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
+    wrm_nnue2score: f32,
 
     /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
     #[arg(long, default_value = "7")]
@@ -1317,14 +1319,6 @@ struct FitTeacherScaleArgs {
     /// Rounding mode for hidden-layer SqrClippedReLU right shifts.
     #[arg(long, value_enum, default_value = "floor")]
     quant_sqrcrelu_round: QuantizedRoundMode,
-
-    /// Rounding mode for the final `output / FV_SCALE` engine score.
-    #[arg(long, value_enum, default_value = "floor")]
-    quant_final_div_round: QuantizedRoundMode,
-
-    /// Diagnostic-only additive offset applied to the reference nn.bin score.
-    #[arg(long, default_value = "0.0")]
-    engine_score_offset: f32,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6219,7 +6213,7 @@ fn quantized_test_args_from_fit_teacher_scale_args(args: &FitTeacherScaleArgs) -
         test_sample: args.sample,
         test_seed: args.seed,
         score_drop_abs: args.score_drop_abs,
-        fv_scale: args.fv_scale,
+        fv_scale: DEFAULT_FV_SCALE.round() as i32,
         sfnn_ft_shift: args.sfnn_ft_shift,
         lambda: 1.0,
         scale: DEFAULT_SIGMOID_SCALE.round() as u32,
@@ -6227,9 +6221,14 @@ fn quantized_test_args_from_fit_teacher_scale_args(args: &FitTeacherScaleArgs) -
         quant_ft_round: args.quant_ft_round,
         quant_crelu_round: args.quant_crelu_round,
         quant_sqrcrelu_round: args.quant_sqrcrelu_round,
-        quant_final_div_round: args.quant_final_div_round,
-        engine_score_offset: args.engine_score_offset,
+        quant_final_div_round: QuantizedRoundMode::Floor,
+        engine_score_offset: 0.0,
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_raw_to_training_score(raw: i32, wrm_nnue2score: f32) -> f64 {
+    f64::from(raw) * f64::from(wrm_nnue2score) / f64::from(DEFAULT_NNUE_RAW_OUTPUT_SCALE)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6237,11 +6236,8 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
     if args.sample_positions == 0 {
         return Err("--sample-positions must be positive".to_string());
     }
-    if args.fv_scale == 0 {
-        return Err("--fv-scale must be non-zero".to_string());
-    }
-    if !args.engine_score_offset.is_finite() {
-        return Err(format!("--engine-score-offset must be finite (got {})", args.engine_score_offset));
+    if !(args.wrm_nnue2score.is_finite() && args.wrm_nnue2score > 0.0) {
+        return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", args.wrm_nnue2score));
     }
 
     let started = std::time::Instant::now();
@@ -6293,8 +6289,7 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
             continue;
         }
         let x = f64::from(teacher_score);
-        let y = f64::from(quantized_final_division(out.raw, qargs.fv_scale, qargs.quant_final_div_round))
-            + f64::from(qargs.engine_score_offset);
+        let y = quantized_raw_to_training_score(out.raw, args.wrm_nnue2score);
         fitted += 1;
         sum_x += x;
         sum_y += y;
@@ -6337,8 +6332,7 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
             continue;
         }
         let x = f64::from(teacher_score);
-        let y = f64::from(quantized_final_division(out.raw, qargs.fv_scale, qargs.quant_final_div_round))
-            + f64::from(qargs.engine_score_offset);
+        let y = quantized_raw_to_training_score(out.raw, args.wrm_nnue2score);
         let after = y - multiplier * x;
         sum_after_sq += after * after;
     }
@@ -7035,7 +7029,8 @@ fn main() {
                         args.sample.cli_name(),
                         args.seed
                     );
-                    println!("  fv_scale          = {}", args.fv_scale);
+                    println!("  wrm_nnue2score    = {:.3}", args.wrm_nnue2score);
+                    println!("  raw_output_scale  = {:.0}", DEFAULT_NNUE_RAW_OUTPUT_SCALE);
                     println!("  loaded            = {}", format_count(report.loaded));
                     println!(
                         "  fitted            = {} (score_cap_filtered={}, zero_score_filtered={})",
@@ -7047,7 +7042,7 @@ fn main() {
                     println!("  formula           = rescaled_score = round(teacher_score * {:.9})", report.multiplier);
                     if report.affine_slope.is_finite() && report.affine_intercept.is_finite() {
                         println!(
-                            "  affine_diagnostic = nn_score ~= {:.9} * teacher_score {:+.3}",
+                            "  affine_diagnostic = reference_score ~= {:.9} * teacher_score {:+.3}",
                             report.affine_slope, report.affine_intercept
                         );
                     }
