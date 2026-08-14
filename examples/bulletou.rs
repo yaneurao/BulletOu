@@ -1265,6 +1265,119 @@ struct QuantizedTestArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou fit-teacher-scale")]
+#[command(about = "Fit a multiplier that maps PSV teacher scores onto a quantized SFNN nn.bin score scale")]
+struct FitTeacherScaleArgs {
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed, e.g.
+    /// `SFNN_halfka2_1024_7_64_k3k3`.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// PSV-compatible teacher file whose score field should be mapped.
+    #[arg(long)]
+    teacher: PathBuf,
+
+    /// Exported YaneuraOu-compatible quantized `nn.bin` used as the reference scale.
+    #[arg(long = "nn-bin")]
+    nn_bin: PathBuf,
+
+    /// Number of positions sampled from `--teacher`.
+    #[arg(long, default_value = "100000")]
+    sample_positions: usize,
+
+    /// How to choose positions from the teacher.
+    #[arg(long, value_enum, default_value = "random")]
+    sample: TestSampleMode,
+
+    /// Seed for random sampling. The default is deterministic.
+    #[arg(long, default_value = "1")]
+    seed: u64,
+
+    /// Drop positions whose |score| >= this. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+
+    /// YaneuraOu FV_SCALE used to interpret the quantized nn.bin output as a score.
+    #[arg(long, default_value = "40")]
+    fv_scale: i32,
+
+    /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
+    #[arg(long, default_value = "7")]
+    sfnn_ft_shift: u32,
+
+    /// Rounding mode for the SFNN feature-transform product.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_ft_round: QuantizedRoundMode,
+
+    /// Rounding mode for hidden-layer ClippedReLU right shifts.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_crelu_round: QuantizedRoundMode,
+
+    /// Rounding mode for hidden-layer SqrClippedReLU right shifts.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_sqrcrelu_round: QuantizedRoundMode,
+
+    /// Rounding mode for the final `output / FV_SCALE` engine score.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_final_div_round: QuantizedRoundMode,
+
+    /// Diagnostic-only additive offset applied to the reference nn.bin score.
+    #[arg(long, default_value = "0.0")]
+    engine_score_offset: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy)]
+struct FitTeacherScaleReport {
+    loaded: usize,
+    fitted: usize,
+    filtered_by_score_cap: usize,
+    filtered_zero_score: usize,
+    multiplier: f64,
+    affine_slope: f64,
+    affine_intercept: f64,
+    rmse_before: f64,
+    rmse_after: f64,
+    elapsed: std::time::Duration,
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou rescale-psv")]
+#[command(about = "Write a PSV-compatible file with score := round(score * multiplier)")]
+struct RescalePsvArgs {
+    /// Input PSV-compatible 40-byte PackedSfenValue file (.psv or .bin).
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output PSV-compatible file.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Multiplier applied to the i16 score field.
+    #[arg(long = "scale-multiplier", alias = "multiplier")]
+    scale_multiplier: f64,
+
+    /// Preserve score values whose absolute value is at least this threshold.
+    /// Use 0 to multiply every score, including mate stamps.
+    #[arg(long, default_value = "32000")]
+    preserve_score_abs: i16,
+
+    /// Overwrite output if it already exists.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RescalePsvReport {
+    records: usize,
+    changed: usize,
+    preserved: usize,
+    clipped: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou average-sfnn-state")]
 #[command(about = "Average multiple cuda-cpp SFNN state.bin files and export one quantized nn.bin")]
 struct AverageSfnnStateArgs {
@@ -6097,6 +6210,227 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_test_args_from_fit_teacher_scale_args(args: &FitTeacherScaleArgs) -> QuantizedTestArgs {
+    QuantizedTestArgs {
+        arch: args.arch,
+        nn_bin: args.nn_bin.clone(),
+        test_teacher: args.teacher.clone(),
+        test_positions: Some(args.sample_positions),
+        test_sample: args.sample,
+        test_seed: args.seed,
+        score_drop_abs: args.score_drop_abs,
+        fv_scale: args.fv_scale,
+        sfnn_ft_shift: args.sfnn_ft_shift,
+        lambda: 1.0,
+        scale: DEFAULT_SIGMOID_SCALE.round() as u32,
+        loss_pow_exp: 2.0,
+        quant_ft_round: args.quant_ft_round,
+        quant_crelu_round: args.quant_crelu_round,
+        quant_sqrcrelu_round: args.quant_sqrcrelu_round,
+        quant_final_div_round: args.quant_final_div_round,
+        engine_score_offset: args.engine_score_offset,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleReport, String> {
+    if args.sample_positions == 0 {
+        return Err("--sample-positions must be positive".to_string());
+    }
+    if args.fv_scale == 0 {
+        return Err("--fv-scale must be non-zero".to_string());
+    }
+    if !args.engine_score_offset.is_finite() {
+        return Err(format!("--engine-score-offset must be finite (got {})", args.engine_score_offset));
+    }
+
+    let started = std::time::Instant::now();
+    let qargs = quantized_test_args_from_fit_teacher_scale_args(args);
+    qargs.validate_arch_flags()?;
+    let layerstack = qargs.effective_layerstack();
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(qargs.arch)?;
+    let weights = parse_quantized_sfnn_nn_bin(&qargs.nn_bin, qargs.arch, layerstack)?;
+    if let Some(params) = &weights.progress_params {
+        set_shogi_sfnn_progress_q16_params(params.clone())?;
+    }
+
+    let teacher = args
+        .teacher
+        .to_str()
+        .ok_or_else(|| format!("--teacher path is not valid UTF-8: {}", args.teacher.display()))?;
+    let positions = match args.sample {
+        TestSampleMode::Random => read_random_teacher_positions(teacher, args.sample_positions, args.seed),
+        TestSampleMode::Sequential => read_teacher_positions_prefix(teacher, args.sample_positions),
+    }
+    .map_err(|err| format!("failed to read teacher {}: {err}", args.teacher.display()))?;
+    if positions.is_empty() {
+        return Err("teacher produced no positions".to_string());
+    }
+
+    let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
+    let outputs = quantized_sfnn_forward_outputs(&weights, &batch, &qargs)?;
+    if positions.len() != outputs.len() {
+        return Err(format!("positions/output length mismatch: {} vs {}", positions.len(), outputs.len()));
+    }
+
+    let mut fitted = 0usize;
+    let mut filtered_by_score_cap = 0usize;
+    let mut filtered_zero_score = 0usize;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_xx = 0.0_f64;
+    let mut sum_xy = 0.0_f64;
+    let mut sum_before_sq = 0.0_f64;
+
+    for (pos, out) in positions.iter().zip(outputs.iter()) {
+        let teacher_score = pos.score();
+        if args.score_drop_abs > 0 && i32::from(teacher_score).abs() >= i32::from(args.score_drop_abs) {
+            filtered_by_score_cap += 1;
+            continue;
+        }
+        if teacher_score == 0 {
+            filtered_zero_score += 1;
+            continue;
+        }
+        let x = f64::from(teacher_score);
+        let y = f64::from(quantized_final_division(out.raw, qargs.fv_scale, qargs.quant_final_div_round))
+            + f64::from(qargs.engine_score_offset);
+        fitted += 1;
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+        let before = y - x;
+        sum_before_sq += before * before;
+    }
+
+    if fitted == 0 || sum_xx <= f64::EPSILON {
+        return Err(format!(
+            "not enough non-zero teacher score samples after filtering: loaded={}, score_cap_filtered={}, zero_score_filtered={}",
+            positions.len(),
+            filtered_by_score_cap,
+            filtered_zero_score
+        ));
+    }
+    let multiplier = sum_xy / sum_xx;
+    if !multiplier.is_finite() {
+        return Err("fitted multiplier is not finite".to_string());
+    }
+
+    let n = fitted as f64;
+    let denom = n * sum_xx - sum_x * sum_x;
+    let (affine_slope, affine_intercept) = if denom.abs() > f64::EPSILON {
+        let slope = (n * sum_xy - sum_x * sum_y) / denom;
+        let intercept = (sum_y - slope * sum_x) / n;
+        (slope, intercept)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+
+    let mut sum_after_sq = 0.0_f64;
+    for (pos, out) in positions.iter().zip(outputs.iter()) {
+        let teacher_score = pos.score();
+        if args.score_drop_abs > 0 && i32::from(teacher_score).abs() >= i32::from(args.score_drop_abs) {
+            continue;
+        }
+        if teacher_score == 0 {
+            continue;
+        }
+        let x = f64::from(teacher_score);
+        let y = f64::from(quantized_final_division(out.raw, qargs.fv_scale, qargs.quant_final_div_round))
+            + f64::from(qargs.engine_score_offset);
+        let after = y - multiplier * x;
+        sum_after_sq += after * after;
+    }
+
+    Ok(FitTeacherScaleReport {
+        loaded: positions.len(),
+        fitted,
+        filtered_by_score_cap,
+        filtered_zero_score,
+        multiplier,
+        affine_slope,
+        affine_intercept,
+        rmse_before: (sum_before_sq / n).sqrt(),
+        rmse_after: (sum_after_sq / n).sqrt(),
+        elapsed: started.elapsed(),
+    })
+}
+
+fn run_rescale_psv(args: &RescalePsvArgs) -> Result<RescalePsvReport, String> {
+    if !args.scale_multiplier.is_finite() {
+        return Err(format!("--scale-multiplier must be finite (got {})", args.scale_multiplier));
+    }
+    if args.preserve_score_abs < 0 {
+        return Err(format!("--preserve-score-abs must be non-negative (got {})", args.preserve_score_abs));
+    }
+    if args.output.exists() && !args.force {
+        return Err(format!("output already exists: {} (use --force to overwrite)", args.output.display()));
+    }
+    let input_size = std::fs::metadata(&args.input)
+        .map_err(|err| format!("failed to stat input {}: {err}", args.input.display()))?
+        .len();
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64;
+    if input_size % record_size != 0 {
+        return Err(format!(
+            "{} size {} is not a multiple of PSV record size {record_size}",
+            args.input.display(),
+            input_size
+        ));
+    }
+    let records = usize::try_from(input_size / record_size)
+        .map_err(|_| format!("{} has too many PSV records for this platform", args.input.display()))?;
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+    }
+
+    use std::io::{Read as _, Write as _};
+    let input = std::fs::File::open(&args.input)
+        .map_err(|err| format!("failed to open input {}: {err}", args.input.display()))?;
+    let output = std::fs::File::create(&args.output)
+        .map_err(|err| format!("failed to create output {}: {err}", args.output.display()))?;
+    let mut reader = std::io::BufReader::new(input);
+    let mut writer = std::io::BufWriter::new(output);
+
+    let mut changed = 0usize;
+    let mut preserved = 0usize;
+    let mut clipped = 0usize;
+    let preserve_abs = i32::from(args.preserve_score_abs);
+    for _ in 0..records {
+        let mut rec = [0u8; 40];
+        reader
+            .read_exact(&mut rec)
+            .map_err(|err| format!("failed to read PSV record from {}: {err}", args.input.display()))?;
+        let old_score = i16::from_le_bytes([rec[32], rec[33]]);
+        let should_preserve = preserve_abs > 0 && i32::from(old_score).abs() >= preserve_abs;
+        if should_preserve {
+            preserved += 1;
+        } else {
+            let scaled = (f64::from(old_score) * args.scale_multiplier).round();
+            let min = f64::from(i16::MIN);
+            let max = f64::from(i16::MAX);
+            let clamped = scaled.clamp(min, max);
+            if clamped != scaled {
+                clipped += 1;
+            }
+            let new_score = clamped as i16;
+            if new_score != old_score {
+                changed += 1;
+                rec[32..34].copy_from_slice(&new_score.to_le_bytes());
+            }
+        }
+        writer
+            .write_all(&rec)
+            .map_err(|err| format!("failed to write PSV record to {}: {err}", args.output.display()))?;
+    }
+    writer.flush().map_err(|err| format!("failed to flush {}: {err}", args.output.display()))?;
+
+    Ok(RescalePsvReport { records, changed, preserved, clipped })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Result<Option<QuantizedTestArgs>, String> {
     if !matches!(
         args.eval_type(),
@@ -6681,6 +7015,83 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
 
 fn main() {
     let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("fit-teacher-scale")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou fit-teacher-scale");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = FitTeacherScaleArgs::parse_from(raw_args);
+            match run_fit_teacher_scale(&args) {
+                Ok(report) => {
+                    println!("fit-teacher-scale complete:");
+                    println!("  arch              = {}", args.arch);
+                    println!("  teacher           = {}", args.teacher.display());
+                    println!("  nn_bin            = {}", args.nn_bin.display());
+                    println!(
+                        "  sample            = {} positions, {}, seed={}",
+                        format_count(args.sample_positions),
+                        args.sample.cli_name(),
+                        args.seed
+                    );
+                    println!("  fv_scale          = {}", args.fv_scale);
+                    println!("  loaded            = {}", format_count(report.loaded));
+                    println!(
+                        "  fitted            = {} (score_cap_filtered={}, zero_score_filtered={})",
+                        format_count(report.fitted),
+                        format_count(report.filtered_by_score_cap),
+                        format_count(report.filtered_zero_score)
+                    );
+                    println!("  scale_multiplier  = {:.9}", report.multiplier);
+                    println!("  formula           = rescaled_score = round(teacher_score * {:.9})", report.multiplier);
+                    if report.affine_slope.is_finite() && report.affine_intercept.is_finite() {
+                        println!(
+                            "  affine_diagnostic = nn_score ~= {:.9} * teacher_score {:+.3}",
+                            report.affine_slope, report.affine_intercept
+                        );
+                    }
+                    println!("  rmse_before       = {:.3}", report.rmse_before);
+                    println!("  rmse_after        = {:.3}", report.rmse_after);
+                    println!("  elapsed           = {:.3}s", report.elapsed.as_secs_f64());
+                }
+                Err(e) => {
+                    eprintln!("error: fit-teacher-scale failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: fit-teacher-scale requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("rescale-psv")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou rescale-psv");
+        }
+        let args = RescalePsvArgs::parse_from(raw_args);
+        match run_rescale_psv(&args) {
+            Ok(report) => {
+                println!("rescale-psv complete:");
+                println!("  input             = {}", args.input.display());
+                println!("  output            = {}", args.output.display());
+                println!("  scale_multiplier  = {:.9}", args.scale_multiplier);
+                println!("  records           = {}", format_count(report.records));
+                println!("  changed           = {}", format_count(report.changed));
+                println!("  preserved         = {}", format_count(report.preserved));
+                println!("  clipped           = {}", format_count(report.clipped));
+            }
+            Err(e) => {
+                eprintln!("error: rescale-psv failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("calibrate-nn-bin")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
