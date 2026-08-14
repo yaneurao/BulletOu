@@ -45,12 +45,6 @@ Training is more stable when teacher positions are well mixed.
 BulletOu shuffles during training by default, so you do not need a shuffle option for the first run.
 If you later need to tune memory usage or the shuffle window, see the [Advanced guide](../advanced/).
 
-## 2.4 When teacher score scales differ
-
-Even when two teacher datasets were both produced by DL-based re-scoring, their score magnitudes may differ if the DL win rate was converted back to eval scores with different coefficients.
-
-You can ignore this for your first training run. When you start mixing multiple teacher datasets, see the [score-scale explanation](../advanced/scale-and-fv-scale.md) in the advanced guide.
-
 ---
 
 Next: [3. Run the training](3-train.md)
