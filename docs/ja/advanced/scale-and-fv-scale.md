@@ -184,6 +184,8 @@ reference_score = raw / 8128 * wrm_nnue2score
   --sample-positions 100000
 ```
 
+個別のサンプルを確認したい場合は、`--dump-samples 10` のように指定します。
+
 出力例:
 
 ```text

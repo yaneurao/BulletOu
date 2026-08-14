@@ -1298,6 +1298,10 @@ struct FitTeacherScaleArgs {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
+    /// Print up to N fitted sample rows for diagnostics.
+    #[arg(long, default_value = "0")]
+    dump_samples: usize,
+
     /// Training-side score scale used to interpret the quantized raw nn.bin output.
     ///
     /// The default matches BulletOu's WRM loss: `score_net = network_output * 600`.
@@ -1323,6 +1327,15 @@ struct FitTeacherScaleArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, Copy)]
+struct FitTeacherScaleSample {
+    sample_index: usize,
+    teacher_score: i16,
+    raw: i32,
+    reference_score: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone)]
 struct FitTeacherScaleReport {
     loaded: usize,
     fitted: usize,
@@ -1333,6 +1346,7 @@ struct FitTeacherScaleReport {
     affine_intercept: f64,
     rmse_before: f64,
     rmse_after: f64,
+    samples: Vec<FitTeacherScaleSample>,
     elapsed: std::time::Duration,
 }
 
@@ -6277,8 +6291,9 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
     let mut sum_xx = 0.0_f64;
     let mut sum_xy = 0.0_f64;
     let mut sum_before_sq = 0.0_f64;
+    let mut samples = Vec::with_capacity(args.dump_samples.min(64));
 
-    for (pos, out) in positions.iter().zip(outputs.iter()) {
+    for (sample_index, (pos, out)) in positions.iter().zip(outputs.iter()).enumerate() {
         let teacher_score = pos.score();
         if args.score_drop_abs > 0 && i32::from(teacher_score).abs() >= i32::from(args.score_drop_abs) {
             filtered_by_score_cap += 1;
@@ -6297,6 +6312,9 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
         sum_xy += x * y;
         let before = y - x;
         sum_before_sq += before * before;
+        if samples.len() < args.dump_samples {
+            samples.push(FitTeacherScaleSample { sample_index, teacher_score, raw: out.raw, reference_score: y });
+        }
     }
 
     if fitted == 0 || sum_xx <= f64::EPSILON {
@@ -6347,6 +6365,7 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
         affine_intercept,
         rmse_before: (sum_before_sq / n).sqrt(),
         rmse_after: (sum_after_sq / n).sqrt(),
+        samples,
         elapsed: started.elapsed(),
     })
 }
@@ -7048,6 +7067,29 @@ fn main() {
                     }
                     println!("  rmse_before       = {:.3}", report.rmse_before);
                     println!("  rmse_after        = {:.3}", report.rmse_after);
+                    if !report.samples.is_empty() {
+                        println!(
+                            "  samples           = sample_index, teacher_score, reference_score, ref/teacher, teacher/ref, raw"
+                        );
+                        for sample in &report.samples {
+                            let teacher = f64::from(sample.teacher_score);
+                            let ref_per_teacher = sample.reference_score / teacher;
+                            let teacher_per_ref = if sample.reference_score.abs() > f64::EPSILON {
+                                teacher / sample.reference_score
+                            } else {
+                                f64::NAN
+                            };
+                            println!(
+                                "    {:>8}  {:>8}  {:>12.3}  {:>11.6}  {:>11.6}  {:>8}",
+                                sample.sample_index,
+                                sample.teacher_score,
+                                sample.reference_score,
+                                ref_per_teacher,
+                                teacher_per_ref,
+                                sample.raw
+                            );
+                        }
+                    }
                     println!("  elapsed           = {:.3}s", report.elapsed.as_secs_f64());
                 }
                 Err(e) => {

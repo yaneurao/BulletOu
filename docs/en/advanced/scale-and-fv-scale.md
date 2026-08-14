@@ -184,6 +184,8 @@ Example:
   --sample-positions 100000
 ```
 
+To inspect individual sampled rows, add an option such as `--dump-samples 10`.
+
 Example output:
 
 ```text
