@@ -828,6 +828,12 @@ pub struct SfnnForwardShape {
     /// 32 means buckets can be decomposed as `hand_stm * 32 + hand_non_stm`.
     /// `0` means there is no hand axis.
     pub factorizer_hand_axis_dim: usize,
+    /// Add one factorizer component for each king-bucket x hand-bucket pair.
+    pub factorizer_king_hand_pair: bool,
+    /// Add one factorizer component for each king-bucket x progress-bucket pair.
+    pub factorizer_king_progress_pair: bool,
+    /// Add one factorizer component for each hand-bucket x progress-bucket pair.
+    pub factorizer_hand_progress_pair: bool,
 }
 
 impl SfnnForwardShape {
@@ -917,6 +923,10 @@ impl SfnnForwardShape {
     }
 
     pub fn factorizer_axis_count(self) -> usize {
+        self.factorizer_base_axis_count().saturating_add(self.factorizer_pair_count())
+    }
+
+    pub fn factorizer_base_axis_count(self) -> usize {
         self.factorizer_king_axis_dim.saturating_mul(2).saturating_add(self.factorizer_hand_axis_dim.saturating_mul(2))
     }
 
@@ -948,6 +958,36 @@ impl SfnnForwardShape {
             self.num_stacks / factorizer_stack_count
         }
     }
+
+    pub fn factorizer_king_hand_pair_count(self) -> usize {
+        if self.factorizer_king_hand_pair {
+            self.factorizer_king_bucket_count().saturating_mul(self.factorizer_hand_bucket_count())
+        } else {
+            0
+        }
+    }
+
+    pub fn factorizer_king_progress_pair_count(self) -> usize {
+        if self.factorizer_king_progress_pair {
+            self.factorizer_king_bucket_count().saturating_mul(self.factorizer_progress_multiplier())
+        } else {
+            0
+        }
+    }
+
+    pub fn factorizer_hand_progress_pair_count(self) -> usize {
+        if self.factorizer_hand_progress_pair {
+            self.factorizer_hand_bucket_count().saturating_mul(self.factorizer_progress_multiplier())
+        } else {
+            0
+        }
+    }
+
+    pub fn factorizer_pair_count(self) -> usize {
+        self.factorizer_king_hand_pair_count()
+            .saturating_add(self.factorizer_king_progress_pair_count())
+            .saturating_add(self.factorizer_hand_progress_pair_count())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,24 +995,54 @@ pub struct SfnnFactorizerActive {
     pub shared: bool,
     pub king_axis: bool,
     pub hand_axis: bool,
+    pub king_hand_pair: bool,
+    pub king_progress_pair: bool,
+    pub hand_progress_pair: bool,
 }
 
 impl SfnnFactorizerActive {
-    pub const NONE: Self = Self { shared: false, king_axis: false, hand_axis: false };
-    pub const SHARED: Self = Self { shared: true, king_axis: false, hand_axis: false };
+    pub const NONE: Self = Self {
+        shared: false,
+        king_axis: false,
+        hand_axis: false,
+        king_hand_pair: false,
+        king_progress_pair: false,
+        hand_progress_pair: false,
+    };
+    pub const SHARED: Self = Self { shared: true, ..Self::NONE };
 
     pub fn any(self) -> bool {
-        self.shared || self.king_axis || self.hand_axis
+        self.shared
+            || self.king_axis
+            || self.hand_axis
+            || self.king_hand_pair
+            || self.king_progress_pair
+            || self.hand_progress_pair
     }
 
     pub fn any_axis(self) -> bool {
-        self.king_axis || self.hand_axis
+        self.king_axis || self.hand_axis || self.king_hand_pair || self.king_progress_pair || self.hand_progress_pair
     }
 
     pub fn active_axis_count(self, shape: SfnnForwardShape) -> usize {
         let king = if self.king_axis { shape.factorizer_king_axis_dim.saturating_mul(2) } else { 0 };
         let hand = if self.hand_axis { shape.factorizer_hand_axis_dim.saturating_mul(2) } else { 0 };
-        king.saturating_add(hand)
+        let king_hand = if self.king_hand_pair {
+            shape.factorizer_king_bucket_count().saturating_mul(shape.factorizer_hand_bucket_count())
+        } else {
+            0
+        };
+        let king_progress = if self.king_progress_pair {
+            shape.factorizer_king_bucket_count().saturating_mul(shape.factorizer_progress_multiplier())
+        } else {
+            0
+        };
+        let hand_progress = if self.hand_progress_pair {
+            shape.factorizer_hand_bucket_count().saturating_mul(shape.factorizer_progress_multiplier())
+        } else {
+            0
+        };
+        king.saturating_add(hand).saturating_add(king_hand).saturating_add(king_progress).saturating_add(hand_progress)
     }
 
     fn from_available(weights: &SfnnForwardDeviceWeights) -> Self {
@@ -981,6 +1051,12 @@ impl SfnnFactorizerActive {
             king_axis: weights.shape.factorizer_king_axis_dim > 0
                 && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
             hand_axis: weights.shape.factorizer_hand_axis_dim > 0
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            king_hand_pair: weights.shape.factorizer_king_hand_pair
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            king_progress_pair: weights.shape.factorizer_king_progress_pair
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            hand_progress_pair: weights.shape.factorizer_hand_progress_pair
                 && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
         }
     }
@@ -992,6 +1068,12 @@ impl SfnnFactorizerActive {
                 && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
             hand_axis: weights.shape.factorizer_hand_axis_dim > 0
                 && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            king_hand_pair: weights.shape.factorizer_king_hand_pair
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            king_progress_pair: weights.shape.factorizer_king_progress_pair
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
+            hand_progress_pair: weights.shape.factorizer_hand_progress_pair
+                && (weights.l2axw.is_some() || weights.l3axw.is_some() || weights.l1axw.is_some()),
         }
     }
 
@@ -1001,6 +1083,19 @@ impl SfnnFactorizerActive {
         }
         if self.hand_axis && shape.factorizer_hand_axis_dim == 0 {
             return Err(CudaCppError::message("SFNN hand-axis factorizer is active but the shape has no hand axis"));
+        }
+        if self.king_hand_pair && !(shape.factorizer_king_axis_dim != 0 && shape.factorizer_hand_axis_dim != 0) {
+            return Err(CudaCppError::message("SFNN king-hand pair factorizer requires both king and hand axes"));
+        }
+        if self.king_progress_pair
+            && !(shape.factorizer_king_axis_dim != 0 && shape.factorizer_progress_multiplier() > 1)
+        {
+            return Err(CudaCppError::message("SFNN king-progress pair factorizer requires king and progress axes"));
+        }
+        if self.hand_progress_pair
+            && !(shape.factorizer_hand_axis_dim != 0 && shape.factorizer_progress_multiplier() > 1)
+        {
+            return Err(CudaCppError::message("SFNN hand-progress pair factorizer requires hand and progress axes"));
         }
         if self.any_axis() && shape.factorizer_axis_count() == 0 {
             return Err(CudaCppError::message("SFNN axis factorizer is active but the shape has no factorizer axes"));
@@ -1014,14 +1109,17 @@ pub struct SfnnFactorizerAlpha {
     pub shared: f32,
     pub king_axis: f32,
     pub hand_axis: f32,
+    pub pair: f32,
 }
 
 impl SfnnFactorizerAlpha {
-    pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
+    pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, pair: 1.0 };
     const MAX: f32 = 10.0;
 
     fn validate(self) -> Result<()> {
-        for (name, value) in [("shared", self.shared), ("king-axis", self.king_axis), ("hand-axis", self.hand_axis)] {
+        for (name, value) in
+            [("shared", self.shared), ("king-axis", self.king_axis), ("hand-axis", self.hand_axis), ("pair", self.pair)]
+        {
             if !(value.is_finite() && (0.0..=Self::MAX).contains(&value)) {
                 return Err(CudaCppError::message(format!(
                     "SFNN factorizer alpha for {name} must be finite and in [0, {}]",
@@ -1570,10 +1668,8 @@ fn sfnn_forward_device_with_factorizer_impl(
         expect_len("sfnn folded_l0w scratch", shape.input_size * shape.ft_size, scratch.len())?;
     }
     let (l1axw, l1axb, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
-        (Some(l1axw), Some(l1axb)) if factorizer.king_axis || factorizer.hand_axis => {
-            (l1axw.as_ptr(), l1axb.as_ptr(), 1)
-        }
-        (None, None) if (factorizer.king_axis || factorizer.hand_axis) && !shape.has_compact_l1() => {
+        (Some(l1axw), Some(l1axb)) if factorizer.any_axis() => (l1axw.as_ptr(), l1axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
@@ -1588,10 +1684,8 @@ fn sfnn_forward_device_with_factorizer_impl(
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
     let (l2axw, l2axb, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
-        (Some(l2axw), Some(l2axb)) if factorizer.king_axis || factorizer.hand_axis => {
-            (l2axw.as_ptr(), l2axb.as_ptr(), 1)
-        }
-        (None, None) if factorizer.king_axis || factorizer.hand_axis => {
+        (Some(l2axw), Some(l2axb)) if factorizer.any_axis() => (l2axw.as_ptr(), l2axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
@@ -1607,10 +1701,8 @@ fn sfnn_forward_device_with_factorizer_impl(
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
     };
     let (l3axw, l3axb, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
-        (Some(l3axw), Some(l3axb)) if factorizer.king_axis || factorizer.hand_axis => {
-            (l3axw.as_ptr(), l3axb.as_ptr(), 1)
-        }
-        (None, None) if factorizer.king_axis || factorizer.hand_axis => {
+        (Some(l3axw), Some(l3axb)) if factorizer.any_axis() => (l3axw.as_ptr(), l3axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
@@ -1673,9 +1765,13 @@ fn sfnn_forward_device_with_factorizer_impl(
             has_l3ax,
             i32::from(factorizer.king_axis),
             i32::from(factorizer.hand_axis),
+            i32::from(factorizer.king_hand_pair),
+            i32::from(factorizer.king_progress_pair),
+            i32::from(factorizer.hand_progress_pair),
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
+            factorizer_alpha.pair,
             workspace.stm_l0.as_ptr(),
             workspace.nstm_l0.as_ptr(),
             workspace.combined.as_ptr(),
@@ -2908,9 +3004,13 @@ pub fn sfnn_backward_train_profile_device_with_factorizer_and_alpha(
             has_l3ax,
             i32::from(factorizer.king_axis),
             i32::from(factorizer.hand_axis),
+            i32::from(factorizer.king_hand_pair),
+            i32::from(factorizer.king_progress_pair),
+            i32::from(factorizer.hand_progress_pair),
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
+            factorizer_alpha.pair,
             loss.mean_output_gradients.as_ptr(),
             backward.l2_gradients.as_ptr(),
             backward.l1_gradients.as_ptr(),
@@ -3089,9 +3189,13 @@ fn sfnn_backward_device_impl(
                 has_l3ax,
                 i32::from(factorizer.king_axis),
                 i32::from(factorizer.hand_axis),
+                i32::from(factorizer.king_hand_pair),
+                i32::from(factorizer.king_progress_pair),
+                i32::from(factorizer.hand_progress_pair),
                 factorizer_alpha.shared,
                 factorizer_alpha.king_axis,
                 factorizer_alpha.hand_axis,
+                factorizer_alpha.pair,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -3165,9 +3269,13 @@ fn sfnn_backward_device_impl(
                 has_l3ax,
                 i32::from(factorizer.king_axis),
                 i32::from(factorizer.hand_axis),
+                i32::from(factorizer.king_hand_pair),
+                i32::from(factorizer.king_progress_pair),
+                i32::from(factorizer.hand_progress_pair),
                 factorizer_alpha.shared,
                 factorizer_alpha.king_axis,
                 factorizer_alpha.hand_axis,
+                factorizer_alpha.pair,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
                 backward.l1_gradients.as_ptr(),
@@ -6837,9 +6945,13 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
             stm_l0: *mut BulletOuCudaCppF32Buffer,
             nstm_l0: *mut BulletOuCudaCppF32Buffer,
             combined: *mut BulletOuCudaCppF32Buffer,
@@ -6889,9 +7001,13 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -6963,9 +7079,13 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -7038,9 +7158,13 @@ mod ffi {
             has_l3ax: i32,
             use_king_axis: i32,
             use_hand_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
             l1_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -7188,6 +7312,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -7242,6 +7369,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 3,
             factorizer_hand_axis_dim: 8,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
 
         assert_eq!(shape.factorizer_stack_count(), 64 * 9);
@@ -7267,6 +7397,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
@@ -7305,6 +7438,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -7331,6 +7467,9 @@ mod tests {
             l1_shard_size: 256,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -7354,6 +7493,9 @@ mod tests {
             l1_shard_size: 1024,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let c0_layout = SfnnBackwardWorkspaceLayout::new(c0_shape, 5, 40);
 
@@ -7806,6 +7948,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         }
     }
 

@@ -1,12 +1,12 @@
 /*!
-bulletou  EBulletOu trainer entry point.
+bulletou  - BulletOu trainer entry point.
 
 Dispatches to the appropriate training routine via `--arch`. The KPPT-family
 architecture values train all three KPPT components (KK + KKP + KPP)
 sequentially in a single invocation and assemble the result into numbered
 checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
-    bulletou --arch KPPT                 (KPPT family, KPP int16 ÁE2)
+    bulletou --arch KPPT                 (KPPT family, KPP int16 x2)
     bulletou --arch KPP_KKPT             (KPP_KKPT factorised, KPP int16)
 
 For NNUE / SFNN targets, `--arch` is the YaneuraOu Makefile architecture name
@@ -120,13 +120,13 @@ enum EvalType {
     /// compatible `nn.bin` per save. Architecture is selected via `--arch`
     /// (default `NNUE_halfkp_256x2_32_32`).
     NnueHalfkp,
-    /// NNUE K-P. YaneuraOu kp_256x2-32-32  Esame 4-layer ClippedReLU network
+    /// NNUE K-P. YaneuraOu kp_256x2-32-32  - same 4-layer ClippedReLU network
     /// as halfkp_256x2-32-32, but the input is `FeatureSet<K, P>` (K = 162
     /// king features, P = 1548 piece features per perspective; 1710 total)
-    /// instead of HalfKP's (king ÁEpiece) cross product. Architecture is
+    /// instead of HalfKP's (king x piece) cross product. Architecture is
     /// selected via `--arch` (default `NNUE_kp_256x2_32_32`).
     NnueKp,
-    /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>`  Esame 4-layer ClippedReLU
+    /// NNUE K-A2. YaneuraOu `FeatureSet<K, A2>`  - same 4-layer ClippedReLU
     /// network as kp_256x2-32-32, but the piece feature is A2 (1629 dims,
     /// kings collapsed onto friend plane via v2 encoding) so both kings
     /// participate in the piece feature in addition to K (162 dims). Input
@@ -135,21 +135,21 @@ enum EvalType {
     /// `YANEURAOU_ENGINE_NNUE_ka2_*` build (single LayerStack, no SFNN
     /// post-FT structure).
     NnueKa2,
-    /// NNUE HalfKPE9. YaneuraOu halfkpe9_*  EHalfKP ÁE9 effect-count buckets
-    /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3ÁE=9
-    /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP ÁE    /// 9). Same 4-layer ClippedReLU network as halfkp / kp. Requires
+    /// NNUE HalfKPE9. YaneuraOu halfkpe9_*  - HalfKP x9 effect-count buckets
+    /// (`per-square own/opponent attacker count, 0/1/2 clipped, 3x3=9
+    /// combinations`). Input dim is 1,128,492 per perspective (= HalfKP x 9). Same 4-layer ClippedReLU network as halfkp / kp. Requires
     /// piece-effect computation, which BulletOu's threat module already
     /// provides.
     NnueHalfkpe9,
-    /// NNUE HalfKP_vm. YaneuraOu halfkpvm_*  EHalfKP with file-mirror
+    /// NNUE HalfKP_vm. YaneuraOu halfkpvm_*  - HalfKP with file-mirror
     /// folding: king positions on files 6-9 are mirrored to files 1-4,
     /// halving the input dimension to 69,660 per perspective (= 45 king
-    /// buckets ÁE1548 piece inputs). Same 4-layer ClippedReLU network as
+    /// buckets x 1548 piece inputs). Same 4-layer ClippedReLU network as
     /// the rest of the NNUE family.
     NnueHalfkpvm,
     /// SFNN-1536 with `HalfKA_hm1` input (= strict v1, both kings on
-    /// separate planes, 76,950 dim). LayerStacks family  Euses a 9-stack
-    /// MLP (FT ↁEfc_0(L1+1 PSQT-shortcut) ↁECReLU + SqrCReLU concat ↁE    /// fc_1 ↁEfc_2 ↁE+PSQT bypass). Bucketing is selected by the `--arch`
+    /// separate planes, 76,950 dim). LayerStacks family  - uses a 9-stack
+    /// MLP (FT -> fc_0(L1+1 PSQT-shortcut) -> CReLU + SqrCReLU concat -> fc_1 -> fc_2 -> +PSQT bypass). Bucketing is selected by the `--arch`
     /// LayerStack suffix.
     /// `--arch SFNN_halfkahm1_1536_15_32_k3k3` matches the corresponding
     /// YaneuraOu SFNN dynamic build.
@@ -237,7 +237,7 @@ impl From<SfnnUpdateScopeArg> for bulletou_cuda_cpp::SfnnUpdateScope {
 enum LayerStackMode {
     /// Single stack, no position-dependent LayerStack bucketing.
     Single,
-    /// 3 ÁE3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
+    /// 3 x 3 = 9 stacks, indexed by `(friend_king_rank/3, enemy_king_rank/3)`.
     /// Matches YaneuraOu `stack_index_for_nnue` byte-for-byte.
     #[default]
     Kingrank3by3,
@@ -1797,8 +1797,8 @@ impl GeometricLR {
     /// so the trainer's LR and the logged LR always agree.
     ///
     /// `lr(t) = start * (min/start)^t` where `t = (total % period) /
-    /// period`. Geometric interpolation in log space: at t=0 ↁEstart
-    /// (lr_max), t=1 ↁEmin (lr_min). Warm restart at cycle boundary
+    /// period`. Geometric interpolation in log space: at t=0 -> start
+    /// (lr_max), t=1 -> min (lr_min). Warm restart at cycle boundary
     /// (= each `period_positions`), mirroring `CosineLR`.
     fn lr_at_positions(start: f32, min: f32, period: u64, total: u64) -> f32 {
         if period == 0 {
@@ -1885,12 +1885,12 @@ impl LrScheduler for StepLR {
 ///
 /// Mirrors [`GeometricLR`] structurally so the two schedules can be
 /// dropped into the same training run as alternatives. Within each
-/// `period_positions`-long cycle the LR sweeps `start` ↁE`min`
+/// `period_positions`-long cycle the LR sweeps `start` -> `min`
 /// following the half-cosine curve; at cycle boundaries it snaps back
 /// to `start` (warm restart). Bullet's `sb`-reset at each epoch lines
 /// up with `in_run = 0` and the cycle index reset, so when
 /// `period_positions == one epoch`, each epoch is exactly one full
-/// cosine cycle  Eapples-to-apples with the stepwise schedule which
+/// cosine cycle  - apples-to-apples with the stepwise schedule which
 /// also resets at epoch boundaries.
 #[derive(Clone, Debug)]
 struct CosineLR {
@@ -2714,8 +2714,14 @@ struct SfnnFactorizerSpec {
     shared: bool,
     king_axis: bool,
     hand_axis: bool,
+    king_hand_pair: bool,
+    king_progress_pair: bool,
+    hand_progress_pair: bool,
     explicit_king_axis: bool,
     explicit_hand_axis: bool,
+    explicit_king_hand_pair: bool,
+    explicit_king_progress_pair: bool,
+    explicit_hand_progress_pair: bool,
 }
 
 impl SfnnFactorizerSpec {
@@ -2723,16 +2729,30 @@ impl SfnnFactorizerSpec {
         shared: false,
         king_axis: false,
         hand_axis: false,
+        king_hand_pair: false,
+        king_progress_pair: false,
+        hand_progress_pair: false,
         explicit_king_axis: false,
         explicit_hand_axis: false,
+        explicit_king_hand_pair: false,
+        explicit_king_progress_pair: false,
+        explicit_hand_progress_pair: false,
     };
-    const SHARED: Self =
-        Self { shared: true, king_axis: false, hand_axis: false, explicit_king_axis: false, explicit_hand_axis: false };
-    const AXIS: Self =
-        Self { shared: true, king_axis: true, hand_axis: true, explicit_king_axis: false, explicit_hand_axis: false };
+    const SHARED: Self = Self { shared: true, ..Self::NONE };
+    const AXIS: Self = Self { shared: true, king_axis: true, hand_axis: true, ..Self::NONE };
+    const PAIR: Self = Self {
+        shared: true,
+        king_axis: true,
+        hand_axis: true,
+        king_hand_pair: true,
+        king_progress_pair: true,
+        hand_progress_pair: true,
+        ..Self::NONE
+    };
 
     fn normalize(mut self) -> Self {
-        if self.king_axis || self.hand_axis {
+        if self.king_axis || self.hand_axis || self.king_hand_pair || self.king_progress_pair || self.hand_progress_pair
+        {
             self.shared = true;
         }
         self
@@ -2745,27 +2765,65 @@ impl SfnnFactorizerSpec {
         if self.hand_axis && !self.explicit_hand_axis && layerstack.factorizer_hand_axis_dim() == 0 {
             self.hand_axis = false;
         }
+        let has_king = layerstack.factorizer_king_axis_dim() != 0;
+        let has_hand = layerstack.factorizer_hand_axis_dim() != 0;
+        let has_progress = layerstack.progress_bucket_count() > 1;
+        if self.king_hand_pair && !self.explicit_king_hand_pair && !(has_king && has_hand) {
+            self.king_hand_pair = false;
+        }
+        if self.king_progress_pair && !self.explicit_king_progress_pair && !(has_king && has_progress) {
+            self.king_progress_pair = false;
+        }
+        if self.hand_progress_pair && !self.explicit_hand_progress_pair && !(has_hand && has_progress) {
+            self.hand_progress_pair = false;
+        }
         self.normalize()
     }
 
     fn config_string(self) -> String {
         format!(
-            "shared={},king_axis={},hand_axis={}",
+            "shared={},king_axis={},hand_axis={},king_hand_pair={},king_progress_pair={},hand_progress_pair={}",
             u8::from(self.shared),
             u8::from(self.king_axis),
-            u8::from(self.hand_axis)
+            u8::from(self.hand_axis),
+            u8::from(self.king_hand_pair),
+            u8::from(self.king_progress_pair),
+            u8::from(self.hand_progress_pair)
         )
     }
 
-    fn label(self) -> &'static str {
-        match (self.shared, self.king_axis, self.hand_axis) {
-            (false, false, false) => "none",
-            (true, false, false) => "shared",
-            (true, true, true) => "shared+king-axis+hand-axis",
-            (true, true, false) => "shared+king-axis",
-            (true, false, true) => "shared+hand-axis",
-            _ => "custom",
+    fn any_pair(self) -> bool {
+        self.king_hand_pair || self.king_progress_pair || self.hand_progress_pair
+    }
+
+    fn any_axis(self) -> bool {
+        self.king_axis || self.hand_axis || self.any_pair()
+    }
+
+    fn label(self) -> String {
+        if !self.shared && !self.king_axis && !self.hand_axis && !self.any_pair() {
+            return "none".to_string();
         }
+        let mut parts = Vec::new();
+        if self.shared {
+            parts.push("shared");
+        }
+        if self.king_axis {
+            parts.push("king-axis");
+        }
+        if self.hand_axis {
+            parts.push("hand-axis");
+        }
+        if self.king_hand_pair {
+            parts.push("king-hand");
+        }
+        if self.king_progress_pair {
+            parts.push("king-progress");
+        }
+        if self.hand_progress_pair {
+            parts.push("hand-progress");
+        }
+        parts.join("+")
     }
 }
 
@@ -2781,6 +2839,7 @@ impl std::str::FromStr for SfnnFactorizerSpec {
             "none" | "off" | "false" | "0" => return Ok(Self::NONE),
             "shared" | "on" | "true" | "1" => return Ok(Self::SHARED),
             "axis" | "axes" => return Ok(Self::AXIS),
+            "pair" | "pairs" => return Ok(Self::PAIR),
             _ => {}
         }
 
@@ -2799,13 +2858,36 @@ impl std::str::FromStr for SfnnFactorizerSpec {
                     spec.king_axis = true;
                     spec.hand_axis = true;
                 }
+                "pair" | "pairs" => {
+                    spec.shared = true;
+                    spec.king_axis = true;
+                    spec.hand_axis = true;
+                    spec.king_hand_pair = true;
+                    spec.king_progress_pair = true;
+                    spec.hand_progress_pair = true;
+                }
+                "king-hand" | "hand-king" | "king_hand" | "hand_king" | "kh" | "hk" => {
+                    spec.shared = true;
+                    spec.king_hand_pair = true;
+                    spec.explicit_king_hand_pair = true;
+                }
+                "king-progress" | "progress-king" | "king_progress" | "progress_king" | "kp" | "pk" => {
+                    spec.shared = true;
+                    spec.king_progress_pair = true;
+                    spec.explicit_king_progress_pair = true;
+                }
+                "hand-progress" | "progress-hand" | "hand_progress" | "progress_hand" | "hp" | "ph" => {
+                    spec.shared = true;
+                    spec.hand_progress_pair = true;
+                    spec.explicit_hand_progress_pair = true;
+                }
                 "none" | "off" => {
                     spec = Self::NONE;
                 }
                 _ => {
                     let (key, value) = token.split_once('=').ok_or_else(|| {
                         format!(
-                            "invalid SFNN factorizer token `{token}`: expected shared, axis, none, king=axis/shared/none, or hand=axis/shared/none"
+                            "invalid SFNN factorizer token `{token}`: expected shared, axis, pair, king-hand, king-progress, hand-progress, none, king=axis/shared/none, or hand=axis/shared/none"
                         )
                     })?;
                     let axis_value = match value {
@@ -2850,22 +2932,29 @@ struct SfnnFactorizerAlphaSpec {
     shared: f32,
     king_axis: f32,
     hand_axis: f32,
+    pair: f32,
 }
 
 impl SfnnFactorizerAlphaSpec {
     const MAX: f32 = 10.0;
-    const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0 };
+    const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, pair: 1.0 };
 
     fn is_default(self) -> bool {
-        self.shared == 1.0 && self.king_axis == 1.0 && self.hand_axis == 1.0
+        self.shared == 1.0 && self.king_axis == 1.0 && self.hand_axis == 1.0 && self.pair == 1.0
     }
 
     fn config_string(self) -> String {
-        format!("shared={:.9},king_axis={:.9},hand_axis={:.9}", self.shared, self.king_axis, self.hand_axis)
+        format!(
+            "shared={:.9},king_axis={:.9},hand_axis={:.9},pair={:.9}",
+            self.shared, self.king_axis, self.hand_axis, self.pair
+        )
     }
 
     fn label(self) -> String {
-        format!("shared={:.3}, king={:.3}, hand={:.3}", self.shared, self.king_axis, self.hand_axis)
+        format!(
+            "shared={:.3}, king={:.3}, hand={:.3}, pair={:.3}",
+            self.shared, self.king_axis, self.hand_axis, self.pair
+        )
     }
 
     fn parse_value(token: &str, raw: &str) -> Result<f32, String> {
@@ -2894,7 +2983,7 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
 
         if !raw.contains('=') && !raw.contains(',') {
             let value = Self::parse_value(raw, raw)?;
-            return Ok(Self { shared: value, king_axis: value, hand_axis: value });
+            return Ok(Self { shared: value, king_axis: value, hand_axis: value, pair: value });
         }
 
         let mut spec = Self::ONE;
@@ -2905,7 +2994,7 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
             }
             let (key, value) = token.split_once('=').ok_or_else(|| {
                 format!(
-                    "invalid SFNN factorizer alpha token `{token}`: expected 0.95, all=0.95, shared=0.95, king=0.95, or hand=0.95"
+                    "invalid SFNN factorizer alpha token `{token}`: expected 0.95, all=0.95, shared=0.95, king=0.95, hand=0.95, or pair=0.95"
                 )
             })?;
             let value = Self::parse_value(value, raw)?;
@@ -2914,13 +3003,15 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
                     spec.shared = value;
                     spec.king_axis = value;
                     spec.hand_axis = value;
+                    spec.pair = value;
                 }
                 "shared" | "common" => spec.shared = value,
                 "king" | "king_axis" | "k" => spec.king_axis = value,
                 "hand" | "hand_axis" | "h" => spec.hand_axis = value,
+                "pair" | "pairs" | "p" => spec.pair = value,
                 _ => {
                     return Err(format!(
-                        "invalid SFNN factorizer alpha token `{token}`: key must be all, shared, king, or hand"
+                        "invalid SFNN factorizer alpha token `{token}`: key must be all, shared, king, hand, or pair"
                     ));
                 }
             }
@@ -2951,7 +3042,7 @@ fn effective_sfnn_factorizer_spec(args: &Args) -> SfnnFactorizerSpec {
 
 fn effective_sfnn_factorized_stack(args: &Args) -> bool {
     let spec = effective_sfnn_factorizer_spec(args);
-    spec.shared || spec.king_axis || spec.hand_axis
+    spec.shared || spec.any_axis()
 }
 
 fn effective_sfnn_factorized_l1(args: &Args) -> bool {
@@ -2970,12 +3061,12 @@ fn effective_sfnn_axis_factorized_l1(args: &Args) -> bool {
         return false;
     };
     let spec = effective_sfnn_factorizer_spec(args);
-    (spec.king_axis || spec.hand_axis) && !arch.has_compact_sfnn_l1()
+    spec.any_axis() && !arch.has_compact_sfnn_l1()
 }
 
 fn effective_sfnn_axis_factorized_l2_l3(args: &Args) -> bool {
     let spec = effective_sfnn_factorizer_spec(args);
-    spec.king_axis || spec.hand_axis
+    spec.any_axis()
 }
 
 fn effective_sfnn_factorizer_alpha(args: &Args) -> SfnnFactorizerAlphaSpec {
@@ -2997,6 +3088,9 @@ fn cuda_cpp_sfnn_factorizer_active(args: &Args) -> bulletou_cuda_cpp::SfnnFactor
         shared: spec.shared,
         king_axis: spec.king_axis,
         hand_axis: spec.hand_axis,
+        king_hand_pair: spec.king_hand_pair,
+        king_progress_pair: spec.king_progress_pair,
+        hand_progress_pair: spec.hand_progress_pair,
     }
 }
 
@@ -3007,6 +3101,7 @@ fn cuda_cpp_sfnn_factorizer_alpha(args: &Args) -> bulletou_cuda_cpp::SfnnFactori
         shared: alpha.shared,
         king_axis: alpha.king_axis,
         hand_axis: alpha.hand_axis,
+        pair: alpha.pair,
     }
 }
 
@@ -3305,7 +3400,7 @@ struct Args {
     /// walk every game; not yet supported by this flag.
     ///
     /// Use the printed total to pick `--superbatches N` for `geometric` / `cos`
-    /// runs such that one epoch ≁E(or ≤) the teacher size. With cosine
+    /// runs such that one epoch 竕・(or 竕､) the teacher size. With cosine
     /// annealing, period auto-aligns to `--superbatches`.
     #[arg(long)]
     count_teacher: bool,
@@ -3429,7 +3524,7 @@ struct Args {
 
     /// LR schedule kind. `step` applies fixed gamma drops within one epoch
     /// and warm-restarts to `--lr` at epoch boundaries. `geometric` and `cos` sweep
-    /// `--lr` (lr_max) ↁE`--lr-min` over **one epoch**, warm-restarting to
+    /// `--lr` (lr_max) ->`--lr-min` over **one epoch**, warm-restarting to
     /// `--lr` at each epoch boundary. `plateau` keeps LR fixed during one
     /// superbatch, then reduces it when the validation monitor does not
     /// improve:
@@ -3439,11 +3534,11 @@ struct Args {
     ///   If `--lr-step-positions` is omitted, this is one gamma drop per
     ///   superbatch.
     /// - `geometric` = exponential interpolation in log space:
-    ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t∁E0,1] is
+    ///   `lr(t) = lr_max * (lr_min/lr_max)^t` where t竏・0,1] is
     ///   "fraction of one epoch completed". Constant multiplicative
     ///   decay per batch.
     /// - `cos` = cosine annealing (SGDR-style):
-    ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(πt))`.
+    ///   `lr(t) = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi*t))`.
     ///   Slower descent at the start and end, fastest in the middle.
     /// - `plateau` = ReduceLROnPlateau: after each saved superbatch,
     ///   if the `--lr-plateau-monitor` metric did not improve, multiply LR by
@@ -3659,7 +3754,7 @@ struct Args {
     #[arg(long, default_value = "0")]
     loader_threads: usize,
 
-    /// Drop positions whose |score| >= this. Useful to exclude ±32000 mate
+    /// Drop positions whose |score| >= this. Useful to exclude ?32000 mate
     /// stamps. Set to 0 to disable.
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
@@ -3995,6 +4090,30 @@ impl Args {
                 if spec.explicit_hand_axis && layerstack.factorizer_hand_axis_dim() == 0 {
                     return Err(format!(
                         "--sfnn-factorizer requested hand=axis, but arch {} has no hand bucket axis",
+                        self.arch().cli_name()
+                    ));
+                }
+                if spec.explicit_king_hand_pair
+                    && !(layerstack.factorizer_king_axis_dim() != 0 && layerstack.factorizer_hand_axis_dim() != 0)
+                {
+                    return Err(format!(
+                        "--sfnn-factorizer requested king-hand, but arch {} does not have both king and hand bucket axes",
+                        self.arch().cli_name()
+                    ));
+                }
+                if spec.explicit_king_progress_pair
+                    && !(layerstack.factorizer_king_axis_dim() != 0 && layerstack.progress_bucket_count() > 1)
+                {
+                    return Err(format!(
+                        "--sfnn-factorizer requested king-progress, but arch {} does not have both king and progress bucket axes",
+                        self.arch().cli_name()
+                    ));
+                }
+                if spec.explicit_hand_progress_pair
+                    && !(layerstack.factorizer_hand_axis_dim() != 0 && layerstack.progress_bucket_count() > 1)
+                {
+                    return Err(format!(
+                        "--sfnn-factorizer requested hand-progress, but arch {} does not have both hand and progress bucket axes",
                         self.arch().cli_name()
                     ));
                 }
@@ -11703,7 +11822,8 @@ fn cuda_cpp_sfnn_factorizer_axis_ids(
     let axis_stack = stack / progress_bucket_count.max(1);
     let king_bucket = axis_stack % king_bucket_count;
     let hand_bucket = (axis_stack / king_bucket_count) % hand_bucket_count;
-    let mut ids = Vec::with_capacity(4);
+    let progress_bucket = stack % progress_bucket_count.max(1);
+    let mut ids = Vec::with_capacity(7);
     if factorizer.king_axis && shape.factorizer_king_axis_dim != 0 {
         ids.push(king_bucket / shape.factorizer_king_axis_dim);
         ids.push(shape.factorizer_king_axis_dim + (king_bucket % shape.factorizer_king_axis_dim));
@@ -11713,6 +11833,30 @@ fn cuda_cpp_sfnn_factorizer_axis_ids(
         ids.push(offset + hand_bucket / shape.factorizer_hand_axis_dim);
         ids.push(offset + shape.factorizer_hand_axis_dim + (hand_bucket % shape.factorizer_hand_axis_dim));
     }
+    let mut offset = shape.factorizer_base_axis_count();
+    if factorizer.king_hand_pair
+        && shape.factorizer_king_hand_pair
+        && shape.factorizer_king_axis_dim != 0
+        && shape.factorizer_hand_axis_dim != 0
+    {
+        ids.push(offset + hand_bucket * king_bucket_count + king_bucket);
+    }
+    offset += shape.factorizer_king_hand_pair_count();
+    if factorizer.king_progress_pair
+        && shape.factorizer_king_progress_pair
+        && shape.factorizer_king_axis_dim != 0
+        && progress_bucket_count > 1
+    {
+        ids.push(offset + progress_bucket * king_bucket_count + king_bucket);
+    }
+    offset += shape.factorizer_king_progress_pair_count();
+    if factorizer.hand_progress_pair
+        && shape.factorizer_hand_progress_pair
+        && shape.factorizer_hand_axis_dim != 0
+        && progress_bucket_count > 1
+    {
+        ids.push(offset + progress_bucket * hand_bucket_count + hand_bucket);
+    }
     ids
 }
 
@@ -11721,14 +11865,25 @@ fn cuda_cpp_sfnn_factorizer_axis_indices(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     factorizer: SfnnFactorizerSpec,
 ) -> Vec<usize> {
-    let mut ids =
-        Vec::with_capacity(shape.factorizer_king_axis_dim.saturating_mul(2) + shape.factorizer_hand_axis_dim * 2);
+    let mut ids = Vec::with_capacity(shape.factorizer_axis_count());
     if factorizer.king_axis {
         ids.extend(0..shape.factorizer_king_axis_dim.saturating_mul(2));
     }
     if factorizer.hand_axis {
         let offset = shape.factorizer_king_axis_dim.saturating_mul(2);
         ids.extend(offset..offset + shape.factorizer_hand_axis_dim.saturating_mul(2));
+    }
+    let kh_offset = shape.factorizer_base_axis_count();
+    let kp_offset = kh_offset + shape.factorizer_king_hand_pair_count();
+    let hp_offset = kp_offset + shape.factorizer_king_progress_pair_count();
+    if factorizer.king_hand_pair {
+        ids.extend(kh_offset..kp_offset);
+    }
+    if factorizer.king_progress_pair {
+        ids.extend(kp_offset..hp_offset);
+    }
+    if factorizer.hand_progress_pair {
+        ids.extend(hp_offset..hp_offset + shape.factorizer_hand_progress_pair_count());
     }
     ids
 }
@@ -11740,7 +11895,14 @@ fn cuda_cpp_sfnn_factorizer_axis_alpha(
     alpha: SfnnFactorizerAlphaSpec,
 ) -> f32 {
     let king_axis_count = shape.factorizer_king_axis_dim.saturating_mul(2);
-    if axis < king_axis_count { alpha.king_axis } else { alpha.hand_axis }
+    let base_axis_count = king_axis_count + shape.factorizer_hand_axis_dim.saturating_mul(2);
+    if axis < king_axis_count {
+        alpha.king_axis
+    } else if axis < base_axis_count {
+        alpha.hand_axis
+    } else {
+        alpha.pair
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12462,6 +12624,9 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         l1_shard_size: args.arch().sfnn_l1_shard_size(),
         factorizer_king_axis_dim: layerstack.factorizer_king_axis_dim(),
         factorizer_hand_axis_dim: layerstack.factorizer_hand_axis_dim(),
+        factorizer_king_hand_pair: effective_sfnn_factorizer_spec(args).king_hand_pair,
+        factorizer_king_progress_pair: effective_sfnn_factorizer_spec(args).king_progress_pair,
+        factorizer_hand_progress_pair: effective_sfnn_factorizer_spec(args).hand_progress_pair,
     };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
@@ -12581,6 +12746,9 @@ fn load_cuda_cpp_sfnn_initial_state(
         l1_shard_size: args.arch().sfnn_l1_shard_size(),
         factorizer_king_axis_dim: layerstack.factorizer_king_axis_dim(),
         factorizer_hand_axis_dim: layerstack.factorizer_hand_axis_dim(),
+        factorizer_king_hand_pair: effective_sfnn_factorizer_spec(args).king_hand_pair,
+        factorizer_king_progress_pair: effective_sfnn_factorizer_spec(args).king_progress_pair,
+        factorizer_hand_progress_pair: effective_sfnn_factorizer_spec(args).hand_progress_pair,
     };
     let mut weights =
         load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, &weights_records).map_err(|err| {
@@ -12788,10 +12956,16 @@ fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
         shared: true,
         king_axis: active.king_axis,
         hand_axis: active.hand_axis,
+        king_hand_pair: active.king_hand_pair,
+        king_progress_pair: active.king_progress_pair,
+        hand_progress_pair: active.hand_progress_pair,
         explicit_king_axis: true,
         explicit_hand_axis: true,
+        explicit_king_hand_pair: true,
+        explicit_king_progress_pair: true,
+        explicit_hand_progress_pair: true,
     };
-    if active_axis.king_axis || active_axis.hand_axis {
+    if active_axis.any_axis() {
         if created.axis_l1 {
             let l1axw = weights
                 .l1axw
@@ -12906,10 +13080,16 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
         shared: true,
         king_axis: !active.king_axis && shape.factorizer_king_axis_dim != 0,
         hand_axis: !active.hand_axis && shape.factorizer_hand_axis_dim != 0,
+        king_hand_pair: !active.king_hand_pair && shape.factorizer_king_hand_pair,
+        king_progress_pair: !active.king_progress_pair && shape.factorizer_king_progress_pair,
+        hand_progress_pair: !active.hand_progress_pair && shape.factorizer_hand_progress_pair,
         explicit_king_axis: true,
         explicit_hand_axis: true,
+        explicit_king_hand_pair: true,
+        explicit_king_progress_pair: true,
+        explicit_hand_progress_pair: true,
     };
-    if (fold_axis.king_axis || fold_axis.hand_axis)
+    if fold_axis.any_axis()
         && (weights.l1axw.is_some()
             || weights.l1axb.is_some()
             || weights.l2axw.is_some()
@@ -13263,10 +13443,16 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
         shared: true,
         king_axis: !active.king_axis && shape.factorizer_king_axis_dim != 0,
         hand_axis: !active.hand_axis && shape.factorizer_hand_axis_dim != 0,
+        king_hand_pair: !active.king_hand_pair && shape.factorizer_king_hand_pair,
+        king_progress_pair: !active.king_progress_pair && shape.factorizer_king_progress_pair,
+        hand_progress_pair: !active.hand_progress_pair && shape.factorizer_hand_progress_pair,
         explicit_king_axis: true,
         explicit_hand_axis: true,
+        explicit_king_hand_pair: true,
+        explicit_king_progress_pair: true,
+        explicit_hand_progress_pair: true,
     };
-    if (fold_axis.king_axis || fold_axis.hand_axis)
+    if fold_axis.any_axis()
         && (optimizer.l1axw.is_some()
             || optimizer.l1axb.is_some()
             || optimizer.l2axw.is_some()
@@ -14628,7 +14814,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
     let l2_in = shape.l2_in();
     let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
     let fc_weight_scale = f32::from(SFNN_QB);
-    let use_axis = factorizer.king_axis || factorizer.hand_axis;
+    let use_axis = factorizer.any_axis();
     let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
     let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
         factorizer.shared && !compact_l1,
@@ -15658,8 +15844,8 @@ impl CudaCppTataraXorShift {
 /// checkpoint directory. Always appends; one line per invocation
 /// `<unix_ts>\t<arg0> <arg1> ...`. Resumes accumulate a history.
 ///
-/// Failures are non-fatal  Eif we can't even create the output dir
-/// here (permissions, broken path, …), the training step itself will
+/// Failures are non-fatal  - if we can't even create the output dir
+/// here (permissions, broken path, ...), the training step itself will
 /// likely report the same problem in a clearer context, so we just
 /// log a warning and let the run continue.
 fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
@@ -15669,7 +15855,7 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     let tag_path = output_dir.join("tag.txt");
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // argv joined with single spaces; quoting/escaping is intentionally
-    // not applied  Ethe line is for human eyeballing, not for re-execution.
+    // not applied  - the line is for human eyeballing, not for re-execution.
     // (clap-parsed values are mostly path/identifier strings without
     // spaces; if the user did pass a quoted path, the original quoting
     // is lost by the time we see std::env::args, so reconstructing it is
@@ -15872,6 +16058,12 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
                 *line = "sfnn_freeze_l1=false".to_string();
             }
         }
+        if line.starts_with("sfnn_factorizer=") && !line.contains("king_hand_pair=") {
+            line.push_str(",king_hand_pair=0,king_progress_pair=0,hand_progress_pair=0");
+        }
+        if line.starts_with("sfnn_factorizer_alpha=") && !line.contains("pair=") {
+            line.push_str(",pair=1.000000000");
+        }
     }
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
@@ -15885,7 +16077,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         &mut out,
         "sfnn_factorizer_alpha=",
         "sfnn_factorizer=",
-        "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000",
+        "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,pair=1.000000000",
     );
     ensure_line_after(
         &mut out,
@@ -15921,12 +16113,14 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     let factorizer = effective_sfnn_factorizer_spec(args);
     let can_omit_validation_rate =
         !stored_has_validation_rate && effective_validation_rate(args) == effective_save_rate(args);
-    let can_omit_factorizer = !stored_has_factorizer && !factorizer.king_axis && !factorizer.hand_axis;
-    let alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000";
+    let can_omit_factorizer = !stored_has_factorizer && !factorizer.any_axis();
+    let alpha_default_line =
+        "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,pair=1.000000000";
+    let old_alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000";
     let stored_alpha_is_default = stored
         .lines()
         .find(|line| line.starts_with("sfnn_factorizer_alpha="))
-        .is_none_or(|line| line == alpha_default_line);
+        .is_none_or(|line| line == alpha_default_line || line == old_alpha_default_line);
     let can_omit_factorizer_alpha = effective_sfnn_factorizer_alpha(args).is_default() && stored_alpha_is_default;
     let mut candidate = current.clone();
     let mut stored_candidate = stored.clone();
@@ -16473,7 +16667,7 @@ fn enrich_bullet_log_to_csv(
         // continued-training rows display monotonically.
         let absolute_epoch = epoch + ctx.epoch_offset;
         // `positions` keeps using bullet's local sb because position_offset
-        // already carries the cumulative count from prior runs  Ethe
+        // already carries the cumulative count from prior runs  - the
         // formula then adds (local_sb-1)*sb_size + b*batch_size to the
         // carry-over to give an honest cumulative position count.
         let positions = ctx.positions_at(local_sb, display_b, position_offset);
@@ -16578,7 +16772,7 @@ fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BT
 /// resetting to 1 each bulletou invocation.
 ///
 /// Returns `None` if the file does not exist or no row has a parseable
-/// epoch  Ewhich collapses to "no previous epochs to carry forward" at
+/// epoch  - which collapses to "no previous epochs to carry forward" at
 /// the call site.
 fn read_latest_epoch_in_top_level_log(top_level_log: &std::path::Path) -> Option<usize> {
     let content = std::fs::read_to_string(top_level_log).ok()?;
@@ -16631,7 +16825,7 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
 /// after Ctrl+C.
 ///
 /// Returns `None` if there is no numbered dir, no `learn.log`, or no
-/// parseable sb column  Ewhich collapses to "treat as a fresh run" by
+/// parseable sb column  - which collapses to "treat as a fresh run" by
 /// the caller.
 fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     let content = numbered_checkpoint_dirs_desc(output_dir)
@@ -16708,7 +16902,7 @@ fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) ->
 /// over fixed-length records (HCPE / PSV) the `plies` part is always
 /// 0. For game-structured loaders (HCPE3 / pack), the pair points to
 /// the start of a game header at `byte_offset` and the ply index
-/// within that game where the next position to be expanded sits  Eso
+/// within that game where the next position to be expanded sits  - so
 /// resume seeks to the header, parses it, then fast-skips `plies`
 /// MoveInfo entries before re-entering the normal expansion loop.
 ///
@@ -16872,12 +17066,12 @@ fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Resu
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 12-column CSV from cuda-cpp checkpoint writing / `assemble_numbered_dirs`) onto
 /// the top-level `<output>/summary-learn.log`, writing the CSV header on first
-/// file creation. The result is a single pure CSV  Eno section headers,
-/// no separators  Ethat pandas / Excel can load directly.
+/// file creation. The result is a single pure CSV  - no section headers,
+/// no separators  - that pandas / Excel can load directly.
 ///
 /// To keep the top-level file readable as a sb-level summary (rather
 /// than a per-batch dump), only the **last row** of each (eval, sb)
-/// group from the per-dir log is appended  Eexactly one row per
+/// group from the per-dir log is appended  - exactly one row per
 /// superbatch save per component. The `curr_batch` column is also
 /// dropped (the summary file uses [`SUMMARY_LEARN_LOG_HEADER`]) because
 /// for sb-boundary rows it conveys no info (always the last batch
@@ -17248,7 +17442,7 @@ fn assemble_numbered_dirs(
         // Each component's bullet `log.txt` is the raw
         // `superbatch,curr_batch,loss` CSV. Enrich each into the current
         // `learn.log` format (header + data rows for kk, then kkp, then
-        // kpp). Pure CSV, no separator between components  Ethe
+        // kpp). Pure CSV, no separator between components  - the
         // `eval` column's `<eval-type>/<component>` suffix distinguishes them.
         let mut log_buf = String::new();
         log_buf.push_str(LEARN_LOG_HEADER);
@@ -17280,7 +17474,7 @@ fn assemble_numbered_dirs(
 
 /// Cache of test-set positions used for validation events. Loaded
 /// once at the start of training (when `--test-teacher` is set) and
-/// reused for every subsequent validation forward pass  Ethe random
+/// reused for every subsequent validation forward pass  - the random
 /// sampling happens once at load time, not on each save.
 struct TestPositionsCache {
     positions: Vec<bulletou_lib::shogi::PackedSfenValue>,
@@ -19357,17 +19551,23 @@ mod tests {
         assert_eq!(scalar.shared, 0.75);
         assert_eq!(scalar.king_axis, 0.75);
         assert_eq!(scalar.hand_axis, 0.75);
-        assert_eq!(scalar.config_string(), "shared=0.750000000,king_axis=0.750000000,hand_axis=0.750000000");
+        assert_eq!(scalar.pair, 0.75);
+        assert_eq!(
+            scalar.config_string(),
+            "shared=0.750000000,king_axis=0.750000000,hand_axis=0.750000000,pair=0.750000000"
+        );
 
         let per_axis: SfnnFactorizerAlphaSpec = "shared=0.95,king=1.10,hand=0.60".parse().unwrap();
         assert_eq!(per_axis.shared, 0.95);
         assert_eq!(per_axis.king_axis, 1.10);
         assert_eq!(per_axis.hand_axis, 0.60);
+        assert_eq!(per_axis.pair, 1.0);
 
         let all_then_override: SfnnFactorizerAlphaSpec = "all=0.50,king=0.90".parse().unwrap();
         assert_eq!(all_then_override.shared, 0.50);
         assert_eq!(all_then_override.king_axis, 0.90);
         assert_eq!(all_then_override.hand_axis, 0.50);
+        assert_eq!(all_then_override.pair, 0.50);
     }
 
     #[test]
@@ -19488,6 +19688,79 @@ mod tests {
     }
 
     #[test]
+    fn sfnn_factorizer_pair_shorthand_selects_all_available_pair_axes() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3_hand1024_progress8",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "pair",
+        ])
+        .unwrap();
+
+        let arch = args.arch();
+        assert_eq!(arch.cli_name(), "SFNN_halfka2_1024_7_64_hand1024_k3k3_progress8");
+        let layerstack = arch.layerstack.unwrap();
+        assert_eq!(layerstack.num_stacks(), 9 * 1024 * 8);
+        assert_eq!(layerstack.factorizer_king_axis_dim(), 3);
+        assert_eq!(layerstack.factorizer_hand_axis_dim(), 32);
+        assert_eq!(layerstack.progress_bucket_count(), 8);
+
+        let spec = effective_sfnn_factorizer_spec(&args);
+        assert!(spec.shared);
+        assert!(spec.king_axis);
+        assert!(spec.hand_axis);
+        assert!(spec.king_hand_pair);
+        assert!(spec.king_progress_pair);
+        assert!(spec.hand_progress_pair);
+        assert_eq!(spec.label(), "shared+king-axis+hand-axis+king-hand+king-progress+hand-progress");
+        assert!(effective_sfnn_axis_factorized_l1(&args));
+        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
+    }
+
+    #[test]
+    fn sfnn_factorizer_pair_shorthand_ignores_missing_pair_axes() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "pair",
+        ])
+        .unwrap();
+
+        let layerstack = args.arch().layerstack.unwrap();
+        assert_eq!(layerstack.factorizer_king_axis_dim(), 3);
+        assert_eq!(layerstack.factorizer_hand_axis_dim(), 0);
+        assert_eq!(layerstack.progress_bucket_count(), 1);
+
+        let spec = effective_sfnn_factorizer_spec(&args);
+        assert!(spec.shared);
+        assert!(spec.king_axis);
+        assert!(!spec.hand_axis);
+        assert!(!spec.king_hand_pair);
+        assert!(!spec.king_progress_pair);
+        assert!(!spec.hand_progress_pair);
+        assert_eq!(spec.label(), "shared+king-axis");
+    }
+
+    #[test]
     fn sfnn_factorizer_can_select_axes_with_progress_axis() {
         use clap::Parser as _;
 
@@ -19544,6 +19817,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 3,
             factorizer_hand_axis_dim: 8,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let factorizer = SfnnFactorizerSpec {
             shared: true,
@@ -19551,6 +19827,7 @@ mod tests {
             hand_axis: true,
             explicit_king_axis: true,
             explicit_hand_axis: true,
+            ..SfnnFactorizerSpec::NONE
         };
         let hand_bucket = 45usize;
         let king_bucket = 7usize;
@@ -19558,6 +19835,43 @@ mod tests {
         let stack = (hand_bucket * 9 + king_bucket) * 2 + progress_bucket;
 
         assert_eq!(cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer), vec![2, 4, 11, 19]);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_factorizer_axis_ids_include_pair_axes() {
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 3,
+            num_stacks: 64 * 9 * 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 3,
+            factorizer_hand_axis_dim: 8,
+            factorizer_king_hand_pair: true,
+            factorizer_king_progress_pair: true,
+            factorizer_hand_progress_pair: true,
+        };
+        let factorizer = SfnnFactorizerSpec {
+            shared: true,
+            king_axis: true,
+            hand_axis: true,
+            king_hand_pair: true,
+            king_progress_pair: true,
+            hand_progress_pair: true,
+            ..SfnnFactorizerSpec::NONE
+        };
+        let hand_bucket = 45usize;
+        let king_bucket = 7usize;
+        let progress_bucket = 1usize;
+        let stack = (hand_bucket * 9 + king_bucket) * 2 + progress_bucket;
+
+        assert_eq!(shape.factorizer_axis_count(), 744);
+        assert_eq!(cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer), vec![2, 4, 11, 19, 434, 614, 725]);
     }
 
     #[test]
@@ -20575,6 +20889,9 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                factorizer_king_hand_pair: false,
+                factorizer_king_progress_pair: false,
+                factorizer_hand_progress_pair: false,
             };
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
             assert_eq!(shape.l1_group_input(), group_input, "{arch}");
@@ -20646,6 +20963,9 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                factorizer_king_hand_pair: false,
+                factorizer_king_progress_pair: false,
+                factorizer_hand_progress_pair: false,
             };
             assert!(shape.has_common_shard_l1(), "{arch}");
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
@@ -20677,6 +20997,9 @@ mod tests {
             l1_shard_size: 1,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         assert!(shape.has_common_shard_l1());
         assert_eq!(cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap(), 24);
@@ -20710,6 +21033,7 @@ mod tests {
             hand_axis: false,
             explicit_king_axis: true,
             explicit_hand_axis: false,
+            ..SfnnFactorizerSpec::NONE
         };
         let path = std::env::temp_dir().join(format!(
             "bulletou-test-sfnn-common-shard-export-{}-{}.nn.bin",
@@ -20776,6 +21100,9 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                factorizer_king_hand_pair: false,
+                factorizer_king_progress_pair: false,
+                factorizer_hand_progress_pair: false,
             };
             assert_eq!(shape.input_size, ShogiKa2.num_inputs(), "{arch}");
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
@@ -21030,6 +21357,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let weights = CudaCppSfnnInitialWeights {
             shape,
@@ -21206,6 +21536,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let l1_out = shape.l1_out();
         let mut l1w = vec![
@@ -21249,6 +21582,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let mut l1w = vec![10.0, 20.0, 30.0, 40.0];
         let mut l1b = vec![1.0, 2.0];
@@ -21276,6 +21612,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let l2_in = shape.l2_in();
         let mut l2w = vec![
@@ -21329,6 +21668,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let mut l3w = vec![0.0, 10.0, 20.0, 30.0];
         let mut l3b = vec![0.0, 100.0, 200.0, 300.0];
@@ -21340,6 +21682,7 @@ mod tests {
             hand_axis: false,
             explicit_king_axis: true,
             explicit_hand_axis: false,
+            ..SfnnFactorizerSpec::NONE
         };
 
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
@@ -21372,6 +21715,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 0,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let mut l3w = vec![0.0, 10.0, 20.0, 30.0];
         let mut l3b = vec![0.0, 100.0, 200.0, 300.0];
@@ -21383,8 +21729,9 @@ mod tests {
             hand_axis: false,
             explicit_king_axis: true,
             explicit_hand_axis: false,
+            ..SfnnFactorizerSpec::NONE
         };
-        let alpha = SfnnFactorizerAlphaSpec { shared: 1.0, king_axis: 0.5, hand_axis: 1.0 };
+        let alpha = SfnnFactorizerAlphaSpec { shared: 1.0, king_axis: 0.5, hand_axis: 1.0, pair: 1.0 };
 
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
             shape,
@@ -21420,6 +21767,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 1,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let axis_count = shape.factorizer_axis_count();
         let l1_out = shape.l1_out();
@@ -21554,6 +21904,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 1,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let axis_count = shape.factorizer_axis_count();
         let l1_out = shape.l1_out();
@@ -21657,6 +22010,9 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 1,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
         };
         let l1_out = shape.l1_out();
         let l2_in = shape.l2_in();
@@ -22895,7 +23251,7 @@ mod tests {
         assert!((scheduler.lr(0, 3) - 0.000875).abs() < 1e-12);
     }
 
-    /// CosineLR formula: `lr_min + 0.5*(lr_max-lr_min)*(1+cos(πt))`.
+    /// CosineLR formula: `lr_min + 0.5*(lr_max-lr_min)*(1+cos(pi*t))`.
     /// It should return lr_max at t=0, midpoint at t=0.5, lr_min near t=1,
     /// and warm-restart to lr_max at the cycle boundary.
     #[test]
@@ -23191,7 +23547,7 @@ mod tests {
             lr_override: None,
         };
         // bullet's local sb in raw log is 1; enrich displays the local sb
-        // verbatim (no cross-run shift  Esb is per-epoch by design).
+        // verbatim (no cross-run shift  - sb is per-epoch by design).
         let raw = "1,32,0.07\n1,64,0.06\n";
         let body =
             enrich_bullet_log_to_csv(&raw, &ctx, /*epoch=*/ 1, "nnue", /*prior=*/ 60_000_000, None, false);
@@ -23415,7 +23771,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
 
-        // 0004 を追加して bar.hcpe にしたら、最新 dir の teacher が返る
+        // If 0004 is followed by bar.hcpe, the newest checkpoint keeps that teacher path.
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
         std::fs::write(d4.join("state.bin"), b"state").unwrap();

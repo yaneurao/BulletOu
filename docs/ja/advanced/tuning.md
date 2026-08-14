@@ -192,17 +192,19 @@ factorizerは、bucket間で共通成分を共有する仕組みです。教師�
 学習中の有効な重みは、概念的には次の形になります。
 
 ```text
-W_effective = W_base + W_shared + W_axis
+W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_base` は各bucketが個別に持つ重みです。`W_shared` は全bucketで共有する成分、`W_axis` は king bucket や hand bucket の軸ごとに共有する成分です。
+`W_base` は各bucketが個別に持つ重みです。`W_shared` は全bucketで共有する成分、`W_axis` は king bucket や hand bucket の単独軸で共有する成分です。`W_pair` は `king-hand`、`king-progress`、`hand-progress` のような2軸の組み合わせで共有する成分です。
 
 | 指定 | 意味 |
 | --- | --- |
 | `--sfnn-factorizer shared` | bucket全体で共通成分を持つ。デフォルト |
 | `--sfnn-factorizer none` | factorizerを使わない |
 | `--sfnn-factorizer axis` | archに存在する軸をまとめて有効化する |
+| `--sfnn-factorizer pair` | `axis` に加えて、使える2軸factorizerをまとめて有効化する |
 | `--sfnn-factorizer king=axis,hand=axis` | 軸ごとに明示する |
+| `--sfnn-factorizer king-hand,king-progress,hand-progress` | 2軸factorizerを個別に指定する |
 | `--sfnn-factorizer king=axis,hand=shared` | kingは軸方向、handは共通成分だけにする |
 
 例:
@@ -223,6 +225,7 @@ W_effective = W_base
             + alpha_shared * W_shared
             + alpha_king   * W_king_axis
             + alpha_hand   * W_hand_axis
+            + alpha_pair   * W_pair
 ```
 
 たとえば、king bucket の axis factorizer だけを90%の強さで使う場合:
@@ -245,6 +248,15 @@ king と hand を別々に弱める場合:
 --sfnn-factorizer axis
 --sfnn-factorizer-alpha 0.90
 ```
+
+`hand1024` と `progress8` のように複数のbucket軸を組み合わせる場合は、2軸factorizerも試せます。
+
+```bash
+--arch SFNN_halfka2_1024_7_64_k3k3_hand1024_progress8
+--sfnn-factorizer pair
+```
+
+この指定は、利用できる範囲で `shared`、`king-axis`、`hand-axis`、`king-hand`、`king-progress`、`hand-progress` を有効化します。archに存在しない軸は自動的に無視されます。
 
 `alpha=1.0` が通常の状態です。`alpha=0.0` にすると、そのfactorizer成分はforwardに足されず、その成分への勾配も0になります。これは「保存済みのfactorizer tensorをbase weightへ畳み込む」操作ではありません。factorizerを完全に外した状態で追加学習したい場合は `--sfnn-factorizer none` を使います。
 

@@ -206,17 +206,19 @@ The factorizer lets buckets share common components. It can reduce overfitting a
 Conceptually, training uses an effective weight like this:
 
 ```text
-W_effective = W_base + W_shared + W_axis
+W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_base` is owned by each bucket. `W_shared` is shared by all buckets. `W_axis` is shared along a bucket axis such as king bucket or hand bucket.
+`W_base` is owned by each bucket. `W_shared` is shared by all buckets. `W_axis` is shared along one bucket axis, such as king bucket or hand bucket. `W_pair` is shared by a pair of axes, such as `king-hand`, `king-progress`, or `hand-progress`.
 
 | Setting | Meaning |
 | --- | --- |
 | `--sfnn-factorizer shared` | Share a common component across buckets. Default |
 | `--sfnn-factorizer none` | Disable factorizer |
 | `--sfnn-factorizer axis` | Enable every available bucket direction in the architecture |
+| `--sfnn-factorizer pair` | Enable `axis` plus every available two-axis factorizer |
 | `--sfnn-factorizer king=axis,hand=axis` | Specify directions explicitly |
+| `--sfnn-factorizer king-hand,king-progress,hand-progress` | Specify two-axis factorizers explicitly |
 | `--sfnn-factorizer king=axis,hand=shared` | Use direction-specific sharing for king and only common sharing for hand |
 
 Example:
@@ -237,6 +239,7 @@ W_effective = W_base
             + alpha_shared * W_shared
             + alpha_king   * W_king_axis
             + alpha_hand   * W_hand_axis
+            + alpha_pair   * W_pair
 ```
 
 For example, to use only 90% of the king-axis factorizer:
@@ -259,6 +262,15 @@ To set every factorizer term to the same strength:
 --sfnn-factorizer axis
 --sfnn-factorizer-alpha 0.90
 ```
+
+When an architecture combines several bucket axes, such as `hand1024` and `progress8`, you can also try two-axis factorizers.
+
+```bash
+--arch SFNN_halfka2_1024_7_64_k3k3_hand1024_progress8
+--sfnn-factorizer pair
+```
+
+This enables `shared`, `king-axis`, `hand-axis`, `king-hand`, `king-progress`, and `hand-progress` wherever the architecture has the required axes. Axes that do not exist in the architecture are ignored automatically.
 
 `alpha=1.0` is the normal setting. With `alpha=0.0`, that factorizer term is not added in forward, and its gradient is also zero. This does not fold stored factorizer tensors into the base weights. If you want to continue training without factorizer terms, use `--sfnn-factorizer none`.
 
