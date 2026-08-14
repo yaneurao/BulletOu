@@ -2722,6 +2722,14 @@ fn effective_validation_rate(args: &Args) -> usize {
     args.validation_rate.unwrap_or_else(|| effective_save_rate(args))
 }
 
+fn effective_quantized_validation_rate(args: &Args) -> Option<usize> {
+    args.quantized_validation_rate
+}
+
+fn quantized_validation_rate_label(args: &Args) -> String {
+    effective_quantized_validation_rate(args).map(|n| n.to_string()).unwrap_or_else(|| "save".to_string())
+}
+
 fn effective_save_epoch_end(args: &Args) -> bool {
     args.save_epoch_end && !args.no_save_epoch_end
 }
@@ -3712,6 +3720,13 @@ struct Args {
     #[arg(long)]
     validation_rate: Option<usize>,
 
+    /// Run quantized SFNN validation every N superbatches without forcing a
+    /// checkpoint save. If omitted, quantized validation runs only when a
+    /// checkpoint is saved. Saved SFNN checkpoints always run quantized
+    /// validation when `--test-teacher` is available.
+    #[arg(long)]
+    quantized_validation_rate: Option<usize>,
+
     /// Also save the final superbatch of each epoch even when it is not on a save-rate boundary.
     #[arg(long, default_value_t = true, action = ArgAction::SetTrue)]
     save_epoch_end: bool,
@@ -4243,6 +4258,9 @@ impl Args {
         if self.validation_rate.is_some_and(|validation_rate| validation_rate == 0) {
             return Err("--validation-rate must be > 0".to_string());
         }
+        if self.quantized_validation_rate.is_some_and(|rate| rate == 0) {
+            return Err("--quantized-validation-rate must be > 0".to_string());
+        }
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
@@ -4259,6 +4277,7 @@ impl Args {
                 || self.lr_step_positions.is_some()
                 || self.save_rate.is_some_and(|save_rate| save_rate != 1)
                 || self.validation_rate.is_some_and(|validation_rate| validation_rate != 1)
+                || self.quantized_validation_rate.is_some_and(|rate| rate != 1)
                 || self.no_save_epoch_end)
         {
             return Err(
@@ -6349,9 +6368,7 @@ impl CudaCppSfnnQuantizedValidationCache {
         Ok(Some(Self { cache, batch }))
     }
 
-    fn run(&self, args: &QuantizedTestArgs) -> Result<TestMetrics, String> {
-        let layerstack = args.effective_layerstack();
-        let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
+    fn run_weights(&self, weights: &QuantizedSfnnWeights, args: &QuantizedTestArgs) -> Result<TestMetrics, String> {
         if let Some(params) = &weights.progress_params {
             set_shogi_sfnn_progress_q16_params(params.clone())?;
         }
@@ -6361,31 +6378,257 @@ impl CudaCppSfnnQuantizedValidationCache {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn maybe_run_saved_sfnn_quantized_validation(
+fn quantized_sfnn_weights_from_cuda_cpp_readback(
     args: &Args,
-    checkpoint_dir: &std::path::Path,
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
+) -> Result<QuantizedSfnnWeights, String> {
+    let feature_set = feature_kind.feature_set();
+    let base_input_size = feature_kind.base_input_size();
+    let virtual_rows = feature_kind.virtual_rows();
+    let factorized_input_size = base_input_size + virtual_rows;
+    if shape.input_size != base_input_size && shape.input_size != factorized_input_size {
+        return Err(format!(
+            "cannot quantize SFNN {} weights for input_size={}, expected {} or factorized {}",
+            feature_kind.source_label(),
+            shape.input_size,
+            base_input_size,
+            factorized_input_size
+        ));
+    }
+    let folded_l0w;
+    let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
+        &weights.l0w
+    } else if virtual_rows > 0 {
+        folded_l0w =
+            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+        &folded_l0w
+    } else {
+        return Err(format!(
+            "cannot quantize SFNN {} weights for factorized input_size={} because the feature has no virtual rows",
+            feature_kind.source_label(),
+            shape.input_size
+        ));
+    };
+
+    let factorizer = effective_sfnn_factorizer_spec(args);
+    let factorizer_alpha = effective_sfnn_factorizer_alpha(args);
+    let l1_out = shape.l1_out();
+    let l2_in = shape.l2_in();
+    let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
+    let fc_weight_scale = f32::from(SFNN_QB);
+    let use_axis = factorizer.any_axis();
+    let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
+    let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared && !compact_l1,
+        "l1f",
+        weights.l1fw.as_deref(),
+        weights.l1fb.as_deref(),
+    )?;
+    let (l1axw, l1axb) = cuda_cpp_sfnn_active_factorizer_pair(
+        use_axis && !compact_l1,
+        "l1ax",
+        weights.l1axw.as_deref(),
+        weights.l1axb.as_deref(),
+    )?;
+    let (l2fw, l2fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared,
+        "l2f",
+        weights.l2fw.as_deref(),
+        weights.l2fb.as_deref(),
+    )?;
+    let (l2axw, l2axb) =
+        cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l2ax", weights.l2axw.as_deref(), weights.l2axb.as_deref())?;
+    let (l3fw, l3fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared,
+        "l3f",
+        weights.l3fw.as_deref(),
+        weights.l3fb.as_deref(),
+    )?;
+    let (l3axw, l3axb) =
+        cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l3ax", weights.l3axw.as_deref(), weights.l3axb.as_deref())?;
+
+    let mut l1w_for_export = if compact_l1 {
+        if l1fw.is_some() {
+            return Err("SFNN compact L1 cannot be quantized with factorized shared L1 weights".to_string());
+        }
+        if l1axw.is_some() {
+            return Err("SFNN compact L1 cannot be quantized with axis-factorized L1 weights".to_string());
+        }
+        expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &weights.l1w)?
+    } else {
+        weights.l1w.clone()
+    };
+    let mut l1b_for_export = weights.l1b.clone();
+    if !compact_l1 {
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
+            shape,
+            &mut l1w_for_export,
+            &mut l1b_for_export,
+            l1fw,
+            l1fb,
+            factorizer_alpha.shared,
+        )?;
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
+            shape,
+            &mut l1w_for_export,
+            &mut l1b_for_export,
+            l1axw,
+            l1axb,
+            factorizer,
+            factorizer_alpha,
+        )?;
+    }
+    let mut l2w_for_export = weights.l2w.clone();
+    let mut l2b_for_export = weights.l2b.clone();
+    let mut l3w_for_export = weights.l3w.clone();
+    let mut l3b_for_export = weights.l3b.clone();
+    fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
+        shape,
+        &mut l2w_for_export,
+        &mut l2b_for_export,
+        l2fw,
+        l2fb,
+        factorizer_alpha.shared,
+    )?;
+    fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
+        shape,
+        &mut l2w_for_export,
+        &mut l2b_for_export,
+        l2axw,
+        l2axb,
+        factorizer,
+        factorizer_alpha,
+    )?;
+    fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
+        shape,
+        &mut l3w_for_export,
+        &mut l3b_for_export,
+        l3fw,
+        l3fb,
+        factorizer_alpha.shared,
+    )?;
+    fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
+        shape,
+        &mut l3w_for_export,
+        &mut l3b_for_export,
+        l3axw,
+        l3axb,
+        factorizer,
+        factorizer_alpha,
+    )?;
+
+    let l1_pad_in = nnue_pad32(shape.ft_size);
+    let l2_pad_in = nnue_pad32(l2_in);
+    let l3_pad_in = nnue_pad32(shape.l2_size);
+    let mut l1b = Vec::with_capacity(shape.num_stacks * l1_out);
+    let mut l1w = Vec::with_capacity(shape.num_stacks * l1_out * l1_pad_in);
+    let mut l2b = Vec::with_capacity(shape.num_stacks * shape.l2_size);
+    let mut l2w = Vec::with_capacity(shape.num_stacks * shape.l2_size * l2_pad_in);
+    let mut l3b = Vec::with_capacity(shape.num_stacks);
+    let mut l3w = Vec::with_capacity(shape.num_stacks * l3_pad_in);
+    for stack in 0..shape.num_stacks {
+        for out_col in 0..l1_out {
+            l1b.push(sfnn_quantise_i32(l1b_for_export[stack * l1_out + out_col], fc_bias_scale));
+        }
+        for out_col in 0..l1_out {
+            for in_col in 0..l1_pad_in {
+                let q = if in_col < shape.ft_size {
+                    let value = l1w_for_export[stack * l1_out * shape.ft_size + out_col * shape.ft_size + in_col];
+                    sfnn_quantise_i8(value, fc_weight_scale)
+                } else {
+                    0
+                };
+                l1w.push(q);
+            }
+        }
+        for out_col in 0..shape.l2_size {
+            l2b.push(sfnn_quantise_i32(l2b_for_export[stack * shape.l2_size + out_col], fc_bias_scale));
+        }
+        for out_col in 0..shape.l2_size {
+            for in_col in 0..l2_pad_in {
+                let q = if in_col < l2_in {
+                    let value = l2w_for_export[stack * shape.l2_size * l2_in + out_col * l2_in + in_col];
+                    sfnn_quantise_i8(value, fc_weight_scale)
+                } else {
+                    0
+                };
+                l2w.push(q);
+            }
+        }
+        l3b.push(sfnn_quantise_i32(l3b_for_export[stack], fc_bias_scale));
+        for in_col in 0..l3_pad_in {
+            let q = if in_col < shape.l2_size {
+                sfnn_quantise_i8(l3w_for_export[stack * shape.l2_size + in_col], fc_weight_scale)
+            } else {
+                0
+            };
+            l3w.push(q);
+        }
+    }
+
+    Ok(QuantizedSfnnWeights {
+        arch_desc: format!(
+            "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}}}",
+            feature_set.display_name(),
+            base_input_size,
+            shape.ft_size,
+            shape.ft_size,
+            shape.num_stacks
+        ),
+        feature_kind,
+        layerstack: args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
+        input_size: base_input_size,
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l1_skip: shape.has_l1_skip(),
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+        l1_pad_in,
+        l2_pad_in,
+        l3_pad_in,
+        l0b: weights.l0b.iter().map(|&value| sfnn_quantise_i16(value, f32::from(SFNN_QA))).collect(),
+        l0w: l0w_for_export.iter().map(|&value| sfnn_quantise_i16(value, f32::from(SFNN_QA))).collect(),
+        progress_params: progress_params.cloned(),
+        l1b,
+        l1w,
+        l2b,
+        l2w,
+        l3b,
+        l3w,
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn maybe_run_live_sfnn_quantized_validation(
+    args: &Args,
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
     epoch: usize,
     superbatch: usize,
+    checkpoint_dir: Option<&std::path::Path>,
     cache: &mut Option<CudaCppSfnnQuantizedValidationCache>,
 ) -> Result<Option<(TestMetrics, std::time::Duration)>, String> {
-    let nn_bin = checkpoint_dir.join("nn.bin");
-    if !nn_bin.is_file() {
-        return Ok(None);
-    }
-    let Some(test_args) = quantized_test_args_from_training_args(args, nn_bin)? else {
+    let Some(test_args) = quantized_test_args_from_training_args(args, PathBuf::from("<live-quantized-sfnn>"))? else {
         return Ok(None);
     };
     let started = std::time::Instant::now();
     if cache.is_none() {
-        *cache =
-            CudaCppSfnnQuantizedValidationCache::try_new(args, cuda_cpp_sfnn_feature_kind_from_arch(args.arch())?)?;
+        *cache = CudaCppSfnnQuantizedValidationCache::try_new(args, feature_kind)?;
     }
     let Some(cache) = cache.as_ref() else {
         return Ok(None);
     };
-    let metrics = cache.run(&test_args)?;
+    let weights = quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
+    let metrics = cache.run_weights(&weights, &test_args)?;
     let elapsed = started.elapsed();
-    update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
+    if let Some(checkpoint_dir) = checkpoint_dir {
+        update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
+    }
     update_summary_log_quantized_metrics(&args.output_dir(), epoch, superbatch, metrics)?;
     Ok(Some((metrics, elapsed)))
 }
@@ -9763,12 +10006,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "schedule",
             format!(
-                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, quantized_validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
                 paint("production", ConsoleColor::BoldGreen),
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
                 effective_save_rate(args),
                 effective_validation_rate(args),
+                quantized_validation_rate_label(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
                 args.lr_schedule.cli_name()
@@ -10306,11 +10550,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             checkpoint_elapsed,
                         )),
                     );
-                    if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
+                    if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
                         args,
-                        &checkpoint_dir,
+                        feature_kind,
+                        cuda_shape,
+                        &trained_weights,
+                        sfnn_progress_params.as_ref(),
                         chunk.epoch,
                         chunk.superbatch,
+                        Some(&checkpoint_dir),
                         &mut sfnn_quantized_validation_cache,
                     )? {
                         excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
@@ -10702,11 +10950,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             Some(validation_elapsed),
                         );
                     }
-                    if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
+                    if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
                         args,
-                        &checkpoint_dir,
+                        feature_kind,
+                        cuda_shape,
+                        &trained_weights,
+                        sfnn_progress_params.as_ref(),
                         chunk.epoch,
                         chunk.superbatch,
+                        Some(&checkpoint_dir),
                         &mut sfnn_quantized_validation_cache,
                     )? {
                         excluded_elapsed = excluded_elapsed.saturating_add(elapsed);
@@ -10719,22 +10971,34 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
-                } else if chunk.run_validation {
+                } else if chunk.run_validation || chunk.run_quantized_validation {
                     ctx.synchronize().map_err(|e| e.to_string())?;
                     let validation_event_started = std::time::Instant::now();
-                    let readback_elapsed = std::time::Duration::ZERO;
-                    let validation_started = std::time::Instant::now();
-                    let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
-                        args,
-                        feature_kind,
-                        &ctx,
-                        cuda_shape,
-                        &runner,
-                        &mut sfnn_resident_validation_cache,
-                    )?;
-                    let validation_elapsed = validation_started.elapsed();
-                    let validation_event_elapsed = validation_event_started.elapsed();
-                    excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
+                    let mut readback_elapsed = std::time::Duration::ZERO;
+                    let mut validation_elapsed = std::time::Duration::ZERO;
+                    let test_metrics = if chunk.run_validation {
+                        let validation_started = std::time::Instant::now();
+                        let metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                            args,
+                            feature_kind,
+                            &ctx,
+                            cuda_shape,
+                            &runner,
+                            &mut sfnn_resident_validation_cache,
+                        )?;
+                        validation_elapsed = validation_started.elapsed();
+                        metrics
+                    } else {
+                        None
+                    };
+                    let quantized_weights = if chunk.run_quantized_validation {
+                        let readback_started = std::time::Instant::now();
+                        let weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                        readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
+                        Some(weights)
+                    } else {
+                        None
+                    };
                     append_cuda_cpp_direct_summary_log_row(
                         &args.output_dir(),
                         args,
@@ -10750,6 +11014,25 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos,
                         },
                     )?;
+                    let quantized_metrics = if let Some(weights) = quantized_weights.as_ref() {
+                        maybe_run_live_sfnn_quantized_validation(
+                            args,
+                            feature_kind,
+                            cuda_shape,
+                            weights,
+                            sfnn_progress_params.as_ref(),
+                            chunk.epoch,
+                            chunk.superbatch,
+                            None,
+                            &mut sfnn_quantized_validation_cache,
+                        )?
+                    } else {
+                        None
+                    };
+                    let quantized_metrics_elapsed =
+                        quantized_metrics.map(|(_, elapsed)| elapsed).unwrap_or(std::time::Duration::ZERO);
+                    let validation_event_elapsed = validation_event_started.elapsed();
+                    excluded_elapsed = excluded_elapsed.saturating_add(validation_event_elapsed);
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
                     let (train_elapsed_sec, _positions_per_sec) =
@@ -10777,9 +11060,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         "cuda-cpp SFNN",
                         CudaCppCheckpointTiming::new(
                             readback_elapsed,
-                            Some(validation_elapsed),
+                            chunk.run_validation.then_some(validation_elapsed),
                             None,
-                            validation_event_elapsed,
+                            validation_elapsed
+                                .saturating_add(readback_elapsed)
+                                .saturating_add(quantized_metrics_elapsed),
                         ),
                     );
                     if let Some(metrics) = test_metrics {
@@ -10789,6 +11074,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             metrics.accuracy,
                             metrics.loss,
                             Some(validation_elapsed),
+                        );
+                    }
+                    if let Some((metrics, elapsed)) = quantized_metrics {
+                        print_cuda_cpp_quantized_validation_summary(
+                            chunk.epoch,
+                            chunk.superbatch,
+                            metrics.accuracy,
+                            metrics.loss,
+                            elapsed,
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
@@ -10982,11 +11276,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 Some(validation_elapsed),
             );
         }
-        if let Some((metrics, elapsed)) = maybe_run_saved_sfnn_quantized_validation(
+        if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
             args,
-            &checkpoint_dir,
+            feature_kind,
+            cuda_shape,
+            &trained_weights,
+            sfnn_progress_params.as_ref(),
             chunk.epoch,
             chunk.superbatch,
+            Some(&checkpoint_dir),
             &mut sfnn_quantized_validation_cache,
         )? {
             print_cuda_cpp_quantized_validation_summary(
@@ -15400,6 +15698,7 @@ struct CudaCppScheduleChunk {
     cumulative_steps: usize,
     save_checkpoint: bool,
     run_validation: bool,
+    run_quantized_validation: bool,
     lr_start: f32,
     lr_end: f32,
 }
@@ -15498,6 +15797,15 @@ fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_schedule_validation(args: &Args) -> bool {
     args.test_teacher.is_some() && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_should_schedule_quantized_validation(args: &Args) -> bool {
+    args.test_teacher.is_some()
+        && matches!(
+            args.eval_type(),
+            EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
+        )
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -15745,6 +16053,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 save_checkpoint: true,
                 run_validation: args.test_teacher.is_some()
                     && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt),
+                run_quantized_validation: cuda_cpp_should_schedule_quantized_validation(args),
                 lr_start: lr,
                 lr_end: lr,
             }],
@@ -15840,6 +16149,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let save_rate = effective_save_rate(args).max(1);
     let validation_enabled = cuda_cpp_should_schedule_validation(args);
     let validation_rate = if validation_enabled { effective_validation_rate(args).max(1) } else { save_rate };
+    let quantized_validation_enabled = cuda_cpp_should_schedule_quantized_validation(args);
+    let quantized_validation_rate = effective_quantized_validation_rate(args).unwrap_or(save_rate).max(1);
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
@@ -15850,10 +16161,19 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             } else {
                 usize::MAX
             };
-            let last_superbatch = save_boundary.min(validation_boundary).min(superbatches);
+            let quantized_validation_boundary =
+                if quantized_validation_enabled && args.quantized_validation_rate.is_some() {
+                    next_superbatch_rate_boundary(first_superbatch, quantized_validation_rate)
+                } else {
+                    usize::MAX
+                };
+            let last_superbatch =
+                save_boundary.min(validation_boundary).min(quantized_validation_boundary).min(superbatches);
             let save_checkpoint = (save_boundary <= superbatches && last_superbatch == save_boundary)
                 || (last_superbatch == superbatches && save_boundary > superbatches && save_epoch_end);
             let run_validation = validation_enabled && (last_superbatch == validation_boundary || save_checkpoint);
+            let run_quantized_validation =
+                quantized_validation_enabled && (save_checkpoint || last_superbatch == quantized_validation_boundary);
             let superbatch_count = last_superbatch - first_superbatch + 1;
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
@@ -15888,6 +16208,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 cumulative_steps,
                 save_checkpoint,
                 run_validation,
+                run_quantized_validation,
                 lr_start,
                 lr_end,
             });
@@ -16091,6 +16412,7 @@ fn resume_signature(args: &Args) -> String {
         ),
         format!("save_rate={}", effective_save_rate(args)),
         format!("validation_rate={}", effective_validation_rate(args)),
+        format!("quantized_validation_rate={}", quantized_validation_rate_label(args)),
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -16186,6 +16508,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     }
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
+    ensure_line_after(&mut out, "quantized_validation_rate=", "validation_rate=", "quantized_validation_rate=save");
     ensure_line_after(&mut out, "loss_pow_exp=", "win_rate_model=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");
     ensure_line_after(&mut out, "wrm_in_offset=", "wrm_nnue2score=", "wrm_in_offset=270.000000000");
@@ -16219,7 +16542,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
 
 fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
-    resume_signature_without_line(&signature, "test_batch_size=")
+    let signature = resume_signature_without_line(&signature, "test_batch_size=");
+    resume_signature_without_line(&signature, "quantized_validation_rate=")
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
@@ -16536,9 +16860,10 @@ const SUMMARY_LEARN_LOG_HEADER_V3: &str = "eval,epoch,superbatch,test_value_accu
 /// `--test-teacher` so the accuracy/loss columns remain attributable
 /// without making the log line as wide as a full path.
 ///
-/// `quantized_value_accuracy` / `quantized_value_loss` are filled only for
-/// SFNN epoch-end checkpoints where an exported `nn.bin` exists. Other rows
-/// use `-`. Accuracy is stored as a 0..1 ratio, matching
+/// `quantized_value_accuracy` / `quantized_value_loss` are filled for SFNN
+/// rows where quantized validation ran. Saved SFNN checkpoints always run it
+/// when possible; `--quantized-validation-rate` can also request non-save
+/// rows. Other rows use `-`. Accuracy is stored as a 0..1 ratio, matching
 /// `test_value_accuracy`; the loss is the engine-scale quantized validation
 /// loss reported by `bulletou quantized-test`.
 ///
@@ -19018,6 +19343,35 @@ mod tests {
     }
 
     #[test]
+    fn cuda_cpp_backend_rejects_zero_quantized_validation_rate() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--quantized-validation-rate",
+            "0",
+        ])
+        .unwrap();
+
+        let err = args.validate_backend_flags().unwrap_err();
+        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
+            "--quantized-validation-rate must be > 0"
+        } else {
+            "cuda-cpp-backend"
+        }));
+    }
+
+    #[test]
     fn cuda_cpp_backend_rejects_mixed_direct_and_production_schedule() {
         use clap::Parser as _;
 
@@ -19229,7 +19583,95 @@ mod tests {
             vec![false, false, false, true, true]
         );
         assert!(schedule.chunks.iter().all(|chunk| chunk.run_validation));
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_quantized_validation));
         assert!(schedule.chunks.iter().all(|chunk| chunk.steps == 2));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_quantized_validation_rate_splits_without_extra_saves() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "5",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "4",
+            "--validation-rate",
+            "4",
+            "--quantized-validation-rate",
+            "2",
+            "--test-teacher",
+            "validation.psv",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "2048",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+
+        assert_eq!(schedule.batches_per_superbatch, 2);
+        assert_eq!(schedule.total_steps, 10);
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.superbatch).collect::<Vec<_>>(), vec![2, 4, 5]);
+        assert_eq!(
+            schedule.chunks.iter().map(|chunk| chunk.save_checkpoint).collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            schedule.chunks.iter().map(|chunk| chunk.run_validation).collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
+        assert!(schedule.chunks.iter().all(|chunk| chunk.run_quantized_validation));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_run_schedule_save_always_runs_quantized_validation() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--save-rate",
+            "2",
+            "--validation-rate",
+            "3",
+            "--test-teacher",
+            "validation.psv",
+            "--batch-size",
+            "1024",
+            "--positions-per-superbatch",
+            "2048",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.superbatch).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(schedule.chunks.iter().all(|chunk| chunk.save_checkpoint));
+        assert!(schedule.chunks.iter().all(|chunk| chunk.run_quantized_validation));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -22763,7 +23205,46 @@ mod tests {
         assert!(sig.contains("optimizer_beta1=0.850000024"));
         assert!(sig.contains("optimizer_beta2=0.995000005"));
         assert!(sig.contains("validation_rate=20"));
+        assert!(sig.contains("quantized_validation_rate=save"));
         assert!(sig.contains("fv_scale=40.000000"));
+    }
+
+    #[test]
+    fn resume_signature_ignores_quantized_validation_rate_for_matching() {
+        use clap::Parser as _;
+
+        let base = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "16",
+        ])
+        .unwrap();
+        let changed = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "16",
+            "--quantized-validation-rate",
+            "1",
+        ])
+        .unwrap();
+
+        assert!(resume_signature_matches(&resume_signature(&base), &changed));
+        assert!(resume_signature_matches(
+            &resume_signature_without_line(&resume_signature(&base), "quantized_validation_rate="),
+            &changed
+        ));
     }
 
     #[test]
