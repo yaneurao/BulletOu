@@ -1308,6 +1308,22 @@ struct FitTeacherScaleArgs {
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
     wrm_nnue2score: f32,
 
+    /// Prediction-side WRM offset used when the reference nn.bin was trained.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_OFFSET)]
+    wrm_in_offset: f32,
+
+    /// Prediction-side WRM scaling used when the reference nn.bin was trained.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_SCALING)]
+    wrm_in_scaling: f32,
+
+    /// Teacher-side WRM offset used when the reference nn.bin was trained.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_OFFSET)]
+    wrm_target_offset: f32,
+
+    /// Teacher-side WRM scaling used when the reference nn.bin was trained.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
+    wrm_target_scaling: f32,
+
     /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
     #[arg(long, default_value = "7")]
     sfnn_ft_shift: u32,
@@ -6246,12 +6262,55 @@ fn quantized_raw_to_training_score(raw: i32, wrm_nnue2score: f32) -> f64 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn wrm_probability_f64(score: f64, offset: f64, scaling: f64) -> f64 {
+    let sigmoid = |x: f64| 1.0 / (1.0 + (-x).exp());
+    let q = (score - offset) / scaling;
+    let qm = (-score - offset) / scaling;
+    0.5 * (1.0 + sigmoid(q) - sigmoid(qm))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn wrm_inverse_probability_f64(probability: f64, offset: f64, scaling: f64) -> f64 {
+    let p = probability.clamp(1.0e-12, 1.0 - 1.0e-12);
+    let mut lo = -1_000_000.0_f64;
+    let mut hi = 1_000_000.0_f64;
+    for _ in 0..96 {
+        let mid = (lo + hi) * 0.5;
+        if wrm_probability_f64(mid, offset, scaling) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo + hi) * 0.5
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_raw_to_teacher_equivalent_score(raw: i32, args: &FitTeacherScaleArgs) -> f64 {
+    let prediction_score = quantized_raw_to_training_score(raw, args.wrm_nnue2score);
+    let p = wrm_probability_f64(prediction_score, f64::from(args.wrm_in_offset), f64::from(args.wrm_in_scaling));
+    wrm_inverse_probability_f64(p, f64::from(args.wrm_target_offset), f64::from(args.wrm_target_scaling))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleReport, String> {
     if args.sample_positions == 0 {
         return Err("--sample-positions must be positive".to_string());
     }
     if !(args.wrm_nnue2score.is_finite() && args.wrm_nnue2score > 0.0) {
         return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", args.wrm_nnue2score));
+    }
+    if !args.wrm_in_offset.is_finite() {
+        return Err(format!("--wrm-in-offset must be finite (got {})", args.wrm_in_offset));
+    }
+    if !(args.wrm_in_scaling.is_finite() && args.wrm_in_scaling > 0.0) {
+        return Err(format!("--wrm-in-scaling must be finite and > 0 (got {})", args.wrm_in_scaling));
+    }
+    if !args.wrm_target_offset.is_finite() {
+        return Err(format!("--wrm-target-offset must be finite (got {})", args.wrm_target_offset));
+    }
+    if !(args.wrm_target_scaling.is_finite() && args.wrm_target_scaling > 0.0) {
+        return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", args.wrm_target_scaling));
     }
 
     let started = std::time::Instant::now();
@@ -6304,7 +6363,7 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
             continue;
         }
         let x = f64::from(teacher_score);
-        let y = quantized_raw_to_training_score(out.raw, args.wrm_nnue2score);
+        let y = quantized_raw_to_teacher_equivalent_score(out.raw, args);
         fitted += 1;
         sum_x += x;
         sum_y += y;
@@ -6350,7 +6409,7 @@ fn run_fit_teacher_scale(args: &FitTeacherScaleArgs) -> Result<FitTeacherScaleRe
             continue;
         }
         let x = f64::from(teacher_score);
-        let y = quantized_raw_to_training_score(out.raw, args.wrm_nnue2score);
+        let y = quantized_raw_to_teacher_equivalent_score(out.raw, args);
         let after = y - multiplier * x;
         sum_after_sq += after * after;
     }
@@ -7050,6 +7109,14 @@ fn main() {
                     );
                     println!("  wrm_nnue2score    = {:.3}", args.wrm_nnue2score);
                     println!("  raw_output_scale  = {:.0}", DEFAULT_NNUE_RAW_OUTPUT_SCALE);
+                    println!(
+                        "  wrm_in            = offset {:.3}, scaling {:.3}",
+                        args.wrm_in_offset, args.wrm_in_scaling
+                    );
+                    println!(
+                        "  wrm_target        = offset {:.3}, scaling {:.3}",
+                        args.wrm_target_offset, args.wrm_target_scaling
+                    );
                     println!("  loaded            = {}", format_count(report.loaded));
                     println!(
                         "  fitted            = {} (score_cap_filtered={}, zero_score_filtered={})",

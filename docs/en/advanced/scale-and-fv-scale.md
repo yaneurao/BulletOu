@@ -166,13 +166,18 @@ The multiplier is fitted with least squares through the origin:
 a = Σ(teacher_score * reference_score) / Σ(teacher_score^2)
 ```
 
-Here `reference_score` is the quantized raw output of the reference `nn.bin`, converted back to the training score scale:
+Here `reference_score` is the quantized raw output of the reference `nn.bin`, converted back to the teacher-score side by using the WRM settings from the reference training run:
 
 ```text
-reference_score = raw / 8128 * wrm_nnue2score
+network_output  = raw / 8128
+prediction_score = network_output * wrm_nnue2score
+prediction_prob  = WRM(prediction_score; wrm_in_offset, wrm_in_scaling)
+reference_score  = inverse_WRM(prediction_prob; wrm_target_offset, wrm_target_scaling)
 ```
 
-The default `wrm_nnue2score` is `600`. If the reference network was trained with a different `--wrm-nnue2score`, pass the same value to `fit-teacher-scale`.
+`8128` is the SFNN `nn.bin` quantization scale: `QA=127`, `QB=64`, so `QA * QB = 8128`.
+
+The default `wrm_nnue2score` is `600`. If the reference network was trained with different `--wrm-nnue2score` or WRM offset/scaling values, pass the same values to `fit-teacher-scale`.
 
 Example:
 
@@ -181,7 +186,9 @@ Example:
   --arch SFNN_halfka2_1024_7_64_k3k3 `
   --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --nn-bin C:\path\to\sojo-trained\nn.bin `
-  --sample-positions 100000
+  --sample-positions 100000 `
+  --wrm-in-offset 0 `
+  --wrm-target-offset 0
 ```
 
 To inspect individual sampled rows, add an option such as `--dump-samples 10`.
@@ -189,11 +196,11 @@ To inspect individual sampled rows, add an option such as `--dump-samples 10`.
 Example output:
 
 ```text
-scale_multiplier = 0.277969165
-formula          = rescaled_score = round(teacher_score * 0.277969165)
+scale_multiplier = 0.310656673
+formula          = rescaled_score = round(teacher_score * 0.310656673)
 ```
 
-This means: multiply the PSV scores by `0.277969165` to bring them closer to the training score scale of the reference `nn.bin`.
+This means: multiply the PSV scores by `0.310656673` to bring them closer to the teacher-side score scale of the reference training run.
 
 Use `rescale-psv` to write a converted PSV file:
 
@@ -201,7 +208,7 @@ Use `rescale-psv` to write a converted PSV file:
 .\target\release\examples\bulletou.exe rescale-psv `
   --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --output D:\teacher\tayayan-rescaled.psv `
-  --scale-multiplier 0.277969165
+  --scale-multiplier 0.310656673
 ```
 
 `rescale-psv` changes only the PSV score field. The position, side to move, move, and game-result fields are preserved.

@@ -166,13 +166,18 @@ reference_score ≒ a * teacher_score
 a = Σ(teacher_score * reference_score) / Σ(teacher_score^2)
 ```
 
-ここで `reference_score` は、指定した `nn.bin` の量子化後 raw 出力を学習時の score scale に戻したものです。
+ここで `reference_score` は、指定した `nn.bin` の量子化後 raw 出力を、学習時の WRM 設定に従って教師 score 相当に戻したものです。
 
 ```text
-reference_score = raw / 8128 * wrm_nnue2score
+network_output  = raw / 8128
+prediction_score = network_output * wrm_nnue2score
+prediction_prob  = WRM(prediction_score; wrm_in_offset, wrm_in_scaling)
+reference_score  = inverse_WRM(prediction_prob; wrm_target_offset, wrm_target_scaling)
 ```
 
-デフォルトの `wrm_nnue2score` は `600` です。学習時に `--wrm-nnue2score` を変えていた場合だけ、`fit-teacher-scale` 側にも同じ値を指定してください。
+`8128` は SFNN `nn.bin` の量子化 scale です。`QA=127`, `QB=64` なので `QA * QB = 8128` になります。
+
+デフォルトの `wrm_nnue2score` は `600` です。参照する `nn.bin` を学習したときに `--wrm-nnue2score` や WRM の offset / scaling を変えていた場合は、`fit-teacher-scale` 側にも同じ値を指定してください。
 
 例:
 
@@ -181,7 +186,9 @@ reference_score = raw / 8128 * wrm_nnue2score
   --arch SFNN_halfka2_1024_7_64_k3k3 `
   --teacher C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --nn-bin C:\path\to\sojo-trained\nn.bin `
-  --sample-positions 100000
+  --sample-positions 100000 `
+  --wrm-in-offset 0 `
+  --wrm-target-offset 0
 ```
 
 個別のサンプルを確認したい場合は、`--dump-samples 10` のように指定します。
@@ -189,11 +196,11 @@ reference_score = raw / 8128 * wrm_nnue2score
 出力例:
 
 ```text
-scale_multiplier = 0.277969165
-formula          = rescaled_score = round(teacher_score * 0.277969165)
+scale_multiplier = 0.310656673
+formula          = rescaled_score = round(teacher_score * 0.310656673)
 ```
 
-この結果は、「この PSV の score を `0.277969165` 倍すると、指定した `nn.bin` を学習したときの score scale に近づく」という意味です。
+この結果は、「この PSV の score を `0.310656673` 倍すると、指定した `nn.bin` を学習したときの教師 score scale に近づく」という意味です。
 
 実際に PSV を変換するには `rescale-psv` を使います。
 
@@ -201,7 +208,7 @@ formula          = rescaled_score = round(teacher_score * 0.277969165)
 .\target\release\examples\bulletou.exe rescale-psv `
   --input C:\shogi\teacher\tayayan\good-testpsv20260717.psv `
   --output D:\teacher\tayayan-rescaled.psv `
-  --scale-multiplier 0.277969165
+  --scale-multiplier 0.310656673
 ```
 
 `rescale-psv` は PSV の score 欄だけを書き換えます。局面、手番、手、勝敗項などはそのままです。
