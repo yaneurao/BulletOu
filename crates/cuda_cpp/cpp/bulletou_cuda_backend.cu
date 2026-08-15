@@ -781,6 +781,7 @@ __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
     size_t hand_axis_dim,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
@@ -821,31 +822,61 @@ __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
     if (use_hand_progress_pair != 0 && hand_axis_dim != 0 && progress_bucket_count > 1) {
         out_ids[count++] = offset + progress_bucket * hand_bucket_count + hand_bucket;
     }
+    offset += (use_hand_progress_pair != 0 && hand_axis_dim != 0 && progress_bucket_count > 1)
+        ? hand_bucket_count * progress_bucket_count
+        : 0;
+    if (use_progress_axis != 0 && progress_bucket_count > 1) {
+        out_ids[count++] = offset + progress_bucket;
+    }
     return count;
 }
 
 __device__ __forceinline__ float sfnn_factorizer_axis_alpha(
     size_t axis,
+    size_t num_stacks,
     size_t king_axis_dim,
     size_t hand_axis_dim,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha) {
+    const size_t king_bucket_count = king_axis_dim == 0 ? 1 : king_axis_dim * king_axis_dim;
+    const size_t hand_bucket_count = hand_axis_dim == 0 ? 1 : hand_axis_dim * hand_axis_dim;
+    const size_t factorizer_stack_count = king_bucket_count * hand_bucket_count;
+    const size_t progress_bucket_count =
+        (factorizer_stack_count != 0 && num_stacks % factorizer_stack_count == 0) ? num_stacks / factorizer_stack_count : 1;
     const size_t king_axis_count = 2 * king_axis_dim;
     const size_t base_axis_count = king_axis_count + 2 * hand_axis_dim;
+    size_t pair_axis_count = 0;
+    if (use_king_hand_pair != 0 && king_axis_dim != 0 && hand_axis_dim != 0) {
+        pair_axis_count += king_bucket_count * hand_bucket_count;
+    }
+    if (use_king_progress_pair != 0 && king_axis_dim != 0 && progress_bucket_count > 1) {
+        pair_axis_count += king_bucket_count * progress_bucket_count;
+    }
+    if (use_hand_progress_pair != 0 && hand_axis_dim != 0 && progress_bucket_count > 1) {
+        pair_axis_count += hand_bucket_count * progress_bucket_count;
+    }
     if (axis < king_axis_count) {
         return king_axis_alpha;
     }
     if (axis < base_axis_count) {
         return hand_axis_alpha;
     }
-    return pair_alpha;
+    if (axis < base_axis_count + pair_axis_count) {
+        return pair_alpha;
+    }
+    return progress_axis_alpha;
 }
 
 __host__ __device__ __forceinline__ size_t sfnn_factorizer_axis_count(
     size_t num_stacks,
     size_t king_axis_dim,
     size_t hand_axis_dim,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair) {
@@ -863,6 +894,9 @@ __host__ __device__ __forceinline__ size_t sfnn_factorizer_axis_count(
     }
     if (use_hand_progress_pair != 0 && hand_axis_dim != 0 && progress_bucket_count > 1) {
         count += hand_bucket_count * progress_bucket_count;
+    }
+    if (use_progress_axis != 0 && progress_bucket_count > 1) {
+        count += progress_bucket_count;
     }
     return count;
 }
@@ -887,12 +921,14 @@ __global__ void sfnn_stacked_l1_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
@@ -923,6 +959,7 @@ __global__ void sfnn_stacked_l1_kernel(
         factorizer_hand_axis_dim,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -930,7 +967,18 @@ __global__ void sfnn_stacked_l1_kernel(
     if (has_axis != 0) {
         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
             const float axis_alpha =
-                sfnn_factorizer_axis_alpha(axis_ids[axis_idx], factorizer_king_axis_dim, factorizer_hand_axis_dim, king_axis_alpha, hand_axis_alpha, pair_alpha);
+                sfnn_factorizer_axis_alpha(
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
+                    factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
+                    king_axis_alpha,
+                    hand_axis_alpha,
+                    progress_axis_alpha,
+                    pair_alpha);
             sum += axis_alpha * axis_bias[axis_ids[axis_idx] * output_dim + out_col];
         }
     }
@@ -944,10 +992,15 @@ __global__ void sfnn_stacked_l1_kernel(
             for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                 const float axis_alpha = sfnn_factorizer_axis_alpha(
                     axis_ids[axis_idx],
+                    num_stacks,
                     factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                 sum += input_value * axis_alpha *
                     axis_weights[axis_ids[axis_idx] * input_dim * output_dim + in_col * output_dim + out_col];
@@ -977,12 +1030,14 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha) {
     constexpr unsigned int WARP = 32;
     constexpr unsigned int WARPS_PER_BLOCK = 8;
@@ -1015,6 +1070,7 @@ __global__ void sfnn_stacked_l1_warp_kernel(
         factorizer_hand_axis_dim,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1031,10 +1087,15 @@ __global__ void sfnn_stacked_l1_warp_kernel(
             for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                 const float axis_alpha = sfnn_factorizer_axis_alpha(
                     axis_ids[axis_idx],
+                    num_stacks,
                     factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                 weight += axis_alpha *
                     axis_weights[axis_ids[axis_idx] * input_dim * output_dim + in_col * output_dim + out_col];
@@ -1055,7 +1116,18 @@ __global__ void sfnn_stacked_l1_warp_kernel(
         if (has_axis != 0) {
             for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                 const float axis_alpha =
-                    sfnn_factorizer_axis_alpha(axis_ids[axis_idx], factorizer_king_axis_dim, factorizer_hand_axis_dim, king_axis_alpha, hand_axis_alpha, pair_alpha);
+                    sfnn_factorizer_axis_alpha(
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
+                    factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
+                    king_axis_alpha,
+                    hand_axis_alpha,
+                    progress_axis_alpha,
+                    pair_alpha);
                 sum += axis_alpha * axis_bias[axis_ids[axis_idx] * output_dim + out_col];
             }
         }
@@ -1199,12 +1271,14 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
@@ -1235,6 +1309,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
         factorizer_hand_axis_dim,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1242,7 +1317,18 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     if (has_axis != 0) {
         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
             const float axis_alpha =
-                sfnn_factorizer_axis_alpha(axis_ids[axis_idx], factorizer_king_axis_dim, factorizer_hand_axis_dim, king_axis_alpha, hand_axis_alpha, pair_alpha);
+                sfnn_factorizer_axis_alpha(
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
+                    factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
+                    king_axis_alpha,
+                    hand_axis_alpha,
+                    progress_axis_alpha,
+                    pair_alpha);
             sum += axis_alpha * axis_bias[axis_ids[axis_idx] * output_dim + out_col];
         }
     }
@@ -1255,10 +1341,15 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
             for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                 const float axis_alpha = sfnn_factorizer_axis_alpha(
                     axis_ids[axis_idx],
+                    num_stacks,
                     factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                 weight += axis_alpha *
                     axis_weights[axis_ids[axis_idx] * output_dim * input_dim + out_col * input_dim + in_col];
@@ -1291,12 +1382,14 @@ __global__ void sfnn_stacked_l3_output_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha) {
     size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= batch) {
@@ -1323,6 +1416,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
         factorizer_hand_axis_dim,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1330,7 +1424,18 @@ __global__ void sfnn_stacked_l3_output_kernel(
     if (has_axis != 0) {
         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
             const float axis_alpha =
-                sfnn_factorizer_axis_alpha(axis_ids[axis_idx], factorizer_king_axis_dim, factorizer_hand_axis_dim, king_axis_alpha, hand_axis_alpha, pair_alpha);
+                sfnn_factorizer_axis_alpha(
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
+                    factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
+                    king_axis_alpha,
+                    hand_axis_alpha,
+                    progress_axis_alpha,
+                    pair_alpha);
             sum += axis_alpha * axis_bias[axis_ids[axis_idx]];
         }
     }
@@ -1343,10 +1448,15 @@ __global__ void sfnn_stacked_l3_output_kernel(
             for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                 const float axis_alpha = sfnn_factorizer_axis_alpha(
                     axis_ids[axis_idx],
+                    num_stacks,
                     factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                 weight += axis_alpha * axis_weights[axis_ids[axis_idx] * input_dim + in_col];
             }
@@ -1568,12 +1678,14 @@ __global__ void sfnn_dense_param_reduce_accum_stacks_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha,
     int use_crelu_gradient) {
     const unsigned int input_tiles =
@@ -1652,17 +1764,23 @@ __global__ void sfnn_dense_param_reduce_accum_stacks_kernel(
                     factorizer_hand_axis_dim,
                     use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         axis_ids);
                 for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                     const float axis_alpha = sfnn_factorizer_axis_alpha(
-                        axis_ids[axis_idx],
-                        factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                     atomicAdd(
                         &axis_weight_gradients[axis_ids[axis_idx] * axis_cell_count + axis_weight_cell],
@@ -1684,17 +1802,23 @@ __global__ void sfnn_dense_param_reduce_accum_stacks_kernel(
                     factorizer_hand_axis_dim,
                     use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         axis_ids);
                 for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                     const float axis_alpha = sfnn_factorizer_axis_alpha(
-                        axis_ids[axis_idx],
-                        factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                     atomicAdd(&axis_bias_gradients[axis_ids[axis_idx] * output_dim + out_col], axis_alpha * bias_sum);
                 }
@@ -1736,12 +1860,14 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha,
     int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1768,6 +1894,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
                 factorizer_hand_axis_dim,
                 use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1775,11 +1902,16 @@ __global__ void sfnn_stacked_l3_backward_kernel(
             if (has_axis != 0) {
                 for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                     const float axis_alpha = sfnn_factorizer_axis_alpha(
-                        axis_ids[axis_idx],
-                        factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                     weight += axis_alpha * axis_weights[axis_ids[axis_idx] * input_dim + row];
                 }
@@ -1795,11 +1927,16 @@ __global__ void sfnn_stacked_l3_backward_kernel(
                 if (has_axis != 0) {
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(&axis_weight_gradients[axis_ids[axis_idx] * input_dim + row], axis_alpha * weight_gradient);
                     }
@@ -1833,17 +1970,23 @@ __global__ void sfnn_stacked_l3_backward_kernel(
                         factorizer_hand_axis_dim,
                         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         axis_ids);
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(&axis_bias_gradients[axis_ids[axis_idx]], axis_alpha * grad);
                     }
@@ -1878,12 +2021,14 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha,
     int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1907,6 +2052,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                 factorizer_hand_axis_dim,
                 use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1922,11 +2068,16 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                     if (has_axis != 0) {
                         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                             const float axis_alpha = sfnn_factorizer_axis_alpha(
-                                axis_ids[axis_idx],
-                                factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                             weight += axis_alpha *
                                 axis_weights[axis_ids[axis_idx] * output_dim * input_dim + out_col * input_dim + in_col];
@@ -1955,6 +2106,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                 factorizer_hand_axis_dim,
                 use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -1972,11 +2124,16 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                 if (has_axis != 0) {
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(
                             &axis_weight_gradients[axis_ids[axis_idx] * output_dim * input_dim + out_col * input_dim + in_col],
@@ -2009,17 +2166,23 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                         factorizer_hand_axis_dim,
                         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         axis_ids);
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(&axis_bias_gradients[axis_ids[axis_idx] * output_dim + out_col], axis_alpha * grad);
                     }
@@ -2335,12 +2498,14 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha,
     int compute_parameter_gradients) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2364,6 +2529,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                 factorizer_hand_axis_dim,
                 use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -2378,11 +2544,16 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                     if (has_axis != 0) {
                         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                             const float axis_alpha = sfnn_factorizer_axis_alpha(
-                                axis_ids[axis_idx],
-                                factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                             weight += axis_alpha *
                                 axis_weights[axis_ids[axis_idx] * input_dim * output_dim + in_col * output_dim + out_col];
@@ -2411,6 +2582,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                 factorizer_hand_axis_dim,
                 use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
@@ -2428,11 +2600,16 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                 if (has_axis != 0) {
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(
                             &axis_weight_gradients[axis_ids[axis_idx] * input_dim * output_dim + in_col * output_dim + out_col],
@@ -2463,17 +2640,23 @@ __global__ void sfnn_factorized_l1_backward_kernel(
                         factorizer_hand_axis_dim,
                         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         axis_ids);
                     for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                         const float axis_alpha = sfnn_factorizer_axis_alpha(
-                            axis_ids[axis_idx],
-                            factorizer_king_axis_dim,
+                    axis_ids[axis_idx],
+                    num_stacks,
+                    factorizer_king_axis_dim,
                     factorizer_hand_axis_dim,
+                    use_king_hand_pair,
+                    use_king_progress_pair,
+                    use_hand_progress_pair,
                     king_axis_alpha,
                     hand_axis_alpha,
+                    progress_axis_alpha,
                     pair_alpha);
                         atomicAdd(&axis_bias_gradients[axis_ids[axis_idx] * output_dim + out_col], axis_alpha * grad);
                     }
@@ -3812,12 +3995,14 @@ int launch_sfnn_forward_kernels(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     float* stm_l0,
     float* nstm_l0,
@@ -3963,12 +4148,14 @@ int launch_sfnn_forward_kernels(
             has_l1ax,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
             factorizer_pair_alpha);
         if (check_kernel_launch("sfnn_stacked_l1_warp_kernel launch") != 0) {
             return -1;
@@ -4006,13 +4193,15 @@ int launch_sfnn_forward_kernels(
         has_l2ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
-        factorizer_shared_alpha,
-        factorizer_king_axis_alpha,
-        factorizer_hand_axis_alpha,
-        factorizer_pair_alpha);
+            factorizer_shared_alpha,
+            factorizer_king_axis_alpha,
+            factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
+            factorizer_pair_alpha);
     if (check_kernel_launch("sfnn_stacked_l2_crelu_kernel launch") != 0) {
         return -1;
     }
@@ -4042,12 +4231,14 @@ int launch_sfnn_forward_kernels(
         has_l3ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
         factorizer_pair_alpha);
     if (check_kernel_launch("sfnn_stacked_l3_output_kernel launch") != 0) {
         return -1;
@@ -4085,6 +4276,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
@@ -4115,6 +4307,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
@@ -4180,12 +4373,14 @@ int launch_sfnn_dense_param_reduce_tiled(
     int has_axis,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float shared_alpha,
     float king_axis_alpha,
     float hand_axis_alpha,
+    float progress_axis_alpha,
     float pair_alpha,
     int use_crelu_gradient,
     const char* label) {
@@ -4228,12 +4423,14 @@ int launch_sfnn_dense_param_reduce_tiled(
             has_axis,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             shared_alpha,
             king_axis_alpha,
             hand_axis_alpha,
+            progress_axis_alpha,
             pair_alpha,
             use_crelu_gradient);
         if (check_kernel_launch(label) != 0) {
@@ -4241,7 +4438,7 @@ int launch_sfnn_dense_param_reduce_tiled(
         }
         return 0;
     }
-    if (has_axis != 0 || use_king_axis != 0 || use_hand_axis != 0) {
+    if (has_axis != 0 || use_king_axis != 0 || use_hand_axis != 0 || use_progress_axis != 0) {
         return fail_message("sfnn dense reduce axis fast path was requested for too many stacks");
     }
     if (num_stacks > SFNN_DENSE_REDUCE_MAX_FAST_STACKS) {
@@ -4560,12 +4757,14 @@ int launch_sfnn_backward_kernels(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     const float* mean_output_gradients,
     float* l2_gradients,
@@ -4654,6 +4853,7 @@ int launch_sfnn_backward_kernels(
                 l1_shard_size,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
+                use_progress_axis,
                 use_king_hand_pair,
                 use_king_progress_pair,
                 use_hand_progress_pair,
@@ -4716,12 +4916,14 @@ int launch_sfnn_backward_kernels(
         has_l3ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
         dense_param_reduce_fast_path ? 0 : 1);
     if (check_kernel_launch("sfnn_stacked_l3_backward_kernel launch") != 0) {
@@ -4751,12 +4953,14 @@ int launch_sfnn_backward_kernels(
                 has_l3ax,
                 use_king_axis,
                 use_hand_axis,
+                use_progress_axis,
                 use_king_hand_pair,
                 use_king_progress_pair,
                 use_hand_progress_pair,
                 factorizer_shared_alpha,
                 factorizer_king_axis_alpha,
                 factorizer_hand_axis_alpha,
+                factorizer_progress_axis_alpha,
                 factorizer_pair_alpha,
                 0,
                 "sfnn dense reduce L3 params") != 0) {
@@ -4801,12 +5005,14 @@ int launch_sfnn_backward_kernels(
         has_l2ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
         dense_param_reduce_fast_path ? 0 : 1);
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
@@ -4836,12 +5042,14 @@ int launch_sfnn_backward_kernels(
                 has_l2ax,
                 use_king_axis,
                 use_hand_axis,
+                use_progress_axis,
                 use_king_hand_pair,
                 use_king_progress_pair,
                 use_hand_progress_pair,
                 factorizer_shared_alpha,
                 factorizer_king_axis_alpha,
                 factorizer_hand_axis_alpha,
+                factorizer_progress_axis_alpha,
                 factorizer_pair_alpha,
                 1,
                 "sfnn dense reduce L2 params") != 0) {
@@ -4950,12 +5158,14 @@ int launch_sfnn_backward_kernels(
             has_l1ax,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             reduce_l1_params ? 0 : 1);
         if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
@@ -4985,12 +5195,14 @@ int launch_sfnn_backward_kernels(
                     has_l1ax,
                     use_king_axis,
                     use_hand_axis,
+                    use_progress_axis,
                     use_king_hand_pair,
                     use_king_progress_pair,
                     use_hand_progress_pair,
                     factorizer_shared_alpha,
                     factorizer_king_axis_alpha,
                     factorizer_hand_axis_alpha,
+                    factorizer_progress_axis_alpha,
                     factorizer_pair_alpha,
                     0,
                     "sfnn dense reduce L1 params") != 0) {
@@ -5046,12 +5258,14 @@ int launch_sfnn_backward_kernels(
                     0,
                     use_king_axis,
                     use_hand_axis,
+                    use_progress_axis,
                     use_king_hand_pair,
                     use_king_progress_pair,
                     use_hand_progress_pair,
                     factorizer_shared_alpha,
                     factorizer_king_axis_alpha,
                     factorizer_hand_axis_alpha,
+                    factorizer_progress_axis_alpha,
                     factorizer_pair_alpha,
                     0,
                     "sfnn dense reduce L1 params") != 0) {
@@ -6416,12 +6630,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     BulletOuCudaCppF32Buffer* stm_l0,
     BulletOuCudaCppF32Buffer* nstm_l0,
@@ -6436,6 +6652,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
@@ -6583,12 +6800,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             has_l3ax,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             stm_l0->ptr,
             nstm_l0->ptr,
@@ -7248,12 +7467,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -7290,6 +7511,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
@@ -7444,12 +7666,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             has_l3ax,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             mean_output_gradients->ptr,
             l2_gradients->ptr,
@@ -7531,12 +7755,14 @@ int sfnn_backward_train_device_impl(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -7576,6 +7802,7 @@ int sfnn_backward_train_device_impl(
         num_stacks,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
@@ -7730,12 +7957,14 @@ int sfnn_backward_train_device_impl(
             has_l3ax,
             use_king_axis,
             use_hand_axis,
+            use_progress_axis,
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
+            factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             mean_output_gradients->ptr,
             l2_gradients->ptr,
@@ -7817,12 +8046,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -7895,12 +8126,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         has_l3ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
         mean_output_gradients,
         l2_gradients,
@@ -7977,12 +8210,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     int has_l3ax,
     int use_king_axis,
     int use_hand_axis,
+    int use_progress_axis,
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -8057,12 +8292,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         has_l3ax,
         use_king_axis,
         use_hand_axis,
+        use_progress_axis,
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
         mean_output_gradients,
         l2_gradients,

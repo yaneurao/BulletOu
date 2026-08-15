@@ -436,7 +436,7 @@ When `progressN` is used, the exported `nn.bin` includes a Progress section.
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
-`progressN` can be combined with factorizer settings. `--sfnn-factorizer axis` shares the single king and hand axes. `--sfnn-factorizer pair` also enables available two-axis factorizers such as `king-progress` and `hand-progress`.
+`progressN` can be combined with factorizer settings. `--sfnn-factorizer axis` shares the single king, hand, and progress axes. `--sfnn-factorizer pair` also enables available two-axis factorizers such as `king-progress` and `hand-progress`.
 
 For example, `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` can use:
 
@@ -444,7 +444,7 @@ For example, `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` can use:
 --sfnn-factorizer pair
 ```
 
-That setting enables the supported subset of `shared`, `king-axis`, `hand-axis`, `king-hand`, `king-progress`, and `hand-progress` for the selected architecture.
+That setting enables the supported subset of `shared`, `king-axis`, `hand-axis`, `progress-axis`, `king-hand`, `king-progress`, and `hand-progress` for the selected architecture.
 
 ## 12. How large combinations get
 

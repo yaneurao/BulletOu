@@ -195,7 +195,7 @@ factorizerは、bucket間で共通成分を共有する仕組みです。教師�
 W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_base` は各bucketが個別に持つ重みです。`W_shared` は全bucketで共有する成分、`W_axis` は king bucket や hand bucket の単独軸で共有する成分です。`W_pair` は `king-hand`、`king-progress`、`hand-progress` のような2軸の組み合わせで共有する成分です。
+`W_base` は各bucketが個別に持つ重みです。`W_shared` は全bucketで共有する成分、`W_axis` は king bucket、hand bucket、progress bucket のような単独軸で共有する成分です。`W_pair` は `king-hand`、`king-progress`、`hand-progress` のような2軸の組み合わせで共有する成分です。
 
 | 指定 | 意味 |
 | --- | --- |
@@ -203,7 +203,7 @@ W_effective = W_base + W_shared + W_axis + W_pair
 | `--sfnn-factorizer none` | factorizerを使わない |
 | `--sfnn-factorizer axis` | archに存在する軸をまとめて有効化する |
 | `--sfnn-factorizer pair` | `axis` に加えて、使える2軸factorizerをまとめて有効化する |
-| `--sfnn-factorizer king=axis,hand=axis` | 軸ごとに明示する |
+| `--sfnn-factorizer king=axis,hand=axis,progress=axis` | 軸ごとに明示する |
 | `--sfnn-factorizer king-hand,king-progress,hand-progress` | 2軸factorizerを個別に指定する |
 | `--sfnn-factorizer king=axis,hand=shared` | kingは軸方向、handは共通成分だけにする |
 
@@ -225,6 +225,7 @@ W_effective = W_base
             + alpha_shared * W_shared
             + alpha_king   * W_king_axis
             + alpha_hand   * W_hand_axis
+            + alpha_progress * W_progress_axis
             + alpha_pair   * W_pair
 ```
 
@@ -242,6 +243,20 @@ king と hand を別々に弱める場合:
 --sfnn-factorizer-alpha king=0.90,hand=0.80
 ```
 
+axis成分全体と2軸成分全体を強める場合:
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha axis=4.0,pair=4.0
+```
+
+progress axis だけを強める場合:
+
+```bash
+--sfnn-factorizer progress=axis
+--sfnn-factorizer-alpha progress=4.0
+```
+
 全factorizer成分を同じ強さにする場合:
 
 ```bash
@@ -256,7 +271,7 @@ king と hand を別々に弱める場合:
 --sfnn-factorizer pair
 ```
 
-この指定は、利用できる範囲で `shared`、`king-axis`、`hand-axis`、`king-hand`、`king-progress`、`hand-progress` を有効化します。archに存在しない軸は自動的に無視されます。
+この指定は、利用できる範囲で `shared`、`king-axis`、`hand-axis`、`progress-axis`、`king-hand`、`king-progress`、`hand-progress` を有効化します。archに存在しない軸は自動的に無視されます。
 
 `alpha=1.0` が通常の状態です。`alpha=0.0` にすると、そのfactorizer成分はforwardに足されず、その成分への勾配も0になります。これは「保存済みのfactorizer tensorをbase weightへ畳み込む」操作ではありません。factorizerを完全に外した状態で追加学習したい場合は `--sfnn-factorizer none` を使います。
 

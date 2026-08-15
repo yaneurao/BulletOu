@@ -209,7 +209,7 @@ Conceptually, training uses an effective weight like this:
 W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_base` is owned by each bucket. `W_shared` is shared by all buckets. `W_axis` is shared along one bucket axis, such as king bucket or hand bucket. `W_pair` is shared by a pair of axes, such as `king-hand`, `king-progress`, or `hand-progress`.
+`W_base` is owned by each bucket. `W_shared` is shared by all buckets. `W_axis` is shared along one bucket axis, such as king bucket, hand bucket, or progress bucket. `W_pair` is shared by a pair of axes, such as `king-hand`, `king-progress`, or `hand-progress`.
 
 | Setting | Meaning |
 | --- | --- |
@@ -217,7 +217,7 @@ W_effective = W_base + W_shared + W_axis + W_pair
 | `--sfnn-factorizer none` | Disable factorizer |
 | `--sfnn-factorizer axis` | Enable every available bucket direction in the architecture |
 | `--sfnn-factorizer pair` | Enable `axis` plus every available two-axis factorizer |
-| `--sfnn-factorizer king=axis,hand=axis` | Specify directions explicitly |
+| `--sfnn-factorizer king=axis,hand=axis,progress=axis` | Specify directions explicitly |
 | `--sfnn-factorizer king-hand,king-progress,hand-progress` | Specify two-axis factorizers explicitly |
 | `--sfnn-factorizer king=axis,hand=shared` | Use direction-specific sharing for king and only common sharing for hand |
 
@@ -239,6 +239,7 @@ W_effective = W_base
             + alpha_shared * W_shared
             + alpha_king   * W_king_axis
             + alpha_hand   * W_hand_axis
+            + alpha_progress * W_progress_axis
             + alpha_pair   * W_pair
 ```
 
@@ -256,6 +257,20 @@ To set king and hand separately:
 --sfnn-factorizer-alpha king=0.90,hand=0.80
 ```
 
+To strengthen all single-axis terms and all two-axis terms:
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha axis=4.0,pair=4.0
+```
+
+To strengthen only the progress-axis term:
+
+```bash
+--sfnn-factorizer progress=axis
+--sfnn-factorizer-alpha progress=4.0
+```
+
 To set every factorizer term to the same strength:
 
 ```bash
@@ -270,7 +285,7 @@ When an architecture combines several bucket axes, such as `hand1024` and `progr
 --sfnn-factorizer pair
 ```
 
-This enables `shared`, `king-axis`, `hand-axis`, `king-hand`, `king-progress`, and `hand-progress` wherever the architecture has the required axes. Axes that do not exist in the architecture are ignored automatically.
+This enables `shared`, `king-axis`, `hand-axis`, `progress-axis`, `king-hand`, `king-progress`, and `hand-progress` wherever the architecture has the required axes. Axes that do not exist in the architecture are ignored automatically.
 
 `alpha=1.0` is the normal setting. With `alpha=0.0`, that factorizer term is not added in forward, and its gradient is also zero. This does not fold stored factorizer tensors into the base weights. If you want to continue training without factorizer terms, use `--sfnn-factorizer none`.
 
