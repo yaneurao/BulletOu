@@ -5387,11 +5387,22 @@ pub struct SfnnLayerLrMultipliers {
     pub l3: f32,
     pub update_scope: SfnnUpdateScope,
     pub factorizer_residual_decay: f32,
+    pub saturation_penalty: f32,
+    pub saturation_threshold: f32,
 }
 
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
-        Self { l0: 1.0, l1: 1.0, l2: 1.0, l3: 1.0, update_scope: SfnnUpdateScope::All, factorizer_residual_decay: 0.0 }
+        Self {
+            l0: 1.0,
+            l1: 1.0,
+            l2: 1.0,
+            l3: 1.0,
+            update_scope: SfnnUpdateScope::All,
+            factorizer_residual_decay: 0.0,
+            saturation_penalty: 0.0,
+            saturation_threshold: 127.0,
+        }
     }
 }
 
@@ -5406,6 +5417,15 @@ impl SfnnLayerLrMultipliers {
         }
         if !(self.factorizer_residual_decay.is_finite() && self.factorizer_residual_decay >= 0.0) {
             return Err(CudaCppError::message("SFNN factorizer residual decay must be finite and non-negative"));
+        }
+        if !(self.saturation_penalty.is_finite() && self.saturation_penalty >= 0.0) {
+            return Err(CudaCppError::message("SFNN saturation penalty must be finite and non-negative"));
+        }
+        if !(self.saturation_threshold.is_finite()
+            && self.saturation_threshold > 0.0
+            && self.saturation_threshold <= 128.0)
+        {
+            return Err(CudaCppError::message("SFNN saturation threshold must be finite and in (0, 128]"));
         }
         Ok(())
     }
@@ -6177,6 +6197,102 @@ impl SfnnTrainStepRunner {
         Ok(params)
     }
 
+    fn add_saturation_penalty_gradients(
+        &self,
+        ctx: &Context,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_update: Option<(&I32Buffer, usize)>,
+    ) -> Result<()> {
+        if lr_multipliers.saturation_penalty == 0.0 {
+            return Ok(());
+        }
+
+        let dirty_buckets = dirty_update.map(|(buckets, _)| buckets);
+        let dirty_count = dirty_update.map(|(_, count)| count).unwrap_or(0);
+        let weight_scale = 64.0f32;
+        let penalty = lr_multipliers.saturation_penalty;
+        let threshold = lr_multipliers.saturation_threshold;
+
+        if !self.shape.has_compact_l1()
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_add_saturation_penalty_gradients_device(
+                ctx,
+                &self.weights.l1w,
+                self.weights.l1fw.as_ref().filter(|_| self.factorizer.shared),
+                self.weights.l1axw.as_ref().filter(|_| self.factorizer.any_axis()),
+                &self.backward_workspace.l1w_gradients,
+                if self.factorizer.shared { Some(&self.backward_workspace.l1fw_gradients) } else { None },
+                if self.factorizer.any_axis() { Some(&self.backward_workspace.l1axw_gradients) } else { None },
+                self.shape.ft_size,
+                self.shape.l1_out(),
+                self.shape.num_stacks,
+                self.shape.factorizer_king_axis_dim,
+                self.shape.factorizer_hand_axis_dim,
+                self.factorizer,
+                self.factorizer_alpha,
+                true,
+                weight_scale,
+                threshold,
+                penalty,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+
+        if lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight) != 0.0 {
+            sfnn_add_saturation_penalty_gradients_device(
+                ctx,
+                &self.weights.l2w,
+                self.weights.l2fw.as_ref().filter(|_| self.factorizer.shared),
+                self.weights.l2axw.as_ref().filter(|_| self.factorizer.any_axis()),
+                &self.backward_workspace.l2w_gradients,
+                if self.factorizer.shared { Some(&self.backward_workspace.l2fw_gradients) } else { None },
+                if self.factorizer.any_axis() { Some(&self.backward_workspace.l2axw_gradients) } else { None },
+                self.shape.l2_in(),
+                self.shape.l2_size,
+                self.shape.num_stacks,
+                self.shape.factorizer_king_axis_dim,
+                self.shape.factorizer_hand_axis_dim,
+                self.factorizer,
+                self.factorizer_alpha,
+                false,
+                weight_scale,
+                threshold,
+                penalty,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+
+        if lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight) != 0.0 {
+            sfnn_add_saturation_penalty_gradients_device(
+                ctx,
+                &self.weights.l3w,
+                self.weights.l3fw.as_ref().filter(|_| self.factorizer.shared),
+                self.weights.l3axw.as_ref().filter(|_| self.factorizer.any_axis()),
+                &self.backward_workspace.l3w_gradients,
+                if self.factorizer.shared { Some(&self.backward_workspace.l3fw_gradients) } else { None },
+                if self.factorizer.any_axis() { Some(&self.backward_workspace.l3axw_gradients) } else { None },
+                self.shape.l2_size,
+                1,
+                self.shape.num_stacks,
+                self.shape.factorizer_king_axis_dim,
+                self.shape.factorizer_hand_axis_dim,
+                self.factorizer,
+                self.factorizer_alpha,
+                false,
+                weight_scale,
+                threshold,
+                penalty,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn prepare_dirty_buckets<'a>(
         &'a self,
         ctx: &Context,
@@ -6216,6 +6332,7 @@ impl SfnnTrainStepRunner {
     ) -> Result<()> {
         lr_multipliers.validate()?;
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
+        self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
         let l0w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
         let l0b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias);
         let l1w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight);
@@ -6519,6 +6636,138 @@ fn update_stacked_param_group_with_lr_multiplier(
             stride,
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sfnn_add_saturation_penalty_gradients_device(
+    ctx: &Context,
+    weights: &F32Buffer,
+    shared_weights: Option<&F32Buffer>,
+    axis_weights: Option<&F32Buffer>,
+    gradients: &F32Buffer,
+    shared_gradients: Option<&F32Buffer>,
+    axis_gradients: Option<&F32Buffer>,
+    input_dim: usize,
+    output_dim: usize,
+    num_stacks: usize,
+    factorizer_king_axis_dim: usize,
+    factorizer_hand_axis_dim: usize,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+    shared_weight_input_major: bool,
+    weight_scale: f32,
+    threshold: f32,
+    penalty: f32,
+    dirty_buckets: Option<&I32Buffer>,
+    dirty_count: usize,
+) -> Result<()> {
+    if penalty == 0.0 {
+        return Ok(());
+    }
+    if input_dim == 0 || output_dim == 0 || num_stacks == 0 {
+        return Err(CudaCppError::message("SFNN saturation penalty layer dimensions must be non-zero"));
+    }
+    if !(weight_scale.is_finite() && weight_scale > 0.0) {
+        return Err(CudaCppError::message("SFNN saturation penalty weight scale must be finite and positive"));
+    }
+    if !(threshold.is_finite() && threshold > 0.0 && threshold <= 128.0) {
+        return Err(CudaCppError::message("SFNN saturation penalty threshold must be finite and in (0, 128]"));
+    }
+    if !(penalty.is_finite() && penalty >= 0.0) {
+        return Err(CudaCppError::message("SFNN saturation penalty must be finite and non-negative"));
+    }
+    let weight_cell_count = input_dim
+        .checked_mul(output_dim)
+        .ok_or_else(|| CudaCppError::message("SFNN saturation penalty weight cell count overflow"))?;
+    let weight_total = num_stacks
+        .checked_mul(weight_cell_count)
+        .ok_or_else(|| CudaCppError::message("SFNN saturation penalty weight length overflow"))?;
+    expect_len("sfnn saturation weights", weight_total, weights.len())?;
+    expect_len("sfnn saturation gradients", weight_total, gradients.len())?;
+    let (shared_weights, shared_gradients, has_shared) = match (shared_weights, shared_gradients) {
+        (Some(weights), Some(gradients)) if factorizer.shared => {
+            expect_len("sfnn saturation shared weights", weight_cell_count, weights.len())?;
+            expect_len("sfnn saturation shared gradients", weight_cell_count, gradients.len())?;
+            (weights.as_ptr(), gradients.as_ptr(), 1)
+        }
+        (None, None) | (Some(_), Some(_)) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN saturation shared weight/gradient optional groups mismatch")),
+    };
+    let axis_count = SfnnForwardShape {
+        input_size: 1,
+        ft_size: 1,
+        l1_hidden: 1,
+        l1_skip: false,
+        l2_size: 1,
+        num_stacks,
+        l1_group_count: 1,
+        l1_common_size: 0,
+        l1_shard_size: 0,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        factorizer_progress_axis: factorizer.progress_axis,
+        factorizer_king_hand_pair: factorizer.king_hand_pair,
+        factorizer_king_progress_pair: factorizer.king_progress_pair,
+        factorizer_hand_progress_pair: factorizer.hand_progress_pair,
+    }
+    .factorizer_axis_count();
+    let (axis_weights, axis_gradients, has_axis) = match (axis_weights, axis_gradients) {
+        (Some(weights), Some(gradients)) if factorizer.any_axis() => {
+            let expected = axis_count
+                .checked_mul(weight_cell_count)
+                .ok_or_else(|| CudaCppError::message("SFNN saturation axis weight length overflow"))?;
+            expect_len("sfnn saturation axis weights", expected, weights.len())?;
+            expect_len("sfnn saturation axis gradients", expected, gradients.len())?;
+            (weights.as_ptr(), gradients.as_ptr(), 1)
+        }
+        (None, None) | (Some(_), Some(_)) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN saturation axis weight/gradient optional groups mismatch")),
+    };
+    let (dirty_buckets, dirty_count) = match dirty_buckets {
+        Some(buckets) if dirty_count > 0 => {
+            if dirty_count > buckets.len() {
+                return Err(CudaCppError::message("SFNN saturation dirty_count exceeds dirty bucket buffer length"));
+            }
+            (buckets.as_ptr(), dirty_count)
+        }
+        _ => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: all device buffers are length-checked here; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
+            ctx.as_ptr(),
+            weights.as_ptr(),
+            shared_weights,
+            has_shared,
+            axis_weights,
+            has_axis,
+            gradients.as_ptr(),
+            shared_gradients,
+            axis_gradients,
+            dirty_buckets,
+            dirty_count,
+            input_dim,
+            output_dim,
+            num_stacks,
+            factorizer_king_axis_dim,
+            factorizer_hand_axis_dim,
+            i32::from(factorizer.king_axis),
+            i32::from(factorizer.hand_axis),
+            i32::from(factorizer.progress_axis),
+            i32::from(factorizer.king_hand_pair),
+            i32::from(factorizer.king_progress_pair),
+            i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.shared,
+            factorizer_alpha.king_axis,
+            factorizer_alpha.hand_axis,
+            factorizer_alpha.progress_axis,
+            factorizer_alpha.pair,
+            i32::from(shared_weight_input_major),
+            weight_scale,
+            threshold,
+            penalty,
+        )
+    })
 }
 
 fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
@@ -7546,6 +7795,39 @@ mod ffi {
             zero_parameter_gradients: i32,
             profile_ms: *mut f32,
             profile_ms_len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
+            ctx: *mut BulletOuCudaCppContext,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            shared_weights: *mut BulletOuCudaCppF32Buffer,
+            has_shared: i32,
+            axis_weights: *mut BulletOuCudaCppF32Buffer,
+            has_axis: i32,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            shared_gradients: *mut BulletOuCudaCppF32Buffer,
+            axis_gradients: *mut BulletOuCudaCppF32Buffer,
+            dirty_buckets: *mut BulletOuCudaCppI32Buffer,
+            dirty_count: usize,
+            input_dim: usize,
+            output_dim: usize,
+            num_stacks: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
+            use_king_axis: i32,
+            use_hand_axis: i32,
+            use_progress_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
+            factorizer_progress_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
+            shared_weight_input_major: i32,
+            weight_scale: f32,
+            threshold: f32,
+            penalty: f32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,

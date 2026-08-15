@@ -40,6 +40,7 @@
 | loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | SFNN の factorizer を変える | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 | SFNN の factorizer の効き具合を変える | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
+| SFNN の量子化飽和を抑える | `--sfnn-saturation-penalty` | `--sfnn-saturation-penalty 1e-7` |
 
 主なオプション一覧:
 
@@ -81,6 +82,8 @@
 | `--quantized-validation-exact` | 量子化後検証をCPU整数forwardで正確に測る。遅いので必要なときだけ使う | off |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
 | `--sfnn-factorizer-alpha` | factorizer成分をどれだけ効かせるか | 1.0 |
+| `--sfnn-saturation-penalty` | fold後のL1/L2/L3重みがi8の端に張り付くのを抑える追加ペナルティ | 0.0 |
+| `--sfnn-saturation-threshold` | 飽和ペナルティをかけ始めるi8量子化値 | 127.0 |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizerの詳細パラメータ | 省略 |
@@ -296,6 +299,32 @@ progress axis だけを強める場合:
 `alpha` は `1.0` より大きくすることもできます。指定可能範囲は `0.0` から `10.0` です。たとえば `king=2.0` は king-axis 成分を forward で2倍して足し、同時に king-axis tensor への勾配も2倍します。大きすぎる値は学習を不安定にする可能性があるため、実験用途として扱ってください。
 
 `nn.bin` を書き出すときは、上の `W_effective` の形に畳み込まれます。そのため `--sfnn-factorizer-alpha king=0.90` で保存した `nn.bin` には、king axis成分が90%で反映されます。
+
+### 6.1 量子化飽和を抑える
+
+SFNNのL1/L2/L3重みは、`nn.bin` に保存するときにi8へ量子化されます。factorizerを強くしたりbucket数を増やしたりすると、fold後の有効重みがi8の上限付近に張り付き、量子化後のlossやaccuracyが悪くなることがあります。
+
+その場合は、実験用に飽和ペナルティを足せます。
+
+```bash
+--sfnn-saturation-penalty 1e-7
+```
+
+このペナルティはデフォルトでは無効です。指定したときだけ、更新直前の勾配に次の追加項を足します。
+
+```text
+q = W_effective * QB
+penalty_loss_per_weight = lambda * max(0, |q| - threshold)^2
+```
+
+`QB` はL1/L2/L3重みの量子化倍率で、通常は64です。`threshold=127` なら、i8の端に到達する重みだけを抑えます。少し手前から抑えたい場合は、たとえば次のようにします。
+
+```bash
+--sfnn-saturation-penalty 1e-7
+--sfnn-saturation-threshold 120
+```
+
+このペナルティは報告される `test_value_loss` の定義を変えません。lossの表示は通常どおり比較できます。
 
 ## 7. 保存と検証の頻度
 

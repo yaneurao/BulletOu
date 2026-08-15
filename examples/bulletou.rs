@@ -4423,6 +4423,18 @@ struct Args {
     #[arg(long = "sfnn-factorizer-residual-decay", default_value = "0.0")]
     sfnn_factorizer_residual_decay: f32,
 
+    /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
+    /// Default 0 disables it. The penalty is added as an optimizer-gradient
+    /// term before each update and does not change the reported value loss.
+    #[arg(long = "sfnn-saturation-penalty", default_value = "0.0")]
+    sfnn_saturation_penalty: f32,
+
+    /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
+    /// units. 127 means only weights that would hit the i8 edge are
+    /// penalized; lower values start damping earlier.
+    #[arg(long = "sfnn-saturation-threshold", default_value = "127.0")]
+    sfnn_saturation_threshold: f32,
+
     /// Compatibility alias for `--sfnn-factorizer none`; disables all SFNN
     /// residual factorizer terms. Use this when resuming an older
     /// non-factorized SFNN experiment.
@@ -4641,6 +4653,24 @@ impl Args {
         }
         if self.sfnn_factorizer_residual_decay != 0.0 && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer-residual-decay applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
+            return Err(format!(
+                "--sfnn-saturation-penalty must be finite and non-negative (got {})",
+                self.sfnn_saturation_penalty
+            ));
+        }
+        if !(self.sfnn_saturation_threshold.is_finite()
+            && self.sfnn_saturation_threshold > 0.0
+            && self.sfnn_saturation_threshold <= 128.0)
+        {
+            return Err(format!(
+                "--sfnn-saturation-threshold must be finite and in (0, 128] (got {})",
+                self.sfnn_saturation_threshold
+            ));
+        }
+        if self.sfnn_saturation_penalty != 0.0 && !eval_type.uses_layerstack() {
+            return Err("--sfnn-saturation-penalty applies to SFNN / LayerStack eval types only".to_string());
         }
         if !(self.sfnn_l1_lr_mult.is_finite() && self.sfnn_l1_lr_mult >= 0.0) {
             return Err(format!("--sfnn-l1-lr-mult must be finite and non-negative (got {})", self.sfnn_l1_lr_mult));
@@ -12314,6 +12344,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::Magenta,
         );
     }
+    if args.sfnn_saturation_penalty != 0.0 {
+        print_startup_kv_colored(
+            "saturation penalty",
+            format!(
+                "lambda={:.9}, threshold={:.3} QB-units (folded L1/L2/L3 i8 weights)",
+                args.sfnn_saturation_penalty, args.sfnn_saturation_threshold
+            ),
+            ConsoleColor::Magenta,
+        );
+    }
     print_startup_kv(
         "stored factorizers",
         format!(
@@ -18277,6 +18317,8 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
         factorizer_residual_decay: args.sfnn_factorizer_residual_decay,
+        saturation_penalty: args.sfnn_saturation_penalty,
+        saturation_threshold: args.sfnn_saturation_threshold,
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -18822,6 +18864,8 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
         format!("sfnn_factorizer_residual_decay={:.9}", args.sfnn_factorizer_residual_decay),
+        format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
+        format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -18948,7 +18992,19 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_factorizer_alpha=",
         "sfnn_factorizer_residual_decay=0.000000000",
     );
-    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_residual_decay=", "sfnn_l1_lr_mult=1.000000000");
+    ensure_line_after(
+        &mut out,
+        "sfnn_saturation_penalty=",
+        "sfnn_factorizer_residual_decay=",
+        "sfnn_saturation_penalty=0.000000000",
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_saturation_threshold=",
+        "sfnn_saturation_penalty=",
+        "sfnn_saturation_threshold=127.000000000",
+    );
+    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_saturation_threshold=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
 

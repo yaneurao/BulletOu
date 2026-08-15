@@ -40,6 +40,7 @@ Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or abo
 | Change the loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | Change SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
 | Change SFNN factorizer strength | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
+| Dampen SFNN quantization saturation | `--sfnn-saturation-penalty` | `--sfnn-saturation-penalty 1e-7` |
 
 Fuller option table:
 
@@ -81,6 +82,8 @@ Fuller option table:
 | `--quantized-validation-exact` | Use exact CPU integer forward for quantized validation. Slow; use only when needed | off |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--sfnn-factorizer-alpha` | How strongly factorizer components contribute | 1.0 |
+| `--sfnn-saturation-penalty` | Extra penalty for folded L1/L2/L3 weights that reach the i8 edge | 0.0 |
+| `--sfnn-saturation-threshold` | Quantized i8 value where the saturation penalty starts | 127.0 |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients | omitted |
@@ -310,6 +313,32 @@ This enables `shared`, `king-axis`, `hand-axis`, `progress-axis`, `king-hand`, `
 `alpha` can also be larger than `1.0`. The accepted range is `0.0` to `10.0`. For example, `king=2.0` adds the king-axis contribution at twice its stored value in forward, and the gradient into king-axis tensors is also doubled. Very large values can destabilize training, so treat this as an experimental tuning knob.
 
 When BulletOu writes `nn.bin`, it folds weights using the `W_effective` formula above. So an `nn.bin` saved with `--sfnn-factorizer-alpha king=0.90` contains the king-axis contribution at 90% strength.
+
+### 7.1 Dampen quantization saturation
+
+SFNN L1/L2/L3 weights are quantized to i8 when BulletOu writes `nn.bin`. With strong factorizer settings or many buckets, the folded effective weights can stick to the i8 edge. That can hurt post-quantization loss and accuracy.
+
+For experiments, you can add a saturation penalty:
+
+```bash
+--sfnn-saturation-penalty 1e-7
+```
+
+The penalty is off by default. When enabled, BulletOu adds this gradient term just before each optimizer update:
+
+```text
+q = W_effective * QB
+penalty_loss_per_weight = lambda * max(0, |q| - threshold)^2
+```
+
+`QB` is the L1/L2/L3 weight quantization scale, normally 64. With `threshold=127`, only weights that would reach the i8 edge are penalized. To start damping earlier:
+
+```bash
+--sfnn-saturation-penalty 1e-7
+--sfnn-saturation-threshold 120
+```
+
+This does not change the reported `test_value_loss` definition, so the normal loss output remains comparable across runs.
 
 ## 8. Save and validation frequency
 

@@ -2239,6 +2239,118 @@ __global__ void sfnn_fold_stacked_param_gradients_to_factorizers_kernel(
     }
 }
 
+__global__ void sfnn_add_saturation_penalty_gradients_kernel(
+    const float* weights,
+    const float* shared_weights,
+    const float* axis_weights,
+    float* weight_gradients,
+    float* shared_weight_gradients,
+    float* axis_weight_gradients,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    int has_shared,
+    int shared_weight_input_major,
+    int has_axis,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float shared_alpha,
+    float king_axis_alpha,
+    float hand_axis_alpha,
+    float progress_axis_alpha,
+    float pair_alpha,
+    float weight_scale,
+    float threshold,
+    float penalty) {
+    const size_t weight_cell_count = input_dim * output_dim;
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    const size_t total = stack_count * weight_cell_count;
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t selected_stack = tid / weight_cell_count;
+    const size_t stack = dirty_count == 0 ? selected_stack : static_cast<size_t>(dirty_buckets[selected_stack]);
+    if (stack >= num_stacks) {
+        return;
+    }
+    const size_t cell = tid - selected_stack * weight_cell_count;
+    const size_t out_col = cell / input_dim;
+    const size_t in_col = cell - out_col * input_dim;
+    const size_t stacked_idx = stack * weight_cell_count + cell;
+    const size_t factorizer_cell = shared_weight_input_major != 0
+        ? in_col * output_dim + out_col
+        : cell;
+
+    float value = weights[stacked_idx];
+    if (has_shared != 0) {
+        value += shared_alpha * shared_weights[factorizer_cell];
+    }
+
+    size_t axis_ids[8];
+    const size_t axis_count = sfnn_factorizer_axis_ids(
+        stack,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        axis_ids);
+    float axis_alphas[8];
+    if (has_axis != 0) {
+        sfnn_factorizer_axis_alphas(
+            axis_ids,
+            axis_count,
+            num_stacks,
+            factorizer_king_axis_dim,
+            factorizer_hand_axis_dim,
+            use_king_hand_pair,
+            use_king_progress_pair,
+            use_hand_progress_pair,
+            king_axis_alpha,
+            hand_axis_alpha,
+            progress_axis_alpha,
+            pair_alpha,
+            axis_alphas);
+        for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
+            value += axis_alphas[axis_idx] * axis_weights[axis_ids[axis_idx] * weight_cell_count + factorizer_cell];
+        }
+    }
+
+    const float q = value * weight_scale;
+    const float excess = fabsf(q) - threshold;
+    if (excess <= 0.0f) {
+        return;
+    }
+
+    const float sign = q < 0.0f ? -1.0f : 1.0f;
+    const float grad = penalty * 2.0f * excess * sign * weight_scale;
+    atomicAdd(&weight_gradients[stacked_idx], grad);
+    if (has_shared != 0) {
+        atomicAdd(&shared_weight_gradients[factorizer_cell], shared_alpha * grad);
+    }
+    if (has_axis != 0) {
+        for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
+            atomicAdd(
+                &axis_weight_gradients[axis_ids[axis_idx] * weight_cell_count + factorizer_cell],
+                axis_alphas[axis_idx] * grad);
+        }
+    }
+}
+
 __global__ void sfnn_stacked_l3_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -4994,6 +5106,105 @@ int launch_sfnn_fold_stacked_param_gradients_to_factorizers(
         hand_axis_alpha,
         progress_axis_alpha,
         pair_alpha);
+    if (check_kernel_launch(label) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_sfnn_add_saturation_penalty_gradients(
+    BulletOuCudaCppContext* ctx,
+    const float* weights,
+    const float* shared_weights,
+    const float* axis_weights,
+    float* weight_gradients,
+    float* shared_weight_gradients,
+    float* axis_weight_gradients,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    int has_shared,
+    int shared_weight_input_major,
+    int has_axis,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float shared_alpha,
+    float king_axis_alpha,
+    float hand_axis_alpha,
+    float progress_axis_alpha,
+    float pair_alpha,
+    float weight_scale,
+    float threshold,
+    float penalty,
+    const char* label) {
+    if (penalty == 0.0f) {
+        return 0;
+    }
+    if (input_dim == 0 || output_dim == 0 || num_stacks == 0) {
+        return fail_message("sfnn saturation penalty dimensions must be non-zero");
+    }
+    if (!(std::isfinite(weight_scale) && weight_scale > 0.0f)) {
+        return fail_message("sfnn saturation penalty weight_scale must be finite and positive");
+    }
+    if (!(std::isfinite(threshold) && threshold > 0.0f && threshold <= 128.0f)) {
+        return fail_message("sfnn saturation penalty threshold must be finite and in (0, 128]");
+    }
+    if (!(std::isfinite(penalty) && penalty >= 0.0f)) {
+        return fail_message("sfnn saturation penalty must be finite and non-negative");
+    }
+    if (input_dim > SIZE_MAX / output_dim) {
+        return fail_message("sfnn saturation penalty weight cell overflow");
+    }
+    const size_t weight_cell_count = input_dim * output_dim;
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    if (stack_count > SIZE_MAX / weight_cell_count) {
+        return fail_message("sfnn saturation penalty total size overflow");
+    }
+    const size_t total = stack_count * weight_cell_count;
+    int blocks = 0;
+    constexpr int threads = 256;
+    if (block_count_1d(total, threads, &blocks, label) != 0) {
+        return -1;
+    }
+    sfnn_add_saturation_penalty_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        weights,
+        shared_weights,
+        axis_weights,
+        weight_gradients,
+        shared_weight_gradients,
+        axis_weight_gradients,
+        dirty_buckets,
+        dirty_count,
+        input_dim,
+        output_dim,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_shared,
+        shared_weight_input_major,
+        has_axis,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        shared_alpha,
+        king_axis_alpha,
+        hand_axis_alpha,
+        progress_axis_alpha,
+        pair_alpha,
+        weight_scale,
+        threshold,
+        penalty);
     if (check_kernel_launch(label) != 0) {
         return -1;
     }
@@ -9102,6 +9313,120 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         zero_parameter_gradients,
         profile_ms,
         profile_ms_len);
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* shared_weights,
+    int has_shared,
+    BulletOuCudaCppF32Buffer* axis_weights,
+    int has_axis,
+    BulletOuCudaCppF32Buffer* gradients,
+    BulletOuCudaCppF32Buffer* shared_gradients,
+    BulletOuCudaCppF32Buffer* axis_gradients,
+    BulletOuCudaCppI32Buffer* dirty_buckets,
+    size_t dirty_count,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float factorizer_shared_alpha,
+    float factorizer_king_axis_alpha,
+    float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
+    float factorizer_pair_alpha,
+    int shared_weight_input_major,
+    float weight_scale,
+    float threshold,
+    float penalty) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (input_dim == 0 || output_dim == 0 || num_stacks == 0) {
+        return fail_message("sfnn saturation penalty dimensions must be non-zero");
+    }
+    if (input_dim > SIZE_MAX / output_dim) {
+        return fail_message("sfnn saturation penalty weight cell overflow");
+    }
+    const size_t weight_cell_count = input_dim * output_dim;
+    if (num_stacks > SIZE_MAX / weight_cell_count) {
+        return fail_message("sfnn saturation penalty weight length overflow");
+    }
+    const size_t weight_total = num_stacks * weight_cell_count;
+    const size_t axis_count = sfnn_factorizer_axis_count(
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair);
+    if (validate_buffer(ctx, weights, weight_total, "sfnn saturation weights") != 0 ||
+        validate_buffer(ctx, gradients, weight_total, "sfnn saturation gradients") != 0) {
+        return -1;
+    }
+    if (has_shared != 0) {
+        if (validate_buffer(ctx, shared_weights, weight_cell_count, "sfnn saturation shared weights") != 0 ||
+            validate_buffer(ctx, shared_gradients, weight_cell_count, "sfnn saturation shared gradients") != 0) {
+            return -1;
+        }
+    }
+    if (has_axis != 0) {
+        if (axis_count == 0 || axis_count > SIZE_MAX / weight_cell_count) {
+            return fail_message("sfnn saturation axis weight length overflow");
+        }
+        const size_t axis_weight_total = axis_count * weight_cell_count;
+        if (validate_buffer(ctx, axis_weights, axis_weight_total, "sfnn saturation axis weights") != 0 ||
+            validate_buffer(ctx, axis_gradients, axis_weight_total, "sfnn saturation axis gradients") != 0) {
+            return -1;
+        }
+    }
+    if (dirty_count != 0 &&
+        validate_i32_buffer(ctx, dirty_buckets, dirty_count, "sfnn saturation dirty_buckets") != 0) {
+        return -1;
+    }
+
+    return launch_sfnn_add_saturation_penalty_gradients(
+        ctx,
+        weights->ptr,
+        has_shared != 0 ? shared_weights->ptr : nullptr,
+        has_axis != 0 ? axis_weights->ptr : nullptr,
+        gradients->ptr,
+        has_shared != 0 ? shared_gradients->ptr : nullptr,
+        has_axis != 0 ? axis_gradients->ptr : nullptr,
+        dirty_count != 0 ? dirty_buckets->ptr : nullptr,
+        dirty_count,
+        input_dim,
+        output_dim,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_shared,
+        shared_weight_input_major,
+        has_axis,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        weight_scale,
+        threshold,
+        penalty,
+        "sfnn saturation penalty gradients");
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(
