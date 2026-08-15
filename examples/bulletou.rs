@@ -1322,6 +1322,131 @@ struct QuantizedTestArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou compare-sfnn-quantization")]
+#[command(
+    about = "Compare fp32 SFNN state.bin outputs with exported quantized nn.bin outputs on the same validation set"
+)]
+struct CompareSfnnQuantizationArgs {
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// C++/CUDA SFNN training checkpoint state (`state.bin`) used for fp32 forward.
+    #[arg(long = "state-bin")]
+    state_bin: PathBuf,
+
+    /// Exported YaneuraOu-compatible quantized `nn.bin` to compare against.
+    #[arg(long = "nn-bin")]
+    nn_bin: PathBuf,
+
+    /// Held-out test set (.hcpe / .psv / .bin).
+    #[arg(long = "test-teacher")]
+    test_teacher: PathBuf,
+
+    /// Number of positions to test. If omitted, all positions in the
+    /// fixed-record validation teacher are used.
+    #[arg(long)]
+    test_positions: Option<usize>,
+
+    /// How to choose validation positions when `--test-positions` is set.
+    /// Omitted `--test-positions` always means all positions.
+    #[arg(long, value_enum, default_value = "sequential")]
+    test_sample: TestSampleMode,
+
+    /// Seed for random validation sampling.
+    #[arg(long, default_value = "0")]
+    test_seed: u64,
+
+    /// Validation forward batch size.
+    #[arg(long, default_value = "65536")]
+    test_batch_size: usize,
+
+    /// Drop positions whose |score| >= this. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+
+    /// YaneuraOu FV_SCALE used by train-scale loss conversion.
+    #[arg(long, default_value = "40")]
+    fv_scale: i32,
+
+    /// Lambda used by the validation loss target.
+    #[arg(long, default_value = "1.0")]
+    lambda: f32,
+
+    /// Teacher eval-score to win-rate sigmoid scale used by the validation loss target.
+    #[arg(long, default_value = "600")]
+    scale: u32,
+
+    /// Exponent of the probability-space error term `|prediction - target|^p`.
+    #[arg(long, default_value = "2.0")]
+    loss_pow_exp: f32,
+
+    /// Use tatara-style WRM loss for loss reporting. This is the default;
+    /// use `--loss-sigmoid-mse` to force plain sigmoid loss.
+    #[arg(long, conflicts_with = "loss_sigmoid_mse")]
+    win_rate_model: bool,
+
+    /// Force plain sigmoid probability loss instead of WRM for loss reporting.
+    #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
+    loss_sigmoid_mse: bool,
+
+    /// WRM prediction-side output scale for train-scale raw output.
+    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
+    wrm_nnue2score: f32,
+
+    /// WRM prediction-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_OFFSET)]
+    wrm_in_offset: f32,
+
+    /// WRM prediction-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_SCALING)]
+    wrm_in_scaling: f32,
+
+    /// WRM target-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_OFFSET)]
+    wrm_target_offset: f32,
+
+    /// WRM target-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
+    wrm_target_scaling: f32,
+
+    /// Factorizer interpretation used while loading the fp32 state.
+    #[arg(long = "sfnn-factorizer", default_value = "shared")]
+    sfnn_factorizer: String,
+
+    /// Factorizer alpha used while forwarding the fp32 state.
+    #[arg(long = "sfnn-factorizer-alpha", default_value = "1.0")]
+    sfnn_factorizer_alpha: String,
+
+    /// Quantized forward path. `gpu` matches live qvalid; `cpu-exact`
+    /// emulates YaneuraOu's integer path and is slower.
+    #[arg(long, value_enum, default_value = "gpu")]
+    mode: QuantizedTestMode,
+
+    /// CUDA device used by fp32 forward and `--mode gpu`.
+    #[arg(long, default_value_t = 0)]
+    cuda_cpp_device: i32,
+
+    /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
+    #[arg(long, default_value = "7")]
+    sfnn_ft_shift: u32,
+
+    /// Rounding mode for the SFNN feature-transform product.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_ft_round: QuantizedRoundMode,
+
+    /// Rounding mode for hidden-layer ClippedReLU right shifts.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_crelu_round: QuantizedRoundMode,
+
+    /// Rounding mode for hidden-layer SqrClippedReLU right shifts.
+    #[arg(long, value_enum, default_value = "floor")]
+    quant_sqrcrelu_round: QuantizedRoundMode,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou average-sfnn-state")]
 #[command(about = "Average multiple cuda-cpp SFNN state.bin files and export one quantized nn.bin")]
 struct AverageSfnnStateArgs {
@@ -1490,6 +1615,134 @@ impl QuantizedTestArgs {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl CompareSfnnQuantizationArgs {
+    fn validate(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; compare-sfnn-quantization supports only SFNN",
+                self.arch.cli_name()
+            ));
+        }
+        if self.test_batch_size == 0 {
+            return Err("--test-batch-size must be > 0".to_string());
+        }
+        if self.fv_scale <= 0 {
+            return Err("--fv-scale must be > 0".to_string());
+        }
+        if self.scale == 0 {
+            return Err("--scale must be > 0".to_string());
+        }
+        if !(self.lambda.is_finite() && (0.0..=1.0).contains(&self.lambda)) {
+            return Err(format!("--lambda must be finite and in [0, 1] (got {})", self.lambda));
+        }
+        if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
+            return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
+        }
+        let _ = self.sfnn_factorizer.parse::<SfnnFactorizerSpec>()?;
+        let factorizer_alpha = self.sfnn_factorizer_alpha.parse::<SfnnFactorizerAlphaSpec>()?;
+        if self.sfnn_factorizer.eq_ignore_ascii_case("none") && !factorizer_alpha.is_default() {
+            return Err("--sfnn-factorizer-alpha is meaningful only when --sfnn-factorizer is active".to_string());
+        }
+        if self.win_rate_model && self.loss_sigmoid_mse {
+            return Err("--win-rate-model and --loss-sigmoid-mse are mutually exclusive".to_string());
+        }
+        if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
+            return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
+        }
+        if !self.wrm_in_offset.is_finite() {
+            return Err(format!("--wrm-in-offset must be finite (got {})", self.wrm_in_offset));
+        }
+        if !(self.wrm_in_scaling.is_finite() && self.wrm_in_scaling > 0.0) {
+            return Err(format!("--wrm-in-scaling must be finite and > 0 (got {})", self.wrm_in_scaling));
+        }
+        if !self.wrm_target_offset.is_finite() {
+            return Err(format!("--wrm-target-offset must be finite (got {})", self.wrm_target_offset));
+        }
+        if !(self.wrm_target_scaling.is_finite() && self.wrm_target_scaling > 0.0) {
+            return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
+        }
+        Ok(())
+    }
+
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn training_args(&self) -> Result<Args, String> {
+        let raw = vec![
+            "bulletou".to_string(),
+            "--backend".to_string(),
+            "cuda-cpp".to_string(),
+            "--teacher".to_string(),
+            "-".to_string(),
+            "--arch".to_string(),
+            self.arch.cli_name(),
+            "--sfnn-factorizer".to_string(),
+            self.sfnn_factorizer.clone(),
+            "--sfnn-factorizer-alpha".to_string(),
+            self.sfnn_factorizer_alpha.clone(),
+            "--fv-scale".to_string(),
+            self.fv_scale.to_string(),
+            "--scale".to_string(),
+            self.scale.to_string(),
+            "--wrm-nnue2score".to_string(),
+            self.wrm_nnue2score.to_string(),
+            "--wrm-in-offset".to_string(),
+            self.wrm_in_offset.to_string(),
+            "--wrm-in-scaling".to_string(),
+            self.wrm_in_scaling.to_string(),
+            "--wrm-target-offset".to_string(),
+            self.wrm_target_offset.to_string(),
+            "--wrm-target-scaling".to_string(),
+            self.wrm_target_scaling.to_string(),
+            "--loss-pow-exp".to_string(),
+            self.loss_pow_exp.to_string(),
+        ];
+        let mut parsed = Args::try_parse_from(raw).map_err(|err| err.to_string())?;
+        parsed.cuda_cpp_device = self.cuda_cpp_device;
+        parsed.lambda = self.lambda;
+        if self.win_rate_model {
+            parsed.win_rate_model = true;
+        }
+        if self.loss_sigmoid_mse {
+            parsed.loss_sigmoid_mse = true;
+        }
+        Ok(parsed)
+    }
+
+    fn as_quantized_test_args(&self) -> QuantizedTestArgs {
+        QuantizedTestArgs {
+            arch: self.arch,
+            nn_bin: self.nn_bin.clone(),
+            test_teacher: self.test_teacher.clone(),
+            test_positions: self.test_positions,
+            test_sample: self.test_sample,
+            test_seed: self.test_seed,
+            score_drop_abs: self.score_drop_abs,
+            fv_scale: self.fv_scale,
+            sfnn_ft_shift: self.sfnn_ft_shift,
+            lambda: self.lambda,
+            scale: self.scale,
+            loss_pow_exp: self.loss_pow_exp,
+            win_rate_model: self.win_rate_model,
+            loss_sigmoid_mse: self.loss_sigmoid_mse,
+            wrm_nnue2score: self.wrm_nnue2score,
+            wrm_in_offset: self.wrm_in_offset,
+            wrm_in_scaling: self.wrm_in_scaling,
+            wrm_target_offset: self.wrm_target_offset,
+            wrm_target_scaling: self.wrm_target_scaling,
+            mode: self.mode,
+            cuda_cpp_device: self.cuda_cpp_device,
+            quant_ft_round: self.quant_ft_round,
+            quant_crelu_round: self.quant_crelu_round,
+            quant_sqrcrelu_round: self.quant_sqrcrelu_round,
+            quant_final_div_round: QuantizedRoundMode::Floor,
+            engine_score_offset: 0.0,
+        }
     }
 }
 
@@ -3566,7 +3819,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf                Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test      Measure accuracy/loss using an exported quantized SFNN nn.bin\n  calibrate-nn-bin    Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state  Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -6090,6 +6343,476 @@ fn quantized_test_report_from_outputs(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy)]
+struct FloatDistributionSummary {
+    mean: f64,
+    mean_abs: f64,
+    rms: f64,
+    min: f32,
+    max: f32,
+    p50_abs: f32,
+    p90_abs: f32,
+    p99_abs: f32,
+    max_abs: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy)]
+struct SignedDeltaSummary {
+    mean: f64,
+    mean_abs: f64,
+    rms: f64,
+    min: f32,
+    p10: f32,
+    p50: f32,
+    p90: f32,
+    max: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy, Default)]
+struct SignComparisonSummary {
+    compared: usize,
+    both_correct: usize,
+    fp32_only_correct: usize,
+    quantized_only_correct: usize,
+    both_wrong: usize,
+    sign_flips: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy, Default)]
+struct LossComparisonSummary {
+    compared: usize,
+    quantized_lower: usize,
+    fp32_lower: usize,
+    equal: usize,
+    delta: SignedDeltaSummary,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug)]
+struct CompareSfnnQuantizationReport {
+    records: usize,
+    fp32: AccuracyReport,
+    quantized: AccuracyReport,
+    fp32_outputs: FloatDistributionSummary,
+    quantized_outputs: FloatDistributionSummary,
+    output_delta: SignedDeltaSummary,
+    sign: SignComparisonSummary,
+    loss: LossComparisonSummary,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl Default for SignedDeltaSummary {
+    fn default() -> Self {
+        Self { mean: 0.0, mean_abs: 0.0, rms: 0.0, min: 0.0, p10: 0.0, p50: 0.0, p90: 0.0, max: 0.0 }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn percentile_sorted(sorted: &[f32], p: f32) -> f32 {
+    if sorted.is_empty() {
+        return f32::NAN;
+    }
+    let p = p.clamp(0.0, 1.0);
+    let index = ((sorted.len() - 1) as f32 * p).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn summarize_float_distribution(values: &[f32]) -> FloatDistributionSummary {
+    if values.is_empty() {
+        return FloatDistributionSummary {
+            mean: f64::NAN,
+            mean_abs: f64::NAN,
+            rms: f64::NAN,
+            min: f32::NAN,
+            max: f32::NAN,
+            p50_abs: f32::NAN,
+            p90_abs: f32::NAN,
+            p99_abs: f32::NAN,
+            max_abs: f32::NAN,
+        };
+    }
+    let mut sum = 0.0f64;
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut abs_values = Vec::with_capacity(values.len());
+    for &value in values {
+        let value64 = f64::from(value);
+        let abs = value.abs();
+        sum += value64;
+        sum_abs += f64::from(abs);
+        sum_sq += value64 * value64;
+        min = min.min(value);
+        max = max.max(value);
+        abs_values.push(abs);
+    }
+    abs_values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len() as f64;
+    FloatDistributionSummary {
+        mean: sum / n,
+        mean_abs: sum_abs / n,
+        rms: (sum_sq / n).sqrt(),
+        min,
+        max,
+        p50_abs: percentile_sorted(&abs_values, 0.50),
+        p90_abs: percentile_sorted(&abs_values, 0.90),
+        p99_abs: percentile_sorted(&abs_values, 0.99),
+        max_abs: *abs_values.last().unwrap_or(&f32::NAN),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn summarize_signed_delta(values: &[f32]) -> SignedDeltaSummary {
+    if values.is_empty() {
+        return SignedDeltaSummary::default();
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mut sum = 0.0f64;
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for &value in values {
+        let value64 = f64::from(value);
+        sum += value64;
+        sum_abs += f64::from(value.abs());
+        sum_sq += value64 * value64;
+    }
+    let n = values.len() as f64;
+    SignedDeltaSummary {
+        mean: sum / n,
+        mean_abs: sum_abs / n,
+        rms: (sum_sq / n).sqrt(),
+        min: *sorted.first().unwrap_or(&0.0),
+        p10: percentile_sorted(&sorted, 0.10),
+        p50: percentile_sorted(&sorted, 0.50),
+        p90: percentile_sorted(&sorted, 0.90),
+        max: *sorted.last().unwrap_or(&0.0),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[inline]
+fn validation_diag_sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[inline]
+fn validation_diag_wrm_probability(score: f32, offset: f32, scaling: f32) -> f32 {
+    let q = (score - offset) / scaling;
+    let qm = (-score - offset) / scaling;
+    0.5 * (1.0 + validation_diag_sigmoid(q) - validation_diag_sigmoid(qm))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn validation_diag_sample_loss(
+    model_output: f32,
+    teacher_score: i16,
+    teacher_result: i8,
+    lambda: f32,
+    eval_scale: f32,
+    model_output_scale: f32,
+    loss_kind: ValidationLossKind,
+) -> f32 {
+    let blend = 1.0 - lambda;
+    let result_norm = match teacher_result.signum() {
+        1 => 1.0,
+        -1 => 0.0,
+        _ => 0.5,
+    };
+    let score_norm = match loss_kind {
+        ValidationLossKind::SigmoidPow { .. } => {
+            let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
+            validation_diag_sigmoid(inv_scale * f32::from(teacher_score))
+        }
+        ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(teacher_score)),
+    };
+    let target = blend * result_norm + (1.0 - blend) * score_norm;
+    let model_p = match loss_kind {
+        ValidationLossKind::SigmoidPow { .. } => {
+            let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
+            validation_diag_sigmoid(model_output * model_inv_scale)
+        }
+        ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
+            validation_diag_wrm_probability(model_output * nnue2score, in_offset, in_scaling)
+        }
+    };
+    let diff = model_p - target;
+    match loss_kind {
+        ValidationLossKind::SigmoidPow { pow_exp } | ValidationLossKind::WinRateModel { pow_exp, .. } => {
+            diff.abs().powf(pow_exp)
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_compare_sfnn_quantization_positions(
+    args: &CompareSfnnQuantizationArgs,
+) -> Result<Vec<bulletou_lib::shogi::PackedSfenValue>, String> {
+    let teacher = args
+        .test_teacher
+        .to_str()
+        .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
+    match args.test_positions {
+        None => read_all_teacher_positions(teacher),
+        Some(n) => match args.test_sample {
+            TestSampleMode::Random => read_random_teacher_positions(teacher, n, args.test_seed),
+            TestSampleMode::Sequential => read_teacher_positions_prefix(teacher, n),
+        },
+    }
+    .map_err(|err| format!("failed to read validation teacher {}: {err}", args.test_teacher.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_state_forward_outputs(
+    args: &CompareSfnnQuantizationArgs,
+    train_args: &Args,
+    feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+) -> Result<Vec<f32>, String> {
+    let state = load_cuda_cpp_sfnn_initial_state(&args.state_bin, train_args, feature_kind)?;
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, state.weights.as_host())
+        .map_err(|e| e.to_string())?;
+    let factorizer = cuda_cpp_sfnn_factorizer_active(train_args);
+    let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(train_args);
+    let mut outputs = Vec::with_capacity(positions.len());
+    for chunk in positions.chunks(args.test_batch_size) {
+        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, chunk)?;
+        let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                buckets: &batch.buckets,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(state.weights.shape, batch.layout.batch_size),
+        )
+        .map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::sfnn_forward_device_with_factorizer_and_alpha(
+            &ctx,
+            &device_batch,
+            &device_weights,
+            &workspace,
+            factorizer,
+            factorizer_alpha,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut chunk_outputs = vec![0.0f32; batch.layout.batch_size];
+        workspace.output.download_prefix(&ctx, &mut chunk_outputs).map_err(|e| e.to_string())?;
+        outputs.append(&mut chunk_outputs);
+    }
+    Ok(outputs)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_train_scale_outputs_cpu_exact(
+    weights: &QuantizedSfnnWeights,
+    args: &CompareSfnnQuantizationArgs,
+    feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    test_args: &QuantizedTestArgs,
+) -> Result<Vec<f32>, String> {
+    let raw_scale = quantized_sfnn_raw_output_scale();
+    let mut outputs = Vec::with_capacity(positions.len());
+    for chunk in positions.chunks(args.test_batch_size) {
+        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, chunk)?;
+        let raw_outputs = quantized_sfnn_forward_outputs(weights, &batch, test_args)?;
+        outputs.extend(raw_outputs.into_iter().map(|out| out.raw as f32 / raw_scale));
+    }
+    Ok(outputs)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_train_scale_outputs_gpu_proxy(
+    weights: &QuantizedSfnnWeights,
+    args: &CompareSfnnQuantizationArgs,
+    feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+) -> Result<Vec<f32>, String> {
+    let proxy_weights = cuda_cpp_sfnn_dequantize_proxy_weights(weights)?;
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, proxy_weights.as_host())
+        .map_err(|e| e.to_string())?;
+    let mut outputs = Vec::with_capacity(positions.len());
+    for chunk in positions.chunks(args.test_batch_size) {
+        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, chunk)?;
+        let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardHostBatch {
+                stm_indices: &batch.stm,
+                nstm_indices: &batch.nstm,
+                buckets: &batch.buckets,
+                batch_size: batch.layout.batch_size,
+                max_active: batch.layout.max_active,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+            &ctx,
+            bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(proxy_weights.shape, batch.layout.batch_size),
+        )
+        .map_err(|e| e.to_string())?;
+        bulletou_cuda_cpp::sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace)
+            .map_err(|e| e.to_string())?;
+        let mut chunk_outputs = vec![0.0f32; batch.layout.batch_size];
+        workspace.output.download_prefix(&ctx, &mut chunk_outputs).map_err(|e| e.to_string())?;
+        outputs.append(&mut chunk_outputs);
+    }
+    Ok(outputs)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_compare_sfnn_quantization(args: &CompareSfnnQuantizationArgs) -> Result<CompareSfnnQuantizationReport, String> {
+    args.validate()?;
+    let train_args = args.training_args()?;
+    let test_args = args.as_quantized_test_args();
+    test_args.validate_arch_flags()?;
+
+    let layerstack = args.effective_layerstack();
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
+    let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
+    if let Some(params) = &weights.progress_params {
+        set_shogi_sfnn_progress_q16_params(params.clone())?;
+    } else if let Some(params) = sfnn_progress_params_for_layerstack(layerstack) {
+        set_shogi_sfnn_progress_q16_params(params)?;
+    }
+
+    let positions = read_compare_sfnn_quantization_positions(args)?;
+    if positions.is_empty() {
+        return Err("validation teacher produced no positions".to_string());
+    }
+    let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+    let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
+    let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
+    let sample_mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
+
+    let fp32_outputs = sfnn_state_forward_outputs(args, &train_args, feature_kind, layerstack, &positions)?;
+    let quantized_outputs = match args.mode {
+        QuantizedTestMode::CpuExact => quantized_sfnn_train_scale_outputs_cpu_exact(
+            &weights,
+            args,
+            feature_kind,
+            layerstack,
+            &positions,
+            &test_args,
+        )?,
+        QuantizedTestMode::Gpu => {
+            quantized_sfnn_train_scale_outputs_gpu_proxy(&weights, args, feature_kind, layerstack, &positions)?
+        }
+    };
+    if fp32_outputs.len() != quantized_outputs.len() {
+        return Err(format!(
+            "fp32/quantized output length mismatch: {} vs {}",
+            fp32_outputs.len(),
+            quantized_outputs.len()
+        ));
+    }
+
+    let loss_kind = quantized_train_scale_loss_kind(&test_args);
+    let model_output_scale = quantized_train_scale_model_output_scale(&test_args);
+    let fp32 = compute_sign_accuracy_with_loss_masked(
+        &fp32_outputs,
+        &teacher_scores,
+        &teacher_results,
+        &sample_mask,
+        args.lambda,
+        args.scale as f32,
+        model_output_scale,
+        loss_kind,
+    );
+    let quantized = compute_sign_accuracy_with_loss_masked(
+        &quantized_outputs,
+        &teacher_scores,
+        &teacher_results,
+        &sample_mask,
+        args.lambda,
+        args.scale as f32,
+        model_output_scale,
+        loss_kind,
+    );
+
+    let mut output_deltas = Vec::with_capacity(fp32_outputs.len());
+    for (&q, &f) in quantized_outputs.iter().zip(fp32_outputs.iter()) {
+        output_deltas.push(q - f);
+    }
+
+    let mut sign = SignComparisonSummary { compared: sample_mask.compared(), ..SignComparisonSummary::default() };
+    for &i in &sample_mask.accuracy_indices {
+        let truth = teacher_results[i] > 0;
+        let fp32_pred = fp32_outputs[i] >= 0.0;
+        let quantized_pred = quantized_outputs[i] >= 0.0;
+        if fp32_pred != quantized_pred {
+            sign.sign_flips += 1;
+        }
+        match (fp32_pred == truth, quantized_pred == truth) {
+            (true, true) => sign.both_correct += 1,
+            (true, false) => sign.fp32_only_correct += 1,
+            (false, true) => sign.quantized_only_correct += 1,
+            (false, false) => sign.both_wrong += 1,
+        }
+    }
+
+    let mut loss_deltas = Vec::with_capacity(sample_mask.loss_indices.len());
+    let mut loss = LossComparisonSummary { compared: sample_mask.loss_sampled(), ..LossComparisonSummary::default() };
+    for &i in &sample_mask.loss_indices {
+        let fp32_loss = validation_diag_sample_loss(
+            fp32_outputs[i],
+            teacher_scores[i],
+            teacher_results[i],
+            args.lambda,
+            args.scale as f32,
+            model_output_scale,
+            loss_kind,
+        );
+        let quantized_loss = validation_diag_sample_loss(
+            quantized_outputs[i],
+            teacher_scores[i],
+            teacher_results[i],
+            args.lambda,
+            args.scale as f32,
+            model_output_scale,
+            loss_kind,
+        );
+        let delta = quantized_loss - fp32_loss;
+        if delta < -1.0e-12 {
+            loss.quantized_lower += 1;
+        } else if delta > 1.0e-12 {
+            loss.fp32_lower += 1;
+        } else {
+            loss.equal += 1;
+        }
+        loss_deltas.push(delta);
+    }
+    loss.delta = summarize_signed_delta(&loss_deltas);
+
+    Ok(CompareSfnnQuantizationReport {
+        records: positions.len(),
+        fp32,
+        quantized,
+        fp32_outputs: summarize_float_distribution(&fp32_outputs),
+        quantized_outputs: summarize_float_distribution(&quantized_outputs),
+        output_delta: summarize_signed_delta(&output_deltas),
+        sign,
+        loss,
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug)]
 struct AverageSfnnStateReport {
     output: PathBuf,
@@ -7874,6 +8597,105 @@ fn main() {
         #[cfg(not(feature = "cuda-cpp-backend"))]
         {
             eprintln!("error: quantized-test requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("compare-sfnn-quantization")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou compare-sfnn-quantization");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = CompareSfnnQuantizationArgs::parse_from(raw_args);
+            match run_compare_sfnn_quantization(&args) {
+                Ok(report) => {
+                    println!("compare-sfnn-quantization complete:");
+                    println!("  arch              = {}", args.arch);
+                    println!("  layerstack        = {}", args.effective_layerstack().cli_name());
+                    println!("  state_bin         = {}", args.state_bin.display());
+                    println!("  nn_bin            = {}", args.nn_bin.display());
+                    println!("  test_teacher      = {}", args.test_teacher.display());
+                    println!("  records           = {}", format_count(report.records));
+                    println!("  mode              = {}", args.mode.cli_name());
+                    println!("  factorizer        = {}", args.sfnn_factorizer);
+                    println!("  factorizer_alpha  = {}", args.sfnn_factorizer_alpha);
+                    println!(
+                        "  fp32              = acc {:.4}%  loss {:.8}  n={}",
+                        report.fp32.accuracy() * 100.0,
+                        report.fp32.test_loss.unwrap_or(f32::NAN),
+                        format_count(report.fp32.loss_sampled)
+                    );
+                    println!(
+                        "  quantized         = acc {:.4}%  loss {:.8}  n={}",
+                        report.quantized.accuracy() * 100.0,
+                        report.quantized.test_loss.unwrap_or(f32::NAN),
+                        format_count(report.quantized.loss_sampled)
+                    );
+                    println!(
+                        "  delta             = q-fp32 loss mean {:+.8}  p10 {:+.8}  p50 {:+.8}  p90 {:+.8}",
+                        report.loss.delta.mean, report.loss.delta.p10, report.loss.delta.p50, report.loss.delta.p90
+                    );
+                    println!(
+                        "  loss counts       = q_lower {}  fp32_lower {}  equal {} / {}",
+                        format_count(report.loss.quantized_lower),
+                        format_count(report.loss.fp32_lower),
+                        format_count(report.loss.equal),
+                        format_count(report.loss.compared)
+                    );
+                    println!(
+                        "  sign counts       = both_ok {}  fp32_only {}  q_only {}  both_bad {}  flips {} / {}",
+                        format_count(report.sign.both_correct),
+                        format_count(report.sign.fp32_only_correct),
+                        format_count(report.sign.quantized_only_correct),
+                        format_count(report.sign.both_wrong),
+                        format_count(report.sign.sign_flips),
+                        format_count(report.sign.compared)
+                    );
+                    println!(
+                        "  output fp32       = mean {:+.6}  mean_abs {:.6}  rms {:.6}  min {:+.6}  max {:+.6}  |p50/p90/p99/max| {:.6}/{:.6}/{:.6}/{:.6}",
+                        report.fp32_outputs.mean,
+                        report.fp32_outputs.mean_abs,
+                        report.fp32_outputs.rms,
+                        report.fp32_outputs.min,
+                        report.fp32_outputs.max,
+                        report.fp32_outputs.p50_abs,
+                        report.fp32_outputs.p90_abs,
+                        report.fp32_outputs.p99_abs,
+                        report.fp32_outputs.max_abs,
+                    );
+                    println!(
+                        "  output quantized  = mean {:+.6}  mean_abs {:.6}  rms {:.6}  min {:+.6}  max {:+.6}  |p50/p90/p99/max| {:.6}/{:.6}/{:.6}/{:.6}",
+                        report.quantized_outputs.mean,
+                        report.quantized_outputs.mean_abs,
+                        report.quantized_outputs.rms,
+                        report.quantized_outputs.min,
+                        report.quantized_outputs.max,
+                        report.quantized_outputs.p50_abs,
+                        report.quantized_outputs.p90_abs,
+                        report.quantized_outputs.p99_abs,
+                        report.quantized_outputs.max_abs,
+                    );
+                    println!(
+                        "  output delta      = mean {:+.8}  mean_abs {:.8}  rms {:.8}  min {:+.8}  p50 {:+.8}  max {:+.8}",
+                        report.output_delta.mean,
+                        report.output_delta.mean_abs,
+                        report.output_delta.rms,
+                        report.output_delta.min,
+                        report.output_delta.p50,
+                        report.output_delta.max,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: compare-sfnn-quantization failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: compare-sfnn-quantization requires building with --features cuda-cpp-backend");
             std::process::exit(2);
         }
         return;
@@ -24371,6 +25193,40 @@ mod tests {
         .unwrap();
         assert!(matches!(quantized_train_scale_loss_kind(&sigmoid), ValidationLossKind::SigmoidPow { .. }));
         assert!(matches!(quantized_engine_scale_loss_kind(&sigmoid), ValidationLossKind::SigmoidPow { .. }));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn compare_sfnn_quantization_cli_accepts_factorizer_and_wrm_flags() {
+        use clap::Parser as _;
+
+        let args = CompareSfnnQuantizationArgs::try_parse_from([
+            "bulletou compare-sfnn-quantization",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--state-bin",
+            "state.bin",
+            "--nn-bin",
+            "nn.bin",
+            "--test-teacher",
+            "test.hcpe",
+            "--sfnn-factorizer",
+            "pair",
+            "--sfnn-factorizer-alpha",
+            "all=3.0",
+            "--wrm-in-offset",
+            "0",
+            "--wrm-target-offset",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.mode, QuantizedTestMode::Gpu);
+        assert_eq!(args.sfnn_factorizer, "pair");
+        assert_eq!(args.sfnn_factorizer_alpha, "all=3.0");
+        assert_eq!(args.wrm_in_offset, 0.0);
+        assert_eq!(args.wrm_target_offset, 0.0);
+        assert!(args.validate().is_ok());
     }
 
     #[test]
