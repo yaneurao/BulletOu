@@ -280,6 +280,22 @@ To set every factorizer term to the same strength:
 --sfnn-factorizer-alpha 0.90
 ```
 
+You can write the same idea explicitly with `all=`, which is often easier to read in experiment notes.
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0
+```
+
+Later keys override earlier ones, so you can set a common value first and then adjust one group.
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0,pair=4.0
+```
+
+In this example, `shared` and `axis` use 3.0, while `pair` uses 4.0.
+
 When an architecture combines several bucket axes, such as `hand1024` and `progress8`, you can also try two-axis factorizers.
 
 ```bash

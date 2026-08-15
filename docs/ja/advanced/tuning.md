@@ -266,6 +266,22 @@ progress axis だけを強める場合:
 --sfnn-factorizer-alpha 0.90
 ```
 
+同じ意味を、明示的に `all=` で書くこともできます。実験メモとして残すなら、こちらのほうが意図が読み取りやすいです。
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0
+```
+
+`all=` のあとに個別指定を書くと、その成分だけ上書きされます。
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0,pair=4.0
+```
+
+この例では `shared` と `axis` は3.0、`pair` は4.0になります。
+
 `hand1024` と `progress8` のように複数のbucket軸を組み合わせる場合は、2軸factorizerも試せます。
 
 ```bash
