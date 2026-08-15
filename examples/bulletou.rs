@@ -1322,6 +1322,21 @@ struct QuantizedTestArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou quantized-weight-stats")]
+#[command(about = "Print layer-wise integer saturation statistics for an exported SFNN nn.bin")]
+struct QuantizedWeightStatsArgs {
+    /// Network architecture in YaneuraOu Makefile form with the
+    /// `YANEURAOU_ENGINE_` prefix removed.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// Exported YaneuraOu-compatible quantized `nn.bin` to inspect.
+    #[arg(long = "nn-bin")]
+    nn_bin: PathBuf,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou compare-sfnn-quantization")]
 #[command(
     about = "Compare fp32 SFNN state.bin outputs with exported quantized nn.bin outputs on the same validation set"
@@ -1613,6 +1628,23 @@ impl QuantizedTestArgs {
         }
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedWeightStatsArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; quantized-weight-stats currently supports only SFNN nn.bin layouts",
+                self.arch.cli_name()
+            ));
         }
         Ok(())
     }
@@ -3819,7 +3851,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -5668,6 +5700,124 @@ impl QuantizedSfnnWeights {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Copy, Debug, Default)]
+struct QuantizedIntegerLayerStats {
+    len: usize,
+    nonzero: usize,
+    min: i32,
+    max: i32,
+    sat_neg: usize,
+    sat_pos: usize,
+    mean_abs: f64,
+    rms: f64,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedIntegerLayerStats {
+    fn sat_total(self) -> usize {
+        self.sat_neg + self.sat_pos
+    }
+
+    fn sat_percent(self) -> f64 {
+        if self.len == 0 { f64::NAN } else { 100.0 * self.sat_total() as f64 / self.len as f64 }
+    }
+
+    fn nonzero_percent(self) -> f64 {
+        if self.len == 0 { f64::NAN } else { 100.0 * self.nonzero as f64 / self.len as f64 }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug)]
+struct QuantizedSfnnWeightStats {
+    l0w_i16: QuantizedIntegerLayerStats,
+    l1w_i8: QuantizedIntegerLayerStats,
+    l2w_i8: QuantizedIntegerLayerStats,
+    l3w_i8: QuantizedIntegerLayerStats,
+    all_i8: QuantizedIntegerLayerStats,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_integer_stats<I>(values: I, len: usize, min_value: i32, max_value: i32) -> QuantizedIntegerLayerStats
+where
+    I: IntoIterator<Item = i32>,
+{
+    if len == 0 {
+        return QuantizedIntegerLayerStats::default();
+    }
+    let mut nonzero = 0usize;
+    let mut min_seen = i32::MAX;
+    let mut max_seen = i32::MIN;
+    let mut sat_neg = 0usize;
+    let mut sat_pos = 0usize;
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for value in values {
+        if value != 0 {
+            nonzero += 1;
+        }
+        if value == min_value {
+            sat_neg += 1;
+        }
+        if value == max_value {
+            sat_pos += 1;
+        }
+        min_seen = min_seen.min(value);
+        max_seen = max_seen.max(value);
+        sum_abs += f64::from(value.abs());
+        let value64 = f64::from(value);
+        sum_sq += value64 * value64;
+    }
+    QuantizedIntegerLayerStats {
+        len,
+        nonzero,
+        min: min_seen,
+        max: max_seen,
+        sat_neg,
+        sat_pos,
+        mean_abs: sum_abs / len as f64,
+        rms: (sum_sq / len as f64).sqrt(),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_weight_stats(weights: &QuantizedSfnnWeights) -> QuantizedSfnnWeightStats {
+    let all_i8_len = weights.l1w.len() + weights.l2w.len() + weights.l3w.len();
+    QuantizedSfnnWeightStats {
+        l0w_i16: quantized_integer_stats(
+            weights.l0w.iter().map(|&v| i32::from(v)),
+            weights.l0w.len(),
+            i16::MIN as i32,
+            i16::MAX as i32,
+        ),
+        l1w_i8: quantized_integer_stats(
+            weights.l1w.iter().map(|&v| i32::from(v)),
+            weights.l1w.len(),
+            i8::MIN as i32,
+            i8::MAX as i32,
+        ),
+        l2w_i8: quantized_integer_stats(
+            weights.l2w.iter().map(|&v| i32::from(v)),
+            weights.l2w.len(),
+            i8::MIN as i32,
+            i8::MAX as i32,
+        ),
+        l3w_i8: quantized_integer_stats(
+            weights.l3w.iter().map(|&v| i32::from(v)),
+            weights.l3w.len(),
+            i8::MIN as i32,
+            i8::MAX as i32,
+        ),
+        all_i8: quantized_integer_stats(
+            weights.l1w.iter().chain(weights.l2w.iter()).chain(weights.l3w.iter()).map(|&v| i32::from(v)),
+            all_i8_len,
+            i8::MIN as i32,
+            i8::MAX as i32,
+        ),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
 struct QuantizedTestReport {
     records: usize,
     engine_scale: AccuracyReport,
@@ -6340,6 +6490,30 @@ fn quantized_test_report_from_outputs(
         train_scale: train_scale_report,
         elapsed: std::time::Duration::default(),
     })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_quantized_weight_stats(args: &QuantizedWeightStatsArgs) -> Result<QuantizedSfnnWeightStats, String> {
+    args.validate_arch_flags()?;
+    let layerstack = args.effective_layerstack();
+    let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
+    Ok(quantized_sfnn_weight_stats(&weights))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_quantized_integer_layer_stats(label: &str, stats: QuantizedIntegerLayerStats) {
+    println!(
+        "  {label:<8} len={} nonzero={:.2}% sat={:.6}% (-={} +={}) min={} max={} mean_abs={:.3} rms={:.3}",
+        format_count(stats.len),
+        stats.nonzero_percent(),
+        stats.sat_percent(),
+        format_count(stats.sat_neg),
+        format_count(stats.sat_pos),
+        stats.min,
+        stats.max,
+        stats.mean_abs,
+        stats.rms,
+    );
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8743,6 +8917,39 @@ fn main() {
         #[cfg(not(feature = "cuda-cpp-backend"))]
         {
             eprintln!("error: quantized-test requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("quantized-weight-stats")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou quantized-weight-stats");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = QuantizedWeightStatsArgs::parse_from(raw_args);
+            match run_quantized_weight_stats(&args) {
+                Ok(stats) => {
+                    println!("quantized-weight-stats complete:");
+                    println!("  arch              = {}", args.arch);
+                    println!("  layerstack        = {}", args.effective_layerstack().cli_name());
+                    println!("  nn_bin            = {}", args.nn_bin.display());
+                    print_quantized_integer_layer_stats("l0w i16", stats.l0w_i16);
+                    print_quantized_integer_layer_stats("l1w i8", stats.l1w_i8);
+                    print_quantized_integer_layer_stats("l2w i8", stats.l2w_i8);
+                    print_quantized_integer_layer_stats("l3w i8", stats.l3w_i8);
+                    print_quantized_integer_layer_stats("all i8", stats.all_i8);
+                }
+                Err(e) => {
+                    eprintln!("error: quantized-weight-stats failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: quantized-weight-stats requires building with --features cuda-cpp-backend");
             std::process::exit(2);
         }
         return;
@@ -25391,6 +25598,24 @@ mod tests {
         assert_eq!(args.wrm_in_offset, 0.0);
         assert_eq!(args.wrm_target_offset, 0.0);
         assert!(args.validate().is_ok());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_weight_stats_cli_accepts_sfnn_nn_bin() {
+        use clap::Parser as _;
+
+        let args = QuantizedWeightStatsArgs::try_parse_from([
+            "bulletou quantized-weight-stats",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--nn-bin",
+            "nn.bin",
+        ])
+        .unwrap();
+
+        assert_eq!(args.effective_layerstack().cli_name(), "hand1024_k3k3_progress4");
+        assert!(args.validate_arch_flags().is_ok());
     }
 
     #[test]
