@@ -77,6 +77,7 @@ Fuller option table:
 | `--loss-sigmoid-mse` | Use plain sigmoid loss instead of WRM | off |
 | `--scale` | Target scale for `--loss-sigmoid-mse` | 600 |
 | `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
+| `--quantized-validation-rate` | How often to run approximate post-quantization accuracy/loss during training | saved checkpoints only |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
 | `--sfnn-factorizer-alpha` | How strongly factorizer components contribute | 1.0 |
 | `--optimizer` | Optimizer | `ranger` |

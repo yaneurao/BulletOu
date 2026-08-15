@@ -3763,10 +3763,12 @@ struct Args {
     #[arg(long)]
     validation_rate: Option<usize>,
 
-    /// Run quantized SFNN validation every N superbatches without forcing a
-    /// checkpoint save. If omitted, quantized validation runs only when a
-    /// checkpoint is saved. Saved SFNN checkpoints always run quantized
-    /// validation when `--test-teacher` is available.
+    /// Run fast GPU-proxy quantized SFNN validation every N superbatches
+    /// without forcing a checkpoint save. This rounds weights to nn.bin scale
+    /// and evaluates them with the GPU f32 forward path; use the
+    /// `quantized-test` subcommand when exact integer-engine validation is
+    /// required. If omitted, proxy quantized validation runs only when a
+    /// checkpoint is saved.
     #[arg(long)]
     quantized_validation_rate: Option<usize>,
 
@@ -5805,42 +5807,6 @@ fn quantized_test_report_from_outputs(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn quantized_engine_metrics_from_cached_outputs(
-    cache: &TestPositionsCache,
-    outputs: &[QuantizedSfnnForwardOutput],
-    args: &QuantizedTestArgs,
-    raw_delta: i32,
-) -> Result<TestMetrics, String> {
-    if cache.positions.len() != outputs.len() {
-        return Err(format!("positions/output length mismatch: {} vs {}", cache.positions.len(), outputs.len()));
-    }
-    let mut engine_outputs = Vec::with_capacity(outputs.len());
-    for out in outputs {
-        let raw = out
-            .raw
-            .checked_add(raw_delta)
-            .ok_or_else(|| format!("raw output overflow while applying L3 bias delta {raw_delta}"))?;
-        engine_outputs.push(
-            quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32 + args.engine_score_offset,
-        );
-    }
-
-    let report = compute_sign_accuracy_with_loss_masked(
-        &engine_outputs,
-        &cache.teacher_scores,
-        &cache.teacher_results,
-        &cache.sample_mask,
-        args.lambda,
-        args.scale as f32,
-        quantized_engine_scale_model_output_scale(args),
-        quantized_engine_scale_loss_kind(args),
-    );
-    let accuracy = if report.compared == 0 { f32::NAN } else { report.accuracy() };
-    let loss = report.test_loss.unwrap_or(f32::NAN);
-    Ok(TestMetrics { accuracy, loss })
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug)]
 struct AverageSfnnStateReport {
     output: PathBuf,
@@ -6377,53 +6343,190 @@ fn update_summary_log_quantized_metrics(
 
 #[cfg(feature = "cuda-cpp-backend")]
 struct CudaCppSfnnQuantizedValidationCache {
-    cache: Arc<TestPositionsCache>,
-    batch: bulletou_lib::value::FastBatchHost,
+    inner: CudaCppSfnnResidentValidationCache,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppSfnnQuantizedValidationCache {
-    fn try_new(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<Option<Self>, String> {
+    fn try_new(
+        args: &Args,
+        feature_kind: CudaCppSfnnFeatureKind,
+        ctx: &bulletou_cuda_cpp::Context,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+    ) -> Result<Option<Self>, String> {
         if !matches!(
             args.eval_type(),
             EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
         ) {
             return Ok(None);
         }
-        let Some(cache) = TestPositionsCache::try_load(args) else {
-            return Ok(None);
-        };
-        if cache.positions.is_empty() {
-            return Ok(None);
-        }
-        let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
-        let started = std::time::Instant::now();
-        let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &cache.positions)?;
-        let elapsed = started.elapsed();
-        let sparse_positions = batch.layout.batch_size;
-        let sparse_bytes = batch
-            .stm
-            .len()
-            .saturating_add(batch.nstm.len())
-            .saturating_add(batch.buckets.len())
-            .saturating_mul(std::mem::size_of::<i32>());
-        eprintln!(
-            "  quantized validation cache = cpu-sparse: positions={}, max_active={}, memory={}, prepared={}",
-            format_count(sparse_positions),
-            format_count(batch.layout.max_active),
-            format_bytes(sparse_bytes as u64),
-            format_duration_secs(elapsed),
-        );
-        Ok(Some(Self { cache, batch }))
+
+        let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(feature_kind, shape);
+        let inner = CudaCppSfnnResidentValidationCache::try_new_labeled(
+            args,
+            feature_kind,
+            ctx,
+            proxy_shape,
+            "gpu-proxy-cached",
+            "quantized validation cache",
+        )?;
+        Ok(inner.map(|inner| Self { inner }))
     }
 
-    fn run_weights(&self, weights: &QuantizedSfnnWeights, args: &QuantizedTestArgs) -> Result<TestMetrics, String> {
-        if let Some(params) = &weights.progress_params {
+    fn run_weights(
+        &mut self,
+        args: &Args,
+        feature_kind: CudaCppSfnnFeatureKind,
+        ctx: &bulletou_cuda_cpp::Context,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+        weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+        progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    ) -> Result<TestMetrics, String> {
+        if let Some(params) = progress_params {
             set_shogi_sfnn_progress_q16_params(params.clone())?;
         }
-        let outputs = quantized_sfnn_forward_outputs(&weights, &self.batch, args)?;
-        quantized_engine_metrics_from_cached_outputs(&self.cache, &outputs, args, 0)
+        let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
+            args,
+            feature_kind,
+            shape,
+            weights,
+            progress_params,
+        )?;
+        let device_weights =
+            bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, proxy_weights.as_host())
+                .map_err(|e| e.to_string())?;
+        self.inner.run_device_weights(args, ctx, &device_weights)
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_quantized_proxy_shape(
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+) -> bulletou_cuda_cpp::SfnnForwardShape {
+    bulletou_cuda_cpp::SfnnForwardShape {
+        input_size: feature_kind.base_input_size(),
+        ft_size: shape.ft_size,
+        l1_hidden: shape.l1_hidden,
+        l1_skip: shape.l1_skip,
+        l2_size: shape.l2_size,
+        num_stacks: shape.num_stacks,
+        l1_group_count: 1,
+        l1_common_size: 0,
+        l1_shard_size: 0,
+        factorizer_king_axis_dim: 0,
+        factorizer_hand_axis_dim: 0,
+        factorizer_progress_axis: false,
+        factorizer_king_hand_pair: false,
+        factorizer_king_progress_pair: false,
+        factorizer_hand_progress_pair: false,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
+    args: &Args,
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
+) -> Result<CudaCppSfnnInitialWeights, String> {
+    let quantized = quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
+    cuda_cpp_sfnn_dequantize_proxy_weights(&quantized)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Result<CudaCppSfnnInitialWeights, String> {
+    let shape = bulletou_cuda_cpp::SfnnForwardShape {
+        input_size: weights.input_size,
+        ft_size: weights.ft_size,
+        l1_hidden: weights.l1_hidden,
+        l1_skip: weights.l1_skip,
+        l2_size: weights.l2_size,
+        num_stacks: weights.num_stacks,
+        l1_group_count: 1,
+        l1_common_size: 0,
+        l1_shard_size: 0,
+        factorizer_king_axis_dim: 0,
+        factorizer_hand_axis_dim: 0,
+        factorizer_progress_axis: false,
+        factorizer_king_hand_pair: false,
+        factorizer_king_progress_pair: false,
+        factorizer_hand_progress_pair: false,
+    };
+    let l1_out = shape.l1_out();
+    let l2_in = shape.l2_in();
+    let qa = f32::from(SFNN_QA);
+    let qb = f32::from(SFNN_QB);
+    let fc_bias_scale = qa * qb;
+
+    let l0b = weights.l0b.iter().map(|&value| f32::from(value) / qa).collect::<Vec<_>>();
+    let l0w = weights.l0w.iter().map(|&value| f32::from(value) / qa).collect::<Vec<_>>();
+
+    let mut l1b = Vec::with_capacity(shape.num_stacks * l1_out);
+    let mut l1w = Vec::with_capacity(shape.num_stacks * l1_out * shape.ft_size);
+    let mut l2b = Vec::with_capacity(shape.num_stacks * shape.l2_size);
+    let mut l2w = Vec::with_capacity(shape.num_stacks * shape.l2_size * l2_in);
+    let mut l3b = Vec::with_capacity(shape.num_stacks);
+    let mut l3w = Vec::with_capacity(shape.num_stacks * shape.l2_size);
+
+    for stack in 0..shape.num_stacks {
+        let l1b_base = stack * l1_out;
+        for out_col in 0..l1_out {
+            l1b.push(weights.l1b[l1b_base + out_col] as f32 / fc_bias_scale);
+        }
+        let l1w_base = stack * l1_out * weights.l1_pad_in;
+        for out_col in 0..l1_out {
+            let row = l1w_base + out_col * weights.l1_pad_in;
+            for in_col in 0..shape.ft_size {
+                l1w.push(f32::from(weights.l1w[row + in_col]) / qb);
+            }
+        }
+
+        let l2b_base = stack * shape.l2_size;
+        for out_col in 0..shape.l2_size {
+            l2b.push(weights.l2b[l2b_base + out_col] as f32 / fc_bias_scale);
+        }
+        let l2w_base = stack * shape.l2_size * weights.l2_pad_in;
+        for out_col in 0..shape.l2_size {
+            let row = l2w_base + out_col * weights.l2_pad_in;
+            for in_col in 0..l2_in {
+                l2w.push(f32::from(weights.l2w[row + in_col]) / qb);
+            }
+        }
+
+        l3b.push(weights.l3b[stack] as f32 / fc_bias_scale);
+        let l3w_base = stack * weights.l3_pad_in;
+        for in_col in 0..shape.l2_size {
+            l3w.push(f32::from(weights.l3w[l3w_base + in_col]) / qb);
+        }
+    }
+
+    let proxy = CudaCppSfnnInitialWeights {
+        shape,
+        l0w,
+        l0b,
+        l1w,
+        l1b,
+        l1fw: None,
+        l1fb: None,
+        l1axw: None,
+        l1axb: None,
+        l2w,
+        l2b,
+        l2fw: None,
+        l2fb: None,
+        l2axw: None,
+        l2axb: None,
+        l3w,
+        l3b,
+        l3fw: None,
+        l3fb: None,
+        l3axw: None,
+        l3axb: None,
+    };
+    proxy.validate()?;
+    Ok(proxy)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6654,6 +6757,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
 fn maybe_run_live_sfnn_quantized_validation(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
+    ctx: &bulletou_cuda_cpp::Context,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
@@ -6666,14 +6770,17 @@ fn maybe_run_live_sfnn_quantized_validation(
         return Ok(None);
     };
     let started = std::time::Instant::now();
-    if cache.is_none() {
-        *cache = CudaCppSfnnQuantizedValidationCache::try_new(args, feature_kind)?;
+    if let Some(params) = progress_params {
+        set_shogi_sfnn_progress_q16_params(params.clone())?;
     }
-    let Some(cache) = cache.as_ref() else {
+    if cache.is_none() {
+        *cache = CudaCppSfnnQuantizedValidationCache::try_new(args, feature_kind, ctx, shape)?;
+    }
+    let Some(cache) = cache.as_mut() else {
         return Ok(None);
     };
-    let weights = quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
-    let metrics = cache.run_weights(&weights, &test_args)?;
+    let _ = test_args;
+    let metrics = cache.run_weights(args, feature_kind, ctx, shape, weights, progress_params)?;
     let elapsed = started.elapsed();
     if let Some(checkpoint_dir) = checkpoint_dir {
         update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
@@ -10602,6 +10709,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
                         args,
                         feature_kind,
+                        &ctx,
                         cuda_shape,
                         &trained_weights,
                         sfnn_progress_params.as_ref(),
@@ -11002,6 +11110,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
                         args,
                         feature_kind,
+                        &ctx,
                         cuda_shape,
                         &trained_weights,
                         sfnn_progress_params.as_ref(),
@@ -11067,6 +11176,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         maybe_run_live_sfnn_quantized_validation(
                             args,
                             feature_kind,
+                            &ctx,
                             cuda_shape,
                             weights,
                             sfnn_progress_params.as_ref(),
@@ -11328,6 +11438,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if let Some((metrics, elapsed)) = maybe_run_live_sfnn_quantized_validation(
             args,
             feature_kind,
+            &ctx,
             cuda_shape,
             &trained_weights,
             sfnn_progress_params.as_ref(),
@@ -11575,6 +11686,17 @@ impl CudaCppSfnnResidentValidationCache {
         ctx: &bulletou_cuda_cpp::Context,
         shape: bulletou_cuda_cpp::SfnnForwardShape,
     ) -> Result<Option<Self>, String> {
+        Self::try_new_labeled(args, feature_kind, ctx, shape, "gpu-resident-cached", "validation cache")
+    }
+
+    fn try_new_labeled(
+        args: &Args,
+        feature_kind: CudaCppSfnnFeatureKind,
+        ctx: &bulletou_cuda_cpp::Context,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+        forward_mode: &str,
+        cache_label: &str,
+    ) -> Result<Option<Self>, String> {
         let Some(cache) = TestPositionsCache::try_load(args) else {
             return Ok(None);
         };
@@ -11632,12 +11754,14 @@ impl CudaCppSfnnResidentValidationCache {
         let elapsed = started.elapsed();
         print_cuda_cpp_validation_forward_config_once(
             &format!("cuda-cpp {}", feature_kind.source_label()),
-            "gpu-resident-cached",
+            forward_mode,
             cache.positions.len(),
             batch_size,
         );
         eprintln!(
-            "  validation cache = gpu-resident: positions={}, chunks={}, batch_size={}, workspaces={}, prepared={}",
+            "  {} = {}: positions={}, chunks={}, batch_size={}, workspaces={}, prepared={}",
+            cache_label,
+            forward_mode,
             format_count(cache.positions.len()),
             format_count(chunks.len()),
             format_count(batch_size),
@@ -11667,6 +11791,32 @@ impl CudaCppSfnnResidentValidationCache {
         if offset != self.outputs.len() {
             return Err(format!(
                 "SFNN validation cache output mismatch: wrote {offset}, expected {}",
+                self.outputs.len()
+            ));
+        }
+        Ok(run_one_test_pass(self.cache.as_ref(), args, &self.outputs))
+    }
+
+    fn run_device_weights(
+        &mut self,
+        args: &Args,
+        ctx: &bulletou_cuda_cpp::Context,
+        weights: &bulletou_cuda_cpp::SfnnForwardDeviceWeights,
+    ) -> Result<TestMetrics, String> {
+        let mut offset = 0usize;
+        for chunk in &self.chunks {
+            let workspace = &self.workspaces[chunk.workspace_index];
+            bulletou_cuda_cpp::sfnn_forward_device(ctx, &chunk.device_batch, weights, workspace)
+                .map_err(|e| e.to_string())?;
+            let end = offset
+                .checked_add(chunk.batch_size)
+                .ok_or_else(|| "SFNN quantized proxy validation output offset overflow".to_string())?;
+            workspace.output.download_prefix(ctx, &mut self.outputs[offset..end]).map_err(|e| e.to_string())?;
+            offset = end;
+        }
+        if offset != self.outputs.len() {
+            return Err(format!(
+                "SFNN quantized proxy validation cache output mismatch: wrote {offset}, expected {}",
                 self.outputs.len()
             ));
         }
@@ -17042,11 +17192,13 @@ const SUMMARY_LEARN_LOG_HEADER_V3: &str = "eval,epoch,superbatch,test_value_accu
 /// without making the log line as wide as a full path.
 ///
 /// `quantized_value_accuracy` / `quantized_value_loss` are filled for SFNN
-/// rows where quantized validation ran. Saved SFNN checkpoints always run it
-/// when possible; `--quantized-validation-rate` can also request non-save
-/// rows. Other rows use `-`. Accuracy is stored as a 0..1 ratio, matching
-/// `test_value_accuracy`; the loss is the engine-scale quantized validation
-/// loss reported by `bulletou quantized-test`.
+/// rows where live quantized validation ran. During training this is a fast
+/// GPU proxy: weights are rounded to nn.bin scale and then evaluated by the
+/// GPU f32 forward path. Use `bulletou quantized-test` on a saved `nn.bin`
+/// when exact integer-engine validation is required. Saved SFNN checkpoints
+/// always run the proxy when possible; `--quantized-validation-rate` can also
+/// request non-save rows. Other rows use `-`. Accuracy is stored as a 0..1
+/// ratio, matching `test_value_accuracy`.
 ///
 /// `checkpoint` is the numbered save directory name (`0033`, etc.) for rows
 /// that saved a checkpoint. Validation-only rows use `-`.

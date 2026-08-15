@@ -77,6 +77,7 @@
 | `--loss-sigmoid-mse` | WRMではなく単純なsigmoid lossを使う | off |
 | `--scale` | `--loss-sigmoid-mse` の target scale | 600 |
 | `--fv-scale` | `nn.bin` の量子化検証・書き出しで想定する `FV_SCALE` | 40 |
+| `--quantized-validation-rate` | 学習中に量子化後の近似accuracy/lossを何sbごとに見るか | 保存時のみ |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
 | `--sfnn-factorizer-alpha` | factorizer成分をどれだけ効かせるか | 1.0 |
 | `--optimizer` | optimizer | `ranger` |

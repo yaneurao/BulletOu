@@ -4,7 +4,9 @@
 
 Training-time validation normally uses the f32 weights in memory. The engine, however, plays with the exported quantized `nn.bin`.
 
-This page covers two commands for inspecting an exported `nn.bin` directly.
+Values printed during training by `--quantized-validation-rate` use a fast GPU proxy: BulletOu rounds weights to the same scale used by `nn.bin`, then evaluates those rounded weights with the f32 forward path. That is useful for watching the trend during training.
+
+This page covers two commands for inspecting an exported `nn.bin` directly. These commands read the quantized `nn.bin` itself, so they are closer to what the engine will use.
 
 | Command | Use |
 |---|---|
