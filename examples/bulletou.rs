@@ -1288,8 +1288,8 @@ struct QuantizedTestArgs {
     wrm_target_scaling: f32,
 
     /// Quantized forward path used by this subcommand. `cpu-exact` emulates
-    /// YaneuraOu's integer path; `gpu` matches the fast live qvalid path used
-    /// during cuda-cpp training.
+    /// YaneuraOu's integer path; `gpu` evaluates nn.bin-quantized weights
+    /// with the same fast f32 GPU proxy used by live qvalid during training.
     #[arg(long, value_enum, default_value = "cpu-exact")]
     mode: QuantizedTestMode,
 
@@ -6854,8 +6854,14 @@ fn cuda_cpp_sfnn_quantized_proxy_shape(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args: &Args, shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
-    let factorizer = effective_sfnn_factorizer_spec(args);
-    (factorizer.shared || factorizer.any_axis()) && !cuda_cpp_sfnn_is_compact_l1_shape(shape)
+    let _ = (args, shape);
+    // Do not quantize base/factorizer tensors separately for live qvalid.
+    // Exported nn.bin first folds all active factorizer terms into each
+    // LayerStack and then quantizes the folded effective weights.  Quantizing
+    // the terms independently and adding them back with alpha is faster, but
+    // it measures a different network when alpha != 1 (and can make qloss look
+    // artificially good).  Keep live qvalid aligned with the saved nn.bin.
+    false
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -18081,10 +18087,12 @@ const SUMMARY_LEARN_LOG_HEADER_V3: &str = "eval,epoch,superbatch,test_value_accu
 /// without making the log line as wide as a full path.
 ///
 /// `quantized_value_accuracy` / `quantized_value_loss` are filled for SFNN
-/// rows where live quantized validation ran. During training this is a fast
-/// GPU proxy: weights are rounded to nn.bin scale and then evaluated by the
-/// GPU f32 forward path. Use `bulletou quantized-test` on a saved `nn.bin`
-/// when exact integer-engine validation is required. Saved SFNN checkpoints
+/// rows where live quantized validation ran. During training this is a GPU
+/// proxy: factorizer terms are folded as they are for nn.bin export, weights
+/// are rounded to nn.bin scale, and then the rounded weights are evaluated by
+/// the GPU f32 forward path. Use `bulletou quantized-test --mode cpu-exact`
+/// on a saved `nn.bin` when exact integer-engine validation is required.
+/// Saved SFNN checkpoints
 /// always run the proxy when possible; `--quantized-validation-rate` can also
 /// request non-save rows. Other rows use `-`. Accuracy is stored as a 0..1
 /// ratio, matching `test_value_accuracy`.
@@ -20888,6 +20896,57 @@ mod tests {
 
         let proxy_signature = resume_signature_without_line(&resume_signature(&args), "quantized_validation_exact=");
         assert!(resume_signature_matches(&proxy_signature, &args));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_quantized_validation_proxy_folds_factorizers_before_quantizing() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--sfnn-factorizer",
+            "pair",
+            "--sfnn-factorizer-alpha",
+            "shared=4.0,axis=4.0,pair=4.0",
+        ])
+        .unwrap();
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 133_578,
+            ft_size: 1024,
+            l1_hidden: 8,
+            l1_skip: false,
+            l2_size: 64,
+            num_stacks: 36_864,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 3,
+            factorizer_hand_axis_dim: 32,
+            factorizer_progress_axis: true,
+            factorizer_king_hand_pair: true,
+            factorizer_king_progress_pair: true,
+            factorizer_hand_progress_pair: true,
+        };
+
+        assert!(
+            !cuda_cpp_sfnn_quantized_proxy_retains_factorizer(&args, shape),
+            "live qvalid must measure the folded nn.bin-equivalent network, not separately quantized factorizer terms"
+        );
+        let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(&args, CudaCppSfnnFeatureKind::Halfka2, shape);
+        assert_eq!(proxy_shape.input_size, CudaCppSfnnFeatureKind::Halfka2.base_input_size());
+        assert_eq!(proxy_shape.factorizer_king_axis_dim, 0);
+        assert_eq!(proxy_shape.factorizer_hand_axis_dim, 0);
+        assert!(!proxy_shape.factorizer_progress_axis);
+        assert!(!proxy_shape.factorizer_king_hand_pair);
+        assert!(!proxy_shape.factorizer_king_progress_pair);
+        assert!(!proxy_shape.factorizer_hand_progress_pair);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
