@@ -2604,14 +2604,16 @@ fn print_cuda_cpp_quantized_validation_summary(
     accuracy: f32,
     loss: f32,
     elapsed: std::time::Duration,
+    mode: &str,
 ) {
     eprintln!(
-        "  {}  {}  {}, {}, {}",
+        "  {}  {}  {}, {}, {}, {}",
         paint_log_tag("[qvalid]", ConsoleColor::Cyan),
         paint(format!("epoch {epoch} sb {superbatch}"), ConsoleColor::BoldYellow),
         colored_metric("quantized_value_accuracy", accuracy, 7),
         colored_metric("quantized_value_loss", loss, 8),
         paint(format!("elapsed={}", format_duration_secs(elapsed)), ConsoleColor::BoldCyan),
+        paint(format!("mode={mode}"), ConsoleColor::Dim),
     );
 }
 
@@ -2728,6 +2730,10 @@ fn effective_quantized_validation_rate(args: &Args) -> Option<usize> {
 
 fn quantized_validation_rate_label(args: &Args) -> String {
     effective_quantized_validation_rate(args).map(|n| n.to_string()).unwrap_or_else(|| "save".to_string())
+}
+
+fn quantized_validation_mode_label(args: &Args) -> &'static str {
+    if args.quantized_validation_exact { "exact" } else { "proxy" }
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
@@ -3771,6 +3777,12 @@ struct Args {
     /// checkpoint is saved.
     #[arg(long)]
     quantized_validation_rate: Option<usize>,
+
+    /// Use the exact CPU integer SFNN forward path for live quantized
+    /// validation. The default is the much faster GPU proxy, which is usually
+    /// enough for watching the training trend.
+    #[arg(long)]
+    quantized_validation_exact: bool,
 
     /// Also save the final superbatch of each epoch even when it is not on a save-rate boundary.
     #[arg(long, default_value_t = true, action = ArgAction::SetTrue)]
@@ -6342,8 +6354,9 @@ fn update_summary_log_quantized_metrics(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-struct CudaCppSfnnQuantizedValidationCache {
-    inner: CudaCppSfnnResidentValidationCache,
+enum CudaCppSfnnQuantizedValidationCache {
+    Proxy { inner: CudaCppSfnnResidentValidationCache },
+    Exact { cache: Arc<TestPositionsCache>, batch: bulletou_lib::value::FastBatchHost },
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6361,6 +6374,33 @@ impl CudaCppSfnnQuantizedValidationCache {
             return Ok(None);
         }
 
+        if args.quantized_validation_exact {
+            let Some(cache) = TestPositionsCache::try_load(args) else {
+                return Ok(None);
+            };
+            if cache.positions.is_empty() {
+                eprintln!("  WARN: --test-teacher yielded no positions; exact quantized SFNN validation skipped");
+                return Ok(None);
+            }
+            let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+            let started = std::time::Instant::now();
+            let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &cache.positions)?;
+            let elapsed = started.elapsed();
+            print_cuda_cpp_validation_forward_config_once(
+                &format!("cuda-cpp {}", feature_kind.source_label()),
+                "cpu-exact-integer",
+                cache.positions.len(),
+                batch.layout.batch_size,
+            );
+            eprintln!(
+                "  quantized validation cache = cpu-exact-integer: positions={}, max_active={}, prepared={}",
+                format_count(cache.positions.len()),
+                format_count(batch.layout.max_active),
+                format_duration_secs(elapsed)
+            );
+            return Ok(Some(Self::Exact { cache, batch }));
+        }
+
         let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(feature_kind, shape);
         let inner = CudaCppSfnnResidentValidationCache::try_new_labeled(
             args,
@@ -6370,7 +6410,7 @@ impl CudaCppSfnnQuantizedValidationCache {
             "gpu-proxy-cached",
             "quantized validation cache",
         )?;
-        Ok(inner.map(|inner| Self { inner }))
+        Ok(inner.map(|inner| Self::Proxy { inner }))
     }
 
     fn run_weights(
@@ -6381,21 +6421,36 @@ impl CudaCppSfnnQuantizedValidationCache {
         shape: bulletou_cuda_cpp::SfnnForwardShape,
         weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
         progress_params: Option<&ShogiSfnnProgressQ16Params>,
+        test_args: &QuantizedTestArgs,
     ) -> Result<TestMetrics, String> {
         if let Some(params) = progress_params {
             set_shogi_sfnn_progress_q16_params(params.clone())?;
         }
-        let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
-            args,
-            feature_kind,
-            shape,
-            weights,
-            progress_params,
-        )?;
-        let device_weights =
-            bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, proxy_weights.as_host())
-                .map_err(|e| e.to_string())?;
-        self.inner.run_device_weights(args, ctx, &device_weights)
+        match self {
+            Self::Proxy { inner } => {
+                let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
+                    args,
+                    feature_kind,
+                    shape,
+                    weights,
+                    progress_params,
+                )?;
+                let device_weights =
+                    bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, proxy_weights.as_host())
+                        .map_err(|e| e.to_string())?;
+                inner.run_device_weights(args, ctx, &device_weights)
+            }
+            Self::Exact { cache, batch } => {
+                let quantized =
+                    quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
+                let outputs = quantized_sfnn_forward_outputs(&quantized, batch, test_args)?;
+                let report = quantized_test_report_from_outputs(&cache.positions, &outputs, test_args, 0)?;
+                let accuracy =
+                    if report.engine_scale.compared == 0 { f32::NAN } else { report.engine_scale.accuracy() };
+                let loss = report.engine_scale.test_loss.unwrap_or(f32::NAN);
+                Ok(TestMetrics { accuracy, loss })
+            }
+        }
     }
 }
 
@@ -6779,8 +6834,7 @@ fn maybe_run_live_sfnn_quantized_validation(
     let Some(cache) = cache.as_mut() else {
         return Ok(None);
     };
-    let _ = test_args;
-    let metrics = cache.run_weights(args, feature_kind, ctx, shape, weights, progress_params)?;
+    let metrics = cache.run_weights(args, feature_kind, ctx, shape, weights, progress_params, &test_args)?;
     let elapsed = started.elapsed();
     if let Some(checkpoint_dir) = checkpoint_dir {
         update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
@@ -10162,13 +10216,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "schedule",
             format!(
-                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, quantized_validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, quantized_validation_rate={}, quantized_validation_mode={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
                 paint("production", ConsoleColor::BoldGreen),
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
                 effective_save_rate(args),
                 effective_validation_rate(args),
                 quantized_validation_rate_label(args),
+                quantized_validation_mode_label(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
                 args.lr_schedule.cli_name()
@@ -10725,6 +10780,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             metrics.accuracy,
                             metrics.loss,
                             elapsed,
+                            quantized_validation_mode_label(args),
                         );
                     }
                     last_checkpoint_metrics = Some(test_metrics);
@@ -11126,6 +11182,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             metrics.accuracy,
                             metrics.loss,
                             elapsed,
+                            quantized_validation_mode_label(args),
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
@@ -11242,6 +11299,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             metrics.accuracy,
                             metrics.loss,
                             elapsed,
+                            quantized_validation_mode_label(args),
                         );
                     }
                     last_checkpoint_metrics = test_metrics;
@@ -11453,6 +11511,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 metrics.accuracy,
                 metrics.loss,
                 elapsed,
+                quantized_validation_mode_label(args),
             );
         }
         last_checkpoint_metrics = test_metrics;
@@ -16728,6 +16787,7 @@ fn resume_signature(args: &Args) -> String {
         format!("save_rate={}", effective_save_rate(args)),
         format!("validation_rate={}", effective_validation_rate(args)),
         format!("quantized_validation_rate={}", quantized_validation_rate_label(args)),
+        format!("quantized_validation_exact={}", args.quantized_validation_exact),
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
@@ -16838,6 +16898,12 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
     ensure_line_after(&mut out, "quantized_validation_rate=", "validation_rate=", "quantized_validation_rate=save");
+    ensure_line_after(
+        &mut out,
+        "quantized_validation_exact=",
+        "quantized_validation_rate=",
+        "quantized_validation_exact=false",
+    );
     ensure_line_after(&mut out, "loss_pow_exp=", "win_rate_model=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");
     ensure_line_after(&mut out, "wrm_in_offset=", "wrm_nnue2score=", "wrm_in_offset=270.000000000");
@@ -16872,7 +16938,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
 fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
-    resume_signature_without_line(&signature, "quantized_validation_rate=")
+    let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
+    resume_signature_without_line(&signature, "quantized_validation_exact=")
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
@@ -19967,6 +20034,38 @@ mod tests {
             vec![false, true, true]
         );
         assert!(schedule.chunks.iter().all(|chunk| chunk.run_quantized_validation));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_quantized_validation_exact_is_validation_mode_only() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+            "--quantized-validation-rate",
+            "1",
+            "--quantized-validation-exact",
+        ])
+        .unwrap();
+
+        assert!(args.quantized_validation_exact);
+        assert_eq!(quantized_validation_mode_label(&args), "exact");
+
+        let proxy_signature = resume_signature_without_line(&resume_signature(&args), "quantized_validation_exact=");
+        assert!(resume_signature_matches(&proxy_signature, &args));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
