@@ -6600,7 +6600,7 @@ fn update_summary_log_quantized_metrics(
 
 #[cfg(feature = "cuda-cpp-backend")]
 enum CudaCppSfnnQuantizedValidationCache {
-    Proxy { inner: CudaCppSfnnResidentValidationCache },
+    Proxy { inner: CudaCppSfnnResidentValidationCache, device_weights: Option<bulletou_cuda_cpp::SfnnForwardDeviceWeights> },
     Exact { cache: Arc<TestPositionsCache>, batch: bulletou_lib::value::FastBatchHost },
 }
 
@@ -6655,7 +6655,7 @@ impl CudaCppSfnnQuantizedValidationCache {
             "gpu-cached",
             "quantized validation cache",
         )?;
-        Ok(inner.map(|inner| Self::Proxy { inner }))
+        Ok(inner.map(|inner| Self::Proxy { inner, device_weights: None }))
     }
 
     fn run_weights(
@@ -6672,7 +6672,7 @@ impl CudaCppSfnnQuantizedValidationCache {
             set_shogi_sfnn_progress_q16_params(params.clone())?;
         }
         match self {
-            Self::Proxy { inner } => {
+            Self::Proxy { inner, device_weights } => {
                 let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
                     args,
                     feature_kind,
@@ -6680,10 +6680,14 @@ impl CudaCppSfnnQuantizedValidationCache {
                     weights,
                     progress_params,
                 )?;
-                let device_weights =
-                    bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, proxy_weights.as_host())
-                        .map_err(|e| e.to_string())?;
-                inner.run_device_weights(args, ctx, &device_weights)
+                let host = proxy_weights.as_host();
+                if let Some(device_weights) = device_weights.as_ref() {
+                    device_weights.upload(ctx, host).map_err(|e| e.to_string())?;
+                } else {
+                    *device_weights =
+                        Some(bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, host).map_err(|e| e.to_string())?);
+                }
+                inner.run_device_weights(args, ctx, device_weights.as_ref().expect("device weights initialized"))
             }
             Self::Exact { cache, batch } => {
                 let quantized =

@@ -1380,6 +1380,20 @@ pub struct SfnnForwardDeviceWeights {
     pub l3axb: Option<F32Buffer>,
 }
 
+fn upload_optional_f32(
+    ctx: &Context,
+    label: &str,
+    dst: &Option<F32Buffer>,
+    values: Option<&[f32]>,
+) -> Result<()> {
+    match (dst, values) {
+        (Some(dst), Some(values)) => dst.upload(ctx, values),
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(CudaCppError::message(format!("{label}: device buffer exists but host values are absent"))),
+        (None, Some(_)) => Err(CudaCppError::message(format!("{label}: host values exist but device buffer is absent"))),
+    }
+}
+
 impl SfnnForwardDeviceWeights {
     pub fn from_host(ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<Self> {
         weights.validate()?;
@@ -1406,6 +1420,37 @@ impl SfnnForwardDeviceWeights {
             l3axw: weights.l3axw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3axb: weights.l3axb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
         })
+    }
+
+    pub fn upload(&self, ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<()> {
+        weights.validate()?;
+        if self.shape != weights.shape {
+            return Err(CudaCppError::message(format!(
+                "SFNN device weight shape mismatch: device {:?}, host {:?}",
+                self.shape, weights.shape
+            )));
+        }
+        self.l0w.upload(ctx, weights.l0w)?;
+        self.l0b.upload(ctx, weights.l0b)?;
+        self.l1w.upload(ctx, weights.l1w)?;
+        self.l1b.upload(ctx, weights.l1b)?;
+        upload_optional_f32(ctx, "sfnn l1fw", &self.l1fw, weights.l1fw)?;
+        upload_optional_f32(ctx, "sfnn l1fb", &self.l1fb, weights.l1fb)?;
+        upload_optional_f32(ctx, "sfnn l1axw", &self.l1axw, weights.l1axw)?;
+        upload_optional_f32(ctx, "sfnn l1axb", &self.l1axb, weights.l1axb)?;
+        self.l2w.upload(ctx, weights.l2w)?;
+        self.l2b.upload(ctx, weights.l2b)?;
+        upload_optional_f32(ctx, "sfnn l2fw", &self.l2fw, weights.l2fw)?;
+        upload_optional_f32(ctx, "sfnn l2fb", &self.l2fb, weights.l2fb)?;
+        upload_optional_f32(ctx, "sfnn l2axw", &self.l2axw, weights.l2axw)?;
+        upload_optional_f32(ctx, "sfnn l2axb", &self.l2axb, weights.l2axb)?;
+        self.l3w.upload(ctx, weights.l3w)?;
+        self.l3b.upload(ctx, weights.l3b)?;
+        upload_optional_f32(ctx, "sfnn l3fw", &self.l3fw, weights.l3fw)?;
+        upload_optional_f32(ctx, "sfnn l3fb", &self.l3fb, weights.l3fb)?;
+        upload_optional_f32(ctx, "sfnn l3axw", &self.l3axw, weights.l3axw)?;
+        upload_optional_f32(ctx, "sfnn l3axb", &self.l3axb, weights.l3axb)?;
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
