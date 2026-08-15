@@ -1387,6 +1387,61 @@ struct AverageSfnnStateArgs {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou bucket-stats")]
+#[command(about = "Measure SFNN LayerStack bucket dispersion on teacher batches without training")]
+struct BucketStatsArgs {
+    /// Teacher path (.hcpe / .psv / .bin file, or a folder).
+    #[arg(long)]
+    teacher: String,
+
+    /// SFNN architecture whose LayerStack bucket is measured.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// Number of mini-batches to scan.
+    #[arg(long, default_value = "32")]
+    batches: usize,
+
+    /// Mini-batch size. Use the same value as training for meaningful dirty-bucket estimates.
+    #[arg(long, default_value = "65536")]
+    batch_size: usize,
+
+    /// Number of mini-batches accumulated into one optimizer update.
+    #[arg(long, default_value = "1")]
+    batches_per_update: usize,
+
+    /// Loader read buffer size in MiB.
+    #[arg(long, default_value = "4096")]
+    buffer_mb: usize,
+
+    /// Teacher batch preparation worker threads. Omit or set 0 for the cuda-cpp default.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// HCPE decode parallelism. 0 means the cuda-cpp default.
+    #[arg(long, default_value = "0")]
+    loader_threads: usize,
+
+    /// Prepared batch queue depth.
+    #[arg(long, default_value = "4")]
+    batch_queue_size: usize,
+
+    /// Optional in-trainer shuffle window in mini-batches for this diagnostic.
+    /// Default 0 disables it so the command does not prefill a full training superbatch.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_buffer_batches: usize,
+
+    /// Shuffle seed used when --teacher-shuffle-buffer-batches is non-zero.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_seed: u64,
+
+    /// Drop positions whose |score| >= this. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 impl QuantizedTestArgs {
     fn effective_layerstack(&self) -> LayerStackMode {
         self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
@@ -1434,6 +1489,32 @@ impl QuantizedTestArgs {
         }
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl BucketStatsArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; bucket-stats measures SFNN LayerStack buckets only",
+                self.arch.cli_name()
+            ));
+        }
+        if self.batches == 0 {
+            return Err("--batches must be > 0".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("--batch-size must be > 0".to_string());
+        }
+        if self.batches_per_update == 0 {
+            return Err("--batches-per-update must be > 0".to_string());
         }
         Ok(())
     }
@@ -7735,6 +7816,26 @@ fn main() {
         }
         return;
     }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("bucket-stats")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou bucket-stats");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = BucketStatsArgs::parse_from(raw_args);
+            if let Err(e) = run_bucket_stats(&args) {
+                eprintln!("error: bucket-stats failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: bucket-stats requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("quantized-test")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
@@ -10490,6 +10591,233 @@ where
         }
     }
     .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_stats_percentile(values: &[usize], pct: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_stats_mean(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().map(|&value| value as f64).sum::<f64>() / values.len() as f64
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_stats_stddev(values: &[usize], mean: f64) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
+    }
+    let variance = values
+        .iter()
+        .map(|&value| {
+            let diff = value as f64 - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
+    use bulletou_lib::value::{SfnnTeacherBatchConfig, WinRateModelTargetParams};
+
+    args.validate()?;
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
+    let layerstack = args.effective_layerstack();
+    let stack_count = layerstack.num_stacks();
+    if let Some(params) = sfnn_progress_params_for_layerstack(layerstack) {
+        set_shogi_sfnn_progress_q16_params(params)?;
+    }
+    let teacher_threads = match args.threads {
+        Some(0) | None => cuda_cpp_default_cpu_threads(),
+        Some(threads) => threads,
+    };
+    let loader_threads = if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads };
+    let config = SfnnTeacherBatchConfig {
+        teacher: &args.teacher,
+        batch_size: args.batch_size,
+        batch_index: 0,
+        dataloader_resume_pos: None,
+        layerstack_bucket: layerstack.bucket_kind(),
+        buffer_mb: args.buffer_mb,
+        loader_threads,
+        threads: teacher_threads,
+        queue_depth: args.batch_queue_size,
+        lambda: 1.0,
+        scale: 600.0,
+        win_rate_model: true,
+        wrm_target: WinRateModelTargetParams::DEFAULT,
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+        teacher_shuffle_seed: args.teacher_shuffle_seed,
+        profile_prepare: false,
+    };
+
+    eprintln!("  bucket-stats: arch={} layerstack={}", args.arch.cli_name(), layerstack.cli_name());
+    eprintln!(
+        "  teacher      = {}  feature={}  stacks={}",
+        args.teacher,
+        feature_kind.source_label(),
+        format_count(stack_count)
+    );
+    eprintln!(
+        "  scan         = {} batch(es) x {} positions, batches_per_update={}, shuffle_window={} batch(es)",
+        format_count(args.batches),
+        format_count(args.batch_size),
+        format_count(args.batches_per_update),
+        format_count(args.teacher_shuffle_buffer_batches)
+    );
+    eprintln!(
+        "  teacher CPU  = prepare_threads={}, loader_threads={}, batch_queue_size={}",
+        teacher_threads, loader_threads, args.batch_queue_size
+    );
+
+    let started = std::time::Instant::now();
+    let mut counts = vec![0u64; stack_count];
+    let mut total_positions = 0u64;
+    let mut batch_unique_counts = Vec::with_capacity(args.batches);
+    let mut update_unique_counts = Vec::new();
+    let mut batch_seen = vec![false; stack_count];
+    let mut batch_seen_list = Vec::new();
+    let mut update_seen = vec![false; stack_count];
+    let mut update_seen_list = Vec::new();
+    let mut seen_batches = 0usize;
+
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, args.batches, |teacher_batch| {
+        seen_batches += 1;
+        batch_seen_list.clear();
+        for &bucket in &teacher_batch.batch.buckets {
+            if bucket < 0 {
+                return Err(format!("teacher batch has negative bucket {bucket}"));
+            }
+            let bucket = bucket as usize;
+            if bucket >= stack_count {
+                return Err(format!("teacher batch bucket {bucket} is out of range 0..{stack_count}"));
+            }
+            counts[bucket] += 1;
+            total_positions += 1;
+            if !batch_seen[bucket] {
+                batch_seen[bucket] = true;
+                batch_seen_list.push(bucket);
+            }
+            if !update_seen[bucket] {
+                update_seen[bucket] = true;
+                update_seen_list.push(bucket);
+            }
+        }
+        batch_unique_counts.push(batch_seen_list.len());
+        for &bucket in &batch_seen_list {
+            batch_seen[bucket] = false;
+        }
+        if seen_batches % args.batches_per_update == 0 {
+            update_unique_counts.push(update_seen_list.len());
+            for &bucket in &update_seen_list {
+                update_seen[bucket] = false;
+            }
+            update_seen_list.clear();
+        }
+        Ok(())
+    })?;
+    if !update_seen_list.is_empty() {
+        update_unique_counts.push(update_seen_list.len());
+        for &bucket in &update_seen_list {
+            update_seen[bucket] = false;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+    let batch_mean = bucket_stats_mean(&batch_unique_counts);
+    let batch_std = bucket_stats_stddev(&batch_unique_counts, batch_mean);
+    let update_mean = bucket_stats_mean(&update_unique_counts);
+    let update_std = bucket_stats_stddev(&update_unique_counts, update_mean);
+    let simpson_effective = if total_positions == 0 {
+        0.0
+    } else {
+        let total = total_positions as f64;
+        let sum_sq = counts
+            .iter()
+            .filter(|&&count| count != 0)
+            .map(|&count| {
+                let p = count as f64 / total;
+                p * p
+            })
+            .sum::<f64>();
+        if sum_sq > 0.0 {
+            1.0 / sum_sq
+        } else {
+            0.0
+        }
+    };
+    let mut top = counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .map(|(bucket, &count)| (bucket, count))
+        .collect::<Vec<_>>();
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let top10_sum = top.iter().take(10).map(|&(_, count)| count).sum::<u64>();
+
+    println!("bucket-stats complete:");
+    println!("  arch                = {}", args.arch.cli_name());
+    println!("  layerstack          = {}", layerstack.cli_name());
+    println!("  stacks              = {}", format_count(stack_count));
+    println!("  scanned_batches     = {}", format_count(seen_batches));
+    println!("  scanned_positions   = {}", format_count(total_positions as usize));
+    println!("  elapsed             = {:.3}s", elapsed.as_secs_f64());
+    println!(
+        "  touched_buckets     = {} / {} ({:.2}%)",
+        format_count(touched_buckets),
+        format_count(stack_count),
+        100.0 * touched_buckets as f64 / stack_count.max(1) as f64
+    );
+    println!("  effective_buckets   = {:.1}  (Simpson, larger means more uniform)", simpson_effective);
+    println!(
+        "  unique_per_batch    = mean {:.1}, std {:.1}, p50 {}, p90 {}, p99 {}, min {}, max {}",
+        batch_mean,
+        batch_std,
+        format_count(bucket_stats_percentile(&batch_unique_counts, 0.50)),
+        format_count(bucket_stats_percentile(&batch_unique_counts, 0.90)),
+        format_count(bucket_stats_percentile(&batch_unique_counts, 0.99)),
+        format_count(*batch_unique_counts.iter().min().unwrap_or(&0)),
+        format_count(*batch_unique_counts.iter().max().unwrap_or(&0))
+    );
+    println!(
+        "  unique_per_update   = mean {:.1}, std {:.1}, p50 {}, p90 {}, p99 {}, min {}, max {}",
+        update_mean,
+        update_std,
+        format_count(bucket_stats_percentile(&update_unique_counts, 0.50)),
+        format_count(bucket_stats_percentile(&update_unique_counts, 0.90)),
+        format_count(bucket_stats_percentile(&update_unique_counts, 0.99)),
+        format_count(*update_unique_counts.iter().min().unwrap_or(&0)),
+        format_count(*update_unique_counts.iter().max().unwrap_or(&0))
+    );
+    println!(
+        "  dirty_update_ratio  = {:.2}% of stacks/update on average",
+        100.0 * update_mean / stack_count.max(1) as f64
+    );
+    println!(
+        "  top10_share         = {:.2}% of scanned positions",
+        if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
+    );
+    println!("  top_buckets         = bucket:count(share)");
+    for (bucket, count) in top.into_iter().take(10) {
+        let share = if total_positions == 0 { 0.0 } else { 100.0 * count as f64 / total_positions as f64 };
+        println!("    {}:{} ({:.3}%)", bucket, format_count(count as usize), share);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
