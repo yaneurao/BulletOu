@@ -498,6 +498,109 @@ __global__ void ranger_lookahead_vec4_kernel(float* weights, float* slow_params,
     reinterpret_cast<float4*>(slow_params)[idx] = weight4;
 }
 
+__global__ void radam_update_reset_gradients_stacked_dirty_kernel(
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t len,
+    float* gradients,
+    float* weights,
+    float* momentum,
+    float* velocity,
+    float gradient_factor,
+    float learning_rate,
+    float step_size,
+    int use_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = dirty_count * stride;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t bucket_offset = tid / stride;
+    size_t in_bucket = tid - bucket_offset * stride;
+    int bucket = dirty_buckets[bucket_offset];
+    if (bucket < 0) {
+        return;
+    }
+    size_t idx = static_cast<size_t>(bucket) * stride + in_bucket;
+    if (idx >= len) {
+        return;
+    }
+
+    float grad = gradient_factor * gradients[idx];
+    float weight = weights[idx];
+    float m = momentum[idx];
+    float v = velocity[idx];
+    radam_update_one(
+        grad, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight, &m, &v);
+
+    gradients[idx] = 0.0f;
+    weights[idx] = weight;
+    momentum[idx] = m;
+    velocity[idx] = v;
+}
+
+__global__ void clear_gradients_stacked_dirty_kernel(
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t len,
+    float* gradients) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = dirty_count * stride;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t bucket_offset = tid / stride;
+    size_t in_bucket = tid - bucket_offset * stride;
+    int bucket = dirty_buckets[bucket_offset];
+    if (bucket < 0) {
+        return;
+    }
+    size_t idx = static_cast<size_t>(bucket) * stride + in_bucket;
+    if (idx < len) {
+        gradients[idx] = 0.0f;
+    }
+}
+
+__global__ void ranger_lookahead_stacked_dirty_kernel(
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t len,
+    float* weights,
+    float* slow_params,
+    float alpha) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = dirty_count * stride;
+    if (tid >= total) {
+        return;
+    }
+
+    size_t bucket_offset = tid / stride;
+    size_t in_bucket = tid - bucket_offset * stride;
+    int bucket = dirty_buckets[bucket_offset];
+    if (bucket < 0) {
+        return;
+    }
+    size_t idx = static_cast<size_t>(bucket) * stride + in_bucket;
+    if (idx >= len) {
+        return;
+    }
+
+    float next = alpha * weights[idx] + (1.0f - alpha) * slow_params[idx];
+    weights[idx] = next;
+    slow_params[idx] = next;
+}
+
 __device__ float crelu(float value) {
     return fminf(fmaxf(value, 0.0f), 1.0f);
 }
@@ -6854,6 +6957,105 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
             if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
                 return -1;
             }
+        }
+    }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
+    BulletOuCudaCppContext* ctx,
+    size_t len,
+    size_t stride,
+    size_t dirty_count,
+    float gradient_factor,
+    float learning_rate,
+    float step_size,
+    int use_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    int do_lookahead,
+    float lookahead_alpha,
+    const BulletOuCudaCppI32Buffer* dirty_buckets,
+    BulletOuCudaCppF32Buffer* gradients,
+    BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* momentum,
+    BulletOuCudaCppF32Buffer* velocity,
+    BulletOuCudaCppF32Buffer* slow_params) {
+    if (validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(dirty_buckets), dirty_count, "dirty_buckets") != 0 ||
+        validate_buffer(ctx, gradients, len, "gradients") != 0 || validate_buffer(ctx, weights, len, "weights") != 0 ||
+        validate_buffer(ctx, momentum, len, "momentum") != 0 || validate_buffer(ctx, velocity, len, "velocity") != 0 ||
+        validate_buffer(ctx, slow_params, len, "slow_params") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0 || stride == 0 || dirty_count == 0) {
+        return ok();
+    }
+    if (dirty_count > SIZE_MAX / stride) {
+        return fail_message("ranger dirty stacked update length overflow");
+    }
+
+    constexpr int threads = 256;
+    const size_t update_threads = dirty_count * stride;
+    int blocks = 0;
+    if (block_count_1d(update_threads, threads, &blocks, "radam_update_reset_gradients_stacked_dirty_kernel") != 0) {
+        return -1;
+    }
+
+    if (learning_rate == 0.0f) {
+        clear_gradients_stacked_dirty_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            dirty_buckets->ptr,
+            dirty_count,
+            stride,
+            len,
+            gradients->ptr);
+        if (check_kernel_launch("clear_gradients_stacked_dirty_kernel launch") != 0) {
+            return -1;
+        }
+        return ok();
+    }
+
+    radam_update_reset_gradients_stacked_dirty_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        dirty_buckets->ptr,
+        dirty_count,
+        stride,
+        len,
+        gradients->ptr,
+        weights->ptr,
+        momentum->ptr,
+        velocity->ptr,
+        gradient_factor,
+        learning_rate,
+        step_size,
+        use_denom,
+        decay,
+        beta1,
+        beta2,
+        epsilon,
+        min_weight,
+        max_weight);
+    if (check_kernel_launch("radam_update_reset_gradients_stacked_dirty_kernel launch") != 0) {
+        return -1;
+    }
+
+    if (do_lookahead != 0) {
+        ranger_lookahead_stacked_dirty_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            dirty_buckets->ptr,
+            dirty_count,
+            stride,
+            len,
+            weights->ptr,
+            slow_params->ptr,
+            lookahead_alpha);
+        if (check_kernel_launch("ranger_lookahead_stacked_dirty_kernel launch") != 0) {
+            return -1;
         }
     }
 

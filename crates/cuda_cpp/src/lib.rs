@@ -994,11 +994,7 @@ impl SfnnForwardShape {
     }
 
     pub fn factorizer_progress_axis_count(self) -> usize {
-        if self.factorizer_progress_axis {
-            self.factorizer_progress_multiplier()
-        } else {
-            0
-        }
+        if self.factorizer_progress_axis { self.factorizer_progress_multiplier() } else { 0 }
     }
 }
 
@@ -1148,8 +1144,7 @@ pub struct SfnnFactorizerAlpha {
 }
 
 impl SfnnFactorizerAlpha {
-    pub const ONE: Self =
-        Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
+    pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
     const MAX: f32 = 10.0;
 
     fn validate(self) -> Result<()> {
@@ -1380,17 +1375,16 @@ pub struct SfnnForwardDeviceWeights {
     pub l3axb: Option<F32Buffer>,
 }
 
-fn upload_optional_f32(
-    ctx: &Context,
-    label: &str,
-    dst: &Option<F32Buffer>,
-    values: Option<&[f32]>,
-) -> Result<()> {
+fn upload_optional_f32(ctx: &Context, label: &str, dst: &Option<F32Buffer>, values: Option<&[f32]>) -> Result<()> {
     match (dst, values) {
         (Some(dst), Some(values)) => dst.upload(ctx, values),
         (None, None) => Ok(()),
-        (Some(_), None) => Err(CudaCppError::message(format!("{label}: device buffer exists but host values are absent"))),
-        (None, Some(_)) => Err(CudaCppError::message(format!("{label}: host values exist but device buffer is absent"))),
+        (Some(_), None) => {
+            Err(CudaCppError::message(format!("{label}: device buffer exists but host values are absent")))
+        }
+        (None, Some(_)) => {
+            Err(CudaCppError::message(format!("{label}: host values exist but device buffer is absent")))
+        }
     }
 }
 
@@ -5332,6 +5326,7 @@ pub struct SfnnTrainStepRunner {
     pub device_batch: SfnnForwardDeviceBatch,
     pub targets: F32Buffer,
     pub entry_weights: F32Buffer,
+    pub dirty_buckets: I32Buffer,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
@@ -5545,6 +5540,7 @@ impl SfnnTrainStepRunner {
             },
             targets: F32Buffer::new(ctx, batch_size)?,
             entry_weights: F32Buffer::new(ctx, batch_size)?,
+            dirty_buckets: I32Buffer::new(ctx, shape.num_stacks)?,
             weights,
             optimizer_states,
             factorizer,
@@ -5633,6 +5629,31 @@ impl SfnnTrainStepRunner {
         update_weights: bool,
         lr_multipliers: SfnnLayerLrMultipliers,
     ) -> Result<()> {
+        self.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+            ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            update_weights,
+            lr_multipliers,
+            None,
+        )
+    }
+
+    pub fn step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_buckets: Option<&[i32]>,
+    ) -> Result<()> {
         self.validate()?;
         lr_multipliers.validate()?;
         batch.validate()?;
@@ -5680,7 +5701,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_alpha,
         )?;
         if update_weights {
-            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
+            self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
         Ok(())
     }
@@ -5763,6 +5784,33 @@ impl SfnnTrainStepRunner {
         update_weights: bool,
         lr_multipliers: SfnnLayerLrMultipliers,
     ) -> Result<()> {
+        self.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+            ctx,
+            upload_ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            finalize_loss,
+            update_weights,
+            lr_multipliers,
+            None,
+        )
+    }
+
+    pub fn step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+        &mut self,
+        ctx: &Context,
+        upload_ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        finalize_loss: bool,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_buckets: Option<&[i32]>,
+    ) -> Result<()> {
         self.validate()?;
         lr_multipliers.validate()?;
         batch.validate()?;
@@ -5817,7 +5865,7 @@ impl SfnnTrainStepRunner {
             )?;
         }
         if update_weights {
-            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
+            self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
         self.upload_slots[slot_idx].record_compute_done(ctx)
     }
@@ -5862,6 +5910,29 @@ impl SfnnTrainStepRunner {
         batch: SfnnTrainStepHostBatch<'_>,
         update_weights: bool,
         lr_multipliers: SfnnLayerLrMultipliers,
+    ) -> Result<SfnnTrainStepProfile> {
+        self.step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+            ctx,
+            params,
+            loss_kind,
+            output_inv_scale,
+            batch,
+            update_weights,
+            lr_multipliers,
+            None,
+        )
+    }
+
+    pub fn step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnTrainStepHostBatch<'_>,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_buckets: Option<&[i32]>,
     ) -> Result<SfnnTrainStepProfile> {
         self.validate()?;
         lr_multipliers.validate()?;
@@ -5921,7 +5992,7 @@ impl SfnnTrainStepRunner {
         )?;
         after_backward.record(ctx)?;
         if update_weights {
-            self.update_weights_with_lr_multipliers(ctx, params, lr_multipliers)?;
+            self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
         stop.record(ctx)?;
         stop.synchronize()?;
@@ -6002,6 +6073,7 @@ impl SfnnTrainStepRunner {
         self.backward_workspace.validate()?;
         expect_len("sfnn train targets", self.batch_size, self.targets.len())?;
         expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())?;
+        expect_len("sfnn train dirty_buckets", self.shape.num_stacks, self.dirty_buckets.len())?;
         if self.next_upload_slot >= self.upload_slots.len() {
             return Err(CudaCppError::message(format!(
                 "SFNN next upload slot {} is out of range for {} slots",
@@ -6105,13 +6177,45 @@ impl SfnnTrainStepRunner {
         Ok(params)
     }
 
-    fn update_weights_with_lr_multipliers(
+    fn prepare_dirty_buckets<'a>(
+        &'a self,
+        ctx: &Context,
+        dirty_buckets: Option<&[i32]>,
+    ) -> Result<Option<(&'a I32Buffer, usize)>> {
+        let Some(dirty_buckets) = dirty_buckets else {
+            return Ok(None);
+        };
+        if self.shape.num_stacks <= 1 {
+            return Ok(None);
+        }
+        if dirty_buckets.len() > self.shape.num_stacks {
+            return Err(CudaCppError::message(format!(
+                "SFNN dirty bucket count {} exceeds stack count {}",
+                dirty_buckets.len(),
+                self.shape.num_stacks
+            )));
+        }
+        for &bucket in dirty_buckets {
+            if bucket < 0 || bucket as usize >= self.shape.num_stacks {
+                return Err(CudaCppError::message(format!(
+                    "SFNN dirty bucket index {bucket} is out of range for {} stacks",
+                    self.shape.num_stacks
+                )));
+            }
+        }
+        self.dirty_buckets.upload(ctx, dirty_buckets)?;
+        Ok(Some((&self.dirty_buckets, dirty_buckets.len())))
+    }
+
+    fn update_weights_with_lr_multipliers_and_dirty_buckets(
         &mut self,
         ctx: &Context,
         params: RangerUpdateParams,
         lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
         lr_multipliers.validate()?;
+        let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         let l0w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
         let l0b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias);
         let l1w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight);
@@ -6139,21 +6243,25 @@ impl SfnnTrainStepRunner {
             &self.optimizer_states.l0b,
             l0b_lr,
         )?;
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l1_residual_params,
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
             l1w_lr,
+            dirty_update,
+            self.shape.l1w_len()? / self.shape.num_stacks,
         )?;
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l1_residual_params,
             &self.backward_workspace.l1b_gradients,
             &self.weights.l1b,
             &self.optimizer_states.l1b,
             l1b_lr,
+            dirty_update,
+            self.shape.l1_out(),
         )?;
         match (&self.weights.l1fw, &self.weights.l1fb, &self.optimizer_states.l1fw, &self.optimizer_states.l1fb) {
             (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
@@ -6201,21 +6309,25 @@ impl SfnnTrainStepRunner {
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l1axw/l1axb optional groups mismatch")),
         }
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l2_residual_params,
             &self.backward_workspace.l2w_gradients,
             &self.weights.l2w,
             &self.optimizer_states.l2w,
             l2w_lr,
+            dirty_update,
+            self.shape.l2_size * self.shape.l2_in(),
         )?;
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l2_residual_params,
             &self.backward_workspace.l2b_gradients,
             &self.weights.l2b,
             &self.optimizer_states.l2b,
             l2b_lr,
+            dirty_update,
+            self.shape.l2_size,
         )?;
         match (&self.weights.l2fw, &self.weights.l2fb, &self.optimizer_states.l2fw, &self.optimizer_states.l2fb) {
             (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) if self.factorizer.shared => {
@@ -6263,21 +6375,25 @@ impl SfnnTrainStepRunner {
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l2axw/l2axb optional groups mismatch")),
         }
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l3_residual_params,
             &self.backward_workspace.l3w_gradients,
             &self.weights.l3w,
             &self.optimizer_states.l3w,
             l3w_lr,
+            dirty_update,
+            self.shape.l2_size,
         )?;
-        update_param_group_with_lr_multiplier(
+        update_stacked_param_group_with_lr_multiplier(
             ctx,
             l3_residual_params,
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
             l3b_lr,
+            dirty_update,
+            1,
         )?;
         match (&self.weights.l3fw, &self.weights.l3fb, &self.optimizer_states.l3fw, &self.optimizer_states.l3fb) {
             (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) if self.factorizer.shared => {
@@ -6364,6 +6480,43 @@ fn update_param_group_with_lr_multiplier(
             momentum: &state.momentum,
             velocity: &state.velocity,
             slow_params: &state.slow_params,
+        },
+    )
+}
+
+fn update_stacked_param_group_with_lr_multiplier(
+    ctx: &Context,
+    params: RangerUpdateParams,
+    gradients: &F32Buffer,
+    weights: &F32Buffer,
+    state: &RangerParamState,
+    lr_multiplier: f32,
+    dirty_update: Option<(&I32Buffer, usize)>,
+    stride: usize,
+) -> Result<()> {
+    if !(lr_multiplier.is_finite() && lr_multiplier >= 0.0) {
+        return Err(CudaCppError::message("SFNN learning-rate multiplier must be finite and non-negative"));
+    }
+    let Some((dirty_buckets, dirty_count)) = dirty_update else {
+        return update_param_group_with_lr_multiplier(ctx, params, gradients, weights, state, lr_multiplier);
+    };
+    if dirty_count == 0 {
+        return Ok(());
+    }
+    let mut params = params;
+    params.radam.learning_rate *= lr_multiplier;
+    ranger_update_stacked_dirty_device(
+        ctx,
+        params,
+        RangerStackedDirtyDeviceStateMut {
+            gradients,
+            weights,
+            momentum: &state.momentum,
+            velocity: &state.velocity,
+            slow_params: &state.slow_params,
+            dirty_buckets,
+            dirty_count,
+            stride,
         },
     )
 }
@@ -6611,6 +6764,59 @@ impl RangerDeviceStateMut<'_> {
     }
 }
 
+pub struct RangerStackedDirtyDeviceStateMut<'a> {
+    pub gradients: &'a F32Buffer,
+    pub weights: &'a F32Buffer,
+    pub momentum: &'a F32Buffer,
+    pub velocity: &'a F32Buffer,
+    pub slow_params: &'a F32Buffer,
+    pub dirty_buckets: &'a I32Buffer,
+    pub dirty_count: usize,
+    pub stride: usize,
+}
+
+impl RangerStackedDirtyDeviceStateMut<'_> {
+    fn validate(&self) -> Result<usize> {
+        if self.stride == 0 {
+            return Err(CudaCppError::message("Ranger dirty stacked update stride must be > 0"));
+        }
+        let len = self.gradients.len();
+        for (name, actual) in [
+            ("weights", self.weights.len()),
+            ("momentum", self.momentum.len()),
+            ("velocity", self.velocity.len()),
+            ("slow_params", self.slow_params.len()),
+        ] {
+            if actual != len {
+                return Err(CudaCppError::message(format!(
+                    "Ranger dirty stacked device length mismatch: gradients={len}, {name}={actual}"
+                )));
+            }
+        }
+        if len % self.stride != 0 {
+            return Err(CudaCppError::message(format!(
+                "Ranger dirty stacked length {len} is not divisible by stride {}",
+                self.stride
+            )));
+        }
+        let stack_count = len / self.stride;
+        if self.dirty_count > stack_count {
+            return Err(CudaCppError::message(format!(
+                "Ranger dirty stacked dirty_count {} exceeds stack count {stack_count}",
+                self.dirty_count
+            )));
+        }
+        if self.dirty_count > self.dirty_buckets.len() {
+            return Err(CudaCppError::message(format!(
+                "Ranger dirty stacked dirty_count {} exceeds dirty bucket buffer length {}",
+                self.dirty_count,
+                self.dirty_buckets.len()
+            )));
+        }
+        Ok(len)
+    }
+}
+
 pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: RangerStateMut<'_>) -> Result<()> {
     params.validate()?;
     let len = state.validate()?;
@@ -6666,6 +6872,48 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
             params.radam.max_weight,
             i32::from(do_lookahead),
             params.lookahead_alpha,
+            state.gradients.as_ptr(),
+            state.weights.as_ptr(),
+            state.momentum.as_ptr(),
+            state.velocity.as_ptr(),
+            state.slow_params.as_ptr(),
+        )
+    })
+}
+
+pub fn ranger_update_stacked_dirty_device(
+    ctx: &Context,
+    params: RangerUpdateParams,
+    state: RangerStackedDirtyDeviceStateMut<'_>,
+) -> Result<()> {
+    params.validate()?;
+    let len = state.validate()?;
+    if state.dirty_count == 0 || len == 0 {
+        return Ok(());
+    }
+    let scale = params.radam.step_scale()?;
+    let do_lookahead = params.should_lookahead()?;
+
+    // SAFETY: backend validates device ownership, lengths, and dirty bucket buffer length.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
+            ctx.as_ptr(),
+            len,
+            state.stride,
+            state.dirty_count,
+            params.radam.gradient_factor,
+            params.radam.learning_rate,
+            scale.step_size,
+            i32::from(scale.use_denom),
+            params.radam.decay,
+            params.radam.beta1,
+            params.radam.beta2,
+            params.radam.epsilon,
+            params.radam.min_weight,
+            params.radam.max_weight,
+            i32::from(do_lookahead),
+            params.lookahead_alpha,
+            state.dirty_buckets.as_ptr(),
             state.gradients.as_ptr(),
             state.weights.as_ptr(),
             state.momentum.as_ptr(),
@@ -7343,6 +7591,30 @@ mod ffi {
             max_weight: f32,
             do_lookahead: i32,
             lookahead_alpha: f32,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            momentum: *mut BulletOuCudaCppF32Buffer,
+            velocity: *mut BulletOuCudaCppF32Buffer,
+            slow_params: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
+            ctx: *mut BulletOuCudaCppContext,
+            len: usize,
+            stride: usize,
+            dirty_count: usize,
+            gradient_factor: f32,
+            learning_rate: f32,
+            step_size: f32,
+            use_denom: i32,
+            decay: f32,
+            beta1: f32,
+            beta2: f32,
+            epsilon: f32,
+            min_weight: f32,
+            max_weight: f32,
+            do_lookahead: i32,
+            lookahead_alpha: f32,
+            dirty_buckets: *mut BulletOuCudaCppI32Buffer,
             gradients: *mut BulletOuCudaCppF32Buffer,
             weights: *mut BulletOuCudaCppF32Buffer,
             momentum: *mut BulletOuCudaCppF32Buffer,

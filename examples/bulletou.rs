@@ -71,30 +71,29 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
-        set_shogi_sfnn_progress_q16_params, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
+        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
         ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
-        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT,
+        set_shogi_sfnn_progress_q16_params,
     },
     nn::optimiser,
-    teacher_path::{expand_teacher, infer_data_format, DataFormat},
+    teacher_path::{DataFormat, expand_teacher, infer_data_format},
     trainer::schedule::lr::LrScheduler,
     validate::{
-        build_validation_sample_mask, compute_sign_accuracy_with_loss_masked, read_all_teacher_positions,
-        read_random_teacher_positions, read_teacher_positions_prefix, AccuracyReport, ValidationLossKind,
-        ValidationSampleMask,
+        AccuracyReport, ValidationLossKind, ValidationSampleMask, build_validation_sample_mask,
+        compute_sign_accuracy_with_loss_masked, read_all_teacher_positions, read_random_teacher_positions,
+        read_teacher_positions_prefix,
     },
     value::{
-        analyze_score_winrate_from_teacher,
+        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, analyze_score_winrate_from_teacher,
         nnue_save::{
-            ft_hash_bytes, header_bytes, l1_bias_scale, network_layer_hash_bytes, pad32 as nnue_pad32,
-            pad_weights_for_simd, Activation as NnueActivation, NnueFeatureSet,
+            Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
+            network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
         },
         nnue_save_sfnn1536::{LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION},
         yaneuraou_kppt::{
-            bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
-            save_yaneuraou_eval, write_state_backend_marker, KppFormat,
+            KppFormat, bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
+            save_yaneuraou_eval, write_state_backend_marker,
         },
-        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport,
     },
 };
 use clap::{ArgAction, Parser, ValueEnum};
@@ -2941,11 +2940,7 @@ fn quantized_validation_rate_label(args: &Args) -> String {
 }
 
 fn quantized_validation_mode_label(args: &Args) -> &'static str {
-    if args.quantized_validation_exact {
-        "cpu-exact"
-    } else {
-        "gpu"
-    }
+    if args.quantized_validation_exact { "cpu-exact" } else { "gpu" }
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
@@ -3411,20 +3406,12 @@ fn cuda_cpp_effective_teacher_threads(args: &Args) -> usize {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_effective_loader_threads(args: &Args) -> usize {
-    if args.loader_threads == 0 {
-        cuda_cpp_default_cpu_threads()
-    } else {
-        args.loader_threads
-    }
+    if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_effective_batch_queue_size(args: &Args) -> usize {
-    if args.batch_queue_size == 32 {
-        4
-    } else {
-        args.batch_queue_size
-    }
+    if args.batch_queue_size == 32 { 4 } else { args.batch_queue_size }
 }
 
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
@@ -3762,6 +3749,14 @@ struct Args {
     /// every mini-batch.
     #[arg(long, default_value_t = 1)]
     batches_per_update: usize,
+
+    /// Experimental SFNN optimizer mode: update bucket-specific L1/L2/L3
+    /// stack tensors only for LayerStack buckets touched since the previous
+    /// optimizer update. Shared/axis/pair factorizer tensors and L0 remain
+    /// normal full updates. This is a sparse/lazy Ranger variant, so results
+    /// are not guaranteed to match the default optimizer exactly.
+    #[arg(long)]
+    sfnn_dirty_bucket_update: bool,
 
     /// Target positions consumed per superbatch. The actual value is rounded
     /// down to a multiple of `--batch-size` because the trainer advances in
@@ -4515,6 +4510,9 @@ impl Args {
         if self.batches_per_update == 0 {
             return Err("--batches-per-update must be > 0".to_string());
         }
+        if self.sfnn_dirty_bucket_update && !eval_type.uses_layerstack() {
+            return Err("--sfnn-dirty-bucket-update is supported for SFNN architectures only".to_string());
+        }
         if self.batches_per_update > 1 {
             if !eval_type.uses_layerstack() {
                 return Err("--batches-per-update > 1 is currently supported for SFNN architectures only".to_string());
@@ -4678,11 +4676,7 @@ fn effective_output_inv_scale(args: &Args) -> f32 {
         return effective_wrm_nnue2score(args) / effective_wrm_in_scaling(args);
     }
     let model_output_scale = effective_model_output_scale(args);
-    if model_output_scale > 0.0 {
-        1.0 / model_output_scale
-    } else {
-        1.0
-    }
+    if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5102,11 +5096,7 @@ impl NerfRng {
     }
 
     fn gen_delta(&mut self) -> i16 {
-        if self.next_u64() & 1 == 0 {
-            -1
-        } else {
-            1
-        }
+        if self.next_u64() & 1 == 0 { -1 } else { 1 }
     }
 }
 
@@ -5444,11 +5434,7 @@ impl QuantizedTestReport {
 
     fn positions_per_sec(self) -> usize {
         let secs = self.elapsed.as_secs_f64();
-        if secs <= 0.0 {
-            0
-        } else {
-            (self.records as f64 / secs).round() as usize
-        }
+        if secs <= 0.0 { 0 } else { (self.records as f64 / secs).round() as usize }
     }
 }
 
@@ -5912,11 +5898,7 @@ fn quantized_final_division(output: i32, fv_scale: i32, round: QuantizedRoundMod
         QuantizedRoundMode::Floor => output / fv_scale,
         QuantizedRoundMode::Nearest => {
             let half = fv_scale / 2;
-            if output >= 0 {
-                (output + half) / fv_scale
-            } else {
-                (output - half) / fv_scale
-            }
+            if output >= 0 { (output + half) / fv_scale } else { (output - half) / fv_scale }
         }
     }
 }
@@ -8569,7 +8551,7 @@ where
 {
     match feature_kind {
         CudaCppNnueFeatureKind::Halfkp => {
-            use bulletou_lib::value::{for_each_halfkp_teacher_fast_batch, HalfkpTeacherBatchConfig};
+            use bulletou_lib::value::{HalfkpTeacherBatchConfig, for_each_halfkp_teacher_fast_batch};
             let config = HalfkpTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8599,7 +8581,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Kp => {
-            use bulletou_lib::value::{for_each_kp_teacher_fast_batch, KpTeacherBatchConfig};
+            use bulletou_lib::value::{KpTeacherBatchConfig, for_each_kp_teacher_fast_batch};
             let config = KpTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8628,7 +8610,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Ka2 => {
-            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
+            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8663,7 +8645,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Halfkpe9 => {
-            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
+            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8698,7 +8680,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Halfkpvm => {
-            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
+            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8820,7 +8802,7 @@ fn for_each_cuda_cpp_kppt_teacher_batch<F>(
 where
     F: FnMut(CudaCppKpptTeacherBatch) -> Result<(), String>,
 {
-    use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
+    use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
 
     let config = KpptTeacherBatchConfig {
         teacher: &args.teacher,
@@ -10755,11 +10737,7 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
                 p * p
             })
             .sum::<f64>();
-        if sum_sq > 0.0 {
-            1.0 / sum_sq
-        } else {
-            0.0
-        }
+        if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 }
     };
     let mut top = counts
         .iter()
@@ -11079,6 +11057,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 paint(format_count(args.batches_per_update), ConsoleColor::BoldYellow),
                 paint(format_count(batch_size.saturating_mul(args.batches_per_update)), ConsoleColor::BoldYellow)
             ),
+        );
+    }
+    if args.sfnn_dirty_bucket_update {
+        print_startup_kv_colored(
+            "dirty bucket update",
+            "experimental: bucket-specific L1/L2/L3 update only touched stacks",
+            ConsoleColor::BoldYellow,
         );
     }
     if feature_kind.virtual_rows() > 0 {
@@ -11703,6 +11688,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut last_checkpoint_metrics = None;
     let mut deferred_direct_checkpoint = None;
     let mut last_epoch_banner = None;
+    let mut dirty_bucket_marks =
+        if args.sfnn_dirty_bucket_update { vec![false; cuda_shape.num_stacks] } else { Vec::new() };
+    let mut dirty_buckets = Vec::<i32>::new();
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
@@ -11749,6 +11737,22 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             batch_size: fast.layout.batch_size,
             max_active: fast.layout.max_active,
         };
+        if args.sfnn_dirty_bucket_update {
+            for &bucket in &fast.buckets {
+                if bucket >= 0 {
+                    let bucket = bucket as usize;
+                    if bucket < dirty_bucket_marks.len() && !dirty_bucket_marks[bucket] {
+                        dirty_bucket_marks[bucket] = true;
+                        dirty_buckets.push(bucket as i32);
+                    }
+                }
+            }
+        }
+        let dirty_update_buckets = if args.sfnn_dirty_bucket_update && is_optimizer_step {
+            Some(dirty_buckets.as_slice())
+        } else {
+            None
+        };
         let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
         let explicit_profile_step = seen_steps <= profile_steps;
         let diagnostic_profile_step =
@@ -11756,7 +11760,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let lr_multipliers = cuda_cpp_sfnn_layer_lr_multipliers(args, progress_for_step);
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
-                .step_profiled_no_readback_with_update_and_lr_multipliers(
+                .step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
                     &ctx,
                     params,
                     loss_kind,
@@ -11764,6 +11768,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     batch,
                     is_optimizer_step,
                     lr_multipliers,
+                    dirty_update_buckets,
                 )
                 .map_err(|e| e.to_string())?;
             sfnn_diagnostics.observe_profile(&profile);
@@ -11803,7 +11808,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             }
         } else {
             runner
-                .step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                .step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
                     &ctx,
                     &upload_ctx,
                     params,
@@ -11813,11 +11818,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     should_report,
                     is_optimizer_step,
                     lr_multipliers,
+                    dirty_update_buckets,
                 )
                 .map_err(|e| e.to_string())?;
         }
         if is_optimizer_step {
             optimizer_updates += 1;
+            if args.sfnn_dirty_bucket_update {
+                for &bucket in &dirty_buckets {
+                    dirty_bucket_marks[bucket as usize] = false;
+                }
+                dirty_buckets.clear();
+            }
         }
         if should_report {
             ctx.synchronize().map_err(|e| e.to_string())?;
@@ -17094,19 +17106,11 @@ fn append_cuda_cpp_sfnn_diagnostics_log(
 
     let train_sec = stats.interval_train_elapsed_sec.max(0.0);
     let pct = |seconds: f64| -> f64 {
-        if train_sec > 0.0 && seconds.is_finite() {
-            100.0 * seconds.max(0.0) / train_sec
-        } else {
-            0.0
-        }
+        if train_sec > 0.0 && seconds.is_finite() { 100.0 * seconds.max(0.0) / train_sec } else { 0.0 }
     };
     let profile_denom = diag.cuda_profile_steps.max(1) as f64;
     let avg_or_zero = |sum_ms: f64| -> f64 {
-        if diag.cuda_profile_steps > 0 && sum_ms.is_finite() {
-            sum_ms / profile_denom
-        } else {
-            0.0
-        }
+        if diag.cuda_profile_steps > 0 && sum_ms.is_finite() { sum_ms / profile_denom } else { 0.0 }
     };
 
     writeln!(
@@ -17527,6 +17531,7 @@ fn resume_signature(args: &Args) -> String {
         format!("net_id={}", args.net_id()),
         format!("batch_size={}", effective_batch_size(args)),
         format!("batches_per_update={}", args.batches_per_update),
+        format!("sfnn_dirty_bucket_update={}", args.sfnn_dirty_bucket_update),
         format!("positions_per_superbatch={positions_per_superbatch}"),
         format!(
             "teacher_shuffle_buffer_batches={}",
@@ -17681,6 +17686,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         }
     }
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
+    ensure_line_after(&mut out, "sfnn_dirty_bucket_update=", "batches_per_update=", "sfnn_dirty_bucket_update=false");
     ensure_line_after(&mut out, "win_rate_model=", "fv_scale=", "win_rate_model=false");
     ensure_line_after(&mut out, "quantized_validation_rate=", "validation_rate=", "quantized_validation_rate=save");
     ensure_line_after(
@@ -17742,8 +17748,7 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     let can_omit_validation_rate =
         !stored_has_validation_rate && effective_validation_rate(args) == effective_save_rate(args);
     let can_omit_factorizer = !stored_has_factorizer && !factorizer.any_axis();
-    let alpha_default_line =
-        "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,progress_axis=1.000000000,pair=1.000000000";
+    let alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,progress_axis=1.000000000,pair=1.000000000";
     let old_alpha_default_line_with_pair =
         "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,pair=1.000000000";
     let old_alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000";
@@ -17910,11 +17915,7 @@ fn remove_non_resume_cuda_cpp_top_level_logs(output_dir: &std::path::Path) {
 }
 
 fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if resume_enabled(args, output_dir) {
-        find_latest_state_bin_raw(output_dir)
-    } else {
-        None
-    }
+    if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
 }
 
 fn prepare_resume_config_or_exit(args: &Args) {
@@ -18983,11 +18984,7 @@ where
 }
 
 fn kppt_black_perspective_component(stm_is_black: bool, stm_sum: f32, nstm_sum: f32) -> f32 {
-    if stm_is_black {
-        stm_sum
-    } else {
-        -nstm_sum
-    }
+    if stm_is_black { stm_sum } else { -nstm_sum }
 }
 
 fn run_kppt_component_dirs_final_validation(
@@ -19611,16 +19608,18 @@ mod tests {
     fn sfnn_progress_params_cli_is_not_supported() {
         use clap::Parser as _;
 
-        assert!(Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "SFNN_halfka2_1024_7_64_progress8",
-            "--teacher",
-            "/dev/null",
-            "--sfnn-progress-params",
-            "progress-params.bin",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "SFNN_halfka2_1024_7_64_progress8",
+                "--teacher",
+                "/dev/null",
+                "--sfnn-progress-params",
+                "progress-params.bin",
+            ])
+            .is_err()
+        );
     }
 
     /// Verify that `--tag` appends `-<tag>` to the auto-generated output
@@ -19681,18 +19680,20 @@ mod tests {
         );
 
         // The exact path mode and folder-root mode are intentionally exclusive.
-        assert!(Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_kp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--output",
-            "/custom/path",
-            "--output-folder",
-            "D:/checkpoints",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "NNUE_kp_256x2_32_32",
+                "--teacher",
+                "/dev/null",
+                "--output",
+                "/custom/path",
+                "--output-folder",
+                "D:/checkpoints",
+            ])
+            .is_err()
+        );
 
         // Explicit --output wins; --tag is ignored.
         let args = Args::try_parse_from([
@@ -23962,12 +23963,14 @@ mod tests {
         );
 
         let mut migrated = optimizer;
-        assert!(fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
-            &mut migrated,
-            shape,
-            SfnnFactorizerSpec::NONE
-        )
-        .unwrap());
+        assert!(
+            fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
+                &mut migrated,
+                shape,
+                SfnnFactorizerSpec::NONE
+            )
+            .unwrap()
+        );
 
         assert_eq!(migrated.l1w.momentum, expected_weights.l1w);
         assert_eq!(migrated.l1b.momentum, expected_weights.l1b);
@@ -24055,12 +24058,14 @@ mod tests {
         migrated.l3axw = Some(vec![0.0; axis_count * shape.l2_size]);
         migrated.l3axb = Some(vec![0.0; axis_count]);
 
-        assert!(extract_cuda_cpp_sfnn_new_factorizers_from_base(
-            &mut migrated,
-            SfnnFactorizerSpec::AXIS,
-            CudaCppSfnnCreatedFactorizers { shared_l1: true, shared_l2_l3: true, axis_l1: true, axis_l2_l3: true },
-        )
-        .unwrap());
+        assert!(
+            extract_cuda_cpp_sfnn_new_factorizers_from_base(
+                &mut migrated,
+                SfnnFactorizerSpec::AXIS,
+                CudaCppSfnnCreatedFactorizers { shared_l1: true, shared_l2_l3: true, axis_l1: true, axis_l2_l3: true },
+            )
+            .unwrap()
+        );
         assert!(migrated.l1fw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
         assert!(migrated.l1axw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
 
