@@ -1256,6 +1256,37 @@ struct QuantizedTestArgs {
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
+    /// Use tatara-style WRM loss for loss reporting. This is the default;
+    /// the flag is accepted when you want the command line to state it
+    /// explicitly. Use `--loss-sigmoid-mse` to force plain sigmoid loss.
+    #[arg(long, conflicts_with = "loss_sigmoid_mse")]
+    win_rate_model: bool,
+
+    /// Force plain sigmoid probability loss instead of WRM for loss reporting.
+    #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
+    loss_sigmoid_mse: bool,
+
+    /// WRM prediction-side output scale for train-scale raw output:
+    /// `score_net = raw/(QA*QB) * N`.
+    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
+    wrm_nnue2score: f32,
+
+    /// WRM prediction-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_OFFSET)]
+    wrm_in_offset: f32,
+
+    /// WRM prediction-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_SCALING)]
+    wrm_in_scaling: f32,
+
+    /// WRM target-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_OFFSET)]
+    wrm_target_offset: f32,
+
+    /// WRM target-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
+    wrm_target_scaling: f32,
+
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
     quant_ft_round: QuantizedRoundMode,
@@ -1372,6 +1403,24 @@ impl QuantizedTestArgs {
         if self.scale == 0 {
             return Err("--scale must be > 0".to_string());
         }
+        if self.win_rate_model && self.loss_sigmoid_mse {
+            return Err("--win-rate-model and --loss-sigmoid-mse are mutually exclusive".to_string());
+        }
+        if !(self.wrm_nnue2score.is_finite() && self.wrm_nnue2score > 0.0) {
+            return Err(format!("--wrm-nnue2score must be finite and > 0 (got {})", self.wrm_nnue2score));
+        }
+        if !self.wrm_in_offset.is_finite() {
+            return Err(format!("--wrm-in-offset must be finite (got {})", self.wrm_in_offset));
+        }
+        if !(self.wrm_in_scaling.is_finite() && self.wrm_in_scaling > 0.0) {
+            return Err(format!("--wrm-in-scaling must be finite and > 0 (got {})", self.wrm_in_scaling));
+        }
+        if !self.wrm_target_offset.is_finite() {
+            return Err(format!("--wrm-target-offset must be finite (got {})", self.wrm_target_offset));
+        }
+        if !(self.wrm_target_scaling.is_finite() && self.wrm_target_scaling > 0.0) {
+            return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
+        }
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
@@ -1433,6 +1482,13 @@ impl AverageSfnnStateArgs {
             lambda: 1.0,
             scale: self.scale,
             loss_pow_exp: self.loss_pow_exp,
+            win_rate_model: false,
+            loss_sigmoid_mse: false,
+            wrm_nnue2score: DEFAULT_WRM_NNUE2SCORE,
+            wrm_in_offset: DEFAULT_WRM_IN_OFFSET,
+            wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
+            wrm_target_offset: DEFAULT_WRM_TARGET_OFFSET,
+            wrm_target_scaling: DEFAULT_WRM_TARGET_SCALING,
             quant_ft_round: QuantizedRoundMode::Floor,
             quant_crelu_round: QuantizedRoundMode::Floor,
             quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -1546,6 +1602,37 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
+    /// Use tatara-style WRM loss for calibration and reporting. This is the
+    /// default; use `--loss-sigmoid-mse` to force plain sigmoid loss.
+    #[arg(long, conflicts_with = "loss_sigmoid_mse")]
+    win_rate_model: bool,
+
+    /// Force plain sigmoid probability loss instead of WRM for calibration
+    /// and reporting.
+    #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
+    loss_sigmoid_mse: bool,
+
+    /// WRM prediction-side output scale for train-scale raw output:
+    /// `score_net = raw/(QA*QB) * N`.
+    #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
+    wrm_nnue2score: f32,
+
+    /// WRM prediction-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_OFFSET)]
+    wrm_in_offset: f32,
+
+    /// WRM prediction-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_IN_SCALING)]
+    wrm_in_scaling: f32,
+
+    /// WRM target-side offset.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_OFFSET)]
+    wrm_target_offset: f32,
+
+    /// WRM target-side scaling.
+    #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
+    wrm_target_scaling: f32,
+
     /// Search objective used to choose the folded offset.
     #[arg(long, value_enum, default_value = "loss")]
     objective: QuantizedCalibrateObjective,
@@ -1608,6 +1695,13 @@ impl QuantizedCalibrateArgs {
             lambda: self.lambda,
             scale: self.scale,
             loss_pow_exp: self.loss_pow_exp,
+            win_rate_model: self.win_rate_model,
+            loss_sigmoid_mse: self.loss_sigmoid_mse,
+            wrm_nnue2score: self.wrm_nnue2score,
+            wrm_in_offset: self.wrm_in_offset,
+            wrm_in_scaling: self.wrm_in_scaling,
+            wrm_target_offset: self.wrm_target_offset,
+            wrm_target_scaling: self.wrm_target_scaling,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
             quant_sqrcrelu_round: self.quant_sqrcrelu_round,
@@ -4572,6 +4666,27 @@ fn sigmoid_loss_label_plain(pow_exp: f32, scale: f32) -> String {
     }
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
+    if quantized_effective_win_rate_model(args) {
+        return format!(
+            "win-rate-model(pow_exp={:.3}, train_nnue2score={:.3}, engine_nnue2score=1.000, in={:.1}/{:.1}, target={:.1}/{:.1})",
+            args.loss_pow_exp,
+            args.wrm_nnue2score,
+            args.wrm_in_offset,
+            args.wrm_in_scaling,
+            args.wrm_target_offset,
+            args.wrm_target_scaling
+        );
+    }
+    sigmoid_loss_label(
+        args.loss_pow_exp,
+        args.scale as f32,
+        args.fv_scale as f32,
+        quantized_train_scale_model_output_scale(args),
+    )
+}
+
 const BULLETOU_DEFAULT_RANGER_CLIP: f32 = 1.98;
 #[cfg(feature = "cuda-cpp-backend")]
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
@@ -5256,13 +5371,46 @@ fn quantized_sfnn_raw_output_scale() -> f32 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_effective_win_rate_model(args: &QuantizedTestArgs) -> bool {
+    args.win_rate_model || !args.loss_sigmoid_mse
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_wrm_target_params(args: &QuantizedTestArgs) -> bulletou_lib::value::WinRateModelTargetParams {
+    bulletou_lib::value::WinRateModelTargetParams { offset: args.wrm_target_offset, scaling: args.wrm_target_scaling }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    if quantized_effective_win_rate_model(args) {
+        ValidationLossKind::WinRateModel {
+            pow_exp: args.loss_pow_exp,
+            nnue2score: args.wrm_nnue2score,
+            in_offset: args.wrm_in_offset,
+            in_scaling: args.wrm_in_scaling,
+            target: quantized_wrm_target_params(args),
+        }
+    } else {
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    if quantized_effective_win_rate_model(args) {
+        ValidationLossKind::WinRateModel {
+            pow_exp: args.loss_pow_exp,
+            // Engine-scale quantized output is already a YaneuraOu Value
+            // after raw/FV_SCALE, so do not multiply it by the train-scale
+            // network-output conversion factor.
+            nnue2score: 1.0,
+            in_offset: args.wrm_in_offset,
+            in_scaling: args.wrm_in_scaling,
+            target: quantized_wrm_target_params(args),
+        }
+    } else {
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6135,15 +6283,7 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
             args.quant_sqrcrelu_round.cli_name(),
             args.quant_final_div_round.cli_name(),
         );
-        eprintln!(
-            "  loss              = {}",
-            sigmoid_loss_label(
-                args.loss_pow_exp,
-                args.scale as f32,
-                args.fv_scale as f32,
-                quantized_train_scale_model_output_scale(args)
-            )
-        );
+        eprintln!("  loss              = {}", quantized_loss_label(args));
         eprintln!(
             "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
             quantized_sfnn_raw_output_scale(),
@@ -6222,6 +6362,13 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
         lambda: args.lambda,
         scale: scale.round() as u32,
         loss_pow_exp: effective_loss_pow_exp(args),
+        win_rate_model: args.win_rate_model,
+        loss_sigmoid_mse: args.loss_sigmoid_mse,
+        wrm_nnue2score: effective_wrm_nnue2score(args),
+        wrm_in_offset: effective_wrm_in_offset(args),
+        wrm_in_scaling: effective_wrm_in_scaling(args),
+        wrm_target_offset: effective_wrm_target_params(args).offset,
+        wrm_target_scaling: effective_wrm_target_params(args).scaling,
         quant_ft_round: QuantizedRoundMode::Floor,
         quant_crelu_round: QuantizedRoundMode::Floor,
         quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -23437,6 +23584,59 @@ mod tests {
             "--loss-sigmoid-mse",
         ]);
         assert!(conflicting.is_err(), "--win-rate-model and --loss-sigmoid-mse must be mutually exclusive");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_test_loss_defaults_to_wrm_with_engine_scale_output() {
+        use clap::Parser as _;
+
+        let args = QuantizedTestArgs::try_parse_from([
+            "bulletou quantized-test",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--nn-bin",
+            "nn.bin",
+            "--test-teacher",
+            "test.hcpe",
+        ])
+        .unwrap();
+
+        match quantized_train_scale_loss_kind(&args) {
+            ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, target, .. } => {
+                assert_eq!(nnue2score, DEFAULT_WRM_NNUE2SCORE);
+                assert_eq!(in_offset, DEFAULT_WRM_IN_OFFSET);
+                assert_eq!(in_scaling, DEFAULT_WRM_IN_SCALING);
+                assert_eq!(target.offset, DEFAULT_WRM_TARGET_OFFSET);
+                assert_eq!(target.scaling, DEFAULT_WRM_TARGET_SCALING);
+            }
+            other => panic!("expected WRM train-scale loss, got {other:?}"),
+        }
+
+        match quantized_engine_scale_loss_kind(&args) {
+            ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, target, .. } => {
+                assert_eq!(nnue2score, 1.0);
+                assert_eq!(in_offset, DEFAULT_WRM_IN_OFFSET);
+                assert_eq!(in_scaling, DEFAULT_WRM_IN_SCALING);
+                assert_eq!(target.offset, DEFAULT_WRM_TARGET_OFFSET);
+                assert_eq!(target.scaling, DEFAULT_WRM_TARGET_SCALING);
+            }
+            other => panic!("expected WRM engine-scale loss, got {other:?}"),
+        }
+
+        let sigmoid = QuantizedTestArgs::try_parse_from([
+            "bulletou quantized-test",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--nn-bin",
+            "nn.bin",
+            "--test-teacher",
+            "test.hcpe",
+            "--loss-sigmoid-mse",
+        ])
+        .unwrap();
+        assert!(matches!(quantized_train_scale_loss_kind(&sigmoid), ValidationLossKind::SigmoidPow { .. }));
+        assert!(matches!(quantized_engine_scale_loss_kind(&sigmoid), ValidationLossKind::SigmoidPow { .. }));
     }
 
     #[test]
