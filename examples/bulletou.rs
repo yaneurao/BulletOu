@@ -6391,6 +6391,17 @@ struct LossComparisonSummary {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputMultiplierSweepSummary {
+    best_multiplier: f32,
+    best_loss: f32,
+    base_loss: f32,
+    loss_at_080: f32,
+    loss_at_090: f32,
+    loss_at_110: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug)]
 struct CompareSfnnQuantizationReport {
     records: usize,
@@ -6401,6 +6412,8 @@ struct CompareSfnnQuantizationReport {
     output_delta: SignedDeltaSummary,
     sign: SignComparisonSummary,
     loss: LossComparisonSummary,
+    fp32_multiplier_sweep: OutputMultiplierSweepSummary,
+    quantized_multiplier_sweep: OutputMultiplierSweepSummary,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6547,6 +6560,119 @@ fn validation_diag_sample_loss(
         ValidationLossKind::SigmoidPow { pow_exp } | ValidationLossKind::WinRateModel { pow_exp, .. } => {
             diff.abs().powf(pow_exp)
         }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn validation_diag_mean_loss_for_multiplier(
+    outputs: &[f32],
+    teacher_scores: &[i16],
+    teacher_results: &[i8],
+    sample_mask: &ValidationSampleMask,
+    lambda: f32,
+    eval_scale: f32,
+    model_output_scale: f32,
+    loss_kind: ValidationLossKind,
+    multiplier: f32,
+) -> f32 {
+    if sample_mask.loss_indices.is_empty() {
+        return f32::NAN;
+    }
+    let mut sum = 0.0f64;
+    for &i in &sample_mask.loss_indices {
+        sum += f64::from(validation_diag_sample_loss(
+            outputs[i] * multiplier,
+            teacher_scores[i],
+            teacher_results[i],
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+        ));
+    }
+    (sum / sample_mask.loss_indices.len() as f64) as f32
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sweep_output_multiplier(
+    outputs: &[f32],
+    teacher_scores: &[i16],
+    teacher_results: &[i8],
+    sample_mask: &ValidationSampleMask,
+    lambda: f32,
+    eval_scale: f32,
+    model_output_scale: f32,
+    loss_kind: ValidationLossKind,
+) -> OutputMultiplierSweepSummary {
+    let mut best_multiplier = f32::NAN;
+    let mut best_loss = f32::INFINITY;
+    // Coarse but stable diagnostic sweep. 0.25..1.50 covers the common
+    // "network output is too hot/cold" range without making the command slow.
+    for step in 25..=150 {
+        let multiplier = step as f32 / 100.0;
+        let loss = validation_diag_mean_loss_for_multiplier(
+            outputs,
+            teacher_scores,
+            teacher_results,
+            sample_mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+            multiplier,
+        );
+        if loss.is_finite() && loss < best_loss {
+            best_loss = loss;
+            best_multiplier = multiplier;
+        }
+    }
+    OutputMultiplierSweepSummary {
+        best_multiplier,
+        best_loss,
+        base_loss: validation_diag_mean_loss_for_multiplier(
+            outputs,
+            teacher_scores,
+            teacher_results,
+            sample_mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+            1.0,
+        ),
+        loss_at_080: validation_diag_mean_loss_for_multiplier(
+            outputs,
+            teacher_scores,
+            teacher_results,
+            sample_mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+            0.8,
+        ),
+        loss_at_090: validation_diag_mean_loss_for_multiplier(
+            outputs,
+            teacher_scores,
+            teacher_results,
+            sample_mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+            0.9,
+        ),
+        loss_at_110: validation_diag_mean_loss_for_multiplier(
+            outputs,
+            teacher_scores,
+            teacher_results,
+            sample_mask,
+            lambda,
+            eval_scale,
+            model_output_scale,
+            loss_kind,
+            1.1,
+        ),
     }
 }
 
@@ -6809,6 +6935,26 @@ fn run_compare_sfnn_quantization(args: &CompareSfnnQuantizationArgs) -> Result<C
         output_delta: summarize_signed_delta(&output_deltas),
         sign,
         loss,
+        fp32_multiplier_sweep: sweep_output_multiplier(
+            &fp32_outputs,
+            &teacher_scores,
+            &teacher_results,
+            &sample_mask,
+            args.lambda,
+            args.scale as f32,
+            model_output_scale,
+            loss_kind,
+        ),
+        quantized_multiplier_sweep: sweep_output_multiplier(
+            &quantized_outputs,
+            &teacher_scores,
+            &teacher_results,
+            &sample_mask,
+            args.lambda,
+            args.scale as f32,
+            model_output_scale,
+            loss_kind,
+        ),
     })
 }
 
@@ -8685,6 +8831,24 @@ fn main() {
                         report.output_delta.min,
                         report.output_delta.p50,
                         report.output_delta.max,
+                    );
+                    println!(
+                        "  fp32 multiplier   = best {:.2} -> loss {:.8}  base {:.8}  m=0.80 {:.8}  m=0.90 {:.8}  m=1.10 {:.8}",
+                        report.fp32_multiplier_sweep.best_multiplier,
+                        report.fp32_multiplier_sweep.best_loss,
+                        report.fp32_multiplier_sweep.base_loss,
+                        report.fp32_multiplier_sweep.loss_at_080,
+                        report.fp32_multiplier_sweep.loss_at_090,
+                        report.fp32_multiplier_sweep.loss_at_110,
+                    );
+                    println!(
+                        "  quant multiplier  = best {:.2} -> loss {:.8}  base {:.8}  m=0.80 {:.8}  m=0.90 {:.8}  m=1.10 {:.8}",
+                        report.quantized_multiplier_sweep.best_multiplier,
+                        report.quantized_multiplier_sweep.best_loss,
+                        report.quantized_multiplier_sweep.base_loss,
+                        report.quantized_multiplier_sweep.loss_at_080,
+                        report.quantized_multiplier_sweep.loss_at_090,
+                        report.quantized_multiplier_sweep.loss_at_110,
                     );
                 }
                 Err(e) => {
