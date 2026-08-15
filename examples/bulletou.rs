@@ -71,29 +71,30 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
-        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
+        set_shogi_sfnn_progress_q16_params, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
         ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
-        set_shogi_sfnn_progress_q16_params,
+        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT,
     },
     nn::optimiser,
-    teacher_path::{DataFormat, expand_teacher, infer_data_format},
+    teacher_path::{expand_teacher, infer_data_format, DataFormat},
     trainer::schedule::lr::LrScheduler,
     validate::{
-        AccuracyReport, ValidationLossKind, ValidationSampleMask, build_validation_sample_mask,
-        compute_sign_accuracy_with_loss_masked, read_all_teacher_positions, read_random_teacher_positions,
-        read_teacher_positions_prefix,
+        build_validation_sample_mask, compute_sign_accuracy_with_loss_masked, read_all_teacher_positions,
+        read_random_teacher_positions, read_teacher_positions_prefix, AccuracyReport, ValidationLossKind,
+        ValidationSampleMask,
     },
     value::{
-        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, analyze_score_winrate_from_teacher,
+        analyze_score_winrate_from_teacher,
         nnue_save::{
-            Activation as NnueActivation, NnueFeatureSet, ft_hash_bytes, header_bytes, l1_bias_scale,
-            network_layer_hash_bytes, pad_weights_for_simd, pad32 as nnue_pad32,
+            ft_hash_bytes, header_bytes, l1_bias_scale, network_layer_hash_bytes, pad32 as nnue_pad32,
+            pad_weights_for_simd, Activation as NnueActivation, NnueFeatureSet,
         },
         nnue_save_sfnn1536::{LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION},
         yaneuraou_kppt::{
-            KppFormat, bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
-            save_yaneuraou_eval, write_state_backend_marker,
+            bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
+            save_yaneuraou_eval, write_state_backend_marker, KppFormat,
         },
+        ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport,
     },
 };
 use clap::{ArgAction, Parser, ValueEnum};
@@ -2859,7 +2860,11 @@ fn quantized_validation_rate_label(args: &Args) -> String {
 }
 
 fn quantized_validation_mode_label(args: &Args) -> &'static str {
-    if args.quantized_validation_exact { "cpu-exact" } else { "gpu" }
+    if args.quantized_validation_exact {
+        "cpu-exact"
+    } else {
+        "gpu"
+    }
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
@@ -3123,8 +3128,7 @@ struct SfnnFactorizerAlphaSpec {
 
 impl SfnnFactorizerAlphaSpec {
     const MAX: f32 = 10.0;
-    const ONE: Self =
-        Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
+    const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
 
     fn is_default(self) -> bool {
         self.shared == 1.0
@@ -3326,12 +3330,20 @@ fn cuda_cpp_effective_teacher_threads(args: &Args) -> usize {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_effective_loader_threads(args: &Args) -> usize {
-    if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads }
+    if args.loader_threads == 0 {
+        cuda_cpp_default_cpu_threads()
+    } else {
+        args.loader_threads
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_effective_batch_queue_size(args: &Args) -> usize {
-    if args.batch_queue_size == 32 { 4 } else { args.batch_queue_size }
+    if args.batch_queue_size == 32 {
+        4
+    } else {
+        args.batch_queue_size
+    }
 }
 
 fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
@@ -4585,7 +4597,11 @@ fn effective_output_inv_scale(args: &Args) -> f32 {
         return effective_wrm_nnue2score(args) / effective_wrm_in_scaling(args);
     }
     let model_output_scale = effective_model_output_scale(args);
-    if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 }
+    if model_output_scale > 0.0 {
+        1.0 / model_output_scale
+    } else {
+        1.0
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5005,7 +5021,11 @@ impl NerfRng {
     }
 
     fn gen_delta(&mut self) -> i16 {
-        if self.next_u64() & 1 == 0 { -1 } else { 1 }
+        if self.next_u64() & 1 == 0 {
+            -1
+        } else {
+            1
+        }
     }
 }
 
@@ -5343,7 +5363,11 @@ impl QuantizedTestReport {
 
     fn positions_per_sec(self) -> usize {
         let secs = self.elapsed.as_secs_f64();
-        if secs <= 0.0 { 0 } else { (self.records as f64 / secs).round() as usize }
+        if secs <= 0.0 {
+            0
+        } else {
+            (self.records as f64 / secs).round() as usize
+        }
     }
 }
 
@@ -5807,7 +5831,11 @@ fn quantized_final_division(output: i32, fv_scale: i32, round: QuantizedRoundMod
         QuantizedRoundMode::Floor => output / fv_scale,
         QuantizedRoundMode::Nearest => {
             let half = fv_scale / 2;
-            if output >= 0 { (output + half) / fv_scale } else { (output - half) / fv_scale }
+            if output >= 0 {
+                (output + half) / fv_scale
+            } else {
+                (output - half) / fv_scale
+            }
         }
     }
 }
@@ -6301,9 +6329,8 @@ fn quantized_test_positions_gpu_proxy(
         },
     )
     .map_err(|e| e.to_string())?;
-    let device_weights =
-        bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, proxy_weights.as_host())
-            .map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, proxy_weights.as_host())
+        .map_err(|e| e.to_string())?;
     let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
         &ctx,
         bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(proxy_weights.shape, batch.layout.batch_size),
@@ -6600,8 +6627,14 @@ fn update_summary_log_quantized_metrics(
 
 #[cfg(feature = "cuda-cpp-backend")]
 enum CudaCppSfnnQuantizedValidationCache {
-    Proxy { inner: CudaCppSfnnResidentValidationCache, device_weights: Option<bulletou_cuda_cpp::SfnnForwardDeviceWeights> },
-    Exact { cache: Arc<TestPositionsCache>, batch: bulletou_lib::value::FastBatchHost },
+    Proxy {
+        inner: CudaCppSfnnResidentValidationCache,
+        device_weights: Option<bulletou_cuda_cpp::SfnnForwardDeviceWeights>,
+    },
+    Exact {
+        cache: Arc<TestPositionsCache>,
+        batch: bulletou_lib::value::FastBatchHost,
+    },
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6646,7 +6679,7 @@ impl CudaCppSfnnQuantizedValidationCache {
             return Ok(Some(Self::Exact { cache, batch }));
         }
 
-        let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(feature_kind, shape);
+        let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(args, feature_kind, shape);
         let inner = CudaCppSfnnResidentValidationCache::try_new_labeled(
             args,
             feature_kind,
@@ -6684,10 +6717,19 @@ impl CudaCppSfnnQuantizedValidationCache {
                 if let Some(device_weights) = device_weights.as_ref() {
                     device_weights.upload(ctx, host).map_err(|e| e.to_string())?;
                 } else {
-                    *device_weights =
-                        Some(bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, host).map_err(|e| e.to_string())?);
+                    *device_weights = Some(
+                        bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, host).map_err(|e| e.to_string())?,
+                    );
                 }
-                inner.run_device_weights(args, ctx, device_weights.as_ref().expect("device weights initialized"))
+                let factorizer = cuda_cpp_sfnn_initial_weights_factorizer_active(&proxy_weights);
+                let alpha = cuda_cpp_sfnn_factorizer_alpha(args);
+                inner.run_device_weights_with_factorizer(
+                    args,
+                    ctx,
+                    device_weights.as_ref().expect("device weights initialized"),
+                    factorizer,
+                    alpha,
+                )
             }
             Self::Exact { cache, batch } => {
                 let quantized =
@@ -6705,9 +6747,29 @@ impl CudaCppSfnnQuantizedValidationCache {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_quantized_proxy_shape(
+    args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
 ) -> bulletou_cuda_cpp::SfnnForwardShape {
+    if cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args, shape) {
+        return bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: feature_kind.base_input_size(),
+            ft_size: shape.ft_size,
+            l1_hidden: shape.l1_hidden,
+            l1_skip: shape.l1_skip,
+            l2_size: shape.l2_size,
+            num_stacks: shape.num_stacks,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: shape.factorizer_king_axis_dim,
+            factorizer_hand_axis_dim: shape.factorizer_hand_axis_dim,
+            factorizer_progress_axis: shape.factorizer_progress_axis,
+            factorizer_king_hand_pair: shape.factorizer_king_hand_pair,
+            factorizer_king_progress_pair: shape.factorizer_king_progress_pair,
+            factorizer_hand_progress_pair: shape.factorizer_hand_progress_pair,
+        };
+    }
     bulletou_cuda_cpp::SfnnForwardShape {
         input_size: feature_kind.base_input_size(),
         ft_size: shape.ft_size,
@@ -6728,6 +6790,12 @@ fn cuda_cpp_sfnn_quantized_proxy_shape(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args: &Args, shape: bulletou_cuda_cpp::SfnnForwardShape) -> bool {
+    let factorizer = effective_sfnn_factorizer_spec(args);
+    (factorizer.shared || factorizer.any_axis()) && !cuda_cpp_sfnn_is_compact_l1_shape(shape)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -6735,8 +6803,140 @@ fn cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<CudaCppSfnnInitialWeights, String> {
+    if cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args, shape) {
+        return cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(args, feature_kind, shape, weights);
+    }
     let quantized = quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
     cuda_cpp_sfnn_dequantize_proxy_weights(&quantized)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
+    args: &Args,
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+) -> Result<CudaCppSfnnInitialWeights, String> {
+    let base_input_size = feature_kind.base_input_size();
+    let virtual_rows = feature_kind.virtual_rows();
+    let factorized_input_size = base_input_size + virtual_rows;
+    if shape.input_size != base_input_size && shape.input_size != factorized_input_size {
+        return Err(format!(
+            "cannot build quantized SFNN {} proxy weights for input_size={}, expected {} or factorized {}",
+            feature_kind.source_label(),
+            shape.input_size,
+            base_input_size,
+            factorized_input_size
+        ));
+    }
+    if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
+        return Err("factorized quantized SFNN proxy requires non-compact L1 shape".to_string());
+    }
+
+    let folded_l0w;
+    let l0w_for_proxy: &[f32] = if shape.input_size == base_input_size {
+        &weights.l0w
+    } else if virtual_rows > 0 {
+        folded_l0w =
+            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+        &folded_l0w
+    } else {
+        return Err(format!(
+            "cannot build quantized SFNN {} proxy weights for factorized input_size={} because the feature has no virtual rows",
+            feature_kind.source_label(),
+            shape.input_size
+        ));
+    };
+
+    let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(args, feature_kind, shape);
+    let factorizer = effective_sfnn_factorizer_spec(args);
+    let use_axis = factorizer.any_axis();
+    let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared,
+        "l1f",
+        weights.l1fw.as_deref(),
+        weights.l1fb.as_deref(),
+    )?;
+    let (l1axw, l1axb) =
+        cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l1ax", weights.l1axw.as_deref(), weights.l1axb.as_deref())?;
+    let (l2fw, l2fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared,
+        "l2f",
+        weights.l2fw.as_deref(),
+        weights.l2fb.as_deref(),
+    )?;
+    let (l2axw, l2axb) =
+        cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l2ax", weights.l2axw.as_deref(), weights.l2axb.as_deref())?;
+    let (l3fw, l3fb) = cuda_cpp_sfnn_active_factorizer_pair(
+        factorizer.shared,
+        "l3f",
+        weights.l3fw.as_deref(),
+        weights.l3fb.as_deref(),
+    )?;
+    let (l3axw, l3axb) =
+        cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l3ax", weights.l3axw.as_deref(), weights.l3axb.as_deref())?;
+
+    let qa = f32::from(SFNN_QA);
+    let qb = f32::from(SFNN_QB);
+    let fc_bias_scale = qa * qb;
+    let proxy = CudaCppSfnnInitialWeights {
+        shape: proxy_shape,
+        l0w: sfnn_quantize_dequant_i16(l0w_for_proxy, qa),
+        l0b: sfnn_quantize_dequant_i16(&weights.l0b, qa),
+        l1w: sfnn_quantize_dequant_i8(&weights.l1w, qb),
+        l1b: sfnn_quantize_dequant_i32(&weights.l1b, fc_bias_scale),
+        l1fw: l1fw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l1fb: l1fb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+        l1axw: l1axw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l1axb: l1axb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+        l2w: sfnn_quantize_dequant_i8(&weights.l2w, qb),
+        l2b: sfnn_quantize_dequant_i32(&weights.l2b, fc_bias_scale),
+        l2fw: l2fw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l2fb: l2fb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+        l2axw: l2axw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l2axb: l2axb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+        l3w: sfnn_quantize_dequant_i8(&weights.l3w, qb),
+        l3b: sfnn_quantize_dequant_i32(&weights.l3b, fc_bias_scale),
+        l3fw: l3fw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l3fb: l3fb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+        l3axw: l3axw.map(|values| sfnn_quantize_dequant_i8(values, qb)),
+        l3axb: l3axb.map(|values| sfnn_quantize_dequant_i32(values, fc_bias_scale)),
+    };
+    proxy.validate()?;
+    Ok(proxy)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_quantize_dequant_i16(values: &[f32], scale: f32) -> Vec<f32> {
+    values.iter().map(|&value| f32::from(sfnn_quantise_i16(value, scale)) / scale).collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_quantize_dequant_i8(values: &[f32], scale: f32) -> Vec<f32> {
+    values.iter().map(|&value| f32::from(sfnn_quantise_i8(value, scale)) / scale).collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_quantize_dequant_i32(values: &[f32], scale: f32) -> Vec<f32> {
+    values.iter().map(|&value| sfnn_quantise_i32(value, scale) as f32 / scale).collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_initial_weights_factorizer_active(
+    weights: &CudaCppSfnnInitialWeights,
+) -> bulletou_cuda_cpp::SfnnFactorizerActive {
+    let shape = weights.shape;
+    let has_shared = weights.l1fw.is_some() || weights.l2fw.is_some() || weights.l3fw.is_some();
+    let has_axis = weights.l1axw.is_some() || weights.l2axw.is_some() || weights.l3axw.is_some();
+    bulletou_cuda_cpp::SfnnFactorizerActive {
+        shared: has_shared,
+        king_axis: has_axis && shape.factorizer_king_axis_dim > 0,
+        hand_axis: has_axis && shape.factorizer_hand_axis_dim > 0,
+        progress_axis: has_axis && shape.factorizer_progress_axis,
+        king_hand_pair: has_axis && shape.factorizer_king_hand_pair,
+        king_progress_pair: has_axis && shape.factorizer_king_progress_pair,
+        hand_progress_pair: has_axis && shape.factorizer_hand_progress_pair,
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8268,7 +8468,7 @@ where
 {
     match feature_kind {
         CudaCppNnueFeatureKind::Halfkp => {
-            use bulletou_lib::value::{HalfkpTeacherBatchConfig, for_each_halfkp_teacher_fast_batch};
+            use bulletou_lib::value::{for_each_halfkp_teacher_fast_batch, HalfkpTeacherBatchConfig};
             let config = HalfkpTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8298,7 +8498,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Kp => {
-            use bulletou_lib::value::{KpTeacherBatchConfig, for_each_kp_teacher_fast_batch};
+            use bulletou_lib::value::{for_each_kp_teacher_fast_batch, KpTeacherBatchConfig};
             let config = KpTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8327,7 +8527,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Ka2 => {
-            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
+            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8362,7 +8562,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Halfkpe9 => {
-            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
+            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8397,7 +8597,7 @@ where
             .map_err(|e| e.to_string())
         }
         CudaCppNnueFeatureKind::Halfkpvm => {
-            use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
+            use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
             let config = KpptTeacherBatchConfig {
                 teacher: &args.teacher,
                 batch_size: options.batch_size,
@@ -8519,7 +8719,7 @@ fn for_each_cuda_cpp_kppt_teacher_batch<F>(
 where
     F: FnMut(CudaCppKpptTeacherBatch) -> Result<(), String>,
 {
-    use bulletou_lib::value::{KpptTeacherBatchConfig, for_each_kppt_teacher_fast_batch};
+    use bulletou_lib::value::{for_each_kppt_teacher_fast_batch, KpptTeacherBatchConfig};
 
     let config = KpptTeacherBatchConfig {
         teacher: &args.teacher,
@@ -12106,17 +12306,26 @@ impl CudaCppSfnnResidentValidationCache {
         Ok(run_one_test_pass(self.cache.as_ref(), args, &self.outputs))
     }
 
-    fn run_device_weights(
+    fn run_device_weights_with_factorizer(
         &mut self,
         args: &Args,
         ctx: &bulletou_cuda_cpp::Context,
         weights: &bulletou_cuda_cpp::SfnnForwardDeviceWeights,
+        factorizer: bulletou_cuda_cpp::SfnnFactorizerActive,
+        factorizer_alpha: bulletou_cuda_cpp::SfnnFactorizerAlpha,
     ) -> Result<TestMetrics, String> {
         let mut offset = 0usize;
         for chunk in &self.chunks {
             let workspace = &self.workspaces[chunk.workspace_index];
-            bulletou_cuda_cpp::sfnn_forward_device(ctx, &chunk.device_batch, weights, workspace)
-                .map_err(|e| e.to_string())?;
+            bulletou_cuda_cpp::sfnn_forward_device_with_factorizer_and_alpha(
+                ctx,
+                &chunk.device_batch,
+                weights,
+                workspace,
+                factorizer,
+                factorizer_alpha,
+            )
+            .map_err(|e| e.to_string())?;
             let end = offset
                 .checked_add(chunk.batch_size)
                 .ok_or_else(|| "SFNN quantized proxy validation output offset overflow".to_string())?;
@@ -13761,9 +13970,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers || progress_axis_appended {
         if progress_axis_appended {
             if keep_optimizer_state_on_factorizer_change {
-                eprintln!(
-                    "  initial optimizer state = reset because progress-axis factorizer tensors were appended"
-                );
+                eprintln!("  initial optimizer state = reset because progress-axis factorizer tensors were appended");
             } else {
                 eprintln!(
                     "  initial optimizer state = reset because the SFNN parameterization changed during progress-axis migration"
@@ -14776,14 +14983,8 @@ fn load_cuda_cpp_sfnn_weights_from_records(
         shape.l2_size,
         "l2ax",
     )?;
-    progress_axis_appended |= extend_cuda_cpp_sfnn_axis_pair_for_progress_tail(
-        shape,
-        &mut l3axw,
-        &mut l3axb,
-        shape.l2_size,
-        1,
-        "l3ax",
-    )?;
+    progress_axis_appended |=
+        extend_cuda_cpp_sfnn_axis_pair_for_progress_tail(shape, &mut l3axw, &mut l3axb, shape.l2_size, 1, "l3ax")?;
 
     let weights = CudaCppSfnnInitialWeights {
         shape,
@@ -14832,12 +15033,10 @@ fn extend_cuda_cpp_sfnn_axis_pair_for_progress_tail(
     let legacy_axis_count = expected_axis_count
         .checked_sub(progress_axis_count)
         .ok_or_else(|| format!("SFNN {label} progress-axis count underflow"))?;
-    let expected_w = expected_axis_count
-        .checked_mul(weight_stride)
-        .ok_or_else(|| format!("SFNN {label} weight length overflow"))?;
-    let expected_b = expected_axis_count
-        .checked_mul(bias_stride)
-        .ok_or_else(|| format!("SFNN {label} bias length overflow"))?;
+    let expected_w =
+        expected_axis_count.checked_mul(weight_stride).ok_or_else(|| format!("SFNN {label} weight length overflow"))?;
+    let expected_b =
+        expected_axis_count.checked_mul(bias_stride).ok_or_else(|| format!("SFNN {label} bias length overflow"))?;
     let legacy_w = legacy_axis_count
         .checked_mul(weight_stride)
         .ok_or_else(|| format!("SFNN {label} legacy weight length overflow"))?;
@@ -16567,11 +16766,19 @@ fn append_cuda_cpp_sfnn_diagnostics_log(
 
     let train_sec = stats.interval_train_elapsed_sec.max(0.0);
     let pct = |seconds: f64| -> f64 {
-        if train_sec > 0.0 && seconds.is_finite() { 100.0 * seconds.max(0.0) / train_sec } else { 0.0 }
+        if train_sec > 0.0 && seconds.is_finite() {
+            100.0 * seconds.max(0.0) / train_sec
+        } else {
+            0.0
+        }
     };
     let profile_denom = diag.cuda_profile_steps.max(1) as f64;
     let avg_or_zero = |sum_ms: f64| -> f64 {
-        if diag.cuda_profile_steps > 0 && sum_ms.is_finite() { sum_ms / profile_denom } else { 0.0 }
+        if diag.cuda_profile_steps > 0 && sum_ms.is_finite() {
+            sum_ms / profile_denom
+        } else {
+            0.0
+        }
     };
 
     writeln!(
@@ -17212,10 +17419,10 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     let old_alpha_default_line_with_pair =
         "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,pair=1.000000000";
     let old_alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000";
-    let stored_alpha_is_default = stored
-        .lines()
-        .find(|line| line.starts_with("sfnn_factorizer_alpha="))
-        .is_none_or(|line| line == alpha_default_line || line == old_alpha_default_line_with_pair || line == old_alpha_default_line);
+    let stored_alpha_is_default =
+        stored.lines().find(|line| line.starts_with("sfnn_factorizer_alpha=")).is_none_or(|line| {
+            line == alpha_default_line || line == old_alpha_default_line_with_pair || line == old_alpha_default_line
+        });
     let can_omit_factorizer_alpha = effective_sfnn_factorizer_alpha(args).is_default() && stored_alpha_is_default;
     let mut candidate = current.clone();
     let mut stored_candidate = stored.clone();
@@ -17375,7 +17582,11 @@ fn remove_non_resume_cuda_cpp_top_level_logs(output_dir: &std::path::Path) {
 }
 
 fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
+    if resume_enabled(args, output_dir) {
+        find_latest_state_bin_raw(output_dir)
+    } else {
+        None
+    }
 }
 
 fn prepare_resume_config_or_exit(args: &Args) {
@@ -18444,7 +18655,11 @@ where
 }
 
 fn kppt_black_perspective_component(stm_is_black: bool, stm_sum: f32, nstm_sum: f32) -> f32 {
-    if stm_is_black { stm_sum } else { -nstm_sum }
+    if stm_is_black {
+        stm_sum
+    } else {
+        -nstm_sum
+    }
 }
 
 fn run_kppt_component_dirs_final_validation(
@@ -19068,18 +19283,16 @@ mod tests {
     fn sfnn_progress_params_cli_is_not_supported() {
         use clap::Parser as _;
 
-        assert!(
-            Args::try_parse_from([
-                "bulletou",
-                "--arch",
-                "SFNN_halfka2_1024_7_64_progress8",
-                "--teacher",
-                "/dev/null",
-                "--sfnn-progress-params",
-                "progress-params.bin",
-            ])
-            .is_err()
-        );
+        assert!(Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_progress8",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-progress-params",
+            "progress-params.bin",
+        ])
+        .is_err());
     }
 
     /// Verify that `--tag` appends `-<tag>` to the auto-generated output
@@ -19140,20 +19353,18 @@ mod tests {
         );
 
         // The exact path mode and folder-root mode are intentionally exclusive.
-        assert!(
-            Args::try_parse_from([
-                "bulletou",
-                "--arch",
-                "NNUE_kp_256x2_32_32",
-                "--teacher",
-                "/dev/null",
-                "--output",
-                "/custom/path",
-                "--output-folder",
-                "D:/checkpoints",
-            ])
-            .is_err()
-        );
+        assert!(Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_kp_256x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--output",
+            "/custom/path",
+            "--output-folder",
+            "D:/checkpoints",
+        ])
+        .is_err());
 
         // Explicit --output wins; --tag is ignored.
         let args = Args::try_parse_from([
@@ -23423,14 +23634,12 @@ mod tests {
         );
 
         let mut migrated = optimizer;
-        assert!(
-            fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
-                &mut migrated,
-                shape,
-                SfnnFactorizerSpec::NONE
-            )
-            .unwrap()
-        );
+        assert!(fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
+            &mut migrated,
+            shape,
+            SfnnFactorizerSpec::NONE
+        )
+        .unwrap());
 
         assert_eq!(migrated.l1w.momentum, expected_weights.l1w);
         assert_eq!(migrated.l1b.momentum, expected_weights.l1b);
@@ -23518,14 +23727,12 @@ mod tests {
         migrated.l3axw = Some(vec![0.0; axis_count * shape.l2_size]);
         migrated.l3axb = Some(vec![0.0; axis_count]);
 
-        assert!(
-            extract_cuda_cpp_sfnn_new_factorizers_from_base(
-                &mut migrated,
-                SfnnFactorizerSpec::AXIS,
-                CudaCppSfnnCreatedFactorizers { shared_l1: true, shared_l2_l3: true, axis_l1: true, axis_l2_l3: true },
-            )
-            .unwrap()
-        );
+        assert!(extract_cuda_cpp_sfnn_new_factorizers_from_base(
+            &mut migrated,
+            SfnnFactorizerSpec::AXIS,
+            CudaCppSfnnCreatedFactorizers { shared_l1: true, shared_l2_l3: true, axis_l1: true, axis_l2_l3: true },
+        )
+        .unwrap());
         assert!(migrated.l1fw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
         assert!(migrated.l1axw.as_ref().unwrap().iter().any(|value| value.abs() > 1.0e-6));
 
