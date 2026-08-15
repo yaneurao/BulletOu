@@ -1287,6 +1287,16 @@ struct QuantizedTestArgs {
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
     wrm_target_scaling: f32,
 
+    /// Quantized forward path used by this subcommand. `cpu-exact` emulates
+    /// YaneuraOu's integer path; `gpu` matches the fast live qvalid path used
+    /// during cuda-cpp training.
+    #[arg(long, value_enum, default_value = "cpu-exact")]
+    mode: QuantizedTestMode,
+
+    /// CUDA device used by `--mode gpu`.
+    #[arg(long, default_value_t = 0)]
+    cuda_cpp_device: i32,
+
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
     quant_ft_round: QuantizedRoundMode,
@@ -1489,6 +1499,8 @@ impl AverageSfnnStateArgs {
             wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
             wrm_target_offset: DEFAULT_WRM_TARGET_OFFSET,
             wrm_target_scaling: DEFAULT_WRM_TARGET_SCALING,
+            mode: QuantizedTestMode::CpuExact,
+            cuda_cpp_device: 0,
             quant_ft_round: QuantizedRoundMode::Floor,
             quant_crelu_round: QuantizedRoundMode::Floor,
             quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -1702,6 +1714,8 @@ impl QuantizedCalibrateArgs {
             wrm_in_scaling: self.wrm_in_scaling,
             wrm_target_offset: self.wrm_target_offset,
             wrm_target_scaling: self.wrm_target_scaling,
+            mode: QuantizedTestMode::CpuExact,
+            cuda_cpp_device: 0,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
             quant_sqrcrelu_round: self.quant_sqrcrelu_round,
@@ -2137,6 +2151,24 @@ impl QuantizedRoundMode {
         match self {
             QuantizedRoundMode::Floor => "floor",
             QuantizedRoundMode::Nearest => "nearest",
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "kebab_case")]
+enum QuantizedTestMode {
+    CpuExact,
+    Gpu,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl QuantizedTestMode {
+    fn cli_name(self) -> &'static str {
+        match self {
+            QuantizedTestMode::CpuExact => "cpu-exact",
+            QuantizedTestMode::Gpu => "gpu",
         }
     }
 }
@@ -2827,7 +2859,7 @@ fn quantized_validation_rate_label(args: &Args) -> String {
 }
 
 fn quantized_validation_mode_label(args: &Args) -> &'static str {
-    if args.quantized_validation_exact { "exact" } else { "proxy" }
+    if args.quantized_validation_exact { "cpu-exact" } else { "gpu" }
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
@@ -6250,6 +6282,66 @@ fn quantized_test_positions(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_test_positions_gpu_proxy(
+    weights: &QuantizedSfnnWeights,
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    batch: &bulletou_lib::value::FastBatchHost,
+    args: &QuantizedTestArgs,
+) -> Result<QuantizedTestReport, String> {
+    let proxy_weights = cuda_cpp_sfnn_dequantize_proxy_weights(weights)?;
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+        &ctx,
+        bulletou_cuda_cpp::SfnnForwardHostBatch {
+            stm_indices: &batch.stm,
+            nstm_indices: &batch.nstm,
+            buckets: &batch.buckets,
+            batch_size: batch.layout.batch_size,
+            max_active: batch.layout.max_active,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let device_weights =
+        bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, proxy_weights.as_host())
+            .map_err(|e| e.to_string())?;
+    let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+        &ctx,
+        bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(proxy_weights.shape, batch.layout.batch_size),
+    )
+    .map_err(|e| e.to_string())?;
+    bulletou_cuda_cpp::sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace)
+        .map_err(|e| e.to_string())?;
+    let mut outputs = vec![0.0f32; batch.layout.batch_size];
+    workspace.output.download_prefix(&ctx, &mut outputs).map_err(|e| e.to_string())?;
+
+    let teacher_scores: Vec<i16> = positions.iter().map(|p| p.score()).collect();
+    let teacher_results: Vec<i8> = positions.iter().map(|p| p.game_result()).collect();
+    let score_cap = (args.score_drop_abs > 0).then_some(args.score_drop_abs);
+    let sample_mask = build_validation_sample_mask(&teacher_scores, &teacher_results, score_cap);
+    let report = compute_sign_accuracy_with_loss_masked(
+        &outputs,
+        &teacher_scores,
+        &teacher_results,
+        &sample_mask,
+        args.lambda,
+        args.scale as f32,
+        quantized_train_scale_model_output_scale(args),
+        quantized_train_scale_loss_kind(args),
+    );
+
+    Ok(QuantizedTestReport {
+        records: positions.len(),
+        // GPU proxy intentionally matches the fast live qvalid path:
+        // outputs are train-scale f32 proxy outputs, not exact engine Value.
+        // Keep both fields equal so existing summary/printing code can read
+        // the usual engine_scale slot without silently switching meaning.
+        engine_scale: report,
+        train_scale: report,
+        elapsed: std::time::Duration::default(),
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, String> {
     run_quantized_test_impl(args, true)
 }
@@ -6269,6 +6361,7 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
         eprintln!("  nn_bin            = {}", args.nn_bin.display());
         eprintln!("  nn_bin_desc       = {}", weights.arch_desc);
         eprintln!("  feature           = {}", weights.feature_kind.source_label());
+        eprintln!("  mode              = {}", args.mode.cli_name());
         eprintln!(
             "  layerstack        = {} ({} stack(s))",
             weights.layerstack.cli_name(),
@@ -6325,7 +6418,10 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
 
     let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, &positions)?;
     let started = std::time::Instant::now();
-    let mut report = quantized_test_positions(&weights, &positions, &batch, args)?;
+    let mut report = match args.mode {
+        QuantizedTestMode::CpuExact => quantized_test_positions(&weights, &positions, &batch, args)?,
+        QuantizedTestMode::Gpu => quantized_test_positions_gpu_proxy(&weights, &positions, &batch, args)?,
+    };
     report.elapsed = started.elapsed();
     Ok(report)
 }
@@ -6369,6 +6465,8 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
         wrm_in_scaling: effective_wrm_in_scaling(args),
         wrm_target_offset: effective_wrm_target_params(args).offset,
         wrm_target_scaling: effective_wrm_target_params(args).scaling,
+        mode: if args.quantized_validation_exact { QuantizedTestMode::CpuExact } else { QuantizedTestMode::Gpu },
+        cuda_cpp_device: args.cuda_cpp_device,
         quant_ft_round: QuantizedRoundMode::Floor,
         quant_crelu_round: QuantizedRoundMode::Floor,
         quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -6554,7 +6652,7 @@ impl CudaCppSfnnQuantizedValidationCache {
             feature_kind,
             ctx,
             proxy_shape,
-            "gpu-proxy-cached",
+            "gpu-cached",
             "quantized validation cache",
         )?;
         Ok(inner.map(|inner| Self::Proxy { inner }))
@@ -7446,6 +7544,7 @@ fn main() {
                     println!("quantized-test complete:");
                     println!("  arch              = {}", args.arch);
                     println!("  layerstack        = {}", args.effective_layerstack().cli_name());
+                    println!("  mode              = {}", args.mode.cli_name());
                     println!("  nn_bin            = {}", args.nn_bin.display());
                     println!("  test_teacher      = {}", args.test_teacher.display());
                     println!("  records           = {}", format_count(report.records));
@@ -20209,7 +20308,7 @@ mod tests {
         .unwrap();
 
         assert!(args.quantized_validation_exact);
-        assert_eq!(quantized_validation_mode_label(&args), "exact");
+        assert_eq!(quantized_validation_mode_label(&args), "cpu-exact");
 
         let proxy_signature = resume_signature_without_line(&resume_signature(&args), "quantized_validation_exact=");
         assert!(resume_signature_matches(&proxy_signature, &args));
