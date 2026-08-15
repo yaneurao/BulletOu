@@ -8137,6 +8137,9 @@ fn main() {
         if let Err(e) = record_invocation_to_tag_txt(&args) {
             eprintln!("warning: failed to write tag.txt under {}: {e}", args.output_dir().display());
         }
+        if let Err(e) = write_build_info_file(&args.output_dir()) {
+            eprintln!("warning: failed to write build-info.txt under {}: {e}", args.output_dir().display());
+        }
     }
     if let Err(e) = run_cuda_cpp_backend(&args) {
         eprintln!("error: {e}");
@@ -9513,6 +9516,8 @@ fn write_cuda_cpp_kppt_component_checkpoint(
         format!("{},{}\n", dataloader_pos.byte_offset, dataloader_pos.plies),
     )
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
+    write_build_info_file(&dir)
+        .map_err(|err| format!("failed to write {}: {err}", dir.join(BUILD_INFO_NAME).display()))?;
 
     let quant_scale = args.yaneuraou_quant_scale.unwrap_or(component.default_quant_scale());
     save_yaneuraou_eval(&dir, quant_scale, args.kpp_format())
@@ -12935,6 +12940,8 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
         format!("{},{}\n", log.dataloader_pos.byte_offset, log.dataloader_pos.plies),
     )
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
+    write_build_info_file(dir)
+        .map_err(|err| format!("failed to write {}: {err}", dir.join(BUILD_INFO_NAME).display()))?;
 
     let mut learn = String::new();
     learn.push_str(LEARN_LOG_HEADER);
@@ -16024,6 +16031,8 @@ fn write_cuda_cpp_nnue_direct_outputs(
     completed_steps: usize,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    write_build_info_file(dir)
+        .map_err(|err| format!("failed to write {}: {err}", dir.join(BUILD_INFO_NAME).display()))?;
     write_cuda_cpp_nnue_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights)?;
     write_cuda_cpp_halfkp_weights_bin(&dir.join("weights.bin"), weights, optimizer_states, completed_steps)
 }
@@ -16091,6 +16100,8 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    write_build_info_file(dir)
+        .map_err(|err| format!("failed to write {}: {err}", dir.join(BUILD_INFO_NAME).display()))?;
     write_cuda_cpp_sfnn_nn_bin(
         &dir.join("nn.bin"),
         feature_kind,
@@ -17463,6 +17474,27 @@ fn record_invocation_to_tag_txt(args: &Args) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&tag_path)?;
     writeln!(f, "{ts}\t{cmdline}")?;
     Ok(())
+}
+
+const BUILD_INFO_NAME: &str = "build-info.txt";
+
+fn bulletou_build_info_text() -> String {
+    let features = if cfg!(feature = "cuda-cpp-backend") { "cuda-cpp-backend" } else { "-" };
+    let mut out = String::new();
+    out.push_str(&format!("bulletou_version={}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("git_commit={}\n", option_env!("BULLETOU_GIT_COMMIT").unwrap_or("unknown")));
+    out.push_str(&format!("git_commit_short={}\n", option_env!("BULLETOU_GIT_COMMIT_SHORT").unwrap_or("unknown")));
+    out.push_str(&format!("git_dirty={}\n", option_env!("BULLETOU_GIT_DIRTY").unwrap_or("unknown")));
+    out.push_str(&format!("build_profile={}\n", option_env!("BULLETOU_BUILD_PROFILE").unwrap_or("unknown")));
+    out.push_str(&format!("build_target={}\n", option_env!("BULLETOU_BUILD_TARGET").unwrap_or("unknown")));
+    out.push_str(&format!("build_features={features}\n"));
+    out.push_str(&format!("built_at_unix={}\n", option_env!("BULLETOU_BUILT_AT_UNIX").unwrap_or("unknown")));
+    out
+}
+
+fn write_build_info_file(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(BUILD_INFO_NAME), bulletou_build_info_text())
 }
 
 fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
