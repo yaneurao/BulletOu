@@ -14144,7 +14144,7 @@ fn write_cuda_cpp_nnue_numbered_checkpoint(
 ) -> Result<std::path::PathBuf, String> {
     let output_dir = args.output_dir();
     std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let idx = count_existing_numbered_dirs(&output_dir) + 1;
+    let idx = next_numbered_checkpoint_idx(&output_dir);
     let dir = output_dir.join(format!("{idx:04}"));
     if dir.exists() {
         return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
@@ -14170,7 +14170,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
 ) -> Result<std::path::PathBuf, String> {
     let output_dir = args.output_dir();
     std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let idx = count_existing_numbered_dirs(&output_dir) + 1;
+    let idx = next_numbered_checkpoint_idx(&output_dir);
     let dir = output_dir.join(format!("{idx:04}"));
     if dir.exists() {
         return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
@@ -18791,16 +18791,14 @@ fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
-/// Count numbered subdirectories under `output_dir` whose names parse as
-/// `usize`. Used so a resumed run extends the numbering rather than
-/// overwriting the previous run's checkpoint dirs.
-fn count_existing_numbered_dirs(output_dir: &std::path::Path) -> usize {
-    let Ok(rd) = std::fs::read_dir(output_dir) else { return 0 };
-    rd.flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| name.parse::<usize>().is_ok())
-        .count()
+/// Return the next numbered checkpoint directory index.
+///
+/// This must be based on the maximum existing number, not the count of
+/// numbered directories. Users commonly delete old checkpoint directories to
+/// free disk space. If only `0073/` and `0074/` remain, count+1 would produce
+/// `0003/`, which is lower than the latest checkpoint and breaks auto-resume.
+fn next_numbered_checkpoint_idx(output_dir: &std::path::Path) -> usize {
+    numbered_checkpoint_dirs_desc(output_dir).into_iter().map(|(n, _)| n).max().unwrap_or(0).saturating_add(1)
 }
 
 const RESUME_CONFIG_NAME: &str = "resume-config.txt";
@@ -19778,7 +19776,7 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
     latest
 }
 
-/// Detect the latest saved superbatch number from the highest-numbered
+/// Detect the latest saved superbatch number from the latest resumable
 /// `<output_dir>/<NNNN>/learn.log`. Used to auto-resume the LR scheduler
 /// (and the trainer's internal sb counter) at `last_sb + 1` instead of
 /// silently restarting from sb=1 when the user re-runs the same command
@@ -19789,11 +19787,8 @@ fn read_latest_nnue_test_metrics_in_top_level_log(top_level_log: &std::path::Pat
 /// the caller.
 #[cfg(test)]
 fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
-    let content = numbered_checkpoint_dirs_desc(output_dir)
-        .into_iter()
-        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
-        .map(|(_, dir)| dir.join("learn.log"))
-        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
+    let content = latest_complete_checkpoint_dir_raw(output_dir)
+        .and_then(|dir| std::fs::read_to_string(dir.join("learn.log")).ok())?;
     // 12-column rows: eval, epoch, sb, batch, test_value_accuracy,
     // test_value_loss, train_value_loss, lr_start, lr_end, lambda,
     // positions, teacher.
@@ -19817,7 +19812,7 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
     max_sb
 }
 
-/// Read the latest cumulative `positions` value from the highest-numbered
+/// Read the latest cumulative `positions` value from the latest resumable
 /// complete `<output_dir>/<NNNN>/learn.log` for the requested component.
 ///
 /// This is used by cuda-cpp fixed-record PSV resume. `dataloader_pos.txt`
@@ -19827,11 +19822,8 @@ fn read_latest_saved_superbatch(output_dir: &std::path::Path) -> Option<usize> {
 /// accepted by the optimizer" and can be converted back into an exact PSV
 /// byte offset even when the teacher length is not divisible by batch size.
 fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) -> Option<usize> {
-    let content = numbered_checkpoint_dirs_desc(output_dir)
-        .into_iter()
-        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
-        .map(|(_, dir)| dir.join("learn.log"))
-        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
+    let content = latest_complete_checkpoint_dir_raw(output_dir)
+        .and_then(|dir| std::fs::read_to_string(dir.join("learn.log")).ok())?;
     let mut latest: Option<usize> = None;
     for line in content.lines() {
         let line = line.trim();
@@ -19855,7 +19847,7 @@ fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) ->
     latest
 }
 
-/// Read the highest-numbered `<output_dir>/<NNNN>/dataloader_pos.txt`
+/// Read the latest resumable `<output_dir>/<NNNN>/dataloader_pos.txt`
 /// (= the dataloader's "I have processed up to this position" marker,
 /// written at each save). Returns `(byte_offset, plies_within_unit)`.
 ///
@@ -19870,11 +19862,8 @@ fn read_latest_saved_positions(output_dir: &std::path::Path, component: &str) ->
 /// Backward-compatible with the legacy single-number format (= just
 /// `<byte_offset>` on the line, plies inferred 0).
 fn read_latest_dataloader_pos(output_dir: &std::path::Path) -> Option<(u64, usize)> {
-    let content = numbered_checkpoint_dirs_desc(output_dir)
-        .into_iter()
-        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
-        .map(|(_, dir)| dir.join("dataloader_pos.txt"))
-        .find_map(|pos_file| std::fs::read_to_string(pos_file).ok())?;
+    let content = latest_complete_checkpoint_dir_raw(output_dir)
+        .and_then(|dir| std::fs::read_to_string(dir.join("dataloader_pos.txt")).ok())?;
     parse_dataloader_pos_text(&content).ok().map(|pos| (pos.byte_offset, pos.plies))
 }
 
@@ -19906,7 +19895,7 @@ fn learn_log_metric_or_dash(value: &str) -> bool {
     value == "-" || value.parse::<f32>().is_ok()
 }
 
-/// Detect the teacher path recorded in the highest-numbered
+/// Detect the teacher path recorded in the latest resumable
 /// `<output_dir>/<NNNN>/learn.log`. Used to decide whether auto-resume's
 /// dataloader skip-ahead is safe: bullet's dataloader skips
 /// `(start_sb - 1) * batches_per_sb` records at startup, which only
@@ -19921,11 +19910,8 @@ fn learn_log_metric_or_dash(value: &str) -> bool {
 /// in the latest dir's learn.log (which is the most recent `--teacher`
 /// arg used for that save). Returns `None` if no row could be parsed.
 fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
-    let content = numbered_checkpoint_dirs_desc(output_dir)
-        .into_iter()
-        .filter(|(_, dir)| is_complete_checkpoint_dir(dir))
-        .map(|(_, dir)| dir.join("learn.log"))
-        .find_map(|learn_log| std::fs::read_to_string(learn_log).ok())?;
+    let content = latest_complete_checkpoint_dir_raw(output_dir)
+        .and_then(|dir| std::fs::read_to_string(dir.join("learn.log")).ok())?;
     // Current rows have quantized_value_accuracy/loss before the trailing
     // teacher field:
     //
@@ -20374,9 +20360,8 @@ fn assemble_numbered_dirs(
         );
     }
 
-    // When resuming, do not overwrite the previous run's numbered dirs --
-    // start at `existing_count + 1` so new saves extend the series.
-    let existing_count = count_existing_numbered_dirs(output_dir);
+    // When resuming, do not overwrite the previous run's numbered dirs.
+    let first_idx = next_numbered_checkpoint_idx(output_dir);
 
     let prior_kk = prior_positions.get("kk").copied().unwrap_or(0);
     let prior_kkp = prior_positions.get("kkp").copied().unwrap_or(0);
@@ -20385,11 +20370,11 @@ fn assemble_numbered_dirs(
     eprintln!(
         "\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===",
         output_dir.display(),
-        existing_count + 1
+        first_idx
     );
     let validation_cache = validation_args.and_then(TestPositionsCache::try_load);
     for i in 0..n {
-        let idx = existing_count + i + 1;
+        let idx = first_idx + i;
         let dst = output_dir.join(format!("{idx:04}"));
         std::fs::create_dir_all(&dst)?;
         let (kk_epoch, _kk_sb, kk_dir) = &kk_dirs[i];
@@ -20448,7 +20433,7 @@ fn assemble_numbered_dirs(
         }
     }
 
-    Ok((existing_count + 1, existing_count + n))
+    Ok((first_idx, first_idx + n - 1))
 }
 
 /// Cache of test-set positions used for validation events. Loaded
@@ -27202,7 +27187,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(1));
 
-        // Add 0004/ with sb=4 -> the highest-numbered dir wins.
+        // Add 0004/ with sb=4 -> the latest checkpoint wins.
         let d4 = tmp.join("0004");
         std::fs::create_dir(&d4).unwrap();
         std::fs::write(d4.join("state.bin"), b"state").unwrap();
@@ -27252,6 +27237,56 @@ mod tests {
         assert_eq!(find_latest_state_bin_raw(&tmp), Some(d19.join("state.bin")));
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(19));
         assert_eq!(read_latest_dataloader_pos(&tmp), Some((1900, 0)));
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("teacher.psv".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn next_checkpoint_number_uses_max_existing_number_after_cleanup() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-resume-cleanup-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Simulate a user keeping only recent high-numbered checkpoints.
+        let d74 = tmp.join("0074");
+        std::fs::create_dir(&d74).unwrap();
+        std::fs::write(d74.join("state.bin"), b"state74").unwrap();
+        std::fs::write(d74.join("dataloader_pos.txt"), "7400,0\n").unwrap();
+        std::fs::write(
+            d74.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,74,32,1216,0.63,0.12,-,0.0001,0.0001,1.000,740000,0.62,0.13,teacher.psv\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(next_numbered_checkpoint_idx(&tmp), 75);
+
+        // Older buggy builds used count+1 after cleanup, so the next checkpoint
+        // could be written as 0003 even though it represents a later epoch.
+        let d3 = tmp.join("0003");
+        std::fs::create_dir(&d3).unwrap();
+        std::fs::write(d3.join("state.bin"), b"state75").unwrap();
+        std::fs::write(d3.join("dataloader_pos.txt"), "7500,0\n").unwrap();
+        std::fs::write(
+            d3.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\n\
+                 SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,75,32,1216,0.64,0.11,-,0.0001,0.0001,1.000,750000,0.63,0.12,teacher.psv\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(next_numbered_checkpoint_idx(&tmp), 75);
+        assert_eq!(find_latest_state_bin_raw(&tmp), Some(d74.join("state.bin")));
+        assert_eq!(latest_checkpoint_epoch_superbatch(&tmp), Some((74, 32)));
+        assert_eq!(read_latest_saved_positions(&tmp, "nnue"), Some(740000));
+        assert_eq!(read_latest_dataloader_pos(&tmp), Some((7400, 0)));
         assert_eq!(read_latest_saved_teacher(&tmp), Some("teacher.psv".to_string()));
 
         let _ = std::fs::remove_dir_all(&tmp);
