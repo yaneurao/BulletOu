@@ -4191,9 +4191,10 @@ struct Args {
     #[arg(long)]
     scale: Option<f32>,
 
-    /// YaneuraOu FV_SCALE written/assumed for quantized NNUE/SFNN export and
-    /// quantized validation. This does not control the default WRM training
-    /// loss; use `--wrm-nnue2score` for the training output scale.
+    /// YaneuraOu FV_SCALE assumed when converting quantized NNUE/SFNN raw
+    /// output to engine scores for quantized validation and calibration. This
+    /// is not written into `nn.bin` and does not control the default WRM
+    /// training loss; use `--wrm-nnue2score` for the WRM training output scale.
     #[arg(long)]
     fv_scale: Option<f32>,
 
@@ -5027,10 +5028,12 @@ fn resolve_wrm_loss_params(args: &Args) -> Result<(), String> {
         ),
     );
     print_startup_kv("WRM target", format!("offset={:.3}, scaling={:.3}", target.offset, target.scaling));
-    print_startup_kv(
-        "FV_SCALE",
-        format!("{:.3} (export/quantized validation only; not used by WRM loss)", effective_fv_scale(args)),
-    );
+    if cuda_cpp_should_schedule_quantized_validation(args) {
+        print_startup_kv(
+            "qvalid FV_SCALE",
+            format!("{:.3} (raw/FV_SCALE for quantized validation; not used by WRM loss)", effective_fv_scale(args)),
+        );
+    }
     Ok(())
 }
 
@@ -11034,8 +11037,9 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     );
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
-    // Interpret f32 NNUE output through the same engine score scale that
-    // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
+    // Convert the f32 NNUE output into the scalar passed to the loss kernel.
+    // WRM uses wrm-nnue2score / wrm-in-scaling here; plain sigmoid loss uses
+    // the YaneuraOu-like quantized score scale.
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
     let completed_step_offset = initial_state.completed_steps;
@@ -12514,8 +12518,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
-    // Interpret f32 SFNN output through the same engine score scale that
-    // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
+    // Convert the f32 SFNN output into the scalar passed to the loss kernel.
+    // WRM uses wrm-nnue2score / wrm-in-scaling here; plain sigmoid loss uses
+    // the YaneuraOu-like quantized score scale.
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
     let mut optimizer_updates = 0usize;
