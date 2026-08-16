@@ -41,7 +41,50 @@ checkpoints/.../
   0004/   ← 再開後はここから保存
 ```
 
-## 4.2 設定を変えるとき
+## 4.2 checkpointを掃除するとき
+
+checkpointは大きくなりやすいので、古い保存点を削除してもかまいません。resumeに必要なのは、親フォルダ直下の `resume-config.txt` と、残したい最新checkpointフォルダの中にある3つのファイルです。
+
+```text
+checkpoints/.../
+  resume-config.txt
+  0074/
+    state.bin
+    learn.log
+    dataloader_pos.txt
+```
+
+| ファイル / フォルダ | resumeに必要か | 説明 |
+| --- | --- | --- |
+| `0074/state.bin` | 必要 | 重みとoptimizer state。これがないとそのcheckpointから再開できません |
+| `0074/dataloader_pos.txt` | 必要 | 教師データをどこまで読んだかの位置 |
+| `0074/learn.log` | 必要 | そのcheckpointが正常に保存完了したことを判定するためのメタ情報 |
+| `resume-config.txt` | 必要 | 同じ学習条件かどうかを確認するための設定記録 |
+| `0074/nn.bin` | 不要 | やねうら王で使うための量子化済み評価関数。resumeには使いません |
+| `summary-learn.log` | 不要 | これまでの検証結果を見るための通算ログ。resume自体には使いません |
+| 古い `0001/`〜`0073/` | 不要 | `0074` から再開するなら削除できます |
+
+たとえば `0074` から再開できればよく、古い `nn.bin` も不要なら、`0001`〜`0073` のフォルダは丸ごと削除できます。
+
+```powershell
+$exp = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\実験フォルダ名"
+
+Get-ChildItem $exp -Directory |
+  Where-Object { $_.Name -match '^\d{4}$' -and [int]$_.Name -lt 74 } |
+  Remove-Item -Recurse -Force -WhatIf
+```
+
+まず `-WhatIf` 付きで削除対象を確認してください。問題なければ、最後の `-WhatIf` を外します。
+
+```powershell
+Get-ChildItem $exp -Directory |
+  Where-Object { $_.Name -match '^\d{4}$' -and [int]$_.Name -lt 74 } |
+  Remove-Item -Recurse -Force
+```
+
+学習中に掃除するときは、いま書き込み中のcheckpointフォルダは削除しないでください。不安なら最新2個を残すと安全です。
+
+## 4.3 設定を変えるとき
 
 `--lr`、`--batch-size`、`--superbatches` などを変えると、自動再開は止まります。
 

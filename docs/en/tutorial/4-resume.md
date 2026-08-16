@@ -41,7 +41,50 @@ checkpoints/.../
   0004/   ← resumed run writes from here
 ```
 
-## 4.2 Changing settings
+## 4.2 Cleaning old checkpoints
+
+Checkpoints can become large. You may delete old save points as long as the latest checkpoint you want to resume from still has these files:
+
+```text
+checkpoints/.../
+  resume-config.txt
+  0074/
+    state.bin
+    learn.log
+    dataloader_pos.txt
+```
+
+| File / folder | Needed for resume? | Meaning |
+| --- | --- | --- |
+| `0074/state.bin` | yes | Weights and optimizer state |
+| `0074/dataloader_pos.txt` | yes | Where the teacher loader should continue |
+| `0074/learn.log` | yes | Metadata used to treat the checkpoint as fully saved |
+| `resume-config.txt` | yes | Training-control signature used by auto-resume |
+| `0074/nn.bin` | no | Quantized network for the engine. Resume does not use it |
+| `summary-learn.log` | no | Cumulative validation log. Useful to keep, but not required for resume |
+| old `0001/` ... `0073/` | no | Safe to delete if you only need to resume from `0074` |
+
+For example, if you only need to resume from `0074` and no longer need old `nn.bin` files, you can delete `0001` through `0073`.
+
+```powershell
+$exp = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\experiment-folder-name"
+
+Get-ChildItem $exp -Directory |
+  Where-Object { $_.Name -match '^\d{4}$' -and [int]$_.Name -lt 74 } |
+  Remove-Item -Recurse -Force -WhatIf
+```
+
+Run it with `-WhatIf` first to confirm what will be removed. If it looks right, remove `-WhatIf`.
+
+```powershell
+Get-ChildItem $exp -Directory |
+  Where-Object { $_.Name -match '^\d{4}$' -and [int]$_.Name -lt 74 } |
+  Remove-Item -Recurse -Force
+```
+
+If training is currently running, do not delete the checkpoint directory that BulletOu is writing. When unsure, keep the latest two checkpoints.
+
+## 4.3 Changing settings
 
 If you change settings such as `--lr`, `--batch-size`, or `--superbatches`, automatic resume stops.
 
