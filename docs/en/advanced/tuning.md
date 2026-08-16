@@ -77,7 +77,7 @@ Fuller option table:
 | `--wrm-target-offset` / `--wrm-target-scaling` | Teacher-side WRM curve | 270 / 380 |
 | `--loss-sigmoid-mse` | Use plain sigmoid loss instead of WRM | off |
 | `--scale` | Target scale for `--loss-sigmoid-mse` | 600 |
-| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
+| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/calibration | 24 |
 | `--quantized-validation-rate` | How often to run post-quantization accuracy/loss during training. Uses the GPU proxy by default | saved checkpoints only |
 | `--quantized-validation-exact` | Use exact CPU integer forward for quantized validation. Slow; use only when needed | off |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
@@ -172,7 +172,7 @@ For the plain sigmoid loss:
 ```bash
 --loss-sigmoid-mse
 --scale 600
---fv-scale 40
+--fv-scale 24
 ```
 
 For the loss formula and how `FV_SCALE` fits in, see [Loss scale and `FV_SCALE`](scale-and-fv-scale.md).

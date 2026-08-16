@@ -77,7 +77,7 @@
 | `--wrm-target-offset` / `--wrm-target-scaling` | WRM lossのteacher側カーブ | 270 / 380 |
 | `--loss-sigmoid-mse` | WRMではなく単純なsigmoid lossを使う | off |
 | `--scale` | `--loss-sigmoid-mse` の target scale | 600 |
-| `--fv-scale` | `nn.bin` の量子化検証・書き出しで想定する `FV_SCALE` | 40 |
+| `--fv-scale` | `nn.bin` の量子化検証・補正で想定する `FV_SCALE` | 24 |
 | `--quantized-validation-rate` | 学習中に量子化後のaccuracy/lossを何sbごとに見るか。デフォルトはGPU近似 | 保存時のみ |
 | `--quantized-validation-exact` | 量子化後検証をCPU整数forwardで正確に測る。遅いので必要なときだけ使う | off |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
@@ -183,7 +183,7 @@ offsetなしWRMと比較したい場合:
 ```bash
 --loss-sigmoid-mse
 --scale 600
---fv-scale 40
+--fv-scale 24
 ```
 
 lossの式と `FV_SCALE` の関係は [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) を参照してください。

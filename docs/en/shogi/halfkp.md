@@ -99,6 +99,6 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p` | 2.0 |
 | `--wrm-nnue2score` | WRM loss coefficient that maps `network_output` to score scale | 600 |
 | `--loss-sigmoid-mse` / `--scale` | Use plain sigmoid loss instead of WRM | off / 600 |
-| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/export | 40 |
+| `--fv-scale` | `FV_SCALE` assumed for quantized `nn.bin` checks/calibration | 24 |
 
 For the loss details, see [Advanced: Loss scale and `FV_SCALE`](../advanced/scale-and-fv-scale.md). Activation is fixed to ClippedReLU (matching the original 2018 architecture).

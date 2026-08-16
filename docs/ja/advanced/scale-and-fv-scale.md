@@ -103,14 +103,14 @@ NNUE/SFNN の `nn.bin` 書き出しでは、おおよそ次の関係になりま
 raw ≒ network_output * 8128
 ```
 
-そのため、`FV_SCALE=40` なら、
+そのため、`FV_SCALE=24` なら、
 
 ```text
-engine_score ≒ network_output * 8128 / 40
-             ≒ network_output * 203.2
+engine_score ≒ network_output * 8128 / 24
+             ≒ network_output * 338.7
 ```
 
-ここで出てくる `203.2` は、量子化後の `nn.bin` をやねうら王で動かしたときの出力スケールです。WRM loss の `--wrm-nnue2score 600` とは別の値です。
+ここで出てくる `338.7` は、量子化後の `nn.bin` をやねうら王で動かしたときの出力スケールです。WRM loss の `--wrm-nnue2score 600` とは別の値です。
 
 ## 5. 何を指定すればよいか
 
@@ -139,7 +139,7 @@ offset なしWRMと比較するなら、次だけ追加します。
 ```powershell
   --loss-sigmoid-mse `
   --scale 600 `
-  --fv-scale 40
+  --fv-scale 24
 ```
 
 ## 6. 量子化後の確認

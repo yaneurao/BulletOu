@@ -1235,7 +1235,7 @@ struct QuantizedTestArgs {
     score_drop_abs: u16,
 
     /// YaneuraOu FV_SCALE applied before the final sign test.
-    #[arg(long, default_value = "40")]
+    #[arg(long, default_value = "24")]
     fv_scale: i32,
 
     /// Shift used by YaneuraOu's quantized SFNN feature-transform product.
@@ -1382,7 +1382,7 @@ struct CompareSfnnQuantizationArgs {
     score_drop_abs: u16,
 
     /// YaneuraOu FV_SCALE used by train-scale loss conversion.
-    #[arg(long, default_value = "40")]
+    #[arg(long, default_value = "24")]
     fv_scale: i32,
 
     /// Lambda used by the validation loss target.
@@ -1948,7 +1948,7 @@ struct QuantizedCalibrateArgs {
 
     /// YaneuraOu FV_SCALE used by the target engine, or `auto` to search
     /// `--fv-scale-min..=--fv-scale-max`.
-    #[arg(long, default_value = "40", value_name = "FV_SCALE|auto", value_parser = parse_quantized_calibrate_fv_scale)]
+    #[arg(long, default_value = "24", value_name = "FV_SCALE|auto", value_parser = parse_quantized_calibrate_fv_scale)]
     fv_scale: QuantizedCalibrateFvScale,
 
     /// Minimum FV_SCALE to try when `--fv-scale auto` is used.
@@ -3192,7 +3192,7 @@ const DEFAULT_POSITIONS_PER_SUPERBATCH: usize = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 const DEFAULT_SAVE_RATE: usize = 20;
 const DEFAULT_SIGMOID_SCALE: f32 = 600.0;
-const DEFAULT_FV_SCALE: f32 = 40.0;
+const DEFAULT_FV_SCALE: f32 = 24.0;
 const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
@@ -5028,12 +5028,6 @@ fn resolve_wrm_loss_params(args: &Args) -> Result<(), String> {
         ),
     );
     print_startup_kv("WRM target", format!("offset={:.3}, scaling={:.3}", target.offset, target.scaling));
-    if cuda_cpp_should_schedule_quantized_validation(args) {
-        print_startup_kv(
-            "qvalid FV_SCALE",
-            format!("{:.3} (raw/FV_SCALE for quantized validation; not used by WRM loss)", effective_fv_scale(args)),
-        );
-    }
     Ok(())
 }
 
@@ -25930,7 +25924,7 @@ mod tests {
         assert!(sig.contains("optimizer_beta2=0.995000005"));
         assert!(sig.contains("validation_rate=20"));
         assert!(sig.contains("quantized_validation_rate=save"));
-        assert!(sig.contains("fv_scale=40.000000"));
+        assert!(sig.contains("fv_scale=24.000000"));
     }
 
     #[test]

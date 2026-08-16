@@ -99,6 +99,6 @@ checkpoints/my-halfkp/
 | `--loss-pow-exp` | `|prediction - target|^p` の `p` | 2.0 |
 | `--wrm-nnue2score` | WRM lossで `network_output` をscoreへ戻す係数 | 600 |
 | `--loss-sigmoid-mse` / `--scale` | WRMではなく単純 sigmoid loss を使う場合の指定 | off / 600 |
-| `--fv-scale` | 量子化後 `nn.bin` の検証・書き出しで想定する `FV_SCALE` | 40 |
+| `--fv-scale` | 量子化後 `nn.bin` の検証・補正で想定する `FV_SCALE` | 24 |
 
 loss の詳細は [応用編: loss の scale と `FV_SCALE`](../advanced/scale-and-fv-scale.md) を参照。活性化関数は ClippedReLU に固定 (2018 年オリジナル準拠)。

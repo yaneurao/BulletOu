@@ -103,14 +103,14 @@ For NNUE/SFNN `nn.bin` export, the approximate relation is:
 raw ≒ network_output * 8128
 ```
 
-So if `FV_SCALE=40`:
+So if `FV_SCALE=24`:
 
 ```text
-engine_score ≒ network_output * 8128 / 40
-             ≒ network_output * 203.2
+engine_score ≒ network_output * 8128 / 24
+             ≒ network_output * 338.7
 ```
 
-The `203.2` value is the output scale of the quantized `nn.bin` inside YaneuraOu. It is separate from the WRM training setting `--wrm-nnue2score 600`.
+The `338.7` value is the output scale of the quantized `nn.bin` inside YaneuraOu. It is separate from the WRM training setting `--wrm-nnue2score 600`.
 
 ## 5. What to use
 
@@ -139,7 +139,7 @@ For the plain sigmoid loss, add:
 ```powershell
   --loss-sigmoid-mse `
   --scale 600 `
-  --fv-scale 40
+  --fv-scale 24
 ```
 
 ## 6. Checking the quantized network
