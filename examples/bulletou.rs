@@ -7827,13 +7827,13 @@ impl CudaCppSfnnQuantizedValidationCache {
         Ok(inner.map(|inner| Self::Proxy { inner, device_weights: None }))
     }
 
-    fn run_weights(
+    fn run_runner(
         &mut self,
         args: &Args,
         feature_kind: CudaCppSfnnFeatureKind,
         ctx: &bulletou_cuda_cpp::Context,
         shape: bulletou_cuda_cpp::SfnnForwardShape,
-        weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+        runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
         progress_params: Option<&ShogiSfnnProgressQ16Params>,
         test_args: &QuantizedTestArgs,
     ) -> Result<TestMetrics, String> {
@@ -7842,34 +7842,74 @@ impl CudaCppSfnnQuantizedValidationCache {
         }
         match self {
             Self::Proxy { inner, device_weights } => {
-                let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
-                    args,
-                    feature_kind,
-                    shape,
-                    weights,
-                    progress_params,
-                )?;
-                let host = proxy_weights.as_host();
-                if let Some(device_weights) = device_weights.as_ref() {
-                    device_weights.upload(ctx, host).map_err(|e| e.to_string())?;
-                } else {
-                    *device_weights = Some(
-                        bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, host).map_err(|e| e.to_string())?,
+                if shape.has_compact_l1() {
+                    let weights = runner.read_weights(ctx).map_err(|e| e.to_string())?;
+                    let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
+                        args,
+                        feature_kind,
+                        shape,
+                        &weights,
+                        progress_params,
+                    )?;
+                    let host = proxy_weights.as_host();
+                    if let Some(device_weights) = device_weights.as_ref() {
+                        device_weights.upload(ctx, host).map_err(|e| e.to_string())?;
+                    } else {
+                        *device_weights = Some(
+                            bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(ctx, host)
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    let factorizer = cuda_cpp_sfnn_initial_weights_factorizer_active(&proxy_weights);
+                    let alpha = cuda_cpp_sfnn_factorizer_alpha(args);
+                    return inner.run_device_weights_with_factorizer(
+                        args,
+                        ctx,
+                        device_weights.as_ref().expect("device weights initialized"),
+                        factorizer,
+                        alpha,
                     );
                 }
-                let factorizer = cuda_cpp_sfnn_initial_weights_factorizer_active(&proxy_weights);
-                let alpha = cuda_cpp_sfnn_factorizer_alpha(args);
+
+                let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(args, feature_kind, shape);
+                let recreate = match device_weights.as_ref() {
+                    Some(weights) => weights.shape != proxy_shape,
+                    None => true,
+                };
+                if recreate {
+                    *device_weights = Some(
+                        bulletou_cuda_cpp::SfnnForwardDeviceWeights::new_dense(ctx, proxy_shape)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                let device_weights_ref = device_weights.as_ref().expect("device weights initialized");
+                bulletou_cuda_cpp::sfnn_build_quantized_proxy_device(
+                    ctx,
+                    feature_kind.base_input_size(),
+                    feature_kind.virtual_rows(),
+                    &runner.weights,
+                    device_weights_ref,
+                    runner.factorizer,
+                    runner.factorizer_alpha,
+                )
+                .map_err(|e| e.to_string())?;
                 inner.run_device_weights_with_factorizer(
                     args,
                     ctx,
-                    device_weights.as_ref().expect("device weights initialized"),
-                    factorizer,
-                    alpha,
+                    device_weights_ref,
+                    bulletou_cuda_cpp::SfnnFactorizerActive::NONE,
+                    bulletou_cuda_cpp::SfnnFactorizerAlpha::ONE,
                 )
             }
             Self::Exact { cache, batch } => {
-                let quantized =
-                    quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
+                let weights = runner.read_weights(ctx).map_err(|e| e.to_string())?;
+                let quantized = quantized_sfnn_weights_from_cuda_cpp_readback(
+                    args,
+                    feature_kind,
+                    shape,
+                    &weights,
+                    progress_params,
+                )?;
                 let outputs = quantized_sfnn_forward_outputs(&quantized, batch, test_args)?;
                 let report = quantized_test_report_from_outputs(&cache.positions, &outputs, test_args, 0)?;
                 let accuracy =
@@ -8405,7 +8445,7 @@ fn maybe_run_live_sfnn_quantized_validation(
     feature_kind: CudaCppSfnnFeatureKind,
     ctx: &bulletou_cuda_cpp::Context,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
-    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
     epoch: usize,
     superbatch: usize,
@@ -8425,7 +8465,7 @@ fn maybe_run_live_sfnn_quantized_validation(
     let Some(cache) = cache.as_mut() else {
         return Ok(None);
     };
-    let metrics = cache.run_weights(args, feature_kind, ctx, shape, weights, progress_params, &test_args)?;
+    let metrics = cache.run_runner(args, feature_kind, ctx, shape, runner, progress_params, &test_args)?;
     let elapsed = started.elapsed();
     if let Some(checkpoint_dir) = checkpoint_dir {
         update_checkpoint_learn_log_quantized_metrics(checkpoint_dir, metrics)?;
@@ -12773,7 +12813,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         feature_kind,
                         &ctx,
                         cuda_shape,
-                        &trained_weights,
+                        &runner,
                         sfnn_progress_params.as_ref(),
                         chunk.epoch,
                         chunk.superbatch,
@@ -13202,7 +13242,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         feature_kind,
                         &ctx,
                         cuda_shape,
-                        &trained_weights,
+                        &runner,
                         sfnn_progress_params.as_ref(),
                         chunk.epoch,
                         chunk.superbatch,
@@ -13223,7 +13263,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 } else if chunk.run_validation || chunk.run_quantized_validation {
                     ctx.synchronize().map_err(|e| e.to_string())?;
                     let validation_event_started = std::time::Instant::now();
-                    let mut readback_elapsed = std::time::Duration::ZERO;
+                    let readback_elapsed = std::time::Duration::ZERO;
                     let mut validation_elapsed = std::time::Duration::ZERO;
                     let test_metrics = if chunk.run_validation {
                         let validation_started = std::time::Instant::now();
@@ -13237,14 +13277,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         )?;
                         validation_elapsed = validation_started.elapsed();
                         metrics
-                    } else {
-                        None
-                    };
-                    let quantized_weights = if chunk.run_quantized_validation {
-                        let readback_started = std::time::Instant::now();
-                        let weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
-                        readback_elapsed = readback_elapsed.saturating_add(readback_started.elapsed());
-                        Some(weights)
                     } else {
                         None
                     };
@@ -13263,13 +13295,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos,
                         },
                     )?;
-                    let quantized_metrics = if let Some(weights) = quantized_weights.as_ref() {
+                    let quantized_metrics = if chunk.run_quantized_validation {
                         maybe_run_live_sfnn_quantized_validation(
                             args,
                             feature_kind,
                             &ctx,
                             cuda_shape,
-                            weights,
+                            &runner,
                             sfnn_progress_params.as_ref(),
                             chunk.epoch,
                             chunk.superbatch,
@@ -13532,7 +13564,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             feature_kind,
             &ctx,
             cuda_shape,
-            &trained_weights,
+            &runner,
             sfnn_progress_params.as_ref(),
             chunk.epoch,
             chunk.superbatch,

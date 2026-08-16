@@ -1197,6 +1197,209 @@ __host__ __device__ __forceinline__ size_t sfnn_factorizer_axis_count(
     return count;
 }
 
+__device__ __forceinline__ float sfnn_quantize_dequant_clamped(
+    float value,
+    float scale,
+    float qmin,
+    float qmax) {
+    float q = roundf(value * scale);
+    q = fminf(fmaxf(q, qmin), qmax);
+    return q / scale;
+}
+
+__global__ void sfnn_build_quantized_proxy_l0w_kernel(
+    const float* src,
+    float* dst,
+    size_t src_input_size,
+    size_t dst_input_size,
+    size_t virtual_rows,
+    size_t ft_size,
+    float scale) {
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = dst_input_size * ft_size;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t feature = tid / ft_size;
+    const size_t row = tid - feature * ft_size;
+    float value = src[tid];
+    if (src_input_size != dst_input_size && virtual_rows != 0) {
+        const size_t virtual_feature = dst_input_size + (feature % virtual_rows);
+        value += src[virtual_feature * ft_size + row];
+    }
+    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -32768.0f, 32767.0f);
+}
+
+__global__ void sfnn_build_quantized_proxy_vector_kernel(
+    const float* src,
+    float* dst,
+    size_t len,
+    float scale,
+    float qmin,
+    float qmax) {
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= len) {
+        return;
+    }
+    dst[tid] = sfnn_quantize_dequant_clamped(src[tid], scale, qmin, qmax);
+}
+
+__global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
+    const float* weights,
+    const float* shared_weights,
+    const float* axis_weights,
+    float* dst,
+    size_t input_dim,
+    size_t output_dim,
+    size_t num_stacks,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    int has_shared,
+    int shared_weight_input_major,
+    int has_axis,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float shared_alpha,
+    float king_axis_alpha,
+    float hand_axis_alpha,
+    float progress_axis_alpha,
+    float pair_alpha,
+    float scale) {
+    const size_t weight_cell_count = input_dim * output_dim;
+    const size_t total = num_stacks * weight_cell_count;
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t stack = tid / weight_cell_count;
+    const size_t cell = tid - stack * weight_cell_count;
+    const size_t out_col = cell / input_dim;
+    const size_t in_col = cell - out_col * input_dim;
+    const size_t factorizer_cell = shared_weight_input_major != 0
+        ? in_col * output_dim + out_col
+        : cell;
+
+    float value = weights[tid];
+    if (has_shared != 0) {
+        value += shared_alpha * shared_weights[factorizer_cell];
+    }
+
+    size_t axis_ids[8];
+    const size_t axis_count = sfnn_factorizer_axis_ids(
+        stack,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        axis_ids);
+    if (has_axis != 0) {
+        float axis_alphas[8];
+        sfnn_factorizer_axis_alphas(
+            axis_ids,
+            axis_count,
+            num_stacks,
+            factorizer_king_axis_dim,
+            factorizer_hand_axis_dim,
+            use_king_hand_pair,
+            use_king_progress_pair,
+            use_hand_progress_pair,
+            king_axis_alpha,
+            hand_axis_alpha,
+            progress_axis_alpha,
+            pair_alpha,
+            axis_alphas);
+        for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
+            value += axis_alphas[axis_idx] * axis_weights[axis_ids[axis_idx] * weight_cell_count + factorizer_cell];
+        }
+    }
+
+    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -128.0f, 127.0f);
+}
+
+__global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
+    const float* bias,
+    const float* shared_bias,
+    const float* axis_bias,
+    float* dst,
+    size_t output_dim,
+    size_t num_stacks,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    int has_shared,
+    int has_axis,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float shared_alpha,
+    float king_axis_alpha,
+    float hand_axis_alpha,
+    float progress_axis_alpha,
+    float pair_alpha,
+    float scale) {
+    const size_t total = num_stacks * output_dim;
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t stack = tid / output_dim;
+    const size_t out_col = tid - stack * output_dim;
+    float value = bias[tid];
+    if (has_shared != 0) {
+        value += shared_alpha * shared_bias[out_col];
+    }
+
+    size_t axis_ids[8];
+    const size_t axis_count = sfnn_factorizer_axis_ids(
+        stack,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        axis_ids);
+    if (has_axis != 0) {
+        float axis_alphas[8];
+        sfnn_factorizer_axis_alphas(
+            axis_ids,
+            axis_count,
+            num_stacks,
+            factorizer_king_axis_dim,
+            factorizer_hand_axis_dim,
+            use_king_hand_pair,
+            use_king_progress_pair,
+            use_hand_progress_pair,
+            king_axis_alpha,
+            hand_axis_alpha,
+            progress_axis_alpha,
+            pair_alpha,
+            axis_alphas);
+        for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
+            value += axis_alphas[axis_idx] * axis_bias[axis_ids[axis_idx] * output_dim + out_col];
+        }
+    }
+
+    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -2147483648.0f, 2147483647.0f);
+}
+
 __global__ void sfnn_stacked_l1_kernel(
     const float* input,
     const float* weights,
@@ -7559,6 +7762,366 @@ extern "C" int bulletou_cuda_cpp_nnue_forward_device(
             output->ptr) != 0) {
         return -1;
     }
+
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
+    BulletOuCudaCppContext* ctx,
+    size_t src_input_size,
+    size_t dst_input_size,
+    size_t virtual_rows,
+    size_t ft_size,
+    size_t l1_hidden,
+    int l1_skip,
+    size_t l2_size,
+    size_t num_stacks,
+    size_t l1_group_count,
+    size_t l1_common_size,
+    size_t l1_shard_size,
+    size_t factorizer_king_axis_dim,
+    size_t factorizer_hand_axis_dim,
+    const BulletOuCudaCppF32Buffer* src_l0w,
+    const BulletOuCudaCppF32Buffer* src_l0b,
+    const BulletOuCudaCppF32Buffer* src_l1w,
+    const BulletOuCudaCppF32Buffer* src_l1b,
+    const BulletOuCudaCppF32Buffer* src_l1fw,
+    const BulletOuCudaCppF32Buffer* src_l1fb,
+    int has_l1f,
+    const BulletOuCudaCppF32Buffer* src_l1axw,
+    const BulletOuCudaCppF32Buffer* src_l1axb,
+    int has_l1ax,
+    const BulletOuCudaCppF32Buffer* src_l2w,
+    const BulletOuCudaCppF32Buffer* src_l2b,
+    const BulletOuCudaCppF32Buffer* src_l2fw,
+    const BulletOuCudaCppF32Buffer* src_l2fb,
+    int has_l2f,
+    const BulletOuCudaCppF32Buffer* src_l2axw,
+    const BulletOuCudaCppF32Buffer* src_l2axb,
+    int has_l2ax,
+    const BulletOuCudaCppF32Buffer* src_l3w,
+    const BulletOuCudaCppF32Buffer* src_l3b,
+    const BulletOuCudaCppF32Buffer* src_l3fw,
+    const BulletOuCudaCppF32Buffer* src_l3fb,
+    int has_l3f,
+    const BulletOuCudaCppF32Buffer* src_l3axw,
+    const BulletOuCudaCppF32Buffer* src_l3axb,
+    int has_l3ax,
+    int use_king_axis,
+    int use_hand_axis,
+    int use_progress_axis,
+    int use_king_hand_pair,
+    int use_king_progress_pair,
+    int use_hand_progress_pair,
+    float factorizer_shared_alpha,
+    float factorizer_king_axis_alpha,
+    float factorizer_hand_axis_alpha,
+    float factorizer_progress_axis_alpha,
+    float factorizer_pair_alpha,
+    BulletOuCudaCppF32Buffer* dst_l0w,
+    BulletOuCudaCppF32Buffer* dst_l0b,
+    BulletOuCudaCppF32Buffer* dst_l1w,
+    BulletOuCudaCppF32Buffer* dst_l1b,
+    BulletOuCudaCppF32Buffer* dst_l2w,
+    BulletOuCudaCppF32Buffer* dst_l2b,
+    BulletOuCudaCppF32Buffer* dst_l3w,
+    BulletOuCudaCppF32Buffer* dst_l3b) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (l1_group_count != 1 || l1_common_size != 0 || l1_shard_size != 0) {
+        return fail_message("sfnn quantized GPU proxy currently supports only dense L1 source weights");
+    }
+    if (src_input_size == 0 || dst_input_size == 0 || ft_size == 0 || l2_size == 0 || num_stacks == 0) {
+        return fail_message("sfnn quantized GPU proxy dimensions must be non-zero");
+    }
+    if (!(src_input_size == dst_input_size ||
+          (virtual_rows != 0 && src_input_size == dst_input_size + virtual_rows))) {
+        return fail_message("sfnn quantized GPU proxy input sizes do not match base/factorized layout");
+    }
+    if (validate_sfnn_shape(
+            src_input_size,
+            ft_size,
+            l1_hidden,
+            l1_skip,
+            l2_size,
+            num_stacks,
+            l1_group_count,
+            l1_common_size,
+            l1_shard_size,
+            factorizer_king_axis_dim,
+            factorizer_hand_axis_dim,
+            1,
+            1) != 0) {
+        return -1;
+    }
+
+    const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
+    const size_t l2_in = l1_hidden * 2;
+    const size_t axis_count = sfnn_factorizer_axis_count(
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair);
+    const size_t src_l0w_len = src_input_size * ft_size;
+    const size_t dst_l0w_len = dst_input_size * ft_size;
+    const size_t l1w_len = num_stacks * l1_out * ft_size;
+    const size_t l1b_len = num_stacks * l1_out;
+    const size_t l2w_len = num_stacks * l2_size * l2_in;
+    const size_t l2b_len = num_stacks * l2_size;
+    const size_t l3w_len = num_stacks * l2_size;
+    const size_t l3b_len = num_stacks;
+
+    if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l0w), src_l0w_len, "sfnn proxy src l0w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l0b), ft_size, "sfnn proxy src l0b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1w), l1w_len, "sfnn proxy src l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1b), l1b_len, "sfnn proxy src l1b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2w), l2w_len, "sfnn proxy src l2w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2b), l2b_len, "sfnn proxy src l2b") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3w), l3w_len, "sfnn proxy src l3w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3b), l3b_len, "sfnn proxy src l3b") != 0 ||
+        validate_buffer(ctx, dst_l0w, dst_l0w_len, "sfnn proxy dst l0w") != 0 ||
+        validate_buffer(ctx, dst_l0b, ft_size, "sfnn proxy dst l0b") != 0 ||
+        validate_buffer(ctx, dst_l1w, l1w_len, "sfnn proxy dst l1w") != 0 ||
+        validate_buffer(ctx, dst_l1b, l1b_len, "sfnn proxy dst l1b") != 0 ||
+        validate_buffer(ctx, dst_l2w, l2w_len, "sfnn proxy dst l2w") != 0 ||
+        validate_buffer(ctx, dst_l2b, l2b_len, "sfnn proxy dst l2b") != 0 ||
+        validate_buffer(ctx, dst_l3w, l3w_len, "sfnn proxy dst l3w") != 0 ||
+        validate_buffer(ctx, dst_l3b, l3b_len, "sfnn proxy dst l3b") != 0) {
+        return -1;
+    }
+
+    if (has_l1f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1fw), ft_size * l1_out, "sfnn proxy src l1fw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1fb), l1_out, "sfnn proxy src l1fb") != 0) {
+            return -1;
+        }
+    }
+    if (has_l1ax != 0) {
+        if (axis_count == 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1axw), axis_count * ft_size * l1_out, "sfnn proxy src l1axw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1axb), axis_count * l1_out, "sfnn proxy src l1axb") != 0) {
+            return -1;
+        }
+    }
+    if (has_l2f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2fw), l2_size * l2_in, "sfnn proxy src l2fw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2fb), l2_size, "sfnn proxy src l2fb") != 0) {
+            return -1;
+        }
+    }
+    if (has_l2ax != 0) {
+        if (axis_count == 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2axw), axis_count * l2_size * l2_in, "sfnn proxy src l2axw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2axb), axis_count * l2_size, "sfnn proxy src l2axb") != 0) {
+            return -1;
+        }
+    }
+    if (has_l3f != 0) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3fw), l2_size, "sfnn proxy src l3fw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3fb), 1, "sfnn proxy src l3fb") != 0) {
+            return -1;
+        }
+    }
+    if (has_l3ax != 0) {
+        if (axis_count == 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3axw), axis_count * l2_size, "sfnn proxy src l3axw") != 0 ||
+            validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l3axb), axis_count, "sfnn proxy src l3axb") != 0) {
+            return -1;
+        }
+    }
+
+    constexpr int threads = 256;
+    int blocks = 0;
+    constexpr float qa = 127.0f;
+    constexpr float qb = 64.0f;
+    constexpr float fc_bias_scale = qa * qb;
+
+    if (block_count_1d(dst_l0w_len, threads, &blocks, "sfnn proxy l0w") != 0) return -1;
+    sfnn_build_quantized_proxy_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l0w->ptr,
+        dst_l0w->ptr,
+        src_input_size,
+        dst_input_size,
+        virtual_rows,
+        ft_size,
+        qa);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l0w_kernel launch") != 0) return -1;
+
+    if (block_count_1d(ft_size, threads, &blocks, "sfnn proxy l0b") != 0) return -1;
+    sfnn_build_quantized_proxy_vector_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l0b->ptr,
+        dst_l0b->ptr,
+        ft_size,
+        qa,
+        -32768.0f,
+        32767.0f);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l0b_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l1w_len, threads, &blocks, "sfnn proxy l1w") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l1w->ptr,
+        has_l1f != 0 ? src_l1fw->ptr : nullptr,
+        has_l1ax != 0 ? src_l1axw->ptr : nullptr,
+        dst_l1w->ptr,
+        ft_size,
+        l1_out,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l1f,
+        1,
+        has_l1ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        qb);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l1w_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l1b_len, threads, &blocks, "sfnn proxy l1b") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l1b->ptr,
+        has_l1f != 0 ? src_l1fb->ptr : nullptr,
+        has_l1ax != 0 ? src_l1axb->ptr : nullptr,
+        dst_l1b->ptr,
+        l1_out,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l1f,
+        has_l1ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        fc_bias_scale);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l1b_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l2w_len, threads, &blocks, "sfnn proxy l2w") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l2w->ptr,
+        has_l2f != 0 ? src_l2fw->ptr : nullptr,
+        has_l2ax != 0 ? src_l2axw->ptr : nullptr,
+        dst_l2w->ptr,
+        l2_in,
+        l2_size,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l2f,
+        0,
+        has_l2ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        qb);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l2w_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l2b_len, threads, &blocks, "sfnn proxy l2b") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l2b->ptr,
+        has_l2f != 0 ? src_l2fb->ptr : nullptr,
+        has_l2ax != 0 ? src_l2axb->ptr : nullptr,
+        dst_l2b->ptr,
+        l2_size,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l2f,
+        has_l2ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        fc_bias_scale);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l2b_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l3w_len, threads, &blocks, "sfnn proxy l3w") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l3w->ptr,
+        has_l3f != 0 ? src_l3fw->ptr : nullptr,
+        has_l3ax != 0 ? src_l3axw->ptr : nullptr,
+        dst_l3w->ptr,
+        l2_size,
+        1,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l3f,
+        0,
+        has_l3ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        qb);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l3w_kernel launch") != 0) return -1;
+
+    if (block_count_1d(l3b_len, threads, &blocks, "sfnn proxy l3b") != 0) return -1;
+    sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        src_l3b->ptr,
+        has_l3f != 0 ? src_l3fb->ptr : nullptr,
+        has_l3ax != 0 ? src_l3axb->ptr : nullptr,
+        dst_l3b->ptr,
+        1,
+        num_stacks,
+        factorizer_king_axis_dim,
+        factorizer_hand_axis_dim,
+        has_l3f,
+        has_l3ax,
+        use_king_axis,
+        use_hand_axis,
+        use_progress_axis,
+        use_king_hand_pair,
+        use_king_progress_pair,
+        use_hand_progress_pair,
+        factorizer_shared_alpha,
+        factorizer_king_axis_alpha,
+        factorizer_hand_axis_alpha,
+        factorizer_progress_axis_alpha,
+        factorizer_pair_alpha,
+        fc_bias_scale);
+    if (check_kernel_launch("sfnn_build_quantized_proxy_l3b_kernel launch") != 0) return -1;
 
     return ok();
 }

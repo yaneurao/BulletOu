@@ -1389,6 +1389,33 @@ fn upload_optional_f32(ctx: &Context, label: &str, dst: &Option<F32Buffer>, valu
 }
 
 impl SfnnForwardDeviceWeights {
+    pub fn new_dense(ctx: &Context, shape: SfnnForwardShape) -> Result<Self> {
+        validate_sfnn_shape(shape)?;
+        Ok(Self {
+            shape,
+            l0w: F32Buffer::new(ctx, checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?)?,
+            l0b: F32Buffer::new(ctx, shape.ft_size)?,
+            l1w: F32Buffer::new(ctx, shape.l1w_len()?)?,
+            l1b: F32Buffer::new(ctx, checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?)?,
+            l1fw: None,
+            l1fb: None,
+            l1axw: None,
+            l1axb: None,
+            l2w: F32Buffer::new(ctx, checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?)?,
+            l2b: F32Buffer::new(ctx, checked_product("sfnn l2b", &[shape.num_stacks, shape.l2_size])?)?,
+            l2fw: None,
+            l2fb: None,
+            l2axw: None,
+            l2axb: None,
+            l3w: F32Buffer::new(ctx, checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?)?,
+            l3b: F32Buffer::new(ctx, shape.num_stacks)?,
+            l3fw: None,
+            l3fb: None,
+            l3axw: None,
+            l3axb: None,
+        })
+    }
+
     pub fn from_host(ctx: &Context, weights: SfnnForwardHostWeights<'_>) -> Result<Self> {
         weights.validate()?;
         Ok(Self {
@@ -1860,6 +1887,183 @@ fn sfnn_forward_device_with_factorizer_impl(
             workspace.l2_input.as_ptr(),
             workspace.l2.as_ptr(),
             workspace.output.as_ptr(),
+        )
+    })
+}
+
+pub fn sfnn_build_quantized_proxy_device(
+    ctx: &Context,
+    base_input_size: usize,
+    virtual_rows: usize,
+    weights: &SfnnForwardDeviceWeights,
+    proxy_weights: &SfnnForwardDeviceWeights,
+    factorizer: SfnnFactorizerActive,
+    factorizer_alpha: SfnnFactorizerAlpha,
+) -> Result<()> {
+    weights.validate()?;
+    proxy_weights.validate()?;
+    factorizer.validate_for_shape(weights.shape)?;
+    factorizer_alpha.validate()?;
+    let shape = weights.shape;
+    let proxy_shape = proxy_weights.shape;
+    if shape.has_compact_l1() {
+        return Err(CudaCppError::message("SFNN quantized GPU proxy currently supports only dense L1 source weights"));
+    }
+    if proxy_shape.input_size != base_input_size
+        || proxy_shape.ft_size != shape.ft_size
+        || proxy_shape.l1_hidden != shape.l1_hidden
+        || proxy_shape.l1_skip != shape.l1_skip
+        || proxy_shape.l2_size != shape.l2_size
+        || proxy_shape.num_stacks != shape.num_stacks
+        || proxy_shape.l1_group_count != 1
+        || proxy_shape.l1_common_size != 0
+        || proxy_shape.l1_shard_size != 0
+        || proxy_shape.factorizer_king_axis_dim != 0
+        || proxy_shape.factorizer_hand_axis_dim != 0
+        || proxy_shape.factorizer_progress_axis
+        || proxy_shape.factorizer_king_hand_pair
+        || proxy_shape.factorizer_king_progress_pair
+        || proxy_shape.factorizer_hand_progress_pair
+    {
+        return Err(CudaCppError::message(format!(
+            "SFNN quantized GPU proxy shape mismatch: source={shape:?}, proxy={proxy_shape:?}, base_input_size={base_input_size}"
+        )));
+    }
+    if !(shape.input_size == base_input_size
+        || (virtual_rows > 0 && shape.input_size == base_input_size.saturating_add(virtual_rows)))
+    {
+        return Err(CudaCppError::message(format!(
+            "SFNN quantized GPU proxy input mismatch: source input_size={}, base_input_size={}, virtual_rows={virtual_rows}",
+            shape.input_size, base_input_size
+        )));
+    }
+    if proxy_weights.l1fw.is_some()
+        || proxy_weights.l1fb.is_some()
+        || proxy_weights.l1axw.is_some()
+        || proxy_weights.l1axb.is_some()
+        || proxy_weights.l2fw.is_some()
+        || proxy_weights.l2fb.is_some()
+        || proxy_weights.l2axw.is_some()
+        || proxy_weights.l2axb.is_some()
+        || proxy_weights.l3fw.is_some()
+        || proxy_weights.l3fb.is_some()
+        || proxy_weights.l3axw.is_some()
+        || proxy_weights.l3axb.is_some()
+    {
+        return Err(CudaCppError::message("SFNN quantized GPU proxy destination must not contain factorizer tensors"));
+    }
+
+    let (l1fw, l1fb, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
+        (Some(l1fw), Some(l1fb)) if factorizer.shared => (l1fw.as_ptr(), l1fb.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
+    };
+    let (l1axw, l1axb, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
+        (Some(l1axw), Some(l1axb)) if factorizer.any_axis() => (l1axw.as_ptr(), l1axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L1 state is partial")),
+    };
+    let (l2fw, l2fb, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
+        (Some(l2fw), Some(l2fb)) if factorizer.shared => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
+    };
+    let (l2axw, l2axb, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
+        (Some(l2axw), Some(l2axb)) if factorizer.any_axis() => (l2axw.as_ptr(), l2axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
+    };
+    let (l3fw, l3fb, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
+        (Some(l3fw), Some(l3fb)) if factorizer.shared => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
+        (None, None) if factorizer.shared => {
+            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
+    };
+    let (l3axw, l3axb, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
+        (Some(l3axw), Some(l3axb)) if factorizer.any_axis() => (l3axw.as_ptr(), l3axb.as_ptr(), 1),
+        (None, None) if factorizer.any_axis() => {
+            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
+        }
+        (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+        _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
+    };
+
+    // SAFETY: all buffers and shapes are validated above; backend validates device ownership and lengths.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
+            ctx.as_ptr(),
+            shape.input_size,
+            base_input_size,
+            virtual_rows,
+            shape.ft_size,
+            shape.l1_hidden,
+            i32::from(shape.l1_skip),
+            shape.l2_size,
+            shape.num_stacks,
+            shape.l1_group_count,
+            shape.l1_common_size,
+            shape.l1_shard_size,
+            shape.factorizer_king_axis_dim,
+            shape.factorizer_hand_axis_dim,
+            weights.l0w.as_ptr(),
+            weights.l0b.as_ptr(),
+            weights.l1w.as_ptr(),
+            weights.l1b.as_ptr(),
+            l1fw,
+            l1fb,
+            has_l1f,
+            l1axw,
+            l1axb,
+            has_l1ax,
+            weights.l2w.as_ptr(),
+            weights.l2b.as_ptr(),
+            l2fw,
+            l2fb,
+            has_l2f,
+            l2axw,
+            l2axb,
+            has_l2ax,
+            weights.l3w.as_ptr(),
+            weights.l3b.as_ptr(),
+            l3fw,
+            l3fb,
+            has_l3f,
+            l3axw,
+            l3axb,
+            has_l3ax,
+            i32::from(factorizer.king_axis),
+            i32::from(factorizer.hand_axis),
+            i32::from(factorizer.progress_axis),
+            i32::from(factorizer.king_hand_pair),
+            i32::from(factorizer.king_progress_pair),
+            i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.shared,
+            factorizer_alpha.king_axis,
+            factorizer_alpha.hand_axis,
+            factorizer_alpha.progress_axis,
+            factorizer_alpha.pair,
+            proxy_weights.l0w.as_ptr(),
+            proxy_weights.l0b.as_ptr(),
+            proxy_weights.l1w.as_ptr(),
+            proxy_weights.l1b.as_ptr(),
+            proxy_weights.l2w.as_ptr(),
+            proxy_weights.l2b.as_ptr(),
+            proxy_weights.l3w.as_ptr(),
+            proxy_weights.l3b.as_ptr(),
         )
     })
 }
@@ -7552,6 +7756,67 @@ mod ffi {
             l2: *mut BulletOuCudaCppF32Buffer,
             output: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
+            ctx: *mut BulletOuCudaCppContext,
+            src_input_size: usize,
+            dst_input_size: usize,
+            virtual_rows: usize,
+            ft_size: usize,
+            l1_hidden: usize,
+            l1_skip: i32,
+            l2_size: usize,
+            num_stacks: usize,
+            l1_group_count: usize,
+            l1_common_size: usize,
+            l1_shard_size: usize,
+            factorizer_king_axis_dim: usize,
+            factorizer_hand_axis_dim: usize,
+            src_l0w: *mut BulletOuCudaCppF32Buffer,
+            src_l0b: *mut BulletOuCudaCppF32Buffer,
+            src_l1w: *mut BulletOuCudaCppF32Buffer,
+            src_l1b: *mut BulletOuCudaCppF32Buffer,
+            src_l1fw: *mut BulletOuCudaCppF32Buffer,
+            src_l1fb: *mut BulletOuCudaCppF32Buffer,
+            has_l1f: i32,
+            src_l1axw: *mut BulletOuCudaCppF32Buffer,
+            src_l1axb: *mut BulletOuCudaCppF32Buffer,
+            has_l1ax: i32,
+            src_l2w: *mut BulletOuCudaCppF32Buffer,
+            src_l2b: *mut BulletOuCudaCppF32Buffer,
+            src_l2fw: *mut BulletOuCudaCppF32Buffer,
+            src_l2fb: *mut BulletOuCudaCppF32Buffer,
+            has_l2f: i32,
+            src_l2axw: *mut BulletOuCudaCppF32Buffer,
+            src_l2axb: *mut BulletOuCudaCppF32Buffer,
+            has_l2ax: i32,
+            src_l3w: *mut BulletOuCudaCppF32Buffer,
+            src_l3b: *mut BulletOuCudaCppF32Buffer,
+            src_l3fw: *mut BulletOuCudaCppF32Buffer,
+            src_l3fb: *mut BulletOuCudaCppF32Buffer,
+            has_l3f: i32,
+            src_l3axw: *mut BulletOuCudaCppF32Buffer,
+            src_l3axb: *mut BulletOuCudaCppF32Buffer,
+            has_l3ax: i32,
+            use_king_axis: i32,
+            use_hand_axis: i32,
+            use_progress_axis: i32,
+            use_king_hand_pair: i32,
+            use_king_progress_pair: i32,
+            use_hand_progress_pair: i32,
+            factorizer_shared_alpha: f32,
+            factorizer_king_axis_alpha: f32,
+            factorizer_hand_axis_alpha: f32,
+            factorizer_progress_axis_alpha: f32,
+            factorizer_pair_alpha: f32,
+            dst_l0w: *mut BulletOuCudaCppF32Buffer,
+            dst_l0b: *mut BulletOuCudaCppF32Buffer,
+            dst_l1w: *mut BulletOuCudaCppF32Buffer,
+            dst_l1b: *mut BulletOuCudaCppF32Buffer,
+            dst_l2w: *mut BulletOuCudaCppF32Buffer,
+            dst_l2b: *mut BulletOuCudaCppF32Buffer,
+            dst_l3w: *mut BulletOuCudaCppF32Buffer,
+            dst_l3b: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_device(
             ctx: *mut BulletOuCudaCppContext,
             input_size: usize,
@@ -8263,6 +8528,181 @@ mod tests {
         let actual = workspace.download_output(&ctx).unwrap();
 
         assert_close_slice("sfnn", &actual, &expected, 1.0e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_quantized_proxy_gpu_matches_cpu_fold() {
+        fn seq(len: usize, scale: f32, offset: f32) -> Vec<f32> {
+            (0..len).map(|i| ((i as f32 % 11.0) - 5.0) * scale + offset).collect()
+        }
+        fn qdq(value: f32, scale: f32, lo: f32, hi: f32) -> f32 {
+            (value * scale).round().clamp(lo, hi) / scale
+        }
+        fn axis_ids(stack: usize) -> [usize; 2] {
+            [stack / 2, 2 + (stack % 2)]
+        }
+        fn expected_weights(
+            stacks: usize,
+            input_dim: usize,
+            output_dim: usize,
+            base: &[f32],
+            shared: &[f32],
+            axis: &[f32],
+            shared_input_major: bool,
+            alpha: SfnnFactorizerAlpha,
+        ) -> Vec<f32> {
+            let cell_count = input_dim * output_dim;
+            let mut out = vec![0.0; stacks * cell_count];
+            for stack in 0..stacks {
+                for cell in 0..cell_count {
+                    let out_col = cell / input_dim;
+                    let in_col = cell - out_col * input_dim;
+                    let factorizer_cell = if shared_input_major { in_col * output_dim + out_col } else { cell };
+                    let mut value = base[stack * cell_count + cell] + alpha.shared * shared[factorizer_cell];
+                    for axis_id in axis_ids(stack) {
+                        value += alpha.king_axis * axis[axis_id * cell_count + factorizer_cell];
+                    }
+                    out[stack * cell_count + cell] = qdq(value, 64.0, -128.0, 127.0);
+                }
+            }
+            out
+        }
+        fn expected_biases(
+            stacks: usize,
+            output_dim: usize,
+            base: &[f32],
+            shared: &[f32],
+            axis: &[f32],
+            alpha: SfnnFactorizerAlpha,
+        ) -> Vec<f32> {
+            let mut out = vec![0.0; stacks * output_dim];
+            for stack in 0..stacks {
+                for out_col in 0..output_dim {
+                    let mut value = base[stack * output_dim + out_col] + alpha.shared * shared[out_col];
+                    for axis_id in axis_ids(stack) {
+                        value += alpha.king_axis * axis[axis_id * output_dim + out_col];
+                    }
+                    out[stack * output_dim + out_col] = qdq(value, 127.0 * 64.0, -2147483648.0, 2147483647.0);
+                }
+            }
+            out
+        }
+
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 2,
+            num_stacks: 4,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 2,
+            factorizer_hand_axis_dim: 0,
+            factorizer_progress_axis: false,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
+        };
+        let l1_out = shape.l1_out();
+        let l2_in = shape.l2_in();
+        let axis_count = shape.factorizer_axis_count();
+        let l0w = seq(shape.input_size * shape.ft_size, 0.013, 0.001);
+        let l0b = seq(shape.ft_size, 0.009, -0.002);
+        let l1w = seq(shape.num_stacks * l1_out * shape.ft_size, 0.011, 0.003);
+        let l1b = seq(shape.num_stacks * l1_out, 0.007, 0.001);
+        let l1fw = seq(shape.ft_size * l1_out, 0.005, -0.001);
+        let l1fb = seq(l1_out, 0.004, 0.002);
+        let l1axw = seq(axis_count * shape.ft_size * l1_out, 0.003, 0.0005);
+        let l1axb = seq(axis_count * l1_out, 0.002, -0.0005);
+        let l2w = seq(shape.num_stacks * shape.l2_size * l2_in, 0.01, -0.002);
+        let l2b = seq(shape.num_stacks * shape.l2_size, 0.006, 0.004);
+        let l2fw = seq(shape.l2_size * l2_in, 0.004, -0.002);
+        let l2fb = seq(shape.l2_size, 0.003, 0.001);
+        let l2axw = seq(axis_count * shape.l2_size * l2_in, 0.002, 0.0015);
+        let l2axb = seq(axis_count * shape.l2_size, 0.0025, -0.001);
+        let l3w = seq(shape.num_stacks * shape.l2_size, 0.012, 0.002);
+        let l3b = seq(shape.num_stacks, 0.005, -0.001);
+        let l3fw = seq(shape.l2_size, 0.004, 0.001);
+        let l3fb = vec![0.003];
+        let l3axw = seq(axis_count * shape.l2_size, 0.002, -0.0005);
+        let l3axb = seq(axis_count, 0.001, 0.00025);
+        let weights = SfnnForwardHostWeights {
+            shape,
+            l0w: &l0w,
+            l0b: &l0b,
+            l1w: &l1w,
+            l1b: &l1b,
+            l1fw: Some(&l1fw),
+            l1fb: Some(&l1fb),
+            l1axw: Some(&l1axw),
+            l1axb: Some(&l1axb),
+            l2w: &l2w,
+            l2b: &l2b,
+            l2fw: Some(&l2fw),
+            l2fb: Some(&l2fb),
+            l2axw: Some(&l2axw),
+            l2axb: Some(&l2axb),
+            l3w: &l3w,
+            l3b: &l3b,
+            l3fw: Some(&l3fw),
+            l3fb: Some(&l3fb),
+            l3axw: Some(&l3axw),
+            l3axb: Some(&l3axb),
+        };
+        let proxy_shape = SfnnForwardShape { factorizer_king_axis_dim: 0, ..shape };
+        let factorizer = SfnnFactorizerActive { shared: true, king_axis: true, ..SfnnFactorizerActive::NONE };
+        let alpha = SfnnFactorizerAlpha { shared: 0.75, king_axis: 1.25, ..SfnnFactorizerAlpha::ONE };
+
+        let ctx = Context::new(0).unwrap();
+        let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, proxy_shape).unwrap();
+        sfnn_build_quantized_proxy_device(&ctx, shape.input_size, 0, &device_weights, &proxy, factorizer, alpha)
+            .unwrap();
+        ctx.synchronize().unwrap();
+
+        let expected_l0w = l0w.iter().map(|&v| qdq(v, 127.0, -32768.0, 32767.0)).collect::<Vec<_>>();
+        let expected_l0b = l0b.iter().map(|&v| qdq(v, 127.0, -32768.0, 32767.0)).collect::<Vec<_>>();
+        assert_close_slice("proxy l0w", &proxy.l0w.download(&ctx).unwrap(), &expected_l0w, 1.0e-6);
+        assert_close_slice("proxy l0b", &proxy.l0b.download(&ctx).unwrap(), &expected_l0b, 1.0e-6);
+        assert_close_slice(
+            "proxy l1w",
+            &proxy.l1w.download(&ctx).unwrap(),
+            &expected_weights(shape.num_stacks, shape.ft_size, l1_out, &l1w, &l1fw, &l1axw, true, alpha),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "proxy l1b",
+            &proxy.l1b.download(&ctx).unwrap(),
+            &expected_biases(shape.num_stacks, l1_out, &l1b, &l1fb, &l1axb, alpha),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "proxy l2w",
+            &proxy.l2w.download(&ctx).unwrap(),
+            &expected_weights(shape.num_stacks, l2_in, shape.l2_size, &l2w, &l2fw, &l2axw, false, alpha),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "proxy l2b",
+            &proxy.l2b.download(&ctx).unwrap(),
+            &expected_biases(shape.num_stacks, shape.l2_size, &l2b, &l2fb, &l2axb, alpha),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "proxy l3w",
+            &proxy.l3w.download(&ctx).unwrap(),
+            &expected_weights(shape.num_stacks, shape.l2_size, 1, &l3w, &l3fw, &l3axw, false, alpha),
+            1.0e-6,
+        );
+        assert_close_slice(
+            "proxy l3b",
+            &proxy.l3b.download(&ctx).unwrap(),
+            &expected_biases(shape.num_stacks, 1, &l3b, &l3fb, &l3axb, alpha),
+            1.0e-6,
+        );
     }
 
     #[test]

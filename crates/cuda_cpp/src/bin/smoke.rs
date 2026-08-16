@@ -326,6 +326,7 @@ fn tiny_sfnn_shape() -> SfnnForwardShape {
         l1_shard_size: 0,
         factorizer_king_axis_dim: 0,
         factorizer_hand_axis_dim: 0,
+        factorizer_progress_axis: false,
         factorizer_king_hand_pair: false,
         factorizer_king_progress_pair: false,
         factorizer_hand_progress_pair: false,
