@@ -8,10 +8,11 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 
 | Page | Topic |
 | --- | --- |
-| [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, loss, and SFNN factorizer |
+| [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, and loss |
 | [Loss scale and `FV_SCALE`](scale-and-fv-scale.md) | WRM loss, plain sigmoid loss, and quantized output scale |
 | [Continued training](additional-training.md) | Add epochs after a finished run, or continue with a new teacher or LR |
 | [LayerStack](layerstack.md) | SFNN hand / king / progress buckets |
+| [SFNN factorizer](sfnn-factorizer.md) | Shared components between buckets, axis/pair, and alpha |
 | [Quantized `nn.bin` checks](quantized-nn-bin.md) | `quantized-test` and `calibrate-nn-bin` |
 | [Using `bulletou_lib` from code](bullet-lib.md) | Custom examples and external crate usage |
 

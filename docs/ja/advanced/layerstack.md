@@ -459,7 +459,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 | Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
-`progressN` は factorizer と併用できます。`--sfnn-factorizer axis` は king / hand / progress の単独軸を共有します。`--sfnn-factorizer pair` はそれに加えて、archに存在する範囲で `king-progress` や `hand-progress` などの2軸factorizerも使います。
+`progressN` は factorizer と併用できます。`--sfnn-factorizer axis` は king / hand / progress の単独軸を共有します。`--sfnn-factorizer pair` はそれに加えて、archに存在する範囲で `king-progress` や `hand-progress` などの2軸factorizerも使います。詳しい分解式は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 
 たとえば `SFNN_halfka2_1024_7_64_k3k3_hand64_progress2` なら、次のように指定できます。
 

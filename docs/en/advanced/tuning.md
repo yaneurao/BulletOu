@@ -208,6 +208,8 @@ SFNN architectures such as `k3k3` or `hand1024` create many buckets. More bucket
 
 The factorizer lets buckets share common components. It can reduce overfitting and stabilize training when teacher density per bucket is low.
 
+For the detailed formulas behind hand axis and two-axis terms such as `king-hand` / `hand-progress`, see [SFNN factorizer](sfnn-factorizer.md). This page focuses on command-line settings.
+
 Conceptually, training uses an effective weight like this:
 
 ```text

@@ -194,6 +194,8 @@ SFNNでは、`k3k3` や `hand1024` のようにbucketを増やせます。bucket
 
 factorizerは、bucket間で共通成分を共有する仕組みです。教師密度が足りないときの過学習を抑えたり、学習を安定させたりする目的で使います。
 
+hand axis や `king-hand` / `hand-progress` のような2軸factorizerの詳しい式は [SFNN factorizer](sfnn-factorizer.md) を参照してください。このページでは、学習コマンドでよく使う指定だけをまとめます。
+
 学習中の有効な重みは、概念的には次の形になります。
 
 ```text

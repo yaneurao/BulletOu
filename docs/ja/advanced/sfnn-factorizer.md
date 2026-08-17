@@ -1,0 +1,263 @@
+# SFNN factorizer
+
+<a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+
+このページでは、SFNN の LayerStack で使う `--sfnn-factorizer` を説明します。
+
+まず学習を1回動かしたいだけなら、このページを読む必要はありません。`hand1024`、`k29k29`、`progress8` のように bucket 数が多い architecture を比較したいときに読んでください。
+
+## 1. factorizer は何をするものか
+
+LayerStack は、局面ごとに使う後段 network を切り替える仕組みです。たとえば次の architecture は、手駒、玉位置、進行度を組み合わせます。
+
+```text
+SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4
+```
+
+この場合、stack 数は次のようになります。
+
+```text
+hand1024 * k3k3 * progress4 = 1024 * 9 * 4 = 36,864 stacks
+```
+
+各 stack が完全に独立した重みを持つと、表現力は上がります。その一方で、1つの stack に届く教師局面は少なくなります。rare な bucket は学習が薄くなり、検証 loss や量子化後 loss が不安定になりやすいです。
+
+factorizer は、この問題を緩和するために、stack 間で共通成分を持たせる仕組みです。ざっくり言うと、各 stack の重みを「個別成分 + 共通成分」の足し算で表します。
+
+```text
+W_effective = W_base + W_shared + W_axis + W_pair
+```
+
+`W_effective` が実際に forward で使われる重みです。ここでの `W` は、SFNN の L1/L2/L3 の stack ごとの weight や bias の1要素だと思ってください。
+
+## 2. bucket 軸と stack 番号
+
+BulletOu では、LayerStack の stack 番号を次の順序で合成します。
+
+```text
+stack = ((hand_bucket * king_bucket_count) + king_bucket) * progress_bucket_count
+      + progress_bucket
+```
+
+architecture にその軸がない場合、その軸の bucket 数は1として扱われます。
+
+| 軸 | 例 | 意味 |
+|---|---|---|
+| hand | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 手番側と非手番側の手駒状態 |
+| king | `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 玉位置 bucket |
+| progress | `progress2`, `progress4`, `progress8`, `progress16`, `progress32` | 進行度 bucket |
+
+factorizer は、この hand / king / progress の軸を使って、どの stack 同士で成分を共有するかを決めます。
+
+## 3. `shared`
+
+`shared` は、全 stack で1つの共通成分を足します。
+
+```text
+W_effective[hand, king, progress]
+  = W_base[hand, king, progress]
+  + alpha_shared * W_shared
+```
+
+全 stack に同じ成分が足されるので、最も粗い共有です。BulletOu のデフォルトは `--sfnn-factorizer shared` です。
+
+## 4. `axis`
+
+`axis` は、bucket の単独軸ごとに成分を足します。
+
+```text
+W_effective[hand, king, progress]
+  = W_base[hand, king, progress]
+  + alpha_shared   * W_shared
+  + alpha_hand     * W_hand_axis[hand]
+  + alpha_king     * W_king_axis[king]
+  + alpha_progress * W_progress_axis[progress]
+```
+
+実際には、architecture に存在する軸だけが使われます。たとえば `k3k3` だけなら hand/progress axis はありません。`hand1024_k3k3_progress4` なら hand / king / progress の3軸すべてがあります。
+
+### hand axis の分解
+
+hand bucket は、手番側と非手番側の手駒 bucket を掛け合わせたものです。
+
+| 指定 | 片側 bucket 数 `D` | 合計 hand bucket 数 |
+|---|---:|---:|
+| `hand4` | 2 | 4 |
+| `hand16` | 4 | 16 |
+| `hand64` | 8 | 64 |
+| `hand64z` | 8 | 64 |
+| `hand256` | 16 | 256 |
+| `hand1024` | 32 | 1024 |
+
+合成式は次の形です。
+
+```text
+hand_bucket = stm_hand_bucket * D + non_stm_hand_bucket
+```
+
+`hand=axis` は、この `hand_bucket` をそのまま1024個の独立成分として持つのではなく、手番側と非手番側の2方向へ分解して持ちます。
+
+```text
+W_hand_axis[hand_bucket]
+  = W_hand_stm_axis[stm_hand_bucket]
+  + W_hand_non_stm_axis[non_stm_hand_bucket]
+```
+
+たとえば `hand1024` なら、片側32 bucketなので、hand-axis の成分数は `32 + 32 = 64` です。1024個を直接持つよりかなり小さいため、rare な手駒組み合わせでも共有が効きます。
+
+### king axis / progress axis
+
+king axis と progress axis も考え方は同じです。
+
+```text
+W_king_axis[king_bucket]
+W_progress_axis[progress_bucket]
+```
+
+`k3k3` の king bucket は、先手玉側3区分と後手玉側3区分の組み合わせです。BulletOu の factorizer では、king axis も内部的にはその2方向へ分解して使います。`k3k3` なら king-axis の成分数は `3 + 3 = 6` です。
+
+`progress8` なら progress-axis の成分数は8です。
+
+## 5. `pair`
+
+`pair` は、単独軸だけでなく、2軸の組み合わせでも成分を共有します。
+
+```text
+W_effective[hand, king, progress]
+  = W_base[hand, king, progress]
+  + alpha_shared   * W_shared
+  + alpha_hand     * W_hand_axis[hand]
+  + alpha_king     * W_king_axis[king]
+  + alpha_progress * W_progress_axis[progress]
+  + alpha_pair     * W_king_hand_pair[hand, king]
+  + alpha_pair     * W_king_progress_pair[king, progress]
+  + alpha_pair     * W_hand_progress_pair[progress, hand]
+```
+
+`--sfnn-factorizer pair` と書くと、`shared` と使える axis 成分も同時に有効になります。つまり、`pair` は「2軸だけを使う」という意味ではありません。
+
+`hand1024_k3k3_progress4` の場合、使える pair 成分は次の3つです。
+
+| pair 成分 | 共有の意味 | 成分数 |
+|---|---|---:|
+| `king-hand` | 同じ hand と king なら progress をまたいで共有 | `1024 * 9 = 9,216` |
+| `king-progress` | 同じ king と progress なら hand をまたいで共有 | `9 * 4 = 36` |
+| `hand-progress` | 同じ hand と progress なら king をまたいで共有 | `1024 * 4 = 4,096` |
+
+たとえば `hand-progress` は、「同じ手駒状態かつ同じ進行度なら、玉位置が違っても使える成分」を持つ、という意味です。
+
+## 6. 指定方法
+
+よく使う指定は次の通りです。
+
+| 指定 | 意味 |
+|---|---|
+| `--sfnn-factorizer shared` | 全 stack 共通成分だけを使う。デフォルト |
+| `--sfnn-factorizer none` | factorizer を使わない |
+| `--sfnn-factorizer axis` | architecture に存在する hand / king / progress の単独軸を使う |
+| `--sfnn-factorizer pair` | `shared`、使える axis、使える pair をまとめて使う |
+| `--sfnn-factorizer king=axis,hand=axis` | 軸ごとに指定する |
+| `--sfnn-factorizer king-hand,hand-progress` | pair 成分を個別に指定する |
+
+`hand1024_k3k3_progress4` で pair まで使う例:
+
+```bash
+--arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4
+--sfnn-factorizer pair
+```
+
+この指定では、architecture に対応する範囲で次の成分が使われます。
+
+```text
+shared
+king-axis
+hand-axis
+progress-axis
+king-hand
+king-progress
+hand-progress
+```
+
+## 7. `--sfnn-factorizer-alpha`
+
+`--sfnn-factorizer-alpha` は、factorizer 成分を forward でどれだけ足すかを変える係数です。
+
+```text
+W_effective = W_base + alpha * W_factorizer
+```
+
+`alpha=1.0` が標準です。`alpha=2.0` なら、その成分を2倍して足します。同時に、その factorizer tensor へ流れる勾配も2倍になります。指定範囲は `0.0` から `10.0` です。
+
+全部を同じ強さにする場合:
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0
+```
+
+単独軸と2軸を同じ強さにする場合:
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha axis=4.0,pair=4.0
+```
+
+hand axis だけを弱める場合:
+
+```bash
+--sfnn-factorizer axis
+--sfnn-factorizer-alpha hand=0.80
+```
+
+`hand=` は hand-axis の強さを変えます。`hand-progress` や `king-hand` のような pair 成分の強さは `pair=` で変えます。
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha hand=0.80,pair=2.0
+```
+
+この例では、hand-axis は0.8倍、pair 成分は2.0倍です。
+
+`all=` と個別指定を組み合わせることもできます。後ろに書いた指定が優先されます。
+
+```bash
+--sfnn-factorizer pair
+--sfnn-factorizer-alpha all=3.0,pair=4.0
+```
+
+この例では、`shared` と `axis` は3.0、`pair` は4.0です。
+
+## 8. `nn.bin` 書き出し時の扱い
+
+`nn.bin` を保存するときは、factorizer 成分は `W_effective` に畳み込まれます。
+
+```text
+W_export = W_base + alpha_shared * W_shared + ...
+```
+
+そのため、エンジン側は factorizer を知る必要がありません。エンジンが読むのは、畳み込み済みの通常の stack weight です。
+
+一方、`state.bin` には base weight と factorizer tensor が分かれて保存されます。追加学習で factorizer 設定を変える場合は、開始時のログで factorizer の状態を確認してください。
+
+## 9. 使い分けの目安
+
+| 状況 | 試す候補 |
+|---|---|
+| `k3k3` だけで安定している | `shared` または `axis` |
+| `k29k29` のように king bucket が多い | `king=axis` |
+| `hand1024` を使う | `hand=axis`、または `pair` |
+| `hand1024_k3k3_progress4` のように複数軸を掛け合わせる | `pair` |
+| qloss が暴れる | `alpha` を上げる、または飽和ペナルティを試す |
+| factorizer が強すぎて伸びない | `alpha` を下げる、または `none` で短く追加学習する |
+
+大きな bucket 構成では、`none` は各 stack を独立に学習できますが、rare bucket が崩れやすくなります。`axis` や `pair` は自由度を少し制限する代わりに、似た bucket 同士で学習を共有できます。
+
+## 10. 量子化飽和を抑える補助オプション
+
+factorizer を強くしたり bucket 数を増やしたりすると、`nn.bin` へ量子化するときに i8 の上限付近へ張り付く重みが増えることがあります。その場合は、実験用に飽和ペナルティを指定できます。
+
+```bash
+--sfnn-saturation-penalty 1e-7
+```
+
+これはデフォルトでは無効です。量子化後の loss や accuracy だけが悪い場合の切り分けに使います。

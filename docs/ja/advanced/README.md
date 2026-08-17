@@ -8,10 +8,11 @@
 
 | ページ | 内容 |
 | --- | --- |
-| [学習設定を調整する](tuning.md) | 学習率、保存頻度、検証頻度、loss、SFNN factorizer |
+| [学習設定を調整する](tuning.md) | 学習率、保存頻度、検証頻度、loss |
 | [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、単純 sigmoid loss、量子化後の出力scale |
 | [追加学習](additional-training.md) | 完走後にさらに epoch を足す、教師や学習率を変えて続ける |
 | [LayerStack](layerstack.md) | SFNN の hand / king / progress bucket |
+| [SFNN factorizer](sfnn-factorizer.md) | bucket 間の共通成分、axis/pair、alpha の仕組み |
 | [量子化後 `nn.bin` の検証](quantized-nn-bin.md) | `quantized-test` と `calibrate-nn-bin` |
 | [`bulletou_lib` をコードから使う](bullet-lib.md) | 独自 example や外部 crate からの利用 |
 
