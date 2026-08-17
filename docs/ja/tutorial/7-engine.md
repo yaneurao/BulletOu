@@ -1,10 +1,10 @@
-# 6. エンジンに組み込む
+# 7. エンジンに組み込む
 
-<a href="../../en/tutorial/6-engine.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/tutorial/7-engine.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 学習結果をやねうら王エンジンで動作確認する最小手順。
 
-## 6.1 NNUE 系 (`nn.bin`)
+## 7.1 NNUE 系 (`nn.bin`)
 
 最新の `000N/nn.bin` をエンジンが探す場所に置く。やねうら王の場合、`EvalDir` オプションでパスを指定する:
 
@@ -19,7 +19,7 @@ bench
 
 `isready` でロードが通れば学習結果が認識できている。`bench` の出力に nn.bin のハッシュが出るので、毎回違う数字になっていれば確かに違う重みを load していることが分かる。
 
-## 6.2 KPPT 系 (`KK_synthesized.bin` 等の 3 ファイル組)
+## 7.2 KPPT 系 (`KK_synthesized.bin` 等の 3 ファイル組)
 
 最新 `000N/` ディレクトリそのものを `EvalDir` に指定する (3 ファイルが揃った状態のディレクトリを指す):
 
@@ -31,7 +31,7 @@ bench
 
 3 ファイルすべてが揃っていない場合エンジンは load に失敗する点に注意。
 
-## 6.3 学習結果が弱いとき
+## 7.3 学習結果が弱いとき
 
 最初の学習は小さな教師で短い superbatch しか回していないので、評価の質はあまり期待しないこと。本格対局できるレベルにするには:
 - 教師サイズを増やす (1 億 → 10 億局面以上)
@@ -42,4 +42,4 @@ bench
 
 ---
 
-前へ: [5. 結果を確認する](5-result.md)
+前へ: [6. 結果を確認する](6-result.md)

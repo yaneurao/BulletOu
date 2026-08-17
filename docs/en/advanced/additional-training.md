@@ -2,7 +2,7 @@
 
 <a href="../../ja/advanced/additional-training.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
-[Tutorial §4 Stop and resume](../tutorial/4-resume.md) covers the case where training stopped and you want to continue. This page covers the case where **training finished cleanly and you want to add more training**.
+[Tutorial §5 Stop and resume](../tutorial/5-resume.md) covers the case where training stopped and you want to continue. This page covers the case where **training finished cleanly and you want to add more training**.
 
 Examples:
 - 3 epochs done → look at the results, want 3 more epochs.

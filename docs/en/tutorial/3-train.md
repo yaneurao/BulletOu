@@ -73,14 +73,15 @@ Training prints lines like:
 
 ```text
 [train] epoch 1  sb 1/1  this-sb=... pos  wall=...s  train=...s  pos/s=...
-[valid] epoch 1  sb 1    test_value_accuracy=...  test_value_loss=...
 ```
 
 `pos/s` is the training-speed indicator. Save and validation time are excluded from the training speed.
 
+To watch accuracy / loss during training, configure a validation set on the next page.
+
 ---
 
-Next: [4. Stop and resume](4-resume.md)
+Next: [4. Enable validation](4-validation.md)
 
 For tuning and comparison experiments, see the [Advanced guide](../advanced/).
 

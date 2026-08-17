@@ -143,7 +143,7 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
 ```
 
-やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [チュートリアル: エンジンに組み込む](../tutorial/6-engine.md) を参照。
+やねうら王の `Makefile` は未知の edition について `nnue_arch_gen.py` を自動実行するので、対応するヘッダはビルド時に動的生成される。edition 名の dim 部分には**ハイフンではなくアンダースコア**を使う (clang の `-Wc99-extensions` 警告を避けるため)。load 手順は [チュートリアル: エンジンに組み込む](../tutorial/7-engine.md) を参照。
 
 ### 主要 CLI フラグ
 

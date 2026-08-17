@@ -1,10 +1,10 @@
-# 4. 中断・再開
+# 5. 中断・再開
 
-<a href="../../en/tutorial/4-resume.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/tutorial/5-resume.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 学習を途中で止めても、同じ設定で再実行すれば最新 checkpoint から続きます。
 
-## 4.1 基本
+## 5.1 基本
 
 同じ `--tag` または同じ `--output` で、同じコマンドをもう一度実行します。`--output-folder` で保存先ドライブを変えている場合は、それも同じ値を指定します。
 
@@ -41,7 +41,7 @@ checkpoints/.../
   0004/   ← 再開後はここから保存
 ```
 
-## 4.2 checkpointを掃除するとき
+## 5.2 checkpointを掃除するとき
 
 checkpointは大きくなりやすいので、古い保存点を削除してもかまいません。resumeに必要なのは、親フォルダ直下の `resume-config.txt` と、残したい最新checkpointフォルダの中にある3つのファイルです。
 
@@ -84,7 +84,7 @@ Get-ChildItem $exp -Directory |
 
 学習中に掃除するときは、いま書き込み中のcheckpointフォルダは削除しないでください。不安なら最新2個を残すと安全です。
 
-## 4.3 設定を変えるとき
+## 5.3 設定を変えるとき
 
 `--lr`、`--batch-size`、`--superbatches` などを変えると、自動再開は止まります。
 
@@ -103,8 +103,8 @@ Get-ChildItem $exp -Directory |
 
 ---
 
-次へ: [5. 結果を確認する](5-result.md)
+次へ: [6. 結果を確認する](6-result.md)
 
 詳しい使い方: [応用編](../advanced/)
 
-前へ: [3. 学習を走らせる](3-train.md)
+前へ: [4. 検証を有効にする](4-validation.md)

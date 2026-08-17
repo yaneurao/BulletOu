@@ -143,7 +143,7 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_1536_15_32_k3k3
 make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k3k3
 ```
 
-YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the matching architecture header is generated on the fly. Use **underscores** (not hyphens) in the dimension part of the edition name to avoid a `clang -Wc99-extensions` warning. See [tutorial: Load into an engine](../tutorial/6-engine.md) for the load procedure.
+YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the matching architecture header is generated on the fly. Use **underscores** (not hyphens) in the dimension part of the edition name to avoid a `clang -Wc99-extensions` warning. See [tutorial: Load into an engine](../tutorial/7-engine.md) for the load procedure.
 
 ### Common CLI flags
 

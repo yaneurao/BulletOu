@@ -1,10 +1,10 @@
-# 6. Load into an engine
+# 7. Load into an engine
 
-<a href="../../ja/tutorial/6-engine.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/7-engine.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 A minimum walkthrough for verifying the trained weights in a YaneuraOu engine.
 
-## 6.1 For NNUE evals (`nn.bin`)
+## 7.1 For NNUE evals (`nn.bin`)
 
 Put the latest `000N/nn.bin` where the engine looks for its eval file. With YaneuraOu the path is set via the `EvalDir` USI option:
 
@@ -19,7 +19,7 @@ Alternatively, place `000N/nn.bin` as `eval/nn.bin` if your engine expects that 
 
 `isready` succeeding means the engine loaded the file. `bench` prints the hash of the loaded `nn.bin`, so a different number on each re-trained model confirms you're really using different weights.
 
-## 6.2 For KPPT-family evals (three-file set)
+## 7.2 For KPPT-family evals (three-file set)
 
 Point `EvalDir` at the latest `000N/` directory directly (it must contain all three files):
 
@@ -31,7 +31,7 @@ bench
 
 The engine refuses to load if any of the three files is missing.
 
-## 6.3 If the result is weak
+## 7.3 If the result is weak
 
 The first training run uses a small teacher and few superbatches, so don't expect competitive strength. To get something usable in real play:
 - Increase teacher size (100M → 1B+ positions)
@@ -42,4 +42,4 @@ For detailed tuning, see the [Advanced guide](../advanced/) and the per-architec
 
 ---
 
-Previous: [5. Inspect the result](5-result.md)
+Previous: [6. Inspect the result](6-result.md)

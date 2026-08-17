@@ -99,7 +99,7 @@ Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.log
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 
-Resume / restart behaviour is identical across every target; see [tutorial: Stop and resume](../tutorial/4-resume.md) for details.
+Resume / restart behaviour is identical across every target; see [tutorial: Stop and resume](../tutorial/5-resume.md) for details.
 
 ### KPP_KKPT (factorised)
 

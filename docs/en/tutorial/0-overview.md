@@ -38,8 +38,9 @@ load nn.bin in YaneuraOu
 | 1 | [Quick Start](1-quickstart.md) | Build and run a smoke test |
 | 2 | [Prepare training data](2-data.md) | Prepare `--arch` and `--teacher` |
 | 3 | [Run the training](3-train.md) | Run the minimal command |
-| 4 | [Stop and resume](4-resume.md) | Continue after interruption |
-| 5 | [Inspect the result](5-result.md) | Check output files and logs |
-| 6 | [Load into an engine](6-engine.md) | Verify in YaneuraOu |
+| 4 | [Enable validation](4-validation.md) | Measure accuracy / loss |
+| 5 | [Stop and resume](5-resume.md) | Continue after interruption |
+| 6 | [Inspect the result](6-result.md) | Check output files and logs |
+| 7 | [Load into an engine](7-engine.md) | Verify in YaneuraOu |
 
 Next: [1. Quick Start](1-quickstart.md)

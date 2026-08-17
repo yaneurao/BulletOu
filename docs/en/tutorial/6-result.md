@@ -1,6 +1,6 @@
-# 5. Inspect the result
+# 6. Inspect the result
 
-<a href="../../ja/tutorial/5-result.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/6-result.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 After training, check two things.
 
@@ -9,7 +9,7 @@ After training, check two things.
 | `000N/nn.bin` | Evaluation file loaded by the engine |
 | `summary-learn.log` | Accuracy / loss history |
 
-## 5.1 Output files
+## 6.1 Output files
 
 NNUE / SFNN output looks like this:
 
@@ -38,7 +38,7 @@ KKP_synthesized.bin
 KPP_synthesized.bin
 ```
 
-## 5.2 Log
+## 6.2 Log
 
 `summary-learn.log` contains one row per validated superbatch.
 
@@ -57,8 +57,8 @@ For deeper log analysis and plotting, see the [Advanced guide](../advanced/).
 
 ---
 
-Next: [6. Load into an engine](6-engine.md)
+Next: [7. Load into an engine](7-engine.md)
 
 Detailed checks: [Advanced guide](../advanced/)
 
-Previous: [4. Stop and resume](4-resume.md)
+Previous: [5. Stop and resume](5-resume.md)

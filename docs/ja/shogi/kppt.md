@@ -99,7 +99,7 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 
-中断・再開の挙動は target 横断で同じなので、[チュートリアル: 中断・再開](../tutorial/4-resume.md) を参照。
+中断・再開の挙動は target 横断で同じなので、[チュートリアル: 中断・再開](../tutorial/5-resume.md) を参照。
 
 ### KPP_KKPT (factorised)
 

@@ -2,7 +2,7 @@
 
 <a href="../../en/advanced/additional-training.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-[チュートリアル §4 中断・再開](../tutorial/4-resume.md) は「学習が途中で止まったので続きを回す」話でした。このページでは、**完走した学習にさらに学習を足す** 場合を扱います。
+[チュートリアル §5 中断・再開](../tutorial/5-resume.md) は「学習が途中で止まったので続きを回す」話でした。このページでは、**完走した学習にさらに学習を足す** 場合を扱います。
 
 例:
 - 3 epoch 学習 → 結果見て「もう 3 epoch 追加で回したい」

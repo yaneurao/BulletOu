@@ -38,8 +38,9 @@ checkpoints/ に nn.bin ができる
 | 1 | [クイックスタート](1-quickstart.md) | ビルドと smoke test |
 | 2 | [教師データを用意する](2-data.md) | `--arch` と `--teacher` の準備 |
 | 3 | [学習を走らせる](3-train.md) | 最小コマンドで学習 |
-| 4 | [中断・再開](4-resume.md) | 止まったときの再開 |
-| 5 | [結果を確認する](5-result.md) | 出力ファイルとログ |
-| 6 | [エンジンに組み込む](6-engine.md) | やねうら王で動作確認 |
+| 4 | [検証を有効にする](4-validation.md) | accuracy / loss を測る |
+| 5 | [中断・再開](5-resume.md) | 止まったときの再開 |
+| 6 | [結果を確認する](6-result.md) | 出力ファイルとログ |
+| 7 | [エンジンに組み込む](7-engine.md) | やねうら王で動作確認 |
 
 次へ: [1. クイックスタート](1-quickstart.md)

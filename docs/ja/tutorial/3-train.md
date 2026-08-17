@@ -73,14 +73,15 @@ checkpoints/
 
 ```text
 [train] epoch 1  sb 1/1  this-sb=... pos  wall=...s  train=...s  pos/s=...
-[valid] epoch 1  sb 1    test_value_accuracy=...  test_value_loss=...
 ```
 
 `pos/s` は学習速度の目安です。保存や検証の時間は学習速度からは除外されます。
 
+accuracy / loss を学習中に見たい場合は、次のページで検証用局面を指定します。
+
 ---
 
-次へ: [4. 中断・再開](4-resume.md)
+次へ: [4. 検証を有効にする](4-validation.md)
 
 詳しい調整や比較実験: [応用編](../advanced/)
 

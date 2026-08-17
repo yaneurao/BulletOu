@@ -1,6 +1,6 @@
-# 5. 結果を確認する
+# 6. 結果を確認する
 
-<a href="../../en/tutorial/5-result.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/tutorial/6-result.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
 学習後に見る場所は2つです。
 
@@ -9,7 +9,7 @@
 | `000N/nn.bin` | エンジンに読み込ませる評価関数 |
 | `summary-learn.log` | accuracy / loss の推移を見るログ |
 
-## 5.1 出力ファイル
+## 6.1 出力ファイル
 
 NNUE / SFNN の出力例です。
 
@@ -38,7 +38,7 @@ KKP_synthesized.bin
 KPP_synthesized.bin
 ```
 
-## 5.2 ログ
+## 6.2 ログ
 
 `summary-learn.log` には、superbatch ごとの検証結果が入ります。
 
@@ -57,8 +57,8 @@ KPP_synthesized.bin
 
 ---
 
-次へ: [6. エンジンに組み込む](6-engine.md)
+次へ: [7. エンジンに組み込む](7-engine.md)
 
 詳しい検証: [応用編](../advanced/)
 
-前へ: [4. 中断・再開](4-resume.md)
+前へ: [5. 中断・再開](5-resume.md)

@@ -1,10 +1,10 @@
-# 4. Stop and resume
+# 5. Stop and resume
 
-<a href="../../ja/tutorial/4-resume.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
+<a href="../../ja/tutorial/5-resume.md"><img alt="日本語で読む" src="https://img.shields.io/badge/Lang-日本語-DC2626?style=flat-square"></a>
 
 If training stops, rerun the same command with the same settings. BulletOu continues from the latest checkpoint.
 
-## 4.1 Basic rule
+## 5.1 Basic rule
 
 Use the same `--tag` or the same `--output`, and rerun the command. If you used `--output-folder` to put checkpoints on another drive, pass the same folder again.
 
@@ -41,7 +41,7 @@ checkpoints/.../
   0004/   ← resumed run writes from here
 ```
 
-## 4.2 Cleaning old checkpoints
+## 5.2 Cleaning old checkpoints
 
 Checkpoints can become large. You may delete old save points as long as the latest checkpoint you want to resume from still has these files:
 
@@ -84,7 +84,7 @@ Get-ChildItem $exp -Directory |
 
 If training is currently running, do not delete the checkpoint directory that BulletOu is writing. When unsure, keep the latest two checkpoints.
 
-## 4.3 Changing settings
+## 5.3 Changing settings
 
 If you change settings such as `--lr`, `--batch-size`, or `--superbatches`, automatic resume stops.
 
@@ -103,8 +103,8 @@ For a new experiment, use a new `--tag`.
 
 ---
 
-Next: [5. Inspect the result](5-result.md)
+Next: [6. Inspect the result](6-result.md)
 
 Detailed notes: [Advanced guide](../advanced/)
 
-Previous: [3. Run the training](3-train.md)
+Previous: [4. Enable validation](4-validation.md)
