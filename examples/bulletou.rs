@@ -12327,6 +12327,312 @@ fn print_bucket_count_progress(
     );
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn add_sfnn_bucket_counts_from_positions(
+    counts: &mut [u32],
+    positions: &[bulletou_lib::shogi::PackedSfenValue],
+    layerstack: LayerStackMode,
+    stack_count: usize,
+    threads: usize,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<(), String> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    if threads <= 1 || positions.len() < 4096 {
+        for pos in positions {
+            let bucket = layerstack.bucket_index(pos);
+            if bucket >= stack_count {
+                return Err(format!("teacher position bucket {bucket} is out of range 0..{stack_count}"));
+            }
+            counts[bucket] = counts[bucket]
+                .checked_add(1)
+                .ok_or_else(|| format!("bucket {bucket} count overflowed u32; reduce --positions"))?;
+        }
+        return Ok(());
+    }
+
+    let worker_count = threads.min(positions.len()).max(1);
+    let chunk_size = positions.len().div_ceil(worker_count).max(1);
+    let compute_local_counts = || {
+        positions
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut local = vec![0u32; stack_count];
+                for pos in chunk {
+                    let bucket = layerstack.bucket_index(pos);
+                    if bucket >= stack_count {
+                        return Err(format!("teacher position bucket {bucket} is out of range 0..{stack_count}"));
+                    }
+                    local[bucket] += 1;
+                }
+                Ok(local)
+            })
+            .collect::<Vec<Result<Vec<u32>, String>>>()
+    };
+    let locals = match pool {
+        Some(pool) => pool.install(compute_local_counts),
+        None => compute_local_counts(),
+    };
+    for local in locals {
+        let local = local?;
+        for (bucket, add) in local.into_iter().enumerate().filter(|&(_, add)| add != 0) {
+            counts[bucket] = counts[bucket]
+                .checked_add(add)
+                .ok_or_else(|| format!("bucket {bucket} count overflowed u32; reduce --positions"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[allow(clippy::too_many_arguments)]
+fn count_sfnn_buckets_from_position_chunks<L>(
+    loader: L,
+    args: &BucketCountArgs,
+    layerstack: LayerStackMode,
+    stack_count: usize,
+    progress_target_positions: Option<usize>,
+    teacher_threads: usize,
+    started: std::time::Instant,
+    progress_interval: Option<std::time::Duration>,
+) -> Result<(SfnnBucketCounts, usize, std::time::Duration), String>
+where
+    L: bulletou_lib::value::loader::DataLoader<bulletou_lib::shogi::PackedSfenValue>,
+{
+    let rayon_pool = if teacher_threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(teacher_threads)
+                .thread_name(|index| format!("bulletou-bucket-count-{index}"))
+                .build()
+                .map_err(|err| {
+                    format!("failed to create bucket-count thread pool with {teacher_threads} threads: {err}")
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let mut counts = vec![0u32; stack_count];
+    let mut total_positions = 0usize;
+    let mut last_progress = started;
+    let mut scan_error = None::<String>;
+
+    loader.map_chunks(0, |chunk| {
+        let take = match args.positions {
+            Some(target) => target.saturating_sub(total_positions).min(chunk.len()),
+            None => chunk.len(),
+        };
+        if take == 0 {
+            return true;
+        }
+        if let Err(err) = add_sfnn_bucket_counts_from_positions(
+            &mut counts,
+            &chunk[..take],
+            layerstack,
+            stack_count,
+            teacher_threads,
+            rayon_pool.as_ref(),
+        ) {
+            scan_error = Some(err);
+            return true;
+        }
+        total_positions += take;
+
+        if let Some(interval) = progress_interval {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_progress) >= interval
+                && args.positions.is_none_or(|target| total_positions < target)
+            {
+                let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+                print_bucket_count_progress(
+                    total_positions,
+                    progress_target_positions,
+                    total_positions.div_ceil(args.batch_size),
+                    touched_buckets,
+                    stack_count,
+                    started,
+                );
+                last_progress = now;
+            }
+        }
+
+        args.positions.is_some_and(|target| total_positions >= target)
+    });
+
+    if let Some(err) = scan_error {
+        return Err(err);
+    }
+    let seen_batches = total_positions.div_ceil(args.batch_size);
+    if progress_interval.is_some() {
+        let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+        print_bucket_count_progress(
+            total_positions,
+            progress_target_positions,
+            seen_batches,
+            touched_buckets,
+            stack_count,
+            started,
+        );
+    }
+    Ok((
+        SfnnBucketCounts { arch: args.arch.cli_name(), positions: total_positions as u64, counts },
+        seen_batches,
+        started.elapsed(),
+    ))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[allow(clippy::too_many_arguments)]
+fn try_bucket_count_fixed_record_fast_path(
+    args: &BucketCountArgs,
+    layerstack: LayerStackMode,
+    stack_count: usize,
+    progress_target_positions: Option<usize>,
+    teacher_threads: usize,
+    loader_threads: usize,
+    started: std::time::Instant,
+    progress_interval: Option<std::time::Duration>,
+) -> Result<Option<(SfnnBucketCounts, usize, std::time::Duration)>, String> {
+    if args.teacher_shuffle_buffer_batches != 0 {
+        return Ok(None);
+    }
+
+    use bulletou_lib::value::loader::{DirectSequentialDataLoader, HcpeDataLoader};
+
+    let paths = expand_teacher(&args.teacher)?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format = infer_data_format(&path_refs)?;
+    let scan_all = args.positions.is_none();
+    let report = match format {
+        DataFormat::Psv => {
+            eprintln!("  count path  = fixed-record bucket-only fast path (PSV/.bin)");
+            let loader = DirectSequentialDataLoader::new(&path_refs).with_single_epoch(scan_all);
+            count_sfnn_buckets_from_position_chunks(
+                loader,
+                args,
+                layerstack,
+                stack_count,
+                progress_target_positions,
+                teacher_threads,
+                started,
+                progress_interval,
+            )?
+        }
+        DataFormat::Hcpe => {
+            eprintln!("  count path  = fixed-record bucket-only fast path (HCPE)");
+            let buffer_records = args.batch_size.saturating_mul(16).max(args.batch_size).max(1);
+            let loader = HcpeDataLoader::new_concat_multiple(
+                &path_refs,
+                args.buffer_mb,
+                (|_| true) as fn(&bulletou_lib::shogi::PackedSfenValue) -> bool,
+            )
+            .with_buffer_records(buffer_records)
+            .with_loader_threads(loader_threads)
+            .with_single_epoch(scan_all);
+            count_sfnn_buckets_from_position_chunks(
+                loader,
+                args,
+                layerstack,
+                stack_count,
+                progress_target_positions,
+                teacher_threads,
+                started,
+                progress_interval,
+            )?
+        }
+        DataFormat::Hcpe3 | DataFormat::Pack => return Ok(None),
+    };
+    Ok(Some(report))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn finish_bucket_count_report(
+    args: &BucketCountArgs,
+    layerstack: LayerStackMode,
+    report: SfnnBucketCounts,
+    seen_batches: usize,
+    elapsed: std::time::Duration,
+) -> Result<(), String> {
+    report.write_to_path(&args.output)?;
+    let total_positions = usize::try_from(report.positions)
+        .map_err(|_| format!("bucket-count positions {} do not fit in usize", report.positions))?;
+    let touched_buckets = report.nonzero_count();
+    let nonzero_counts = report.counts.iter().copied().filter(|&count| count != 0).collect::<Vec<_>>();
+    let nonzero_mean = bucket_count_mean(&nonzero_counts);
+    let nonzero_stddev = bucket_count_stddev(&nonzero_counts, nonzero_mean);
+    let mut top = report
+        .counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .map(|(bucket, &count)| (bucket, count))
+        .collect::<Vec<_>>();
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let top10_sum = top.iter().take(10).map(|&(_, count)| u64::from(count)).sum::<u64>();
+    println!("bucket-count complete:");
+    println!("  arch              = {}", report.arch);
+    println!("  layerstack        = {}", layerstack.cli_name());
+    println!("  output            = {}", args.output.display());
+    println!("  stacks            = {}", format_count(report.stack_count()));
+    println!("  scanned_batches   = {}", format_count(seen_batches));
+    println!("  scanned_positions = {}", format_count(total_positions));
+    println!("  elapsed           = {:.3}s", elapsed.as_secs_f64());
+    println!(
+        "  touched_buckets   = {} / {} ({:.2}%)",
+        format_count(touched_buckets),
+        format_count(report.stack_count()),
+        100.0 * touched_buckets as f64 / report.stack_count().max(1) as f64
+    );
+    println!("  zero_buckets      = {}", format_count(report.stack_count() - touched_buckets));
+    println!(
+        "  count_per_bucket  = all: p50 {}, p90 {}, p99 {}, max {}",
+        format_count(bucket_count_percentile(&report.counts, 0.50) as usize),
+        format_count(bucket_count_percentile(&report.counts, 0.90) as usize),
+        format_count(bucket_count_percentile(&report.counts, 0.99) as usize),
+        format_count(report.max() as usize)
+    );
+    println!(
+        "  count_per_seen    = mean {:.1}, std {:.1}, min {}, p50 {}, p90 {}, p99 {}, max {}",
+        nonzero_mean,
+        nonzero_stddev,
+        format_count(report.min_nonzero() as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.50) as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.90) as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.99) as usize),
+        format_count(report.max() as usize)
+    );
+    let count_thresholds = [
+        ("1B", 1_000_000_000u32),
+        ("100M", 100_000_000u32),
+        ("10M", 10_000_000u32),
+        ("1M", 1_000_000u32),
+        ("100K", 100_000u32),
+        ("10K", 10_000u32),
+        ("1K", 1_000u32),
+    ];
+    let threshold_summary = count_thresholds
+        .iter()
+        .map(|&(label, threshold)| {
+            let buckets = report.counts.iter().filter(|&&count| count >= threshold).count();
+            format!(">={label} {}", format_count(buckets))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  buckets_by_count  = {threshold_summary}");
+    println!(
+        "  top10_share       = {:.2}% of scanned positions",
+        if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
+    );
+    println!("  top_buckets       = bucket:count(share)");
+    for (bucket, count) in top.into_iter().take(10) {
+        let share = if total_positions == 0 { 0.0 } else { 100.0 * count as f64 / total_positions as f64 };
+        println!("    {}:{} ({:.3}%)", bucket, format_count(count as usize), share);
+    }
+    Ok(())
+}
+
 fn effective_sfnn_residual_count_decay(args: &Args) -> f32 {
     match args.sfnn_residual_count_decay {
         Some(decay) => decay,
@@ -12677,6 +12983,20 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     let started = std::time::Instant::now();
     let progress_interval =
         (args.progress_interval_sec > 0.0).then(|| std::time::Duration::from_secs_f64(args.progress_interval_sec));
+    if let Some((report, seen_batches, elapsed)) = try_bucket_count_fixed_record_fast_path(
+        args,
+        layerstack,
+        stack_count,
+        progress_target_positions,
+        teacher_threads,
+        loader_threads,
+        started,
+        progress_interval,
+    )? {
+        return finish_bucket_count_report(args, layerstack, report, seen_batches, elapsed);
+    }
+    eprintln!("  count path  = teacher-batch compatibility path");
+
     let mut last_progress = started;
     let mut counts = vec![0u32; stack_count];
     let mut total_positions = 0usize;
@@ -12728,82 +13048,8 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     })?;
 
     let report = SfnnBucketCounts { arch: args.arch.cli_name(), positions: total_positions as u64, counts };
-    report.write_to_path(&args.output)?;
-
     let elapsed = started.elapsed();
-    let touched_buckets = report.nonzero_count();
-    let nonzero_counts = report.counts.iter().copied().filter(|&count| count != 0).collect::<Vec<_>>();
-    let nonzero_mean = bucket_count_mean(&nonzero_counts);
-    let nonzero_stddev = bucket_count_stddev(&nonzero_counts, nonzero_mean);
-    let mut top = report
-        .counts
-        .iter()
-        .enumerate()
-        .filter(|&(_, &count)| count != 0)
-        .map(|(bucket, &count)| (bucket, count))
-        .collect::<Vec<_>>();
-    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let top10_sum = top.iter().take(10).map(|&(_, count)| u64::from(count)).sum::<u64>();
-    println!("bucket-count complete:");
-    println!("  arch              = {}", report.arch);
-    println!("  layerstack        = {}", layerstack.cli_name());
-    println!("  output            = {}", args.output.display());
-    println!("  stacks            = {}", format_count(report.stack_count()));
-    println!("  scanned_batches   = {}", format_count(seen_batches));
-    println!("  scanned_positions = {}", format_count(total_positions));
-    println!("  elapsed           = {:.3}s", elapsed.as_secs_f64());
-    println!(
-        "  touched_buckets   = {} / {} ({:.2}%)",
-        format_count(touched_buckets),
-        format_count(report.stack_count()),
-        100.0 * touched_buckets as f64 / report.stack_count().max(1) as f64
-    );
-    println!("  zero_buckets      = {}", format_count(report.stack_count() - touched_buckets));
-    println!(
-        "  count_per_bucket  = all: p50 {}, p90 {}, p99 {}, max {}",
-        format_count(bucket_count_percentile(&report.counts, 0.50) as usize),
-        format_count(bucket_count_percentile(&report.counts, 0.90) as usize),
-        format_count(bucket_count_percentile(&report.counts, 0.99) as usize),
-        format_count(report.max() as usize)
-    );
-    println!(
-        "  count_per_seen    = mean {:.1}, std {:.1}, min {}, p50 {}, p90 {}, p99 {}, max {}",
-        nonzero_mean,
-        nonzero_stddev,
-        format_count(report.min_nonzero() as usize),
-        format_count(bucket_count_percentile(&nonzero_counts, 0.50) as usize),
-        format_count(bucket_count_percentile(&nonzero_counts, 0.90) as usize),
-        format_count(bucket_count_percentile(&nonzero_counts, 0.99) as usize),
-        format_count(report.max() as usize)
-    );
-    let count_thresholds = [
-        ("1B", 1_000_000_000u32),
-        ("100M", 100_000_000u32),
-        ("10M", 10_000_000u32),
-        ("1M", 1_000_000u32),
-        ("100K", 100_000u32),
-        ("10K", 10_000u32),
-        ("1K", 1_000u32),
-    ];
-    let threshold_summary = count_thresholds
-        .iter()
-        .map(|&(label, threshold)| {
-            let buckets = report.counts.iter().filter(|&&count| count >= threshold).count();
-            format!(">={label} {}", format_count(buckets))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("  buckets_by_count  = {threshold_summary}");
-    println!(
-        "  top10_share       = {:.2}% of scanned positions",
-        if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
-    );
-    println!("  top_buckets       = bucket:count(share)");
-    for (bucket, count) in top.into_iter().take(10) {
-        let share = if total_positions == 0 { 0.0 } else { 100.0 * count as f64 / total_positions as f64 };
-        println!("    {}:{} ({:.3}%)", bucket, format_count(count as usize), share);
-    }
-    Ok(())
+    finish_bucket_count_report(args, layerstack, report, seen_batches, elapsed)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
