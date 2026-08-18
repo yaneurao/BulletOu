@@ -1,4 +1,4 @@
-# SFNN factorizer
+﻿# SFNN factorizer
 
 <a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
@@ -286,31 +286,34 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k-ratio 0.1
+--sfnn-residual-count-decay-k-ratio 0.05
 ```
 
 stack ごとの減衰係数は次の式です。
 
 ```text
-lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
+decay_stack = max_decay * min(1, sqrt((K + 1) / (count_stack + 1)))
 ```
 
-`lambda0` が `--sfnn-residual-count-decay` です。`K` はデフォルトでは次のように自動計算されます。
+`max_decay` は最大減衰量です。`--sfnn-residual-count-decay-k-ratio` または `--sfnn-residual-count-decay-k` を指定して count decay を有効にした場合、`max_decay` はデフォルトで `1e-7` になります。必要なときだけ `--sfnn-residual-count-decay <値>` で上書きできます。
+
+`K` はデフォルトでは次のように自動計算されます。
 
 ```text
 average_count = count.bin に記録された集計局面数 / stack 数
 K = average_count * --sfnn-residual-count-decay-k-ratio
 ```
 
-つまり `--sfnn-residual-count-decay-k-ratio 0.1` は、「平均的な bucket 出現回数の 10% ぐらいまでを rare bucket として強めに抑える」という意味です。`count.bin` に集計局面数が入っているので、5億局面で count しても50億局面で count しても、同じ ratio ならだいたい同じ意味になります。
+つまり `--sfnn-residual-count-decay-k-ratio 0.05` は、「平均的な bucket 出現回数の 5% ぐらいまでを rare bucket として強めに抑える」という意味です。`count.bin` に集計局面数が入っているので、5億局面で count しても50億局面で count しても、同じ ratio ならだいたい同じ意味になります。
+
+普通は `--sfnn-bucket-counts <count.bin>` と `--sfnn-residual-count-decay-k-ratio <ratio>` だけ指定すれば十分です。
 
 生の count 値で直接指定したい場合だけ、上級者向けに `--sfnn-residual-count-decay-k <count>` を使えます。この場合は `--sfnn-residual-count-decay-k-ratio` は使われません。
 
 | count | 挙動 |
 |---:|---|
-| `count <= K` | 最大の `lambda0` で residual を抑える |
-| `count = 4K` | 約 `lambda0 / 2` になる |
+| `count <= K` | 最大の `max_decay` で residual を抑える |
+| `count = 4K` | 約 `max_decay / 2` になる |
 | count が十分多い | ほとんど効かなくなる |
 
 この正則化は factorizer tensor には直接かけません。`shared` / `axis` / `pair` の共有成分は残し、bucket 固有の residual だけを count に応じて抑えます。そのため、rare bucket を完全に無視するのではなく、「まず共有成分を信じ、十分な出現回数がある bucket だけ個別成分を強く学習する」という挙動になります。

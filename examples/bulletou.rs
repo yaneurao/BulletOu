@@ -3290,6 +3290,8 @@ const DEFAULT_SIGMOID_SCALE: f32 = 600.0;
 const DEFAULT_FV_SCALE: f32 = 24.0;
 const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
+const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY: f32 = 1.0e-7;
+const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY_K_RATIO: f32 = 0.05;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_IN_OFFSET: f32 = 270.0;
 const DEFAULT_WRM_IN_SCALING: f32 = 340.0;
@@ -4519,17 +4521,17 @@ struct Args {
     #[arg(long = "sfnn-factorizer-residual-decay", default_value = "0.0")]
     sfnn_factorizer_residual_decay: f32,
 
-    /// Bucket-count file produced by `bulletou bucket-count`. When used with
-    /// `--sfnn-residual-count-decay`, BulletOu decays bucket-specific base
-    /// stack residuals more strongly for low-count stacks.
+    /// Bucket-count file produced by `bulletou bucket-count`. By itself this
+    /// only validates and prints count statistics. Use one of the residual
+    /// count decay options to apply it to training.
     #[arg(long = "sfnn-bucket-counts")]
     sfnn_bucket_counts: Option<PathBuf>,
 
     /// Maximum count-aware residual decay for SFNN base stack tensors.
-    /// Requires `--sfnn-bucket-counts`. Per-stack lambda is
-    /// `decay * min(1, sqrt((K+1)/(count+1)))`.
-    #[arg(long = "sfnn-residual-count-decay", default_value = "0.0")]
-    sfnn_residual_count_decay: f32,
+    /// Requires `--sfnn-bucket-counts`. If omitted while K or K-ratio is
+    /// specified, BulletOu uses the default maximum decay 1e-7.
+    #[arg(long = "sfnn-residual-count-decay")]
+    sfnn_residual_count_decay: Option<f32>,
 
     /// Raw K parameter for `--sfnn-residual-count-decay`, in count.bin units.
     /// If omitted while count decay is enabled, BulletOu uses
@@ -4537,10 +4539,11 @@ struct Args {
     #[arg(long = "sfnn-residual-count-decay-k")]
     sfnn_residual_count_decay_k: Option<f32>,
 
-    /// Automatic K ratio for `--sfnn-residual-count-decay`.
+    /// Enables count-aware residual decay using automatic K.
     /// Effective K is `count.bin positions / stack_count * ratio`.
-    #[arg(long = "sfnn-residual-count-decay-k-ratio", default_value = "0.1")]
-    sfnn_residual_count_decay_k_ratio: f32,
+    /// If `--sfnn-residual-count-decay` is omitted, max decay defaults to 1e-7.
+    #[arg(long = "sfnn-residual-count-decay-k-ratio")]
+    sfnn_residual_count_decay_k_ratio: Option<f32>,
 
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
@@ -4776,27 +4779,28 @@ impl Args {
         if self.sfnn_bucket_counts.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-bucket-counts applies to SFNN / LayerStack eval types only".to_string());
         }
-        if !(self.sfnn_residual_count_decay.is_finite() && self.sfnn_residual_count_decay >= 0.0) {
-            return Err(format!(
-                "--sfnn-residual-count-decay must be finite and non-negative (got {})",
-                self.sfnn_residual_count_decay
-            ));
+        if let Some(decay) = self.sfnn_residual_count_decay {
+            if !(decay.is_finite() && decay >= 0.0) {
+                return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
+            }
         }
         if let Some(k) = self.sfnn_residual_count_decay_k {
             if !(k.is_finite() && k >= 0.0) {
                 return Err(format!("--sfnn-residual-count-decay-k must be finite and non-negative (got {k})"));
             }
         }
-        if !(self.sfnn_residual_count_decay_k_ratio.is_finite() && self.sfnn_residual_count_decay_k_ratio >= 0.0) {
-            return Err(format!(
-                "--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {})",
-                self.sfnn_residual_count_decay_k_ratio
-            ));
+        if let Some(ratio) = self.sfnn_residual_count_decay_k_ratio {
+            if !(ratio.is_finite() && ratio >= 0.0) {
+                return Err(format!(
+                    "--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {ratio})"
+                ));
+            }
         }
-        if self.sfnn_residual_count_decay != 0.0 && !eval_type.uses_layerstack() {
+        let effective_residual_count_decay = effective_sfnn_residual_count_decay(self);
+        if effective_residual_count_decay != 0.0 && !eval_type.uses_layerstack() {
             return Err("--sfnn-residual-count-decay applies to SFNN / LayerStack eval types only".to_string());
         }
-        if self.sfnn_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
+        if effective_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string());
         }
         if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
@@ -4925,7 +4929,7 @@ impl Args {
                     .to_string(),
             );
         }
-        if self.sfnn_residual_count_decay != 0.0 && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE {
+        if effective_residual_count_decay != 0.0 && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE {
             return Err(
                 "--sfnn-residual-count-decay requires an active SFNN factorizer; use --sfnn-factorizer shared, axis, or pair"
                     .to_string(),
@@ -12307,6 +12311,20 @@ fn print_bucket_count_progress(
     );
 }
 
+fn effective_sfnn_residual_count_decay(args: &Args) -> f32 {
+    match args.sfnn_residual_count_decay {
+        Some(decay) => decay,
+        None if args.sfnn_residual_count_decay_k.is_some() || args.sfnn_residual_count_decay_k_ratio.is_some() => {
+            DEFAULT_SFNN_RESIDUAL_COUNT_DECAY
+        }
+        None => 0.0,
+    }
+}
+
+fn effective_sfnn_residual_count_decay_k_ratio(args: &Args) -> f32 {
+    args.sfnn_residual_count_decay_k_ratio.unwrap_or(DEFAULT_SFNN_RESIDUAL_COUNT_DECAY_K_RATIO)
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32) -> Result<Vec<f32>, String> {
     if !(decay.is_finite() && decay >= 0.0) {
@@ -12335,24 +12353,22 @@ fn effective_sfnn_residual_count_decay_k(args: &Args, counts: &SfnnBucketCounts)
         }
         return Ok((k, format!("raw count K={k:.3}")));
     }
-    if !(args.sfnn_residual_count_decay_k_ratio.is_finite() && args.sfnn_residual_count_decay_k_ratio >= 0.0) {
-        return Err(format!(
-            "--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {})",
-            args.sfnn_residual_count_decay_k_ratio
-        ));
+    let k_ratio = effective_sfnn_residual_count_decay_k_ratio(args);
+    if !(k_ratio.is_finite() && k_ratio >= 0.0) {
+        return Err(format!("--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {})", k_ratio));
     }
     let stack_count = counts.stack_count().max(1) as f64;
     let mean_count = counts.positions as f64 / stack_count;
-    let k = mean_count * f64::from(args.sfnn_residual_count_decay_k_ratio);
+    let k = mean_count * f64::from(k_ratio);
     if !(k.is_finite() && k >= 0.0 && k <= f32::MAX as f64) {
         return Err(format!(
             "auto --sfnn-residual-count-decay-k overflowed: positions={}, stacks={}, ratio={}",
             counts.positions,
             counts.stack_count(),
-            args.sfnn_residual_count_decay_k_ratio
+            k_ratio
         ));
     }
-    Ok((k as f32, format!("auto: mean_count={mean_count:.3} * ratio={:.6}", args.sfnn_residual_count_decay_k_ratio)))
+    Ok((k as f32, format!("auto: mean_count={mean_count:.3} * ratio={k_ratio:.6}")))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12945,13 +12961,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         None
     };
-    let sfnn_residual_count_decay = if args.sfnn_residual_count_decay != 0.0 {
+    let effective_residual_count_decay = effective_sfnn_residual_count_decay(args);
+    let sfnn_residual_count_decay = if effective_residual_count_decay != 0.0 {
         let counts = sfnn_bucket_counts
             .as_ref()
             .map(|(_, counts)| counts)
             .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
         let (effective_k, k_label) = effective_sfnn_residual_count_decay_k(args, counts)?;
-        let lambdas = sfnn_bucket_count_decay_lambdas(counts, args.sfnn_residual_count_decay, effective_k)?;
+        let lambdas = sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?;
         Some((effective_k, k_label, lambdas))
     } else {
         None
@@ -13086,8 +13103,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv_colored(
             "count residual decay",
             format!(
-                "lambda0={:.9}, K={:.3} ({k_label}), per-stack lambda p50={:.9}, p90={:.9}, p99={:.9}, max={:.9}",
-                args.sfnn_residual_count_decay,
+                "max_decay={:.9}, K={:.3} ({k_label}), per-stack decay p50={:.9}, p90={:.9}, p99={:.9}, max={:.9}",
+                effective_residual_count_decay,
                 effective_k,
                 f32_percentile(lambdas, 0.50),
                 f32_percentile(lambdas, 0.90),
@@ -19543,13 +19560,14 @@ fn resume_signature(args: &Args) -> String {
     let test_positions = args.test_positions.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
     let test_sample = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
     let test_seed = if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() };
+    let residual_count_decay_signature = effective_sfnn_residual_count_decay(args);
     let (residual_count_decay_k_signature, residual_count_decay_k_ratio_signature) =
-        if args.sfnn_residual_count_decay == 0.0 {
+        if residual_count_decay_signature == 0.0 {
             ("0.000000000".to_string(), "ignored".to_string())
         } else if let Some(k) = args.sfnn_residual_count_decay_k {
             (format!("{k:.9}"), "ignored".to_string())
         } else {
-            ("auto".to_string(), format!("{:.9}", args.sfnn_residual_count_decay_k_ratio))
+            ("auto".to_string(), format!("{:.9}", effective_sfnn_residual_count_decay_k_ratio(args)))
         };
     [
         "schema=bulletou-resume-v3".to_string(),
@@ -19626,7 +19644,7 @@ fn resume_signature(args: &Args) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "none".to_string())
         ),
-        format!("sfnn_residual_count_decay={:.9}", args.sfnn_residual_count_decay),
+        format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
         format!("sfnn_residual_count_decay_k={residual_count_decay_k_signature}"),
         format!("sfnn_residual_count_decay_k_ratio={residual_count_decay_k_ratio_signature}"),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),

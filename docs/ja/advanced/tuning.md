@@ -1,4 +1,4 @@
-# 学習設定を調整する
+﻿# 学習設定を調整する
 
 <a href="../../en/advanced/tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
@@ -348,11 +348,10 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k-ratio 0.1
+--sfnn-residual-count-decay-k-ratio 0.05
 ```
 
-`--sfnn-residual-count-decay-k-ratio 0.1` は、「平均的な bucket 出現回数の 10% ぐらいまでを rare bucket として強めに抑える」という意味です。平均出現回数は `count.bin` に記録された集計局面数から自動計算されるので、count に使った局面数を変えても手で K を調整し直す必要がありません。
+`--sfnn-residual-count-decay-k-ratio 0.05` は、「平均的な bucket 出現回数の 5% ぐらいまでを rare bucket として強めに抑える」という意味です。この指定だけで count decay は有効になり、最大減衰量はデフォルトで `1e-7` になります。平均出現回数は `count.bin` に記録された集計局面数から自動計算されるので、count に使った局面数を変えても手で K を調整し直す必要がありません。
 
 count decay は factorizer 成分ではなく、bucket 固有の residual にだけかかります。count が多い bucket は residual を大きく学習しやすく、count が少ない bucket は factorizer の共有成分に寄ります。
 

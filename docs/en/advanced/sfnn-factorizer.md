@@ -1,4 +1,4 @@
-# SFNN factorizer
+﻿# SFNN factorizer
 
 <a href="../../ja/advanced/sfnn-factorizer.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
@@ -286,31 +286,34 @@ Then pass it during training:
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k-ratio 0.1
+--sfnn-residual-count-decay-k-ratio 0.05
 ```
 
 The per-stack decay coefficient is:
 
 ```text
-lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
+decay_stack = max_decay * min(1, sqrt((K + 1) / (count_stack + 1)))
 ```
 
-`lambda0` is `--sfnn-residual-count-decay`. By default, `K` is computed automatically:
+`max_decay` is the maximum decay. If you enable count decay with `--sfnn-residual-count-decay-k-ratio` or `--sfnn-residual-count-decay-k`, BulletOu uses `max_decay = 1e-7` by default. Override it with `--sfnn-residual-count-decay <value>` only when you need to tune the maximum decay itself.
+
+By default, `K` is computed automatically:
 
 ```text
 average_count = positions recorded in count.bin / number of stacks
 K = average_count * --sfnn-residual-count-decay-k-ratio
 ```
 
-For example, `--sfnn-residual-count-decay-k-ratio 0.1` means: apply the strongest damping up to roughly 10% of the average bucket count. Because the total scanned position count is stored in `count.bin`, the same ratio keeps roughly the same meaning even if you build the count file from a different number of positions.
+For example, `--sfnn-residual-count-decay-k-ratio 0.05` means: apply the strongest damping up to roughly 5% of the average bucket count. Because the total scanned position count is stored in `count.bin`, the same ratio keeps roughly the same meaning even if you build the count file from a different number of positions.
+
+In normal use, pass only `--sfnn-bucket-counts <count.bin>` and `--sfnn-residual-count-decay-k-ratio <ratio>`.
 
 If you really want to specify a raw count threshold, use `--sfnn-residual-count-decay-k <count>`. In that case, `--sfnn-residual-count-decay-k-ratio` is ignored.
 
 | count | Behavior |
 |---:|---|
-| `count <= K` | Use the maximum decay `lambda0` |
-| `count = 4K` | About `lambda0 / 2` |
+| `count <= K` | Use the maximum `max_decay` |
+| `count = 4K` | About `max_decay / 2` |
 | Very large count | Almost no extra decay |
 
 This does not directly decay the factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual is damped according to count. The effect is: trust the shared structure first, and let heavily observed buckets learn stronger individual residuals.
