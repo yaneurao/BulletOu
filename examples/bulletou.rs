@@ -1606,7 +1606,7 @@ struct BucketCountArgs {
     batch_size: usize,
 
     /// Loader read buffer size in MiB.
-    #[arg(long, default_value = "4096")]
+    #[arg(long, default_value = "1024")]
     buffer_mb: usize,
 
     /// Teacher batch preparation worker threads. Omit or set 0 for the cuda-cpp default.
@@ -12290,6 +12290,20 @@ fn bucket_count_stddev(counts: &[u32], mean: f64) -> f64 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy)]
+struct BucketCountProgressState {
+    last_positions: usize,
+    last_time: std::time::Instant,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl BucketCountProgressState {
+    fn new(started: std::time::Instant) -> Self {
+        Self { last_positions: 0, last_time: started }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn print_bucket_count_progress(
     scanned_positions: usize,
     target_positions: Option<usize>,
@@ -12297,10 +12311,17 @@ fn print_bucket_count_progress(
     touched_buckets: usize,
     stack_count: usize,
     started: std::time::Instant,
+    progress_state: &mut BucketCountProgressState,
 ) {
     let elapsed = started.elapsed();
     let elapsed_sec = elapsed.as_secs_f64();
     let positions_per_sec = if elapsed_sec > 0.0 { scanned_positions as f64 / elapsed_sec } else { 0.0 };
+    let interval_elapsed = progress_state.last_time.elapsed();
+    let interval_sec = interval_elapsed.as_secs_f64();
+    let interval_positions = scanned_positions.saturating_sub(progress_state.last_positions);
+    let interval_positions_per_sec = if interval_sec > 0.0 { interval_positions as f64 / interval_sec } else { 0.0 };
+    progress_state.last_positions = scanned_positions;
+    progress_state.last_time = std::time::Instant::now();
     let (target_text, pct_text, eta_text) = match target_positions {
         Some(target) => {
             let pct = if target == 0 { 100.0 } else { 100.0 * scanned_positions.min(target) as f64 / target as f64 };
@@ -12314,7 +12335,7 @@ fn print_bucket_count_progress(
         None => ("all".to_string(), "?".to_string(), "?".to_string()),
     };
     eprintln!(
-        "  [count] positions={}/{} ({}) batches={} touched_buckets={}/{} elapsed={} pos/s={} eta={}",
+        "  [count] positions={}/{} ({}) batches={} touched_buckets={}/{} elapsed={} avg_pos/s={} inst_pos/s={} eta={}",
         format_count(scanned_positions),
         target_text,
         pct_text,
@@ -12323,6 +12344,7 @@ fn print_bucket_count_progress(
         format_count(stack_count),
         format_duration_secs(elapsed),
         format_count(positions_per_sec.round() as usize),
+        format_count(interval_positions_per_sec.round() as usize),
         eta_text
     );
 }
@@ -12418,6 +12440,7 @@ where
     let mut counts = vec![0u32; stack_count];
     let mut total_positions = 0usize;
     let mut last_progress = started;
+    let mut progress_state = BucketCountProgressState::new(started);
     let mut scan_error = None::<String>;
 
     loader.map_chunks(0, |chunk| {
@@ -12454,6 +12477,7 @@ where
                     touched_buckets,
                     stack_count,
                     started,
+                    &mut progress_state,
                 );
                 last_progress = now;
             }
@@ -12475,8 +12499,246 @@ where
             touched_buckets,
             stack_count,
             started,
+            &mut progress_state,
         );
     }
+    Ok((
+        SfnnBucketCounts { arch: args.arch.cli_name(), positions: total_positions as u64, counts },
+        seen_batches,
+        started.elapsed(),
+    ))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_count_direct_buffer_records(args: &BucketCountArgs) -> Result<usize, String> {
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
+    let buffer_bytes = args
+        .buffer_mb
+        .checked_mul(1024)
+        .and_then(|bytes| bytes.checked_mul(1024))
+        .ok_or_else(|| format!("--buffer-mb {} is too large", args.buffer_mb))?;
+    let mut records = (buffer_bytes / record_size).max(args.batch_size).max(1);
+    if let Some(target) = args.positions {
+        records = records.min(target.max(1));
+    }
+    Ok(records)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn uninit_packed_sfen_buffer(records: usize) -> Box<[bulletou_lib::shogi::PackedSfenValue]> {
+    let buf = Box::<[bulletou_lib::shogi::PackedSfenValue]>::new_uninit_slice(records);
+    // Safety: `PackedSfenValue` is a plain 40-byte payload and has no Drop.
+    // The count path only reads the prefix filled by `read_packed_sfen_records`.
+    unsafe { buf.assume_init() }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_packed_sfen_records(
+    file: &mut std::fs::File,
+    buffer: &mut [bulletou_lib::shogi::PackedSfenValue],
+    max_records: usize,
+) -> Result<usize, String> {
+    use std::io::Read;
+
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
+    let byte_len = max_records
+        .checked_mul(record_size)
+        .ok_or_else(|| format!("read size overflow: records={max_records}, record_size={record_size}"))?;
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), byte_len) };
+    let mut filled = 0usize;
+    while filled < byte_len {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(format!("failed to read teacher file: {err}")),
+        }
+    }
+    if filled % record_size != 0 {
+        return Err(format!(
+            "teacher file ended inside a PSV/.bin record: read {} trailing byte(s)",
+            filled % record_size
+        ));
+    }
+    Ok(filled / record_size)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[allow(clippy::too_many_arguments)]
+fn count_sfnn_buckets_from_direct_record_files(
+    paths: Vec<String>,
+    args: &BucketCountArgs,
+    layerstack: LayerStackMode,
+    stack_count: usize,
+    progress_target_positions: Option<usize>,
+    teacher_threads: usize,
+    started: std::time::Instant,
+    progress_interval: Option<std::time::Duration>,
+) -> Result<(SfnnBucketCounts, usize, std::time::Duration), String> {
+    let rayon_pool = if teacher_threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(teacher_threads)
+                .thread_name(|index| format!("bulletou-bucket-count-{index}"))
+                .build()
+                .map_err(|err| {
+                    format!("failed to create bucket-count thread pool with {teacher_threads} threads: {err}")
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
+    let records_per_buffer = bucket_count_direct_buffer_records(args)?;
+    let buffer_count = 2usize;
+    eprintln!(
+        "  read buffer = {} records x {} = {} x {} buffer(s)",
+        format_count(records_per_buffer),
+        record_size,
+        format_bytes((records_per_buffer as u64).saturating_mul(record_size as u64)),
+        buffer_count
+    );
+
+    let target_positions = args.positions;
+    let reader_paths = paths;
+    let (empty_tx, empty_rx) =
+        std::sync::mpsc::sync_channel::<Box<[bulletou_lib::shogi::PackedSfenValue]>>(buffer_count);
+    let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<
+        Result<(Box<[bulletou_lib::shogi::PackedSfenValue]>, usize), String>,
+    >(buffer_count);
+    for _ in 0..buffer_count {
+        empty_tx
+            .send(uninit_packed_sfen_buffer(records_per_buffer))
+            .map_err(|err| format!("failed to initialize bucket-count read buffer: {err}"))?;
+    }
+
+    let reader = std::thread::spawn(move || {
+        let mut read_positions = 0usize;
+        let mut spare = None::<Box<[bulletou_lib::shogi::PackedSfenValue]>>;
+        'files: for file_path in reader_paths {
+            let file_size = match std::fs::metadata(&file_path) {
+                Ok(metadata) => metadata.len(),
+                Err(err) => {
+                    let _ = full_tx.send(Err(format!("failed to stat teacher file {file_path}: {err}")));
+                    return;
+                }
+            };
+            if file_size % record_size as u64 != 0 {
+                let _ = full_tx.send(Err(format!(
+                    "teacher file {file_path} size {} is not a multiple of PSV/.bin record size {record_size}",
+                    file_size
+                )));
+                return;
+            }
+            let mut file = match std::fs::File::open(&file_path) {
+                Ok(file) => file,
+                Err(err) => {
+                    let _ = full_tx.send(Err(format!("failed to open teacher file {file_path}: {err}")));
+                    return;
+                }
+            };
+            loop {
+                let remaining = target_positions.map_or(usize::MAX, |target| target.saturating_sub(read_positions));
+                if remaining == 0 {
+                    break 'files;
+                }
+                let mut buffer = match spare.take() {
+                    Some(buffer) => buffer,
+                    None => match empty_rx.recv() {
+                        Ok(buffer) => buffer,
+                        Err(_) => return,
+                    },
+                };
+                let max_records = records_per_buffer.min(remaining);
+                let len = match read_packed_sfen_records(&mut file, &mut buffer, max_records) {
+                    Ok(len) => len,
+                    Err(err) => {
+                        let _ = full_tx.send(Err(format!("{file_path}: {err}")));
+                        return;
+                    }
+                };
+                if len == 0 {
+                    spare = Some(buffer);
+                    break;
+                }
+                read_positions += len;
+                if full_tx.send(Ok((buffer, len))).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut counts = vec![0u32; stack_count];
+    let mut total_positions = 0usize;
+    let mut seen_batches = 0usize;
+    let mut last_progress = started;
+    let mut progress_state = BucketCountProgressState::new(started);
+    let mut reader_wait = std::time::Duration::ZERO;
+    let mut count_time = std::time::Duration::ZERO;
+
+    loop {
+        let wait_started = std::time::Instant::now();
+        let message = match full_rx.recv() {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+        reader_wait += wait_started.elapsed();
+        let (buffer, len) = message?;
+        let count_started = std::time::Instant::now();
+        add_sfnn_bucket_counts_from_positions(
+            &mut counts,
+            &buffer[..len],
+            layerstack,
+            stack_count,
+            teacher_threads,
+            rayon_pool.as_ref(),
+        )?;
+        count_time += count_started.elapsed();
+        total_positions += len;
+        seen_batches = total_positions.div_ceil(args.batch_size);
+        let _ = empty_tx.send(buffer);
+
+        if let Some(interval) = progress_interval {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_progress) >= interval
+                && args.positions.is_none_or(|target| total_positions < target)
+            {
+                let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+                print_bucket_count_progress(
+                    total_positions,
+                    progress_target_positions,
+                    seen_batches,
+                    touched_buckets,
+                    stack_count,
+                    started,
+                    &mut progress_state,
+                );
+                last_progress = now;
+            }
+        }
+    }
+
+    reader.join().map_err(|_| "bucket-count reader thread panicked".to_string())?;
+    if progress_interval.is_some() {
+        let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+        print_bucket_count_progress(
+            total_positions,
+            progress_target_positions,
+            seen_batches,
+            touched_buckets,
+            stack_count,
+            started,
+            &mut progress_state,
+        );
+    }
+    eprintln!(
+        "  count timing = reader_wait={} count={} total={}",
+        format_duration_secs(reader_wait),
+        format_duration_secs(count_time),
+        format_duration_secs(started.elapsed())
+    );
     Ok((
         SfnnBucketCounts { arch: args.arch.cli_name(), positions: total_positions as u64, counts },
         seen_batches,
@@ -12500,7 +12762,7 @@ fn try_bucket_count_fixed_record_fast_path(
         return Ok(None);
     }
 
-    use bulletou_lib::value::loader::{DirectSequentialDataLoader, HcpeDataLoader};
+    use bulletou_lib::value::loader::HcpeDataLoader;
 
     let paths = expand_teacher(&args.teacher)?;
     let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
@@ -12508,10 +12770,9 @@ fn try_bucket_count_fixed_record_fast_path(
     let scan_all = args.positions.is_none();
     let report = match format {
         DataFormat::Psv => {
-            eprintln!("  count path  = fixed-record bucket-only fast path (PSV/.bin)");
-            let loader = DirectSequentialDataLoader::new(&path_refs).with_single_epoch(scan_all);
-            count_sfnn_buckets_from_position_chunks(
-                loader,
+            eprintln!("  count path  = fixed-record pipelined bucket-only fast path (PSV/.bin)");
+            count_sfnn_buckets_from_direct_record_files(
+                paths,
                 args,
                 layerstack,
                 stack_count,
@@ -12999,6 +13260,7 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     eprintln!("  count path  = teacher-batch compatibility path");
 
     let mut last_progress = started;
+    let mut progress_state = BucketCountProgressState::new(started);
     let mut counts = vec![0u32; stack_count];
     let mut total_positions = 0usize;
     let mut seen_batches = 0usize;
@@ -13041,6 +13303,7 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
                     touched_buckets,
                     stack_count,
                     started,
+                    &mut progress_state,
                 );
                 last_progress = now;
             }
