@@ -346,3 +346,21 @@ count decay は `W_residual` にだけかかります。したがって、出現
 つまり `all=1.0` は factorizer 成分を普通に足す設定で、count decay は「bucket 固有成分の自由度を count に応じて変える」設定です。count が多い bucket ほど `none` に近い自由度を持ち、count が少ない bucket ほど factorizer に寄ります。
 
 `--sfnn-bucket-counts` だけを指定した場合は、count.bin の検証と統計表示だけを行います。学習に効かせるには `--sfnn-count-confidence` を指定してください。
+
+### `count.bin` のファイル形式
+
+通常は `bulletou.exe bucket-count` で作るので、手で書く必要はありません。外部ツールで読む場合の形式は次の通りです。整数はすべて little-endian です。
+
+| 順序 | 型 | 内容 |
+|---:|---|---|
+| 1 | `u8[8]` | magic。ASCIIで `BOUCNT1\0` |
+| 2 | `u32` | version。現在は `1` |
+| 3 | `u32` | architecture名のbyte長 |
+| 4 | `u8[arch_len]` | UTF-8のarchitecture名。例: `SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4` |
+| 5 | `u64` | countに使った局面数 |
+| 6 | `u32` | stack数 |
+| 7 | `u32[stack数]` | 各LayerStack bucketの出現回数 |
+
+`counts[i]` は LayerStack bucket index `i` の出現回数です。学習時に `--sfnn-bucket-counts` で指定すると、BulletOu はファイル内のarchitecture名と stack数が現在の `--arch` と一致するか確認します。
+
+出現回数は `u32` なので、1つのbucketに 4,294,967,295 回を超えて入るような集計はできません。その場合は `--positions` を減らして集計範囲を小さくしてください。

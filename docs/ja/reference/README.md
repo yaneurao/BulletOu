@@ -9,3 +9,7 @@ BulletOu の基本概念、データ形式、保存形式、補助コマンド�
 - [3. 学習データフォーマット](3-data.md) — bulletformat / `.pack` / `.hcpe` / `.hcpe3` / `.psv` / `.bin`
 - [4. 学習済みネットワーク](4-saved-networks.md) — チェックポイント、`SavedFormat`、量子化、変換チェーン
 - [5. `nerf` コマンド](5-nerf.md) — 学習済み評価関数ファイルにランダム摂動を加える実験用後処理
+
+補助ファイル:
+
+- [`count.bin` の形式](../advanced/sfnn-factorizer.md#countbin-のファイル形式) — SFNN LayerStack bucket の出現回数ファイル

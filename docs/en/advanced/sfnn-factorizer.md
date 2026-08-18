@@ -346,3 +346,21 @@ The count-aware decay applies only to `W_residual`. Low-count buckets keep `W_re
 In other words, `all=1.0` means “add the factorizer normally,” and count-aware decay means “control the freedom of the bucket-specific component by count.” High-count buckets behave closer to `none`; low-count buckets stay closer to the factorizer.
 
 If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-count-confidence` to enable the regularization.
+
+### `count.bin` file format
+
+Normally you create this file with `bulletou.exe bucket-count`; you do not need to write it by hand. If you want to inspect it from another tool, the layout is below. All integer fields are little-endian.
+
+| Order | Type | Meaning |
+|---:|---|---|
+| 1 | `u8[8]` | Magic bytes: ASCII `BOUCNT1\0` |
+| 2 | `u32` | Version. Currently `1` |
+| 3 | `u32` | Byte length of the architecture name |
+| 4 | `u8[arch_len]` | UTF-8 architecture name, for example `SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4` |
+| 5 | `u64` | Number of positions scanned |
+| 6 | `u32` | Number of stacks |
+| 7 | `u32[stack_count]` | Occurrence count for each LayerStack bucket |
+
+`counts[i]` is the occurrence count for LayerStack bucket index `i`. When you pass the file with `--sfnn-bucket-counts`, BulletOu checks that the architecture name and stack count match the current `--arch`.
+
+Counts are stored as `u32`, so one bucket cannot exceed 4,294,967,295 occurrences. If a bucket would overflow, count a smaller prefix with `--positions`.

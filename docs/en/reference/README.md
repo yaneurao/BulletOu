@@ -9,3 +9,7 @@ Reference material for BulletOu concepts, data formats, saved networks, and auxi
 - [3. Training Data Formats](3-data.md) — bulletformat / `.pack` / `.hcpe` / `.hcpe3` / `.psv` / `.bin`
 - [4. Saved Networks](4-saved-networks.md) — checkpoints, `SavedFormat`, quantisation, and transformation chains
 - [5. `nerf` Command](5-nerf.md) — experimental post-processing that adds random perturbations to trained evaluation files
+
+Auxiliary files:
+
+- [`count.bin` format](../advanced/sfnn-factorizer.md#countbin-file-format) — occurrence counts for SFNN LayerStack buckets
