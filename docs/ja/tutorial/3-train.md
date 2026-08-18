@@ -79,6 +79,17 @@ checkpoints/
 
 accuracy / loss を学習中に見たい場合は、次のページで検証用局面を指定します。
 
+## 3.6 bucket 数が多い SFNN を学習する場合
+
+`hand1024_k3k3_progress4` のように bucket 数が多い SFNN では、ほとんど出現しない bucket の個別成分が不安定になることがあります。その場合は、教師データから bucket の出現回数を数えた `count.bin` を作り、学習時に次のように指定します。
+
+```powershell
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-count-confidence 1.0
+```
+
+`--sfnn-count-confidence 1.0` は、「bucket 固有成分のパラメーター数と同じぐらい出現するまでは、その bucket を強く信用しない」という意味です。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
+
 ---
 
 次へ: [4. 検証を有効にする](4-validation.md)

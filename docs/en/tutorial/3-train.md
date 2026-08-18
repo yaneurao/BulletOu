@@ -79,6 +79,17 @@ Training prints lines like:
 
 To watch accuracy / loss during training, configure a validation set on the next page.
 
+## 3.6 Training SFNNs with many buckets
+
+For SFNN architectures with many buckets, such as `hand1024_k3k3_progress4`, rarely seen buckets can learn unstable bucket-specific residuals. You can pre-count bucket occurrences into a `count.bin` file and pass it during training:
+
+```powershell
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-count-confidence 1.0
+```
+
+`--sfnn-count-confidence 1.0` means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own parameter count. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
+
 ---
 
 Next: [4. Enable validation](4-validation.md)
