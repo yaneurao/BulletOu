@@ -261,3 +261,46 @@ With strong factorizer settings or many buckets, folded i8 weights in `nn.bin` c
 ```
 
 This is off by default.
+
+## 11. Count-aware decay for rare buckets
+
+Architectures such as `hand1024_k3k3_progress8` have many stacks, and some buckets may appear only rarely. If a rare bucket is allowed to learn a large independent residual from just a few positions, it can drift away from the shared structure.
+
+BulletOu can pre-count bucket occurrences from the teacher data and use that count to apply a weaker or stronger decay to the base stack residual. Here, “residual” means the per-stack base weight, not the shared factorizer tensor.
+
+First, create a count.bin file:
+
+```powershell
+.\target\release\examples\bulletou.exe bucket-count `
+  --teacher D:\sojoteam_datasets `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --positions 500000000 `
+  --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
+```
+
+Then pass it during training:
+
+```powershell
+--sfnn-factorizer pair `
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
+--sfnn-residual-count-decay 1e-7 `
+--sfnn-residual-count-decay-k 10000
+```
+
+The per-stack decay coefficient is:
+
+```text
+lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
+```
+
+`lambda0` is `--sfnn-residual-count-decay`, and `K` is `--sfnn-residual-count-decay-k`.
+
+| count | Behavior |
+|---:|---|
+| `count <= K` | Use the maximum decay `lambda0` |
+| `count = 4K` | About `lambda0 / 2` |
+| Very large count | Almost no extra decay |
+
+This does not directly decay the factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual is damped according to count. The effect is: trust the shared structure first, and let heavily observed buckets learn stronger individual residuals.
+
+If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-residual-count-decay` above zero to enable the regularization.

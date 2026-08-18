@@ -328,6 +328,28 @@ penalty_loss_per_weight = lambda * max(0, |q| - threshold)^2
 
 このペナルティは報告される `test_value_loss` の定義を変えません。lossの表示は通常どおり比較できます。
 
+### 6.2 rare bucket を count で抑える
+
+bucket 数が多い arch では、出現回数の少ない stack の個別成分だけが暴れることがあります。その場合は、教師データから stack ごとの出現回数を数えた `count.bin` を作り、count に応じて base stack residual を弱く正則化できます。
+
+```powershell
+.\target\release\examples\bulletou.exe bucket-count `
+  --teacher D:\sojoteam_datasets `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --positions 500000000 `
+  --output D:\BulletOu-snapshots\counts\count.bin
+```
+
+学習では次のように指定します。
+
+```powershell
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-residual-count-decay 1e-7 `
+--sfnn-residual-count-decay-k 10000
+```
+
+詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
+
 ## 7. 保存と検証の頻度
 
 保存と検証は別々に指定できます。

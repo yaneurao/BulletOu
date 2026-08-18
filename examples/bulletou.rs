@@ -1581,6 +1581,65 @@ struct BucketStatsArgs {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou bucket-count")]
+#[command(about = "Count SFNN LayerStack bucket occurrences from a teacher stream and write count.bin")]
+struct BucketCountArgs {
+    /// Teacher path (.hcpe / .psv / .bin file, or a folder).
+    #[arg(long)]
+    teacher: String,
+
+    /// SFNN architecture whose LayerStack bucket is counted.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// Number of teacher positions to scan.
+    #[arg(long)]
+    positions: usize,
+
+    /// Output count.bin path.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Mini-batch size used while scanning.
+    #[arg(long, default_value = "65536")]
+    batch_size: usize,
+
+    /// Loader read buffer size in MiB.
+    #[arg(long, default_value = "4096")]
+    buffer_mb: usize,
+
+    /// Teacher batch preparation worker threads. Omit or set 0 for the cuda-cpp default.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// HCPE decode parallelism. 0 means the cuda-cpp default.
+    #[arg(long, default_value = "0")]
+    loader_threads: usize,
+
+    /// Prepared batch queue depth.
+    #[arg(long, default_value = "4")]
+    batch_queue_size: usize,
+
+    /// Optional in-trainer shuffle window in mini-batches for this diagnostic.
+    /// Default 0 disables it and scans the teacher stream sequentially.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_buffer_batches: usize,
+
+    /// Shuffle seed used when --teacher-shuffle-buffer-batches is non-zero.
+    #[arg(long, default_value = "0")]
+    teacher_shuffle_seed: u64,
+
+    /// Drop positions whose |score| >= this while counting. Set to 0 to disable.
+    #[arg(long, default_value = "32000")]
+    score_drop_abs: u16,
+
+    /// Allow overwriting --output.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 impl QuantizedTestArgs {
     fn effective_layerstack(&self) -> LayerStackMode {
         self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
@@ -1799,6 +1858,32 @@ impl BucketStatsArgs {
         }
         if self.batches_per_update == 0 {
             return Err("--batches-per-update must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl BucketCountArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; bucket-count counts SFNN LayerStack buckets only",
+                self.arch.cli_name()
+            ));
+        }
+        if self.positions == 0 {
+            return Err("--positions must be > 0".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("--batch-size must be > 0".to_string());
+        }
+        if self.output.exists() && !self.overwrite {
+            return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
         }
         Ok(())
     }
@@ -3851,7 +3936,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -4424,6 +4509,22 @@ struct Args {
     #[arg(long = "sfnn-factorizer-residual-decay", default_value = "0.0")]
     sfnn_factorizer_residual_decay: f32,
 
+    /// Bucket-count file produced by `bulletou bucket-count`. When used with
+    /// `--sfnn-residual-count-decay`, BulletOu decays bucket-specific base
+    /// stack residuals more strongly for low-count stacks.
+    #[arg(long = "sfnn-bucket-counts")]
+    sfnn_bucket_counts: Option<PathBuf>,
+
+    /// Maximum count-aware residual decay for SFNN base stack tensors.
+    /// Requires `--sfnn-bucket-counts`. Per-stack lambda is
+    /// `decay * min(1, sqrt((K+1)/(count+1)))`.
+    #[arg(long = "sfnn-residual-count-decay", default_value = "0.0")]
+    sfnn_residual_count_decay: f32,
+
+    /// K parameter for `--sfnn-residual-count-decay`, in count.bin units.
+    #[arg(long = "sfnn-residual-count-decay-k", default_value = "0")]
+    sfnn_residual_count_decay_k: f32,
+
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
     /// term before each update and does not change the reported value loss.
@@ -4655,6 +4756,27 @@ impl Args {
         if self.sfnn_factorizer_residual_decay != 0.0 && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer-residual-decay applies to SFNN / LayerStack eval types only".to_string());
         }
+        if self.sfnn_bucket_counts.is_some() && !eval_type.uses_layerstack() {
+            return Err("--sfnn-bucket-counts applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if !(self.sfnn_residual_count_decay.is_finite() && self.sfnn_residual_count_decay >= 0.0) {
+            return Err(format!(
+                "--sfnn-residual-count-decay must be finite and non-negative (got {})",
+                self.sfnn_residual_count_decay
+            ));
+        }
+        if !(self.sfnn_residual_count_decay_k.is_finite() && self.sfnn_residual_count_decay_k >= 0.0) {
+            return Err(format!(
+                "--sfnn-residual-count-decay-k must be finite and non-negative (got {})",
+                self.sfnn_residual_count_decay_k
+            ));
+        }
+        if self.sfnn_residual_count_decay != 0.0 && !eval_type.uses_layerstack() {
+            return Err("--sfnn-residual-count-decay applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if self.sfnn_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
+            return Err("--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string());
+        }
         if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
             return Err(format!(
                 "--sfnn-saturation-penalty must be finite and non-negative (got {})",
@@ -4778,6 +4900,12 @@ impl Args {
         {
             return Err(
                 "--sfnn-factorizer-residual-decay requires an active SFNN factorizer; use --sfnn-factorizer shared or axis"
+                    .to_string(),
+            );
+        }
+        if self.sfnn_residual_count_decay != 0.0 && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE {
+            return Err(
+                "--sfnn-residual-count-decay requires an active SFNN factorizer; use --sfnn-factorizer shared, axis, or pair"
                     .to_string(),
             );
         }
@@ -8934,6 +9062,26 @@ fn main() {
         }
         return;
     }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("bucket-count")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou bucket-count");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = BucketCountArgs::parse_from(raw_args);
+            if let Err(e) = run_bucket_count(&args) {
+                eprintln!("error: bucket-count failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: bucket-count requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("quantized-test")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
@@ -11884,6 +12032,185 @@ fn bucket_stats_stddev(values: &[usize], mean: f64) -> f64 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+const SFNN_BUCKET_COUNT_MAGIC: &[u8; 8] = b"BOUCNT1\0";
+
+#[cfg(feature = "cuda-cpp-backend")]
+const SFNN_BUCKET_COUNT_VERSION: u32 = 1;
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone)]
+struct SfnnBucketCounts {
+    arch: String,
+    positions: u64,
+    counts: Vec<u32>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl SfnnBucketCounts {
+    fn stack_count(&self) -> usize {
+        self.counts.len()
+    }
+
+    fn write_to_path(&self, path: &Path) -> Result<(), String> {
+        let arch_bytes = self.arch.as_bytes();
+        if arch_bytes.len() > u32::MAX as usize {
+            return Err("bucket-count arch string is too long".to_string());
+        }
+        let stack_count_u32 = u32::try_from(self.counts.len())
+            .map_err(|_| format!("bucket-count stack count {} does not fit in u32", self.counts.len()))?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create bucket-count output directory {}: {err}", parent.display()))?;
+        }
+        let mut writer = std::io::BufWriter::new(
+            std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?,
+        );
+        use std::io::Write as _;
+        writer
+            .write_all(SFNN_BUCKET_COUNT_MAGIC)
+            .and_then(|_| writer.write_all(&SFNN_BUCKET_COUNT_VERSION.to_le_bytes()))
+            .and_then(|_| writer.write_all(&(arch_bytes.len() as u32).to_le_bytes()))
+            .and_then(|_| writer.write_all(arch_bytes))
+            .and_then(|_| writer.write_all(&self.positions.to_le_bytes()))
+            .and_then(|_| writer.write_all(&stack_count_u32.to_le_bytes()))
+            .map_err(|err| format!("failed to write {} header: {err}", path.display()))?;
+        for &count in &self.counts {
+            writer
+                .write_all(&count.to_le_bytes())
+                .map_err(|err| format!("failed to write {} counts: {err}", path.display()))?;
+        }
+        writer.flush().map_err(|err| format!("failed to flush {}: {err}", path.display()))
+    }
+
+    fn read_from_path(path: &Path) -> Result<Self, String> {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(
+            std::fs::File::open(path)
+                .map_err(|err| format!("failed to open bucket-count file {}: {err}", path.display()))?,
+        );
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).map_err(|err| format!("failed to read {} magic: {err}", path.display()))?;
+        if &magic != SFNN_BUCKET_COUNT_MAGIC {
+            return Err(format!("{} is not a BulletOu SFNN bucket-count file", path.display()));
+        }
+        let version = read_le_u32(&mut reader, path, "version")?;
+        if version != SFNN_BUCKET_COUNT_VERSION {
+            return Err(format!(
+                "{} has unsupported bucket-count version {}; expected {}",
+                path.display(),
+                version,
+                SFNN_BUCKET_COUNT_VERSION
+            ));
+        }
+        let arch_len = read_le_u32(&mut reader, path, "arch_len")? as usize;
+        let mut arch_bytes = vec![0u8; arch_len];
+        reader
+            .read_exact(&mut arch_bytes)
+            .map_err(|err| format!("failed to read {} arch string: {err}", path.display()))?;
+        let arch = String::from_utf8(arch_bytes)
+            .map_err(|err| format!("{} has invalid UTF-8 arch string: {err}", path.display()))?;
+        let positions = read_le_u64(&mut reader, path, "positions")?;
+        let stack_count = read_le_u32(&mut reader, path, "stack_count")? as usize;
+        let mut counts = Vec::with_capacity(stack_count);
+        for index in 0..stack_count {
+            counts.push(read_le_u32(&mut reader, path, &format!("count[{index}]"))?);
+        }
+        Ok(Self { arch, positions, counts })
+    }
+
+    fn validate_for_arch(&self, path: &Path, arch: NnueArch, layerstack: LayerStackMode) -> Result<(), String> {
+        let expected_arch = arch.cli_name();
+        if self.arch != expected_arch {
+            return Err(format!(
+                "{} was built for arch `{}`, but current --arch is `{}`",
+                path.display(),
+                self.arch,
+                expected_arch
+            ));
+        }
+        let expected_stacks = layerstack.num_stacks();
+        if self.counts.len() != expected_stacks {
+            return Err(format!(
+                "{} has {} stack counts, but arch `{}` expects {}",
+                path.display(),
+                self.counts.len(),
+                expected_arch,
+                expected_stacks
+            ));
+        }
+        Ok(())
+    }
+
+    fn nonzero_count(&self) -> usize {
+        self.counts.iter().filter(|&&count| count != 0).count()
+    }
+
+    fn min_nonzero(&self) -> u32 {
+        self.counts.iter().copied().filter(|&count| count != 0).min().unwrap_or(0)
+    }
+
+    fn max(&self) -> u32 {
+        self.counts.iter().copied().max().unwrap_or(0)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_le_u32(reader: &mut impl std::io::Read, path: &Path, label: &str) -> Result<u32, String> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes).map_err(|err| format!("failed to read {} {label}: {err}", path.display()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_le_u64(reader: &mut impl std::io::Read, path: &Path, label: &str) -> Result<u64, String> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes).map_err(|err| format!("failed to read {} {label}: {err}", path.display()))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_count_percentile(counts: &[u32], pct: f64) -> u32 {
+    if counts.is_empty() {
+        return 0;
+    }
+    let mut sorted = counts.to_vec();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32) -> Result<Vec<f32>, String> {
+    if !(decay.is_finite() && decay >= 0.0) {
+        return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
+    }
+    if !(k.is_finite() && k >= 0.0) {
+        return Err(format!("--sfnn-residual-count-decay-k must be finite and non-negative (got {k})"));
+    }
+    let numerator = f64::from(k) + 1.0;
+    let decay = f64::from(decay);
+    Ok(counts
+        .counts
+        .iter()
+        .map(|&count| {
+            let ratio = (numerator / (f64::from(count) + 1.0)).sqrt().min(1.0);
+            (decay * ratio) as f32
+        })
+        .collect())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn f32_percentile(values: &[f32], pct: f64) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
     use bulletou_lib::value::{SfnnTeacherBatchConfig, WinRateModelTargetParams};
 
@@ -12067,6 +12394,131 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
         let share = if total_positions == 0 { 0.0 } else { 100.0 * count as f64 / total_positions as f64 };
         println!("    {}:{} ({:.3}%)", bucket, format_count(count as usize), share);
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
+    use bulletou_lib::value::{SfnnTeacherBatchConfig, WinRateModelTargetParams};
+
+    args.validate()?;
+    let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
+    let layerstack = args.effective_layerstack();
+    let stack_count = layerstack.num_stacks();
+    if let Some(params) = sfnn_progress_params_for_layerstack(layerstack) {
+        set_shogi_sfnn_progress_q16_params(params)?;
+    }
+    let teacher_threads = match args.threads {
+        Some(0) | None => cuda_cpp_default_cpu_threads(),
+        Some(threads) => threads,
+    };
+    let loader_threads = if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads };
+    let batches = args
+        .positions
+        .checked_add(args.batch_size - 1)
+        .ok_or_else(|| "--positions + --batch-size overflow".to_string())?
+        / args.batch_size;
+    let config = SfnnTeacherBatchConfig {
+        teacher: &args.teacher,
+        batch_size: args.batch_size,
+        batch_index: 0,
+        dataloader_resume_pos: None,
+        layerstack_bucket: layerstack.bucket_kind(),
+        buffer_mb: args.buffer_mb,
+        loader_threads,
+        threads: teacher_threads,
+        queue_depth: args.batch_queue_size,
+        lambda: 1.0,
+        scale: 600.0,
+        win_rate_model: true,
+        wrm_target: WinRateModelTargetParams::DEFAULT,
+        score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
+        teacher_shuffle_buffer_batches: args.teacher_shuffle_buffer_batches,
+        teacher_shuffle_seed: args.teacher_shuffle_seed,
+        profile_prepare: false,
+    };
+
+    eprintln!("  bucket-count: arch={} layerstack={}", args.arch.cli_name(), layerstack.cli_name());
+    eprintln!(
+        "  teacher     = {}  feature={}  stacks={}",
+        args.teacher,
+        feature_kind.source_label(),
+        format_count(stack_count)
+    );
+    eprintln!(
+        "  scan        = {} positions ({} batch(es) x {} max), shuffle_window={} batch(es)",
+        format_count(args.positions),
+        format_count(batches),
+        format_count(args.batch_size),
+        format_count(args.teacher_shuffle_buffer_batches)
+    );
+    eprintln!(
+        "  teacher CPU = prepare_threads={}, loader_threads={}, batch_queue_size={}",
+        teacher_threads, loader_threads, args.batch_queue_size
+    );
+
+    let started = std::time::Instant::now();
+    let mut counts = vec![0u32; stack_count];
+    let mut total_positions = 0usize;
+    let mut seen_batches = 0usize;
+
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, batches, |teacher_batch| {
+        seen_batches += 1;
+        let remaining = args.positions.saturating_sub(total_positions);
+        if remaining == 0 {
+            return Ok(());
+        }
+        let take = remaining.min(teacher_batch.batch.buckets.len());
+        for &bucket in teacher_batch.batch.buckets.iter().take(take) {
+            if bucket < 0 {
+                return Err(format!("teacher batch has negative bucket {bucket}"));
+            }
+            let bucket = bucket as usize;
+            if bucket >= stack_count {
+                return Err(format!("teacher batch bucket {bucket} is out of range 0..{stack_count}"));
+            }
+            counts[bucket] = counts[bucket]
+                .checked_add(1)
+                .ok_or_else(|| format!("bucket {bucket} count overflowed u32; reduce --positions"))?;
+            total_positions += 1;
+        }
+        Ok(())
+    })?;
+
+    let report = SfnnBucketCounts { arch: args.arch.cli_name(), positions: total_positions as u64, counts };
+    report.write_to_path(&args.output)?;
+
+    let elapsed = started.elapsed();
+    let touched_buckets = report.nonzero_count();
+    let top10_sum = {
+        let mut sorted = report.counts.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        sorted.into_iter().take(10).map(u64::from).sum::<u64>()
+    };
+    println!("bucket-count complete:");
+    println!("  arch              = {}", report.arch);
+    println!("  layerstack        = {}", layerstack.cli_name());
+    println!("  output            = {}", args.output.display());
+    println!("  stacks            = {}", format_count(report.stack_count()));
+    println!("  scanned_batches   = {}", format_count(seen_batches));
+    println!("  scanned_positions = {}", format_count(total_positions));
+    println!("  elapsed           = {:.3}s", elapsed.as_secs_f64());
+    println!(
+        "  touched_buckets   = {} / {} ({:.2}%)",
+        format_count(touched_buckets),
+        format_count(report.stack_count()),
+        100.0 * touched_buckets as f64 / report.stack_count().max(1) as f64
+    );
+    println!("  zero_buckets      = {}", format_count(report.stack_count() - touched_buckets));
+    println!("  min_nonzero       = {}", format_count(report.min_nonzero() as usize));
+    println!("  p50               = {}", format_count(bucket_count_percentile(&report.counts, 0.50) as usize));
+    println!("  p90               = {}", format_count(bucket_count_percentile(&report.counts, 0.90) as usize));
+    println!("  p99               = {}", format_count(bucket_count_percentile(&report.counts, 0.99) as usize));
+    println!("  max               = {}", format_count(report.max() as usize));
+    println!(
+        "  top10_share       = {:.2}% of scanned positions",
+        if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
+    );
     Ok(())
 }
 
@@ -12273,6 +12725,22 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let factorizer_spec = effective_sfnn_factorizer_spec(args);
     let factorizer_active = cuda_cpp_sfnn_factorizer_active(args);
     let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(args);
+    let sfnn_bucket_counts = if let Some(path) = args.sfnn_bucket_counts.as_deref() {
+        let counts = SfnnBucketCounts::read_from_path(path)?;
+        counts.validate_for_arch(path, args.arch(), layerstack)?;
+        Some((path.to_path_buf(), counts))
+    } else {
+        None
+    };
+    let sfnn_residual_count_decay_by_stack = if args.sfnn_residual_count_decay != 0.0 {
+        let counts = sfnn_bucket_counts
+            .as_ref()
+            .map(|(_, counts)| counts)
+            .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
+        Some(sfnn_bucket_count_decay_lambdas(counts, args.sfnn_residual_count_decay, args.sfnn_residual_count_decay_k)?)
+    } else {
+        None
+    };
     if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
             "weights + Ranger optimizer state"
@@ -12379,6 +12847,38 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv_colored(
             "factorizer residual decay",
             format!("{:.9} (base stack tensors only)", args.sfnn_factorizer_residual_decay),
+            ConsoleColor::Magenta,
+        );
+    }
+    if let Some((path, counts)) = sfnn_bucket_counts.as_ref() {
+        print_startup_kv(
+            "bucket counts",
+            format!(
+                "{} (positions={}, stacks={}, nonzero={}, min_nonzero={}, p50={}, p90={}, p99={}, max={})",
+                paint(path.display(), ConsoleColor::Cyan),
+                paint(format_count_u64(counts.positions), ConsoleColor::BoldYellow),
+                format_count(counts.stack_count()),
+                format_count(counts.nonzero_count()),
+                format_count(counts.min_nonzero() as usize),
+                format_count(bucket_count_percentile(&counts.counts, 0.50) as usize),
+                format_count(bucket_count_percentile(&counts.counts, 0.90) as usize),
+                format_count(bucket_count_percentile(&counts.counts, 0.99) as usize),
+                format_count(counts.max() as usize)
+            ),
+        );
+    }
+    if let Some(lambdas) = sfnn_residual_count_decay_by_stack.as_ref() {
+        print_startup_kv_colored(
+            "count residual decay",
+            format!(
+                "lambda0={:.9}, K={:.3}, per-stack lambda p50={:.9}, p90={:.9}, p99={:.9}, max={:.9}",
+                args.sfnn_residual_count_decay,
+                args.sfnn_residual_count_decay_k,
+                f32_percentile(lambdas, 0.50),
+                f32_percentile(lambdas, 0.90),
+                f32_percentile(lambdas, 0.99),
+                lambdas.iter().copied().fold(0.0_f32, f32::max)
+            ),
             ConsoleColor::Magenta,
         );
     }
@@ -12509,6 +13009,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ),
     }
     .map_err(|e| e.to_string())?;
+    if let Some(lambdas) = sfnn_residual_count_decay_by_stack.as_deref() {
+        runner.set_residual_count_decay_by_stack(&ctx, Some(lambdas)).map_err(|e| e.to_string())?;
+    }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
@@ -18893,6 +19396,15 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
         format!("sfnn_factorizer_residual_decay={:.9}", args.sfnn_factorizer_residual_decay),
+        format!(
+            "sfnn_bucket_counts={}",
+            args.sfnn_bucket_counts
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        format!("sfnn_residual_count_decay={:.9}", args.sfnn_residual_count_decay),
+        format!("sfnn_residual_count_decay_k={:.9}", args.sfnn_residual_count_decay_k),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
@@ -19021,10 +19533,23 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_factorizer_alpha=",
         "sfnn_factorizer_residual_decay=0.000000000",
     );
+    ensure_line_after(&mut out, "sfnn_bucket_counts=", "sfnn_factorizer_residual_decay=", "sfnn_bucket_counts=none");
+    ensure_line_after(
+        &mut out,
+        "sfnn_residual_count_decay=",
+        "sfnn_bucket_counts=",
+        "sfnn_residual_count_decay=0.000000000",
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_residual_count_decay_k=",
+        "sfnn_residual_count_decay=",
+        "sfnn_residual_count_decay_k=0.000000000",
+    );
     ensure_line_after(
         &mut out,
         "sfnn_saturation_penalty=",
-        "sfnn_factorizer_residual_decay=",
+        "sfnn_residual_count_decay_k=",
         "sfnn_saturation_penalty=0.000000000",
     );
     ensure_line_after(
@@ -20366,11 +20891,7 @@ fn assemble_numbered_dirs(
     let prior_kkp = prior_positions.get("kkp").copied().unwrap_or(0);
     let prior_kpp = prior_positions.get("kpp").copied().unwrap_or(0);
 
-    eprintln!(
-        "\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===",
-        output_dir.display(),
-        first_idx
-    );
+    eprintln!("\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===", output_dir.display(), first_idx);
     let validation_cache = validation_args.and_then(TestPositionsCache::try_load);
     for i in 0..n {
         let idx = first_idx + i;
@@ -27349,6 +27870,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), None, "legacy 9-col row should be skipped");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn sfnn_bucket_counts_roundtrip_and_decay_lambdas() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-bucket-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("count.bin");
+
+        let counts = SfnnBucketCounts {
+            arch: "SFNN_halfka2_1024_7_64_k3k3".to_string(),
+            positions: 120,
+            counts: vec![0, 1, 3, 15, 100, 0, 7, 9, 2],
+        };
+        counts.write_to_path(&path).unwrap();
+        let loaded = SfnnBucketCounts::read_from_path(&path).unwrap();
+        assert_eq!(loaded.arch, counts.arch);
+        assert_eq!(loaded.positions, counts.positions);
+        assert_eq!(loaded.counts, counts.counts);
+        loaded
+            .validate_for_arch(
+                &path,
+                NnueArch::new(
+                    NnueArchFamily::Sfnn,
+                    NnueArchFeature::Halfka2,
+                    1024,
+                    7,
+                    64,
+                    Some(LayerStackMode::Kingrank3by3),
+                ),
+                LayerStackMode::Kingrank3by3,
+            )
+            .unwrap();
+
+        let lambdas = sfnn_bucket_count_decay_lambdas(&loaded, 1.0e-7, 3.0).unwrap();
+        assert_eq!(lambdas.len(), loaded.counts.len());
+        assert_eq!(lambdas[0], 1.0e-7, "zero-count buckets get the maximum decay");
+        assert!(lambdas[4] < lambdas[3], "higher-count buckets get weaker decay");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

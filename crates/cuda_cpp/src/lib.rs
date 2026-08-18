@@ -5531,6 +5531,8 @@ pub struct SfnnTrainStepRunner {
     pub targets: F32Buffer,
     pub entry_weights: F32Buffer,
     pub dirty_buckets: I32Buffer,
+    pub residual_count_decay_by_stack: F32Buffer,
+    pub residual_count_decay_enabled: bool,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
@@ -5765,6 +5767,8 @@ impl SfnnTrainStepRunner {
             targets: F32Buffer::new(ctx, batch_size)?,
             entry_weights: F32Buffer::new(ctx, batch_size)?,
             dirty_buckets: I32Buffer::new(ctx, shape.num_stacks)?,
+            residual_count_decay_by_stack: F32Buffer::new(ctx, shape.num_stacks)?,
+            residual_count_decay_enabled: false,
             weights,
             optimizer_states,
             factorizer,
@@ -5775,6 +5779,28 @@ impl SfnnTrainStepRunner {
             upload_slots,
             next_upload_slot: 0,
         })
+    }
+
+    pub fn set_residual_count_decay_by_stack(&mut self, ctx: &Context, values: Option<&[f32]>) -> Result<()> {
+        match values {
+            Some(values) => {
+                expect_len("SFNN residual count decay by-stack coefficients", self.shape.num_stacks, values.len())?;
+                for &value in values {
+                    if !(value.is_finite() && value >= 0.0) {
+                        return Err(CudaCppError::message(
+                            "SFNN residual count decay by-stack coefficients must be finite and non-negative",
+                        ));
+                    }
+                }
+                self.residual_count_decay_by_stack.upload(ctx, values)?;
+                self.residual_count_decay_enabled = values.iter().any(|&value| value != 0.0);
+            }
+            None => {
+                self.residual_count_decay_by_stack.fill(ctx, 0.0)?;
+                self.residual_count_decay_enabled = false;
+            }
+        }
+        Ok(())
     }
 
     pub fn step(
@@ -6497,6 +6523,107 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    fn add_residual_count_decay_gradients(
+        &self,
+        ctx: &Context,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_update: Option<(&I32Buffer, usize)>,
+    ) -> Result<()> {
+        if !self.residual_count_decay_enabled {
+            return Ok(());
+        }
+        let dirty_buckets = dirty_update.map(|(buckets, _)| buckets);
+        let dirty_count = dirty_update.map(|(_, count)| count).unwrap_or(0);
+
+        if !self.shape.has_compact_l1()
+            && self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l1w,
+                &self.backward_workspace.l1w_gradients,
+                &self.residual_count_decay_by_stack,
+                self.shape.l1w_len()? / self.shape.num_stacks,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l1b,
+                &self.backward_workspace.l1b_gradients,
+                &self.residual_count_decay_by_stack,
+                self.shape.l1_out(),
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L2)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l2w,
+                &self.backward_workspace.l2w_gradients,
+                &self.residual_count_decay_by_stack,
+                self.shape.l2_in() * self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L2)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l2b,
+                &self.backward_workspace.l2b_gradients,
+                &self.residual_count_decay_by_stack,
+                self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L3)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l3w,
+                &self.backward_workspace.l3w_gradients,
+                &self.residual_count_decay_by_stack,
+                self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L3)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_add_residual_count_decay_gradients_device(
+                ctx,
+                &self.weights.l3b,
+                &self.backward_workspace.l3b_gradients,
+                &self.residual_count_decay_by_stack,
+                1,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn prepare_dirty_buckets<'a>(
         &'a self,
         ctx: &Context,
@@ -6537,6 +6664,7 @@ impl SfnnTrainStepRunner {
         lr_multipliers.validate()?;
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
+        self.add_residual_count_decay_gradients(ctx, lr_multipliers, dirty_update)?;
         let l0w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
         let l0b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias);
         let l1w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight);
@@ -6970,6 +7098,51 @@ fn sfnn_add_saturation_penalty_gradients_device(
             weight_scale,
             threshold,
             penalty,
+        )
+    })
+}
+
+fn sfnn_add_residual_count_decay_gradients_device(
+    ctx: &Context,
+    weights: &F32Buffer,
+    gradients: &F32Buffer,
+    decay_by_stack: &F32Buffer,
+    stride: usize,
+    num_stacks: usize,
+    dirty_buckets: Option<&I32Buffer>,
+    dirty_count: usize,
+) -> Result<()> {
+    if stride == 0 || num_stacks == 0 {
+        return Err(CudaCppError::message("SFNN residual count decay dimensions must be non-zero"));
+    }
+    let total = num_stacks
+        .checked_mul(stride)
+        .ok_or_else(|| CudaCppError::message("SFNN residual count decay weight length overflow"))?;
+    expect_len("sfnn residual count decay weights", total, weights.len())?;
+    expect_len("sfnn residual count decay gradients", total, gradients.len())?;
+    expect_len("sfnn residual count decay by-stack coefficients", num_stacks, decay_by_stack.len())?;
+    let (dirty_buckets, dirty_count) = match dirty_buckets {
+        Some(buckets) if dirty_count > 0 => {
+            if dirty_count > buckets.len() {
+                return Err(CudaCppError::message(
+                    "SFNN residual count decay dirty_count exceeds dirty bucket buffer length",
+                ));
+            }
+            (buckets.as_ptr(), dirty_count)
+        }
+        _ => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: all device buffers are length-checked here; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_add_residual_count_decay_gradients_device(
+            ctx.as_ptr(),
+            weights.as_ptr(),
+            gradients.as_ptr(),
+            decay_by_stack.as_ptr(),
+            dirty_buckets,
+            dirty_count,
+            stride,
+            num_stacks,
         )
     })
 }
@@ -8093,6 +8266,16 @@ mod ffi {
             weight_scale: f32,
             threshold: f32,
             penalty: f32,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_add_residual_count_decay_gradients_device(
+            ctx: *mut BulletOuCudaCppContext,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            decay_by_stack: *mut BulletOuCudaCppF32Buffer,
+            dirty_buckets: *mut BulletOuCudaCppI32Buffer,
+            dirty_count: usize,
+            stride: usize,
+            num_stacks: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_host(
             device: i32,

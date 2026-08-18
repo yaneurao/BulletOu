@@ -342,6 +342,28 @@ penalty_loss_per_weight = lambda * max(0, |q| - threshold)^2
 
 This does not change the reported `test_value_loss` definition, so the normal loss output remains comparable across runs.
 
+### 7.2 Count-aware damping for rare buckets
+
+With many bucket stacks, rare stacks can sometimes learn unstable residuals. You can pre-count stack occurrences from the teacher data into a `count.bin` file, then use that file to damp the base stack residual more strongly for low-count stacks.
+
+```powershell
+.\target\release\examples\bulletou.exe bucket-count `
+  --teacher D:\sojoteam_datasets `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --positions 500000000 `
+  --output D:\BulletOu-snapshots\counts\count.bin
+```
+
+Then pass it during training:
+
+```powershell
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-residual-count-decay 1e-7 `
+--sfnn-residual-count-decay-k 10000
+```
+
+See [SFNN factorizer](sfnn-factorizer.md) for the formula and the model-side interpretation.
+
 ## 8. Save and validation frequency
 
 Save and validation frequency are independent:

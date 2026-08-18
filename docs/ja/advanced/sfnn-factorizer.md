@@ -261,3 +261,46 @@ factorizer を強くしたり bucket 数を増やしたりすると、`nn.bin` �
 ```
 
 これはデフォルトでは無効です。量子化後の loss や accuracy だけが悪い場合の切り分けに使います。
+
+## 11. rare bucket を count で弱く正則化する
+
+`hand1024_k3k3_progress8` のように stack 数が多い構成では、ほとんど出現しない bucket があります。そういう bucket の個別成分を自由に動かしすぎると、少数の局面に引っ張られて崩れることがあります。
+
+BulletOu では、教師データから bucket の出現回数を事前に数えて、その count に応じて base stack residual を弱く減衰できます。ここでいう residual は、factorizer で共有される成分ではなく、各 stack が個別に持っている base weight です。
+
+まず count.bin を作ります。
+
+```powershell
+.\target\release\examples\bulletou.exe bucket-count `
+  --teacher D:\sojoteam_datasets `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --positions 500000000 `
+  --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
+```
+
+学習時にそのファイルを指定します。
+
+```powershell
+--sfnn-factorizer pair `
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
+--sfnn-residual-count-decay 1e-7 `
+--sfnn-residual-count-decay-k 10000
+```
+
+stack ごとの減衰係数は次の式です。
+
+```text
+lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
+```
+
+`lambda0` が `--sfnn-residual-count-decay`、`K` が `--sfnn-residual-count-decay-k` です。
+
+| count | 挙動 |
+|---:|---|
+| `count <= K` | 最大の `lambda0` で residual を抑える |
+| `count = 4K` | 約 `lambda0 / 2` になる |
+| count が十分多い | ほとんど効かなくなる |
+
+この正則化は factorizer tensor には直接かけません。`shared` / `axis` / `pair` の共有成分は残し、bucket 固有の residual だけを count に応じて抑えます。そのため、rare bucket を完全に無視するのではなく、「まず共有成分を信じ、十分な出現回数がある bucket だけ個別成分を強く学習する」という挙動になります。
+
+`--sfnn-bucket-counts` だけを指定した場合は、count.bin の検証と統計表示だけを行います。学習に効かせるには `--sfnn-residual-count-decay` を 0 より大きくしてください。

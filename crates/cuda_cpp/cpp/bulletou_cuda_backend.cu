@@ -2554,6 +2554,35 @@ __global__ void sfnn_add_saturation_penalty_gradients_kernel(
     }
 }
 
+__global__ void sfnn_add_residual_count_decay_gradients_kernel(
+    const float* weights,
+    float* gradients,
+    const float* decay_by_stack,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks) {
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    const size_t total = stack_count * stride;
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t selected_stack = tid / stride;
+    const size_t stack = dirty_count == 0 ? selected_stack : static_cast<size_t>(dirty_buckets[selected_stack]);
+    if (stack >= num_stacks) {
+        return;
+    }
+    const float decay = decay_by_stack[stack];
+    if (decay == 0.0f) {
+        return;
+    }
+    const size_t cell = tid - selected_stack * stride;
+    const size_t idx = stack * stride + cell;
+    atomicAdd(&gradients[idx], 2.0f * decay * weights[idx]);
+}
+
 __global__ void sfnn_stacked_l3_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -5408,6 +5437,43 @@ int launch_sfnn_add_saturation_penalty_gradients(
         weight_scale,
         threshold,
         penalty);
+    if (check_kernel_launch(label) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int launch_sfnn_add_residual_count_decay_gradients(
+    BulletOuCudaCppContext* ctx,
+    const float* weights,
+    float* gradients,
+    const float* decay_by_stack,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks,
+    const char* label) {
+    if (stride == 0 || num_stacks == 0) {
+        return fail_message("sfnn residual count decay dimensions must be non-zero");
+    }
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    if (stack_count > SIZE_MAX / stride) {
+        return fail_message("sfnn residual count decay total size overflow");
+    }
+    const size_t total = stack_count * stride;
+    int blocks = 0;
+    constexpr int threads = 256;
+    if (block_count_1d(total, threads, &blocks, label) != 0) {
+        return -1;
+    }
+    sfnn_add_residual_count_decay_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        weights,
+        gradients,
+        decay_by_stack,
+        dirty_buckets,
+        dirty_count,
+        stride,
+        num_stacks);
     if (check_kernel_launch(label) != 0) {
         return -1;
     }
@@ -9990,6 +10056,46 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
         threshold,
         penalty,
         "sfnn saturation penalty gradients");
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_add_residual_count_decay_gradients_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* gradients,
+    BulletOuCudaCppF32Buffer* decay_by_stack,
+    BulletOuCudaCppI32Buffer* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks) {
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (stride == 0 || num_stacks == 0) {
+        return fail_message("sfnn residual count decay dimensions must be non-zero");
+    }
+    if (num_stacks > SIZE_MAX / stride) {
+        return fail_message("sfnn residual count decay weight length overflow");
+    }
+    const size_t total = num_stacks * stride;
+    if (validate_buffer(ctx, weights, total, "sfnn residual count decay weights") != 0 ||
+        validate_buffer(ctx, gradients, total, "sfnn residual count decay gradients") != 0 ||
+        validate_buffer(ctx, decay_by_stack, num_stacks, "sfnn residual count decay by-stack coefficients") != 0) {
+        return -1;
+    }
+    if (dirty_count != 0 &&
+        validate_i32_buffer(ctx, dirty_buckets, dirty_count, "sfnn residual count decay dirty_buckets") != 0) {
+        return -1;
+    }
+    return launch_sfnn_add_residual_count_decay_gradients(
+        ctx,
+        weights->ptr,
+        gradients->ptr,
+        decay_by_stack->ptr,
+        dirty_count != 0 ? dirty_buckets->ptr : nullptr,
+        dirty_count,
+        stride,
+        num_stacks,
+        "sfnn residual count decay gradients");
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(
