@@ -275,10 +275,29 @@ First, create a count.bin file:
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --positions 500000000 `
+  --buffer-mb 1024 `
+  --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once. Keep `--positions` when you want to sample only a prefix of a very large teacher set.
+
+For fixed-size `.psv` / `.bin` records, BulletOu uses a dedicated fast path. It keeps several read buffers and reads into one buffer while counting another one. The implementation uses queues, but the buffers are reused like a ring buffer.
+
+| Option | Meaning | Typical value |
+|---|---|---|
+| `--buffer-mb` | Size of one read buffer | default `1024` |
+| `--read-buffers` | Number of read buffers | default `3`, minimum `2` |
+
+Memory use is roughly `--buffer-mb × --read-buffers`. For example, `--buffer-mb 1024 --read-buffers 4` uses about 4GiB for read buffers. Larger is not always faster. If disk throughput is uneven, try `3` or `4`; for small cached inputs, smaller buffers may be faster.
+
+Progress output separates the average speed from the recent interval speed:
+
+```text
+[count] ... avg_pos/s=... inst_pos/s=... read_wait=... count=...
+```
+
+`avg_pos/s` is the average since start. `inst_pos/s` is the speed of the latest progress interval. If `read_wait` is large, the run is mostly waiting for disk reads. If `count` is large, bucket decode/count is the main cost.
 
 Then pass it during training:
 

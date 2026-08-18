@@ -90,6 +90,8 @@ accuracy / loss を学習中に見たい場合は、次のページで検証用�
 
 `--sfnn-count-confidence 1.0` は、「bucket 固有成分のパラメーター数と同じぐらい出現するまでは、その bucket を強く信用しない」という意味です。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
+巨大な教師フォルダ全体から `count.bin` を作る場合、`bucket-count` は固定長の `.psv` / `.bin` をまとめ読みしながら count します。Dドライブなどで読み込み速度が波打つ場合は、応用編の説明を見て `--buffer-mb` と `--read-buffers` を調整してください。
+
 ---
 
 次へ: [4. 検証を有効にする](4-validation.md)

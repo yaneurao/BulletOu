@@ -90,6 +90,8 @@ For SFNN architectures with many buckets, such as `hand1024_k3k3_progress4`, rar
 
 `--sfnn-count-confidence 1.0` means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own parameter count. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
+When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
+
 ---
 
 Next: [4. Enable validation](4-validation.md)

@@ -275,10 +275,29 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --positions 500000000 `
+  --buffer-mb 1024 `
+  --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
 `--positions` を省略すると、指定した teacher path に含まれる全ファイルを1回だけ読んで count します。大きな教師データから一部だけサンプリングしたい場合は、上の例のように `--positions` を指定します。
+
+`.psv` / `.bin` は固定長レコードなので、BulletOu は専用の高速経路で読みます。読み込み用 buffer を複数個用意し、片方を count している間に別の buffer へディスク読み込みします。実装上は queue で buffer を回しますが、動作としては ring buffer です。
+
+| オプション | 意味 | 目安 |
+|---|---|---|
+| `--buffer-mb` | 1個の読み込み buffer の大きさ | デフォルト `1024` |
+| `--read-buffers` | 読み込み buffer の個数 | デフォルト `3`、最低 `2` |
+
+必要なメモリはおおよそ `--buffer-mb × --read-buffers` です。例えば `--buffer-mb 1024 --read-buffers 4` なら、読み込み buffer だけで約4GiB使います。大きくしすぎても必ず速くなるわけではありません。ディスク読み込みが波打つ場合は `3` か `4`、OSキャッシュ上の小さな入力では小さめの値が速いこともあります。
+
+進捗表示では、開始からの平均速度と直近区間の速度を分けて出します。
+
+```text
+[count] ... avg_pos/s=... inst_pos/s=... read_wait=... count=...
+```
+
+`avg_pos/s` は開始からの平均、`inst_pos/s` は直近の進捗区間だけの速度です。`read_wait` が大きい場合は、count/decode 側ではなくディスク読み込み待ちが主なボトルネックです。`count` が大きい場合は、bucket のdecode/count側が主なボトルネックです。
 
 学習時にそのファイルを指定します。
 

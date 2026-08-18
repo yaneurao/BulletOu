@@ -1609,6 +1609,11 @@ struct BucketCountArgs {
     #[arg(long, default_value = "1024")]
     buffer_mb: usize,
 
+    /// Number of PSV/.bin read buffers used by the pipelined bucket-count fast path.
+    /// Memory use is roughly --buffer-mb multiplied by this value.
+    #[arg(long, default_value = "3")]
+    read_buffers: usize,
+
     /// Teacher batch preparation worker threads. Omit or set 0 for the cuda-cpp default.
     #[arg(long)]
     threads: Option<usize>,
@@ -1885,6 +1890,12 @@ impl BucketCountArgs {
         }
         if self.batch_size == 0 {
             return Err("--batch-size must be > 0".to_string());
+        }
+        if self.buffer_mb == 0 {
+            return Err("--buffer-mb must be > 0".to_string());
+        }
+        if self.read_buffers < 2 {
+            return Err("--read-buffers must be >= 2".to_string());
         }
         if self.output.exists() && !self.overwrite {
             return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
@@ -12294,12 +12305,19 @@ fn bucket_count_stddev(counts: &[u32], mean: f64) -> f64 {
 struct BucketCountProgressState {
     last_positions: usize,
     last_time: std::time::Instant,
+    last_reader_wait: std::time::Duration,
+    last_count_time: std::time::Duration,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 impl BucketCountProgressState {
     fn new(started: std::time::Instant) -> Self {
-        Self { last_positions: 0, last_time: started }
+        Self {
+            last_positions: 0,
+            last_time: started,
+            last_reader_wait: std::time::Duration::ZERO,
+            last_count_time: std::time::Duration::ZERO,
+        }
     }
 }
 
@@ -12312,6 +12330,7 @@ fn print_bucket_count_progress(
     stack_count: usize,
     started: std::time::Instant,
     progress_state: &mut BucketCountProgressState,
+    pipeline_timing: Option<(std::time::Duration, std::time::Duration)>,
 ) {
     let elapsed = started.elapsed();
     let elapsed_sec = elapsed.as_secs_f64();
@@ -12322,6 +12341,19 @@ fn print_bucket_count_progress(
     let interval_positions_per_sec = if interval_sec > 0.0 { interval_positions as f64 / interval_sec } else { 0.0 };
     progress_state.last_positions = scanned_positions;
     progress_state.last_time = std::time::Instant::now();
+    let timing_text = pipeline_timing
+        .map(|(reader_wait, count_time)| {
+            let interval_reader_wait = reader_wait.saturating_sub(progress_state.last_reader_wait);
+            let interval_count_time = count_time.saturating_sub(progress_state.last_count_time);
+            progress_state.last_reader_wait = reader_wait;
+            progress_state.last_count_time = count_time;
+            format!(
+                " read_wait={} count={}",
+                format_duration_secs(interval_reader_wait),
+                format_duration_secs(interval_count_time)
+            )
+        })
+        .unwrap_or_default();
     let (target_text, pct_text, eta_text) = match target_positions {
         Some(target) => {
             let pct = if target == 0 { 100.0 } else { 100.0 * scanned_positions.min(target) as f64 / target as f64 };
@@ -12335,7 +12367,7 @@ fn print_bucket_count_progress(
         None => ("all".to_string(), "?".to_string(), "?".to_string()),
     };
     eprintln!(
-        "  [count] positions={}/{} ({}) batches={} touched_buckets={}/{} elapsed={} avg_pos/s={} inst_pos/s={} eta={}",
+        "  [count] positions={}/{} ({}) batches={} touched_buckets={}/{} elapsed={} avg_pos/s={} inst_pos/s={} eta={}{}",
         format_count(scanned_positions),
         target_text,
         pct_text,
@@ -12345,7 +12377,8 @@ fn print_bucket_count_progress(
         format_duration_secs(elapsed),
         format_count(positions_per_sec.round() as usize),
         format_count(interval_positions_per_sec.round() as usize),
-        eta_text
+        eta_text,
+        timing_text
     );
 }
 
@@ -12478,6 +12511,7 @@ where
                     stack_count,
                     started,
                     &mut progress_state,
+                    None,
                 );
                 last_progress = now;
             }
@@ -12500,6 +12534,7 @@ where
             stack_count,
             started,
             &mut progress_state,
+            None,
         );
     }
     Ok((
@@ -12591,7 +12626,7 @@ fn count_sfnn_buckets_from_direct_record_files(
 
     let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
     let records_per_buffer = bucket_count_direct_buffer_records(args)?;
-    let buffer_count = 2usize;
+    let buffer_count = args.read_buffers;
     eprintln!(
         "  read buffer = {} records x {} = {} x {} buffer(s)",
         format_count(records_per_buffer),
@@ -12714,6 +12749,7 @@ fn count_sfnn_buckets_from_direct_record_files(
                     stack_count,
                     started,
                     &mut progress_state,
+                    Some((reader_wait, count_time)),
                 );
                 last_progress = now;
             }
@@ -12731,6 +12767,7 @@ fn count_sfnn_buckets_from_direct_record_files(
             stack_count,
             started,
             &mut progress_state,
+            Some((reader_wait, count_time)),
         );
     }
     eprintln!(
@@ -13304,6 +13341,7 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
                     stack_count,
                     started,
                     &mut progress_state,
+                    None,
                 );
                 last_progress = now;
             }
