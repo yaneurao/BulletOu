@@ -5363,6 +5363,33 @@ fn run_count_teacher(teacher: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn fixed_record_teacher_positions(teacher: &str) -> Result<Option<usize>, String> {
+    let paths = expand_teacher(teacher)?;
+    let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let format = infer_data_format(&path_refs)?;
+    let Some(record_size) = (match format {
+        DataFormat::Hcpe => Some(bulletou_lib::value::loader::hcpe::HCPE_RECORD_SIZE as u64),
+        DataFormat::Psv => Some(std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64),
+        DataFormat::Hcpe3 | DataFormat::Pack => None,
+    }) else {
+        return Ok(None);
+    };
+
+    let mut total_records = 0u64;
+    for path in &paths {
+        let len = std::fs::metadata(path).map_err(|err| format!("failed to stat teacher {path}: {err}"))?.len();
+        if len % record_size != 0 {
+            return Err(format!("teacher {path} has byte size {len}, not aligned to fixed record size {record_size}"));
+        }
+        total_records = total_records
+            .checked_add(len / record_size)
+            .ok_or_else(|| "fixed-record teacher record count overflow".to_string())?;
+    }
+    usize::try_from(total_records)
+        .map(Some)
+        .map_err(|_| format!("fixed-record teacher has too many records for this platform: {total_records}"))
+}
+
 // ----- score->win-rate diagnostics --------------------------------------
 
 fn run_analyze_score_winrate(args: &Args) -> Result<(), String> {
@@ -12592,6 +12619,8 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     };
     let loader_threads = if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads };
     let scan_all = args.positions.is_none();
+    let fixed_record_total_positions = if scan_all { fixed_record_teacher_positions(&args.teacher)? } else { None };
+    let progress_target_positions = args.positions.or(fixed_record_total_positions);
     let batches = match args.positions {
         Some(positions) => {
             positions
@@ -12631,8 +12660,10 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     eprintln!(
         "  scan        = {} positions ({}), shuffle_window={} batch(es)",
         args.positions.map(format_count).unwrap_or_else(|| "all".to_string()),
-        if scan_all {
-            "single teacher pass".to_string()
+        if let Some(estimated) = fixed_record_total_positions {
+            format!("single teacher pass; fixed-record total={}", format_count(estimated))
+        } else if scan_all {
+            "single teacher pass; variable-length total unknown".to_string()
         } else {
             format!("{} batch(es) x {} max", format_count(batches), format_count(args.batch_size))
         },
@@ -12684,7 +12715,7 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
                 let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
                 print_bucket_count_progress(
                     total_positions,
-                    args.positions,
+                    progress_target_positions,
                     seen_batches,
                     touched_buckets,
                     stack_count,
@@ -28178,6 +28209,38 @@ mod tests {
         assert_eq!(lambdas.len(), loaded.counts.len());
         assert_eq!(lambdas[0], 1.0e-7, "zero-count buckets get the maximum decay");
         assert!(lambdas[4] < lambdas[3], "higher-count buckets get weaker decay");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fixed_record_teacher_positions_counts_psv_bin_and_hcpe_by_file_size() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-fixed-record-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let psv_record = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>();
+        let psv_dir = tmp.join("psv");
+        std::fs::create_dir(&psv_dir).unwrap();
+        std::fs::write(psv_dir.join("a.psv"), vec![0u8; psv_record * 3]).unwrap();
+        std::fs::write(psv_dir.join("b.bin"), vec![0u8; psv_record * 2]).unwrap();
+        assert_eq!(fixed_record_teacher_positions(psv_dir.to_str().unwrap()).unwrap(), Some(5));
+
+        let hcpe_record = bulletou_lib::value::loader::hcpe::HCPE_RECORD_SIZE;
+        let hcpe = tmp.join("c.hcpe");
+        std::fs::write(&hcpe, vec![0u8; hcpe_record * 7]).unwrap();
+        assert_eq!(fixed_record_teacher_positions(hcpe.to_str().unwrap()).unwrap(), Some(7));
+
+        let hcpe3 = tmp.join("d.hcpe3");
+        std::fs::write(&hcpe3, b"variable-length-placeholder").unwrap();
+        assert_eq!(fixed_record_teacher_positions(hcpe3.to_str().unwrap()).unwrap(), None);
+
+        let bad = tmp.join("bad.psv");
+        std::fs::write(&bad, vec![0u8; psv_record + 1]).unwrap();
+        assert!(fixed_record_teacher_positions(bad.to_str().unwrap()).unwrap_err().contains("not aligned"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
