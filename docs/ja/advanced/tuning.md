@@ -348,10 +348,10 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-residual-count-decay-k-ratio 0.05
+--sfnn-count-confidence 1.0
 ```
 
-`--sfnn-residual-count-decay-k-ratio 0.05` は、「平均的な bucket 出現回数の 5% ぐらいまでを rare bucket として強めに抑える」という意味です。この指定だけで count decay は有効になり、最大減衰量はデフォルトで `1e-7` になります。平均出現回数は `count.bin` に記録された集計局面数から自動計算されるので、count に使った局面数を変えても手で K を調整し直す必要がありません。
+`--sfnn-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ信用しない」という意味です。この指定だけで count decay は有効になり、最大減衰量はデフォルトで `1e-7` になります。
 
 count decay は factorizer 成分ではなく、bucket 固有の residual にだけかかります。count が多い bucket は residual を大きく学習しやすく、count が少ない bucket は factorizer の共有成分に寄ります。
 

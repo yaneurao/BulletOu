@@ -3291,7 +3291,7 @@ const DEFAULT_FV_SCALE: f32 = 24.0;
 const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
 const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY: f32 = 1.0e-7;
-const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY_K_RATIO: f32 = 0.05;
+const DEFAULT_SFNN_COUNT_CONFIDENCE: f32 = 1.0;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_IN_OFFSET: f32 = 270.0;
 const DEFAULT_WRM_IN_SCALING: f32 = 340.0;
@@ -4528,22 +4528,18 @@ struct Args {
     sfnn_bucket_counts: Option<PathBuf>,
 
     /// Maximum count-aware residual decay for SFNN base stack tensors.
-    /// Requires `--sfnn-bucket-counts`. If omitted while K or K-ratio is
-    /// specified, BulletOu uses the default maximum decay 1e-7.
+    /// Requires `--sfnn-bucket-counts`. If omitted while
+    /// `--sfnn-count-confidence` is specified, BulletOu uses the default
+    /// maximum decay 1e-7.
     #[arg(long = "sfnn-residual-count-decay")]
     sfnn_residual_count_decay: Option<f32>,
 
-    /// Raw K parameter for `--sfnn-residual-count-decay`, in count.bin units.
-    /// If omitted while count decay is enabled, BulletOu uses
-    /// `average_count_per_stack * --sfnn-residual-count-decay-k-ratio`.
-    #[arg(long = "sfnn-residual-count-decay-k")]
-    sfnn_residual_count_decay_k: Option<f32>,
-
-    /// Enables count-aware residual decay using automatic K.
-    /// Effective K is `count.bin positions / stack_count * ratio`.
-    /// If `--sfnn-residual-count-decay` is omitted, max decay defaults to 1e-7.
-    #[arg(long = "sfnn-residual-count-decay-k-ratio")]
-    sfnn_residual_count_decay_k_ratio: Option<f32>,
+    /// Enables count-aware residual decay.
+    /// `1.0` means BulletOu uses roughly one bucket-specific parameter count
+    /// as the confidence threshold. If `--sfnn-residual-count-decay` is
+    /// omitted, max decay defaults to 1e-7.
+    #[arg(long = "sfnn-count-confidence")]
+    sfnn_count_confidence: Option<f32>,
 
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
@@ -4784,16 +4780,9 @@ impl Args {
                 return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
             }
         }
-        if let Some(k) = self.sfnn_residual_count_decay_k {
-            if !(k.is_finite() && k >= 0.0) {
-                return Err(format!("--sfnn-residual-count-decay-k must be finite and non-negative (got {k})"));
-            }
-        }
-        if let Some(ratio) = self.sfnn_residual_count_decay_k_ratio {
-            if !(ratio.is_finite() && ratio >= 0.0) {
-                return Err(format!(
-                    "--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {ratio})"
-                ));
+        if let Some(confidence) = self.sfnn_count_confidence {
+            if !(confidence.is_finite() && confidence >= 0.0) {
+                return Err(format!("--sfnn-count-confidence must be finite and non-negative (got {confidence})"));
             }
         }
         let effective_residual_count_decay = effective_sfnn_residual_count_decay(self);
@@ -12314,26 +12303,28 @@ fn print_bucket_count_progress(
 fn effective_sfnn_residual_count_decay(args: &Args) -> f32 {
     match args.sfnn_residual_count_decay {
         Some(decay) => decay,
-        None if args.sfnn_residual_count_decay_k.is_some() || args.sfnn_residual_count_decay_k_ratio.is_some() => {
-            DEFAULT_SFNN_RESIDUAL_COUNT_DECAY
-        }
+        None if args.sfnn_count_confidence.is_some() => DEFAULT_SFNN_RESIDUAL_COUNT_DECAY,
         None => 0.0,
     }
 }
 
-fn effective_sfnn_residual_count_decay_k_ratio(args: &Args) -> f32 {
-    args.sfnn_residual_count_decay_k_ratio.unwrap_or(DEFAULT_SFNN_RESIDUAL_COUNT_DECAY_K_RATIO)
+fn effective_sfnn_count_confidence(args: &Args) -> f32 {
+    args.sfnn_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32) -> Result<Vec<f32>, String> {
+fn sfnn_bucket_count_decay_lambdas(
+    counts: &SfnnBucketCounts,
+    decay: f32,
+    confidence_count: f32,
+) -> Result<Vec<f32>, String> {
     if !(decay.is_finite() && decay >= 0.0) {
         return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
     }
-    if !(k.is_finite() && k >= 0.0) {
-        return Err(format!("--sfnn-residual-count-decay-k must be finite and non-negative (got {k})"));
+    if !(confidence_count.is_finite() && confidence_count >= 0.0) {
+        return Err(format!("SFNN count confidence produced invalid confidence_count={confidence_count}"));
     }
-    let numerator = f64::from(k) + 1.0;
+    let numerator = f64::from(confidence_count) + 1.0;
     let decay = f64::from(decay);
     Ok(counts
         .counts
@@ -12346,29 +12337,44 @@ fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn effective_sfnn_residual_count_decay_k(args: &Args, counts: &SfnnBucketCounts) -> Result<(f32, String), String> {
-    if let Some(k) = args.sfnn_residual_count_decay_k {
-        if !(k.is_finite() && k >= 0.0) {
-            return Err(format!("--sfnn-residual-count-decay-k must be finite and non-negative (got {k})"));
-        }
-        return Ok((k, format!("raw count K={k:.3}")));
+fn sfnn_residual_params_per_bucket(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
+    if shape.num_stacks == 0 {
+        return Err("SFNN shape has zero stacks".to_string());
     }
-    let k_ratio = effective_sfnn_residual_count_decay_k_ratio(args);
-    if !(k_ratio.is_finite() && k_ratio >= 0.0) {
-        return Err(format!("--sfnn-residual-count-decay-k-ratio must be finite and non-negative (got {})", k_ratio));
+    let l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks;
+    let l1b = shape.l1_out();
+    let l2w = shape
+        .l2_size
+        .checked_mul(shape.l2_in())
+        .ok_or_else(|| "SFNN residual parameter count overflow at L2 weight".to_string())?;
+    let l2b = shape.l2_size;
+    let l3w = shape.l2_size;
+    let l3b = 1usize;
+    l1w.checked_add(l1b)
+        .and_then(|v| v.checked_add(l2w))
+        .and_then(|v| v.checked_add(l2b))
+        .and_then(|v| v.checked_add(l3w))
+        .and_then(|v| v.checked_add(l3b))
+        .ok_or_else(|| "SFNN residual parameter count overflow".to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn effective_sfnn_count_decay_k(
+    args: &Args,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+) -> Result<(f32, String), String> {
+    let confidence = effective_sfnn_count_confidence(args);
+    if !(confidence.is_finite() && confidence >= 0.0) {
+        return Err(format!("--sfnn-count-confidence must be finite and non-negative (got {confidence})"));
     }
-    let stack_count = counts.stack_count().max(1) as f64;
-    let mean_count = counts.positions as f64 / stack_count;
-    let k = mean_count * f64::from(k_ratio);
+    let params = sfnn_residual_params_per_bucket(shape)? as f64;
+    let k = params * f64::from(confidence);
     if !(k.is_finite() && k >= 0.0 && k <= f32::MAX as f64) {
         return Err(format!(
-            "auto --sfnn-residual-count-decay-k overflowed: positions={}, stacks={}, ratio={}",
-            counts.positions,
-            counts.stack_count(),
-            k_ratio
+            "--sfnn-count-confidence overflowed: residual_params_per_bucket={params:.3}, confidence={confidence}"
         ));
     }
-    Ok((k as f32, format!("auto: mean_count={mean_count:.3} * ratio={k_ratio:.6}")))
+    Ok((k as f32, format!("residual_params_per_bucket={params:.0} * confidence={confidence:.6}")))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12739,6 +12745,24 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         format_count(bucket_count_percentile(&nonzero_counts, 0.99) as usize),
         format_count(report.max() as usize)
     );
+    let count_thresholds = [
+        ("1B", 1_000_000_000u32),
+        ("100M", 100_000_000u32),
+        ("10M", 10_000_000u32),
+        ("1M", 1_000_000u32),
+        ("100K", 100_000u32),
+        ("10K", 10_000u32),
+        ("1K", 1_000u32),
+    ];
+    let threshold_summary = count_thresholds
+        .iter()
+        .map(|&(label, threshold)| {
+            let buckets = report.counts.iter().filter(|&&count| count >= threshold).count();
+            format!(">={label} {}", format_count(buckets))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  buckets_by_count  = {threshold_summary}");
     println!(
         "  top10_share       = {:.2}% of scanned positions",
         if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
@@ -12967,7 +12991,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             .as_ref()
             .map(|(_, counts)| counts)
             .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
-        let (effective_k, k_label) = effective_sfnn_residual_count_decay_k(args, counts)?;
+        let (effective_k, k_label) = effective_sfnn_count_decay_k(args, initial_weights.shape)?;
         let lambdas = sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?;
         Some((effective_k, k_label, lambdas))
     } else {
@@ -13103,7 +13127,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv_colored(
             "count residual decay",
             format!(
-                "max_decay={:.9}, K={:.3} ({k_label}), per-stack decay p50={:.9}, p90={:.9}, p99={:.9}, max={:.9}",
+                "max_decay={:.9}, confidence_count={:.3} ({k_label}), per-stack decay p50={:.9}, p90={:.9}, p99={:.9}, max={:.9}",
                 effective_residual_count_decay,
                 effective_k,
                 f32_percentile(lambdas, 0.50),
@@ -19561,14 +19585,11 @@ fn resume_signature(args: &Args) -> String {
     let test_sample = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
     let test_seed = if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() };
     let residual_count_decay_signature = effective_sfnn_residual_count_decay(args);
-    let (residual_count_decay_k_signature, residual_count_decay_k_ratio_signature) =
-        if residual_count_decay_signature == 0.0 {
-            ("0.000000000".to_string(), "ignored".to_string())
-        } else if let Some(k) = args.sfnn_residual_count_decay_k {
-            (format!("{k:.9}"), "ignored".to_string())
-        } else {
-            ("auto".to_string(), format!("{:.9}", effective_sfnn_residual_count_decay_k_ratio(args)))
-        };
+    let count_confidence_signature = if residual_count_decay_signature == 0.0 {
+        "ignored".to_string()
+    } else {
+        format!("{:.9}", effective_sfnn_count_confidence(args))
+    };
     [
         "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
@@ -19645,8 +19666,7 @@ fn resume_signature(args: &Args) -> String {
                 .unwrap_or_else(|| "none".to_string())
         ),
         format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
-        format!("sfnn_residual_count_decay_k={residual_count_decay_k_signature}"),
-        format!("sfnn_residual_count_decay_k_ratio={residual_count_decay_k_ratio_signature}"),
+        format!("sfnn_count_confidence={count_confidence_signature}"),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
@@ -19784,20 +19804,14 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     );
     ensure_line_after(
         &mut out,
-        "sfnn_residual_count_decay_k=",
+        "sfnn_count_confidence=",
         "sfnn_residual_count_decay=",
-        "sfnn_residual_count_decay_k=0.000000000",
-    );
-    ensure_line_after(
-        &mut out,
-        "sfnn_residual_count_decay_k_ratio=",
-        "sfnn_residual_count_decay_k=",
-        "sfnn_residual_count_decay_k_ratio=ignored",
+        "sfnn_count_confidence=ignored",
     );
     ensure_line_after(
         &mut out,
         "sfnn_saturation_penalty=",
-        "sfnn_residual_count_decay_k_ratio=",
+        "sfnn_count_confidence=",
         "sfnn_saturation_penalty=0.000000000",
     );
     ensure_line_after(
@@ -19819,7 +19833,9 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
-    resume_signature_without_line(&signature, "quantized_validation_exact=")
+    let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
+    let signature = resume_signature_without_line(&signature, "sfnn_residual_count_decay_k=");
+    resume_signature_without_line(&signature, "sfnn_residual_count_decay_k_ratio=")
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {

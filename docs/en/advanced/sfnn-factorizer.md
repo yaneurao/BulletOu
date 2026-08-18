@@ -286,34 +286,32 @@ Then pass it during training:
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-residual-count-decay-k-ratio 0.05
+--sfnn-count-confidence 1.0
 ```
 
 The per-stack decay coefficient is:
 
 ```text
-decay_stack = max_decay * min(1, sqrt((K + 1) / (count_stack + 1)))
+decay_stack = max_decay * min(1, sqrt((confidence_count + 1) / (count_stack + 1)))
 ```
 
-`max_decay` is the maximum decay. If you enable count decay with `--sfnn-residual-count-decay-k-ratio` or `--sfnn-residual-count-decay-k`, BulletOu uses `max_decay = 1e-7` by default. Override it with `--sfnn-residual-count-decay <value>` only when you need to tune the maximum decay itself.
+`max_decay` is the maximum decay. If you enable count decay with `--sfnn-count-confidence`, BulletOu uses `max_decay = 1e-7` by default. Override it with `--sfnn-residual-count-decay <value>` only when you need to tune the maximum decay itself.
 
-By default, `K` is computed automatically:
+`confidence_count` is computed from the model shape:
 
 ```text
-average_count = positions recorded in count.bin / number of stacks
-K = average_count * --sfnn-residual-count-decay-k-ratio
+residual_params_per_bucket = number of bucket-specific residual parameters per bucket
+confidence_count = residual_params_per_bucket * --sfnn-count-confidence
 ```
 
-For example, `--sfnn-residual-count-decay-k-ratio 0.05` means: apply the strongest damping up to roughly 5% of the average bucket count. Because the total scanned position count is stored in `count.bin`, the same ratio keeps roughly the same meaning even if you build the count file from a different number of positions.
+For example, `--sfnn-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This is based on model degrees of freedom, not on a fraction of the total teacher positions.
 
-In normal use, pass only `--sfnn-bucket-counts <count.bin>` and `--sfnn-residual-count-decay-k-ratio <ratio>`.
-
-If you really want to specify a raw count threshold, use `--sfnn-residual-count-decay-k <count>`. In that case, `--sfnn-residual-count-decay-k-ratio` is ignored.
+In normal use, pass only `--sfnn-bucket-counts <count.bin>` and `--sfnn-count-confidence 1.0`.
 
 | count | Behavior |
 |---:|---|
-| `count <= K` | Use the maximum `max_decay` |
-| `count = 4K` | About `max_decay / 2` |
+| `count <= confidence_count` | Use the maximum `max_decay` |
+| `count = 4 * confidence_count` | About `max_decay / 2` |
 | Very large count | Almost no extra decay |
 
 This does not directly decay the factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual is damped according to count. The effect is: trust the shared structure first, and let heavily observed buckets learn stronger individual residuals.
@@ -328,4 +326,4 @@ The count-aware decay applies only to `W_residual`. Low-count buckets keep `W_re
 
 In other words, `all=1.0` means “add the factorizer normally,” and count-aware decay means “control the freedom of the bucket-specific component by count.” High-count buckets behave closer to `none`; low-count buckets stay closer to the factorizer.
 
-If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-residual-count-decay` above zero to enable the regularization.
+If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-count-confidence` to enable the regularization.
