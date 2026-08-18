@@ -345,10 +345,14 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 学習では次のように指定します。
 
 ```powershell
+--sfnn-factorizer pair `
+--sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
 --sfnn-residual-count-decay 1e-7 `
 --sfnn-residual-count-decay-k 10000
 ```
+
+count decay は factorizer 成分ではなく、bucket 固有の residual にだけかかります。count が多い bucket は residual を大きく学習しやすく、count が少ない bucket は factorizer の共有成分に寄ります。
 
 詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 

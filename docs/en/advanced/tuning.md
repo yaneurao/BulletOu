@@ -359,10 +359,14 @@ If you omit `--positions`, BulletOu scans every file in the teacher path once.
 Then pass it during training:
 
 ```powershell
+--sfnn-factorizer pair `
+--sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
 --sfnn-residual-count-decay 1e-7 `
 --sfnn-residual-count-decay-k 10000
 ```
+
+The decay applies to the bucket-specific residual, not to the factorizer component. High-count buckets can learn a larger residual; low-count buckets stay closer to the shared factorizer structure.
 
 See [SFNN factorizer](sfnn-factorizer.md) for the formula and the model-side interpretation.
 

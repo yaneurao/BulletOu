@@ -284,6 +284,7 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 
 ```powershell
 --sfnn-factorizer pair `
+--sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
 --sfnn-residual-count-decay 1e-7 `
 --sfnn-residual-count-decay-k 10000
@@ -304,5 +305,15 @@ lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
 | count が十分多い | ほとんど効かなくなる |
 
 この正則化は factorizer tensor には直接かけません。`shared` / `axis` / `pair` の共有成分は残し、bucket 固有の residual だけを count に応じて抑えます。そのため、rare bucket を完全に無視するのではなく、「まず共有成分を信じ、十分な出現回数がある bucket だけ個別成分を強く学習する」という挙動になります。
+
+`--sfnn-factorizer-alpha all=1.0` の場合、forward で使う重みは次のように考えます。
+
+```text
+W_effective = W_residual + W_factorizer
+```
+
+count decay は `W_residual` にだけかかります。したがって、出現回数が少ない bucket では `W_residual` が小さく抑えられ、`W_effective` は factorizer 側の共有成分に寄ります。出現回数が多い bucket では decay が弱くなるので、必要なら `W_residual` を大きく学習できます。
+
+つまり `all=1.0` は factorizer 成分を普通に足す設定で、count decay は「bucket 固有成分の自由度を count に応じて変える」設定です。count が多い bucket ほど `none` に近い自由度を持ち、count が少ない bucket ほど factorizer に寄ります。
 
 `--sfnn-bucket-counts` だけを指定した場合は、count.bin の検証と統計表示だけを行います。学習に効かせるには `--sfnn-residual-count-decay` を 0 より大きくしてください。

@@ -284,6 +284,7 @@ Then pass it during training:
 
 ```powershell
 --sfnn-factorizer pair `
+--sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
 --sfnn-residual-count-decay 1e-7 `
 --sfnn-residual-count-decay-k 10000
@@ -304,5 +305,15 @@ lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
 | Very large count | Almost no extra decay |
 
 This does not directly decay the factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual is damped according to count. The effect is: trust the shared structure first, and let heavily observed buckets learn stronger individual residuals.
+
+With `--sfnn-factorizer-alpha all=1.0`, the forward weight can be read as:
+
+```text
+W_effective = W_residual + W_factorizer
+```
+
+The count-aware decay applies only to `W_residual`. Low-count buckets keep `W_residual` small, so `W_effective` stays close to the shared factorizer component. High-count buckets receive weaker decay, so they can learn a larger bucket-specific residual when the data supports it.
+
+In other words, `all=1.0` means “add the factorizer normally,” and count-aware decay means “control the freedom of the bucket-specific component by count.” High-count buckets behave closer to `none`; low-count buckets stay closer to the factorizer.
 
 If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-residual-count-decay` above zero to enable the regularization.
