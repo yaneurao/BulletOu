@@ -1634,6 +1634,10 @@ struct BucketCountArgs {
     #[arg(long, default_value = "32000")]
     score_drop_abs: u16,
 
+    /// Progress print interval in seconds. Set to 0 to disable periodic progress.
+    #[arg(long, default_value = "5.0")]
+    progress_interval_sec: f64,
+
     /// Allow overwriting --output.
     #[arg(long)]
     overwrite: bool,
@@ -1884,6 +1888,12 @@ impl BucketCountArgs {
         }
         if self.output.exists() && !self.overwrite {
             return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
+        }
+        if !(self.progress_interval_sec.is_finite() && self.progress_interval_sec >= 0.0) {
+            return Err(format!(
+                "--progress-interval-sec must be finite and non-negative (got {})",
+                self.progress_interval_sec
+            ));
         }
         Ok(())
     }
@@ -12205,6 +12215,42 @@ fn bucket_count_stddev(counts: &[u32], mean: f64) -> f64 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn print_bucket_count_progress(
+    scanned_positions: usize,
+    target_positions: usize,
+    seen_batches: usize,
+    touched_buckets: usize,
+    stack_count: usize,
+    started: std::time::Instant,
+) {
+    let elapsed = started.elapsed();
+    let elapsed_sec = elapsed.as_secs_f64();
+    let positions_per_sec = if elapsed_sec > 0.0 { scanned_positions as f64 / elapsed_sec } else { 0.0 };
+    let pct = if target_positions == 0 {
+        100.0
+    } else {
+        100.0 * scanned_positions.min(target_positions) as f64 / target_positions as f64
+    };
+    let eta = if positions_per_sec > 0.0 && scanned_positions < target_positions {
+        std::time::Duration::from_secs_f64((target_positions - scanned_positions) as f64 / positions_per_sec)
+    } else {
+        std::time::Duration::ZERO
+    };
+    eprintln!(
+        "  [count] positions={}/{} ({:.2}%) batches={} touched_buckets={}/{} elapsed={} pos/s={} eta={}",
+        format_count(scanned_positions),
+        format_count(target_positions),
+        pct,
+        format_count(seen_batches),
+        format_count(touched_buckets),
+        format_count(stack_count),
+        format_duration_secs(elapsed),
+        format_count(positions_per_sec.round() as usize),
+        format_duration_secs(eta)
+    );
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32) -> Result<Vec<f32>, String> {
     if !(decay.is_finite() && decay >= 0.0) {
         return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
@@ -12483,6 +12529,9 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     );
 
     let started = std::time::Instant::now();
+    let progress_interval =
+        (args.progress_interval_sec > 0.0).then(|| std::time::Duration::from_secs_f64(args.progress_interval_sec));
+    let mut last_progress = started;
     let mut counts = vec![0u32; stack_count];
     let mut total_positions = 0usize;
     let mut seen_batches = 0usize;
@@ -12506,6 +12555,21 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
                 .checked_add(1)
                 .ok_or_else(|| format!("bucket {bucket} count overflowed u32; reduce --positions"))?;
             total_positions += 1;
+        }
+        if let Some(interval) = progress_interval {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_progress) >= interval && total_positions < args.positions {
+                let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
+                print_bucket_count_progress(
+                    total_positions,
+                    args.positions,
+                    seen_batches,
+                    touched_buckets,
+                    stack_count,
+                    started,
+                );
+                last_progress = now;
+            }
         }
         Ok(())
     })?;
