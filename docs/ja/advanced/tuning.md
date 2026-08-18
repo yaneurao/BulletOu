@@ -340,6 +340,8 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
+`--positions` を省略すると、teacher path 内の全ファイルを1回だけ読んで count します。
+
 学習では次のように指定します。
 
 ```powershell

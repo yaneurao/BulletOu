@@ -39,7 +39,7 @@ pub use teacher_batch::{
     ScoreWinrateModelMetrics, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
     TeacherDataloaderPos, analyze_score_winrate_from_teacher, for_each_halfkp_teacher_fast_batch,
     for_each_kp_teacher_fast_batch, for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch,
-    for_each_sfnn_teacher_fast_batch, load_halfkp_teacher_fast_batch,
+    for_each_sfnn_teacher_fast_batch, for_each_sfnn_teacher_fast_batch_single_epoch, load_halfkp_teacher_fast_batch,
 };
 
 use crate::{

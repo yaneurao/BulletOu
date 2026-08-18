@@ -1120,6 +1120,37 @@ where
     F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
     E: fmt::Display,
 {
+    for_each_sfnn_teacher_fast_batch_with_epoch_mode(input_getter, input_label, config, batch_count, false, visitor)
+}
+
+pub fn for_each_sfnn_teacher_fast_batch_single_epoch<I, F, E>(
+    input_getter: I,
+    input_label: &'static str,
+    config: &SfnnTeacherBatchConfig<'_>,
+    batch_count: usize,
+    visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    I: SparseInputType<RequiredDataType = PackedSfenValue> + Send,
+    F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    for_each_sfnn_teacher_fast_batch_with_epoch_mode(input_getter, input_label, config, batch_count, true, visitor)
+}
+
+fn for_each_sfnn_teacher_fast_batch_with_epoch_mode<I, F, E>(
+    input_getter: I,
+    input_label: &'static str,
+    config: &SfnnTeacherBatchConfig<'_>,
+    batch_count: usize,
+    single_epoch: bool,
+    visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    I: SparseInputType<RequiredDataType = PackedSfenValue> + Send,
+    F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
     validate_sfnn_config(config)?;
     if batch_count == 0 {
         return Ok(0);
@@ -1138,7 +1169,7 @@ where
             )
             .with_buffer_records(config.batch_size)
             .with_loader_threads(config.loader_threads)
-            .with_single_epoch(false);
+            .with_single_epoch(single_epoch);
             if let Some(pos) = config.dataloader_resume_pos {
                 if pos.plies != 0 {
                     return Err(TeacherBatchError::invalid_input(format!(
@@ -1175,6 +1206,7 @@ where
                 format,
                 config,
                 batch_count,
+                single_epoch,
                 loader_start_position,
                 move |visited_batches| {
                     hcpe_dataloader_pos_after_batch(base_byte_offset, total_bytes, config.batch_size, visited_batches)
@@ -1185,7 +1217,7 @@ where
         DataFormat::Hcpe3 => {
             let mut loader = Hcpe3DataLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(false);
+                .with_single_epoch(single_epoch);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
@@ -1201,6 +1233,7 @@ where
                 format,
                 config,
                 batch_count,
+                single_epoch,
                 loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
@@ -1214,7 +1247,7 @@ where
         DataFormat::Pack => {
             let mut loader = ShogiPackLoader::new_concat_multiple(&data_files_ref, config.buffer_mb, |_| true)
                 .with_buffer_records(config.batch_size)
-                .with_single_epoch(false);
+                .with_single_epoch(single_epoch);
             let offset_handle = loader.consumed_offset_handle();
             let plies_handle = loader.consumed_plies_handle();
             let loader_start_position = if let Some(pos) = config.dataloader_resume_pos {
@@ -1230,6 +1263,7 @@ where
                 format,
                 config,
                 batch_count,
+                single_epoch,
                 loader_start_position,
                 |_| {
                     Some(TeacherDataloaderPos {
@@ -1241,7 +1275,7 @@ where
             )
         }
         DataFormat::Psv => {
-            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
+            let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(single_epoch);
             let record_size = std::mem::size_of::<PackedSfenValue>();
             let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
             let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
@@ -1261,6 +1295,7 @@ where
                 format,
                 config,
                 batch_count,
+                single_epoch,
                 loader_start_position,
                 move |visited_batches| {
                     fixed_record_dataloader_pos_after_batch(
@@ -2433,6 +2468,7 @@ fn visit_sfnn_batches<I, D, P, F, E>(
     format: DataFormat,
     config: &SfnnTeacherBatchConfig<'_>,
     batch_count: usize,
+    single_epoch: bool,
     loader_start_position: usize,
     mut dataloader_pos: P,
     mut visitor: F,
@@ -2543,7 +2579,7 @@ where
                     let _ = sender.send(Err(err.clone()));
                     return Err(err);
                 }
-                if produced_batches != batch_count {
+                if !single_epoch && produced_batches != batch_count {
                     return Err(TeacherBatchError::invalid_input(format!(
                         "SFNN/{input_label} teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
                         config.batch_index, config.batch_size
@@ -2584,7 +2620,7 @@ where
                 return Err(err);
             }
             producer_result?;
-            if consumed_batches != batch_count {
+            if !single_epoch && consumed_batches != batch_count {
                 return Err(TeacherBatchError::invalid_input(format!(
                     "SFNN/{input_label} teacher did not deliver {batch_count} complete prepared batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
                     config.batch_index, config.batch_size
@@ -2659,7 +2695,7 @@ where
     if let Some(err) = visit_error {
         return Err(err);
     }
-    if visited_batches != batch_count {
+    if !single_epoch && visited_batches != batch_count {
         return Err(TeacherBatchError::invalid_input(format!(
             "SFNN/{input_label} teacher did not yield {batch_count} complete batches starting at batch index {} of {} positions; use a smaller --batch-size, batch-index, or batch count",
             config.batch_index, config.batch_size

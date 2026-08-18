@@ -1593,9 +1593,9 @@ struct BucketCountArgs {
     #[arg(long)]
     arch: NnueArch,
 
-    /// Number of teacher positions to scan.
+    /// Number of teacher positions to scan. If omitted, scan every record in the teacher path once.
     #[arg(long)]
-    positions: usize,
+    positions: Option<usize>,
 
     /// Output count.bin path.
     #[arg(long)]
@@ -1880,7 +1880,7 @@ impl BucketCountArgs {
                 self.arch.cli_name()
             ));
         }
-        if self.positions == 0 {
+        if self.positions == Some(0) {
             return Err("--positions must be > 0".to_string());
         }
         if self.batch_size == 0 {
@@ -11986,21 +11986,64 @@ fn for_each_cuda_cpp_sfnn_teacher_batch<F>(
 where
     F: FnMut(bulletou_lib::value::SfnnTeacherBatch) -> Result<(), String>,
 {
-    use bulletou_lib::value::for_each_sfnn_teacher_fast_batch;
+    for_each_cuda_cpp_sfnn_teacher_batch_with_epoch_mode(feature_kind, config, batch_count, false, visitor)
+}
 
-    match feature_kind {
-        CudaCppSfnnFeatureKind::Halfka1hm => {
+#[cfg(feature = "cuda-cpp-backend")]
+fn for_each_cuda_cpp_sfnn_teacher_batch_with_epoch_mode<F>(
+    feature_kind: CudaCppSfnnFeatureKind,
+    config: &bulletou_lib::value::SfnnTeacherBatchConfig<'_>,
+    batch_count: usize,
+    single_epoch: bool,
+    visitor: F,
+) -> Result<usize, String>
+where
+    F: FnMut(bulletou_lib::value::SfnnTeacherBatch) -> Result<(), String>,
+{
+    use bulletou_lib::value::for_each_sfnn_teacher_fast_batch;
+    use bulletou_lib::value::for_each_sfnn_teacher_fast_batch_single_epoch;
+
+    match (feature_kind, single_epoch) {
+        (CudaCppSfnnFeatureKind::Halfka1hm, false) => {
             for_each_sfnn_teacher_fast_batch(ShogiHalfKaHm1, feature_kind.input_label(), config, batch_count, visitor)
         }
-        CudaCppSfnnFeatureKind::Halfka2hm => {
+        (CudaCppSfnnFeatureKind::Halfka2hm, false) => {
             for_each_sfnn_teacher_fast_batch(ShogiHalfKaHm2, feature_kind.input_label(), config, batch_count, visitor)
         }
-        CudaCppSfnnFeatureKind::Halfka2 => {
+        (CudaCppSfnnFeatureKind::Halfka2, false) => {
             for_each_sfnn_teacher_fast_batch(ShogiHalfKa2, feature_kind.input_label(), config, batch_count, visitor)
         }
-        CudaCppSfnnFeatureKind::Ka2 => {
+        (CudaCppSfnnFeatureKind::Ka2, false) => {
             for_each_sfnn_teacher_fast_batch(ShogiKa2, feature_kind.input_label(), config, batch_count, visitor)
         }
+        (CudaCppSfnnFeatureKind::Halfka1hm, true) => for_each_sfnn_teacher_fast_batch_single_epoch(
+            ShogiHalfKaHm1,
+            feature_kind.input_label(),
+            config,
+            batch_count,
+            visitor,
+        ),
+        (CudaCppSfnnFeatureKind::Halfka2hm, true) => for_each_sfnn_teacher_fast_batch_single_epoch(
+            ShogiHalfKaHm2,
+            feature_kind.input_label(),
+            config,
+            batch_count,
+            visitor,
+        ),
+        (CudaCppSfnnFeatureKind::Halfka2, true) => for_each_sfnn_teacher_fast_batch_single_epoch(
+            ShogiHalfKa2,
+            feature_kind.input_label(),
+            config,
+            batch_count,
+            visitor,
+        ),
+        (CudaCppSfnnFeatureKind::Ka2, true) => for_each_sfnn_teacher_fast_batch_single_epoch(
+            ShogiKa2,
+            feature_kind.input_label(),
+            config,
+            batch_count,
+            visitor,
+        ),
     }
     .map_err(|e| e.to_string())
 }
@@ -12217,7 +12260,7 @@ fn bucket_count_stddev(counts: &[u32], mean: f64) -> f64 {
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_bucket_count_progress(
     scanned_positions: usize,
-    target_positions: usize,
+    target_positions: Option<usize>,
     seen_batches: usize,
     touched_buckets: usize,
     stack_count: usize,
@@ -12226,27 +12269,29 @@ fn print_bucket_count_progress(
     let elapsed = started.elapsed();
     let elapsed_sec = elapsed.as_secs_f64();
     let positions_per_sec = if elapsed_sec > 0.0 { scanned_positions as f64 / elapsed_sec } else { 0.0 };
-    let pct = if target_positions == 0 {
-        100.0
-    } else {
-        100.0 * scanned_positions.min(target_positions) as f64 / target_positions as f64
-    };
-    let eta = if positions_per_sec > 0.0 && scanned_positions < target_positions {
-        std::time::Duration::from_secs_f64((target_positions - scanned_positions) as f64 / positions_per_sec)
-    } else {
-        std::time::Duration::ZERO
+    let (target_text, pct_text, eta_text) = match target_positions {
+        Some(target) => {
+            let pct = if target == 0 { 100.0 } else { 100.0 * scanned_positions.min(target) as f64 / target as f64 };
+            let eta = if positions_per_sec > 0.0 && scanned_positions < target {
+                std::time::Duration::from_secs_f64((target - scanned_positions) as f64 / positions_per_sec)
+            } else {
+                std::time::Duration::ZERO
+            };
+            (format_count(target), format!("{pct:.2}%"), format_duration_secs(eta))
+        }
+        None => ("all".to_string(), "?".to_string(), "?".to_string()),
     };
     eprintln!(
-        "  [count] positions={}/{} ({:.2}%) batches={} touched_buckets={}/{} elapsed={} pos/s={} eta={}",
+        "  [count] positions={}/{} ({}) batches={} touched_buckets={}/{} elapsed={} pos/s={} eta={}",
         format_count(scanned_positions),
-        format_count(target_positions),
-        pct,
+        target_text,
+        pct_text,
         format_count(seen_batches),
         format_count(touched_buckets),
         format_count(stack_count),
         format_duration_secs(elapsed),
         format_count(positions_per_sec.round() as usize),
-        format_duration_secs(eta)
+        eta_text
     );
 }
 
@@ -12484,11 +12529,16 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         Some(threads) => threads,
     };
     let loader_threads = if args.loader_threads == 0 { cuda_cpp_default_cpu_threads() } else { args.loader_threads };
-    let batches = args
-        .positions
-        .checked_add(args.batch_size - 1)
-        .ok_or_else(|| "--positions + --batch-size overflow".to_string())?
-        / args.batch_size;
+    let scan_all = args.positions.is_none();
+    let batches = match args.positions {
+        Some(positions) => {
+            positions
+                .checked_add(args.batch_size - 1)
+                .ok_or_else(|| "--positions + --batch-size overflow".to_string())?
+                / args.batch_size
+        }
+        None => usize::MAX,
+    };
     let config = SfnnTeacherBatchConfig {
         teacher: &args.teacher,
         batch_size: args.batch_size,
@@ -12517,10 +12567,13 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         format_count(stack_count)
     );
     eprintln!(
-        "  scan        = {} positions ({} batch(es) x {} max), shuffle_window={} batch(es)",
-        format_count(args.positions),
-        format_count(batches),
-        format_count(args.batch_size),
+        "  scan        = {} positions ({}), shuffle_window={} batch(es)",
+        args.positions.map(format_count).unwrap_or_else(|| "all".to_string()),
+        if scan_all {
+            "single teacher pass".to_string()
+        } else {
+            format!("{} batch(es) x {} max", format_count(batches), format_count(args.batch_size))
+        },
         format_count(args.teacher_shuffle_buffer_batches)
     );
     eprintln!(
@@ -12536,13 +12589,18 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     let mut total_positions = 0usize;
     let mut seen_batches = 0usize;
 
-    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, batches, |teacher_batch| {
+    for_each_cuda_cpp_sfnn_teacher_batch_with_epoch_mode(feature_kind, &config, batches, scan_all, |teacher_batch| {
         seen_batches += 1;
-        let remaining = args.positions.saturating_sub(total_positions);
-        if remaining == 0 {
-            return Ok(());
-        }
-        let take = remaining.min(teacher_batch.batch.buckets.len());
+        let take = match args.positions {
+            Some(target) => {
+                let remaining = target.saturating_sub(total_positions);
+                if remaining == 0 {
+                    return Ok(());
+                }
+                remaining.min(teacher_batch.batch.buckets.len())
+            }
+            None => teacher_batch.batch.buckets.len(),
+        };
         for &bucket in teacher_batch.batch.buckets.iter().take(take) {
             if bucket < 0 {
                 return Err(format!("teacher batch has negative bucket {bucket}"));
@@ -12558,7 +12616,9 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         }
         if let Some(interval) = progress_interval {
             let now = std::time::Instant::now();
-            if now.duration_since(last_progress) >= interval && total_positions < args.positions {
+            if now.duration_since(last_progress) >= interval
+                && args.positions.is_none_or(|target| total_positions < target)
+            {
                 let touched_buckets = counts.iter().filter(|&&count| count != 0).count();
                 print_bucket_count_progress(
                     total_positions,

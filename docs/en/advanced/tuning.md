@@ -354,6 +354,8 @@ With many bucket stacks, rare stacks can sometimes learn unstable residuals. You
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
+If you omit `--positions`, BulletOu scans every file in the teacher path once.
+
 Then pass it during training:
 
 ```powershell

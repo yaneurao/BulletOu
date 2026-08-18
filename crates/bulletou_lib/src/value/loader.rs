@@ -165,6 +165,7 @@ where
         }
 
         let mut incomplete_buf = Vec::new();
+        let mut stopped_by_callback = false;
 
         self.loader.map_chunks(start_position, |chunk| {
             let remainder = if !incomplete_buf.is_empty() {
@@ -176,6 +177,7 @@ where
                     incomplete_buf.clear();
 
                     if should_break {
+                        stopped_by_callback = true;
                         return true;
                     }
                 } else {
@@ -195,6 +197,7 @@ where
                     let should_break = f(batch);
 
                     if should_break {
+                        stopped_by_callback = true;
                         return true;
                     }
                 }
@@ -202,6 +205,10 @@ where
 
             false
         });
+
+        if !stopped_by_callback && !incomplete_buf.is_empty() {
+            let _ = f(&incomplete_buf);
+        }
     }
 
     fn load_and_map_shuffled_batches_from_position<F: FnMut(&[I::RequiredDataType]) -> bool>(

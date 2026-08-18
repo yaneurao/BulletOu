@@ -278,6 +278,8 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
+`--positions` を省略すると、指定した teacher path に含まれる全ファイルを1回だけ読んで count します。大きな教師データから一部だけサンプリングしたい場合は、上の例のように `--positions` を指定します。
+
 学習時にそのファイルを指定します。
 
 ```powershell

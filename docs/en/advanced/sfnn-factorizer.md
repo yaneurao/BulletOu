@@ -278,6 +278,8 @@ First, create a count.bin file:
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
+If you omit `--positions`, BulletOu scans every file in the teacher path once. Keep `--positions` when you want to sample only a prefix of a very large teacher set.
+
 Then pass it during training:
 
 ```powershell
