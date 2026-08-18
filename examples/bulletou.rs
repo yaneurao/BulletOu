@@ -12180,6 +12180,31 @@ fn bucket_count_percentile(counts: &[u32], pct: f64) -> u32 {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn bucket_count_mean(counts: &[u32]) -> f64 {
+    if counts.is_empty() {
+        0.0
+    } else {
+        counts.iter().map(|&count| count as f64).sum::<f64>() / counts.len() as f64
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn bucket_count_stddev(counts: &[u32], mean: f64) -> f64 {
+    if counts.len() <= 1 {
+        return 0.0;
+    }
+    let variance = counts
+        .iter()
+        .map(|&count| {
+            let diff = count as f64 - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / counts.len() as f64;
+    variance.sqrt()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_bucket_count_decay_lambdas(counts: &SfnnBucketCounts, decay: f32, k: f32) -> Result<Vec<f32>, String> {
     if !(decay.is_finite() && decay >= 0.0) {
         return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
@@ -12490,11 +12515,18 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
 
     let elapsed = started.elapsed();
     let touched_buckets = report.nonzero_count();
-    let top10_sum = {
-        let mut sorted = report.counts.clone();
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        sorted.into_iter().take(10).map(u64::from).sum::<u64>()
-    };
+    let nonzero_counts = report.counts.iter().copied().filter(|&count| count != 0).collect::<Vec<_>>();
+    let nonzero_mean = bucket_count_mean(&nonzero_counts);
+    let nonzero_stddev = bucket_count_stddev(&nonzero_counts, nonzero_mean);
+    let mut top = report
+        .counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .map(|(bucket, &count)| (bucket, count))
+        .collect::<Vec<_>>();
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let top10_sum = top.iter().take(10).map(|&(_, count)| u64::from(count)).sum::<u64>();
     println!("bucket-count complete:");
     println!("  arch              = {}", report.arch);
     println!("  layerstack        = {}", layerstack.cli_name());
@@ -12510,15 +12542,32 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         100.0 * touched_buckets as f64 / report.stack_count().max(1) as f64
     );
     println!("  zero_buckets      = {}", format_count(report.stack_count() - touched_buckets));
-    println!("  min_nonzero       = {}", format_count(report.min_nonzero() as usize));
-    println!("  p50               = {}", format_count(bucket_count_percentile(&report.counts, 0.50) as usize));
-    println!("  p90               = {}", format_count(bucket_count_percentile(&report.counts, 0.90) as usize));
-    println!("  p99               = {}", format_count(bucket_count_percentile(&report.counts, 0.99) as usize));
-    println!("  max               = {}", format_count(report.max() as usize));
+    println!(
+        "  count_per_bucket  = all: p50 {}, p90 {}, p99 {}, max {}",
+        format_count(bucket_count_percentile(&report.counts, 0.50) as usize),
+        format_count(bucket_count_percentile(&report.counts, 0.90) as usize),
+        format_count(bucket_count_percentile(&report.counts, 0.99) as usize),
+        format_count(report.max() as usize)
+    );
+    println!(
+        "  count_per_seen    = mean {:.1}, std {:.1}, min {}, p50 {}, p90 {}, p99 {}, max {}",
+        nonzero_mean,
+        nonzero_stddev,
+        format_count(report.min_nonzero() as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.50) as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.90) as usize),
+        format_count(bucket_count_percentile(&nonzero_counts, 0.99) as usize),
+        format_count(report.max() as usize)
+    );
     println!(
         "  top10_share       = {:.2}% of scanned positions",
         if total_positions == 0 { 0.0 } else { 100.0 * top10_sum as f64 / total_positions as f64 }
     );
+    println!("  top_buckets       = bucket:count(share)");
+    for (bucket, count) in top.into_iter().take(10) {
+        let share = if total_positions == 0 { 0.0 } else { 100.0 * count as f64 / total_positions as f64 };
+        println!("    {}:{} ({:.3}%)", bucket, format_count(count as usize), share);
+    }
     Ok(())
 }
 
