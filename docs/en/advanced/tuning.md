@@ -363,8 +363,10 @@ Then pass it during training:
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
 --sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k 10000
+--sfnn-residual-count-decay-k-ratio 0.1
 ```
+
+`--sfnn-residual-count-decay-k-ratio 0.1` means: apply the strongest damping up to roughly 10% of the average bucket count. BulletOu computes the average from the scanned position count stored in `count.bin`, so you do not have to manually retune raw K whenever the count file is built from a different number of positions.
 
 The decay applies to the bucket-specific residual, not to the factorizer component. High-count buckets can learn a larger residual; low-count buckets stay closer to the shared factorizer structure.
 

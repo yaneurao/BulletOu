@@ -287,7 +287,7 @@ Then pass it during training:
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
 --sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k 10000
+--sfnn-residual-count-decay-k-ratio 0.1
 ```
 
 The per-stack decay coefficient is:
@@ -296,7 +296,16 @@ The per-stack decay coefficient is:
 lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
 ```
 
-`lambda0` is `--sfnn-residual-count-decay`, and `K` is `--sfnn-residual-count-decay-k`.
+`lambda0` is `--sfnn-residual-count-decay`. By default, `K` is computed automatically:
+
+```text
+average_count = positions recorded in count.bin / number of stacks
+K = average_count * --sfnn-residual-count-decay-k-ratio
+```
+
+For example, `--sfnn-residual-count-decay-k-ratio 0.1` means: apply the strongest damping up to roughly 10% of the average bucket count. Because the total scanned position count is stored in `count.bin`, the same ratio keeps roughly the same meaning even if you build the count file from a different number of positions.
+
+If you really want to specify a raw count threshold, use `--sfnn-residual-count-decay-k <count>`. In that case, `--sfnn-residual-count-decay-k-ratio` is ignored.
 
 | count | Behavior |
 |---:|---|

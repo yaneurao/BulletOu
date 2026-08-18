@@ -287,7 +287,7 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
 --sfnn-residual-count-decay 1e-7 `
---sfnn-residual-count-decay-k 10000
+--sfnn-residual-count-decay-k-ratio 0.1
 ```
 
 stack ごとの減衰係数は次の式です。
@@ -296,7 +296,16 @@ stack ごとの減衰係数は次の式です。
 lambda_stack = lambda0 * min(1, sqrt((K + 1) / (count_stack + 1)))
 ```
 
-`lambda0` が `--sfnn-residual-count-decay`、`K` が `--sfnn-residual-count-decay-k` です。
+`lambda0` が `--sfnn-residual-count-decay` です。`K` はデフォルトでは次のように自動計算されます。
+
+```text
+average_count = count.bin に記録された集計局面数 / stack 数
+K = average_count * --sfnn-residual-count-decay-k-ratio
+```
+
+つまり `--sfnn-residual-count-decay-k-ratio 0.1` は、「平均的な bucket 出現回数の 10% ぐらいまでを rare bucket として強めに抑える」という意味です。`count.bin` に集計局面数が入っているので、5億局面で count しても50億局面で count しても、同じ ratio ならだいたい同じ意味になります。
+
+生の count 値で直接指定したい場合だけ、上級者向けに `--sfnn-residual-count-decay-k <count>` を使えます。この場合は `--sfnn-residual-count-decay-k-ratio` は使われません。
 
 | count | 挙動 |
 |---:|---|
