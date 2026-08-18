@@ -118,8 +118,7 @@ fn shogi_perspective_king_squares_from_board(board: &ShogiBoard) -> (Square, Squ
 }
 
 #[inline]
-fn shogi_king_rank_bucket_from_board<const N: usize>(board: &ShogiBoard) -> usize {
-    let (f_sq, e_sq) = shogi_perspective_king_squares_from_board(board);
+fn shogi_king_rank_bucket_from_perspective_squares<const N: usize>(f_sq: Square, e_sq: Square) -> usize {
     let f_rank = f_sq.rank() as usize;
     let e_rank = e_sq.rank() as usize;
 
@@ -868,6 +867,16 @@ impl ShogiSfnnHandBucketKind {
 
     pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
         let (stm_hand, ntm_hand) = shogi_stm_ntm_hands_from_board(board);
+        self.bucket_from_stm_ntm_hands(stm_hand, ntm_hand)
+    }
+
+    fn bucket_from_hands(self, stm: Color, black_hand: Hand, white_hand: Hand) -> usize {
+        let (stm_hand, ntm_hand) =
+            if stm == Color::Black { (black_hand, white_hand) } else { (white_hand, black_hand) };
+        self.bucket_from_stm_ntm_hands(stm_hand, ntm_hand)
+    }
+
+    fn bucket_from_stm_ntm_hands(self, stm_hand: Hand, ntm_hand: Hand) -> usize {
         match self {
             Self::None => 0,
             Self::Hand4 => shogi_hand4_single_bucket(stm_hand) * 2 + shogi_hand4_single_bucket(ntm_hand),
@@ -932,10 +941,22 @@ impl ShogiSfnnKingBucketKind {
 
     pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
         let (f_sq, e_sq) = shogi_perspective_king_squares_from_board(board);
+        self.bucket_from_perspective_squares(f_sq, e_sq)
+    }
+
+    fn bucket_from_perspective(self, stm: Color, black_king: Square, white_king: Square) -> usize {
+        let f_king = if stm == Color::Black { black_king } else { white_king };
+        let e_king = if stm == Color::Black { white_king } else { black_king };
+        let f_sq = if stm == Color::Black { f_king } else { f_king.inverse() };
+        let e_sq = if stm == Color::Black { e_king.inverse() } else { e_king };
+        self.bucket_from_perspective_squares(f_sq, e_sq)
+    }
+
+    fn bucket_from_perspective_squares(self, f_sq: Square, e_sq: Square) -> usize {
         match self {
             Self::None => 0,
-            Self::KingRank9 => shogi_king_rank_bucket_from_board::<9>(board),
-            Self::KingRank81 => shogi_king_rank_bucket_from_board::<81>(board),
+            Self::KingRank9 => shogi_king_rank_bucket_from_perspective_squares::<9>(f_sq, e_sq),
+            Self::KingRank81 => shogi_king_rank_bucket_from_perspective_squares::<81>(f_sq, e_sq),
             Self::King9ZoneByKing9Zone => {
                 shogi_king9_zone_single_bucket(f_sq) * 9 + shogi_king9_zone_single_bucket(e_sq)
             }
@@ -1144,12 +1165,316 @@ impl ShogiSfnnLayerStackBucketKind {
         self.bucket_from_board(&board)
     }
 
+    /// Faster equivalent of [`Self::bucket`] for diagnostics that only need
+    /// the LayerStack index.
+    ///
+    /// The normal path decodes a full [`ShogiBoard`].  Bucket assignment only
+    /// needs side-to-move, king squares, hand counts, and for BulletOu's
+    /// built-in `progressN` heuristic the number of horses/dragons.  This
+    /// method reads just those pieces of information from the packed Huffman
+    /// stream.  If a future non-material progress model is installed, it falls
+    /// back to the full decode path.
+    pub fn bucket_fast(self, pos: &PackedSfenValue) -> usize {
+        let (stm, black_king, white_king) = shogi_sfnn_fast_side_and_kings(pos);
+        let king_bucket = self.king.bucket_from_perspective(stm, black_king, white_king);
+        let progress_count = self.progress.bucket_count();
+        let progress_needs_material = progress_count > 1
+            && SHOGI_SFNN_PROGRESS_Q16_PARAMS.get().is_some()
+            && SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC.get().copied().unwrap_or(false);
+        let progress_is_neutral = progress_count > 1 && SHOGI_SFNN_PROGRESS_Q16_PARAMS.get().is_none();
+        if self.hand == ShogiSfnnHandBucketKind::None && self.progress == ShogiSfnnProgressBucketKind::None {
+            return king_bucket;
+        }
+        if progress_count > 1 && !progress_needs_material && !progress_is_neutral {
+            return self.bucket(pos);
+        }
+
+        let parts = if self.hand != ShogiSfnnHandBucketKind::None || progress_needs_material {
+            Some(shogi_sfnn_fast_decode_bucket_parts(pos, progress_needs_material))
+        } else {
+            None
+        };
+        let hand_bucket = parts
+            .as_ref()
+            .map_or(0, |parts| self.hand.bucket_from_hands(parts.stm, parts.black_hand, parts.white_hand));
+        let progress_bucket = if progress_count <= 1 {
+            0
+        } else if progress_is_neutral {
+            shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_sum_q16(0), progress_count)
+        } else {
+            let parts = parts.expect("material progress parts decoded above");
+            let sum_q16 = shogi_sfnn_material_heuristic_sum_q16_from_parts(
+                parts.black_hand,
+                parts.white_hand,
+                parts.horse_count,
+                parts.dragon_count,
+            );
+            shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16), progress_count)
+        };
+        (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
+    }
+
     pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
         let hand_bucket = self.hand.bucket_from_board(board);
         let king_bucket = self.king.bucket_from_board(board);
         let progress_bucket = self.progress.bucket_from_board(board);
         (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
     }
+}
+
+#[derive(Clone, Copy)]
+struct ShogiSfnnFastBucketParts {
+    stm: Color,
+    black_hand: Hand,
+    white_hand: Hand,
+    horse_count: u8,
+    dragon_count: u8,
+}
+
+#[inline]
+fn shogi_sfnn_fast_side_and_kings(pos: &PackedSfenValue) -> (Color, Square, Square) {
+    let bytes = pos.sfen().as_bytes();
+    let stm = if (bytes[0] & 1) != 0 { Color::White } else { Color::Black };
+    let black_king = Square((bytes[0] >> 1) & 0x7f);
+    let white_king = Square(bytes[1] & 0x7f);
+    (stm, black_king, white_king)
+}
+
+fn shogi_sfnn_fast_decode_bucket_parts(
+    pos: &PackedSfenValue,
+    count_material_progress: bool,
+) -> ShogiSfnnFastBucketParts {
+    let (stm, black_king, white_king) = shogi_sfnn_fast_side_and_kings(pos);
+    let mut stream = ShogiSfnnFastBitReader::new(pos.sfen().as_bytes());
+    stream.skip(1);
+    stream.skip(7);
+    stream.skip(7);
+
+    let mut horse_count = 0u8;
+    let mut dragon_count = 0u8;
+    for sq_idx in 0..81u8 {
+        if sq_idx == black_king.0 || sq_idx == white_king.0 {
+            continue;
+        }
+        let piece = stream.decode_board_piece();
+        if count_material_progress {
+            match piece {
+                ShogiSfnnFastBoardPiece::Horse => horse_count = horse_count.saturating_add(1),
+                ShogiSfnnFastBoardPiece::Dragon => dragon_count = dragon_count.saturating_add(1),
+                ShogiSfnnFastBoardPiece::None | ShogiSfnnFastBoardPiece::Other => {}
+            }
+        }
+    }
+
+    let mut black_hand = Hand::EMPTY;
+    let mut white_hand = Hand::EMPTY;
+    while stream.cursor() < 256 {
+        let Some((color, piece_type, is_piecebox)) = stream.decode_hand_piece() else {
+            break;
+        };
+        if is_piecebox {
+            continue;
+        }
+        match color {
+            Color::Black => black_hand.add(piece_type, 1),
+            Color::White => white_hand.add(piece_type, 1),
+        }
+    }
+
+    ShogiSfnnFastBucketParts { stm, black_hand, white_hand, horse_count, dragon_count }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShogiSfnnFastBoardPiece {
+    None,
+    Horse,
+    Dragon,
+    Other,
+}
+
+struct ShogiSfnnFastBitReader<'a> {
+    bytes: &'a [u8],
+    bit_cursor: usize,
+}
+
+impl<'a> ShogiSfnnFastBitReader<'a> {
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_cursor: 0 }
+    }
+
+    #[inline]
+    fn cursor(&self) -> usize {
+        self.bit_cursor
+    }
+
+    #[inline]
+    fn skip(&mut self, bits: usize) {
+        self.bit_cursor = self.bit_cursor.saturating_add(bits);
+    }
+
+    #[inline]
+    fn bit(&self, offset: usize) -> bool {
+        ((self.peek16() >> offset) & 1) != 0
+    }
+
+    #[inline]
+    fn peek16(&self) -> u32 {
+        let byte = self.bit_cursor >> 3;
+        let shift = self.bit_cursor & 7;
+        let b0 = u32::from(*self.bytes.get(byte).unwrap_or(&0));
+        let b1 = u32::from(*self.bytes.get(byte + 1).unwrap_or(&0));
+        let b2 = u32::from(*self.bytes.get(byte + 2).unwrap_or(&0));
+        ((b0 | (b1 << 8) | (b2 << 16)) >> shift) & 0xffff
+    }
+
+    #[inline]
+    fn decode_board_piece(&mut self) -> ShogiSfnnFastBoardPiece {
+        let bits = self.peek16();
+
+        if (bits & 0b1) == 0 {
+            self.skip(1);
+            return ShogiSfnnFastBoardPiece::None;
+        }
+        if (bits & 0b11) == 0b01 {
+            // Pawn: Huffman 2 bits + promoted bit + color bit.
+            self.skip(4);
+            return ShogiSfnnFastBoardPiece::Other;
+        }
+
+        match bits & 0b1111 {
+            0b0011 | 0b1011 | 0b0111 => {
+                // Lance/Knight/Silver: Huffman 4 bits + promoted bit + color bit.
+                self.skip(6);
+                return ShogiSfnnFastBoardPiece::Other;
+            }
+            _ => {}
+        }
+
+        if (bits & 0b1_1111) == 0b0_1111 {
+            // Gold: Huffman 5 bits + color bit.
+            self.skip(6);
+            return ShogiSfnnFastBoardPiece::Other;
+        }
+
+        match bits & 0b11_1111 {
+            0b01_1111 => {
+                // Bishop: Huffman 6 bits + promoted bit + color bit.
+                let promoted = self.bit(6);
+                self.skip(8);
+                if promoted { ShogiSfnnFastBoardPiece::Horse } else { ShogiSfnnFastBoardPiece::Other }
+            }
+            0b11_1111 => {
+                // Rook: Huffman 6 bits + promoted bit + color bit.
+                let promoted = self.bit(6);
+                self.skip(8);
+                if promoted { ShogiSfnnFastBoardPiece::Dragon } else { ShogiSfnnFastBoardPiece::Other }
+            }
+            _ => {
+                self.skip(6);
+                ShogiSfnnFastBoardPiece::None
+            }
+        }
+    }
+
+    #[inline]
+    fn decode_hand_piece(&mut self) -> Option<(Color, PieceType, bool)> {
+        if self.bit_cursor >= 256 {
+            return None;
+        }
+
+        let bits = self.peek16();
+        if (bits & 0b1) == 0 {
+            // Pawn: hand Huffman 1 bit + piecebox bit + color bit.
+            let is_piecebox = self.bit(1);
+            let color = if self.bit(2) { Color::White } else { Color::Black };
+            self.skip(3);
+            return Some((color, PieceType::Pawn, is_piecebox));
+        }
+
+        match bits & 0b111 {
+            0b001 => {
+                let is_piecebox = self.bit(3);
+                let color = if self.bit(4) { Color::White } else { Color::Black };
+                self.skip(5);
+                return Some((color, PieceType::Lance, is_piecebox));
+            }
+            0b101 => {
+                let is_piecebox = self.bit(3);
+                let color = if self.bit(4) { Color::White } else { Color::Black };
+                self.skip(5);
+                return Some((color, PieceType::Knight, is_piecebox));
+            }
+            0b011 => {
+                let is_piecebox = self.bit(3);
+                let color = if self.bit(4) { Color::White } else { Color::Black };
+                self.skip(5);
+                return Some((color, PieceType::Silver, is_piecebox));
+            }
+            _ => {}
+        }
+
+        if (bits & 0b1111) == 0b0111 {
+            // Gold: hand Huffman 4 bits + color bit.
+            let color = if self.bit(4) { Color::White } else { Color::Black };
+            self.skip(5);
+            return Some((color, PieceType::Gold, false));
+        }
+
+        match bits & 0b1_1111 {
+            0b0_1111 => {
+                let is_piecebox = self.bit(5);
+                let color = if self.bit(6) { Color::White } else { Color::Black };
+                self.skip(7);
+                Some((color, PieceType::Bishop, is_piecebox))
+            }
+            0b1_1111 => {
+                let is_piecebox = self.bit(5);
+                let color = if self.bit(6) { Color::White } else { Color::Black };
+                self.skip(7);
+                Some((color, PieceType::Rook, is_piecebox))
+            }
+            _ => {
+                self.skip(5);
+                None
+            }
+        }
+    }
+}
+
+#[inline]
+fn shogi_sfnn_material_heuristic_sum_q16_from_parts(
+    black_hand: Hand,
+    white_hand: Hand,
+    horse_count: u8,
+    dragon_count: u8,
+) -> i64 {
+    #[inline]
+    fn q16(x: f32) -> i64 {
+        (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i64
+    }
+
+    let mut sum_q16 = q16(-3.0);
+    let hand_point = 0.07_f32;
+    let pawn = q16(hand_point * 1.0);
+    let lance_knight = q16(hand_point * 2.0);
+    let silver_gold = q16(hand_point * 3.0);
+    let bishop_rook = q16(hand_point * 5.0);
+    let horse = q16(0.18);
+    let dragon = q16(0.22);
+
+    sum_q16 += 2 * i64::from(horse_count) * horse;
+    sum_q16 += 2 * i64::from(dragon_count) * dragon;
+    for hand in [black_hand, white_hand] {
+        sum_q16 += 2 * i64::from(hand.pawn()) * pawn;
+        sum_q16 += 2 * i64::from(hand.lance()) * lance_knight;
+        sum_q16 += 2 * i64::from(hand.knight()) * lance_knight;
+        sum_q16 += 2 * i64::from(hand.silver()) * silver_gold;
+        sum_q16 += 2 * i64::from(hand.gold()) * silver_gold;
+        sum_q16 += 2 * i64::from(hand.bishop()) * bishop_rook;
+        sum_q16 += 2 * i64::from(hand.rook()) * bishop_rook;
+    }
+    sum_q16
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2277,6 +2602,37 @@ mod tests {
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiKingRankBucket::<81>.bucket(&startpos_like), 80);
         assert_eq!(ShogiKingRankBucket::<9>.bucket(&startpos_like), 8);
+    }
+
+    #[test]
+    fn test_shogi_sfnn_layerstack_bucket_fast_matches_full_decode() {
+        let _ = set_shogi_sfnn_progress_q16_params(ShogiSfnnProgressQ16Params::material_heuristic());
+        let positions = [
+            psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0)),
+            psv_with_kings(Color::White, Square::new(4, 2), Square::new(3, 7)),
+            psv_with_kings(Color::Black, Square::new(0, 6), Square::new(8, 2)),
+        ];
+        let kinds = [
+            ShogiSfnnLayerStackBucketKind::Single,
+            ShogiSfnnLayerStackBucketKind::KingRank9,
+            ShogiSfnnLayerStackBucketKind::KingRank81,
+            ShogiSfnnLayerStackBucketKind::King9ZoneByKing9Zone,
+            ShogiSfnnLayerStackBucketKind::King13ZoneByKing13Zone,
+            ShogiSfnnLayerStackBucketKind::King21ByKing21,
+            ShogiSfnnLayerStackBucketKind::King29ByKing29,
+            ShogiSfnnLayerStackBucketKind::Hand1024,
+            ShogiSfnnLayerStackBucketKind::Hand1024KingRank9,
+            ShogiSfnnLayerStackBucketKind::new(
+                ShogiSfnnHandBucketKind::Hand1024,
+                ShogiSfnnKingBucketKind::KingRank9,
+                ShogiSfnnProgressBucketKind::Progress4,
+            ),
+        ];
+        for pos in positions {
+            for kind in kinds {
+                assert_eq!(kind.bucket_fast(&pos), kind.bucket(&pos), "kind={kind:?}");
+            }
+        }
     }
 
     #[test]

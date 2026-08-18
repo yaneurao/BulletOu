@@ -12339,9 +12339,10 @@ fn add_sfnn_bucket_counts_from_positions(
     if positions.is_empty() {
         return Ok(());
     }
+    let bucket_kind = layerstack.bucket_kind();
     if threads <= 1 || positions.len() < 4096 {
         for pos in positions {
-            let bucket = layerstack.bucket_index(pos);
+            let bucket = bucket_kind.bucket_fast(pos);
             if bucket >= stack_count {
                 return Err(format!("teacher position bucket {bucket} is out of range 0..{stack_count}"));
             }
@@ -12360,7 +12361,7 @@ fn add_sfnn_bucket_counts_from_positions(
             .map(|chunk| {
                 let mut local = vec![0u32; stack_count];
                 for pos in chunk {
-                    let bucket = layerstack.bucket_index(pos);
+                    let bucket = bucket_kind.bucket_fast(pos);
                     if bucket >= stack_count {
                         return Err(format!("teacher position bucket {bucket} is out of range 0..{stack_count}"));
                     }
