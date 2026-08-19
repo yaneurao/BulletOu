@@ -413,6 +413,27 @@ python .\spsa_local_runner.py `
   --sfnn-saturation-penalty 1e-7
 ```
 
+`--tune` は「runner が動かすパラメーター」を指定します。
+
+| 指定 | 動くもの |
+| --- | --- |
+| `--tune alpha` | `shared_alpha`, `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha`, `pair_alpha` |
+| `--tune axis` | `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha` |
+| `--tune pair` | `pair_alpha` だけ。`king-hand` などの3種類を個別には動かさない |
+| `--tune count` | residual count、axis count、pair count の全体 |
+| `--tune axis_count` | `king_axis_count`, `hand_axis_count`, `progress_axis_count` |
+| `--tune pair_count` | `king_hand_pair_count`, `king_progress_pair_count`, `hand_progress_pair_count` |
+
+shared 以外を全部動かしたい場合は、次のようにします。
+
+```powershell
+--tune alpha `
+--tune count `
+--fixed shared
+```
+
+この場合、`--tune alpha` には `shared_alpha` も含まれるので、`--fixed shared` を必ず付けます。
+
 `--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、各 trial で共通に使う学習条件を書きます。
 
 runner が自動で指定するので、後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。

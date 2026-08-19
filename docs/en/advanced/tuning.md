@@ -427,6 +427,27 @@ python .\spsa_local_runner.py `
   --sfnn-saturation-penalty 1e-7
 ```
 
+`--tune` chooses which parameters the runner is allowed to move.
+
+| Setting | Parameters moved |
+| --- | --- |
+| `--tune alpha` | `shared_alpha`, `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha`, `pair_alpha` |
+| `--tune axis` | `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha` |
+| `--tune pair` | `pair_alpha` only. It does not tune the three pair families separately |
+| `--tune count` | residual count, axis count, and pair count |
+| `--tune axis_count` | `king_axis_count`, `hand_axis_count`, `progress_axis_count` |
+| `--tune pair_count` | `king_hand_pair_count`, `king_progress_pair_count`, `hand_progress_pair_count` |
+
+To tune everything except shared, use:
+
+```powershell
+--tune alpha `
+--tune count `
+--fixed shared
+```
+
+`--tune alpha` includes `shared_alpha`, so keep `--fixed shared` there.
+
 The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common trial options such as `--lr` and `--optimizer` there.
 
 Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial.

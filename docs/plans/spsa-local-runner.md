@@ -110,6 +110,25 @@ shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,k
 - `--tune axis_count`
 - `--tune pair_count`
 
+対応関係:
+
+| 指定 | 動くもの |
+| --- | --- |
+| `--tune alpha` | `shared_alpha`, `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha`, `pair_alpha` |
+| `--tune axis` | `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha` |
+| `--tune pair` | `pair_alpha` だけ |
+| `--tune count` | residual count、axis count、pair count の全体 |
+| `--tune axis_count` | `king_axis_count`, `hand_axis_count`, `progress_axis_count` |
+| `--tune pair_count` | `king_hand_pair_count`, `king_progress_pair_count`, `hand_progress_pair_count` |
+
+shared 以外を全部動かすなら:
+
+```powershell
+--tune alpha `
+--tune count `
+--fixed shared
+```
+
 `--fixed shared` を付けると、shared は固定される。shared は全体の土台になりやすいので、最初の実験では固定するほうが結果を読みやすい。
 
 ## qloss が悪化したときの扱い

@@ -203,7 +203,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Parameter or group to tune. Repeatable. Groups: alpha, axis, pair, count, "
-            "axis_count, pair_count. Default: non-zero parameters except shared_alpha."
+            "axis_count, pair_count. `pair` means pair_alpha only; `pair_count` means "
+            "king_hand/king_progress/hand_progress pair count confidences. Default: "
+            "non-zero parameters except shared_alpha."
         ),
     )
     parser.add_argument("--fixed", action="append", default=[], help="Parameter to keep fixed. Repeatable.")
