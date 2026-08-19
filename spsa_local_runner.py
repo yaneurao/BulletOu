@@ -195,6 +195,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-step-scale", type=float, default=2.0)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--no-stream-child-output",
+        action="store_true",
+        help="Do not mirror bulletou.exe stdout to the console. Logs are still saved.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to bulletou.exe")
     args = parser.parse_args()
@@ -587,16 +592,31 @@ def run_trial(
 ) -> TrialResult:
     cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
     log_path = log_dir / f"{tag}.stdout.log"
-    print(f"[run] {side} tag={tag}")
-    print("      " + subprocess.list2cmdline(cmd))
+    print(f"[run] {side} tag={tag}", flush=True)
+    print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"))
     start = time.time()
     with log_path.open("w", encoding="utf-8", newline="") as log:
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log.write(line)
+            log.flush()
+            if not args.no_stream_child_output:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        returncode = proc.wait()
     elapsed = time.time() - start
-    if proc.returncode != 0:
-        raise RuntimeError(f"trial {tag} failed with exit code {proc.returncode}; see {log_path}")
+    if returncode != 0:
+        raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
     output_dir = find_output_dir(trial_output_folder, tag)
     row = last_summary_row(output_dir / "summary-learn.log")
     metric = metric_from_row(row)
@@ -611,7 +631,8 @@ def run_trial(
         raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
     print(
         f"[done] {side} tag={tag} score={score:.9f} "
-        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s"
+        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+        flush=True,
     )
     return TrialResult(side, tag, output_dir, next_checkpoint, metric, score)
 
@@ -698,7 +719,8 @@ def main() -> int:
 
             print(
                 f"[iter] {iteration}/{args.iterations} base_score={base_score:.9f} "
-                f"step_scale={step_scale:.4f} failed_retries={failed_retries}"
+                f"step_scale={step_scale:.4f} failed_retries={failed_retries}",
+                flush=True,
             )
             write_json(
                 state_path,
@@ -757,7 +779,7 @@ def main() -> int:
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
                 },
             )
-            print(f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f}")
+            print(f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f}", flush=True)
 
         write_json(
             state_path,
@@ -772,9 +794,9 @@ def main() -> int:
                 "complete": True,
             },
         )
-        print(f"[complete] runner_dir={runner_dir}")
-        print(f"[complete] best_checkpoint={accepted_checkpoint}")
-        print(f"[complete] best_score={base_score:.9f}")
+        print(f"[complete] runner_dir={runner_dir}", flush=True)
+        print(f"[complete] best_checkpoint={accepted_checkpoint}", flush=True)
+        print(f"[complete] best_score={base_score:.9f}", flush=True)
         return 0
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -357,6 +357,66 @@ count decay は factorizer 成分ではなく、bucket 固有の residual にだ
 
 axis 行・pair 行そのものを count に応じて弱めたい場合は、`--sfnn-axis-count-confidence` と `--sfnn-pair-count-confidence` を使います。特定の種類だけ強さを変えたい場合は、`--sfnn-king-axis-count-confidence` や `--sfnn-hand-progress-pair-count-confidence` のような個別指定を使います。詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 
+### 6.3 qloss を見ながら自動調整する
+
+factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。既に良い checkpoint がある場合は、`spsa_local_runner.py` で近傍探索できます。
+
+この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) が良いほうだけを採用します。accuracy は値が荒いので、採否判断には qloss を使います。
+
+```text
+1 iteration:
+  plus  trial: base checkpoint から 8 sb 学習
+  minus trial: base checkpoint から 8 sb 学習
+  qloss が小さいほうを次の base checkpoint にする
+```
+
+`--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
+
+例:
+
+```powershell
+$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
+
+python .\spsa_local_runner.py `
+  --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --base-checkpoint $base `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --output-folder D:\BulletOu-snapshots\20260820 `
+  --tag-prefix spsa-pair2-qloss `
+  --factorizer pair `
+  --iterations 20 `
+  --sb-per-trial 8 `
+  --positions-per-superbatch 40000000 `
+  --metric quantized_value_loss `
+  --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
+  --tune axis `
+  --tune pair `
+  --tune count `
+  --fixed shared `
+  -- `
+  --lr 0.000100 `
+  --lr-min 0.000100 `
+  --wrm-in-offset 0 `
+  --wrm-target-offset 0 `
+  --lr-schedule step `
+  --optimizer ranger `
+  --optimizer-weight-decay 0.0 `
+  --batches-per-update 1 `
+  --sfnn-dirty-bucket-update `
+  --sfnn-saturation-penalty 1e-7
+```
+
+`--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、各 trial で共通に使う学習条件を書きます。
+
+runner が自動で指定するので、後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。
+
+runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
+
+各 trial の checkpoint、標準出力、採否履歴は `--output-folder` の下に作られる runner 専用フォルダへ保存されます。元の checkpoint は上書きされません。
+
 ## 7. 保存と検証の頻度
 
 保存と検証は別々に指定できます。

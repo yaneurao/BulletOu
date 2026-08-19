@@ -371,6 +371,66 @@ The decay applies to the bucket-specific residual, not to the factorizer compone
 
 You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confidence` and `--sfnn-pair-count-confidence`. If one family needs a different strength, use the split options such as `--sfnn-king-axis-count-confidence` or `--sfnn-hand-progress-pair-count-confidence`. See [SFNN factorizer](sfnn-factorizer.md) for the formulas and the model-side interpretation.
 
+### 7.3 Automatic local tuning by qloss
+
+Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `spsa_local_runner.py` to search nearby settings instead of hand-writing many small runs.
+
+The runner branches two short trials, `plus` and `minus`, from the same checkpoint. It adopts only the checkpoint with the lower quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
+
+```text
+1 iteration:
+  plus  trial: train 8 sb from the base checkpoint
+  minus trial: train 8 sb from the base checkpoint
+  adopt the side with lower qloss
+```
+
+`--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
+
+Example:
+
+```powershell
+$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
+
+python .\spsa_local_runner.py `
+  --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --base-checkpoint $base `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --output-folder D:\BulletOu-snapshots\20260820 `
+  --tag-prefix spsa-pair2-qloss `
+  --factorizer pair `
+  --iterations 20 `
+  --sb-per-trial 8 `
+  --positions-per-superbatch 40000000 `
+  --metric quantized_value_loss `
+  --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
+  --tune axis `
+  --tune pair `
+  --tune count `
+  --fixed shared `
+  -- `
+  --lr 0.000100 `
+  --lr-min 0.000100 `
+  --wrm-in-offset 0 `
+  --wrm-target-offset 0 `
+  --lr-schedule step `
+  --optimizer ranger `
+  --optimizer-weight-decay 0.0 `
+  --batches-per-update 1 `
+  --sfnn-dirty-bucket-update `
+  --sfnn-saturation-penalty 1e-7
+```
+
+The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common trial options such as `--lr` and `--optimizer` there.
+
+Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial.
+
+The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
+
+Trial checkpoints, stdout logs, and the accept/reject history are written under a runner directory below `--output-folder`. The source checkpoint is not overwritten.
+
 ## 8. Save and validation frequency
 
 Save and validation frequency are independent:
