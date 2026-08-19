@@ -375,7 +375,7 @@ You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confiden
 
 Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `spsa_local_runner.py` to search nearby settings instead of hand-writing many small runs.
 
-The runner branches two short trials, `plus` and `minus`, from the same checkpoint. It adopts only the checkpoint with the lower quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
+The runner branches two short trials, `plus` and `minus`, from the same checkpoint and compares their quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
 
 At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss by itself. It prints the result as a `[base]` line. Use `--base-metric-source summary` only when you explicitly want to read the existing summary instead.
 
@@ -385,12 +385,15 @@ If both trials are worse than the base, the runner does not adopt either side im
 1 iteration:
   plus  trial: train 8 sb from the base checkpoint
   minus trial: train 8 sb from the base checkpoint
-  adopt the side with lower qloss
+  adopt the checkpoint from the side with lower qloss
+  move the parameters only partway toward the winning side
 ```
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
-The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` initially becomes roughly `0.309` and `0.291` on the plus/minus sides. If both sides get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` initially becomes roughly `0.309` and `0.291` on the plus/minus sides. With the default `--update-mode spsa`, the runner does not jump directly to the winning trial value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width toward the winning side, so this example moves to roughly `0.3009`, not `0.309`. If both sides get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+
+Use `--update-mode winner` only if you explicitly want to jump directly to the winning trial's parameter values.
 
 By default, the plus/minus trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
 
@@ -462,7 +465,7 @@ Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--valid
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
-The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
+The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The accepted summary includes `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`, so you can see how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
 ## 8. Save and validation frequency
 

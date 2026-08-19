@@ -3,8 +3,10 @@
 
 This script does not change BulletOu's training algorithm.  It repeatedly
 branches from a checkpoint, runs two short trials with slightly different
-factorizer hyperparameters, and adopts the better checkpoint according to
-quantized validation loss.
+factorizer hyperparameters, estimates an SPSA direction from the plus/minus
+losses, and updates the hyperparameters by a small fraction of that
+perturbation width.
+The model weights are continued from the better short trial checkpoint.
 
 Typical use:
 
@@ -183,6 +185,13 @@ class RetryBest:
     theta: dict[str, float]
 
 
+@dataclass(frozen=True)
+class SpsaUpdate:
+    theta: dict[str, float]
+    gradient_log: dict[str, float]
+    log_update: dict[str, float]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run short plus/minus BulletOu trials and adopt better factorizer hyperparameters."
@@ -278,6 +287,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-grow", type=float, default=1.01, help="Grow factor after an improving acceptance")
     parser.add_argument("--min-step-scale", type=float, default=1.005)
     parser.add_argument("--max-step-scale", type=float, default=1.10)
+    parser.add_argument(
+        "--update-mode",
+        choices=["spsa", "winner"],
+        default="spsa",
+        help=(
+            "How to update theta after plus/minus trials. `spsa` uses the plus/minus "
+            "loss difference as a gradient estimate. `winner` keeps the old behavior "
+            "and jumps to the better trial's theta."
+        ),
+    )
+    parser.add_argument(
+        "--spsa-move-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Fraction of the plus/minus perturbation used for the accepted theta update. "
+            "Default 0.1 means move theta by 10%% of the current delta width."
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -318,6 +346,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min-step-scale should be > 1")
     if args.max_step_scale < args.min_step_scale:
         parser.error("--max-step-scale must be >= --min-step-scale")
+    if not math.isfinite(args.spsa_move_ratio) or args.spsa_move_ratio < 0.0:
+        parser.error("--spsa-move-ratio must be finite and >= 0")
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
     return args
@@ -525,13 +555,24 @@ def tuned_keys(args: argparse.Namespace, theta: dict[str, float]) -> list[str]:
     return [key for key in keys if key not in fixed]
 
 
+def theta_log_offset(lo: float, hi: float) -> float:
+    return max(1.0e-6, min(0.01, (hi - lo) * 1.0e-4))
+
+
+def theta_to_log(value: float, lo: float, hi: float) -> float:
+    return math.log(max(value, lo) + theta_log_offset(lo, hi))
+
+
+def theta_from_log(value: float, lo: float, hi: float) -> float:
+    return min(max(math.exp(value) - theta_log_offset(lo, hi), lo), hi)
+
+
 def perturb_value(value: float, sign: int, step_scale: float, lo: float, hi: float) -> float:
     if lo == hi:
         return lo
-    offset = max(1.0e-6, min(0.01, (hi - lo) * 1.0e-4))
-    y = math.log(max(value, lo) + offset)
+    y = theta_to_log(value, lo, hi)
     y += sign * math.log(step_scale)
-    return min(max(math.exp(y) - offset, lo), hi)
+    return theta_from_log(y, lo, hi)
 
 
 def make_variant(
@@ -546,6 +587,42 @@ def make_variant(
         lo, hi = bounds[key]
         out[key] = perturb_value(theta[key], side_sign * direction, step_scale, lo, hi)
     return out
+
+
+def make_spsa_update(
+    theta: dict[str, float],
+    bounds: dict[str, tuple[float, float]],
+    keys: list[str],
+    delta: dict[str, int],
+    plus_score: float,
+    minus_score: float,
+    step_scale: float,
+    move_ratio: float,
+) -> SpsaUpdate:
+    if not (math.isfinite(plus_score) and math.isfinite(minus_score)):
+        raise ValueError("SPSA update requires finite plus/minus scores")
+    c = math.log(step_scale)
+    if c <= 0.0:
+        raise ValueError("--step-scale must be > 1 for SPSA update")
+    if plus_score < minus_score:
+        winner_sign = +1
+    elif minus_score < plus_score:
+        winner_sign = -1
+    else:
+        winner_sign = 0
+    next_theta = dict(theta)
+    gradient_log: dict[str, float] = {}
+    log_update: dict[str, float] = {}
+    for key in keys:
+        lo, hi = bounds[key]
+        direction = delta[key]
+        grad = (plus_score - minus_score) / (2.0 * c * direction)
+        update = winner_sign * direction * move_ratio * c
+        z = theta_to_log(theta[key], lo, hi)
+        next_theta[key] = theta_from_log(z + update, lo, hi)
+        gradient_log[key] = grad
+        log_update[key] = update
+    return SpsaUpdate(next_theta, gradient_log, log_update)
 
 
 def alpha_arg(theta: dict[str, float]) -> str:
@@ -896,6 +973,22 @@ def write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def theta_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    return {key: after[key] - before[key] for key in before}
+
+
+def theta_change_text(before: dict[str, float], after: dict[str, float], keys: list[str]) -> str:
+    parts: list[str] = []
+    for key in keys:
+        old = before[key]
+        new = after[key]
+        diff = new - old
+        if diff == 0.0:
+            continue
+        parts.append(f"{key}:{old:.9g}->{new:.9g}({diff:+.9g})")
+    return ";".join(parts)
+
+
 def append_history(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
@@ -992,6 +1085,8 @@ def main() -> int:
 
         for iteration in range(1, args.iterations + 1):
             old_base_score = base_score
+            theta_before = dict(theta)
+            step_scale_used = step_scale
             delta = {key: rng.choice([-1, 1]) for key in keys}
             plus_theta = make_variant(theta, bounds, delta, +1, step_scale)
             minus_theta = make_variant(theta, bounds, delta, -1, step_scale)
@@ -1015,6 +1110,7 @@ def main() -> int:
                     "failed_retries": failed_retries,
                     "accepted_sbs": accepted_sbs,
                     "delta": delta,
+                    "update_mode": args.update_mode,
                 },
             )
 
@@ -1023,12 +1119,41 @@ def main() -> int:
             candidates = [plus, minus]
             pair_best = min(candidates, key=lambda item: item.score)
             pair_best_theta = theta_for_result(pair_best, plus_theta, minus_theta)
+            theta_candidate = pair_best_theta
+            spsa_gradient_log: dict[str, float] = {}
+            spsa_log_update: dict[str, float] = {}
+            if args.update_mode == "spsa":
+                if math.isfinite(plus.score) and math.isfinite(minus.score):
+                    update = make_spsa_update(
+                        theta,
+                        bounds,
+                        keys,
+                        delta,
+                        plus.score,
+                        minus.score,
+                        step_scale,
+                        args.spsa_move_ratio,
+                    )
+                    theta_candidate = update.theta
+                    spsa_gradient_log = update.gradient_log
+                    spsa_log_update = update.log_update
+                    max_abs_log_update = max((abs(value) for value in spsa_log_update.values()), default=0.0)
+                    print(
+                        f"[theta] mode=spsa score_diff={plus.score - minus.score:+.9f} "
+                        f"move_ratio={args.spsa_move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
+                        flush=True,
+                    )
+                else:
+                    theta_candidate = dict(theta)
+                    print("[theta] mode=spsa skipped because trial scores are not finite", flush=True)
+            else:
+                print(f"[theta] mode=winner next={pair_best.side} trial theta", flush=True)
             best = pair_best
             history_retry_best = retry_best
 
             if pair_best.score < base_score:
                 reason = "improved"
-                theta = pair_best_theta
+                theta = theta_candidate
                 if not args.dry_run and not args.keep_trials:
                     accepted_checkpoint = move_checkpoint_to_current(pair_best.checkpoint_dir, current_dir, runner_dir)
                     safe_rmtree(retry_best_dir, runner_dir)
@@ -1045,7 +1170,7 @@ def main() -> int:
                 if retry_best is None or pair_best.score < retry_best.result.score:
                     retry_best = stash_retry_best(
                         pair_best,
-                        pair_best_theta,
+                        theta_candidate,
                         retry_best_dir,
                         runner_dir,
                         args.keep_trials,
@@ -1099,6 +1224,13 @@ def main() -> int:
                         "test_value_accuracy": fmt_metric(best.metric.test_acc),
                         "current_checkpoint": str(accepted_checkpoint),
                         "public_checkpoint": public_checkpoint,
+                        "update_mode": args.update_mode,
+                        "step_scale_used": f"{step_scale_used:.9f}",
+                        "step_scale_next": f"{step_scale:.9f}",
+                        "spsa_move_ratio": f"{args.spsa_move_ratio:.9f}",
+                        "theta_change": theta_change_text(theta_before, theta, keys),
+                        "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
+                        "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
                         "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
                     },
                 )
@@ -1121,12 +1253,25 @@ def main() -> int:
                     "public_checkpoint": public_checkpoint,
                     "retry_best_score": f"{history_retry_best.result.score:.9f}" if history_retry_best is not None else "",
                     "retry_best_checkpoint": str(history_retry_best.result.checkpoint_dir) if history_retry_best is not None else "",
-                    "step_scale": f"{step_scale:.9f}",
+                    "update_mode": args.update_mode,
+                    "step_scale_used": f"{step_scale_used:.9f}",
+                    "step_scale_next": f"{step_scale:.9f}",
+                    "spsa_move_ratio": f"{args.spsa_move_ratio:.9f}",
+                    "theta_change": theta_change_text(theta_before, theta, keys),
+                    "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
+                    "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
                     "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+                    "theta_candidate_json": json.dumps(theta_candidate, ensure_ascii=False, sort_keys=True),
+                    "spsa_gradient_log_json": json.dumps(spsa_gradient_log, ensure_ascii=False, sort_keys=True),
+                    "spsa_log_update_json": json.dumps(spsa_log_update, ensure_ascii=False, sort_keys=True),
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
                 },
             )
-            print(f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f}", flush=True)
+            print(
+                f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f} "
+                f"theta_change={theta_change_text(theta_before, theta, keys) or '-'}",
+                flush=True,
+            )
 
         write_json(
             state_path,
@@ -1139,6 +1284,7 @@ def main() -> int:
                 "step_scale": step_scale,
                 "failed_retries": failed_retries,
                 "accepted_sbs": accepted_sbs,
+                "update_mode": args.update_mode,
                 "complete": True,
             },
         )

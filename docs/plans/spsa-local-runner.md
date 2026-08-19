@@ -18,9 +18,10 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 2. 調整対象パラメーターにランダムな `+/-` 方向を作る。
 3. `plus` trial と `minus` trial を、同じ checkpoint から同じ局面位置で開始する。
 4. 各 trial は短い superbatch 数だけ学習し、最後に qloss を測る。
-5. qloss が下がった trial があれば、その checkpoint とパラメーターを採用する。
-6. 両方悪化した場合は、変化幅を小さくして retry する。
-7. retry が続きすぎた場合は、悪化が小さいほうを採用して先へ進める。
+5. qloss が下がった trial があれば、その checkpoint を採用する。
+6. ハイパーパラメーターは、勝った trial の値へ飛ばさず、勝った方向へ `--spsa-move-ratio` ぶんだけ動かす。
+7. 両方悪化した場合は、変化幅を小さくして retry する。
+8. retry が続きすぎた場合は、悪化が小さいほうを採用して先へ進める。
 
 デフォルトの評価指標は `quantized_value_loss`。`quantized_value_accuracy` は目的関数として粗すぎるので、採否判定には使わない。
 
@@ -37,6 +38,8 @@ retry 中は、その retry window 全体で qloss が最も良い checkpoint �
 - 一時 trial 出力: `trials/`
 - 採用経路の現在状態: `current/`
 - 外向けに残す採用 checkpoint: `accepted-checkpoints/`
+
+`accepted-summary-learn.log` には、採用時の `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json`, `update_mode`, `step_scale_used`, `step_scale_next`, `spsa_move_ratio` を出す。これにより、どのハイパーパラメーターがどちらへどれだけ動いたかを後から追える。
 
 runner は既存の checkpoint を上書きしない。デフォルトでは plus/minus の trial フォルダは採否判定後に削除する。採用された state は `current/` に移動し、採用経路が `--accepted-save-rate-sbs` ぶん進んだときだけ `accepted-checkpoints/` にコピーする。
 
@@ -155,9 +158,12 @@ SPSA の `+/-` は足し算ではなく倍率で動かす。デフォルトは�
 --step-grow 1.01
 --min-step-scale 1.005
 --max-step-scale 1.10
+--spsa-move-ratio 0.1
 ```
 
-たとえば `pair=0.3` なら、初回はおおむね `0.309` と `0.291` になる。`1.25` のような大きい値にすると `0.375` と `0.24` まで飛び、8 sb trial では回復しきれず学習を壊しやすい。
+たとえば `pair=0.3` なら、初回の trial はおおむね `0.309` と `0.291` になる。ただし `--update-mode spsa` では、勝った側へそのまま飛ばず、探索幅の `--spsa-move-ratio` 倍だけ動く。デフォルトなら探索幅の10%だけなので、`0.309` に飛ばず、おおむね `0.3009` 付近へ動く。
+
+勝った trial のパラメーターへそのまま移動する挙動を試したい場合だけ、`--update-mode winner` を使う。
 
 ## qloss が悪化したときの扱い
 

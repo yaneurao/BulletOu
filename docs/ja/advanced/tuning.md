@@ -361,7 +361,7 @@ axis 行・pair 行そのものを count に応じて弱めたい場合は、`--
 
 factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。既に良い checkpoint がある場合は、`spsa_local_runner.py` で近傍探索できます。
 
-この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) が良いほうだけを採用します。accuracy は値が荒いので、採否判断には qloss を使います。
+この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) を比較します。accuracy は値が荒いので、判断には qloss を使います。
 
 開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を自分で測り直します。その結果は `[base]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
 
@@ -371,12 +371,15 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 1 iteration:
   plus  trial: base checkpoint から 8 sb 学習
   minus trial: base checkpoint から 8 sb 学習
-  qloss が小さいほうを次の base checkpoint にする
+  checkpoint は qloss が小さいほうを採用する
+  パラメーターは plus/minus の勝った方向へ、探索幅の一部だけ動かす
 ```
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
-パラメーターの変化幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、最初の plus/minus はおおむね `0.309` と `0.291` になります。両方悪化した場合は `--step-shrink 0.70` で変化幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。変化幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
+パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、最初の plus/minus はおおむね `0.309` と `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、勝った trial の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、勝った方向へ探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
+
+勝った trial のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
 
 デフォルトでは、plus/minus の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
 
@@ -448,7 +451,7 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 ## 7. 保存と検証の頻度
 
