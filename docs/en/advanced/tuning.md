@@ -379,6 +379,8 @@ The runner branches two short trials, `plus` and `minus`, from the same checkpoi
 
 At startup, the runner reads the base qacc/qloss from `summary-learn.log` next to the base checkpoint and prints it as a `[base]` line. It does not re-run validation at this point.
 
+If both trials are worse than the base, the runner does not adopt either side immediately. It shrinks the perturbation and retries. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-adopts the best qloss from the whole retry window, not merely the last plus/minus pair.
+
 ```text
 1 iteration:
   plus  trial: train 8 sb from the base checkpoint

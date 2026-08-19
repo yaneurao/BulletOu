@@ -365,6 +365,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 開始時には、継続元 checkpoint の親フォルダにある `summary-learn.log` から基準 qacc/qloss を読み、`[base]` 行として stdout に表示します。ここでは再計測はしません。
 
+両方の trial が基準より悪い場合は、すぐには採用せず変化幅を小さくして retry します。retry 中に出た trial のうち、qloss が一番良かったものだけを `retry-best/` に退避します。`--max-retries` に達しても基準を超えられない場合は、最後の2本ではなく、retry 全体の best qloss を強制採用します。
+
 ```text
 1 iteration:
   plus  trial: base checkpoint から 8 sb 学習

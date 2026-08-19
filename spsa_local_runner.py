@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -146,6 +146,12 @@ class TrialResult:
     metric: Metric
     score: float
     summary_row: dict[str, str]
+
+
+@dataclass(frozen=True)
+class RetryBest:
+    result: TrialResult
+    theta: dict[str, float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -737,6 +743,31 @@ def prune_trial_outputs(results: list[TrialResult], trial_output_folder: Path) -
         safe_rmtree(result.output_dir, trial_output_folder)
 
 
+def theta_for_result(result: TrialResult, plus_theta: dict[str, float], minus_theta: dict[str, float]) -> dict[str, float]:
+    if result.side == "plus":
+        return plus_theta
+    if result.side == "minus":
+        return minus_theta
+    raise ValueError(f"unknown trial side {result.side!r}")
+
+
+def stash_retry_best(
+    result: TrialResult,
+    theta: dict[str, float],
+    retry_best_dir: Path,
+    runner_dir: Path,
+    keep_trials: bool,
+    dry_run: bool,
+) -> RetryBest:
+    if keep_trials or dry_run:
+        return RetryBest(result, dict(theta))
+    safe_rmtree(retry_best_dir, runner_dir)
+    if not result.checkpoint_dir.exists():
+        raise FileNotFoundError(f"{result.checkpoint_dir} does not exist")
+    shutil.move(str(result.checkpoint_dir), str(retry_best_dir))
+    return RetryBest(replace(result, checkpoint_dir=retry_best_dir), dict(theta))
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -784,6 +815,7 @@ def main() -> int:
         log_dir.mkdir(parents=True, exist_ok=True)
         current_dir = runner_dir / "current"
         accepted_root = runner_dir / "accepted-checkpoints"
+        retry_best_dir = runner_dir / "retry-best"
 
         if args.base_score is not None:
             base_metric = Metric(None, None, None, None)
@@ -818,6 +850,7 @@ def main() -> int:
                     "accepted_save_rate_sbs": args.accepted_save_rate_sbs,
                     "accepted_root": str(accepted_root),
                     "current_dir": str(current_dir),
+                    "retry_best_dir": str(retry_best_dir),
                 },
             },
         )
@@ -826,6 +859,7 @@ def main() -> int:
         failed_retries = 0
         accepted_checkpoint = base_checkpoint
         accepted_sbs = 0
+        retry_best: RetryBest | None = None
 
         for iteration in range(1, args.iterations + 1):
             old_base_score = base_score
@@ -858,33 +892,61 @@ def main() -> int:
             plus = run_trial(args, accepted_checkpoint, f"{tag_base}-plus", "plus", plus_theta, trial_output_folder, log_dir)
             minus = run_trial(args, accepted_checkpoint, f"{tag_base}-minus", "minus", minus_theta, trial_output_folder, log_dir)
             candidates = [plus, minus]
-            best = min(candidates, key=lambda item: item.score)
+            pair_best = min(candidates, key=lambda item: item.score)
+            pair_best_theta = theta_for_result(pair_best, plus_theta, minus_theta)
+            best = pair_best
+            history_retry_best = retry_best
 
-            if best.score < base_score:
+            if pair_best.score < base_score:
                 reason = "improved"
-                theta = plus_theta if best.side == "plus" else minus_theta
+                theta = pair_best_theta
                 if not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
+                    accepted_checkpoint = move_checkpoint_to_current(pair_best.checkpoint_dir, current_dir, runner_dir)
+                    safe_rmtree(retry_best_dir, runner_dir)
                 else:
-                    accepted_checkpoint = best.checkpoint_dir
-                base_metric = best.metric
-                base_score = best.score
+                    accepted_checkpoint = pair_best.checkpoint_dir
+                retry_best = None
+                history_retry_best = None
+                base_metric = pair_best.metric
+                base_score = pair_best.score
                 failed_retries = 0
                 step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
                 accepted_sbs += args.sb_per_trial
-            elif failed_retries + 1 >= args.max_retries:
+            else:
+                if retry_best is None or pair_best.score < retry_best.result.score:
+                    retry_best = stash_retry_best(
+                        pair_best,
+                        pair_best_theta,
+                        retry_best_dir,
+                        runner_dir,
+                        args.keep_trials,
+                        args.dry_run,
+                    )
+                    history_retry_best = retry_best
+                    print(
+                        f"[retry-best] retry={retry} side={pair_best.side} score={pair_best.score:.9f} "
+                        f"checkpoint={retry_best.result.checkpoint_dir}",
+                        flush=True,
+                    )
+
+            if pair_best.score >= old_base_score and failed_retries + 1 >= args.max_retries:
                 reason = f"forced_after_{args.max_retries}_retries"
-                theta = plus_theta if best.side == "plus" else minus_theta
+                if retry_best is None:
+                    raise RuntimeError("internal error: retry_best is missing at forced acceptance")
+                history_retry_best = retry_best
+                best = retry_best.result
+                theta = retry_best.theta
                 if not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
+                    accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
                 else:
-                    accepted_checkpoint = best.checkpoint_dir
+                    accepted_checkpoint = retry_best.result.checkpoint_dir
+                retry_best = None
                 base_metric = best.metric
                 base_score = best.score
                 failed_retries = 0
                 step_scale = args.min_step_scale
                 accepted_sbs += args.sb_per_trial
-            else:
+            elif pair_best.score >= old_base_score:
                 reason = "retry_with_smaller_step"
                 failed_retries += 1
                 step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
@@ -928,6 +990,8 @@ def main() -> int:
                     "new_base_checkpoint": str(accepted_checkpoint),
                     "accepted_sbs": accepted_sbs,
                     "public_checkpoint": public_checkpoint,
+                    "retry_best_score": f"{history_retry_best.result.score:.9f}" if history_retry_best is not None else "",
+                    "retry_best_checkpoint": str(history_retry_best.result.checkpoint_dir) if history_retry_best is not None else "",
                     "step_scale": f"{step_scale:.9f}",
                     "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
