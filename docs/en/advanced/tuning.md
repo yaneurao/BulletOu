@@ -399,6 +399,8 @@ By default, the plus/minus trial directories are deleted after the decision. The
 
 Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
+The runner judges hyperparameters from the qloss difference between short trials. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting an 8-sb decision too much.
+
 Example:
 
 ```powershell

@@ -385,6 +385,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 trial 内の checkpoint 保存は trial 末だけですが、通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
+SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
+
 例:
 
 ```powershell
