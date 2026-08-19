@@ -4558,12 +4558,36 @@ struct Args {
     #[arg(long = "sfnn-axis-count-confidence")]
     sfnn_axis_count_confidence: Option<f32>,
 
+    /// Overrides `--sfnn-axis-count-confidence` for king-axis factorizer rows.
+    #[arg(long = "sfnn-king-axis-count-confidence")]
+    sfnn_king_axis_count_confidence: Option<f32>,
+
+    /// Overrides `--sfnn-axis-count-confidence` for hand-axis factorizer rows.
+    #[arg(long = "sfnn-hand-axis-count-confidence")]
+    sfnn_hand_axis_count_confidence: Option<f32>,
+
+    /// Overrides `--sfnn-axis-count-confidence` for progress-axis factorizer rows.
+    #[arg(long = "sfnn-progress-axis-count-confidence")]
+    sfnn_progress_axis_count_confidence: Option<f32>,
+
     /// Dampens SFNN pair factorizer terms by count-derived confidence.
     /// Requires `--sfnn-bucket-counts`. `1.0` means roughly one pair term
     /// parameter count is needed before the pair term is trusted. Default 0
     /// disables it.
     #[arg(long = "sfnn-pair-count-confidence")]
     sfnn_pair_count_confidence: Option<f32>,
+
+    /// Overrides `--sfnn-pair-count-confidence` for king-hand pair factorizer rows.
+    #[arg(long = "sfnn-king-hand-pair-count-confidence")]
+    sfnn_king_hand_pair_count_confidence: Option<f32>,
+
+    /// Overrides `--sfnn-pair-count-confidence` for king-progress pair factorizer rows.
+    #[arg(long = "sfnn-king-progress-pair-count-confidence")]
+    sfnn_king_progress_pair_count_confidence: Option<f32>,
+
+    /// Overrides `--sfnn-pair-count-confidence` for hand-progress pair factorizer rows.
+    #[arg(long = "sfnn-hand-progress-pair-count-confidence")]
+    sfnn_hand_progress_pair_count_confidence: Option<f32>,
 
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
@@ -4807,7 +4831,13 @@ impl Args {
         for (name, confidence) in [
             ("--sfnn-residual-count-confidence", self.sfnn_residual_count_confidence),
             ("--sfnn-axis-count-confidence", self.sfnn_axis_count_confidence),
+            ("--sfnn-king-axis-count-confidence", self.sfnn_king_axis_count_confidence),
+            ("--sfnn-hand-axis-count-confidence", self.sfnn_hand_axis_count_confidence),
+            ("--sfnn-progress-axis-count-confidence", self.sfnn_progress_axis_count_confidence),
             ("--sfnn-pair-count-confidence", self.sfnn_pair_count_confidence),
+            ("--sfnn-king-hand-pair-count-confidence", self.sfnn_king_hand_pair_count_confidence),
+            ("--sfnn-king-progress-pair-count-confidence", self.sfnn_king_progress_pair_count_confidence),
+            ("--sfnn-hand-progress-pair-count-confidence", self.sfnn_hand_progress_pair_count_confidence),
         ] {
             if let Some(confidence) = confidence {
                 if !(confidence.is_finite() && confidence >= 0.0) {
@@ -4822,11 +4852,9 @@ impl Args {
         if effective_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string());
         }
-        if effective_sfnn_axis_count_confidence(self) != 0.0 && self.sfnn_bucket_counts.is_none() {
-            return Err("--sfnn-axis-count-confidence requires --sfnn-bucket-counts".to_string());
-        }
-        if effective_sfnn_pair_count_confidence(self) != 0.0 && self.sfnn_bucket_counts.is_none() {
-            return Err("--sfnn-pair-count-confidence requires --sfnn-bucket-counts".to_string());
+        if effective_sfnn_factorizer_axis_count_confidence_enabled(self) && self.sfnn_bucket_counts.is_none() {
+            return Err("--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
+                .to_string());
         }
         if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
             return Err(format!(
@@ -4960,11 +4988,11 @@ impl Args {
                     .to_string(),
             );
         }
-        if (effective_sfnn_axis_count_confidence(self) != 0.0 || effective_sfnn_pair_count_confidence(self) != 0.0)
+        if effective_sfnn_factorizer_axis_count_confidence_enabled(self)
             && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
         {
             return Err(
-                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require an active SFNN factorizer"
+                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require an active SFNN factorizer"
                     .to_string(),
             );
         }
@@ -8470,21 +8498,20 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
 
     let factorizer = effective_sfnn_factorizer_spec(args);
     let factorizer_alpha = effective_sfnn_factorizer_alpha(args);
-    let factorizer_axis_confidences =
-        if effective_sfnn_axis_count_confidence(args) != 0.0 || effective_sfnn_pair_count_confidence(args) != 0.0 {
-            let count_path = args.sfnn_bucket_counts.as_deref().ok_or_else(|| {
-                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require --sfnn-bucket-counts".to_string()
-            })?;
-            let counts = SfnnBucketCounts::read_from_path(count_path)?;
-            counts.validate_for_arch(
-                count_path,
-                args.arch(),
-                args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
-            )?;
-            sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, &counts)?
-        } else {
-            None
-        };
+    let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
+        let count_path = args.sfnn_bucket_counts.as_deref().ok_or_else(|| {
+            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
+        })?;
+        let counts = SfnnBucketCounts::read_from_path(count_path)?;
+        counts.validate_for_arch(
+            count_path,
+            args.arch(),
+            args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
+        )?;
+        sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, &counts)?
+    } else {
+        None
+    };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
     let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
@@ -13005,8 +13032,45 @@ fn effective_sfnn_axis_count_confidence(args: &Args) -> f32 {
     args.sfnn_axis_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
 }
 
+fn effective_sfnn_king_axis_count_confidence(args: &Args) -> f32 {
+    args.sfnn_king_axis_count_confidence.unwrap_or_else(|| effective_sfnn_axis_count_confidence(args))
+}
+
+fn effective_sfnn_hand_axis_count_confidence(args: &Args) -> f32 {
+    args.sfnn_hand_axis_count_confidence.unwrap_or_else(|| effective_sfnn_axis_count_confidence(args))
+}
+
+fn effective_sfnn_progress_axis_count_confidence(args: &Args) -> f32 {
+    args.sfnn_progress_axis_count_confidence.unwrap_or_else(|| effective_sfnn_axis_count_confidence(args))
+}
+
 fn effective_sfnn_pair_count_confidence(args: &Args) -> f32 {
     args.sfnn_pair_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
+}
+
+fn effective_sfnn_king_hand_pair_count_confidence(args: &Args) -> f32 {
+    args.sfnn_king_hand_pair_count_confidence.unwrap_or_else(|| effective_sfnn_pair_count_confidence(args))
+}
+
+fn effective_sfnn_king_progress_pair_count_confidence(args: &Args) -> f32 {
+    args.sfnn_king_progress_pair_count_confidence.unwrap_or_else(|| effective_sfnn_pair_count_confidence(args))
+}
+
+fn effective_sfnn_hand_progress_pair_count_confidence(args: &Args) -> f32 {
+    args.sfnn_hand_progress_pair_count_confidence.unwrap_or_else(|| effective_sfnn_pair_count_confidence(args))
+}
+
+fn effective_sfnn_factorizer_axis_count_confidence_enabled(args: &Args) -> bool {
+    [
+        effective_sfnn_king_axis_count_confidence(args),
+        effective_sfnn_hand_axis_count_confidence(args),
+        effective_sfnn_progress_axis_count_confidence(args),
+        effective_sfnn_king_hand_pair_count_confidence(args),
+        effective_sfnn_king_progress_pair_count_confidence(args),
+        effective_sfnn_hand_progress_pair_count_confidence(args),
+    ]
+    .into_iter()
+    .any(|confidence| confidence != 0.0)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -13093,10 +13157,59 @@ fn sfnn_count_confidence_multiplier(count: u64, confidence_param_count: f64) -> 
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn sfnn_factorizer_axis_is_pair(shape: bulletou_cuda_cpp::SfnnForwardShape, axis: usize) -> bool {
-    let base_axis_count = shape.factorizer_base_axis_count();
-    let pair_end = base_axis_count.saturating_add(shape.factorizer_pair_count());
-    axis >= base_axis_count && axis < pair_end
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SfnnFactorizerAxisTermKind {
+    KingAxis,
+    HandAxis,
+    ProgressAxis,
+    KingHandPair,
+    KingProgressPair,
+    HandProgressPair,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_factorizer_axis_term_kind(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    axis: usize,
+) -> Option<SfnnFactorizerAxisTermKind> {
+    let king_axis_end = shape.factorizer_king_axis_dim.saturating_mul(2);
+    if axis < king_axis_end {
+        return Some(SfnnFactorizerAxisTermKind::KingAxis);
+    }
+    let hand_axis_end = king_axis_end.saturating_add(shape.factorizer_hand_axis_dim.saturating_mul(2));
+    if axis < hand_axis_end {
+        return Some(SfnnFactorizerAxisTermKind::HandAxis);
+    }
+
+    let king_hand_pair_end = shape.factorizer_base_axis_count().saturating_add(shape.factorizer_king_hand_pair_count());
+    if axis < king_hand_pair_end {
+        return Some(SfnnFactorizerAxisTermKind::KingHandPair);
+    }
+    let king_progress_pair_end = king_hand_pair_end.saturating_add(shape.factorizer_king_progress_pair_count());
+    if axis < king_progress_pair_end {
+        return Some(SfnnFactorizerAxisTermKind::KingProgressPair);
+    }
+    let hand_progress_pair_end = king_progress_pair_end.saturating_add(shape.factorizer_hand_progress_pair_count());
+    if axis < hand_progress_pair_end {
+        return Some(SfnnFactorizerAxisTermKind::HandProgressPair);
+    }
+    let progress_axis_end = hand_progress_pair_end.saturating_add(shape.factorizer_progress_axis_count());
+    if axis < progress_axis_end {
+        return Some(SfnnFactorizerAxisTermKind::ProgressAxis);
+    }
+    None
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn effective_sfnn_axis_term_count_confidence(args: &Args, kind: SfnnFactorizerAxisTermKind) -> f32 {
+    match kind {
+        SfnnFactorizerAxisTermKind::KingAxis => effective_sfnn_king_axis_count_confidence(args),
+        SfnnFactorizerAxisTermKind::HandAxis => effective_sfnn_hand_axis_count_confidence(args),
+        SfnnFactorizerAxisTermKind::ProgressAxis => effective_sfnn_progress_axis_count_confidence(args),
+        SfnnFactorizerAxisTermKind::KingHandPair => effective_sfnn_king_hand_pair_count_confidence(args),
+        SfnnFactorizerAxisTermKind::KingProgressPair => effective_sfnn_king_progress_pair_count_confidence(args),
+        SfnnFactorizerAxisTermKind::HandProgressPair => effective_sfnn_hand_progress_pair_count_confidence(args),
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -13106,9 +13219,7 @@ fn sfnn_factorizer_axis_confidences_from_counts(
     factorizer: SfnnFactorizerSpec,
     counts: &SfnnBucketCounts,
 ) -> Result<Option<Vec<f32>>, String> {
-    let axis_confidence = effective_sfnn_axis_count_confidence(args);
-    let pair_confidence = effective_sfnn_pair_count_confidence(args);
-    if axis_confidence == 0.0 && pair_confidence == 0.0 {
+    if !effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
         return Ok(None);
     }
     if counts.counts.len() != shape.num_stacks {
@@ -13120,7 +13231,7 @@ fn sfnn_factorizer_axis_confidences_from_counts(
     }
     if !factorizer.any_axis() {
         return Err(
-            "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require axis or pair factorizer terms"
+            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require axis or pair factorizer terms"
                 .to_string(),
         );
     }
@@ -13139,10 +13250,18 @@ fn sfnn_factorizer_axis_confidences_from_counts(
     }
 
     let params = sfnn_factorizer_axis_term_params(shape)? as f64;
-    let axis_k = params * f64::from(axis_confidence);
-    let pair_k = params * f64::from(pair_confidence);
-    if !(axis_k.is_finite() && axis_k >= 0.0 && pair_k.is_finite() && pair_k >= 0.0) {
-        return Err("--sfnn-axis-count-confidence / --sfnn-pair-count-confidence overflowed".to_string());
+    for (name, confidence) in [
+        ("--sfnn-king-axis-count-confidence", effective_sfnn_king_axis_count_confidence(args)),
+        ("--sfnn-hand-axis-count-confidence", effective_sfnn_hand_axis_count_confidence(args)),
+        ("--sfnn-progress-axis-count-confidence", effective_sfnn_progress_axis_count_confidence(args)),
+        ("--sfnn-king-hand-pair-count-confidence", effective_sfnn_king_hand_pair_count_confidence(args)),
+        ("--sfnn-king-progress-pair-count-confidence", effective_sfnn_king_progress_pair_count_confidence(args)),
+        ("--sfnn-hand-progress-pair-count-confidence", effective_sfnn_hand_progress_pair_count_confidence(args)),
+    ] {
+        let k = params * f64::from(confidence);
+        if !(k.is_finite() && k >= 0.0) {
+            return Err(format!("{name} overflowed: term_params={params:.3}, confidence={confidence}"));
+        }
     }
 
     let mut values = vec![1.0f32; axis_count];
@@ -13151,12 +13270,14 @@ fn sfnn_factorizer_axis_confidences_from_counts(
         if axis >= values.len() {
             continue;
         }
-        let is_pair = sfnn_factorizer_axis_is_pair(shape, axis);
-        let confidence = if is_pair { pair_confidence } else { axis_confidence };
+        let Some(kind) = sfnn_factorizer_axis_term_kind(shape, axis) else {
+            continue;
+        };
+        let confidence = effective_sfnn_axis_term_count_confidence(args, kind);
         if confidence == 0.0 {
             continue;
         }
-        let k = if is_pair { pair_k } else { axis_k };
+        let k = params * f64::from(confidence);
         values[axis] = sfnn_count_confidence_multiplier(per_axis_counts[axis], k);
     }
     Ok(Some(values))
@@ -13772,15 +13893,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         None
     };
-    let sfnn_factorizer_axis_confidences =
-        if effective_sfnn_axis_count_confidence(args) != 0.0 || effective_sfnn_pair_count_confidence(args) != 0.0 {
-            let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts).ok_or_else(|| {
-                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require --sfnn-bucket-counts".to_string()
-            })?;
-            sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
-        } else {
-            None
-        };
+    let sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
+        let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts).ok_or_else(|| {
+            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
+        })?;
+        sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
+    } else {
+        None
+    };
     if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
             "weights + Ranger optimizer state"
@@ -13926,9 +14046,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv_colored(
             "count factorizer",
             format!(
-                "axis_confidence={:.6}, pair_confidence={:.6}, {}",
-                effective_sfnn_axis_count_confidence(args),
-                effective_sfnn_pair_count_confidence(args),
+                "axis(k/h/p)={:.6}/{:.6}/{:.6}, pair(kh/kp/hp)={:.6}/{:.6}/{:.6}, {}",
+                effective_sfnn_king_axis_count_confidence(args),
+                effective_sfnn_hand_axis_count_confidence(args),
+                effective_sfnn_progress_axis_count_confidence(args),
+                effective_sfnn_king_hand_pair_count_confidence(args),
+                effective_sfnn_king_progress_pair_count_confidence(args),
+                effective_sfnn_hand_progress_pair_count_confidence(args),
                 sfnn_factorizer_axis_confidence_summary(initial_weights.shape, factorizer_spec, confidences)
             ),
             ConsoleColor::Magenta,
@@ -20677,7 +20801,19 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
         format!("sfnn_residual_count_confidence={:.9}", effective_sfnn_residual_count_confidence(args)),
         format!("sfnn_axis_count_confidence={:.9}", effective_sfnn_axis_count_confidence(args)),
+        format!("sfnn_king_axis_count_confidence={:.9}", effective_sfnn_king_axis_count_confidence(args)),
+        format!("sfnn_hand_axis_count_confidence={:.9}", effective_sfnn_hand_axis_count_confidence(args)),
+        format!("sfnn_progress_axis_count_confidence={:.9}", effective_sfnn_progress_axis_count_confidence(args)),
         format!("sfnn_pair_count_confidence={:.9}", effective_sfnn_pair_count_confidence(args)),
+        format!("sfnn_king_hand_pair_count_confidence={:.9}", effective_sfnn_king_hand_pair_count_confidence(args)),
+        format!(
+            "sfnn_king_progress_pair_count_confidence={:.9}",
+            effective_sfnn_king_progress_pair_count_confidence(args)
+        ),
+        format!(
+            "sfnn_hand_progress_pair_count_confidence={:.9}",
+            effective_sfnn_hand_progress_pair_count_confidence(args)
+        ),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
@@ -20729,6 +20865,9 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         } else {
             out.push(line.to_string());
         }
+    }
+    fn line_value(out: &[String], prefix: &str, fallback: &str) -> String {
+        out.iter().find_map(|line| line.strip_prefix(prefix)).unwrap_or(fallback).to_string()
     }
 
     let has_teacher_shuffle_buffer_batches = out.iter().any(|line| line.starts_with("teacher_shuffle_buffer_batches="));
@@ -20829,16 +20968,54 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_residual_count_confidence=",
         "sfnn_axis_count_confidence=0.000000000",
     );
+    let axis_count_confidence_default = line_value(&out, "sfnn_axis_count_confidence=", "0.000000000");
+    ensure_line_after(
+        &mut out,
+        "sfnn_king_axis_count_confidence=",
+        "sfnn_axis_count_confidence=",
+        &format!("sfnn_king_axis_count_confidence={axis_count_confidence_default}"),
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_hand_axis_count_confidence=",
+        "sfnn_king_axis_count_confidence=",
+        &format!("sfnn_hand_axis_count_confidence={axis_count_confidence_default}"),
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_progress_axis_count_confidence=",
+        "sfnn_hand_axis_count_confidence=",
+        &format!("sfnn_progress_axis_count_confidence={axis_count_confidence_default}"),
+    );
     ensure_line_after(
         &mut out,
         "sfnn_pair_count_confidence=",
-        "sfnn_axis_count_confidence=",
+        "sfnn_progress_axis_count_confidence=",
         "sfnn_pair_count_confidence=0.000000000",
+    );
+    let pair_count_confidence_default = line_value(&out, "sfnn_pair_count_confidence=", "0.000000000");
+    ensure_line_after(
+        &mut out,
+        "sfnn_king_hand_pair_count_confidence=",
+        "sfnn_pair_count_confidence=",
+        &format!("sfnn_king_hand_pair_count_confidence={pair_count_confidence_default}"),
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_king_progress_pair_count_confidence=",
+        "sfnn_king_hand_pair_count_confidence=",
+        &format!("sfnn_king_progress_pair_count_confidence={pair_count_confidence_default}"),
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_hand_progress_pair_count_confidence=",
+        "sfnn_king_progress_pair_count_confidence=",
+        &format!("sfnn_hand_progress_pair_count_confidence={pair_count_confidence_default}"),
     );
     ensure_line_after(
         &mut out,
         "sfnn_saturation_penalty=",
-        "sfnn_pair_count_confidence=",
+        "sfnn_hand_progress_pair_count_confidence=",
         "sfnn_saturation_penalty=0.000000000",
     );
     ensure_line_after(

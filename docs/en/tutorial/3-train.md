@@ -97,6 +97,8 @@ The count-based controls are off unless you specify them. You can also apply cou
 --sfnn-pair-count-confidence 1.0
 ```
 
+If needed, split them by factorizer family, for example `--sfnn-king-axis-count-confidence`, `--sfnn-hand-axis-count-confidence`, `--sfnn-progress-axis-count-confidence`, `--sfnn-king-hand-pair-count-confidence`, `--sfnn-king-progress-pair-count-confidence`, and `--sfnn-hand-progress-pair-count-confidence`.
+
 The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.

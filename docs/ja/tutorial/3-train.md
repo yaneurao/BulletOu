@@ -97,6 +97,8 @@ count による confidence は、指定しなければ無効です。factorizer 
 --sfnn-pair-count-confidence 1.0
 ```
 
+必要なら、`--sfnn-king-axis-count-confidence`、`--sfnn-hand-axis-count-confidence`、`--sfnn-progress-axis-count-confidence`、`--sfnn-king-hand-pair-count-confidence`、`--sfnn-king-progress-pair-count-confidence`、`--sfnn-hand-progress-pair-count-confidence` のように、factorizer の種類ごとに分けて指定できます。
+
 residual / axis / pair の confidence は、同じ `count.bin` を使います。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
 巨大な教師フォルダ全体から `count.bin` を作る場合、`bucket-count` は固定長の `.psv` / `.bin` をまとめ読みしながら count します。Dドライブなどで読み込み速度が波打つ場合は、応用編の説明を見て `--buffer-mb` と `--read-buffers` を調整してください。

@@ -366,6 +366,24 @@ axis 行・pair 行そのものを count に応じて弱めるには、次のよ
 --sfnn-pair-count-confidence 1.0
 ```
 
+axis の共通指定は、king / hand / progress axis 行に使われます。個別に変えたい場合は、次のように上書きします。
+
+```powershell
+--sfnn-axis-count-confidence 2.0 `
+--sfnn-king-axis-count-confidence 4.0 `
+--sfnn-hand-axis-count-confidence 0.5 `
+--sfnn-progress-axis-count-confidence 0.0
+```
+
+pair の共通指定は、king-hand / king-progress / hand-progress pair 行に使われます。個別に変えたい場合は、次のように上書きします。
+
+```powershell
+--sfnn-pair-count-confidence 10.0 `
+--sfnn-king-hand-pair-count-confidence 4.0 `
+--sfnn-king-progress-pair-count-confidence 8.0 `
+--sfnn-hand-progress-pair-count-confidence 20.0
+```
+
 BulletOu は、それぞれの axis 行・pair 行を使う LayerStack bucket の出現回数を合計します。そして、factorizer の足し込み量に次の係数を掛けます。
 
 ```text
@@ -373,6 +391,8 @@ confidence = count_term / (count_term + term_params * option_value)
 ```
 
 `term_params` は、1つの axis 行または pair 行が L1/L2/L3 に持つパラメーター数です。option value が `0` なら係数は `1` になり、その factorizer 行は弱まりません。option を有効にしていて count が `0` の行は、係数が `0` になります。
+
+例えば `--sfnn-axis-count-confidence 2.0` と `--sfnn-king-axis-count-confidence 4.0` を両方指定した場合、king-axis 行だけ `4.0` を使い、hand-axis 行と progress-axis 行は `2.0` を使います。pair 側も同じ考え方です。
 
 alpha と count confidence を同時に使うと、実効重みは次のように考えられます。
 

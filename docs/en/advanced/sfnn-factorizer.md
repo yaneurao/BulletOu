@@ -366,6 +366,24 @@ These options dampen factorizer rows themselves:
 --sfnn-pair-count-confidence 1.0
 ```
 
+The common axis option is used for king / hand / progress axis rows unless you override one of them:
+
+```powershell
+--sfnn-axis-count-confidence 2.0 `
+--sfnn-king-axis-count-confidence 4.0 `
+--sfnn-hand-axis-count-confidence 0.5 `
+--sfnn-progress-axis-count-confidence 0.0
+```
+
+The common pair option is used for king-hand / king-progress / hand-progress pair rows unless you override one of them:
+
+```powershell
+--sfnn-pair-count-confidence 10.0 `
+--sfnn-king-hand-pair-count-confidence 4.0 `
+--sfnn-king-progress-pair-count-confidence 8.0 `
+--sfnn-hand-progress-pair-count-confidence 20.0
+```
+
 For each axis or pair row, BulletOu sums the counts of all LayerStack buckets that use that row. It then multiplies the corresponding factorizer contribution by:
 
 ```text
@@ -373,6 +391,8 @@ confidence = count_term / (count_term + term_params * option_value)
 ```
 
 `term_params` is the number of parameters held by one axis or pair row across L1/L2/L3. If the option value is `0`, the multiplier is `1` and the factorizer row is not damped. If a row has count `0` and the option is enabled, its multiplier is `0`.
+
+For example, if `--sfnn-axis-count-confidence 2.0` and `--sfnn-king-axis-count-confidence 4.0` are both specified, king-axis rows use `4.0`; hand-axis and progress-axis rows use `2.0`. The same rule applies to pair rows.
 
 With both alpha and count confidence, the effective weight is:
 
