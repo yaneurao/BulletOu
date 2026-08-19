@@ -39,7 +39,7 @@ retry 中は、その retry window 全体で qloss が最も良い checkpoint �
 - 採用経路の現在状態: `current/`
 - 外向けに残す採用 checkpoint: `accepted-checkpoints/`
 
-`accepted-summary-learn.log` には、採用時の `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json`, `update_mode`, `step_scale_used`, `step_scale_next`, `spsa_move_ratio` を出す。これにより、どのハイパーパラメーターがどちらへどれだけ動いたかを後から追える。
+`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作る。これにより、最初の採用が発生する前からエディタで開いておける。採用時には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json`, `update_mode`, `step_scale_used`, `step_scale_next`, `spsa_move_ratio` を出す。これにより、どのハイパーパラメーターがどちらへどれだけ動いたかを後から追える。
 
 runner は既存の checkpoint を上書きしない。デフォルトでは plus/minus の trial フォルダは採否判定後に削除する。採用された state は `current/` に移動し、採用経路が `--accepted-save-rate-sbs` ぶん進んだときだけ `accepted-checkpoints/` にコピーする。
 

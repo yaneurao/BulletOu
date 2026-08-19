@@ -451,7 +451,7 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作られるので、学習開始直後からエディタで開いておけます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
 

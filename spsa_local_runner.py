@@ -146,6 +146,29 @@ QUANTIZED_TEST_BOOL_FLAGS = {
 }
 
 
+ACCEPTED_SUMMARY_FIELDS = [
+    "iteration",
+    "accepted_sbs",
+    "reason",
+    "accepted",
+    "score",
+    "quantized_value_loss",
+    "quantized_value_accuracy",
+    "test_value_loss",
+    "test_value_accuracy",
+    "current_checkpoint",
+    "public_checkpoint",
+    "update_mode",
+    "step_scale_used",
+    "step_scale_next",
+    "spsa_move_ratio",
+    "theta_change",
+    "theta_before_json",
+    "theta_delta_json",
+    "theta_json",
+]
+
+
 @dataclass(frozen=True)
 class Metric:
     qloss: float | None
@@ -1075,8 +1098,22 @@ def append_history(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
+        return
+    with path.open("w", encoding="utf-8", newline="") as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+
 def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
-    append_history(path, row)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=ACCEPTED_SUMMARY_FIELDS, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
@@ -1172,6 +1209,7 @@ def main() -> int:
         state_path = runner_dir / "state.json"
         history_path = runner_dir / "history.csv"
         accepted_summary_path = runner_dir / "accepted-summary-learn.log"
+        ensure_csv_header(accepted_summary_path, ACCEPTED_SUMMARY_FIELDS)
 
         if args.resume_runner:
             if not state_path.exists():
