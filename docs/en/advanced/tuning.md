@@ -362,14 +362,14 @@ Then pass it during training:
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
 ```
 
-`--sfnn-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This option enables count decay by itself; the maximum decay defaults to `1e-7`.
+`--sfnn-residual-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This option enables residual count decay; the maximum decay defaults to `1e-7`.
 
 The decay applies to the bucket-specific residual, not to the factorizer component. High-count buckets can learn a larger residual; low-count buckets stay closer to the shared factorizer structure.
 
-See [SFNN factorizer](sfnn-factorizer.md) for the formula and the model-side interpretation.
+You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confidence` and `--sfnn-pair-count-confidence`. See [SFNN factorizer](sfnn-factorizer.md) for the formulas and the model-side interpretation.
 
 ## 8. Save and validation frequency
 

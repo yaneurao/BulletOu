@@ -305,7 +305,20 @@ Then pass it during training:
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
+```
+
+`count.bin` stores counts for full LayerStack buckets. The same file can also be used for axis and pair factorizer confidence; BulletOu derives those counts by summing the stacks that touch each axis or pair row.
+
+All count-confidence options are off by default. Passing only `--sfnn-bucket-counts <count.bin>` validates the file and prints statistics, but does not change training.
+
+### Count-aware residual decay
+
+This option dampens only the bucket-specific residual tensors:
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-residual-count-confidence 1.0
 ```
 
 The per-stack decay coefficient is:
@@ -314,18 +327,16 @@ The per-stack decay coefficient is:
 decay_stack = max_decay * min(1, sqrt((confidence_count + 1) / (count_stack + 1)))
 ```
 
-`max_decay` is the maximum decay. If you enable count decay with `--sfnn-count-confidence`, BulletOu uses `max_decay = 1e-7` by default. Override it with `--sfnn-residual-count-decay <value>` only when you need to tune the maximum decay itself.
+`max_decay` is the maximum decay. If you enable residual count confidence and omit `--sfnn-residual-count-decay`, BulletOu uses `max_decay = 1e-7`. Override it with `--sfnn-residual-count-decay <value>` only when you need to tune the maximum decay itself.
 
 `confidence_count` is computed from the model shape:
 
 ```text
 residual_params_per_bucket = number of bucket-specific residual parameters per bucket
-confidence_count = residual_params_per_bucket * --sfnn-count-confidence
+confidence_count = residual_params_per_bucket * --sfnn-residual-count-confidence
 ```
 
-For example, `--sfnn-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This is based on model degrees of freedom, not on a fraction of the total teacher positions.
-
-In normal use, pass only `--sfnn-bucket-counts <count.bin>` and `--sfnn-count-confidence 1.0`.
+For example, `--sfnn-residual-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This is based on model degrees of freedom, not on a fraction of the total teacher positions.
 
 | count | Behavior |
 |---:|---|
@@ -345,7 +356,35 @@ The count-aware decay applies only to `W_residual`. Low-count buckets keep `W_re
 
 In other words, `all=1.0` means “add the factorizer normally,” and count-aware decay means “control the freedom of the bucket-specific component by count.” High-count buckets behave closer to `none`; low-count buckets stay closer to the factorizer.
 
-If you pass only `--sfnn-bucket-counts`, BulletOu validates the file and prints count statistics, but it does not change training. Set `--sfnn-count-confidence` to enable the regularization.
+### Count-aware axis / pair confidence
+
+These options dampen factorizer rows themselves:
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-axis-count-confidence 1.0 `
+--sfnn-pair-count-confidence 1.0
+```
+
+For each axis or pair row, BulletOu sums the counts of all LayerStack buckets that use that row. It then multiplies the corresponding factorizer contribution by:
+
+```text
+confidence = count_term / (count_term + term_params * option_value)
+```
+
+`term_params` is the number of parameters held by one axis or pair row across L1/L2/L3. If the option value is `0`, the multiplier is `1` and the factorizer row is not damped. If a row has count `0` and the option is enabled, its multiplier is `0`.
+
+With both alpha and count confidence, the effective weight is:
+
+```text
+W_effective =
+    W_residual
+  + shared_alpha * W_shared
+  + axis_alpha   * confidence_axis * W_axis
+  + pair_alpha   * confidence_pair * W_pair
+```
+
+This is useful when you want `shared` to remain as the broad prior, while axis or pair rows that have almost no observations are kept weak until the data supports them.
 
 ### `count.bin` file format
 

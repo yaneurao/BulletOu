@@ -305,7 +305,20 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
+```
+
+`count.bin` には完全な LayerStack bucket ごとの出現回数が入ります。axis / pair factorizer に対する confidence も、この同じファイルから計算できます。BulletOu は、各 axis 行・pair 行を使う stack の count を合計して使います。
+
+`--sfnn-*-count-confidence` は、指定しなければすべて無効です。`--sfnn-bucket-counts <count.bin>` だけを指定した場合は、count.bin の検証と統計表示だけを行い、学習内容は変えません。
+
+### count に応じて residual を弱める
+
+bucket 固有 residual だけを count に応じて抑えるには、次のように指定します。
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-residual-count-confidence 1.0
 ```
 
 stack ごとの減衰係数は次の式です。
@@ -314,18 +327,16 @@ stack ごとの減衰係数は次の式です。
 decay_stack = max_decay * min(1, sqrt((confidence_count + 1) / (count_stack + 1)))
 ```
 
-`max_decay` は最大減衰量です。`--sfnn-count-confidence` を指定して count decay を有効にした場合、`max_decay` はデフォルトで `1e-7` になります。必要なときだけ `--sfnn-residual-count-decay <値>` で上書きできます。
+`max_decay` は最大減衰量です。`--sfnn-residual-count-confidence` を指定し、`--sfnn-residual-count-decay` を省略した場合、`max_decay` は `1e-7` になります。最大減衰量そのものを調整したいときだけ `--sfnn-residual-count-decay <値>` を指定します。
 
 `confidence_count` は次のように計算されます。
 
 ```text
 residual_params_per_bucket = 1 bucket が個別に持つ residual パラメーター数
-confidence_count = residual_params_per_bucket * --sfnn-count-confidence
+confidence_count = residual_params_per_bucket * --sfnn-residual-count-confidence
 ```
 
-つまり `--sfnn-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ信用しない」という意味です。教師データ全体の局面数に対する割合ではなく、モデル側の自由度を基準にします。
-
-普通は `--sfnn-bucket-counts <count.bin>` と `--sfnn-count-confidence 1.0` だけ指定すれば十分です。
+つまり `--sfnn-residual-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ強く信用しない」という意味です。教師データ全体に対する割合ではなく、モデル側の自由度を基準にします。
 
 | count | 挙動 |
 |---:|---|
@@ -345,7 +356,35 @@ count decay は `W_residual` にだけかかります。したがって、出現
 
 つまり `all=1.0` は factorizer 成分を普通に足す設定で、count decay は「bucket 固有成分の自由度を count に応じて変える」設定です。count が多い bucket ほど `none` に近い自由度を持ち、count が少ない bucket ほど factorizer に寄ります。
 
-`--sfnn-bucket-counts` だけを指定した場合は、count.bin の検証と統計表示だけを行います。学習に効かせるには `--sfnn-count-confidence` を指定してください。
+### count に応じて axis / pair factorizer を弱める
+
+axis 行・pair 行そのものを count に応じて弱めるには、次のように指定します。
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-axis-count-confidence 1.0 `
+--sfnn-pair-count-confidence 1.0
+```
+
+BulletOu は、それぞれの axis 行・pair 行を使う LayerStack bucket の出現回数を合計します。そして、factorizer の足し込み量に次の係数を掛けます。
+
+```text
+confidence = count_term / (count_term + term_params * option_value)
+```
+
+`term_params` は、1つの axis 行または pair 行が L1/L2/L3 に持つパラメーター数です。option value が `0` なら係数は `1` になり、その factorizer 行は弱まりません。option を有効にしていて count が `0` の行は、係数が `0` になります。
+
+alpha と count confidence を同時に使うと、実効重みは次のように考えられます。
+
+```text
+W_effective =
+    W_residual
+  + shared_alpha * W_shared
+  + axis_alpha   * confidence_axis * W_axis
+  + pair_alpha   * confidence_pair * W_pair
+```
+
+`shared` を広い prior として残しつつ、ほとんど出現していない axis / pair 行だけを弱くしておきたいときに使います。
 
 ### `count.bin` のファイル形式
 

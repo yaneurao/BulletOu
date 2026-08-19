@@ -348,14 +348,14 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
 ```
 
-`--sfnn-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ信用しない」という意味です。この指定だけで count decay は有効になり、最大減衰量はデフォルトで `1e-7` になります。
+`--sfnn-residual-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ強く信用しない」という意味です。この指定で residual count decay が有効になり、最大減衰量はデフォルトで `1e-7` になります。
 
 count decay は factorizer 成分ではなく、bucket 固有の residual にだけかかります。count が多い bucket は residual を大きく学習しやすく、count が少ない bucket は factorizer の共有成分に寄ります。
 
-詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
+axis 行・pair 行そのものを count に応じて弱めたい場合は、`--sfnn-axis-count-confidence` と `--sfnn-pair-count-confidence` を使います。詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 
 ## 7. 保存と検証の頻度
 

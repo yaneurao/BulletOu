@@ -85,10 +85,19 @@ For SFNN architectures with many buckets, such as `hand1024_k3k3_progress4`, rar
 
 ```powershell
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
 ```
 
-`--sfnn-count-confidence 1.0` means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own parameter count. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
+`--sfnn-residual-count-confidence 1.0` means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own parameter count.
+
+The count-based controls are off unless you specify them. You can also apply count-based confidence to factorizer terms:
+
+```powershell
+--sfnn-axis-count-confidence 1.0 `
+--sfnn-pair-count-confidence 1.0
+```
+
+The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
 

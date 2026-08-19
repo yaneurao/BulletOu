@@ -3302,7 +3302,7 @@ const DEFAULT_FV_SCALE: f32 = 24.0;
 const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
 const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY: f32 = 1.0e-7;
-const DEFAULT_SFNN_COUNT_CONFIDENCE: f32 = 1.0;
+const DEFAULT_SFNN_COUNT_CONFIDENCE: f32 = 0.0;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_IN_OFFSET: f32 = 270.0;
 const DEFAULT_WRM_IN_SCALING: f32 = 340.0;
@@ -4539,18 +4539,31 @@ struct Args {
     sfnn_bucket_counts: Option<PathBuf>,
 
     /// Maximum count-aware residual decay for SFNN base stack tensors.
-    /// Requires `--sfnn-bucket-counts`. If omitted while
-    /// `--sfnn-count-confidence` is specified, BulletOu uses the default
-    /// maximum decay 1e-7.
+    /// Requires `--sfnn-bucket-counts` and
+    /// `--sfnn-residual-count-confidence`. If omitted while residual count
+    /// confidence is specified, BulletOu uses the default maximum decay 1e-7.
     #[arg(long = "sfnn-residual-count-decay")]
     sfnn_residual_count_decay: Option<f32>,
 
-    /// Enables count-aware residual decay.
-    /// `1.0` means BulletOu uses roughly one bucket-specific parameter count
-    /// as the confidence threshold. If `--sfnn-residual-count-decay` is
-    /// omitted, max decay defaults to 1e-7.
-    #[arg(long = "sfnn-count-confidence")]
-    sfnn_count_confidence: Option<f32>,
+    /// Enables count-aware residual decay for bucket-specific residual tensors.
+    /// `1.0` means roughly one residual parameter count is needed before the
+    /// residual is trusted. Default 0 disables it.
+    #[arg(long = "sfnn-residual-count-confidence")]
+    sfnn_residual_count_confidence: Option<f32>,
+
+    /// Dampens SFNN axis factorizer terms by count-derived confidence.
+    /// Requires `--sfnn-bucket-counts`. `1.0` means roughly one axis term
+    /// parameter count is needed before the axis term is trusted. Default 0
+    /// disables it.
+    #[arg(long = "sfnn-axis-count-confidence")]
+    sfnn_axis_count_confidence: Option<f32>,
+
+    /// Dampens SFNN pair factorizer terms by count-derived confidence.
+    /// Requires `--sfnn-bucket-counts`. `1.0` means roughly one pair term
+    /// parameter count is needed before the pair term is trusted. Default 0
+    /// disables it.
+    #[arg(long = "sfnn-pair-count-confidence")]
+    sfnn_pair_count_confidence: Option<f32>,
 
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
@@ -4791,9 +4804,15 @@ impl Args {
                 return Err(format!("--sfnn-residual-count-decay must be finite and non-negative (got {decay})"));
             }
         }
-        if let Some(confidence) = self.sfnn_count_confidence {
-            if !(confidence.is_finite() && confidence >= 0.0) {
-                return Err(format!("--sfnn-count-confidence must be finite and non-negative (got {confidence})"));
+        for (name, confidence) in [
+            ("--sfnn-residual-count-confidence", self.sfnn_residual_count_confidence),
+            ("--sfnn-axis-count-confidence", self.sfnn_axis_count_confidence),
+            ("--sfnn-pair-count-confidence", self.sfnn_pair_count_confidence),
+        ] {
+            if let Some(confidence) = confidence {
+                if !(confidence.is_finite() && confidence >= 0.0) {
+                    return Err(format!("{name} must be finite and non-negative (got {confidence})"));
+                }
             }
         }
         let effective_residual_count_decay = effective_sfnn_residual_count_decay(self);
@@ -4802,6 +4821,12 @@ impl Args {
         }
         if effective_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string());
+        }
+        if effective_sfnn_axis_count_confidence(self) != 0.0 && self.sfnn_bucket_counts.is_none() {
+            return Err("--sfnn-axis-count-confidence requires --sfnn-bucket-counts".to_string());
+        }
+        if effective_sfnn_pair_count_confidence(self) != 0.0 && self.sfnn_bucket_counts.is_none() {
+            return Err("--sfnn-pair-count-confidence requires --sfnn-bucket-counts".to_string());
         }
         if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
             return Err(format!(
@@ -4932,6 +4957,14 @@ impl Args {
         if effective_residual_count_decay != 0.0 && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE {
             return Err(
                 "--sfnn-residual-count-decay requires an active SFNN factorizer; use --sfnn-factorizer shared, axis, or pair"
+                    .to_string(),
+            );
+        }
+        if (effective_sfnn_axis_count_confidence(self) != 0.0 || effective_sfnn_pair_count_confidence(self) != 0.0)
+            && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
+        {
+            return Err(
+                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require an active SFNN factorizer"
                     .to_string(),
             );
         }
@@ -7518,6 +7551,7 @@ fn run_average_sfnn_state(args: &AverageSfnnStateArgs) -> Result<AverageSfnnStat
         &readback,
         effective_sfnn_factorizer_spec(&train_args),
         SfnnFactorizerAlphaSpec::ONE,
+        None,
         progress_params.as_ref(),
     )?;
 
@@ -8069,6 +8103,11 @@ impl CudaCppSfnnQuantizedValidationCache {
                     device_weights_ref,
                     runner.factorizer,
                     runner.factorizer_alpha,
+                    if runner.factorizer_axis_confidences_enabled {
+                        Some(&runner.factorizer_axis_confidences)
+                    } else {
+                        None
+                    },
                 )
                 .map_err(|e| e.to_string())?;
                 inner.run_device_weights_with_factorizer(
@@ -8431,6 +8470,21 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
 
     let factorizer = effective_sfnn_factorizer_spec(args);
     let factorizer_alpha = effective_sfnn_factorizer_alpha(args);
+    let factorizer_axis_confidences =
+        if effective_sfnn_axis_count_confidence(args) != 0.0 || effective_sfnn_pair_count_confidence(args) != 0.0 {
+            let count_path = args.sfnn_bucket_counts.as_deref().ok_or_else(|| {
+                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require --sfnn-bucket-counts".to_string()
+            })?;
+            let counts = SfnnBucketCounts::read_from_path(count_path)?;
+            counts.validate_for_arch(
+                count_path,
+                args.arch(),
+                args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
+            )?;
+            sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, &counts)?
+        } else {
+            None
+        };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
     let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
@@ -8495,6 +8549,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
             l1axb,
             factorizer,
             factorizer_alpha,
+            factorizer_axis_confidences.as_deref(),
         )?;
     }
     let mut l2w_for_export = weights.l2w.clone();
@@ -8517,6 +8572,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
         l2axb,
         factorizer,
         factorizer_alpha,
+        factorizer_axis_confidences.as_deref(),
     )?;
     fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
         shape,
@@ -8534,6 +8590,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
         l3axb,
         factorizer,
         factorizer_alpha,
+        factorizer_axis_confidences.as_deref(),
     )?;
 
     let l1_pad_in = nnue_pad32(shape.ft_size);
@@ -12935,13 +12992,21 @@ fn finish_bucket_count_report(
 fn effective_sfnn_residual_count_decay(args: &Args) -> f32 {
     match args.sfnn_residual_count_decay {
         Some(decay) => decay,
-        None if args.sfnn_count_confidence.is_some() => DEFAULT_SFNN_RESIDUAL_COUNT_DECAY,
+        None if effective_sfnn_residual_count_confidence(args) != 0.0 => DEFAULT_SFNN_RESIDUAL_COUNT_DECAY,
         None => 0.0,
     }
 }
 
-fn effective_sfnn_count_confidence(args: &Args) -> f32 {
-    args.sfnn_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
+fn effective_sfnn_residual_count_confidence(args: &Args) -> f32 {
+    args.sfnn_residual_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
+}
+
+fn effective_sfnn_axis_count_confidence(args: &Args) -> f32 {
+    args.sfnn_axis_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
+}
+
+fn effective_sfnn_pair_count_confidence(args: &Args) -> f32 {
+    args.sfnn_pair_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12991,19 +13056,150 @@ fn sfnn_residual_params_per_bucket(shape: bulletou_cuda_cpp::SfnnForwardShape) -
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn effective_sfnn_count_decay_k(
+fn sfnn_factorizer_axis_term_params(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
+    let mut params = 0usize;
+    if !shape.has_compact_l1() {
+        params = params
+            .checked_add(
+                shape
+                    .ft_size
+                    .checked_mul(shape.l1_out())
+                    .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L1 weight".to_string())?,
+            )
+            .and_then(|v| v.checked_add(shape.l1_out()))
+            .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L1".to_string())?;
+    }
+    params = params
+        .checked_add(
+            shape
+                .l2_size
+                .checked_mul(shape.l2_in())
+                .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L2 weight".to_string())?,
+        )
+        .and_then(|v| v.checked_add(shape.l2_size))
+        .and_then(|v| v.checked_add(shape.l2_size))
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| "SFNN factorizer axis parameter count overflow".to_string())?;
+    Ok(params)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_count_confidence_multiplier(count: u64, confidence_param_count: f64) -> f32 {
+    if confidence_param_count <= 0.0 {
+        return 1.0;
+    }
+    let count = count as f64;
+    (count / (count + confidence_param_count)).clamp(0.0, 1.0) as f32
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_factorizer_axis_is_pair(shape: bulletou_cuda_cpp::SfnnForwardShape, axis: usize) -> bool {
+    let base_axis_count = shape.factorizer_base_axis_count();
+    let pair_end = base_axis_count.saturating_add(shape.factorizer_pair_count());
+    axis >= base_axis_count && axis < pair_end
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_factorizer_axis_confidences_from_counts(
+    args: &Args,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    factorizer: SfnnFactorizerSpec,
+    counts: &SfnnBucketCounts,
+) -> Result<Option<Vec<f32>>, String> {
+    let axis_confidence = effective_sfnn_axis_count_confidence(args);
+    let pair_confidence = effective_sfnn_pair_count_confidence(args);
+    if axis_confidence == 0.0 && pair_confidence == 0.0 {
+        return Ok(None);
+    }
+    if counts.counts.len() != shape.num_stacks {
+        return Err(format!(
+            "--sfnn-bucket-counts stack count mismatch: count file has {}, arch uses {} stacks",
+            counts.counts.len(),
+            shape.num_stacks
+        ));
+    }
+    if !factorizer.any_axis() {
+        return Err(
+            "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require axis or pair factorizer terms"
+                .to_string(),
+        );
+    }
+
+    let axis_count = shape.factorizer_axis_count();
+    let mut per_axis_counts = vec![0u64; axis_count];
+    for (stack, &count) in counts.counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        for axis in cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer) {
+            if axis < per_axis_counts.len() {
+                per_axis_counts[axis] = per_axis_counts[axis].saturating_add(u64::from(count));
+            }
+        }
+    }
+
+    let params = sfnn_factorizer_axis_term_params(shape)? as f64;
+    let axis_k = params * f64::from(axis_confidence);
+    let pair_k = params * f64::from(pair_confidence);
+    if !(axis_k.is_finite() && axis_k >= 0.0 && pair_k.is_finite() && pair_k >= 0.0) {
+        return Err("--sfnn-axis-count-confidence / --sfnn-pair-count-confidence overflowed".to_string());
+    }
+
+    let mut values = vec![1.0f32; axis_count];
+    let active_ids = cuda_cpp_sfnn_factorizer_axis_indices(shape, factorizer);
+    for axis in active_ids {
+        if axis >= values.len() {
+            continue;
+        }
+        let is_pair = sfnn_factorizer_axis_is_pair(shape, axis);
+        let confidence = if is_pair { pair_confidence } else { axis_confidence };
+        if confidence == 0.0 {
+            continue;
+        }
+        let k = if is_pair { pair_k } else { axis_k };
+        values[axis] = sfnn_count_confidence_multiplier(per_axis_counts[axis], k);
+    }
+    Ok(Some(values))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_factorizer_axis_confidence_summary(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    factorizer: SfnnFactorizerSpec,
+    values: &[f32],
+) -> String {
+    let active_values = cuda_cpp_sfnn_factorizer_axis_indices(shape, factorizer)
+        .into_iter()
+        .filter_map(|axis| values.get(axis).copied())
+        .collect::<Vec<_>>();
+    if active_values.is_empty() {
+        return "active_axes=0".to_string();
+    }
+    format!(
+        "active_axes={}, min={:.4}, p50={:.4}, p90={:.4}, p99={:.4}, max={:.4}",
+        active_values.len(),
+        active_values.iter().copied().fold(f32::INFINITY, f32::min),
+        f32_percentile(&active_values, 0.50),
+        f32_percentile(&active_values, 0.90),
+        f32_percentile(&active_values, 0.99),
+        active_values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn effective_sfnn_residual_count_decay_k(
     args: &Args,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
 ) -> Result<(f32, String), String> {
-    let confidence = effective_sfnn_count_confidence(args);
+    let confidence = effective_sfnn_residual_count_confidence(args);
     if !(confidence.is_finite() && confidence >= 0.0) {
-        return Err(format!("--sfnn-count-confidence must be finite and non-negative (got {confidence})"));
+        return Err(format!("--sfnn-residual-count-confidence must be finite and non-negative (got {confidence})"));
     }
     let params = sfnn_residual_params_per_bucket(shape)? as f64;
     let k = params * f64::from(confidence);
     if !(k.is_finite() && k >= 0.0 && k <= f32::MAX as f64) {
         return Err(format!(
-            "--sfnn-count-confidence overflowed: residual_params_per_bucket={params:.3}, confidence={confidence}"
+            "--sfnn-residual-count-confidence overflowed: residual_params_per_bucket={params:.3}, confidence={confidence}"
         ));
     }
     Ok((k as f32, format!("residual_params_per_bucket={params:.0} * confidence={confidence:.6}")))
@@ -13570,12 +13766,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             .as_ref()
             .map(|(_, counts)| counts)
             .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
-        let (effective_k, k_label) = effective_sfnn_count_decay_k(args, initial_weights.shape)?;
+        let (effective_k, k_label) = effective_sfnn_residual_count_decay_k(args, initial_weights.shape)?;
         let lambdas = sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?;
         Some((effective_k, k_label, lambdas))
     } else {
         None
     };
+    let sfnn_factorizer_axis_confidences =
+        if effective_sfnn_axis_count_confidence(args) != 0.0 || effective_sfnn_pair_count_confidence(args) != 0.0 {
+            let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts).ok_or_else(|| {
+                "--sfnn-axis-count-confidence / --sfnn-pair-count-confidence require --sfnn-bucket-counts".to_string()
+            })?;
+            sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
+        } else {
+            None
+        };
     if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
             "weights + Ranger optimizer state"
@@ -13717,6 +13922,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::Magenta,
         );
     }
+    if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
+        print_startup_kv_colored(
+            "count factorizer",
+            format!(
+                "axis_confidence={:.6}, pair_confidence={:.6}, {}",
+                effective_sfnn_axis_count_confidence(args),
+                effective_sfnn_pair_count_confidence(args),
+                sfnn_factorizer_axis_confidence_summary(initial_weights.shape, factorizer_spec, confidences)
+            ),
+            ConsoleColor::Magenta,
+        );
+    }
     if args.sfnn_saturation_penalty != 0.0 {
         print_startup_kv_colored(
             "saturation penalty",
@@ -13846,6 +14063,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     .map_err(|e| e.to_string())?;
     if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
         runner.set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice())).map_err(|e| e.to_string())?;
+    }
+    if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
+        runner.set_factorizer_axis_confidences(&ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
     }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
@@ -14092,6 +14312,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         factorizer_alpha,
                     )
                     .map_err(|e| e.to_string())?;
+                    if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
+                        runner
+                            .set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice()))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
+                        runner
+                            .set_factorizer_axis_confidences(&ctx, Some(confidences.as_slice()))
+                            .map_err(|e| e.to_string())?;
+                    }
                     completed_steps = snapshot_completed_steps;
                     optimizer_steps = snapshot_optimizer_steps;
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_started.elapsed());
@@ -14110,6 +14340,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         completed_steps,
                         optimizer_steps,
                         sfnn_progress_params.as_ref(),
+                        sfnn_factorizer_axis_confidences.as_deref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
@@ -14296,6 +14527,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             optimizer_steps,
             factorizer_spec,
             effective_sfnn_factorizer_alpha(args),
+            sfnn_factorizer_axis_confidences.as_deref(),
             sfnn_progress_params.as_ref(),
         )?;
         eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
@@ -14520,6 +14752,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         completed_step_offset + seen_steps,
                         optimizer_step_offset + optimizer_updates,
                         sfnn_progress_params.as_ref(),
+                        sfnn_factorizer_axis_confidences.as_deref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
                             superbatch: chunk.superbatch,
@@ -14857,6 +15090,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             completed_steps,
             optimizer_steps,
             sfnn_progress_params.as_ref(),
+            sfnn_factorizer_axis_confidences.as_deref(),
             CudaCppCheckpointLog {
                 epoch: chunk.epoch,
                 superbatch: chunk.superbatch,
@@ -14930,6 +15164,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         optimizer_steps,
         factorizer_spec,
         effective_sfnn_factorizer_alpha(args),
+        sfnn_factorizer_axis_confidences.as_deref(),
         sfnn_progress_params.as_ref(),
     )?;
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
@@ -15505,6 +15740,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     completed_steps: usize,
     optimizer_steps: usize,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    factorizer_axis_confidences: Option<&[f32]>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
     let (output_dir, idx, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args)?;
@@ -15516,6 +15752,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             weights,
             effective_sfnn_factorizer_spec(args),
             effective_sfnn_factorizer_alpha(args),
+            factorizer_axis_confidences,
             progress_params,
         )?;
         write_cuda_cpp_sfnn_weights_bin(
@@ -16038,6 +16275,17 @@ fn cuda_cpp_sfnn_factorizer_axis_alpha(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    axis: usize,
+    alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
+) -> f32 {
+    let confidence = factorizer_axis_confidences.and_then(|values| values.get(axis)).copied().unwrap_or(1.0);
+    cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha) * confidence
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     l1w: &mut [f32],
@@ -16046,6 +16294,7 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
     l1axb: Option<&[f32]>,
     factorizer: SfnnFactorizerSpec,
     alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
 ) -> Result<(), String> {
     let l1_out = shape.l1_out();
     let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
@@ -16062,6 +16311,14 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
                 return Err("SFNN compact L1 does not support axis-factorized L1 weights".to_string());
             }
             let axis_count = shape.factorizer_axis_count();
+            if let Some(confidences) = factorizer_axis_confidences {
+                if confidences.len() != axis_count {
+                    return Err(format!(
+                        "SFNN factorizer axis confidence length mismatch: got {}, expected {axis_count}",
+                        confidences.len()
+                    ));
+                }
+            }
             let expected_w = axis_count * shape.ft_size * l1_out;
             let expected_b = axis_count * l1_out;
             if axis_w.len() != expected_w {
@@ -16075,7 +16332,12 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
                 let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
                 let bias_base = stack * l1_out;
                 for &axis in &axis_ids {
-                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha);
+                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+                        shape,
+                        axis,
+                        alpha,
+                        factorizer_axis_confidences,
+                    );
                     for out_col in 0..l1_out {
                         l1b[bias_base + out_col] += axis_alpha * axis_b[axis * l1_out + out_col];
                     }
@@ -16083,7 +16345,12 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
 
                 let weight_base = stack * stack_stride;
                 for &axis in &axis_ids {
-                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha);
+                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+                        shape,
+                        axis,
+                        alpha,
+                        factorizer_axis_confidences,
+                    );
                     let axis_base = axis * shape.ft_size * l1_out;
                     for out_col in 0..l1_out {
                         let row_base = weight_base + out_col * shape.ft_size;
@@ -16111,6 +16378,7 @@ fn fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
     l2axb: Option<&[f32]>,
     factorizer: SfnnFactorizerSpec,
     alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
 ) -> Result<(), String> {
     let l2_in = shape.l2_in();
     let expected_l2w = shape.num_stacks * shape.l2_size * l2_in;
@@ -16124,6 +16392,14 @@ fn fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
     match (l2axw, l2axb) {
         (Some(axis_w), Some(axis_b)) => {
             let axis_count = shape.factorizer_axis_count();
+            if let Some(confidences) = factorizer_axis_confidences {
+                if confidences.len() != axis_count {
+                    return Err(format!(
+                        "SFNN factorizer axis confidence length mismatch: got {}, expected {axis_count}",
+                        confidences.len()
+                    ));
+                }
+            }
             let expected_w = axis_count * shape.l2_size * l2_in;
             let expected_b = axis_count * shape.l2_size;
             if axis_w.len() != expected_w {
@@ -16137,7 +16413,12 @@ fn fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
                 let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
                 let bias_base = stack * shape.l2_size;
                 for &axis in &axis_ids {
-                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha);
+                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+                        shape,
+                        axis,
+                        alpha,
+                        factorizer_axis_confidences,
+                    );
                     for out_col in 0..shape.l2_size {
                         l2b[bias_base + out_col] += axis_alpha * axis_b[axis * shape.l2_size + out_col];
                     }
@@ -16145,7 +16426,12 @@ fn fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
 
                 let weight_base = stack * stack_stride;
                 for &axis in &axis_ids {
-                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha);
+                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+                        shape,
+                        axis,
+                        alpha,
+                        factorizer_axis_confidences,
+                    );
                     let axis_base = axis * shape.l2_size * l2_in;
                     for out_col in 0..shape.l2_size {
                         let row_base = weight_base + out_col * l2_in;
@@ -16174,6 +16460,7 @@ fn fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
     l3axb: Option<&[f32]>,
     factorizer: SfnnFactorizerSpec,
     alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
 ) -> Result<(), String> {
     let expected_l3w = shape.num_stacks * shape.l2_size;
     if l3w.len() != expected_l3w {
@@ -16185,6 +16472,14 @@ fn fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
     match (l3axw, l3axb) {
         (Some(axis_w), Some(axis_b)) => {
             let axis_count = shape.factorizer_axis_count();
+            if let Some(confidences) = factorizer_axis_confidences {
+                if confidences.len() != axis_count {
+                    return Err(format!(
+                        "SFNN factorizer axis confidence length mismatch: got {}, expected {axis_count}",
+                        confidences.len()
+                    ));
+                }
+            }
             let expected_w = axis_count * shape.l2_size;
             if axis_w.len() != expected_w {
                 return Err(format!("SFNN l3axw length mismatch: got {}, expected {expected_w}", axis_w.len()));
@@ -16195,7 +16490,12 @@ fn fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
             for stack in 0..shape.num_stacks {
                 let axis_ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer);
                 for &axis in &axis_ids {
-                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha);
+                    let axis_alpha = cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
+                        shape,
+                        axis,
+                        alpha,
+                        factorizer_axis_confidences,
+                    );
                     l3b[stack] += axis_alpha * axis_b[axis];
                     let weight_base = stack * shape.l2_size;
                     let axis_base = axis * shape.l2_size;
@@ -17261,6 +17561,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l1axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )?;
         fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
             shape,
@@ -17270,6 +17571,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l2axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )?;
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
             shape,
@@ -17279,6 +17581,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l3axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )?;
         if active.any_axis() {
             zero_cuda_cpp_sfnn_axis_factorizer_slices(weights, fold_axis)?;
@@ -17422,6 +17725,7 @@ fn fold_cuda_cpp_sfnn_l1_axis_optimizer_into_stacked_l1(
         l1axb.map(|state| state.momentum.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
         shape,
@@ -17431,6 +17735,7 @@ fn fold_cuda_cpp_sfnn_l1_axis_optimizer_into_stacked_l1(
         l1axb.map(|state| state.velocity.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
         shape,
@@ -17440,6 +17745,7 @@ fn fold_cuda_cpp_sfnn_l1_axis_optimizer_into_stacked_l1(
         l1axb.map(|state| state.slow_params.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )
 }
 
@@ -17460,6 +17766,7 @@ fn fold_cuda_cpp_sfnn_l2_axis_optimizer_into_stacked_l2(
         l2axb.map(|state| state.momentum.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
         shape,
@@ -17469,6 +17776,7 @@ fn fold_cuda_cpp_sfnn_l2_axis_optimizer_into_stacked_l2(
         l2axb.map(|state| state.velocity.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
         shape,
@@ -17478,6 +17786,7 @@ fn fold_cuda_cpp_sfnn_l2_axis_optimizer_into_stacked_l2(
         l2axb.map(|state| state.slow_params.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )
 }
 
@@ -17498,6 +17807,7 @@ fn fold_cuda_cpp_sfnn_l3_axis_optimizer_into_stacked_l3(
         l3axb.map(|state| state.momentum.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
         shape,
@@ -17507,6 +17817,7 @@ fn fold_cuda_cpp_sfnn_l3_axis_optimizer_into_stacked_l3(
         l3axb.map(|state| state.velocity.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )?;
     fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
         shape,
@@ -17516,6 +17827,7 @@ fn fold_cuda_cpp_sfnn_l3_axis_optimizer_into_stacked_l3(
         l3axb.map(|state| state.slow_params.as_slice()),
         factorizer,
         SfnnFactorizerAlphaSpec::ONE,
+        None,
     )
 }
 
@@ -18780,6 +19092,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     optimizer_steps: usize,
     factorizer: SfnnFactorizerSpec,
     factorizer_alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
@@ -18792,6 +19105,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         weights,
         factorizer,
         factorizer_alpha,
+        factorizer_axis_confidences,
         progress_params,
     )?;
     write_cuda_cpp_sfnn_weights_bin(
@@ -18996,6 +19310,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     factorizer: SfnnFactorizerSpec,
     factorizer_alpha: SfnnFactorizerAlphaSpec,
+    factorizer_axis_confidences: Option<&[f32]>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     use std::io::Write as _;
@@ -19124,6 +19439,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
             l1axb,
             factorizer,
             factorizer_alpha,
+            factorizer_axis_confidences,
         )?;
     }
     let mut l2w_for_export = weights.l2w.clone();
@@ -19146,6 +19462,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         l2axb,
         factorizer,
         factorizer_alpha,
+        factorizer_axis_confidences,
     )?;
     fold_cuda_cpp_sfnn_l3f_into_stacked_l3(
         shape,
@@ -19163,6 +19480,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         l3axb,
         factorizer,
         factorizer_alpha,
+        factorizer_axis_confidences,
     )?;
 
     for stack in 0..shape.num_stacks {
@@ -20281,11 +20599,6 @@ fn resume_signature(args: &Args) -> String {
     let test_sample = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
     let test_seed = if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() };
     let residual_count_decay_signature = effective_sfnn_residual_count_decay(args);
-    let count_confidence_signature = if residual_count_decay_signature == 0.0 {
-        "ignored".to_string()
-    } else {
-        format!("{:.9}", effective_sfnn_count_confidence(args))
-    };
     [
         "schema=bulletou-resume-v3".to_string(),
         format!("backend={}", args.backend.cli_name()),
@@ -20362,7 +20675,9 @@ fn resume_signature(args: &Args) -> String {
                 .unwrap_or_else(|| "none".to_string())
         ),
         format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
-        format!("sfnn_count_confidence={count_confidence_signature}"),
+        format!("sfnn_residual_count_confidence={:.9}", effective_sfnn_residual_count_confidence(args)),
+        format!("sfnn_axis_count_confidence={:.9}", effective_sfnn_axis_count_confidence(args)),
+        format!("sfnn_pair_count_confidence={:.9}", effective_sfnn_pair_count_confidence(args)),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
@@ -20458,6 +20773,10 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
                 line.push_str(",progress_axis=1.000000000");
             }
         }
+        if let Some(value) = line.strip_prefix("sfnn_count_confidence=") {
+            let value = if value == "ignored" { "0.000000000" } else { value };
+            *line = format!("sfnn_residual_count_confidence={value}");
+        }
     }
     ensure_line_after(&mut out, "batches_per_update=", "batch_size=", "batches_per_update=1");
     ensure_line_after(&mut out, "sfnn_dirty_bucket_update=", "batches_per_update=", "sfnn_dirty_bucket_update=false");
@@ -20500,14 +20819,26 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     );
     ensure_line_after(
         &mut out,
-        "sfnn_count_confidence=",
+        "sfnn_residual_count_confidence=",
         "sfnn_residual_count_decay=",
-        "sfnn_count_confidence=ignored",
+        "sfnn_residual_count_confidence=0.000000000",
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_axis_count_confidence=",
+        "sfnn_residual_count_confidence=",
+        "sfnn_axis_count_confidence=0.000000000",
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_pair_count_confidence=",
+        "sfnn_axis_count_confidence=",
+        "sfnn_pair_count_confidence=0.000000000",
     );
     ensure_line_after(
         &mut out,
         "sfnn_saturation_penalty=",
-        "sfnn_count_confidence=",
+        "sfnn_pair_count_confidence=",
         "sfnn_saturation_penalty=0.000000000",
     );
     ensure_line_after(
@@ -25877,6 +26208,7 @@ mod tests {
             factorizer,
             SfnnFactorizerAlphaSpec::ONE,
             None,
+            None,
         )
         .unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
@@ -26527,6 +26859,7 @@ mod tests {
             Some(&l3axb),
             factorizer,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
 
@@ -26577,6 +26910,7 @@ mod tests {
             Some(&l3axb),
             factorizer,
             alpha,
+            None,
         )
         .unwrap();
 
@@ -26673,6 +27007,7 @@ mod tests {
             expected.l1axb.as_deref(),
             axis_factorizer,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
         fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
@@ -26683,6 +27018,7 @@ mod tests {
             expected.l2axb.as_deref(),
             axis_factorizer,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
@@ -26693,6 +27029,7 @@ mod tests {
             expected.l3axb.as_deref(),
             axis_factorizer,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
         expected.l1fw = None;
@@ -26942,6 +27279,7 @@ mod tests {
             effective.l1axb.as_deref(),
             SfnnFactorizerSpec::AXIS,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
         fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
@@ -26952,6 +27290,7 @@ mod tests {
             effective.l2axb.as_deref(),
             SfnnFactorizerSpec::AXIS,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
@@ -26962,6 +27301,7 @@ mod tests {
             effective.l3axb.as_deref(),
             SfnnFactorizerSpec::AXIS,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
         )
         .unwrap();
 

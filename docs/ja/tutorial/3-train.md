@@ -85,10 +85,19 @@ accuracy / loss を学習中に見たい場合は、次のページで検証用�
 
 ```powershell
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-count-confidence 1.0
+--sfnn-residual-count-confidence 1.0
 ```
 
-`--sfnn-count-confidence 1.0` は、「bucket 固有成分のパラメーター数と同じぐらい出現するまでは、その bucket を強く信用しない」という意味です。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
+`--sfnn-residual-count-confidence 1.0` は、「bucket 固有成分のパラメーター数と同じぐらい出現するまでは、その bucket を強く信用しない」という意味です。
+
+count による confidence は、指定しなければ無効です。factorizer 側にも同じ考え方を使う場合は、次のように指定します。
+
+```powershell
+--sfnn-axis-count-confidence 1.0 `
+--sfnn-pair-count-confidence 1.0
+```
+
+residual / axis / pair の confidence は、同じ `count.bin` を使います。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
 巨大な教師フォルダ全体から `count.bin` を作る場合、`bucket-count` は固定長の `.psv` / `.bin` をまとめ読みしながら count します。Dドライブなどで読み込み速度が波打つ場合は、応用編の説明を見て `--buffer-mb` と `--read-buffers` を調整してください。
 
