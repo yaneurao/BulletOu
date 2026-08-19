@@ -377,7 +377,7 @@ Factorizer alpha values and count-confidence values have many useful combination
 
 The runner branches two short trials, `plus` and `minus`, from the same checkpoint. It adopts only the checkpoint with the lower quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
 
-At startup, the runner reads the base qacc/qloss from `summary-learn.log` next to the base checkpoint and prints it as a `[base]` line. It does not re-run validation at this point.
+At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss by itself. It prints the result as a `[base]` line. Use `--base-metric-source summary` only when you explicitly want to read the existing summary instead.
 
 If both trials are worse than the base, the runner does not adopt either side immediately. It shrinks the perturbation and retries. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-adopts the best qloss from the whole retry window, not merely the last plus/minus pair.
 

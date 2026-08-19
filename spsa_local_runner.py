@@ -33,6 +33,7 @@ import csv
 import json
 import math
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -113,6 +114,34 @@ CONFIDENCE_FLAG_BY_KEY = {
     "king_hand_pair_count_confidence": "--sfnn-king-hand-pair-count-confidence",
     "king_progress_pair_count_confidence": "--sfnn-king-progress-pair-count-confidence",
     "hand_progress_pair_count_confidence": "--sfnn-hand-progress-pair-count-confidence",
+}
+
+
+QUANTIZED_TEST_VALUE_FLAGS = {
+    "--test-positions",
+    "--test-sample",
+    "--test-seed",
+    "--score-drop-abs",
+    "--fv-scale",
+    "--sfnn-ft-shift",
+    "--lambda",
+    "--scale",
+    "--loss-pow-exp",
+    "--wrm-nnue2score",
+    "--wrm-in-offset",
+    "--wrm-in-scaling",
+    "--wrm-target-offset",
+    "--wrm-target-scaling",
+    "--loader-threads",
+    "--batch-queue-size",
+    "--teacher-shuffle-buffer-batches",
+    "--teacher-shuffle-seed",
+}
+
+
+QUANTIZED_TEST_BOOL_FLAGS = {
+    "--win-rate-model",
+    "--loss-sigmoid-mse",
 }
 
 
@@ -203,6 +232,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--base-score", type=float, default=None, help="Base score override. Lower is better.")
     parser.add_argument("--metric", choices=["quantized_value_loss", "test_value_loss"], default="quantized_value_loss")
+    parser.add_argument(
+        "--base-metric-source",
+        choices=["quantized-test", "summary"],
+        default="quantized-test",
+        help="How to obtain the initial base metric. Default runs bulletou quantized-test on base nn.bin.",
+    )
+    parser.add_argument(
+        "--base-quantized-test-mode",
+        choices=["gpu", "cpu-exact"],
+        default="gpu",
+        help="quantized-test mode used for the initial base metric.",
+    )
     parser.add_argument(
         "--theta",
         action="append",
@@ -637,6 +678,104 @@ def checkpoint_metric(checkpoint_dir: Path, metric_name: str) -> Metric:
     return found
 
 
+def quantized_test_passthrough_args(extra_args: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(extra_args):
+        token = extra_args[i]
+        if token in QUANTIZED_TEST_VALUE_FLAGS:
+            if i + 1 >= len(extra_args):
+                raise ValueError(f"{token} in passthrough args requires a value")
+            out.extend([token, extra_args[i + 1]])
+            i += 2
+        elif token in QUANTIZED_TEST_BOOL_FLAGS:
+            out.append(token)
+            i += 1
+        else:
+            i += 1
+    return out
+
+
+def run_process_tee(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, float, list[str]]:
+    lines: list[str] = []
+    start = time.time()
+    with log_path.open("w", encoding="utf-8", newline="") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line)
+            log.write(line)
+            log.flush()
+            if stream:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        returncode = proc.wait()
+    elapsed = time.time() - start
+    return returncode, elapsed, lines
+
+
+def parse_quantized_test_metric(lines: list[str]) -> Metric:
+    qacc: float | None = None
+    qloss: float | None = None
+    test_loss: float | None = None
+    for line in lines:
+        text = line.strip()
+        if text.startswith("accuracy"):
+            match = re.search(r"=\s*([0-9.+\-eE]+)%", text)
+            if match:
+                qacc = float(match.group(1)) / 100.0
+        elif text.startswith("loss_engine_scale"):
+            match = re.search(r"=\s*([0-9.+\-eE]+)", text)
+            if match:
+                qloss = float(match.group(1))
+        elif text.startswith("loss_train_scale"):
+            match = re.search(r"=\s*([0-9.+\-eE]+)", text)
+            if match:
+                test_loss = float(match.group(1))
+    if qloss is None:
+        raise ValueError("quantized-test output did not contain loss_engine_scale")
+    return Metric(qloss=qloss, qacc=qacc, test_loss=test_loss, test_acc=None)
+
+
+def run_base_quantized_test(args: argparse.Namespace, base_checkpoint: Path, log_dir: Path) -> Metric:
+    nn_bin = base_checkpoint / "nn.bin"
+    if not nn_bin.exists():
+        raise FileNotFoundError(f"{nn_bin} does not exist; use --base-metric-source summary or provide a checkpoint with nn.bin")
+    cmd = [
+        str(args.exe),
+        "quantized-test",
+        "--arch",
+        args.arch,
+        "--nn-bin",
+        str(nn_bin),
+        "--test-teacher",
+        str(args.test_teacher),
+        "--mode",
+        args.base_quantized_test_mode,
+    ]
+    cmd.extend(quantized_test_passthrough_args(args.extra_args))
+    log_path = log_dir / "base-quantized-test.stdout.log"
+    print("[base-run] " + subprocess.list2cmdline(cmd), flush=True)
+    returncode, elapsed, lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
+    if returncode != 0:
+        raise RuntimeError(f"base quantized-test failed with exit code {returncode}; see {log_path}")
+    metric = parse_quantized_test_metric(lines)
+    print(
+        f"[base-done] source=quantized-test mode={args.base_quantized_test_mode} "
+        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} "
+        f"loss_train_scale={fmt_metric(metric.test_loss)} elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+    return metric
+
+
 def run_trial(
     args: argparse.Namespace,
     checkpoint_dir: Path,
@@ -652,25 +791,7 @@ def run_trial(
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
-    start = time.time()
-    with log_path.open("w", encoding="utf-8", newline="") as log:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            log.write(line)
-            log.flush()
-            if not args.no_stream_child_output:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-        returncode = proc.wait()
-    elapsed = time.time() - start
+    returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
     if returncode != 0:
         raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
     output_dir = find_output_dir(trial_output_folder, tag)
@@ -820,14 +941,22 @@ def main() -> int:
         if args.base_score is not None:
             base_metric = Metric(None, None, None, None)
             base_score = args.base_score
+            base_source = "--base-score"
+        elif args.base_metric_source == "quantized-test" and not args.dry_run:
+            base_metric = run_base_quantized_test(args, base_checkpoint, log_dir)
+            base_score = base_metric.score(args.metric)
+            base_source = str(log_dir / "base-quantized-test.stdout.log")
         else:
             base_metric = checkpoint_metric(base_checkpoint, args.metric)
             base_score = base_metric.score(args.metric)
+            base_source = str(base_checkpoint.parent / "summary-learn.log")
+            if args.base_metric_source == "quantized-test" and args.dry_run:
+                base_source += " (dry-run fallback)"
         print(
             f"[base] checkpoint={base_checkpoint} score={base_score:.9f} "
             f"qloss={fmt_metric(base_metric.qloss)} qacc={fmt_metric(base_metric.qacc)} "
             f"test_loss={fmt_metric(base_metric.test_loss)} test_acc={fmt_metric(base_metric.test_acc)} "
-            f"source={'--base-score' if args.base_score is not None else str(base_checkpoint.parent / 'summary-learn.log')}",
+            f"source={base_source}",
             flush=True,
         )
 

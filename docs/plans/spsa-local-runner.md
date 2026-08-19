@@ -12,7 +12,7 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 
 1 iteration は次の流れで進む。
 
-開始時に、base checkpoint の親フォルダにある `summary-learn.log` から qacc/qloss を読み、`[base]` 行として表示する。ここでは再計測しない。
+開始時に、base checkpoint の `nn.bin` に対して `bulletou.exe quantized-test --mode gpu` を実行し、base qacc/qloss を測り直す。結果は `[base]` 行として表示する。summaryから読むのは `--base-metric-source summary` を指定した場合だけ。
 
 1. 現在の採用 checkpoint を基準にする。
 2. 調整対象パラメーターにランダムな `+/-` 方向を作る。
@@ -169,6 +169,6 @@ SPSA の `+/-` は足し算ではなく倍率で動かす。デフォルトは�
 
 - 1 iteration で `plus` と `minus` の 2 本を走らせるので、`--sb-per-trial 8` なら 16sb 分の学習時間を使う。
 - trial は同じ checkpoint と同じ dataloader position から始まる。
-- `--base-checkpoint` の親フォルダにある `summary-learn.log` から基準 qloss を読む。そこに qloss がない場合は `--base-score` で手入力する。
+- デフォルトでは base checkpoint 直下の `nn.bin` を `quantized-test --mode gpu` で測って基準 qloss にする。既存summaryを使いたい場合は `--base-metric-source summary`、手入力したい場合は `--base-score` を使う。
 - count confidence を 1 つでも非ゼロにする場合は `--bucket-counts` が必要。
 - 採用されなかった trial と、採用後に `current/` へ移動済みの trial は削除される。残したい場合は `--keep-trials` を使う。

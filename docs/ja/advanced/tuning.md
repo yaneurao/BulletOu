@@ -363,7 +363,7 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) が良いほうだけを採用します。accuracy は値が荒いので、採否判断には qloss を使います。
 
-開始時には、継続元 checkpoint の親フォルダにある `summary-learn.log` から基準 qacc/qloss を読み、`[base]` 行として stdout に表示します。ここでは再計測はしません。
+開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を自分で測り直します。その結果は `[base]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
 
 両方の trial が基準より悪い場合は、すぐには採用せず変化幅を小さくして retry します。retry 中に出た trial のうち、qloss が一番良かったものだけを `retry-best/` に退避します。`--max-retries` に達しても基準を超えられない場合は、最後の2本ではなく、retry 全体の best qloss を強制採用します。
 
