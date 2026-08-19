@@ -209,11 +209,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--fixed", action="append", default=[], help="Parameter to keep fixed. Repeatable.")
-    parser.add_argument("--step-scale", type=float, default=1.25, help="Initial multiplicative perturbation scale")
+    parser.add_argument(
+        "--step-scale",
+        type=float,
+        default=1.03,
+        help="Initial multiplicative perturbation scale. 1.03 moves 0.300 to about 0.309/0.291.",
+    )
     parser.add_argument("--step-shrink", type=float, default=0.70, help="Shrink factor when both trials are worse")
-    parser.add_argument("--step-grow", type=float, default=1.03, help="Grow factor after an improving acceptance")
-    parser.add_argument("--min-step-scale", type=float, default=1.02)
-    parser.add_argument("--max-step-scale", type=float, default=2.0)
+    parser.add_argument("--step-grow", type=float, default=1.01, help="Grow factor after an improving acceptance")
+    parser.add_argument("--min-step-scale", type=float, default=1.005)
+    parser.add_argument("--max-step-scale", type=float, default=1.10)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(

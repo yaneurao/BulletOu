@@ -386,6 +386,8 @@ The runner branches two short trials, `plus` and `minus`, from the same checkpoi
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
+The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` initially becomes roughly `0.309` and `0.291` on the plus/minus sides. If both sides get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+
 By default, the plus/minus trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
 
 Example:

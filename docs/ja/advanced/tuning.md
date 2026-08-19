@@ -372,6 +372,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
+パラメーターの変化幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、最初の plus/minus はおおむね `0.309` と `0.291` になります。両方悪化した場合は `--step-shrink 0.70` で変化幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。変化幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
+
 デフォルトでは、plus/minus の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
 
 例:
