@@ -453,6 +453,32 @@ runner は `bulletou.exe` の stdout をコンソールへそのまま表示し�
 
 採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
+中断した runner を再開する場合は、同じ学習条件で `--runner-dir` に既存の runner root を指定し、`--resume-runner` を付けます。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
+
+```powershell
+python .\spsa_local_runner.py `
+  --resume-runner `
+  --runner-dir D:\BulletOu-snapshots\20260820\spsa-pair2-qloss-20260820-034620 `
+  --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --output-folder D:\BulletOu-snapshots\20260820 `
+  --tag-prefix spsa-pair2-qloss `
+  --factorizer pair `
+  --iterations 1000 `
+  --sb-per-trial 8 `
+  --positions-per-superbatch 40000000 `
+  --metric quantized_value_loss `
+  --tune alpha `
+  --tune count `
+  --fixed shared `
+  -- --lr 0.000100 --lr-min 0.000100 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
+```
+
+`--iterations` は「runner全体で何iterationまで進めるか」です。たとえば `state.json` が `next_iteration=37` なら、`--iterations 1000` で37回目から1000回目まで続きます。
+
 ## 7. 保存と検証の頻度
 
 保存と検証は別々に指定できます。

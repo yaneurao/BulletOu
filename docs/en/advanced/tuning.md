@@ -467,6 +467,32 @@ The runner mirrors `bulletou.exe` stdout to the console and also saves it under 
 
 The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The accepted summary includes `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`, so you can see how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
+To resume an interrupted runner, pass the existing runner root with `--runner-dir` and add `--resume-runner`. The runner restores the checkpoint, theta, step scale, retry state, and accepted sb count from `state.json`.
+
+```powershell
+python .\spsa_local_runner.py `
+  --resume-runner `
+  --runner-dir D:\BulletOu-snapshots\20260820\spsa-pair2-qloss-20260820-034620 `
+  --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --output-folder D:\BulletOu-snapshots\20260820 `
+  --tag-prefix spsa-pair2-qloss `
+  --factorizer pair `
+  --iterations 1000 `
+  --sb-per-trial 8 `
+  --positions-per-superbatch 40000000 `
+  --metric quantized_value_loss `
+  --tune alpha `
+  --tune count `
+  --fixed shared `
+  -- --lr 0.000100 --lr-min 0.000100 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
+```
+
+`--iterations` is the target total iteration count for the whole runner. If `state.json` says `next_iteration=37`, `--iterations 1000` continues from iteration 37 through 1000.
+
 ## 8. Save and validation frequency
 
 Save and validation frequency are independent:

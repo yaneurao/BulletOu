@@ -197,13 +197,18 @@ def parse_args() -> argparse.Namespace:
         description="Run short plus/minus BulletOu trials and adopt better factorizer hyperparameters."
     )
     parser.add_argument("--exe", required=True, help="Path to bulletou.exe")
-    parser.add_argument("--base-checkpoint", required=True, type=Path, help="Checkpoint directory containing state.bin")
+    parser.add_argument("--base-checkpoint", type=Path, default=None, help="Checkpoint directory containing state.bin")
     parser.add_argument("--teacher", required=True)
     parser.add_argument("--test-teacher", required=True)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--bucket-counts", type=Path, default=None)
     parser.add_argument("--output-folder", required=True, type=Path, help="Root folder for runner outputs")
     parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/spsa-...")
+    parser.add_argument(
+        "--resume-runner",
+        action="store_true",
+        help="Resume an existing runner from --runner-dir/state.json instead of starting from --base-checkpoint.",
+    )
     parser.add_argument("--tag-prefix", required=True)
     parser.add_argument("--factorizer", default="pair")
     parser.add_argument("--iterations", type=int, default=20)
@@ -318,6 +323,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.extra_args and args.extra_args[0] == "--":
         args.extra_args = args.extra_args[1:]
+    if args.resume_runner and args.runner_dir is None:
+        parser.error("--resume-runner requires --runner-dir")
+    if not args.resume_runner and args.base_checkpoint is None:
+        parser.error("--base-checkpoint is required unless --resume-runner is specified")
     if args.iterations <= 0:
         parser.error("--iterations must be > 0")
     if args.sb_per_trial <= 0:
@@ -359,6 +368,26 @@ def load_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def metric_to_json(metric: Metric) -> dict[str, float | None]:
+    return {
+        "qloss": metric.qloss,
+        "qacc": metric.qacc,
+        "test_loss": metric.test_loss,
+        "test_acc": metric.test_acc,
+    }
+
+
+def metric_from_json(raw: Any) -> Metric:
+    if not isinstance(raw, dict):
+        raise ValueError("metric state must be an object")
+    return Metric(
+        qloss=parse_float(str(raw["qloss"])) if raw.get("qloss") is not None else None,
+        qacc=parse_float(str(raw["qacc"])) if raw.get("qacc") is not None else None,
+        test_loss=parse_float(str(raw["test_loss"])) if raw.get("test_loss") is not None else None,
+        test_acc=parse_float(str(raw["test_acc"])) if raw.get("test_acc") is not None else None,
+    )
 
 
 def split_assignments(text: str) -> list[tuple[str, float]]:
@@ -868,6 +897,7 @@ def run_trial(
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
+    prune_trial_output_by_tag(trial_output_folder, tag)
     returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
     if returncode != 0:
         raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
@@ -941,6 +971,14 @@ def prune_trial_outputs(results: list[TrialResult], trial_output_folder: Path) -
         safe_rmtree(result.output_dir, trial_output_folder)
 
 
+def prune_trial_output_by_tag(trial_output_folder: Path, tag: str) -> None:
+    if not trial_output_folder.exists():
+        return
+    for path in trial_output_folder.iterdir():
+        if path.is_dir() and path.name.endswith(f"-{tag}"):
+            safe_rmtree(path, trial_output_folder)
+
+
 def theta_for_result(result: TrialResult, plus_theta: dict[str, float], minus_theta: dict[str, float]) -> dict[str, float]:
     if result.side == "plus":
         return plus_theta
@@ -964,6 +1002,45 @@ def stash_retry_best(
         raise FileNotFoundError(f"{result.checkpoint_dir} does not exist")
     shutil.move(str(result.checkpoint_dir), str(retry_best_dir))
     return RetryBest(replace(result, checkpoint_dir=retry_best_dir), dict(theta))
+
+
+def retry_best_to_json(retry_best: RetryBest | None) -> dict[str, Any] | None:
+    if retry_best is None:
+        return None
+    result = retry_best.result
+    return {
+        "theta": retry_best.theta,
+        "result": {
+            "side": result.side,
+            "tag": result.tag,
+            "output_dir": str(result.output_dir),
+            "checkpoint_dir": str(result.checkpoint_dir),
+            "metric": metric_to_json(result.metric),
+            "score": result.score,
+        },
+    }
+
+
+def retry_best_from_json(raw: Any) -> RetryBest | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("result"), dict):
+        raise ValueError("retry_best state must be null or an object")
+    result_raw = raw["result"]
+    metric = metric_from_json(result_raw["metric"])
+    result = TrialResult(
+        side=str(result_raw["side"]),
+        tag=str(result_raw["tag"]),
+        output_dir=Path(str(result_raw["output_dir"])),
+        checkpoint_dir=Path(str(result_raw["checkpoint_dir"])),
+        metric=metric,
+        score=float(result_raw["score"]),
+        summary_row={},
+    )
+    theta_raw = raw.get("theta")
+    if not isinstance(theta_raw, dict):
+        raise ValueError("retry_best theta must be an object")
+    return RetryBest(result, {str(key): float(value) for key, value in theta_raw.items()})
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -1007,6 +1084,43 @@ def now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def write_runner_state(
+    path: Path,
+    *,
+    phase: str,
+    iteration: int,
+    next_iteration: int,
+    base_checkpoint: Path,
+    base_score: float,
+    base_metric: Metric,
+    theta: dict[str, float],
+    step_scale: float,
+    failed_retries: int,
+    accepted_sbs: int,
+    retry_best: RetryBest | None,
+    update_mode: str,
+    complete: bool = False,
+) -> None:
+    write_json(
+        path,
+        {
+            "phase": phase,
+            "iteration": iteration,
+            "next_iteration": next_iteration,
+            "base_checkpoint": str(base_checkpoint),
+            "base_score": base_score,
+            "base_metric": metric_to_json(base_metric),
+            "theta": theta,
+            "step_scale": step_scale,
+            "failed_retries": failed_retries,
+            "accepted_sbs": accepted_sbs,
+            "retry_best": retry_best_to_json(retry_best),
+            "update_mode": update_mode,
+            "complete": complete,
+        },
+    )
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -1014,12 +1128,6 @@ def main() -> int:
         theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
         keys = tuned_keys(args, theta)
         rng = random.Random(args.seed)
-
-        base_checkpoint = args.base_checkpoint.resolve()
-        if not (base_checkpoint / "state.bin").exists():
-            raise FileNotFoundError(f"{base_checkpoint / 'state.bin'} does not exist")
-        if not (base_checkpoint / "dataloader_pos.txt").exists():
-            raise FileNotFoundError(f"{base_checkpoint / 'dataloader_pos.txt'} does not exist")
 
         runner_dir = args.runner_dir or (args.output_folder / f"spsa-{args.tag_prefix}-{now_stamp()}")
         trial_output_folder = runner_dir / "trials"
@@ -1031,59 +1139,110 @@ def main() -> int:
         accepted_root = runner_dir / "accepted-checkpoints"
         retry_best_dir = runner_dir / "retry-best"
 
-        if args.base_score is not None:
-            base_metric = Metric(None, None, None, None)
-            base_score = args.base_score
-            base_source = "--base-score"
-        elif args.base_metric_source == "quantized-test" and not args.dry_run:
-            base_metric = run_base_quantized_test(args, base_checkpoint, log_dir)
-            base_score = base_metric.score(args.metric)
-            base_source = str(log_dir / "base-quantized-test.stdout.log")
+        state_path = runner_dir / "state.json"
+        history_path = runner_dir / "history.csv"
+        accepted_summary_path = runner_dir / "accepted-summary-learn.log"
+
+        if args.resume_runner:
+            if not state_path.exists():
+                raise FileNotFoundError(f"{state_path} does not exist")
+            state = load_json_object(state_path)
+            accepted_checkpoint = Path(str(state["base_checkpoint"])).resolve()
+            base_metric = metric_from_json(state["base_metric"])
+            base_score = float(state["base_score"])
+            theta_raw = state.get("theta")
+            if not isinstance(theta_raw, dict):
+                raise ValueError("state theta must be an object")
+            theta = clamp_theta({str(key): float(value) for key, value in theta_raw.items()}, bounds)
+            step_scale = float(state["step_scale"])
+            failed_retries = int(state.get("failed_retries", 0))
+            accepted_sbs = int(state.get("accepted_sbs", 0))
+            retry_best = retry_best_from_json(state.get("retry_best"))
+            phase = str(state.get("phase", "complete" if state.get("complete") else "running_trials"))
+            if phase in ("between_iterations", "complete"):
+                start_iteration = int(state.get("next_iteration", int(state["iteration"]) + 1))
+            else:
+                start_iteration = int(state.get("next_iteration", state["iteration"]))
+            base_source = f"{state_path} (--resume-runner)"
+            print(
+                f"[resume] runner_dir={runner_dir} phase={phase} start_iteration={start_iteration} "
+                f"accepted_sbs={accepted_sbs} checkpoint={accepted_checkpoint}",
+                flush=True,
+            )
         else:
-            base_metric = checkpoint_metric(base_checkpoint, args.metric)
-            base_score = base_metric.score(args.metric)
-            base_source = str(base_checkpoint.parent / "summary-learn.log")
-            if args.base_metric_source == "quantized-test" and args.dry_run:
-                base_source += " (dry-run fallback)"
+            assert args.base_checkpoint is not None
+            accepted_checkpoint = args.base_checkpoint.resolve()
+            if not (accepted_checkpoint / "state.bin").exists():
+                raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
+            if not (accepted_checkpoint / "dataloader_pos.txt").exists():
+                raise FileNotFoundError(f"{accepted_checkpoint / 'dataloader_pos.txt'} does not exist")
+
+            if args.base_score is not None:
+                base_metric = Metric(None, None, None, None)
+                base_score = args.base_score
+                base_source = "--base-score"
+            elif args.base_metric_source == "quantized-test" and not args.dry_run:
+                base_metric = run_base_quantized_test(args, accepted_checkpoint, log_dir)
+                base_score = base_metric.score(args.metric)
+                base_source = str(log_dir / "base-quantized-test.stdout.log")
+            else:
+                base_metric = checkpoint_metric(accepted_checkpoint, args.metric)
+                base_score = base_metric.score(args.metric)
+                base_source = str(accepted_checkpoint.parent / "summary-learn.log")
+                if args.base_metric_source == "quantized-test" and args.dry_run:
+                    base_source += " (dry-run fallback)"
+            write_json(
+                runner_dir / "config.json",
+                {
+                    "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "extra_args"},
+                    "extra_args": args.extra_args,
+                    "initial_theta": theta,
+                    "bounds": bounds,
+                    "tuned_keys": keys,
+                    "initial_base_checkpoint": str(accepted_checkpoint),
+                    "initial_base_score": base_score,
+                    "accepted_checkpoint_policy": {
+                        "keep_trials": args.keep_trials,
+                        "epoch_sbs": args.epoch_sbs,
+                        "accepted_save_rate_sbs": args.accepted_save_rate_sbs,
+                        "accepted_root": str(accepted_root),
+                        "current_dir": str(current_dir),
+                        "retry_best_dir": str(retry_best_dir),
+                    },
+                },
+            )
+            step_scale = args.step_scale
+            failed_retries = 0
+            accepted_sbs = 0
+            retry_best = None
+            start_iteration = 1
+
+        for _ in range(1, start_iteration):
+            for _key in keys:
+                rng.choice([-1, 1])
+
+        if not (accepted_checkpoint / "state.bin").exists():
+            raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
+        if not (accepted_checkpoint / "dataloader_pos.txt").exists():
+            raise FileNotFoundError(f"{accepted_checkpoint / 'dataloader_pos.txt'} does not exist")
+
         print(
-            f"[base] checkpoint={base_checkpoint} score={base_score:.9f} "
+            f"[base] checkpoint={accepted_checkpoint} score={base_score:.9f} "
             f"qloss={fmt_metric(base_metric.qloss)} qacc={fmt_metric(base_metric.qacc)} "
             f"test_loss={fmt_metric(base_metric.test_loss)} test_acc={fmt_metric(base_metric.test_acc)} "
             f"source={base_source}",
             flush=True,
         )
 
-        state_path = runner_dir / "state.json"
-        history_path = runner_dir / "history.csv"
-        accepted_summary_path = runner_dir / "accepted-summary-learn.log"
-        write_json(
-            runner_dir / "config.json",
-            {
-                "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "extra_args"},
-                "extra_args": args.extra_args,
-                "initial_theta": theta,
-                "bounds": bounds,
-                "tuned_keys": keys,
-                "initial_base_checkpoint": str(base_checkpoint),
-                "initial_base_score": base_score,
-                "accepted_checkpoint_policy": {
-                    "keep_trials": args.keep_trials,
-                    "epoch_sbs": args.epoch_sbs,
-                    "accepted_save_rate_sbs": args.accepted_save_rate_sbs,
-                    "accepted_root": str(accepted_root),
-                    "current_dir": str(current_dir),
-                    "retry_best_dir": str(retry_best_dir),
-                },
-            },
-        )
+        if start_iteration > args.iterations:
+            print(
+                f"[complete] runner_dir={runner_dir} already reached iteration {start_iteration - 1}; "
+                f"--iterations={args.iterations}",
+                flush=True,
+            )
+            return 0
 
-        step_scale = args.step_scale
-        failed_retries = 0
-        accepted_checkpoint = base_checkpoint
-        accepted_sbs = 0
-        retry_best: RetryBest | None = None
-
-        for iteration in range(1, args.iterations + 1):
+        for iteration in range(start_iteration, args.iterations + 1):
             old_base_score = base_score
             theta_before = dict(theta)
             step_scale_used = step_scale
@@ -1098,20 +1257,20 @@ def main() -> int:
                 f"step_scale={step_scale:.4f} failed_retries={failed_retries}",
                 flush=True,
             )
-            write_json(
+            write_runner_state(
                 state_path,
-                {
-                    "iteration": iteration,
-                    "base_checkpoint": str(accepted_checkpoint),
-                    "base_score": base_score,
-                    "base_metric": base_metric.__dict__,
-                    "theta": theta,
-                    "step_scale": step_scale,
-                    "failed_retries": failed_retries,
-                    "accepted_sbs": accepted_sbs,
-                    "delta": delta,
-                    "update_mode": args.update_mode,
-                },
+                phase="running_trials",
+                iteration=iteration,
+                next_iteration=iteration,
+                base_checkpoint=accepted_checkpoint,
+                base_score=base_score,
+                base_metric=base_metric,
+                theta=theta,
+                step_scale=step_scale,
+                failed_retries=failed_retries,
+                accepted_sbs=accepted_sbs,
+                retry_best=retry_best,
+                update_mode=args.update_mode,
             )
 
             plus = run_trial(args, accepted_checkpoint, f"{tag_base}-plus", "plus", plus_theta, trial_output_folder, log_dir)
@@ -1267,26 +1426,42 @@ def main() -> int:
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
                 },
             )
+            write_runner_state(
+                state_path,
+                phase="between_iterations",
+                iteration=iteration,
+                next_iteration=iteration + 1,
+                base_checkpoint=accepted_checkpoint,
+                base_score=base_score,
+                base_metric=base_metric,
+                theta=theta,
+                step_scale=step_scale,
+                failed_retries=failed_retries,
+                accepted_sbs=accepted_sbs,
+                retry_best=retry_best,
+                update_mode=args.update_mode,
+            )
             print(
                 f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f} "
                 f"theta_change={theta_change_text(theta_before, theta, keys) or '-'}",
                 flush=True,
             )
 
-        write_json(
+        write_runner_state(
             state_path,
-            {
-                "iteration": args.iterations,
-                "base_checkpoint": str(accepted_checkpoint),
-                "base_score": base_score,
-                "base_metric": base_metric.__dict__,
-                "theta": theta,
-                "step_scale": step_scale,
-                "failed_retries": failed_retries,
-                "accepted_sbs": accepted_sbs,
-                "update_mode": args.update_mode,
-                "complete": True,
-            },
+            phase="complete",
+            iteration=args.iterations,
+            next_iteration=args.iterations + 1,
+            base_checkpoint=accepted_checkpoint,
+            base_score=base_score,
+            base_metric=base_metric,
+            theta=theta,
+            step_scale=step_scale,
+            failed_retries=failed_retries,
+            accepted_sbs=accepted_sbs,
+            retry_best=retry_best,
+            update_mode=args.update_mode,
+            complete=True,
         )
         print(f"[complete] runner_dir={runner_dir}", flush=True)
         print(f"[complete] best_checkpoint={accepted_checkpoint}", flush=True)
