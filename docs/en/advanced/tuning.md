@@ -467,12 +467,11 @@ The runner mirrors `bulletou.exe` stdout to the console and also saves it under 
 
 The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The accepted summary includes `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`, so you can see how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
-To resume an interrupted runner, pass the existing runner root with `--runner-dir` and add `--resume-runner`. The runner restores the checkpoint, theta, step scale, retry state, and accepted sb count from `state.json`.
+To resume an interrupted runner, use the same `--output-folder` and `--tag-prefix` and add `--resume`. The runner root is determined as `--output-folder\spsa-<tag-prefix>`, so you normally do not need to pass `--runner-dir`. The runner restores the checkpoint, theta, step scale, retry state, and accepted sb count from `state.json`.
 
 ```powershell
 python .\spsa_local_runner.py `
-  --resume-runner `
-  --runner-dir D:\BulletOu-snapshots\20260820\spsa-pair2-qloss-20260820-034620 `
+  --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `

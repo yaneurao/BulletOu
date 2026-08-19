@@ -453,12 +453,11 @@ runner は `bulletou.exe` の stdout をコンソールへそのまま表示し�
 
 採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
-中断した runner を再開する場合は、同じ学習条件で `--runner-dir` に既存の runner root を指定し、`--resume-runner` を付けます。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
+中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
 
 ```powershell
 python .\spsa_local_runner.py `
-  --resume-runner `
-  --runner-dir D:\BulletOu-snapshots\20260820\spsa-pair2-qloss-20260820-034620 `
+  --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `

@@ -41,7 +41,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -203,11 +202,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--bucket-counts", type=Path, default=None)
     parser.add_argument("--output-folder", required=True, type=Path, help="Root folder for runner outputs")
-    parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/spsa-...")
+    parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/spsa-<tag-prefix>")
     parser.add_argument(
+        "--resume",
         "--resume-runner",
+        dest="resume_runner",
         action="store_true",
-        help="Resume an existing runner from --runner-dir/state.json instead of starting from --base-checkpoint.",
+        help="Resume an existing runner resolved from --output-folder and --tag-prefix, or from --runner-dir if specified.",
     )
     parser.add_argument("--tag-prefix", required=True)
     parser.add_argument("--factorizer", default="pair")
@@ -323,10 +324,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.extra_args and args.extra_args[0] == "--":
         args.extra_args = args.extra_args[1:]
-    if args.resume_runner and args.runner_dir is None:
-        parser.error("--resume-runner requires --runner-dir")
     if not args.resume_runner and args.base_checkpoint is None:
-        parser.error("--base-checkpoint is required unless --resume-runner is specified")
+        parser.error("--base-checkpoint is required unless --resume is specified")
     if args.iterations <= 0:
         parser.error("--iterations must be > 0")
     if args.sb_per_trial <= 0:
@@ -1080,8 +1079,39 @@ def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
     append_history(path, row)
 
 
-def now_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
+    return output_folder / f"spsa-{tag_prefix}"
+
+
+def resolve_runner_dir(args: argparse.Namespace) -> Path:
+    if args.runner_dir is not None:
+        runner_dir = args.runner_dir
+        if not args.resume_runner and (runner_dir / "state.json").exists():
+            raise FileExistsError(f"{runner_dir} already has state.json; use --resume or choose a new --tag-prefix/--runner-dir")
+        return runner_dir
+
+    runner_dir = default_runner_dir(args.output_folder, args.tag_prefix)
+    if args.resume_runner:
+        if (runner_dir / "state.json").exists():
+            return runner_dir
+        legacy = [
+            path
+            for path in args.output_folder.glob(f"spsa-{args.tag_prefix}-*")
+            if path.is_dir() and (path / "state.json").exists()
+        ]
+        if len(legacy) == 1:
+            return legacy[0]
+        if len(legacy) > 1:
+            names = "\n  ".join(str(path) for path in legacy)
+            raise ValueError(
+                "multiple legacy runner directories match this tag-prefix; "
+                "refusing to choose by timestamp. Specify --runner-dir explicitly:\n  " + names
+            )
+        raise FileNotFoundError(f"{runner_dir / 'state.json'} does not exist; start a new run without --resume")
+
+    if (runner_dir / "state.json").exists():
+        raise FileExistsError(f"{runner_dir} already has state.json; use --resume or choose a new --tag-prefix")
+    return runner_dir
 
 
 def write_runner_state(
@@ -1129,7 +1159,7 @@ def main() -> int:
         keys = tuned_keys(args, theta)
         rng = random.Random(args.seed)
 
-        runner_dir = args.runner_dir or (args.output_folder / f"spsa-{args.tag_prefix}-{now_stamp()}")
+        runner_dir = resolve_runner_dir(args)
         trial_output_folder = runner_dir / "trials"
         log_dir = runner_dir / "logs"
         runner_dir.mkdir(parents=True, exist_ok=True)
@@ -1163,7 +1193,7 @@ def main() -> int:
                 start_iteration = int(state.get("next_iteration", int(state["iteration"]) + 1))
             else:
                 start_iteration = int(state.get("next_iteration", state["iteration"]))
-            base_source = f"{state_path} (--resume-runner)"
+            base_source = f"{state_path} (--resume)"
             print(
                 f"[resume] runner_dir={runner_dir} phase={phase} start_iteration={start_iteration} "
                 f"accepted_sbs={accepted_sbs} checkpoint={accepted_checkpoint}",

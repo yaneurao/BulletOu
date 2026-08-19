@@ -43,7 +43,9 @@ retry 中は、その retry window 全体で qloss が最も良い checkpoint �
 
 runner は既存の checkpoint を上書きしない。デフォルトでは plus/minus の trial フォルダは採否判定後に削除する。採用された state は `current/` に移動し、採用経路が `--accepted-save-rate-sbs` ぶん進んだときだけ `accepted-checkpoints/` にコピーする。
 
-`--resume-runner --runner-dir <runner root>` で中断した runner を再開できる。再開時は `state.json` から checkpoint、theta、step scale、retry状態、accepted_sbsを復元する。`phase=running_trials` の場合は同じ iteration をやり直し、`phase=between_iterations` の場合は `next_iteration` から続ける。中断で残った同名 trial 出力は、runner root の `trials/` 内だけ削除してから再実行する。
+新規 runner root は `--output-folder\spsa-<tag-prefix>` とする。中断した runner は、同じ `--output-folder` と `--tag-prefix` に `--resume` を付ければ再開できる。通常は `--runner-dir` を書かない。古い timestamp 付き runner は、同じ tag-prefix の候補が1個だけなら `--resume` で拾う。複数候補がある場合は保存時刻で選ばず、曖昧として停止し、`--runner-dir` の明示を要求する。
+
+再開時は `state.json` から checkpoint、theta、step scale、retry状態、accepted_sbsを復元する。`phase=running_trials` の場合は同じ iteration をやり直し、`phase=between_iterations` の場合は `next_iteration` から続ける。中断で残った同名 trial 出力は、runner root の `trials/` 内だけ削除してから再実行する。
 
 trial 内の保存は trial 末だけにする。一方、validation と quantized validation は毎 sb 実行して stdout に qloss を出す。
 
