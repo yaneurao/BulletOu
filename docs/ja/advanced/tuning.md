@@ -363,6 +363,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) が良いほうだけを採用します。accuracy は値が荒いので、採否判断には qloss を使います。
 
+開始時には、継続元 checkpoint の親フォルダにある `summary-learn.log` から基準 qacc/qloss を読み、`[base]` 行として stdout に表示します。ここでは再計測はしません。
+
 ```text
 1 iteration:
   plus  trial: base checkpoint から 8 sb 学習

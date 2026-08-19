@@ -791,6 +791,13 @@ def main() -> int:
         else:
             base_metric = checkpoint_metric(base_checkpoint, args.metric)
             base_score = base_metric.score(args.metric)
+        print(
+            f"[base] checkpoint={base_checkpoint} score={base_score:.9f} "
+            f"qloss={fmt_metric(base_metric.qloss)} qacc={fmt_metric(base_metric.qacc)} "
+            f"test_loss={fmt_metric(base_metric.test_loss)} test_acc={fmt_metric(base_metric.test_acc)} "
+            f"source={'--base-score' if args.base_score is not None else str(base_checkpoint.parent / 'summary-learn.log')}",
+            flush=True,
+        )
 
         state_path = runner_dir / "state.json"
         history_path = runner_dir / "history.csv"

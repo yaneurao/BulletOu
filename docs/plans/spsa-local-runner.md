@@ -12,6 +12,8 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 
 1 iteration は次の流れで進む。
 
+開始時に、base checkpoint の親フォルダにある `summary-learn.log` から qacc/qloss を読み、`[base]` 行として表示する。ここでは再計測しない。
+
 1. 現在の採用 checkpoint を基準にする。
 2. 調整対象パラメーターにランダムな `+/-` 方向を作る。
 3. `plus` trial と `minus` trial を、同じ checkpoint から同じ局面位置で開始する。

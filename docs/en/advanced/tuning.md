@@ -377,6 +377,8 @@ Factorizer alpha values and count-confidence values have many useful combination
 
 The runner branches two short trials, `plus` and `minus`, from the same checkpoint. It adopts only the checkpoint with the lower quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
 
+At startup, the runner reads the base qacc/qloss from `summary-learn.log` next to the base checkpoint and prints it as a `[base]` line. It does not re-run validation at this point.
+
 ```text
 1 iteration:
   plus  trial: train 8 sb from the base checkpoint
