@@ -33,6 +33,7 @@ import csv
 import json
 import math
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -144,6 +145,7 @@ class TrialResult:
     checkpoint_dir: Path
     metric: Metric
     score: float
+    summary_row: dict[str, str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +164,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--factorizer", default="pair")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--sb-per-trial", type=int, default=8)
+    parser.add_argument(
+        "--epoch-sbs",
+        type=int,
+        default=32,
+        help="Number of accepted superbatches treated as one runner epoch. Used for accepted checkpoint names.",
+    )
+    parser.add_argument(
+        "--accepted-save-rate-sbs",
+        type=int,
+        default=32,
+        help="Save the accepted path every N accepted superbatches. 0 disables public accepted checkpoints.",
+    )
+    parser.add_argument(
+        "--keep-trials",
+        action="store_true",
+        help="Keep plus/minus trial output directories. Default deletes both sides after the decision.",
+    )
     parser.add_argument("--positions-per-superbatch", type=int, default=40_000_000)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--base-score", type=float, default=None, help="Base score override. Lower is better.")
@@ -209,6 +228,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--iterations must be > 0")
     if args.sb_per_trial <= 0:
         parser.error("--sb-per-trial must be > 0")
+    if args.epoch_sbs <= 0:
+        parser.error("--epoch-sbs must be > 0")
+    if args.epoch_sbs % args.sb_per_trial != 0:
+        parser.error("--epoch-sbs must be divisible by --sb-per-trial")
+    if args.accepted_save_rate_sbs < 0:
+        parser.error("--accepted-save-rate-sbs must be >= 0")
+    if args.accepted_save_rate_sbs and args.accepted_save_rate_sbs % args.sb_per_trial != 0:
+        parser.error("--accepted-save-rate-sbs must be divisible by --sb-per-trial")
     if args.positions_per_superbatch <= 0:
         parser.error("--positions-per-superbatch must be > 0")
     for name in ["step_scale", "step_shrink", "step_grow", "min_step_scale", "max_step_scale"]:
@@ -595,7 +622,7 @@ def run_trial(
     print(f"[run] {side} tag={tag}", flush=True)
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
-        return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"))
+        return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
     start = time.time()
     with log_path.open("w", encoding="utf-8", newline="") as log:
         proc = subprocess.Popen(
@@ -634,11 +661,57 @@ def run_trial(
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
         flush=True,
     )
-    return TrialResult(side, tag, output_dir, next_checkpoint, metric, score)
+    return TrialResult(side, tag, output_dir, next_checkpoint, metric, score, row)
 
 
 def fmt_metric(value: float | None) -> str:
     return "-" if value is None else f"{value:.9f}"
+
+
+def ensure_inside(path: Path, root: Path) -> tuple[Path, Path]:
+    resolved = path.resolve()
+    resolved_root = root.resolve()
+    if resolved == resolved_root or resolved_root not in resolved.parents:
+        raise ValueError(f"refusing to modify {resolved}; it is not inside {resolved_root}")
+    return resolved, resolved_root
+
+
+def safe_rmtree(path: Path, root: Path) -> None:
+    resolved, _ = ensure_inside(path, root)
+    if resolved.exists():
+        shutil.rmtree(resolved)
+
+
+def move_checkpoint_to_current(src: Path, current_dir: Path, runner_dir: Path) -> Path:
+    ensure_inside(current_dir, runner_dir)
+    temp_dir = runner_dir / "current.new"
+    safe_rmtree(temp_dir, runner_dir)
+    if not src.exists():
+        raise FileNotFoundError(f"{src} does not exist")
+    shutil.move(str(src), str(temp_dir))
+    safe_rmtree(current_dir, runner_dir)
+    temp_dir.rename(current_dir)
+    return current_dir
+
+
+def accepted_checkpoint_name(accepted_sbs: int, epoch_sbs: int) -> str:
+    if accepted_sbs % epoch_sbs == 0:
+        return f"{accepted_sbs // epoch_sbs:04d}"
+    return f"sb{accepted_sbs:08d}"
+
+
+def copy_public_checkpoint(src: Path, accepted_root: Path, accepted_sbs: int, epoch_sbs: int) -> Path:
+    accepted_root.mkdir(parents=True, exist_ok=True)
+    dst = accepted_root / accepted_checkpoint_name(accepted_sbs, epoch_sbs)
+    if dst.exists():
+        raise FileExistsError(f"accepted checkpoint already exists: {dst}")
+    shutil.copytree(src, dst)
+    return dst
+
+
+def prune_trial_outputs(results: list[TrialResult], trial_output_folder: Path) -> None:
+    for result in results:
+        safe_rmtree(result.output_dir, trial_output_folder)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -656,6 +729,10 @@ def append_history(path: Path, row: dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
+    append_history(path, row)
 
 
 def now_stamp() -> str:
@@ -682,6 +759,8 @@ def main() -> int:
         runner_dir.mkdir(parents=True, exist_ok=True)
         trial_output_folder.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
+        current_dir = runner_dir / "current"
+        accepted_root = runner_dir / "accepted-checkpoints"
 
         if args.base_score is not None:
             base_metric = Metric(None, None, None, None)
@@ -692,6 +771,7 @@ def main() -> int:
 
         state_path = runner_dir / "state.json"
         history_path = runner_dir / "history.csv"
+        accepted_summary_path = runner_dir / "accepted-summary-learn.log"
         write_json(
             runner_dir / "config.json",
             {
@@ -702,12 +782,20 @@ def main() -> int:
                 "tuned_keys": keys,
                 "initial_base_checkpoint": str(base_checkpoint),
                 "initial_base_score": base_score,
+                "accepted_checkpoint_policy": {
+                    "keep_trials": args.keep_trials,
+                    "epoch_sbs": args.epoch_sbs,
+                    "accepted_save_rate_sbs": args.accepted_save_rate_sbs,
+                    "accepted_root": str(accepted_root),
+                    "current_dir": str(current_dir),
+                },
             },
         )
 
         step_scale = args.step_scale
         failed_retries = 0
         accepted_checkpoint = base_checkpoint
+        accepted_sbs = 0
 
         for iteration in range(1, args.iterations + 1):
             old_base_score = base_score
@@ -732,6 +820,7 @@ def main() -> int:
                     "theta": theta,
                     "step_scale": step_scale,
                     "failed_retries": failed_retries,
+                    "accepted_sbs": accepted_sbs,
                     "delta": delta,
                 },
             )
@@ -744,23 +833,56 @@ def main() -> int:
             if best.score < base_score:
                 reason = "improved"
                 theta = plus_theta if best.side == "plus" else minus_theta
-                accepted_checkpoint = best.checkpoint_dir
+                if not args.dry_run and not args.keep_trials:
+                    accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
+                else:
+                    accepted_checkpoint = best.checkpoint_dir
                 base_metric = best.metric
                 base_score = best.score
                 failed_retries = 0
                 step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
+                accepted_sbs += args.sb_per_trial
             elif failed_retries + 1 >= args.max_retries:
                 reason = f"forced_after_{args.max_retries}_retries"
                 theta = plus_theta if best.side == "plus" else minus_theta
-                accepted_checkpoint = best.checkpoint_dir
+                if not args.dry_run and not args.keep_trials:
+                    accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
+                else:
+                    accepted_checkpoint = best.checkpoint_dir
                 base_metric = best.metric
                 base_score = best.score
                 failed_retries = 0
                 step_scale = args.min_step_scale
+                accepted_sbs += args.sb_per_trial
             else:
                 reason = "retry_with_smaller_step"
                 failed_retries += 1
                 step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
+
+            public_checkpoint = ""
+            if reason != "retry_with_smaller_step" and not args.dry_run:
+                if args.accepted_save_rate_sbs and accepted_sbs % args.accepted_save_rate_sbs == 0:
+                    public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
+                    print(f"[save] accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", flush=True)
+                append_accepted_summary(
+                    accepted_summary_path,
+                    {
+                        "iteration": iteration,
+                        "accepted_sbs": accepted_sbs,
+                        "reason": reason,
+                        "accepted": best.side,
+                        "score": f"{base_score:.9f}",
+                        "quantized_value_loss": fmt_metric(best.metric.qloss),
+                        "quantized_value_accuracy": fmt_metric(best.metric.qacc),
+                        "test_value_loss": fmt_metric(best.metric.test_loss),
+                        "test_value_accuracy": fmt_metric(best.metric.test_acc),
+                        "current_checkpoint": str(accepted_checkpoint),
+                        "public_checkpoint": public_checkpoint,
+                        "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+                    },
+                )
+            if not args.keep_trials and not args.dry_run:
+                prune_trial_outputs(candidates, trial_output_folder)
 
             append_history(
                 history_path,
@@ -774,6 +896,8 @@ def main() -> int:
                     "minus_score": f"{minus.score:.9f}",
                     "new_base_score": f"{base_score:.9f}",
                     "new_base_checkpoint": str(accepted_checkpoint),
+                    "accepted_sbs": accepted_sbs,
+                    "public_checkpoint": public_checkpoint,
                     "step_scale": f"{step_scale:.9f}",
                     "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
@@ -791,6 +915,7 @@ def main() -> int:
                 "theta": theta,
                 "step_scale": step_scale,
                 "failed_retries": failed_retries,
+                "accepted_sbs": accepted_sbs,
                 "complete": True,
             },
         )

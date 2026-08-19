@@ -372,6 +372,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
+デフォルトでは、plus/minus の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
+
 例:
 
 ```powershell
@@ -389,6 +391,8 @@ python .\spsa_local_runner.py `
   --factorizer pair `
   --iterations 20 `
   --sb-per-trial 8 `
+  --epoch-sbs 32 `
+  --accepted-save-rate-sbs 32 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
@@ -415,7 +419,7 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-各 trial の checkpoint、標準出力、採否履歴は `--output-folder` の下に作られる runner 専用フォルダへ保存されます。元の checkpoint は上書きされません。
+採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 ## 7. 保存と検証の頻度
 

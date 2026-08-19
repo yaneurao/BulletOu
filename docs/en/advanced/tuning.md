@@ -386,6 +386,8 @@ The runner branches two short trials, `plus` and `minus`, from the same checkpoi
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
+By default, the plus/minus trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
+
 Example:
 
 ```powershell
@@ -403,6 +405,8 @@ python .\spsa_local_runner.py `
   --factorizer pair `
   --iterations 20 `
   --sb-per-trial 8 `
+  --epoch-sbs 32 `
+  --accepted-save-rate-sbs 32 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
@@ -429,7 +433,7 @@ Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--valid
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
-Trial checkpoints, stdout logs, and the accept/reject history are written under a runner directory below `--output-folder`. The source checkpoint is not overwritten.
+The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
 ## 8. Save and validation frequency
 

@@ -28,10 +28,22 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 - 実行設定: `config.json`
 - 現在状態: `state.json`
 - 採否履歴: `history.csv`
+- 採用 checkpoint だけの要約: `accepted-summary-learn.log`
 - 各 trial の標準出力: `logs/*.stdout.log`
-- 各 trial の checkpoint: `trials/`
+- 一時 trial 出力: `trials/`
+- 採用経路の現在状態: `current/`
+- 外向けに残す採用 checkpoint: `accepted-checkpoints/`
 
-runner は既存の checkpoint を上書きしない。trial は runner 専用フォルダに作る。
+runner は既存の checkpoint を上書きしない。デフォルトでは plus/minus の trial フォルダは採否判定後に削除する。採用された state は `current/` に移動し、採用経路が `--accepted-save-rate-sbs` ぶん進んだときだけ `accepted-checkpoints/` にコピーする。
+
+デフォルトは次の通り。
+
+```text
+--epoch-sbs 32
+--accepted-save-rate-sbs 32
+```
+
+つまり、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... ができる。8 sb trialなら4 iterationごとに1回保存される。trial フォルダを調査用に残したい場合だけ `--keep-trials` を指定する。
 
 ## 今の実験から継続する例
 
@@ -54,6 +66,8 @@ python .\spsa_local_runner.py `
   --factorizer pair `
   --iterations 20 `
   --sb-per-trial 8 `
+  --epoch-sbs 32 `
+  --accepted-save-rate-sbs 32 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
@@ -110,3 +124,4 @@ shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,k
 - trial は同じ checkpoint と同じ dataloader position から始まる。
 - `--base-checkpoint` の親フォルダにある `summary-learn.log` から基準 qloss を読む。そこに qloss がない場合は `--base-score` で手入力する。
 - count confidence を 1 つでも非ゼロにする場合は `--bucket-counts` が必要。
+- 採用されなかった trial と、採用後に `current/` へ移動済みの trial は削除される。残したい場合は `--keep-trials` を使う。
