@@ -36,6 +36,16 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 
 runner は既存の checkpoint を上書きしない。デフォルトでは plus/minus の trial フォルダは採否判定後に削除する。採用された state は `current/` に移動し、採用経路が `--accepted-save-rate-sbs` ぶん進んだときだけ `accepted-checkpoints/` にコピーする。
 
+trial 内の保存は trial 末だけにする。一方、validation と quantized validation は毎 sb 実行して stdout に qloss を出す。
+
+```text
+--save-rate = --sb-per-trial
+--validation-rate = --trial-validation-rate-sbs      # default 1
+--quantized-validation-rate = --trial-quantized-validation-rate-sbs  # default 1
+```
+
+stdout ログは runner root の `logs/*.stdout.log` に保存する。`trials/` は削除対象なので、そこのファイルを開いて監視する運用はしない。
+
 デフォルトは次の通り。
 
 ```text

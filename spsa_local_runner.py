@@ -181,6 +181,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep plus/minus trial output directories. Default deletes both sides after the decision.",
     )
+    parser.add_argument(
+        "--trial-validation-rate-sbs",
+        type=int,
+        default=1,
+        help="Run normal validation every N sb inside each trial. Default: 1, so stdout shows loss every sb.",
+    )
+    parser.add_argument(
+        "--trial-quantized-validation-rate-sbs",
+        type=int,
+        default=1,
+        help="Run quantized validation every N sb inside each trial. Default: 1, so stdout shows qloss every sb.",
+    )
     parser.add_argument("--positions-per-superbatch", type=int, default=40_000_000)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--base-score", type=float, default=None, help="Base score override. Lower is better.")
@@ -243,6 +255,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--accepted-save-rate-sbs must be >= 0")
     if args.accepted_save_rate_sbs and args.accepted_save_rate_sbs % args.sb_per_trial != 0:
         parser.error("--accepted-save-rate-sbs must be divisible by --sb-per-trial")
+    if args.trial_validation_rate_sbs <= 0:
+        parser.error("--trial-validation-rate-sbs must be > 0")
+    if args.trial_quantized_validation_rate_sbs <= 0:
+        parser.error("--trial-quantized-validation-rate-sbs must be > 0")
     if args.positions_per_superbatch <= 0:
         parser.error("--positions-per-superbatch must be > 0")
     for name in ["step_scale", "step_shrink", "step_grow", "min_step_scale", "max_step_scale"]:
@@ -547,9 +563,9 @@ def base_command(
         "--save-rate",
         str(args.sb_per_trial),
         "--validation-rate",
-        str(args.sb_per_trial),
+        str(args.trial_validation_rate_sbs),
         "--quantized-validation-rate",
-        str(args.sb_per_trial),
+        str(args.trial_quantized_validation_rate_sbs),
     ]
     if args.batch_size is not None:
         cmd.extend(["--batch-size", str(args.batch_size)])

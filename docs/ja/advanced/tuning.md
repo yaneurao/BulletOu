@@ -376,6 +376,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 デフォルトでは、plus/minus の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
 
+trial 内の checkpoint 保存は trial 末だけですが、通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
+
 例:
 
 ```powershell
@@ -442,7 +444,7 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 ## 7. 保存と検証の頻度
 

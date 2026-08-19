@@ -390,6 +390,8 @@ The perturbation size is multiplicative. The default is `--step-scale 1.03`. For
 
 By default, the plus/minus trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
 
+Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
+
 Example:
 
 ```powershell
@@ -456,7 +458,7 @@ Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--valid
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
-The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
+The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
 ## 8. Save and validation frequency
 
