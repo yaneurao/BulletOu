@@ -15479,17 +15479,19 @@ fn write_cuda_cpp_nnue_numbered_checkpoint(
     completed_steps: usize,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
-    let output_dir = args.output_dir();
-    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let idx = next_numbered_checkpoint_idx(&output_dir);
-    let dir = output_dir.join(format!("{idx:04}"));
-    if dir.exists() {
-        return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+    let (output_dir, idx, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args)?;
+    let write_result = (|| -> Result<(), String> {
+        write_cuda_cpp_nnue_nn_bin(&tmp_dir.join("nn.bin"), feature_kind, shape, weights)?;
+        write_cuda_cpp_halfkp_weights_bin(&tmp_dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
+        write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, args, log)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(err);
     }
-    std::fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-    write_cuda_cpp_nnue_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights)?;
-    write_cuda_cpp_halfkp_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
-    write_cuda_cpp_direct_checkpoint_metadata(&output_dir, idx, &dir, args, log)?;
+    commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
+    append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
     Ok(dir)
 }
 
@@ -15505,38 +15507,38 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
-    let output_dir = args.output_dir();
-    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let idx = next_numbered_checkpoint_idx(&output_dir);
-    let dir = output_dir.join(format!("{idx:04}"));
-    if dir.exists() {
-        return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+    let (output_dir, idx, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args)?;
+    let write_result = (|| -> Result<(), String> {
+        write_cuda_cpp_sfnn_nn_bin(
+            &tmp_dir.join("nn.bin"),
+            feature_kind,
+            shape,
+            weights,
+            effective_sfnn_factorizer_spec(args),
+            effective_sfnn_factorizer_alpha(args),
+            progress_params,
+        )?;
+        write_cuda_cpp_sfnn_weights_bin(
+            &tmp_dir.join("state.bin"),
+            weights,
+            optimizer_states,
+            completed_steps,
+            optimizer_steps,
+        )?;
+        write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, args, log)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(err);
     }
-    std::fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-    write_cuda_cpp_sfnn_nn_bin(
-        &dir.join("nn.bin"),
-        feature_kind,
-        shape,
-        weights,
-        effective_sfnn_factorizer_spec(args),
-        effective_sfnn_factorizer_alpha(args),
-        progress_params,
-    )?;
-    write_cuda_cpp_sfnn_weights_bin(
-        &dir.join("state.bin"),
-        weights,
-        optimizer_states,
-        completed_steps,
-        optimizer_steps,
-    )?;
-    write_cuda_cpp_direct_checkpoint_metadata(&output_dir, idx, &dir, args, log)?;
+    commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
+    append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
     Ok(dir)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn write_cuda_cpp_direct_checkpoint_metadata(
-    output_dir: &std::path::Path,
-    idx: usize,
+fn write_cuda_cpp_direct_checkpoint_metadata_files(
     dir: &std::path::Path,
     args: &Args,
     log: CudaCppCheckpointLog,
@@ -15556,9 +15558,84 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     learn.push('\n');
     learn.push_str(&cuda_cpp_direct_learn_log_row(args, log));
     std::fs::write(dir.join("learn.log"), learn)
-        .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))?;
+        .map_err(|err| format!("failed to write {}: {err}", dir.join("learn.log").display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn append_cuda_cpp_direct_checkpoint_summary(
+    output_dir: &std::path::Path,
+    idx: usize,
+    args: &Args,
+) -> Result<(), String> {
     append_to_top_level_log(output_dir, idx, Some(args))
         .map_err(|err| format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display()))
+}
+
+#[cfg(all(feature = "cuda-cpp-backend", test))]
+fn write_cuda_cpp_direct_checkpoint_metadata(
+    output_dir: &std::path::Path,
+    idx: usize,
+    dir: &std::path::Path,
+    args: &Args,
+    log: CudaCppCheckpointLog,
+) -> Result<(), String> {
+    write_cuda_cpp_direct_checkpoint_metadata_files(dir, args, log)?;
+    append_cuda_cpp_direct_checkpoint_summary(output_dir, idx, args)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn prepare_cuda_cpp_numbered_checkpoint_dir(
+    args: &Args,
+) -> Result<(std::path::PathBuf, usize, std::path::PathBuf, std::path::PathBuf), String> {
+    let output_dir = args.output_dir();
+    std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let idx = next_numbered_checkpoint_idx(&output_dir);
+    let dir = output_dir.join(format!("{idx:04}"));
+    if dir.exists() {
+        if is_complete_checkpoint_dir(&dir) {
+            return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+        }
+        archive_incomplete_numbered_checkpoint_dir(&dir)?;
+    }
+
+    for attempt in 0..1000usize {
+        let tmp_dir = output_dir.join(format!("{idx:04}.tmp-{}-{attempt}", std::process::id()));
+        if tmp_dir.exists() {
+            continue;
+        }
+        std::fs::create_dir(&tmp_dir).map_err(|err| format!("failed to create {}: {err}", tmp_dir.display()))?;
+        return Ok((output_dir, idx, dir, tmp_dir));
+    }
+    Err(format!("failed to choose temporary checkpoint directory for {}", dir.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn archive_incomplete_numbered_checkpoint_dir(dir: &std::path::Path) -> Result<(), String> {
+    let parent = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("checkpoint");
+    let timestamp =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    for attempt in 0..1000usize {
+        let suffix = if attempt == 0 { String::new() } else { format!("-{attempt}") };
+        let failed = parent.join(format!("{name}.failed-{timestamp}{suffix}"));
+        if failed.exists() {
+            continue;
+        }
+        std::fs::rename(dir, &failed).map_err(|err| {
+            format!("failed to archive incomplete checkpoint {} to {}: {err}", dir.display(), failed.display())
+        })?;
+        return Ok(());
+    }
+    Err(format!("failed to archive incomplete checkpoint {}", dir.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn commit_cuda_cpp_numbered_checkpoint_dir(tmp_dir: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    if dir.exists() {
+        return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
+    }
+    std::fs::rename(tmp_dir, dir)
+        .map_err(|err| format!("failed to rename {} to {}: {err}", tmp_dir.display(), dir.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -20161,12 +20238,21 @@ fn write_cuda_cpp_state_records_atomic<'a>(
 
 /// Return the next numbered checkpoint directory index.
 ///
-/// This must be based on the maximum existing number, not the count of
-/// numbered directories. Users commonly delete old checkpoint directories to
-/// free disk space. If only `0073/` and `0074/` remain, count+1 would produce
-/// `0003/`, which is lower than the latest checkpoint and breaks auto-resume.
+/// This is based on the maximum complete checkpoint, not the count of
+/// numbered directories and not incomplete directories left by a failed save.
+/// Users commonly delete old checkpoint directories to free disk space. If
+/// only `0073/` and `0074/` remain, count+1 would produce `0003/`, which is
+/// lower than the latest checkpoint and breaks auto-resume. Conversely, if a
+/// failed save left `0075/` with only `nn.bin`, the next successful save should
+/// still be `0075/`, not `0076/`.
 fn next_numbered_checkpoint_idx(output_dir: &std::path::Path) -> usize {
-    numbered_checkpoint_dirs_desc(output_dir).into_iter().map(|(n, _)| n).max().unwrap_or(0).saturating_add(1)
+    numbered_checkpoint_dirs_desc(output_dir)
+        .into_iter()
+        .filter(|(_, path)| is_complete_checkpoint_dir(path))
+        .map(|(n, _)| n)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 const RESUME_CONFIG_NAME: &str = "resume-config.txt";
@@ -28632,6 +28718,34 @@ mod tests {
         assert_eq!(read_latest_saved_superbatch(&tmp), Some(19));
         assert_eq!(read_latest_dataloader_pos(&tmp), Some((1900, 0)));
         assert_eq!(read_latest_saved_teacher(&tmp), Some("teacher.psv".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn next_checkpoint_number_ignores_incomplete_higher_number() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-next-incomplete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let d14 = tmp.join("0014");
+        std::fs::create_dir(&d14).unwrap();
+        std::fs::write(d14.join("state.bin"), b"state").unwrap();
+        std::fs::write(d14.join("dataloader_pos.txt"), "1400,0\n").unwrap();
+        std::fs::write(
+            d14.join("learn.log"),
+            format!("{LEARN_LOG_HEADER}\nNNUE,14,1,1,-,-,-,0,0,1,0,-,-,teacher.psv\n"),
+        )
+        .unwrap();
+
+        let d15 = tmp.join("0015");
+        std::fs::create_dir(&d15).unwrap();
+        std::fs::write(d15.join("nn.bin"), b"incomplete").unwrap();
+
+        assert_eq!(next_numbered_checkpoint_idx(&tmp), 15);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
