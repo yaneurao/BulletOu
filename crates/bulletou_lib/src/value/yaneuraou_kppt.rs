@@ -72,7 +72,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 const SQ_NB: usize = 81;
@@ -281,15 +281,43 @@ fn skip_exact<R: Read>(reader: &mut R, mut bytes: usize, id: &str) -> io::Result
 /// [`parse_model_weights_bin`] reads. Returns the in-memory byte buffer.
 pub fn write_model_weights_bin<'a>(records: impl IntoIterator<Item = (&'a str, &'a [f32])>) -> Vec<u8> {
     let mut buf = Vec::new();
+    write_model_weights_bin_writer(&mut buf, records).expect("writing model weights to Vec<u8> should not fail");
+    buf
+}
+
+/// Streaming variant of [`write_model_weights_bin`].
+///
+/// This writes each record directly to `writer` and avoids allocating a second
+/// byte buffer as large as the whole serialized state. It is intended for huge
+/// CUDA `state.bin` files where the f32 tensors are already resident in host
+/// memory after GPU readback.
+pub fn write_model_weights_bin_writer<'a, W>(
+    mut writer: W,
+    records: impl IntoIterator<Item = (&'a str, &'a [f32])>,
+) -> io::Result<()>
+where
+    W: Write,
+{
     for (id, values) in records {
-        buf.extend_from_slice(id.as_bytes());
-        buf.push(b'\n');
-        buf.extend_from_slice(&values.len().to_le_bytes());
-        for v in values {
+        writer.write_all(id.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.write_all(&values.len().to_le_bytes())?;
+        write_f32_values_to_writer(&mut writer, values)?;
+    }
+    Ok(())
+}
+
+fn write_f32_values_to_writer<W: Write>(writer: &mut W, values: &[f32]) -> io::Result<()> {
+    const CHUNK_VALUES: usize = 64 * 1024;
+    let mut buf = Vec::with_capacity(CHUNK_VALUES * std::mem::size_of::<f32>());
+    for chunk in values.chunks(CHUNK_VALUES) {
+        buf.clear();
+        for v in chunk {
             buf.extend_from_slice(&v.to_le_bytes());
         }
+        writer.write_all(&buf)?;
     }
-    buf
+    Ok(())
 }
 
 pub const STATE_BACKEND_RECORD_PREFIX: &str = "meta/state_backend/";
@@ -653,6 +681,24 @@ mod tests {
         .unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["l0w"], vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn streaming_write_matches_in_memory_write() {
+        let records = [
+            ("nnue/weights/l0w", [1.0f32, -2.5, 3.25].as_slice()),
+            ("nnue/weights/l0b", [].as_slice()),
+            ("nnue/step_ranger/l0w", [1234.0f32].as_slice()),
+        ];
+        let expected = write_model_weights_bin(records);
+        let mut actual = Vec::new();
+        write_model_weights_bin_writer(&mut actual, records).unwrap();
+        assert_eq!(actual, expected);
+
+        let parsed = parse_model_weights_bin_reader(std::io::Cursor::new(actual)).unwrap();
+        assert_eq!(parsed["nnue/weights/l0w"], vec![1.0, -2.5, 3.25]);
+        assert_eq!(parsed["nnue/weights/l0b"], Vec::<f32>::new());
+        assert_eq!(parsed["nnue/step_ranger/l0w"], vec![1234.0]);
     }
 
     #[test]

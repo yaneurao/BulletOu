@@ -92,7 +92,7 @@ use bulletou_lib::{
         nnue_save_sfnn1536::{LEB128_MAGIC, NNUE_VERSION as SFNN_NNUE_VERSION},
         yaneuraou_kppt::{
             KppFormat, bundle_component_state, parse_model_weights_bin, parse_model_weights_bin_file_select_map,
-            save_yaneuraou_eval, write_state_backend_marker,
+            save_yaneuraou_eval, write_model_weights_bin_writer, write_state_backend_marker,
         },
     },
 };
@@ -18653,7 +18653,6 @@ fn write_cuda_cpp_halfkp_weights_bin(
     completed_steps: usize,
 ) -> Result<(), String> {
     let completed_steps = [completed_steps as f32];
-    let mut bytes = write_state_backend_marker("cuda-cpp");
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/weights/l0w", weights.l0w.as_slice()),
         ("nnue/weights/l0b", weights.l0b.as_slice()),
@@ -18690,8 +18689,7 @@ fn write_cuda_cpp_halfkp_weights_bin(
         ("nnue/step_ranger/outw", completed_steps.as_slice()),
         ("nnue/step_ranger/outb", completed_steps.as_slice()),
     ]);
-    bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(records));
-    write_bytes_atomic(path, &bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    write_cuda_cpp_state_records_atomic(path, records)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -18738,7 +18736,6 @@ fn write_cuda_cpp_sfnn_weights_bin(
 ) -> Result<(), String> {
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
-    let mut bytes = write_state_backend_marker("cuda-cpp");
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
         ("nnue/weights/l0w", weights.l0w.as_slice()),
@@ -18911,8 +18908,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
         ]);
     }
 
-    bytes.extend_from_slice(&bulletou_lib::value::yaneuraou_kppt::write_model_weights_bin(records));
-    write_bytes_atomic(path, &bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    write_cuda_cpp_state_records_atomic(path, records)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -20124,6 +20120,41 @@ fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_state_records_atomic<'a>(
+    path: &std::path::Path,
+    records: Vec<(&'a str, &'a [f32])>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("state.bin");
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
+        writer.write_all(&write_state_backend_marker("cuda-cpp"))?;
+        write_model_weights_bin_writer(&mut writer, records)?;
+        writer.flush()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to write {}: {err}", path.display()));
+    }
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|err| format!("failed to replace {}: {err}", path.display()))?;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to rename {} to {}: {err}", tmp.display(), path.display()));
     }
     Ok(())
 }
