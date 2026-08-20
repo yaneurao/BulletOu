@@ -1122,9 +1122,9 @@ def trial_start_line(
 ) -> None:
     event_line(
         args,
-        "TRIAL START",
+        f"TRIAL {trial_number} START",
         (
-            f"trial {trial_number} start  {probe_label(side)}  tag={tag}  "
+            f"{probe_label(side)}  tag={tag}  "
             f"{accept_threshold_text(args, base_score, base_metric)}"
         ),
         "cyan",
@@ -1141,13 +1141,19 @@ def score_compare_text(args: argparse.Namespace, score: float, base_score: float
     )
 
 
-def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_score: float) -> None:
+def trial_threshold_line(
+    args: argparse.Namespace,
+    trial: TrialResult,
+    base_score: float,
+    *,
+    trial_number: int,
+) -> None:
     beats_target = trial.score < base_score
     status = "beats_target" if beats_target else "misses_target"
     color = "green" if beats_target else "yellow"
     event_line(
         args,
-        "TRIAL END",
+        f"TRIAL {trial_number} END",
         (
             f"{probe_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
             f"qacc={fmt_metric(trial.metric.qacc)} result={status}"
@@ -2058,12 +2064,15 @@ def main() -> int:
                 update_mode=args.update_mode,
             )
 
+            probe_a_trial_number = (retry - 1) * 2 + 1
+            probe_b_trial_number = (retry - 1) * 2 + 2
+
             probe_a = run_trial(
                 args,
                 accepted_checkpoint,
                 f"{tag_base}-probe-a",
                 PROBE_A,
-                1,
+                probe_a_trial_number,
                 old_base_score,
                 base_metric,
                 probe_a_theta,
@@ -2071,13 +2080,13 @@ def main() -> int:
                 log_dir,
                 worker,
             )
-            trial_threshold_line(args, probe_a, old_base_score)
+            trial_threshold_line(args, probe_a, old_base_score, trial_number=probe_a_trial_number)
             probe_b = run_trial(
                 args,
                 accepted_checkpoint,
                 f"{tag_base}-probe-b",
                 PROBE_B,
-                2,
+                probe_b_trial_number,
                 old_base_score,
                 base_metric,
                 probe_b_theta,
@@ -2085,7 +2094,7 @@ def main() -> int:
                 log_dir,
                 worker,
             )
-            trial_threshold_line(args, probe_b, old_base_score)
+            trial_threshold_line(args, probe_b, old_base_score, trial_number=probe_b_trial_number)
             candidates = [probe_a, probe_b]
             best_probe = min(candidates, key=lambda item: item.score)
             best_probe_theta = theta_for_result(best_probe, probe_a_theta, probe_b_theta)
