@@ -103,6 +103,16 @@ residual / axis / pair の confidence は、同じ `count.bin` を使います�
 
 `progress4` など `progressN` を含む architecture では、進行度を計算するパラメーターも学習され、`nn.bin` の Progress section に保存されます。`count.bin` を作る場合は、進行度bucketを決めるために同じ architecture の `nn.bin` も指定します。
 
+`progressN` 付きの architecture は、何も指定しない場合、学習中に進行度パラメーターも更新します。この経路では学習時に隣接bucketを使うため、通常のbucketよりかなり遅くなります。
+
+進行度パラメーターをこれ以上動かさない段階では、再開時に次を指定します。
+
+```powershell
+--sfnn-freeze-progress
+```
+
+これを指定すると、進行度パラメーターを固定し、`nn.bin` に書き出すときと同じ hard bucket 判定で学習します。学習と validation cache の両方が軽くなります。最初から進行度パラメーターを学習したい場合は、このオプションは付けないでください。
+
 巨大な教師フォルダ全体から `count.bin` を作る場合、`bucket-count` は固定長の `.psv` / `.bin` をまとめ読みしながら count します。Dドライブなどで読み込み速度が波打つ場合は、応用編の説明を見て `--buffer-mb` と `--read-buffers` を調整してください。
 
 ---
