@@ -9125,10 +9125,7 @@ fn worker_json_string_array(request: &serde_json::Value, field: &str) -> Result<
         .iter()
         .enumerate()
         .map(|(i, value)| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("worker `{field}` item {i} is not a string"))
+            value.as_str().map(str::to_string).ok_or_else(|| format!("worker `{field}` item {i} is not a string"))
         })
         .collect()
 }
@@ -9192,13 +9189,9 @@ fn worker_last_summary_row(output_dir: &std::path::Path) -> Result<Option<serde_
         row.insert((*key).to_string(), serde_json::Value::String(value.to_string()));
     }
     let mut metrics = serde_json::Map::new();
-    for key in [
-        "test_value_accuracy",
-        "test_value_loss",
-        "quantized_value_accuracy",
-        "quantized_value_loss",
-        "positions",
-    ] {
+    for key in
+        ["test_value_accuracy", "test_value_loss", "quantized_value_accuracy", "quantized_value_loss", "positions"]
+    {
         if let Some(value) = row.get(key).and_then(serde_json::Value::as_str) {
             if let Ok(parsed) = value.parse::<f64>() {
                 if let Some(number) = serde_json::Number::from_f64(parsed) {
@@ -9281,10 +9274,7 @@ fn worker_require_sfnn_feature(args: &Args) -> Result<CudaCppSfnnFeatureKind, St
         EvalType::SfnnHalfka2hm => Ok(CudaCppSfnnFeatureKind::Halfka2hm),
         EvalType::SfnnHalfka2 => Ok(CudaCppSfnnFeatureKind::Halfka2),
         EvalType::SfnnKa2 => Ok(CudaCppSfnnFeatureKind::Ka2),
-        other => Err(format!(
-            "worker train-session currently supports SFNN cuda-cpp only; got {}",
-            other.cli_name()
-        )),
+        other => Err(format!("worker train-session currently supports SFNN cuda-cpp only; got {}", other.cli_name())),
     }
 }
 
@@ -9387,7 +9377,8 @@ impl WorkerSfnnSession {
         let dataloader_pos =
             cuda_cpp_auto_resume_dataloader_pos(&args, batch_size, initial_state.completed_steps, "nnue")?;
         let validation_cache = CudaCppSfnnResidentValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
-        let quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
+        let quantized_validation_cache =
+            CudaCppSfnnQuantizedValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
         Ok(Self {
             args,
             feature_kind,
@@ -9434,7 +9425,8 @@ impl WorkerSfnnSession {
         }
         if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
             let counts = sfnn_bucket_counts.as_ref().ok_or_else(|| {
-                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
+                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
+                    .to_string()
             })?;
             let spec = effective_sfnn_factorizer_spec(args);
             let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, counts)?;
@@ -9452,10 +9444,7 @@ impl WorkerSfnnSession {
 
     fn apply_args_to_runner(&mut self, args: &Args) -> Result<(), String> {
         self.runner
-            .set_factorizer_config(
-                cuda_cpp_sfnn_factorizer_active(args),
-                cuda_cpp_sfnn_factorizer_alpha(args),
-            )
+            .set_factorizer_config(cuda_cpp_sfnn_factorizer_active(args), cuda_cpp_sfnn_factorizer_alpha(args))
             .map_err(|e| e.to_string())?;
         self.factorizer_axis_confidences =
             Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
@@ -9476,18 +9465,17 @@ impl WorkerSfnnSession {
 
     fn restore_host_snapshot(&mut self, args: &Args, snapshot: &WorkerSfnnHostSnapshot) -> Result<(), String> {
         let started = std::time::Instant::now();
-        self.runner = bulletou_cuda_cpp::SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
-            &self.ctx,
-            cuda_cpp_sfnn_weights_readback_as_host(self.shape, &snapshot.weights),
-            cuda_cpp_sfnn_optimizer_readback_as_host(&snapshot.optimizer_states),
-            self.batch_size,
-            self.feature_kind.max_active(),
-            cuda_cpp_sfnn_factorizer_active(args),
-            cuda_cpp_sfnn_factorizer_alpha(args),
-        )
-        .map_err(|e| e.to_string())?;
+        self.runner
+            .upload_state_from_host(
+                &self.ctx,
+                cuda_cpp_sfnn_weights_readback_as_host(self.shape, &snapshot.weights),
+                cuda_cpp_sfnn_optimizer_readback_as_host(&snapshot.optimizer_states),
+                cuda_cpp_sfnn_factorizer_active(args),
+                cuda_cpp_sfnn_factorizer_alpha(args),
+            )
+            .map_err(|e| e.to_string())?;
         self.apply_args_to_runner(args)?;
-        eprintln!("  worker restore = host RAM -> GPU: {}", format_duration_secs(started.elapsed()));
+        eprintln!("  worker restore = host RAM -> existing GPU buffers: {}", format_duration_secs(started.elapsed()));
         Ok(())
     }
 
@@ -9543,11 +9531,7 @@ impl WorkerSfnnSession {
         validate_teacher_shuffle_buffer(&trial_args, schedule.batches_per_superbatch)?;
         let teacher_shuffle_buffer_batches =
             effective_teacher_shuffle_buffer_batches(&trial_args, schedule.batches_per_superbatch)?;
-        let snapshot = if keep {
-            None
-        } else {
-            Some(self.snapshot_host()?)
-        };
+        let snapshot = if keep { None } else { Some(self.snapshot_host()?) };
         let base_args = self.args.clone();
         let base_dataloader_pos = self.dataloader_pos;
         self.apply_args_to_runner(&trial_args)?;
@@ -9755,26 +9739,21 @@ impl WorkerSfnnSession {
                 &mut self.validation_cache,
             )?
         };
-        let quantized_metrics =
-            if last_quantized_metrics.is_some() { last_quantized_metrics } else { self.run_quantized_validation(&trial_args)? };
+        let quantized_metrics = if last_quantized_metrics.is_some() {
+            last_quantized_metrics
+        } else {
+            self.run_quantized_validation(&trial_args)?
+        };
         let elapsed = started.elapsed();
         eprintln!(
             "  worker {}: steps={}, updates={}, test_loss={}, test_acc={}, qloss={}, qacc={}, elapsed={}",
             if keep { "adopt" } else { "trial" },
             format_count(seen_steps),
             format_count(optimizer_updates),
-            test_metrics
-                .map(|m| format!("{:.8}", m.loss))
-                .unwrap_or_else(|| "-".to_string()),
-            test_metrics
-                .map(|m| format!("{:.7}", m.accuracy))
-                .unwrap_or_else(|| "-".to_string()),
-            quantized_metrics
-                .map(|m| format!("{:.8}", m.loss))
-                .unwrap_or_else(|| "-".to_string()),
-            quantized_metrics
-                .map(|m| format!("{:.7}", m.accuracy))
-                .unwrap_or_else(|| "-".to_string()),
+            test_metrics.map(|m| format!("{:.8}", m.loss)).unwrap_or_else(|| "-".to_string()),
+            test_metrics.map(|m| format!("{:.7}", m.accuracy)).unwrap_or_else(|| "-".to_string()),
+            quantized_metrics.map(|m| format!("{:.8}", m.loss)).unwrap_or_else(|| "-".to_string()),
+            quantized_metrics.map(|m| format!("{:.7}", m.accuracy)).unwrap_or_else(|| "-".to_string()),
             format_duration_secs(elapsed)
         );
         if keep {
@@ -9829,10 +9808,8 @@ impl WorkerSfnnSession {
         self.ctx.synchronize().map_err(|e| e.to_string())?;
         let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
         let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
-        let dataloader_pos = self.dataloader_pos.unwrap_or(bulletou_lib::value::TeacherDataloaderPos {
-            byte_offset: 0,
-            plies: 0,
-        });
+        let dataloader_pos =
+            self.dataloader_pos.unwrap_or(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
         let log = CudaCppCheckpointLog {
             epoch,
             superbatch,
@@ -9846,8 +9823,7 @@ impl WorkerSfnnSession {
         };
         let checkpoint_dir = if let Some(dir) = exact_dir.as_ref() {
             let parent = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
             let tmp_dir = parent.join(format!(
                 "{}.tmp-{}",
                 dir.file_name().and_then(|name| name.to_str()).unwrap_or("worker-checkpoint"),
@@ -9908,8 +9884,12 @@ impl WorkerSfnnSession {
                 quantized_test_args_from_training_args(&save_args, PathBuf::from("<worker-save-live-quantized-sfnn>"))?
             {
                 if self.quantized_validation_cache.is_none() {
-                    self.quantized_validation_cache =
-                        CudaCppSfnnQuantizedValidationCache::try_new(&save_args, self.feature_kind, &self.ctx, self.shape)?;
+                    self.quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(
+                        &save_args,
+                        self.feature_kind,
+                        &self.ctx,
+                        self.shape,
+                    )?;
                 }
                 if let Some(cache) = self.quantized_validation_cache.as_mut() {
                     let metrics = cache.run_runner(
@@ -10033,10 +10013,7 @@ fn worker_handle_request(
             };
             let epoch = request.get("epoch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
             let superbatch = request.get("superbatch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
-            let exact_dir = request
-                .get("dir")
-                .and_then(serde_json::Value::as_str)
-                .map(std::path::PathBuf::from);
+            let exact_dir = request.get("dir").and_then(serde_json::Value::as_str).map(std::path::PathBuf::from);
             let save_result = match exact_dir {
                 Some(dir) => session.save_exact(save_args, dir, epoch, superbatch),
                 None => session.save(save_args, epoch, superbatch),

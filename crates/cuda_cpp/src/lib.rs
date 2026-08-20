@@ -1430,7 +1430,12 @@ fn clone_optional_f32_device(ctx: &Context, src: &Option<F32Buffer>) -> Result<O
     src.as_ref().map(|buffer| buffer.try_clone_device(ctx)).transpose()
 }
 
-fn copy_optional_f32_device(ctx: &Context, label: &str, dst: &Option<F32Buffer>, src: &Option<F32Buffer>) -> Result<()> {
+fn copy_optional_f32_device(
+    ctx: &Context,
+    label: &str,
+    dst: &Option<F32Buffer>,
+    src: &Option<F32Buffer>,
+) -> Result<()> {
     match (dst, src) {
         (Some(dst), Some(src)) => dst.copy_from(ctx, src),
         (None, None) => Ok(()),
@@ -3852,6 +3857,14 @@ impl RangerParamState {
         })
     }
 
+    pub fn upload(&self, ctx: &Context, len: usize, state: RangerParamHostState<'_>) -> Result<()> {
+        state.validate(len, "optimizer state")?;
+        self.validate(len, "optimizer state")?;
+        self.momentum.upload(ctx, state.momentum)?;
+        self.velocity.upload(ctx, state.velocity)?;
+        self.slow_params.upload(ctx, state.slow_params)
+    }
+
     pub fn download(&self, ctx: &Context) -> Result<RangerParamStateReadback> {
         Ok(RangerParamStateReadback {
             momentum: self.momentum.download(ctx)?,
@@ -4068,6 +4081,25 @@ fn copy_optional_ranger_device(
         }
         (None, Some(_)) => {
             Err(CudaCppError::message(format!("{label}: source state exists but destination is absent")))
+        }
+    }
+}
+
+fn upload_optional_ranger_host(
+    ctx: &Context,
+    label: &str,
+    dst: &Option<RangerParamState>,
+    len: usize,
+    state: Option<RangerParamHostState<'_>>,
+) -> Result<()> {
+    match (dst, state) {
+        (Some(dst), Some(state)) => dst.upload(ctx, len, state),
+        (None, None) => Ok(()),
+        (Some(_), None) => {
+            Err(CudaCppError::message(format!("{label}: destination state exists but host state is absent")))
+        }
+        (None, Some(_)) => {
+            Err(CudaCppError::message(format!("{label}: host state exists but destination state is absent")))
         }
     }
 }
@@ -4935,6 +4967,54 @@ impl SfnnRangerOptimizerStates {
             l3axw: self.l3axw.as_ref().map(|state| state.download(ctx)).transpose()?,
             l3axb: self.l3axb.as_ref().map(|state| state.download(ctx)).transpose()?,
         })
+    }
+
+    pub fn upload(
+        &self,
+        ctx: &Context,
+        shape: SfnnForwardShape,
+        states: SfnnRangerOptimizerHostStates<'_>,
+    ) -> Result<()> {
+        validate_sfnn_shape(shape)?;
+        self.validate(shape)?;
+        let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?;
+        let l1w_len = shape.l1w_len()?;
+        let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
+        let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
+        let axis_count = shape.factorizer_axis_count();
+        let l1axw_len = checked_product("sfnn l1axw", &[axis_count, shape.ft_size, shape.l1_out()])?;
+        let l1axb_len = checked_product("sfnn l1axb", &[axis_count, shape.l1_out()])?;
+        let l2fw_len = checked_product("sfnn l2fw", &[shape.l2_size, shape.l2_in()])?;
+        let l2axw_len = checked_product("sfnn l2axw", &[axis_count, shape.l2_size, shape.l2_in()])?;
+        let l2axb_len = checked_product("sfnn l2axb", &[axis_count, shape.l2_size])?;
+        let l3axw_len = checked_product("sfnn l3axw", &[axis_count, shape.l2_size])?;
+
+        self.l0w.upload(ctx, l0w_len, states.l0w)?;
+        self.l0b.upload(ctx, shape.ft_size, states.l0b)?;
+        self.l1w.upload(ctx, l1w_len, states.l1w)?;
+        self.l1b.upload(ctx, shape.num_stacks * shape.l1_out(), states.l1b)?;
+        upload_optional_ranger_host(
+            ctx,
+            "optimizer l1fw",
+            &self.l1fw,
+            checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
+            states.l1fw,
+        )?;
+        upload_optional_ranger_host(ctx, "optimizer l1fb", &self.l1fb, shape.l1_out(), states.l1fb)?;
+        upload_optional_ranger_host(ctx, "optimizer l1axw", &self.l1axw, l1axw_len, states.l1axw)?;
+        upload_optional_ranger_host(ctx, "optimizer l1axb", &self.l1axb, l1axb_len, states.l1axb)?;
+        self.l2w.upload(ctx, l2w_len, states.l2w)?;
+        self.l2b.upload(ctx, shape.num_stacks * shape.l2_size, states.l2b)?;
+        upload_optional_ranger_host(ctx, "optimizer l2fw", &self.l2fw, l2fw_len, states.l2fw)?;
+        upload_optional_ranger_host(ctx, "optimizer l2fb", &self.l2fb, shape.l2_size, states.l2fb)?;
+        upload_optional_ranger_host(ctx, "optimizer l2axw", &self.l2axw, l2axw_len, states.l2axw)?;
+        upload_optional_ranger_host(ctx, "optimizer l2axb", &self.l2axb, l2axb_len, states.l2axb)?;
+        self.l3w.upload(ctx, l3w_len, states.l3w)?;
+        self.l3b.upload(ctx, shape.num_stacks, states.l3b)?;
+        upload_optional_ranger_host(ctx, "optimizer l3fw", &self.l3fw, shape.l2_size, states.l3fw)?;
+        upload_optional_ranger_host(ctx, "optimizer l3fb", &self.l3fb, 1, states.l3fb)?;
+        upload_optional_ranger_host(ctx, "optimizer l3axw", &self.l3axw, l3axw_len, states.l3axw)?;
+        upload_optional_ranger_host(ctx, "optimizer l3axb", &self.l3axb, axis_count, states.l3axb)
     }
 
     pub fn try_clone_device(&self, ctx: &Context, shape: SfnnForwardShape) -> Result<Self> {
@@ -6167,6 +6247,32 @@ impl SfnnTrainStepRunner {
         self.optimizer_states.copy_from_device(ctx, self.shape, &src.optimizer_states)?;
         self.factorizer = src.factorizer;
         self.factorizer_alpha = src.factorizer_alpha;
+        Ok(())
+    }
+
+    pub fn upload_state_from_host(
+        &mut self,
+        ctx: &Context,
+        weights: SfnnForwardHostWeights<'_>,
+        optimizer_states: SfnnRangerOptimizerHostStates<'_>,
+        factorizer: SfnnFactorizerActive,
+        factorizer_alpha: SfnnFactorizerAlpha,
+    ) -> Result<()> {
+        weights.validate()?;
+        if self.shape != weights.shape {
+            return Err(CudaCppError::message(format!(
+                "SFNN runner shape mismatch while restoring host state: runner {:?}, host {:?}",
+                self.shape, weights.shape
+            )));
+        }
+        factorizer.validate_for_shape(self.shape)?;
+        factorizer_alpha.validate()?;
+        self.weights.upload(ctx, weights)?;
+        self.optimizer_states.upload(ctx, self.shape, optimizer_states)?;
+        self.backward_workspace.zero_parameter_gradients(ctx)?;
+        self.next_upload_slot = 0;
+        self.factorizer = factorizer;
+        self.factorizer_alpha = factorizer_alpha;
         Ok(())
     }
 
