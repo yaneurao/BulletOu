@@ -335,7 +335,12 @@ def parse_args() -> argparse.Namespace:
             "Default 0.1 means move theta by 10%% of the current delta width."
         ),
     )
-    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Force-adopt the best retry trial after this many non-improving plus/minus pairs. Default: 2.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--no-stream-child-output",

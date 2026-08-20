@@ -25,7 +25,7 @@ SFNN LayerStack の factorizer まわりは、`shared/axis/pair` の強さ、cou
 
 デフォルトの評価指標は `quantized_value_loss`。`quantized_value_accuracy` は目的関数として粗すぎるので、採否判定には使わない。
 
-retry 中は、その retry window 全体で qloss が最も良い checkpoint だけを `retry-best/` に退避する。`--max-retries 5` なら最大10本の trial が走るが、強制採用時は最後の2本ではなく、その10本全体のbest qlossを採用する。
+retry 中は、その retry window 全体で qloss が最も良い checkpoint だけを `retry-best/` に退避する。デフォルトの `--max-retries 2` なら最大4本の trial が走るが、強制採用時は最後の2本ではなく、その4本全体のbest qlossを採用する。
 
 ## ファイル
 
@@ -177,7 +177,7 @@ SPSA runner は短い trial の qloss 差でハイパーパラメーターを判
 
 両方の trial が悪化した場合、runner はすぐには採用せず、変化幅を小さくして retry する。
 
-`--max-retries 5` の場合、5 回連続で改善しないときだけ、悪化が小さいほうを採用して進める。これは「どの方向でも短期 qloss は下がらないが、局所的に動かないと先へ進めない」状態を避けるため。
+デフォルトの `--max-retries 2` では、2 回連続で改善しないとき、retry window 全体で qloss が一番良かった trial を採用して進める。これは「どの方向でも短期 qloss は下がらないが、局所的に動かないと先へ進めない」状態を避けるため。
 
 ## 注意点
 
