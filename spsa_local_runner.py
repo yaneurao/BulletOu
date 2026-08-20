@@ -34,6 +34,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -80,6 +81,15 @@ PAIR_COUNT_KEYS = [
     "king_progress_pair_count_confidence",
     "hand_progress_pair_count_confidence",
 ]
+
+
+ANSI_COLORS = {
+    "reset": "\x1b[0m",
+    "bold": "\x1b[1m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "cyan": "\x1b[36m",
+}
 
 
 DEFAULT_BOUNDS: dict[str, tuple[float, float]] = {
@@ -385,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         "--no-stream-child-output",
         action="store_true",
         help="Do not mirror bulletou.exe stdout to the console. Logs are still saved.",
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Color runner event lines. Default: auto.",
     )
     parser.add_argument(
         "--use-worker",
@@ -1011,6 +1027,37 @@ def os_devnull_log_name() -> str:
     return "NUL" if sys.platform.startswith("win") else "/dev/null"
 
 
+def use_color(args: argparse.Namespace) -> bool:
+    if args.color == "always":
+        return True
+    if args.color == "never":
+        return False
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def color_text(args: argparse.Namespace, text: str, color: str, *, bold: bool = False) -> str:
+    if not use_color(args):
+        return text
+    prefix = ""
+    if bold:
+        prefix += ANSI_COLORS["bold"]
+    prefix += ANSI_COLORS[color]
+    return f"{prefix}{text}{ANSI_COLORS['reset']}"
+
+
+def event_line(args: argparse.Namespace, label: str, message: str, color: str, *, bold: bool = False) -> None:
+    print(f"{color_text(args, f'[{label}]', color, bold=bold)} {message}", flush=True)
+
+
+def next_save_sbs(args: argparse.Namespace, accepted_sbs: int) -> int | None:
+    if args.accepted_save_rate_sbs <= 0:
+        return None
+    remainder = accepted_sbs % args.accepted_save_rate_sbs
+    if remainder == 0:
+        return accepted_sbs
+    return accepted_sbs + (args.accepted_save_rate_sbs - remainder)
+
+
 def parse_quantized_test_metric(lines: list[str]) -> Metric:
     qacc: float | None = None
     qloss: float | None = None
@@ -1152,7 +1199,7 @@ def worker_save_checkpoint(
         stream=not args.no_stream_child_output,
     )
     saved = Path(str(payload.get("checkpoint_dir", save_dir))).resolve()
-    print(f"[worker-save] accepted_sbs={accepted_sbs} checkpoint={saved} elapsed={elapsed:.1f}s", flush=True)
+    event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={saved} elapsed={elapsed:.1f}s", "cyan", bold=True)
     return saved
 
 
@@ -1858,7 +1905,7 @@ def main() -> int:
                         public_checkpoint = str(accepted_checkpoint)
                     else:
                         public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
-                        print(f"[save] accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", flush=True)
+                        event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
                 append_accepted_summary(
                     accepted_summary_path,
                     {
@@ -1937,11 +1984,55 @@ def main() -> int:
                 retry_best=retry_best,
                 update_mode=args.update_mode,
             )
-            print(
-                f"[accept] reason={reason} checkpoint={accepted_checkpoint} score={base_score:.9f} "
-                f"theta_change={theta_change_text(theta_before, theta, keys) or '-'}",
-                flush=True,
-            )
+            theta_change = theta_change_text(theta_before, theta, keys) or "-"
+            if reason == "retry_with_smaller_step":
+                event_line(
+                    args,
+                    "RETRY",
+                    (
+                        f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
+                        f"score_stays={base_score:.9f} next_step_scale={step_scale:.9f}"
+                    ),
+                    "yellow",
+                    bold=True,
+                )
+            else:
+                event_line(
+                    args,
+                    "ACCEPT",
+                    (
+                        f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
+                        f"reason={reason} score={base_score:.9f} theta_change={theta_change}"
+                    ),
+                    "green",
+                    bold=True,
+                )
+                if public_checkpoint:
+                    event_line(
+                        args,
+                        "SAFE TO STOP",
+                        f"saved_checkpoint={public_checkpoint}",
+                        "green",
+                        bold=True,
+                    )
+                elif worker is not None and not args.dry_run:
+                    save_at = next_save_sbs(args, accepted_sbs)
+                    suffix = f" next_save_accepted_sbs={save_at}" if save_at is not None else " public_save_disabled"
+                    event_line(
+                        args,
+                        "WAIT FOR SAVE",
+                        "accepted state is GPU-resident; stopping now loses progress since last save." + suffix,
+                        "yellow",
+                        bold=True,
+                    )
+                else:
+                    event_line(
+                        args,
+                        "SAFE TO STOP",
+                        f"runner_state_written checkpoint={accepted_checkpoint}",
+                        "green",
+                        bold=True,
+                    )
             iteration = next_iteration
 
         write_runner_state(

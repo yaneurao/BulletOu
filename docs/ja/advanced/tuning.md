@@ -464,6 +464,8 @@ runner は `bulletou.exe` の stdout をコンソールへそのまま表示し�
 
 採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作られるので、学習開始直後からエディタで開いておけます。`accepted-summary-learn.log` には `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出ます。見るべきなのは、probe の名前ではなく、qloss が改善したか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
+画面上では、節目の行だけ色付きで出ます。`ACCEPT` は採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
+
 中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
 
 ```powershell
