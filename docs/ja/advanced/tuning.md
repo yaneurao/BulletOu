@@ -365,7 +365,7 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を自分で測り直します。その結果は `[base]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
 
-両方の trial が基準より悪い場合は、すぐには採用せず変化幅を小さくして retry します。retry 中に出た trial のうち、qloss が一番良かったものだけを `retry-best/` に退避します。`--max-retries` に達しても基準を超えられない場合は、最後の2本ではなく、retry 全体の best qloss を強制採用します。
+両方の trial が基準より悪い場合は、すぐには採用せず、同じ探索幅のまま別方向で retry します。retry 中に出た trial のうち、qloss が一番良かったものだけを `retry-best/` に退避します。`--max-retries` に達しても基準を超えられない場合は、最後の2本ではなく、retry 全体の best qloss を強制採用します。
 
 ```text
 1 iteration:
@@ -381,7 +381,7 @@ retry は同じ iteration のまま実行されます。たとえば iteration 1
 
 保存も retry の回数ではなく、accept された回数で決まります。runner の `--save-rate 1` なら accept ごとに保存、`--save-rate 4` なら4回 accept するごとに `accepted-checkpoints/` へ保存します。`--save-rate 0` なら accepted checkpoint の自動保存を無効にします。
 
-パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.309`、反対側の probe では `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
+パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.309`、反対側の probe では `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。retry 時も探索幅は変えません。改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
 
 qloss が小さかった probe のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
 

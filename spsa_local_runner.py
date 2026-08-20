@@ -385,7 +385,6 @@ def parse_args() -> argparse.Namespace:
         default=1.03,
         help="Initial multiplicative perturbation scale. 1.03 moves 0.300 to about 0.309/0.291.",
     )
-    parser.add_argument("--step-shrink", type=float, default=0.70, help="Shrink factor when both trials are worse")
     parser.add_argument("--step-grow", type=float, default=1.01, help="Grow factor after an improving acceptance")
     parser.add_argument("--min-step-scale", type=float, default=1.005)
     parser.add_argument("--max-step-scale", type=float, default=1.10)
@@ -472,7 +471,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--trial-quantized-validation-rate-sbs must be > 0")
     if args.positions_per_superbatch <= 0:
         parser.error("--positions-per-superbatch must be > 0")
-    for name in ["step_scale", "step_shrink", "step_grow", "min_step_scale", "max_step_scale"]:
+    for name in ["step_scale", "step_grow", "min_step_scale", "max_step_scale"]:
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be finite and > 0")
@@ -1929,7 +1928,7 @@ def main() -> int:
                 start_iteration = int(state.get("next_iteration", state["iteration"]))
             elif phase == "between_iterations" and failed_retries > 0:
                 # Old runner versions wrote phase=between_iterations even when
-                # the logical iteration only shrank step_scale for a retry.
+                # the logical iteration was still retrying the same target.
                 # Keep that retry under the same iteration number.
                 start_iteration = int(state["iteration"])
             elif phase in ("between_iterations", "complete"):
@@ -2191,11 +2190,10 @@ def main() -> int:
                 step_scale = args.min_step_scale
                 accepted_sbs += args.sb_per_trial
             elif best_probe.score >= old_base_score:
-                reason = "retry_with_smaller_step"
+                reason = "retry"
                 failed_retries += 1
-                step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
 
-            if worker is not None and not args.dry_run and reason == "retry_with_smaller_step":
+            if worker is not None and not args.dry_run and reason == "retry":
                 keep_tag = retry_best.result.tag if retry_best is not None else ""
                 drop_keys = [trial.tag for trial in candidates if trial.tag != keep_tag]
                 if previous_retry_best_tag and previous_retry_best_tag != keep_tag:
@@ -2208,7 +2206,7 @@ def main() -> int:
                 )
 
             public_checkpoint = ""
-            if reason != "retry_with_smaller_step" and not args.dry_run:
+            if reason != "retry" and not args.dry_run:
                 if should_save_accepted_checkpoint(args, accepted_sbs):
                     if worker is not None:
                         save_dir = accepted_root / accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)
@@ -2231,7 +2229,7 @@ def main() -> int:
             forced_retry_best_tag = history_retry_best.result.tag if reason.startswith("forced_after_") and history_retry_best is not None else ""
             candidate_tags = {trial.tag for trial in candidates}
             for trial in candidates:
-                if reason == "retry_with_smaller_step":
+                if reason == "retry":
                     result_label = "retry_best" if trial.tag == current_retry_best_tag else "discarded"
                 elif reason.startswith("forced_after_"):
                     result_label = "forced_accepted" if trial.tag == forced_retry_best_tag else "discarded"
@@ -2273,7 +2271,7 @@ def main() -> int:
                     spsa_move_ratio=args.spsa_move_ratio,
                 )
 
-            if reason != "retry_with_smaller_step" and not args.dry_run:
+            if reason != "retry" and not args.dry_run:
                 append_accepted_summary(
                     accepted_summary_path,
                     {
@@ -2329,8 +2327,8 @@ def main() -> int:
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
                 },
             )
-            next_iteration = iteration if reason == "retry_with_smaller_step" else iteration + 1
-            phase = "between_retries" if reason == "retry_with_smaller_step" else "between_iterations"
+            next_iteration = iteration if reason == "retry" else iteration + 1
+            phase = "between_retries" if reason == "retry" else "between_iterations"
             write_runner_state(
                 state_path,
                 phase=phase,
@@ -2347,7 +2345,7 @@ def main() -> int:
                 update_mode=args.update_mode,
             )
             theta_change = theta_change_text(theta_before, theta, keys) or "-"
-            if reason == "retry_with_smaller_step":
+            if reason == "retry":
                 event_line(
                     args,
                     "RETRY",
@@ -2355,7 +2353,7 @@ def main() -> int:
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
                         f"{score_compare_text(args, best_probe.score, old_base_score, value_name='best_trial')} "
                         f"decision=retry because best_trial did not beat start "
-                        f"next_step_scale={step_scale:.9f}"
+                        f"same_step_scale={step_scale:.9f}"
                     ),
                     "yellow",
                     bold=True,

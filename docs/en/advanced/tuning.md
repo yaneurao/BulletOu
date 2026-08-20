@@ -379,7 +379,7 @@ The runner branches two short probes from the same checkpoint. The probes are th
 
 At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss by itself. It prints the result as a `[base]` line. Use `--base-metric-source summary` only when you explicitly want to read the existing summary instead.
 
-If both trials are worse than the base, the runner does not accept either side immediately. It shrinks the perturbation and retries. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-accepts the best qloss from the whole retry window, not merely the last probe pair.
+If both trials are worse than the base, the runner does not accept either side immediately. It retries with the same perturbation size and a new random direction. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-accepts the best qloss from the whole retry window, not merely the last probe pair.
 
 ```text
 1 iteration:
@@ -395,7 +395,7 @@ Retries stay under the same iteration number. For example, if iteration 12 fails
 
 Saving is also based on accepted trials, not on retry count. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
 
-The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. If both probes get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. Retries keep the same perturbation size. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
 
 Use `--update-mode winner` only if you explicitly want to jump directly to the parameter values of the lower-qloss probe.
 
