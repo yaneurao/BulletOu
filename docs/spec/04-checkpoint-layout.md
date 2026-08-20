@@ -194,21 +194,26 @@ NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,1525,0.576647,0.181778,0.071046,0.001000
 
 bullet は 32 batch ごとに 1 行 loss を記録する。デフォルト batch-size 65536 では、1 sb 内に約 48 行 (= 実効superbatch内batch数 ÷ 32)。`test_value_accuracy` / `test_value_loss` は **sb 境界の最終行のみ実値**、その他の per-batch 行は `-`。cuda-cpp では `--validation-rate` で validation 間隔を `--save-rate` から分離できる。未指定時は従来通り `--save-rate` と同じ。
 
-### top-level `<output>/summary-learn.log` (= 12 列、sb 境界のみ抽出)
+### top-level `<output>/summary-learn.log` (= 15 列、sb 境界のみ)
 
 ```
-eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,0.576647,0.181778,0.071046,0.001000,0.000934,1.000000,99942400,teachers/,test.hcpe
-NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,0.077046,0.000934,0.000753,1.000000,199884800,teachers/,test.hcpe
+eval,epoch,superbatch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,quantized_value_accuracy,quantized_value_loss,checkpoint
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,1,-,-,-,0.001000,0.000934,1.000000,99942400,teachers/,test.hcpe,-,-,-
+NNUE_HALFKP-NNUE_halfkp_256x2_32_32,1,2,0.583300,0.174947,-,0.000934,0.000753,1.000000,199884800,teachers/,test.hcpe,-,-,0001
 ```
 
 `test_teacher` is summary-only: it records the filename (basename) of the `--test-teacher` file that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
 
-When `--validation-rate` is smaller than `--save-rate`, `summary-learn.log`
-can contain validation-only rows that do not have a matching numbered
-checkpoint directory. Those rows are observation logs, not resumable state;
-on resume, rows after the latest complete checkpoint are trimmed before
-schedule calculation.
+`summary-learn.log` is created with its header at run startup and then gets
+one row per completed superbatch. If ordinary validation did not run at that
+sb, `test_value_accuracy` / `test_value_loss` are `-`. If quantized
+validation did not run, `quantized_value_accuracy` /
+`quantized_value_loss` are `-`. If the row does not correspond to a saved
+checkpoint, `checkpoint` is `-`.
+
+Rows without a matching numbered checkpoint directory are observation logs,
+not resumable state. On resume, rows after the latest complete checkpoint are
+trimmed before schedule calculation.
 
 cuda-cpp minibatch loss readback is disabled by default because it synchronises the GPU stream and the value is too noisy for training decisions. When `--cuda-cpp-loss-readback-interval N` is specified for diagnostics, the sampled minibatch loss is appended to `<output>/cuda-cpp-progress.log` as CSV:
 
@@ -219,7 +224,7 @@ SFNN,5300,21960,5300,1,3,36,1220,610,86835200,12.345678,7034567,0.06564487,C:\sh
 
 The cuda-cpp stdout `pos/s` and progress-log `pos_per_sec` exclude checkpoint file saving, validation, optional loss readback, and progress-log write time.
 
-per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。新規 save callback で 1 行ずつ追記される。
+per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = sb 境界の代表行のみ)。複数 run / 複数 epoch を跨いで連結される。cuda-cpp direct 学習では、save / validation の有無に関係なく、sb 完了ごとに 1 行ずつ追記される。
 
 ### 列の意味
 
@@ -229,21 +234,25 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 | `epoch` | この save の epoch 番号。継続学習を跨いで連続化される (= `LogContext.epoch_offset` 補正後の値)。1 始まり |
 | `superbatch` | 現在 epoch 内の 1 始まり superbatch カウンタ。`--positions-per-superbatch` の実効局面数ごとに +1 される。**per-epoch カウンタ**で、cross-run 累積ではない。新 epoch ごとに 1 にリセット |
 | `curr_batch` | (per-save 版のみ) 現在 superbatch 内の 1 始まり batch カウンタ。bullet は 32 batch ごとに 1 行記録するので 32, 64, 96, ... の値を取る |
-| `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。sb 境界行のみ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
-| `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。sb 境界行のみ実値、それ以外は `-` |
+| `test_value_accuracy` | `--test-teacher` 検証局面に対する **draw-excluded sign agreement** (詳細は [06-validation-metrics.md])。その sb で通常検証を実行したときだけ実値、それ以外は `-`。`--test-teacher` 未指定なら全行 `-` |
+| `test_value_loss` | `--test-teacher` 検証局面に対する average loss (sigmoid + WDL の合成 target に対する MSE。draw は loss 側には含まれる)。その sb で通常検証を実行したときだけ実値、それ以外は `-` |
 | `train_value_loss` | 予約列。現在の cuda-cpp direct trainer は `-` を書く。minibatch loss を診断したい場合は `--cuda-cpp-loss-readback-interval N` で `cuda-cpp-progress.log` に出力する |
 | `lr_start` | その行が表す区間の開始時点の学習率。summary 行ではその superbatch の開始 LR |
 | `lr_end` | その行が表す区間の最後の batch で使った学習率。summary 行ではその superbatch の終端側 LR |
 | `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |
 | `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × 実効superbatch内batch数 × batch_size` を書く。常に単調増加 |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
+| `test_teacher` | CLI の `--test-teacher` のファイル名部分。未指定なら `-` |
+| `quantized_value_accuracy` | 量子化後検証を実行したときだけ実値、それ以外は `-` |
+| `quantized_value_loss` | 量子化後検証を実行したときだけ実値、それ以外は `-` |
+| `checkpoint` | この行に対応する numbered checkpoint dir 名。保存していないsbなら `-` |
 
 ### 累積ロジック
 
 - 1 run 内で各 component が消費する局面数: `positions = cb_prior_position + (local_superbatch − 1) × 実効superbatch内batch数 × batch_size + curr_batch × batch_size`
 - `cb_prior_position` は run 開始時 + 各 epoch 境界で `read_prior_positions()` から再ロードされる (= component 別の最大 `positions`)
 - 各 save dir の `0NNN/learn.log` は「**その save 時点までの累積**」(bullet が log.txt を逐次更新するため)。最新番号 dir の `learn.log` を読めばその run の全貌が分かる
-- トップレベル `<output>/summary-learn.log` は各 save の callback で sb 境界行を 1 行ずつ追記する (新規作成時のみ 1 度ヘッダを書く)。ファイル内のヘッダは常に 1 行のみ
+- トップレベル `<output>/summary-learn.log` は run 開始時にヘッダを作り、cuda-cpp direct 学習では sb 完了ごとに 1 行ずつ追記する。ファイル内のヘッダは常に 1 行のみ
 - resume を跨いでも `epoch` / `superbatch` / `positions` 全部が連続表示される (= `epoch_offset` + 自然な per-epoch sb + `cb_prior_position` のおかげ)。Pandas で `positions` を sort key にすれば確実に時系列順
 
 ## ファイル名規約 (一時)

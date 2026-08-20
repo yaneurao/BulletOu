@@ -66,6 +66,9 @@ When validation is enabled, BulletOu prints lines like:
 
 `--validation-rate` controls accuracy / loss measurement.
 
+`summary-learn.log` still gets one row per sb. For sb where ordinary
+validation is not run, `test_value_accuracy` / `test_value_loss` are `-`.
+
 For example, to save only at epoch end but validate every sb:
 
 ```powershell
@@ -84,6 +87,9 @@ To also watch accuracy / loss after quantizing like `nn.bin`, use `--quantized-v
 ```powershell
 --quantized-validation-rate 1
 ```
+
+For sb where quantized validation is not run, `summary-learn.log` writes
+`quantized_value_accuracy` / `quantized_value_loss` as `-`.
 
 Quantized validation is heavier, so start with only `--test-teacher` and `--validation-rate`. For details, see [Advanced: Validate a quantized `nn.bin`](../advanced/quantized-nn-bin.md).
 

@@ -40,7 +40,9 @@ KPP_synthesized.bin
 
 ## 6.2 Log
 
-`summary-learn.log` contains one row per validated superbatch.
+`summary-learn.log` contains one row per superbatch.
+If that sb did not run ordinary validation, `test_value_accuracy` / `test_value_loss` are `-`.
+If that sb did not run quantized validation, `quantized_value_accuracy` / `quantized_value_loss` are `-`.
 
 The main columns are:
 

@@ -9451,6 +9451,7 @@ fn worker_run_train(request: &serde_json::Value) -> Result<serde_json::Value, St
         if let Err(err) = write_build_info_file(&output_dir) {
             eprintln!("warning: failed to write build-info.txt under {}: {err}", output_dir.display());
         }
+        ensure_cuda_cpp_summary_log_header(&output_dir)?;
     }
 
     let started = std::time::Instant::now();
@@ -11182,6 +11183,10 @@ fn main() {
         }
         if let Err(e) = write_build_info_file(&args.output_dir()) {
             eprintln!("warning: failed to write build-info.txt under {}: {e}", args.output_dir().display());
+        }
+        if let Err(e) = ensure_cuda_cpp_summary_log_header(&args.output_dir()) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
         }
     }
     if let Err(e) = run_cuda_cpp_backend(&args) {
@@ -13426,6 +13431,16 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         "  cuda-cpp checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
                         chunk.epoch, chunk.superbatch
                     );
+                    if let Some(progress) = schedule.progress_for_step(seen_steps) {
+                        append_cuda_cpp_superbatch_summary_log_row(
+                            args,
+                            &schedule,
+                            progress,
+                            seen_steps,
+                            batch_size,
+                            dataloader_pos,
+                        )?;
+                    }
                 }
             } else {
                 deferred_direct_checkpoint = Some((chunk, dataloader_pos));
@@ -13442,6 +13457,23 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             let (train_elapsed_sec, _positions_per_sec) = cuda_cpp_train_timing(positions, &started, excluded_elapsed);
             let progress_stats = progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
             print_cuda_cpp_superbatch_progress("cuda-cpp", progress, batch_size, positions, progress_stats);
+            if let Some(progress) = progress {
+                let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                    args,
+                    seen_steps,
+                    batch_size,
+                    last_dataloader_pos,
+                    dataloader_resume_pos,
+                )?;
+                append_cuda_cpp_superbatch_summary_log_row(
+                    args,
+                    &schedule,
+                    progress,
+                    seen_steps,
+                    batch_size,
+                    dataloader_pos,
+                )?;
+            }
         }
         Ok::<(), String>(())
     })
@@ -16728,6 +16760,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let progress_stats =
                         progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
                     if let Some(progress) = progress {
+                        append_cuda_cpp_superbatch_summary_log_row(
+                            args,
+                            &schedule,
+                            progress,
+                            seen_steps,
+                            batch_size,
+                            dataloader_pos,
+                        )?;
                         append_cuda_cpp_sfnn_diagnostics_log(
                             args,
                             progress,
@@ -16754,6 +16794,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             let progress_stats = progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
             print_cuda_cpp_superbatch_progress("cuda-cpp SFNN", progress, batch_size, positions, progress_stats);
             if let Some(progress) = progress {
+                let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                    args,
+                    seen_steps,
+                    batch_size,
+                    last_dataloader_pos,
+                    dataloader_resume_pos,
+                )?;
+                append_cuda_cpp_superbatch_summary_log_row(
+                    args,
+                    &schedule,
+                    progress,
+                    seen_steps,
+                    batch_size,
+                    dataloader_pos,
+                )?;
                 append_cuda_cpp_sfnn_diagnostics_log(args, progress, positions, progress_stats, &sfnn_diagnostics)?;
                 sfnn_diagnostics.reset();
             }
@@ -17760,6 +17815,54 @@ fn append_cuda_cpp_direct_summary_log_row(
     }
     file.write_all(cuda_cpp_direct_summary_log_row(args, log).as_bytes())
         .map_err(|err| format!("failed to write {}: {err}", top.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn ensure_cuda_cpp_summary_log_header(output_dir: &std::path::Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    let top_existed =
+        ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
+    if top_existed {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&top)
+        .map_err(|err| format!("failed to open {}: {err}", top.display()))?;
+    writeln!(file, "{SUMMARY_LEARN_LOG_HEADER}").map_err(|err| format!("failed to write {}: {err}", top.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn append_cuda_cpp_superbatch_summary_log_row(
+    args: &Args,
+    schedule: &CudaCppRunSchedule,
+    progress: CudaCppScheduleProgress,
+    seen_steps: usize,
+    batch_size: usize,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+) -> Result<(), String> {
+    let sb_steps = progress.batches_per_superbatch.min(seen_steps);
+    let sb_start_step = seen_steps.saturating_sub(sb_steps);
+    let sb_end_step = seen_steps.saturating_sub(1);
+    append_cuda_cpp_direct_summary_log_row(
+        &args.output_dir(),
+        args,
+        CudaCppCheckpointLog {
+            epoch: progress.epoch,
+            superbatch: progress.superbatch,
+            curr_batch: progress.batches_per_superbatch,
+            prior_positions: schedule.prior_positions,
+            train_steps: seen_steps,
+            test_metrics: None,
+            lr_start: schedule.lr_for_step(args, sb_start_step, batch_size),
+            lr_end: schedule.lr_for_step(args, sb_end_step, batch_size),
+            dataloader_pos,
+        },
+    )
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -23769,20 +23872,19 @@ fn enrich_bullet_log_to_csv(
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
 /// Reads the **summary** log [`SUMMARY_LEARN_LOG_NAME`] (`<output>/
-/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (12
+/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (15
 /// columns, NO `curr_batch`):
 ///
 ///   eval, epoch, superbatch, test_value_accuracy, test_value_loss,
 ///   train_value_loss, lr_start, lr_end, lambda, **positions**, teacher,
-///   test_teacher
+///   test_teacher, quantized_value_accuracy, quantized_value_loss, checkpoint
 ///
 /// `positions` is at index 9 in the current schema. Older summary logs
 /// used a single `lr` column and had `positions` at index 8; accept both
 /// when reading offsets so users can still resume far enough to receive
 /// the explicit schema-mismatch warning on append.
 ///
-/// `splitn` keeps any commas inside
-/// the trailing `teacher` field are preserved. Component is extracted
+/// Component is extracted
 /// from the `eval` column at index 0: a slash-suffix (e.g. `KPPT/kk`)
 /// names the component explicitly; absence of a slash maps to `"nnue"`.
 fn read_prior_positions(top_level_log: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
@@ -30524,6 +30626,89 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolve_test_teacher_for_summary(Some(&args)), "validation-set.hcpe");
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_summary_header_is_created_once() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-summary-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
+        ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
+
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines, vec![SUMMARY_LEARN_LOG_HEADER]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_superbatch_summary_row_can_record_without_validation() {
+        use clap::Parser as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "bulletou-test-cuda-cpp-summary-sb-row-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let output_arg = tmp.to_string_lossy().into_owned();
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_256x2_32_32",
+            "--teacher",
+            "teacher.psv",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "5",
+            "--positions-per-superbatch",
+            "10",
+            "--output",
+            &output_arg,
+        ])
+        .unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+
+        append_cuda_cpp_superbatch_summary_log_row(
+            &args,
+            &schedule,
+            CudaCppScheduleProgress {
+                epoch: 1,
+                superbatch: 1,
+                superbatches_per_epoch: 3,
+                batch_in_superbatch: 2,
+                batches_per_superbatch: 2,
+            },
+            2,
+            5,
+            bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 },
+        )
+        .unwrap();
+
+        let summary = std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], SUMMARY_LEARN_LOG_HEADER);
+        let cols = lines[1].split(',').collect::<Vec<_>>();
+        assert_eq!(cols[1], "1");
+        assert_eq!(cols[2], "1");
+        assert_eq!(cols[3], "-", "ordinary validation did not run");
+        assert_eq!(cols[4], "-", "ordinary validation did not run");
+        assert_eq!(cols[9], "10");
+        assert_eq!(cols[12], "-", "quantized validation did not run");
+        assert_eq!(cols[13], "-", "quantized validation did not run");
+        assert_eq!(cols[14], "-", "no checkpoint was saved");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

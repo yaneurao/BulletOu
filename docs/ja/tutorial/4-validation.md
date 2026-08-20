@@ -66,6 +66,9 @@
 
 `--validation-rate` は accuracy / loss を測る頻度です。
 
+`summary-learn.log` 自体は1sbごとに1行書かれますが、検証しないsbの
+`test_value_accuracy` / `test_value_loss` は `-` になります。
+
 たとえば、保存は epoch 末だけでよく、検証は毎 sb 見たい場合は次のようにします。
 
 ```powershell
@@ -84,6 +87,9 @@
 ```powershell
 --quantized-validation-rate 1
 ```
+
+量子化後検証をしないsbでは、`summary-learn.log` の
+`quantized_value_accuracy` / `quantized_value_loss` は `-` になります。
 
 量子化後検証は少し重いので、最初は `--test-teacher` と `--validation-rate` だけで十分です。詳しくは [応用編: 量子化後の `nn.bin` を検証する](../advanced/quantized-nn-bin.md) を参照してください。
 

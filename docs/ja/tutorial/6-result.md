@@ -40,7 +40,9 @@ KPP_synthesized.bin
 
 ## 6.2 ログ
 
-`summary-learn.log` には、superbatch ごとの検証結果が入ります。
+`summary-learn.log` には、superbatch ごとに1行ずつ進捗が入ります。
+検証を行っていないsbでは、`test_value_accuracy` / `test_value_loss` は `-` になります。
+量子化後検証を行っていないsbでは、`quantized_value_accuracy` / `quantized_value_loss` は `-` になります。
 
 よく見る列は次の通りです。
 
