@@ -1076,7 +1076,7 @@ def objective_label(metric_name: str) -> str:
 
 def accept_threshold_text(args: argparse.Namespace, base_score: float, base_metric: Metric) -> str:
     label = objective_label(args.metric)
-    text = f"accept_if {label} < {base_score:.9f}"
+    text = color_text(args, f"accept_if {label} < {base_score:.9f}", "cyan", bold=True)
     if args.metric != "quantized_value_loss":
         text += f"  base_qloss={fmt_metric(base_metric.qloss)}"
     text += (
@@ -1085,6 +1085,27 @@ def accept_threshold_text(args: argparse.Namespace, base_score: float, base_metr
         f"  base_test_acc={fmt_metric(base_metric.test_acc)}"
     )
     return text
+
+
+def trial_start_line(
+    args: argparse.Namespace,
+    *,
+    trial_number: int,
+    side: str,
+    tag: str,
+    base_score: float,
+    base_metric: Metric,
+) -> None:
+    event_line(
+        args,
+        "TRIAL",
+        (
+            f"trial {trial_number} start  {probe_label(side)}  tag={tag}  "
+            f"{accept_threshold_text(args, base_score, base_metric)}"
+        ),
+        "cyan",
+        bold=True,
+    )
 
 
 def score_compare_text(args: argparse.Namespace, score: float, base_score: float, *, value_name: str) -> str:
@@ -1110,6 +1131,63 @@ def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_scor
         color,
         bold=True,
     )
+
+
+def colored_metric_value(args: argparse.Namespace, value: float | None, color: str) -> str:
+    return color_text(args, fmt_metric(value), color, bold=True)
+
+
+def lower_is_better_color(value: float | None, baseline: float | None) -> str:
+    if value is None or baseline is None:
+        return "cyan"
+    return "green" if value < baseline else "yellow"
+
+
+def higher_is_better_color(value: float | None, baseline: float | None) -> str:
+    if value is None or baseline is None:
+        return "cyan"
+    return "green" if value > baseline else "yellow"
+
+
+def done_metric_text(
+    args: argparse.Namespace,
+    metric: Metric,
+    score: float,
+    base_score: float | None,
+    base_metric: Metric | None,
+) -> str:
+    parts: list[str] = []
+    label = objective_label(args.metric)
+    if label != "qloss" and label != "test_loss":
+        parts.append(
+            f"{label}={color_text(args, f'{score:.9f}', lower_is_better_color(score, base_score), bold=True)}"
+        )
+    if label == "test_loss":
+        parts.append(
+            "test_loss="
+            + colored_metric_value(
+                args,
+                metric.test_loss,
+                lower_is_better_color(metric.test_loss, base_metric.test_loss if base_metric is not None else None),
+            )
+        )
+    qloss_baseline = base_metric.qloss if base_metric is not None else (base_score if label == "qloss" else None)
+    parts.append(
+        "qloss=" + colored_metric_value(args, metric.qloss, lower_is_better_color(metric.qloss, qloss_baseline))
+    )
+    parts.append(
+        "qacc="
+        + colored_metric_value(
+            args,
+            metric.qacc,
+            higher_is_better_color(metric.qacc, base_metric.qacc if base_metric is not None else None),
+        )
+    )
+    if label != "test_loss" and metric.test_loss is not None:
+        parts.append(f"test_loss={fmt_metric(metric.test_loss)}")
+    if metric.test_acc is not None:
+        parts.append(f"test_acc={fmt_metric(metric.test_acc)}")
+    return " ".join(parts)
 
 
 def next_save_sbs(args: argparse.Namespace, accepted_sbs: int) -> int | None:
@@ -1235,8 +1313,7 @@ def worker_adopt_trial(
         "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
     }
     print(
-        f"[advance-done] tag={tag} {objective_label(args.metric)}={score:.9f} "
-        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+        f"[advance-done] tag={tag} {done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s",
         flush=True,
     )
     return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
@@ -1317,6 +1394,9 @@ def run_trial(
     checkpoint_dir: Path,
     tag: str,
     side: str,
+    trial_number: int,
+    base_score: float,
+    base_metric: Metric,
     theta: dict[str, float],
     trial_output_folder: Path,
     log_dir: Path,
@@ -1324,7 +1404,14 @@ def run_trial(
 ) -> TrialResult:
     cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
     log_path = log_dir / f"{tag}.stdout.log"
-    print(f"[run] {probe_label(side)} tag={tag}", flush=True)
+    trial_start_line(
+        args,
+        trial_number=trial_number,
+        side=side,
+        tag=tag,
+        base_score=base_score,
+        base_metric=base_metric,
+    )
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
@@ -1347,8 +1434,8 @@ def run_trial(
             "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
         }
         print(
-            f"[done] {probe_label(side)} tag={tag} {objective_label(args.metric)}={score:.9f} "
-            f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+            f"[done] {probe_label(side)} tag={tag} "
+            f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
             flush=True,
         )
         return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
@@ -1369,8 +1456,8 @@ def run_trial(
     if not (next_checkpoint / "dataloader_pos.txt").exists():
         raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
     print(
-        f"[done] {probe_label(side)} tag={tag} {objective_label(args.metric)}={score:.9f} "
-        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+        f"[done] {probe_label(side)} tag={tag} "
+        f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
         flush=True,
     )
     return TrialResult(side, tag, output_dir, next_checkpoint, metric, score, row)
@@ -1897,6 +1984,9 @@ def main() -> int:
                 accepted_checkpoint,
                 f"{tag_base}-probe-a",
                 PROBE_A,
+                1,
+                old_base_score,
+                base_metric,
                 probe_a_theta,
                 trial_output_folder,
                 log_dir,
@@ -1908,6 +1998,9 @@ def main() -> int:
                 accepted_checkpoint,
                 f"{tag_base}-probe-b",
                 PROBE_B,
+                2,
+                old_base_score,
+                base_metric,
                 probe_b_theta,
                 trial_output_folder,
                 log_dir,
