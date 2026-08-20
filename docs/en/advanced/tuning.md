@@ -391,6 +391,10 @@ If both trials are worse than the base, the runner does not adopt either side im
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
+Retries stay under the same iteration number. For example, if iteration 12 fails on its first attempt, the next attempt is iteration 12 / retry 2, not iteration 13. `accepted-summary-learn.log` only records rows where the accepted path advances, so iteration numbers do not skip. Use `history.csv` when you want every attempt.
+
+Saving is also based on accepted progress, not on retry count. When an attempt is accepted or force-accepted, `accepted_sbs` increases by `--sb-per-trial`; the runner writes to `accepted-checkpoints/` only when that value reaches a `--accepted-save-rate-sbs` boundary.
+
 The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. If both probes get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
 
 Use `--update-mode winner` only if you explicitly want to jump directly to the parameter values of the lower-qloss probe.

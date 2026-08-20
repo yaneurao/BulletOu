@@ -692,6 +692,16 @@ def make_variant(
     return out
 
 
+def probe_direction(seed: int, iteration: int, retry: int, keys: list[str]) -> dict[str, int]:
+    mixed = (
+        (seed & 0xFFFFFFFFFFFFFFFF)
+        ^ ((iteration * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF)
+        ^ ((retry * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF)
+    )
+    rng = random.Random(mixed)
+    return {key: rng.choice([-1, 1]) for key in keys}
+
+
 def make_spsa_update(
     theta: dict[str, float],
     bounds: dict[str, tuple[float, float]],
@@ -1523,7 +1533,6 @@ def main() -> int:
         bounds = load_bounds(args.bounds_json)
         theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
         keys = tuned_keys(args, theta)
-        rng = random.Random(args.seed)
 
         runner_dir = resolve_runner_dir(args)
         trial_output_folder = runner_dir / "trials"
@@ -1571,7 +1580,14 @@ def main() -> int:
             accepted_sbs = int(state.get("accepted_sbs", 0))
             retry_best = retry_best_from_json(state.get("retry_best"))
             phase = str(state.get("phase", "complete" if state.get("complete") else "running_trials"))
-            if phase in ("between_iterations", "complete"):
+            if phase == "between_retries":
+                start_iteration = int(state.get("next_iteration", state["iteration"]))
+            elif phase == "between_iterations" and failed_retries > 0:
+                # Old runner versions wrote phase=between_iterations even when
+                # the logical iteration only shrank step_scale for a retry.
+                # Keep that retry under the same iteration number.
+                start_iteration = int(state["iteration"])
+            elif phase in ("between_iterations", "complete"):
                 start_iteration = int(state.get("next_iteration", int(state["iteration"]) + 1))
             else:
                 start_iteration = int(state.get("next_iteration", state["iteration"]))
@@ -1629,10 +1645,6 @@ def main() -> int:
             retry_best = None
             start_iteration = 1
 
-        for _ in range(1, start_iteration):
-            for _key in keys:
-                rng.choice([-1, 1])
-
         if not (accepted_checkpoint / "state.bin").exists():
             raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
         if not (accepted_checkpoint / "dataloader_pos.txt").exists():
@@ -1657,14 +1669,15 @@ def main() -> int:
             )
             return 0
 
-        for iteration in range(start_iteration, args.iterations + 1):
+        iteration = start_iteration
+        while iteration <= args.iterations:
             old_base_score = base_score
             theta_before = dict(theta)
             step_scale_used = step_scale
-            delta = {key: rng.choice([-1, 1]) for key in keys}
+            retry = failed_retries + 1
+            delta = probe_direction(args.seed, iteration, retry, keys)
             probe_a_theta = make_variant(theta, bounds, delta, +1, step_scale)
             probe_b_theta = make_variant(theta, bounds, delta, -1, step_scale)
-            retry = failed_retries + 1
             tag_base = f"{args.tag_prefix}-i{iteration:03d}-r{retry:02d}"
 
             print(
@@ -1907,11 +1920,13 @@ def main() -> int:
                     "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
                 },
             )
+            next_iteration = iteration if reason == "retry_with_smaller_step" else iteration + 1
+            phase = "between_retries" if reason == "retry_with_smaller_step" else "between_iterations"
             write_runner_state(
                 state_path,
-                phase="between_iterations",
+                phase=phase,
                 iteration=iteration,
-                next_iteration=iteration + 1,
+                next_iteration=next_iteration,
                 base_checkpoint=accepted_checkpoint,
                 base_score=base_score,
                 base_metric=base_metric,
@@ -1927,6 +1942,7 @@ def main() -> int:
                 f"theta_change={theta_change_text(theta_before, theta, keys) or '-'}",
                 flush=True,
             )
+            iteration = next_iteration
 
         write_runner_state(
             state_path,

@@ -377,6 +377,10 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
+retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての試行を見たい場合は `history.csv` を見ます。
+
+保存も retry の回数ではなく、採用経路が進んだ量で決まります。採用または強制採用されると `accepted_sbs` が `--sb-per-trial` ぶん増え、その値が `--accepted-save-rate-sbs` の境界に来たときだけ `accepted-checkpoints/` に保存されます。
+
 パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.309`、反対側の probe では `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
 
 qloss が小さかった probe のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
