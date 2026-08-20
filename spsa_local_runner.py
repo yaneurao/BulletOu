@@ -2,11 +2,12 @@
 """Local SPSA-style runner for BulletOu fine-tuning experiments.
 
 This script does not change BulletOu's training algorithm.  It repeatedly
-branches from a checkpoint, runs two short trials with slightly different
-factorizer hyperparameters along opposite random directions, estimates an SPSA
-direction from the two probe losses, and updates the hyperparameters by a small
-fraction of that perturbation width.
-The model weights are continued from the better short trial checkpoint.
+branches from a checkpoint and runs two short probe trials with slightly
+different factorizer hyperparameters along opposite random directions.  In
+SPSA mode, the probe losses choose a small hyperparameter move, then the runner
+runs one real advance trial with that moved hyperparameter set and accepts it
+only when the advance metric beats the starting metric.  In winner mode, the
+model weights are continued from the better observed probe.
 
 Typical use:
 
@@ -158,6 +159,7 @@ QUANTIZED_TEST_BOOL_FLAGS = {
 
 PROBE_A = "probe_a"
 PROBE_B = "probe_b"
+CANDIDATE = "candidate"
 LEGACY_PROBE_A = {"probe_a", "plus"}
 LEGACY_PROBE_B = {"probe_b", "minus"}
 TRIAL_NO_INTERVAL_SAVE_RATE = 9999
@@ -192,6 +194,8 @@ HISTORY_FIELDS = [
     "probe_b_score",
     "probe_score_diff",
     "best_probe_score",
+    "candidate_score",
+    "candidate_tag",
     "new_base_score",
     "new_base_checkpoint",
     "accepted_sbs",
@@ -1157,6 +1161,45 @@ def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_scor
     )
 
 
+def probe_pair_result_line(
+    args: argparse.Namespace,
+    best_probe: TrialResult,
+    base_score: float,
+    *,
+    next_action: str,
+) -> None:
+    beats_target = best_probe.score < base_score
+    status = "probe_best beats start" if beats_target else "probe_best misses start"
+    color = "green" if beats_target else "yellow"
+    event_line(
+        args,
+        "PROBE RESULT",
+        (
+            f"best={probe_label(best_probe.side)} "
+            f"{score_compare_text(args, best_probe.score, base_score, value_name='best_probe')} "
+            f"decision={status}; next={next_action}"
+        ),
+        color,
+        bold=True,
+    )
+
+
+def advance_threshold_line(args: argparse.Namespace, result: TrialResult, base_score: float) -> None:
+    beats_target = result.score < base_score
+    status = "advance beats start" if beats_target else "advance misses start"
+    color = "green" if beats_target else "yellow"
+    event_line(
+        args,
+        "ADVANCE",
+        (
+            f"{score_compare_text(args, result.score, base_score, value_name='advance')} "
+            f"qacc={fmt_metric(result.metric.qacc)} result={status}"
+        ),
+        color,
+        bold=True,
+    )
+
+
 def colored_metric_value(args: argparse.Namespace, value: float | None, color: str) -> str:
     return color_text(args, fmt_metric(value), color, bold=True)
 
@@ -1315,6 +1358,8 @@ def probe_label(side: str) -> str:
         return "probe A"
     if side in LEGACY_PROBE_B:
         return "probe B"
+    if side == CANDIDATE:
+        return "candidate"
     return side.replace("_", " ")
 
 
@@ -1353,6 +1398,58 @@ def worker_adopt_trial(
         flush=True,
     )
     return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
+
+
+def worker_try_adopt_trial(
+    args: argparse.Namespace,
+    worker: BulletOuWorker,
+    checkpoint_dir: Path,
+    tag: str,
+    theta: dict[str, float],
+    trial_output_folder: Path,
+    log_dir: Path,
+    base_score: float,
+    base_metric: Metric,
+) -> TrialResult:
+    cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
+    log_path = log_dir / f"{tag}.stdout.log"
+    event_line(
+        args,
+        "ADVANCE RUN",
+        f"tag={tag} {accept_threshold_text(args, base_score, base_metric)}",
+        "cyan",
+        bold=True,
+    )
+    print("      " + subprocess.list2cmdline(cmd), flush=True)
+    payload, elapsed, _lines = worker.request(
+        "try-adopt",
+        {"args": cmd[1:], "metric": args.metric, "accept_below": base_score},
+        log_path,
+        stream=not args.no_stream_child_output,
+    )
+    metric = metric_from_worker_trial_payload(payload)
+    score = metric.score(args.metric)
+    accepted = bool(payload.get("accepted", False))
+    row = {
+        "test_value_accuracy": fmt_metric(metric.test_acc),
+        "test_value_loss": fmt_metric(metric.test_loss),
+        "quantized_value_accuracy": fmt_metric(metric.qacc),
+        "quantized_value_loss": fmt_metric(metric.qloss),
+        "checkpoint": "",
+        "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+    }
+    color = "green" if accepted else "yellow"
+    event_line(
+        args,
+        "ADVANCE DONE",
+        (
+            f"tag={tag} {done_metric_text(args, metric, score, base_score, base_metric)} "
+            f"kept={'yes' if accepted else 'no'} elapsed={elapsed:.1f}s"
+        ),
+        color,
+        bold=True,
+    )
+    return TrialResult(CANDIDATE, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
 
 
 def worker_save_checkpoint(
@@ -2076,37 +2173,128 @@ def main() -> int:
                     print("[theta] mode=spsa skipped because trial scores are not finite", flush=True)
             else:
                 print("[theta] mode=winner next=best observed probe theta", flush=True)
+            next_action = "run SPSA candidate advance" if args.update_mode == "spsa" and best_probe.score < old_base_score else (
+                "accept best probe" if best_probe.score < old_base_score else "retry with smaller step"
+            )
+            probe_pair_result_line(args, best_probe, old_base_score, next_action=next_action)
+
+            summary_trials = list(candidates)
+            decision_candidate = best_probe
+            decision_theta = best_probe_theta
             best = best_probe
             history_retry_best = retry_best
 
             if best_probe.score < base_score:
-                reason = "improved"
-                theta = theta_candidate
-                if worker is not None and not args.dry_run:
-                    train_theta = worker_trial_theta(best_probe)
-                    best = worker_adopt_trial(
-                        args,
-                        worker,
-                        accepted_checkpoint,
-                        f"{tag_base}-advance",
-                        best_probe.side,
-                        train_theta,
-                        trial_output_folder,
-                        log_dir,
-                    )
-                    safe_rmtree(retry_best_dir, runner_dir)
-                elif not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(best_probe.checkpoint_dir, current_dir, runner_dir)
-                    safe_rmtree(retry_best_dir, runner_dir)
+                if args.update_mode == "spsa":
+                    decision_theta = theta_candidate
+                    if worker is not None and not args.dry_run:
+                        decision_candidate = worker_try_adopt_trial(
+                            args,
+                            worker,
+                            accepted_checkpoint,
+                            f"{tag_base}-advance",
+                            theta_candidate,
+                            trial_output_folder,
+                            log_dir,
+                            old_base_score,
+                            base_metric,
+                        )
+                    else:
+                        decision_candidate = run_trial(
+                            args,
+                            accepted_checkpoint,
+                            f"{tag_base}-advance",
+                            CANDIDATE,
+                            3,
+                            old_base_score,
+                            base_metric,
+                            theta_candidate,
+                            trial_output_folder,
+                            log_dir,
+                            worker,
+                        )
+                    summary_trials.append(decision_candidate)
+                    advance_threshold_line(args, decision_candidate, old_base_score)
+
+                if decision_candidate.score < old_base_score:
+                    reason = "improved"
+                    theta = decision_theta
+                    best = decision_candidate
+                    if args.update_mode != "spsa" and worker is not None and not args.dry_run:
+                        best = worker_adopt_trial(
+                            args,
+                            worker,
+                            accepted_checkpoint,
+                            f"{tag_base}-advance",
+                            best_probe.side,
+                            decision_theta,
+                            trial_output_folder,
+                            log_dir,
+                        )
+                    elif worker is None and not args.dry_run and not args.keep_trials:
+                        accepted_checkpoint = move_checkpoint_to_current(decision_candidate.checkpoint_dir, current_dir, runner_dir)
+                    elif worker is None:
+                        accepted_checkpoint = decision_candidate.checkpoint_dir
+                    if not args.dry_run:
+                        safe_rmtree(retry_best_dir, runner_dir)
+                    retry_best = None
+                    history_retry_best = None
+                    base_metric = best.metric
+                    base_score = best.score
+                    failed_retries = 0
+                    step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
+                    accepted_sbs += args.sb_per_trial
                 else:
-                    accepted_checkpoint = best_probe.checkpoint_dir
-                retry_best = None
-                history_retry_best = None
-                base_metric = best_probe.metric
-                base_score = best_probe.score
-                failed_retries = 0
-                step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
-                accepted_sbs += args.sb_per_trial
+                    if retry_best is None or decision_candidate.score < retry_best.result.score:
+                        if worker is not None and not args.dry_run:
+                            retry_best = RetryBest(decision_candidate, decision_theta)
+                        else:
+                            retry_best = stash_retry_best(
+                                decision_candidate,
+                                decision_theta,
+                                retry_best_dir,
+                                runner_dir,
+                                args.keep_trials,
+                                args.dry_run,
+                            )
+                        history_retry_best = retry_best
+                        print(
+                            f"[retry-best] retry={retry} {objective_label(args.metric)}={decision_candidate.score:.9f} "
+                            f"checkpoint={retry_best.result.checkpoint_dir}",
+                            flush=True,
+                        )
+                    if failed_retries + 1 >= args.max_retries:
+                        reason = f"forced_after_{args.max_retries}_retries"
+                        if retry_best is None:
+                            raise RuntimeError("internal error: retry_best is missing at forced acceptance")
+                        history_retry_best = retry_best
+                        best = retry_best.result
+                        theta = retry_best.theta
+                        if worker is not None and not args.dry_run:
+                            best = worker_adopt_trial(
+                                args,
+                                worker,
+                                accepted_checkpoint,
+                                f"{tag_base}-advance-forced",
+                                best.side,
+                                retry_best.theta,
+                                trial_output_folder,
+                                log_dir,
+                            )
+                        elif not args.dry_run and not args.keep_trials:
+                            accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
+                        else:
+                            accepted_checkpoint = retry_best.result.checkpoint_dir
+                        retry_best = None
+                        base_metric = best.metric
+                        base_score = best.score
+                        failed_retries = 0
+                        step_scale = args.min_step_scale
+                        accepted_sbs += args.sb_per_trial
+                    else:
+                        reason = "retry_with_smaller_step"
+                        failed_retries += 1
+                        step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
             else:
                 if retry_best is None or best_probe.score < retry_best.result.score:
                     if worker is not None and not args.dry_run:
@@ -2126,40 +2314,38 @@ def main() -> int:
                         f"checkpoint={retry_best.result.checkpoint_dir}",
                         flush=True,
                     )
-
-            if best_probe.score >= old_base_score and failed_retries + 1 >= args.max_retries:
-                reason = f"forced_after_{args.max_retries}_retries"
-                if retry_best is None:
-                    raise RuntimeError("internal error: retry_best is missing at forced acceptance")
-                history_retry_best = retry_best
-                best = retry_best.result
-                theta = retry_best.theta
-                if worker is not None and not args.dry_run:
-                    train_theta = worker_trial_theta(best)
-                    best = worker_adopt_trial(
-                        args,
-                        worker,
-                        accepted_checkpoint,
-                        f"{tag_base}-advance-forced",
-                        best.side,
-                        train_theta,
-                        trial_output_folder,
-                        log_dir,
-                    )
-                elif not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
+                if failed_retries + 1 >= args.max_retries:
+                    reason = f"forced_after_{args.max_retries}_retries"
+                    if retry_best is None:
+                        raise RuntimeError("internal error: retry_best is missing at forced acceptance")
+                    history_retry_best = retry_best
+                    best = retry_best.result
+                    theta = retry_best.theta
+                    if worker is not None and not args.dry_run:
+                        best = worker_adopt_trial(
+                            args,
+                            worker,
+                            accepted_checkpoint,
+                            f"{tag_base}-advance-forced",
+                            best.side,
+                            retry_best.theta,
+                            trial_output_folder,
+                            log_dir,
+                        )
+                    elif not args.dry_run and not args.keep_trials:
+                        accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
+                    else:
+                        accepted_checkpoint = retry_best.result.checkpoint_dir
+                    retry_best = None
+                    base_metric = best.metric
+                    base_score = best.score
+                    failed_retries = 0
+                    step_scale = args.min_step_scale
+                    accepted_sbs += args.sb_per_trial
                 else:
-                    accepted_checkpoint = retry_best.result.checkpoint_dir
-                retry_best = None
-                base_metric = best.metric
-                base_score = best.score
-                failed_retries = 0
-                step_scale = args.min_step_scale
-                accepted_sbs += args.sb_per_trial
-            elif best_probe.score >= old_base_score:
-                reason = "retry_with_smaller_step"
-                failed_retries += 1
-                step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
+                    reason = "retry_with_smaller_step"
+                    failed_retries += 1
+                    step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
 
             public_checkpoint = ""
             if reason != "retry_with_smaller_step" and not args.dry_run:
@@ -2183,14 +2369,15 @@ def main() -> int:
                         event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
             current_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
             forced_retry_best_tag = history_retry_best.result.tag if reason.startswith("forced_after_") and history_retry_best is not None else ""
-            candidate_tags = {trial.tag for trial in candidates}
-            for trial in candidates:
+            candidate_tags = {trial.tag for trial in summary_trials}
+            for trial in summary_trials:
                 if reason == "retry_with_smaller_step":
                     result_label = "retry_best" if trial.tag == current_retry_best_tag else "discarded"
                 elif reason.startswith("forced_after_"):
                     result_label = "forced_accepted" if trial.tag == forced_retry_best_tag else "discarded"
                 else:
-                    result_label = "accepted" if trial.tag == best_probe.tag else "discarded"
+                    result_label = "accepted" if trial.tag == best.tag else "discarded"
+                trial_theta = theta_candidate if trial.side == CANDIDATE else theta_for_result(trial, probe_a_theta, probe_b_theta)
                 append_trial_summary_row(
                     trial_summary_path,
                     iteration=iteration,
@@ -2199,7 +2386,7 @@ def main() -> int:
                     reason=reason,
                     accepted_sbs=accepted_sbs,
                     trial=trial,
-                    trial_theta=theta_for_result(trial, probe_a_theta, probe_b_theta),
+                    trial_theta=trial_theta,
                     theta_before=theta_before,
                     keys=keys,
                     saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
@@ -2250,7 +2437,7 @@ def main() -> int:
                     },
                 )
             if not args.keep_trials and not args.dry_run:
-                prune_trial_outputs(candidates, trial_output_folder)
+                prune_trial_outputs(summary_trials, trial_output_folder)
 
             append_history(
                 history_path,
@@ -2263,6 +2450,8 @@ def main() -> int:
                     "probe_b_score": f"{probe_b.score:.9f}",
                     "probe_score_diff": f"{probe_score_diff:.9f}",
                     "best_probe_score": f"{best_probe.score:.9f}",
+                    "candidate_score": f"{decision_candidate.score:.9f}",
+                    "candidate_tag": decision_candidate.tag,
                     "new_base_score": f"{base_score:.9f}",
                     "new_base_checkpoint": str(accepted_checkpoint),
                     "accepted_sbs": accepted_sbs,
@@ -2307,8 +2496,8 @@ def main() -> int:
                     "RETRY",
                     (
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"{score_compare_text(args, best_probe.score, old_base_score, value_name='best_trial')} "
-                        f"decision=retry because best_trial did not beat start "
+                        f"{score_compare_text(args, decision_candidate.score, old_base_score, value_name='candidate')} "
+                        f"decision=retry because candidate did not beat start "
                         f"next_step_scale={step_scale:.9f}"
                     ),
                     "yellow",

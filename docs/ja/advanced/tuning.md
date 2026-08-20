@@ -371,11 +371,12 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 1 iteration:
   probe A: base checkpoint から 8 sb 学習
   probe B: base checkpoint から 8 sb 学習
-  qloss が小さい probe の checkpoint を次の継続元にする
-  パラメーターは SPSA の推定方向へ、探索幅の一部だけ動かす
+  2本の qloss 差から、SPSA の推定方向へパラメーターを少しだけ動かす
+  candidate: 動かしたパラメーターで base checkpoint から 8 sb 学習
+  candidate の qloss が開始時 qloss より小さければ採用
 ```
 
-`--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
+`--sb-per-trial 8` は「1本の trial が8 sb」という意味です。`--update-mode spsa` では、probe A/B の2本に加えて、採用候補の candidate を1本走らせます。probe は「どちらへ動かすか」を見るための測定で、採用判定そのものは candidate の qloss で行います。採用された場合、採用経路として進む量は8 sbです。
 
 retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての trial を1行ずつ見たい場合は `summary-learn.log` を見ます。
 
@@ -389,7 +390,7 @@ qloss が小さかった probe のパラメーター値へそのまま移動す�
 
 trial 内の checkpoint 保存は trial 末だけです。runner は BulletOu本体へ、trial中に到達しない大きな `--save-rate` を渡し、デフォルト有効の epoch末保存でtrial末checkpointだけを作ります。通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
-`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。採用するときだけ、qloss が良かった probe と同じ条件で学習を進め、その状態をGPU上に残します。
+`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。`--update-mode spsa` では candidate を1回だけ学習し、candidate の qloss が開始時 qloss より小さければその状態をGPU上に残し、悪ければ自動で開始時状態へ戻します。
 
 `--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 8` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
 
@@ -472,7 +473,7 @@ runner root には3種類のCSVログが出ます。
 
 `summary-learn.log` には `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, `theta_json` が出ます。`result` は `accepted`, `forced_accepted`, `retry_best`, `discarded` のような値です。`saved_checkpoint` は `accepted-checkpoints/` に保存されたフォルダ名です。保存境界でない行では空欄になります。`accepted-summary-learn.log` も `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint` が先頭側に来る列順です。`reason` や `theta_json` のような長い列は右側に寄せています。見るべきなのは、probe の名前ではなく、qloss が改善したか、どこが保存済みか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
-画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration での採用閾値です。通常は `accept_if qloss < ...` と表示され、この値より trial の qloss が小さければ採用されます。各 probe の開始時には `TRIAL trial 1 start` / `TRIAL trial 2 start` が出ます。各 probe が終わると `done` 行の `qloss` / `qacc` が色付きで出ます。基準より良ければ緑、悪ければ黄色です。続く `TRIAL` 行には `final_qloss`, `start_qloss`, `delta` が出ます。`final_qloss < start_qloss` なら緑、超えていなければ黄色です。2本の probe が両方とも基準を超えなかった場合は、黄色の `RETRY` 行に `decision=retry because best_trial did not beat start` と出ます。retry上限に達して強制採用する場合は黄色の `FORCE` 行になります。`ACCEPT` は改善した trial の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
+画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration での採用閾値です。通常は `accept_if qloss < ...` と表示されます。各 probe の開始時には `TRIAL trial 1 start` / `TRIAL trial 2 start` が出ます。各 probe が終わると `done` 行の `qloss` / `qacc` が色付きで出ます。基準より良ければ緑、悪ければ黄色です。続く `TRIAL` 行には `final_qloss`, `start_qloss`, `delta` が出ます。2本のprobe後には `PROBE RESULT` が出て、probeとしては基準を超えたかを表示します。`--update-mode spsa` では、その後に `ADVANCE RUN` / `ADVANCE DONE` / `ADVANCE` が出ます。ここが実際の採用候補です。`ADVANCE` の `advance_qloss < start_qloss` なら採用、そうでなければ retry です。retry上限に達して強制採用する場合は黄色の `FORCE` 行になります。`ACCEPT` は改善した candidate の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
 
 中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
 
