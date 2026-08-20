@@ -9456,6 +9456,33 @@ impl WorkerSfnnSession {
         Ok(())
     }
 
+    fn run_quantized_validation(&mut self, args: &Args) -> Result<Option<TestMetrics>, String> {
+        if !cuda_cpp_should_schedule_quantized_validation(args) {
+            return Ok(None);
+        }
+        let Some(test_args) =
+            quantized_test_args_from_training_args(args, PathBuf::from("<worker-live-quantized-sfnn>"))?
+        else {
+            return Ok(None);
+        };
+        if self.quantized_validation_cache.is_none() {
+            self.quantized_validation_cache =
+                CudaCppSfnnQuantizedValidationCache::try_new(args, self.feature_kind, &self.ctx, self.shape)?;
+        }
+        match self.quantized_validation_cache.as_mut() {
+            Some(cache) => Ok(Some(cache.run_runner(
+                args,
+                self.feature_kind,
+                &self.ctx,
+                self.shape,
+                &self.runner,
+                self.progress_params.as_ref(),
+                &test_args,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     fn run_trial(&mut self, trial_args: Args, keep: bool) -> Result<WorkerSfnnTrialOutcome, String> {
         let trial_feature = worker_require_sfnn_feature(&trial_args)?;
         if trial_feature != self.feature_kind {
@@ -9517,6 +9544,11 @@ impl WorkerSfnnSession {
         let mut seen_steps = 0usize;
         let mut optimizer_updates = 0usize;
         let mut last_dataloader_pos = None;
+        let mut checkpoint_chunk_idx = 0usize;
+        let mut last_test_metrics = None::<TestMetrics>;
+        let mut last_quantized_metrics = None::<TestMetrics>;
+        let mut excluded_elapsed = std::time::Duration::ZERO;
+        let mut progress_meter = CudaCppProgressMeter::default();
         let mut dirty_bucket_marks =
             if trial_args.sfnn_dirty_bucket_update { vec![false; self.shape.num_stacks] } else { Vec::new() };
         let mut dirty_buckets = Vec::<i32>::new();
@@ -9601,10 +9633,74 @@ impl WorkerSfnnSession {
                     dirty_buckets.clear();
                 }
             }
+            let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
+            if checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps) {
+                let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
+                self.ctx.synchronize().map_err(|e| e.to_string())?;
+                let event_started = std::time::Instant::now();
+                let positions = seen_steps.saturating_mul(self.batch_size);
+                let (train_elapsed_sec, _positions_per_sec) =
+                    cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                let progress_stats =
+                    progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
+                print_cuda_cpp_superbatch_progress(
+                    "worker SFNN",
+                    schedule.progress_for_step(seen_steps),
+                    self.batch_size,
+                    positions,
+                    progress_stats,
+                );
+                if chunk.run_validation {
+                    let validation_started = std::time::Instant::now();
+                    let metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+                        &trial_args,
+                        self.feature_kind,
+                        &self.ctx,
+                        self.shape,
+                        &self.runner,
+                        &mut self.validation_cache,
+                    )?;
+                    let validation_elapsed = validation_started.elapsed();
+                    if let Some(metrics) = metrics {
+                        print_cuda_cpp_validation_summary_elapsed(
+                            "worker SFNN",
+                            Some((chunk.epoch, chunk.superbatch)),
+                            metrics.accuracy,
+                            metrics.loss,
+                            Some(validation_elapsed),
+                        );
+                        last_test_metrics = Some(metrics);
+                    }
+                }
+                if chunk.run_quantized_validation {
+                    let qvalid_started = std::time::Instant::now();
+                    let metrics = self.run_quantized_validation(&trial_args)?;
+                    let qvalid_elapsed = qvalid_started.elapsed();
+                    if let Some(metrics) = metrics {
+                        print_cuda_cpp_quantized_validation_summary(
+                            chunk.epoch,
+                            chunk.superbatch,
+                            metrics.accuracy,
+                            metrics.loss,
+                            qvalid_elapsed,
+                            quantized_validation_mode_label(&trial_args),
+                        );
+                        last_quantized_metrics = Some(metrics);
+                    }
+                }
+                excluded_elapsed = excluded_elapsed.saturating_add(event_started.elapsed());
+                checkpoint_chunk_idx += 1;
+            }
             Ok::<(), String>(())
         })
         .map_err(|e| e.to_string())?;
         self.ctx.synchronize().map_err(|e| e.to_string())?;
+        if checkpoint_chunk_idx != schedule.chunks.len() {
+            return Err(format!(
+                "worker SFNN schedule ended after {checkpoint_chunk_idx} chunks, expected {}",
+                schedule.chunks.len()
+            ));
+        }
         let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
             &trial_args,
             seen_steps,
@@ -9612,41 +9708,20 @@ impl WorkerSfnnSession {
             last_dataloader_pos,
             base_dataloader_pos,
         )?;
-        let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
-            &trial_args,
-            self.feature_kind,
-            &self.ctx,
-            self.shape,
-            &self.runner,
-            &mut self.validation_cache,
-        )?;
-        let quantized_metrics = if cuda_cpp_should_schedule_quantized_validation(&trial_args) {
-            let test_args =
-                quantized_test_args_from_training_args(&trial_args, PathBuf::from("<worker-live-quantized-sfnn>"))?;
-            match test_args {
-                Some(test_args) => {
-                    if self.quantized_validation_cache.is_none() {
-                        self.quantized_validation_cache =
-                            CudaCppSfnnQuantizedValidationCache::try_new(&trial_args, self.feature_kind, &self.ctx, self.shape)?;
-                    }
-                    match self.quantized_validation_cache.as_mut() {
-                        Some(cache) => Some(cache.run_runner(
-                            &trial_args,
-                            self.feature_kind,
-                            &self.ctx,
-                            self.shape,
-                            &self.runner,
-                            self.progress_params.as_ref(),
-                            &test_args,
-                        )?),
-                        None => None,
-                    }
-                }
-                None => None,
-            }
+        let test_metrics = if last_test_metrics.is_some() {
+            last_test_metrics
         } else {
-            None
+            run_cuda_cpp_sfnn_resident_validation_cached(
+                &trial_args,
+                self.feature_kind,
+                &self.ctx,
+                self.shape,
+                &self.runner,
+                &mut self.validation_cache,
+            )?
         };
+        let quantized_metrics =
+            if last_quantized_metrics.is_some() { last_quantized_metrics } else { self.run_quantized_validation(&trial_args)? };
         let elapsed = started.elapsed();
         eprintln!(
             "  worker {}: steps={}, updates={}, test_loss={}, test_acc={}, qloss={}, qacc={}, elapsed={}",
