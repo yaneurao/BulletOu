@@ -1160,13 +1160,19 @@ def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_scor
 def probe_decision_line(args: argparse.Namespace, best_probe: TrialResult, base_score: float) -> None:
     beats_target = best_probe.score < base_score
     color = "green" if beats_target else "yellow"
-    decision = "accept best probe" if beats_target else "retry because best probe did not beat start"
+    if beats_target:
+        if args.update_mode == "spsa":
+            decision = "continue from lower-loss NN weights; theta_update=spsa_step"
+        else:
+            decision = "continue from lower-loss NN weights; theta_update=winner_theta"
+    else:
+        decision = "retry because lower-loss trial did not beat start"
     event_line(
         args,
         "DECISION",
         (
-            f"best={probe_label(best_probe.side)} "
-            f"{score_compare_text(args, best_probe.score, base_score, value_name='best_probe')} "
+            f"lower_loss_trial={probe_label(best_probe.side)} "
+            f"{score_compare_text(args, best_probe.score, base_score, value_name='lower_loss_trial')} "
             f"decision={decision}"
         ),
         color,
@@ -1350,8 +1356,12 @@ def worker_accept_cached_trial(
     }
     event_line(
         args,
-        "CACHE",
-        f"accepted cached {probe_label(result.side)} state tag={result.tag} {done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s",
+        "WEIGHTS",
+        (
+            f"restored selected trial NN weights ({probe_label(result.side)}) tag={result.tag}; "
+            f"theta is updated separately by {args.update_mode}  "
+            f"{done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s"
+        ),
         "green",
         bold=True,
     )
