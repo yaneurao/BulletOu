@@ -1322,6 +1322,16 @@ struct QuantizedTestArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou worker")]
+#[command(about = "Run a long-lived JSON Lines worker process")]
+struct WorkerArgs {
+    /// Worker protocol version. Currently only version 1 is supported.
+    #[arg(long, default_value_t = 1)]
+    protocol_version: u32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou quantized-weight-stats")]
 #[command(about = "Print layer-wise integer saturation statistics for an exported SFNN nn.bin")]
 struct QuantizedWeightStatsArgs {
@@ -3959,7 +3969,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(name = "bulletou")]
 #[command(about = "BulletOu unified trainer")]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Training backend. BulletOu training is Windows-native C++/CUDA;
@@ -9071,10 +9081,277 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     })
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_request_id(request: &serde_json::Value) -> serde_json::Value {
+    request.get("id").cloned().unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_response_ok(id: serde_json::Value, cmd: &str, payload: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "ok": true,
+        "cmd": cmd,
+        "payload": payload,
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_response_error(id: serde_json::Value, error: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "ok": false,
+        "error": error.into(),
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_f32(value: f32) -> serde_json::Value {
+    if value.is_finite() { serde_json::json!(value) } else { serde_json::Value::Null }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_opt_f32(value: Option<f32>) -> serde_json::Value {
+    value.map(worker_json_f32).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_string_array(request: &serde_json::Value, field: &str) -> Result<Vec<String>, String> {
+    let values = request
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("worker request requires `{field}` array"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("worker `{field}` item {i} is not a string"))
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_run_quantized_test(request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut raw_args = Vec::<std::ffi::OsString>::new();
+    raw_args.push(std::ffi::OsString::from("bulletou quantized-test"));
+    for arg in worker_json_string_array(request, "args")? {
+        raw_args.push(std::ffi::OsString::from(arg));
+    }
+    let args = QuantizedTestArgs::try_parse_from(raw_args).map_err(|err| err.to_string())?;
+    let report = run_quantized_test(&args)?;
+    Ok(serde_json::json!({
+        "arch": args.arch.to_string(),
+        "layerstack": args.effective_layerstack().cli_name(),
+        "mode": args.mode.cli_name(),
+        "nn_bin": args.nn_bin.display().to_string(),
+        "test_teacher": args.test_teacher.display().to_string(),
+        "records": report.records,
+        "positions_per_sec": report.positions_per_sec(),
+        "elapsed_sec": report.elapsed.as_secs_f64(),
+        "quantized_value_accuracy": worker_json_f32(report.engine_scale.accuracy()),
+        "quantized_value_loss": worker_json_opt_f32(report.engine_scale.test_loss),
+        "quantized_value_compared": report.engine_scale.compared,
+        "quantized_value_matches": report.engine_scale.sign_matches,
+        "quantized_value_draws": report.engine_scale.drawn_games,
+        "quantized_value_mate_filtered": report.engine_scale.filtered_by_score_cap,
+        "quantized_value_loss_n": report.engine_scale.loss_sampled,
+        "train_scale_loss": worker_json_opt_f32(report.train_scale.test_loss),
+        "train_scale_loss_n": report.train_scale.loss_sampled,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_last_summary_row(output_dir: &std::path::Path) -> Result<Option<serde_json::Value>, String> {
+    let path = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut header = None::<String>;
+    let mut last = None::<String>;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("eval,") {
+            header = Some(trimmed.to_string());
+        } else {
+            last = Some(trimmed.to_string());
+        }
+    }
+    let (Some(header), Some(last)) = (header, last) else { return Ok(None) };
+    let headers = header.split(',').collect::<Vec<_>>();
+    let values = last.splitn(headers.len(), ',').collect::<Vec<_>>();
+    let mut row = serde_json::Map::new();
+    for (index, key) in headers.iter().enumerate() {
+        let value = values.get(index).copied().unwrap_or_default();
+        row.insert((*key).to_string(), serde_json::Value::String(value.to_string()));
+    }
+    let mut metrics = serde_json::Map::new();
+    for key in [
+        "test_value_accuracy",
+        "test_value_loss",
+        "quantized_value_accuracy",
+        "quantized_value_loss",
+        "positions",
+    ] {
+        if let Some(value) = row.get(key).and_then(serde_json::Value::as_str) {
+            if let Ok(parsed) = value.parse::<f64>() {
+                if let Some(number) = serde_json::Number::from_f64(parsed) {
+                    metrics.insert(key.to_string(), serde_json::Value::Number(number));
+                }
+            }
+        }
+    }
+    Ok(Some(serde_json::json!({
+        "path": path.display().to_string(),
+        "row": row,
+        "metrics": metrics,
+    })))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_run_train(request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut raw_args = Vec::<std::ffi::OsString>::new();
+    raw_args.push(std::ffi::OsString::from("bulletou"));
+    for arg in worker_json_string_array(request, "args")? {
+        raw_args.push(std::ffi::OsString::from(arg));
+    }
+    let args = Args::try_parse_from(raw_args).map_err(|err| err.to_string())?;
+    let batches_per_superbatch = effective_batches_per_superbatch(&args)?;
+    args.validate_arch_flags()?;
+    args.validate_backend_flags()?;
+    validate_teacher_shuffle_buffer(&args, args.cuda_cpp_train_steps.unwrap_or(batches_per_superbatch))?;
+    resolve_value_loss_runtime_params(&args)?;
+    if !args.cuda_cpp_smoke {
+        let output_dir = args.output_dir();
+        write_resume_config(&output_dir, &args)
+            .map_err(|err| format!("failed to write {}: {err}", output_dir.join(RESUME_CONFIG_NAME).display()))?;
+        if let Err(err) = record_invocation_to_tag_txt(&args) {
+            eprintln!("warning: failed to write tag.txt under {}: {err}", output_dir.display());
+        }
+        if let Err(err) = write_build_info_file(&output_dir) {
+            eprintln!("warning: failed to write build-info.txt under {}: {err}", output_dir.display());
+        }
+    }
+
+    let started = std::time::Instant::now();
+    run_cuda_cpp_backend(&args)?;
+    let output_dir = args.output_dir();
+    let latest_checkpoint = latest_checkpoint_dir(&output_dir);
+    Ok(serde_json::json!({
+        "output_dir": output_dir.display().to_string(),
+        "latest_checkpoint_dir": latest_checkpoint.as_ref().map(|path| path.display().to_string()),
+        "latest_state_bin": latest_checkpoint.as_ref().map(|path| path.join("state.bin").display().to_string()),
+        "summary": worker_last_summary_row(&output_dir)?,
+        "elapsed_sec": started.elapsed().as_secs_f64(),
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_handle_request(args: &WorkerArgs, request: &serde_json::Value) -> (serde_json::Value, bool) {
+    let id = worker_request_id(request);
+    let cmd = match request.get("cmd").and_then(serde_json::Value::as_str) {
+        Some(cmd) => cmd,
+        None => return (worker_response_error(id, "worker request requires string `cmd`"), false),
+    };
+    match cmd {
+        "hello" => (
+            worker_response_ok(
+                id,
+                cmd,
+                serde_json::json!({
+                    "worker": "bulletou",
+                    "protocol_version": args.protocol_version,
+                    "capabilities": ["hello", "train", "quantized-test", "quit"],
+                    "note": "`train` currently reuses the existing trainer inside this process; GPU snapshot train-session support is the next phase.",
+                }),
+            ),
+            false,
+        ),
+        "train" => match worker_run_train(request) {
+            Ok(payload) => (worker_response_ok(id, cmd, payload), false),
+            Err(error) => (worker_response_error(id, error), false),
+        },
+        "quantized-test" => match worker_run_quantized_test(request) {
+            Ok(payload) => (worker_response_ok(id, cmd, payload), false),
+            Err(error) => (worker_response_error(id, error), false),
+        },
+        "trial" | "open" | "adopt" | "save" => (
+            worker_response_error(
+                id,
+                format!("worker command `{cmd}` needs SFNN train-session support and is not implemented yet"),
+            ),
+            false,
+        ),
+        "quit" | "exit" => (worker_response_ok(id, cmd, serde_json::json!({"bye": true})), true),
+        _ => (worker_response_error(id, format!("unknown worker command `{cmd}`")), false),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_worker(args: &WorkerArgs) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    if args.protocol_version != 1 {
+        return Err(format!("unsupported worker protocol version {}; expected 1", args.protocol_version));
+    }
+
+    eprintln!("bulletou worker: ready (JSON Lines protocol v{})", args.protocol_version);
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for (line_index, line) in stdin.lock().lines().enumerate() {
+        let line = line.map_err(|err| format!("worker failed to read stdin line {}: {err}", line_index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = worker_response_error(serde_json::Value::Null, format!("invalid JSON: {err}"));
+                writeln!(stdout, "{response}").map_err(|err| format!("worker failed to write response: {err}"))?;
+                stdout.flush().map_err(|err| format!("worker failed to flush response: {err}"))?;
+                continue;
+            }
+        };
+        let (response, should_quit) = worker_handle_request(args, &request);
+        writeln!(stdout, "{response}").map_err(|err| format!("worker failed to write response: {err}"))?;
+        stdout.flush().map_err(|err| format!("worker failed to flush response: {err}"))?;
+        if should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
 // ----- dispatch ----------------------------------------------------------
 
 fn main() {
     let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("worker")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou worker");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = WorkerArgs::parse_from(raw_args);
+            if let Err(e) = run_worker(&args) {
+                eprintln!("error: worker failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: worker requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("calibrate-nn-bin")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
