@@ -1087,6 +1087,31 @@ def accept_threshold_text(args: argparse.Namespace, base_score: float, base_metr
     return text
 
 
+def score_compare_text(args: argparse.Namespace, score: float, base_score: float, *, value_name: str) -> str:
+    label = objective_label(args.metric)
+    return (
+        f"{value_name}_{label}={score:.9f} "
+        f"start_{label}={base_score:.9f} "
+        f"delta={score - base_score:+.9f}"
+    )
+
+
+def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_score: float) -> None:
+    beats_target = trial.score < base_score
+    status = "beats_target" if beats_target else "misses_target"
+    color = "green" if beats_target else "yellow"
+    event_line(
+        args,
+        "TRIAL",
+        (
+            f"{probe_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
+            f"qacc={fmt_metric(trial.metric.qacc)} result={status}"
+        ),
+        color,
+        bold=True,
+    )
+
+
 def next_save_sbs(args: argparse.Namespace, accepted_sbs: int) -> int | None:
     if args.accepted_save_rate_sbs <= 0:
         return None
@@ -1877,6 +1902,7 @@ def main() -> int:
                 log_dir,
                 worker,
             )
+            trial_threshold_line(args, probe_a, old_base_score)
             probe_b = run_trial(
                 args,
                 accepted_checkpoint,
@@ -1887,6 +1913,7 @@ def main() -> int:
                 log_dir,
                 worker,
             )
+            trial_threshold_line(args, probe_b, old_base_score)
             candidates = [probe_a, probe_b]
             best_probe = min(candidates, key=lambda item: item.score)
             best_probe_theta = theta_for_result(best_probe, probe_a_theta, probe_b_theta)
@@ -2151,22 +2178,27 @@ def main() -> int:
                     "RETRY",
                     (
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"{objective_label(args.metric)}_stays={base_score:.9f} "
+                        f"{score_compare_text(args, best_probe.score, old_base_score, value_name='best_trial')} "
+                        f"decision=retry because best_trial did not beat start "
                         f"next_step_scale={step_scale:.9f}"
                     ),
                     "yellow",
                     bold=True,
                 )
             else:
+                decision_score = best.score
+                forced_accept = decision_score >= old_base_score
+                decision = "accept because final beat start" if not forced_accept else f"force_accept after {args.max_retries} retries"
                 event_line(
                     args,
-                    "ACCEPT",
+                    "FORCE" if forced_accept else "ACCEPT",
                     (
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"reason={reason} new_{objective_label(args.metric)}={base_score:.9f} "
+                        f"reason={reason} {score_compare_text(args, decision_score, old_base_score, value_name='final')} "
+                        f"decision={decision} "
                         f"theta_change={theta_change}"
                     ),
-                    "green",
+                    "yellow" if forced_accept else "green",
                     bold=True,
                 )
                 if public_checkpoint:
