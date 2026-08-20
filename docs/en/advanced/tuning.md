@@ -399,7 +399,9 @@ By default, the plus/minus trial directories are deleted after the decision. The
 
 Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
-With `--use-worker`, the runner starts `bulletou.exe worker` once and sends each trial through JSON Lines. This avoids per-trial process startup. At this stage, trial-end checkpoint saving and the existing trainer initialization path still remain. The faster design where the worker snapshots/restores CUDA state and compares plus/minus trials without disk checkpoints is the next implementation phase.
+With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For plus/minus measurement, the worker snapshots/restores GPU weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. When a side is adopted, the worker reruns that side in the same session and keeps the resulting GPU state.
+
+Saving under `--use-worker` follows `--accepted-save-rate-sbs`. For example, `--accepted-save-rate-sbs 32` writes `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller `--accepted-save-rate-sbs` when exact interruption recovery matters.
 
 The runner judges hyperparameters from the qloss difference between short trials. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting an 8-sb decision too much.
 

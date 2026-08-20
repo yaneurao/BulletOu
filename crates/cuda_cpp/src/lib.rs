@@ -378,6 +378,25 @@ impl F32Buffer {
         check(unsafe { ffi::bulletou_cuda_cpp_f32_fill(ctx.as_ptr(), self.raw.as_ptr(), value, self.len) })
     }
 
+    pub fn copy_from(&self, ctx: &Context, src: &F32Buffer) -> Result<()> {
+        if self.len != src.len {
+            return Err(CudaCppError::message(format!(
+                "f32 device copy length mismatch: dst={}, src={}",
+                self.len, src.len
+            )));
+        }
+        // SAFETY: both device buffers are owned wrappers; backend validates context, device, and length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_f32_copy_device(ctx.as_ptr(), self.raw.as_ptr(), src.raw.as_ptr(), self.len)
+        })
+    }
+
+    pub fn try_clone_device(&self, ctx: &Context) -> Result<F32Buffer> {
+        let out = F32Buffer::new(ctx, self.len)?;
+        out.copy_from(ctx, self)?;
+        Ok(out)
+    }
+
     fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppF32Buffer {
         self.raw.as_ptr()
     }
@@ -445,6 +464,25 @@ impl I32Buffer {
         check(unsafe {
             ffi::bulletou_cuda_cpp_i32_download(ctx.as_ptr(), self.raw.as_ptr(), out.as_mut_ptr(), out.len())
         })
+    }
+
+    pub fn copy_from(&self, ctx: &Context, src: &I32Buffer) -> Result<()> {
+        if self.len != src.len {
+            return Err(CudaCppError::message(format!(
+                "i32 device copy length mismatch: dst={}, src={}",
+                self.len, src.len
+            )));
+        }
+        // SAFETY: both device buffers are owned wrappers; backend validates context, device, and length.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_i32_copy_device(ctx.as_ptr(), self.raw.as_ptr(), src.raw.as_ptr(), self.len)
+        })
+    }
+
+    pub fn try_clone_device(&self, ctx: &Context) -> Result<I32Buffer> {
+        let out = I32Buffer::new(ctx, self.len)?;
+        out.copy_from(ctx, self)?;
+        Ok(out)
     }
 
     fn as_ptr(&self) -> *mut ffi::BulletOuCudaCppI32Buffer {
@@ -1388,6 +1426,23 @@ fn upload_optional_f32(ctx: &Context, label: &str, dst: &Option<F32Buffer>, valu
     }
 }
 
+fn clone_optional_f32_device(ctx: &Context, src: &Option<F32Buffer>) -> Result<Option<F32Buffer>> {
+    src.as_ref().map(|buffer| buffer.try_clone_device(ctx)).transpose()
+}
+
+fn copy_optional_f32_device(ctx: &Context, label: &str, dst: &Option<F32Buffer>, src: &Option<F32Buffer>) -> Result<()> {
+    match (dst, src) {
+        (Some(dst), Some(src)) => dst.copy_from(ctx, src),
+        (None, None) => Ok(()),
+        (Some(_), None) => {
+            Err(CudaCppError::message(format!("{label}: destination buffer exists but source is absent")))
+        }
+        (None, Some(_)) => {
+            Err(CudaCppError::message(format!("{label}: source buffer exists but destination is absent")))
+        }
+    }
+}
+
 impl SfnnForwardDeviceWeights {
     pub fn new_dense(ctx: &Context, shape: SfnnForwardShape) -> Result<Self> {
         validate_sfnn_shape(shape)?;
@@ -1472,6 +1527,64 @@ impl SfnnForwardDeviceWeights {
         upload_optional_f32(ctx, "sfnn l3axw", &self.l3axw, weights.l3axw)?;
         upload_optional_f32(ctx, "sfnn l3axb", &self.l3axb, weights.l3axb)?;
         Ok(())
+    }
+
+    pub fn try_clone_device(&self, ctx: &Context) -> Result<Self> {
+        self.validate()?;
+        Ok(Self {
+            shape: self.shape,
+            l0w: self.l0w.try_clone_device(ctx)?,
+            l0b: self.l0b.try_clone_device(ctx)?,
+            l1w: self.l1w.try_clone_device(ctx)?,
+            l1b: self.l1b.try_clone_device(ctx)?,
+            l1fw: clone_optional_f32_device(ctx, &self.l1fw)?,
+            l1fb: clone_optional_f32_device(ctx, &self.l1fb)?,
+            l1axw: clone_optional_f32_device(ctx, &self.l1axw)?,
+            l1axb: clone_optional_f32_device(ctx, &self.l1axb)?,
+            l2w: self.l2w.try_clone_device(ctx)?,
+            l2b: self.l2b.try_clone_device(ctx)?,
+            l2fw: clone_optional_f32_device(ctx, &self.l2fw)?,
+            l2fb: clone_optional_f32_device(ctx, &self.l2fb)?,
+            l2axw: clone_optional_f32_device(ctx, &self.l2axw)?,
+            l2axb: clone_optional_f32_device(ctx, &self.l2axb)?,
+            l3w: self.l3w.try_clone_device(ctx)?,
+            l3b: self.l3b.try_clone_device(ctx)?,
+            l3fw: clone_optional_f32_device(ctx, &self.l3fw)?,
+            l3fb: clone_optional_f32_device(ctx, &self.l3fb)?,
+            l3axw: clone_optional_f32_device(ctx, &self.l3axw)?,
+            l3axb: clone_optional_f32_device(ctx, &self.l3axb)?,
+        })
+    }
+
+    pub fn copy_from_device(&self, ctx: &Context, src: &Self) -> Result<()> {
+        self.validate()?;
+        src.validate()?;
+        if self.shape != src.shape {
+            return Err(CudaCppError::message(format!(
+                "SFNN device weight shape mismatch while copying: dst {:?}, src {:?}",
+                self.shape, src.shape
+            )));
+        }
+        self.l0w.copy_from(ctx, &src.l0w)?;
+        self.l0b.copy_from(ctx, &src.l0b)?;
+        self.l1w.copy_from(ctx, &src.l1w)?;
+        self.l1b.copy_from(ctx, &src.l1b)?;
+        copy_optional_f32_device(ctx, "sfnn l1fw", &self.l1fw, &src.l1fw)?;
+        copy_optional_f32_device(ctx, "sfnn l1fb", &self.l1fb, &src.l1fb)?;
+        copy_optional_f32_device(ctx, "sfnn l1axw", &self.l1axw, &src.l1axw)?;
+        copy_optional_f32_device(ctx, "sfnn l1axb", &self.l1axb, &src.l1axb)?;
+        self.l2w.copy_from(ctx, &src.l2w)?;
+        self.l2b.copy_from(ctx, &src.l2b)?;
+        copy_optional_f32_device(ctx, "sfnn l2fw", &self.l2fw, &src.l2fw)?;
+        copy_optional_f32_device(ctx, "sfnn l2fb", &self.l2fb, &src.l2fb)?;
+        copy_optional_f32_device(ctx, "sfnn l2axw", &self.l2axw, &src.l2axw)?;
+        copy_optional_f32_device(ctx, "sfnn l2axb", &self.l2axb, &src.l2axb)?;
+        self.l3w.copy_from(ctx, &src.l3w)?;
+        self.l3b.copy_from(ctx, &src.l3b)?;
+        copy_optional_f32_device(ctx, "sfnn l3fw", &self.l3fw, &src.l3fw)?;
+        copy_optional_f32_device(ctx, "sfnn l3fb", &self.l3fb, &src.l3fb)?;
+        copy_optional_f32_device(ctx, "sfnn l3axw", &self.l3axw, &src.l3axw)?;
+        copy_optional_f32_device(ctx, "sfnn l3axb", &self.l3axb, &src.l3axb)
     }
 
     fn validate(&self) -> Result<()> {
@@ -3747,6 +3860,20 @@ impl RangerParamState {
         })
     }
 
+    pub fn try_clone_device(&self, ctx: &Context) -> Result<Self> {
+        Ok(Self {
+            momentum: self.momentum.try_clone_device(ctx)?,
+            velocity: self.velocity.try_clone_device(ctx)?,
+            slow_params: self.slow_params.try_clone_device(ctx)?,
+        })
+    }
+
+    pub fn copy_from_device(&self, ctx: &Context, src: &Self) -> Result<()> {
+        self.momentum.copy_from(ctx, &src.momentum)?;
+        self.velocity.copy_from(ctx, &src.velocity)?;
+        self.slow_params.copy_from(ctx, &src.slow_params)
+    }
+
     fn validate(&self, len: usize, name: &'static str) -> Result<()> {
         expect_len(name, len, self.momentum.len())?;
         expect_len(name, len, self.velocity.len())?;
@@ -3921,6 +4048,28 @@ pub struct SfnnRangerOptimizerStatesReadback {
     pub l3fb: Option<RangerParamStateReadback>,
     pub l3axw: Option<RangerParamStateReadback>,
     pub l3axb: Option<RangerParamStateReadback>,
+}
+
+fn clone_optional_ranger_device(ctx: &Context, src: &Option<RangerParamState>) -> Result<Option<RangerParamState>> {
+    src.as_ref().map(|state| state.try_clone_device(ctx)).transpose()
+}
+
+fn copy_optional_ranger_device(
+    ctx: &Context,
+    label: &str,
+    dst: &Option<RangerParamState>,
+    src: &Option<RangerParamState>,
+) -> Result<()> {
+    match (dst, src) {
+        (Some(dst), Some(src)) => dst.copy_from_device(ctx, src),
+        (None, None) => Ok(()),
+        (Some(_), None) => {
+            Err(CudaCppError::message(format!("{label}: destination state exists but source is absent")))
+        }
+        (None, Some(_)) => {
+            Err(CudaCppError::message(format!("{label}: source state exists but destination is absent")))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4788,6 +4937,57 @@ impl SfnnRangerOptimizerStates {
         })
     }
 
+    pub fn try_clone_device(&self, ctx: &Context, shape: SfnnForwardShape) -> Result<Self> {
+        self.validate(shape)?;
+        Ok(Self {
+            l0w: self.l0w.try_clone_device(ctx)?,
+            l0b: self.l0b.try_clone_device(ctx)?,
+            l1w: self.l1w.try_clone_device(ctx)?,
+            l1b: self.l1b.try_clone_device(ctx)?,
+            l1fw: clone_optional_ranger_device(ctx, &self.l1fw)?,
+            l1fb: clone_optional_ranger_device(ctx, &self.l1fb)?,
+            l1axw: clone_optional_ranger_device(ctx, &self.l1axw)?,
+            l1axb: clone_optional_ranger_device(ctx, &self.l1axb)?,
+            l2w: self.l2w.try_clone_device(ctx)?,
+            l2b: self.l2b.try_clone_device(ctx)?,
+            l2fw: clone_optional_ranger_device(ctx, &self.l2fw)?,
+            l2fb: clone_optional_ranger_device(ctx, &self.l2fb)?,
+            l2axw: clone_optional_ranger_device(ctx, &self.l2axw)?,
+            l2axb: clone_optional_ranger_device(ctx, &self.l2axb)?,
+            l3w: self.l3w.try_clone_device(ctx)?,
+            l3b: self.l3b.try_clone_device(ctx)?,
+            l3fw: clone_optional_ranger_device(ctx, &self.l3fw)?,
+            l3fb: clone_optional_ranger_device(ctx, &self.l3fb)?,
+            l3axw: clone_optional_ranger_device(ctx, &self.l3axw)?,
+            l3axb: clone_optional_ranger_device(ctx, &self.l3axb)?,
+        })
+    }
+
+    pub fn copy_from_device(&self, ctx: &Context, shape: SfnnForwardShape, src: &Self) -> Result<()> {
+        self.validate(shape)?;
+        src.validate(shape)?;
+        self.l0w.copy_from_device(ctx, &src.l0w)?;
+        self.l0b.copy_from_device(ctx, &src.l0b)?;
+        self.l1w.copy_from_device(ctx, &src.l1w)?;
+        self.l1b.copy_from_device(ctx, &src.l1b)?;
+        copy_optional_ranger_device(ctx, "optimizer l1fw", &self.l1fw, &src.l1fw)?;
+        copy_optional_ranger_device(ctx, "optimizer l1fb", &self.l1fb, &src.l1fb)?;
+        copy_optional_ranger_device(ctx, "optimizer l1axw", &self.l1axw, &src.l1axw)?;
+        copy_optional_ranger_device(ctx, "optimizer l1axb", &self.l1axb, &src.l1axb)?;
+        self.l2w.copy_from_device(ctx, &src.l2w)?;
+        self.l2b.copy_from_device(ctx, &src.l2b)?;
+        copy_optional_ranger_device(ctx, "optimizer l2fw", &self.l2fw, &src.l2fw)?;
+        copy_optional_ranger_device(ctx, "optimizer l2fb", &self.l2fb, &src.l2fb)?;
+        copy_optional_ranger_device(ctx, "optimizer l2axw", &self.l2axw, &src.l2axw)?;
+        copy_optional_ranger_device(ctx, "optimizer l2axb", &self.l2axb, &src.l2axb)?;
+        self.l3w.copy_from_device(ctx, &src.l3w)?;
+        self.l3b.copy_from_device(ctx, &src.l3b)?;
+        copy_optional_ranger_device(ctx, "optimizer l3fw", &self.l3fw, &src.l3fw)?;
+        copy_optional_ranger_device(ctx, "optimizer l3fb", &self.l3fb, &src.l3fb)?;
+        copy_optional_ranger_device(ctx, "optimizer l3axw", &self.l3axw, &src.l3axw)?;
+        copy_optional_ranger_device(ctx, "optimizer l3axb", &self.l3axb, &src.l3axb)
+    }
+
     fn validate(&self, shape: SfnnForwardShape) -> Result<()> {
         self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, "optimizer sfnn l0w")?;
         self.l0b.validate(shape.ft_size, "optimizer sfnn l0b")?;
@@ -5635,6 +5835,14 @@ pub struct SfnnTrainStepRunner {
     pub next_upload_slot: usize,
 }
 
+#[derive(Debug)]
+pub struct SfnnTrainStepRunnerSnapshot {
+    pub weights: SfnnForwardDeviceWeights,
+    pub optimizer_states: SfnnRangerOptimizerStates,
+    pub factorizer: SfnnFactorizerActive,
+    pub factorizer_alpha: SfnnFactorizerAlpha,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SfnnUpdateScope {
     All,
@@ -5928,6 +6136,38 @@ impl SfnnTrainStepRunner {
         } else {
             None
         }
+    }
+
+    pub fn set_factorizer_config(
+        &mut self,
+        factorizer: SfnnFactorizerActive,
+        factorizer_alpha: SfnnFactorizerAlpha,
+    ) -> Result<()> {
+        factorizer.validate_for_shape(self.shape)?;
+        factorizer_alpha.validate()?;
+        self.factorizer = factorizer;
+        self.factorizer_alpha = factorizer_alpha;
+        Ok(())
+    }
+
+    pub fn snapshot_device(&self, ctx: &Context) -> Result<SfnnTrainStepRunnerSnapshot> {
+        self.validate()?;
+        Ok(SfnnTrainStepRunnerSnapshot {
+            weights: self.weights.try_clone_device(ctx)?,
+            optimizer_states: self.optimizer_states.try_clone_device(ctx, self.shape)?,
+            factorizer: self.factorizer,
+            factorizer_alpha: self.factorizer_alpha,
+        })
+    }
+
+    pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        src.factorizer.validate_for_shape(self.shape)?;
+        src.factorizer_alpha.validate()?;
+        self.weights.copy_from_device(ctx, &src.weights)?;
+        self.optimizer_states.copy_from_device(ctx, self.shape, &src.optimizer_states)?;
+        self.factorizer = src.factorizer;
+        self.factorizer_alpha = src.factorizer_alpha;
+        Ok(())
     }
 
     pub fn step(
@@ -7818,6 +8058,12 @@ mod ffi {
             dst: *mut i32,
             len: usize,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_i32_copy_device(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppI32Buffer,
+            src: *mut BulletOuCudaCppI32Buffer,
+            len: usize,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_f32_upload(
             ctx: *mut BulletOuCudaCppContext,
             dst: *mut BulletOuCudaCppF32Buffer,
@@ -7835,6 +8081,12 @@ mod ffi {
             ctx: *mut BulletOuCudaCppContext,
             src: *mut BulletOuCudaCppF32Buffer,
             dst: *mut f32,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_copy_device(
+            ctx: *mut BulletOuCudaCppContext,
+            dst: *mut BulletOuCudaCppF32Buffer,
+            src: *mut BulletOuCudaCppF32Buffer,
             len: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_f32_fill(

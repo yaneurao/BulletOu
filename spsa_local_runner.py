@@ -351,8 +351,8 @@ def parse_args() -> argparse.Namespace:
         "--use-worker",
         action="store_true",
         help=(
-            "Run bulletou.exe worker once and send train/quantized-test requests over JSON Lines. "
-            "This avoids per-trial process startup, but still uses the current trainer path."
+            "Run one GPU-resident bulletou.exe worker session. Plus/minus trials use GPU snapshot/restore "
+            "and do not write trial checkpoints; accepted states are saved only at --accepted-save-rate-sbs."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -994,6 +994,111 @@ def metric_from_worker_quantized_payload(payload: dict[str, Any]) -> Metric:
     )
 
 
+def metric_from_worker_trial_payload(payload: dict[str, Any]) -> Metric:
+    return Metric(
+        qloss=parse_float(str(payload.get("quantized_value_loss")) if payload.get("quantized_value_loss") is not None else None),
+        qacc=parse_float(str(payload.get("quantized_value_accuracy")) if payload.get("quantized_value_accuracy") is not None else None),
+        test_loss=parse_float(str(payload.get("test_value_loss")) if payload.get("test_value_loss") is not None else None),
+        test_acc=parse_float(str(payload.get("test_value_accuracy")) if payload.get("test_value_accuracy") is not None else None),
+    )
+
+
+def worker_open_session(
+    args: argparse.Namespace,
+    worker: BulletOuWorker,
+    checkpoint_dir: Path,
+    theta: dict[str, float],
+    runner_dir: Path,
+    log_dir: Path,
+) -> None:
+    cmd = base_command(args, checkpoint_dir, "worker-session-open", theta, runner_dir / "session-open")
+    print("[worker-open] " + subprocess.list2cmdline(cmd), flush=True)
+    payload, elapsed, _lines = worker.request(
+        "open",
+        {"args": cmd[1:]},
+        log_dir / "worker-open.stdout.log",
+        stream=not args.no_stream_child_output,
+    )
+    print(
+        f"[worker-open-done] arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
+        f"completed_steps={payload.get('completed_steps')} optimizer_steps={payload.get('optimizer_steps')} "
+        f"elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+
+
+def worker_trial_theta(result: TrialResult) -> dict[str, float]:
+    raw = result.summary_row.get("worker_trial_theta_json")
+    if not raw:
+        raise ValueError(f"worker trial {result.tag} does not carry worker_trial_theta_json")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("worker_trial_theta_json must decode to an object")
+    return {str(k): float(v) for k, v in value.items()}
+
+
+def worker_adopt_trial(
+    args: argparse.Namespace,
+    worker: BulletOuWorker,
+    checkpoint_dir: Path,
+    tag: str,
+    side: str,
+    theta: dict[str, float],
+    trial_output_folder: Path,
+    log_dir: Path,
+) -> TrialResult:
+    cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
+    log_path = log_dir / f"{tag}.stdout.log"
+    print(f"[adopt-run] {side} tag={tag}", flush=True)
+    print("      " + subprocess.list2cmdline(cmd), flush=True)
+    payload, elapsed, _lines = worker.request(
+        "adopt",
+        {"args": cmd[1:]},
+        log_path,
+        stream=not args.no_stream_child_output,
+    )
+    metric = metric_from_worker_trial_payload(payload)
+    score = metric.score(args.metric)
+    row = {
+        "test_value_accuracy": fmt_metric(metric.test_acc),
+        "test_value_loss": fmt_metric(metric.test_loss),
+        "quantized_value_accuracy": fmt_metric(metric.qacc),
+        "quantized_value_loss": fmt_metric(metric.qloss),
+        "checkpoint": "",
+        "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+    }
+    print(
+        f"[adopt-done] {side} tag={tag} score={score:.9f} "
+        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+    return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
+
+
+def worker_save_checkpoint(
+    args: argparse.Namespace,
+    worker: BulletOuWorker,
+    checkpoint_hint: Path,
+    theta: dict[str, float],
+    save_dir: Path,
+    accepted_sbs: int,
+    log_dir: Path,
+) -> Path:
+    tag = f"worker-save-{accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)}"
+    cmd = base_command(args, checkpoint_hint, tag, theta, save_dir.parent)
+    epoch = max(1, accepted_sbs // args.epoch_sbs)
+    superbatch = args.epoch_sbs if accepted_sbs % args.epoch_sbs == 0 else accepted_sbs % args.epoch_sbs
+    payload, elapsed, _lines = worker.request(
+        "save",
+        {"args": cmd[1:], "dir": str(save_dir), "epoch": epoch, "superbatch": superbatch},
+        log_dir / f"{tag}.stdout.log",
+        stream=not args.no_stream_child_output,
+    )
+    saved = Path(str(payload.get("checkpoint_dir", save_dir))).resolve()
+    print(f"[worker-save] accepted_sbs={accepted_sbs} checkpoint={saved} elapsed={elapsed:.1f}s", flush=True)
+    return saved
+
+
 def run_base_quantized_test(
     args: argparse.Namespace,
     base_checkpoint: Path,
@@ -1058,12 +1163,28 @@ def run_trial(
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
     prune_trial_output_by_tag(trial_output_folder, tag)
     if worker is not None:
-        _payload, elapsed, _lines = worker.request(
-            "train",
+        payload, elapsed, _lines = worker.request(
+            "trial",
             {"args": cmd[1:]},
             log_path,
             stream=not args.no_stream_child_output,
         )
+        metric = metric_from_worker_trial_payload(payload)
+        score = metric.score(args.metric)
+        row = {
+            "test_value_accuracy": fmt_metric(metric.test_acc),
+            "test_value_loss": fmt_metric(metric.test_loss),
+            "quantized_value_accuracy": fmt_metric(metric.qacc),
+            "quantized_value_loss": fmt_metric(metric.qloss),
+            "checkpoint": "",
+            "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+        }
+        print(
+            f"[done] {side} tag={tag} score={score:.9f} "
+            f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+        return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
     else:
         returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
         if returncode != 0:
@@ -1462,6 +1583,9 @@ def main() -> int:
             flush=True,
         )
 
+        if worker is not None and not args.dry_run:
+            worker_open_session(args, worker, accepted_checkpoint, theta, runner_dir, log_dir)
+
         if start_iteration > args.iterations:
             print(
                 f"[complete] runner_dir={runner_dir} already reached iteration {start_iteration - 1}; "
@@ -1559,7 +1683,20 @@ def main() -> int:
             if pair_best.score < base_score:
                 reason = "improved"
                 theta = theta_candidate
-                if not args.dry_run and not args.keep_trials:
+                if worker is not None and not args.dry_run:
+                    train_theta = worker_trial_theta(pair_best)
+                    best = worker_adopt_trial(
+                        args,
+                        worker,
+                        accepted_checkpoint,
+                        f"{tag_base}-adopt-{pair_best.side}",
+                        pair_best.side,
+                        train_theta,
+                        trial_output_folder,
+                        log_dir,
+                    )
+                    safe_rmtree(retry_best_dir, runner_dir)
+                elif not args.dry_run and not args.keep_trials:
                     accepted_checkpoint = move_checkpoint_to_current(pair_best.checkpoint_dir, current_dir, runner_dir)
                     safe_rmtree(retry_best_dir, runner_dir)
                 else:
@@ -1573,14 +1710,17 @@ def main() -> int:
                 accepted_sbs += args.sb_per_trial
             else:
                 if retry_best is None or pair_best.score < retry_best.result.score:
-                    retry_best = stash_retry_best(
-                        pair_best,
-                        theta_candidate,
-                        retry_best_dir,
-                        runner_dir,
-                        args.keep_trials,
-                        args.dry_run,
-                    )
+                    if worker is not None and not args.dry_run:
+                        retry_best = RetryBest(pair_best, theta_candidate)
+                    else:
+                        retry_best = stash_retry_best(
+                            pair_best,
+                            theta_candidate,
+                            retry_best_dir,
+                            runner_dir,
+                            args.keep_trials,
+                            args.dry_run,
+                        )
                     history_retry_best = retry_best
                     print(
                         f"[retry-best] retry={retry} side={pair_best.side} score={pair_best.score:.9f} "
@@ -1595,7 +1735,19 @@ def main() -> int:
                 history_retry_best = retry_best
                 best = retry_best.result
                 theta = retry_best.theta
-                if not args.dry_run and not args.keep_trials:
+                if worker is not None and not args.dry_run:
+                    train_theta = worker_trial_theta(best)
+                    best = worker_adopt_trial(
+                        args,
+                        worker,
+                        accepted_checkpoint,
+                        f"{tag_base}-forced-adopt-{best.side}",
+                        best.side,
+                        train_theta,
+                        trial_output_folder,
+                        log_dir,
+                    )
+                elif not args.dry_run and not args.keep_trials:
                     accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
                 else:
                     accepted_checkpoint = retry_best.result.checkpoint_dir
@@ -1613,8 +1765,23 @@ def main() -> int:
             public_checkpoint = ""
             if reason != "retry_with_smaller_step" and not args.dry_run:
                 if args.accepted_save_rate_sbs and accepted_sbs % args.accepted_save_rate_sbs == 0:
-                    public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
-                    print(f"[save] accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", flush=True)
+                    if worker is not None:
+                        save_dir = accepted_root / accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)
+                        if save_dir.exists():
+                            raise FileExistsError(f"accepted checkpoint already exists: {save_dir}")
+                        accepted_checkpoint = worker_save_checkpoint(
+                            args,
+                            worker,
+                            accepted_checkpoint,
+                            theta,
+                            save_dir,
+                            accepted_sbs,
+                            log_dir,
+                        )
+                        public_checkpoint = str(accepted_checkpoint)
+                    else:
+                        public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
+                        print(f"[save] accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", flush=True)
                 append_accepted_summary(
                     accepted_summary_path,
                     {

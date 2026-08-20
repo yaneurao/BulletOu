@@ -7467,6 +7467,28 @@ extern "C" int bulletou_cuda_cpp_i32_download(
     return ok();
 }
 
+extern "C" int bulletou_cuda_cpp_i32_copy_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppI32Buffer* dst,
+    const BulletOuCudaCppI32Buffer* src,
+    size_t len) {
+    if (validate_i32_buffer(ctx, dst, len, "dst") != 0 ||
+        validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(src), len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, src->ptr, len * sizeof(int), cudaMemcpyDeviceToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync i32 device copy", status);
+    }
+    return ok();
+}
+
 extern "C" int bulletou_cuda_cpp_f32_upload(
     BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* dst,
@@ -7510,6 +7532,28 @@ extern "C" int bulletou_cuda_cpp_f32_download(
     status = cudaStreamSynchronize(ctx->stream);
     if (status != cudaSuccess) {
         return fail("cudaStreamSynchronize f32 download", status);
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_copy_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* dst,
+    const BulletOuCudaCppF32Buffer* src,
+    size_t len) {
+    if (validate_buffer(ctx, dst, len, "dst") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src), len, "src") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return ok();
+    }
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, src->ptr, len * sizeof(float), cudaMemcpyDeviceToDevice, ctx->stream);
+    if (status != cudaSuccess) {
+        return fail("cudaMemcpyAsync f32 device copy", status);
     }
     return ok();
 }

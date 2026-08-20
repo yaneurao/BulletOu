@@ -9253,7 +9253,599 @@ fn worker_run_train(request: &serde_json::Value) -> Result<serde_json::Value, St
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn worker_handle_request(args: &WorkerArgs, request: &serde_json::Value) -> (serde_json::Value, bool) {
+fn worker_json_bool(request: &serde_json::Value, field: &str, default_value: bool) -> Result<bool, String> {
+    match request.get(field) {
+        Some(value) => value.as_bool().ok_or_else(|| format!("worker `{field}` must be a bool")),
+        None => Ok(default_value),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_args_from_json(request: &serde_json::Value, program: &str) -> Result<Args, String> {
+    let mut raw_args = Vec::<std::ffi::OsString>::new();
+    raw_args.push(std::ffi::OsString::from(program));
+    for arg in worker_json_string_array(request, "args")? {
+        raw_args.push(std::ffi::OsString::from(arg));
+    }
+    let args = Args::try_parse_from(raw_args).map_err(|err| err.to_string())?;
+    args.validate_arch_flags()?;
+    args.validate_backend_flags()?;
+    resolve_value_loss_runtime_params(&args)?;
+    Ok(args)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_require_sfnn_feature(args: &Args) -> Result<CudaCppSfnnFeatureKind, String> {
+    match args.eval_type() {
+        EvalType::SfnnHalfka1hm => Ok(CudaCppSfnnFeatureKind::Halfka1hm),
+        EvalType::SfnnHalfka2hm => Ok(CudaCppSfnnFeatureKind::Halfka2hm),
+        EvalType::SfnnHalfka2 => Ok(CudaCppSfnnFeatureKind::Halfka2),
+        EvalType::SfnnKa2 => Ok(CudaCppSfnnFeatureKind::Ka2),
+        other => Err(format!(
+            "worker train-session currently supports SFNN cuda-cpp only; got {}",
+            other.cli_name()
+        )),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone)]
+struct WorkerSfnnTrialOutcome {
+    steps: usize,
+    optimizer_updates: usize,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+    test_metrics: Option<TestMetrics>,
+    quantized_metrics: Option<TestMetrics>,
+    elapsed: std::time::Duration,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+struct WorkerSfnnSession {
+    args: Args,
+    feature_kind: CudaCppSfnnFeatureKind,
+    layerstack: LayerStackMode,
+    progress_params: Option<ShogiSfnnProgressQ16Params>,
+    ctx: bulletou_cuda_cpp::Context,
+    upload_ctx: bulletou_cuda_cpp::Context,
+    runner: bulletou_cuda_cpp::SfnnTrainStepRunner,
+    validation_cache: Option<CudaCppSfnnResidentValidationCache>,
+    quantized_validation_cache: Option<CudaCppSfnnQuantizedValidationCache>,
+    factorizer_axis_confidences: Option<Vec<f32>>,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    batch_size: usize,
+    completed_steps: usize,
+    optimizer_steps: usize,
+    dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl WorkerSfnnSession {
+    fn open(args: Args) -> Result<Self, String> {
+        if args.lr_schedule == LrScheduleKind::Plateau {
+            return Err("worker train-session does not support --lr-schedule plateau yet".to_string());
+        }
+        if args.cuda_cpp_profile_steps != 0
+            || args.cuda_cpp_diagnostics_rate != 0
+            || args.cuda_cpp_loss_readback_interval != 0
+        {
+            eprintln!(
+                "  WARN: worker train-session ignores per-step profile/diagnostic/loss-readback output; trial metrics are validation/qvalidation only"
+            );
+        }
+        let feature_kind = worker_require_sfnn_feature(&args)?;
+        let schedule = cuda_cpp_run_schedule(&args)?;
+        validate_teacher_shuffle_buffer(&args, schedule.batches_per_superbatch)?;
+        let batch_size = effective_batch_size(&args);
+        let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+        let progress_params = sfnn_progress_params_for_layerstack(layerstack);
+        if let Some(params) = progress_params.clone() {
+            set_shogi_sfnn_progress_q16_params(params)?;
+        }
+        let device = args.cuda_cpp_device;
+        let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
+        eprintln!(
+            "  worker session open: device={device}:{name}, arch={}, trial_steps={}, batch_size={}",
+            args.arch().cli_name(),
+            schedule.total_steps,
+            format_count(batch_size)
+        );
+        let initial_state = build_sfnn_initial_state_for_cuda_cpp(&args, feature_kind)?;
+        let initial_weights = &initial_state.weights;
+        let shape = initial_weights.shape;
+        let ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
+        let upload_ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
+        let factorizer_active = cuda_cpp_sfnn_factorizer_active(&args);
+        let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(&args);
+        let max_active = feature_kind.max_active();
+        let mut runner = match initial_state.optimizer_states.as_ref() {
+            Some(optimizer_states) => bulletou_cuda_cpp::SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
+                &ctx,
+                initial_weights.as_host(),
+                optimizer_states.as_host(),
+                batch_size,
+                max_active,
+                factorizer_active,
+                factorizer_alpha,
+            ),
+            None => bulletou_cuda_cpp::SfnnTrainStepRunner::new_with_factorizer(
+                &ctx,
+                initial_weights.as_host(),
+                batch_size,
+                max_active,
+                factorizer_active,
+                factorizer_alpha,
+            ),
+        }
+        .map_err(|e| e.to_string())?;
+        let factorizer_axis_confidences = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
+        let dataloader_pos =
+            cuda_cpp_auto_resume_dataloader_pos(&args, batch_size, initial_state.completed_steps, "nnue")?;
+        let validation_cache = CudaCppSfnnResidentValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
+        let quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
+        Ok(Self {
+            args,
+            feature_kind,
+            layerstack,
+            progress_params,
+            ctx,
+            upload_ctx,
+            runner,
+            validation_cache,
+            quantized_validation_cache,
+            factorizer_axis_confidences,
+            shape,
+            batch_size,
+            completed_steps: initial_state.completed_steps,
+            optimizer_steps: initial_state.optimizer_steps,
+            dataloader_pos,
+        })
+    }
+
+    fn apply_count_settings_to_runner(
+        args: &Args,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+        ctx: &bulletou_cuda_cpp::Context,
+        runner: &mut bulletou_cuda_cpp::SfnnTrainStepRunner,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+        let sfnn_bucket_counts = if let Some(path) = args.sfnn_bucket_counts.as_deref() {
+            let counts = SfnnBucketCounts::read_from_path(path)?;
+            counts.validate_for_arch(path, args.arch(), layerstack)?;
+            Some(counts)
+        } else {
+            None
+        };
+        let effective_residual_count_decay = effective_sfnn_residual_count_decay(args);
+        if effective_residual_count_decay != 0.0 {
+            let counts = sfnn_bucket_counts
+                .as_ref()
+                .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
+            let (effective_k, _) = effective_sfnn_residual_count_decay_k(args, shape)?;
+            let lambdas = sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?;
+            runner.set_residual_count_decay_by_stack(ctx, Some(lambdas.as_slice())).map_err(|e| e.to_string())?;
+        } else {
+            runner.set_residual_count_decay_by_stack(ctx, None).map_err(|e| e.to_string())?;
+        }
+        if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
+            let counts = sfnn_bucket_counts.as_ref().ok_or_else(|| {
+                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
+            })?;
+            let spec = effective_sfnn_factorizer_spec(args);
+            let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, counts)?;
+            if let Some(confidences) = confidences.as_ref() {
+                runner.set_factorizer_axis_confidences(ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
+            } else {
+                runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
+            }
+            return Ok(confidences);
+        } else {
+            runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
+        }
+        Ok(None)
+    }
+
+    fn apply_args_to_runner(&mut self, args: &Args) -> Result<(), String> {
+        self.runner
+            .set_factorizer_config(
+                cuda_cpp_sfnn_factorizer_active(args),
+                cuda_cpp_sfnn_factorizer_alpha(args),
+            )
+            .map_err(|e| e.to_string())?;
+        self.factorizer_axis_confidences =
+            Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
+        Ok(())
+    }
+
+    fn run_trial(&mut self, trial_args: Args, keep: bool) -> Result<WorkerSfnnTrialOutcome, String> {
+        let trial_feature = worker_require_sfnn_feature(&trial_args)?;
+        if trial_feature != self.feature_kind {
+            return Err("worker trial feature kind differs from the opened session".to_string());
+        }
+        if trial_args.arch() != self.args.arch() {
+            return Err("worker trial arch differs from the opened session".to_string());
+        }
+        if trial_args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3) != self.layerstack {
+            return Err("worker trial layerstack differs from the opened session".to_string());
+        }
+        if effective_batch_size(&trial_args) != self.batch_size {
+            return Err("worker trial --batch-size differs from the opened session".to_string());
+        }
+        if trial_args.lr_schedule == LrScheduleKind::Plateau {
+            return Err("worker trial does not support --lr-schedule plateau yet".to_string());
+        }
+        let schedule = cuda_cpp_run_schedule(&trial_args)?;
+        if !schedule.production {
+            return Err("worker trial requires production schedule; use --superbatches/--max-epochs".to_string());
+        }
+        let train_steps = schedule.total_steps;
+        validate_teacher_shuffle_buffer(&trial_args, schedule.batches_per_superbatch)?;
+        let teacher_shuffle_buffer_batches =
+            effective_teacher_shuffle_buffer_batches(&trial_args, schedule.batches_per_superbatch)?;
+        let snapshot = if keep {
+            None
+        } else {
+            Some(self.runner.snapshot_device(&self.ctx).map_err(|e| e.to_string())?)
+        };
+        let base_args = self.args.clone();
+        let base_dataloader_pos = self.dataloader_pos;
+        self.apply_args_to_runner(&trial_args)?;
+
+        let teacher_threads = cuda_cpp_effective_teacher_threads(&trial_args);
+        let loader_threads = cuda_cpp_effective_loader_threads(&trial_args);
+        let batch_queue_size = cuda_cpp_effective_batch_queue_size(&trial_args);
+        let config = bulletou_lib::value::SfnnTeacherBatchConfig {
+            teacher: &trial_args.teacher,
+            batch_size: self.batch_size,
+            batch_index: 0,
+            dataloader_resume_pos: base_dataloader_pos,
+            layerstack_bucket: self.layerstack.bucket_kind(),
+            buffer_mb: trial_args.buffer_mb,
+            loader_threads,
+            threads: teacher_threads,
+            queue_depth: batch_queue_size,
+            lambda: trial_args.lambda,
+            scale: effective_scale(&trial_args),
+            win_rate_model: effective_win_rate_model(&trial_args),
+            wrm_target: effective_wrm_target_params(&trial_args),
+            score_drop_abs: (trial_args.score_drop_abs > 0).then_some(trial_args.score_drop_abs),
+            teacher_shuffle_buffer_batches,
+            teacher_shuffle_seed: trial_args.teacher_shuffle_seed,
+            profile_prepare: false,
+        };
+        let loss_kind = cuda_cpp_scalar_loss_kind(&trial_args);
+        let output_inv_scale = effective_output_inv_scale(&trial_args);
+        let mut seen_steps = 0usize;
+        let mut optimizer_updates = 0usize;
+        let mut last_dataloader_pos = None;
+        let mut dirty_bucket_marks =
+            if trial_args.sfnn_dirty_bucket_update { vec![false; self.shape.num_stacks] } else { Vec::new() };
+        let mut dirty_buckets = Vec::<i32>::new();
+        let started = std::time::Instant::now();
+        for_each_cuda_cpp_sfnn_teacher_batch(self.feature_kind, &config, train_steps, |teacher_batch| {
+            seen_steps += 1;
+            last_dataloader_pos = teacher_batch.dataloader_pos;
+            let batches_per_update = trial_args.batches_per_update;
+            let is_optimizer_step = seen_steps % batches_per_update == 0;
+            let optimizer_step = self.optimizer_steps + optimizer_updates + usize::from(is_optimizer_step);
+            let fast = teacher_batch.batch;
+            let ranger = ranger_params(&trial_args, BULLETOU_DEFAULT_RANGER_CLIP);
+            let step_index = if is_optimizer_step {
+                seen_steps.saturating_sub(batches_per_update)
+            } else {
+                seen_steps.saturating_sub(1)
+            };
+            let learning_rate = schedule.lr_for_step(&trial_args, step_index, self.batch_size);
+            let params = bulletou_cuda_cpp::RangerUpdateParams {
+                radam: bulletou_cuda_cpp::RAdamUpdateParams {
+                    step: optimizer_step as u64,
+                    gradient_factor: 1.0 / batches_per_update as f32,
+                    learning_rate,
+                    decay: ranger.decay,
+                    beta1: ranger.beta1,
+                    beta2: ranger.beta2,
+                    epsilon: ranger.epsilon,
+                    min_weight: ranger.min_weight,
+                    max_weight: ranger.max_weight,
+                    ..bulletou_cuda_cpp::RAdamUpdateParams::default()
+                },
+                lookahead_alpha: ranger.alpha,
+                lookahead_period: ranger.k as u64,
+            };
+            let batch = bulletou_cuda_cpp::SfnnTrainStepHostBatch {
+                stm_indices: &fast.stm,
+                nstm_indices: &fast.nstm,
+                buckets: &fast.buckets,
+                targets: &fast.targets,
+                entry_weights: &fast.weights,
+                batch_size: fast.layout.batch_size,
+                max_active: fast.layout.max_active,
+            };
+            if trial_args.sfnn_dirty_bucket_update {
+                for &bucket in &fast.buckets {
+                    if bucket >= 0 {
+                        let bucket = bucket as usize;
+                        if bucket < dirty_bucket_marks.len() && !dirty_bucket_marks[bucket] {
+                            dirty_bucket_marks[bucket] = true;
+                            dirty_buckets.push(bucket as i32);
+                        }
+                    }
+                }
+            }
+            let dirty_update_buckets = if trial_args.sfnn_dirty_bucket_update && is_optimizer_step {
+                Some(dirty_buckets.as_slice())
+            } else {
+                None
+            };
+            let lr_multipliers =
+                cuda_cpp_sfnn_layer_lr_multipliers(&trial_args, schedule.progress_for_step(seen_steps));
+            self.runner
+                .step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    &self.ctx,
+                    &self.upload_ctx,
+                    params,
+                    loss_kind,
+                    output_inv_scale,
+                    batch,
+                    false,
+                    is_optimizer_step,
+                    lr_multipliers,
+                    dirty_update_buckets,
+                )
+                .map_err(|e| e.to_string())?;
+            if is_optimizer_step {
+                optimizer_updates += 1;
+                if trial_args.sfnn_dirty_bucket_update {
+                    for &bucket in &dirty_buckets {
+                        dirty_bucket_marks[bucket as usize] = false;
+                    }
+                    dirty_buckets.clear();
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .map_err(|e| e.to_string())?;
+        self.ctx.synchronize().map_err(|e| e.to_string())?;
+        let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+            &trial_args,
+            seen_steps,
+            self.batch_size,
+            last_dataloader_pos,
+            base_dataloader_pos,
+        )?;
+        let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+            &trial_args,
+            self.feature_kind,
+            &self.ctx,
+            self.shape,
+            &self.runner,
+            &mut self.validation_cache,
+        )?;
+        let quantized_metrics = if cuda_cpp_should_schedule_quantized_validation(&trial_args) {
+            let test_args =
+                quantized_test_args_from_training_args(&trial_args, PathBuf::from("<worker-live-quantized-sfnn>"))?;
+            match test_args {
+                Some(test_args) => {
+                    if self.quantized_validation_cache.is_none() {
+                        self.quantized_validation_cache =
+                            CudaCppSfnnQuantizedValidationCache::try_new(&trial_args, self.feature_kind, &self.ctx, self.shape)?;
+                    }
+                    match self.quantized_validation_cache.as_mut() {
+                        Some(cache) => Some(cache.run_runner(
+                            &trial_args,
+                            self.feature_kind,
+                            &self.ctx,
+                            self.shape,
+                            &self.runner,
+                            self.progress_params.as_ref(),
+                            &test_args,
+                        )?),
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let elapsed = started.elapsed();
+        eprintln!(
+            "  worker {}: steps={}, updates={}, test_loss={}, test_acc={}, qloss={}, qacc={}, elapsed={}",
+            if keep { "adopt" } else { "trial" },
+            format_count(seen_steps),
+            format_count(optimizer_updates),
+            test_metrics
+                .map(|m| format!("{:.8}", m.loss))
+                .unwrap_or_else(|| "-".to_string()),
+            test_metrics
+                .map(|m| format!("{:.7}", m.accuracy))
+                .unwrap_or_else(|| "-".to_string()),
+            quantized_metrics
+                .map(|m| format!("{:.8}", m.loss))
+                .unwrap_or_else(|| "-".to_string()),
+            quantized_metrics
+                .map(|m| format!("{:.7}", m.accuracy))
+                .unwrap_or_else(|| "-".to_string()),
+            format_duration_secs(elapsed)
+        );
+        if keep {
+            self.completed_steps = self.completed_steps.saturating_add(seen_steps);
+            self.optimizer_steps = self.optimizer_steps.saturating_add(optimizer_updates);
+            self.dataloader_pos = Some(dataloader_pos);
+            self.args = trial_args;
+        } else if let Some(snapshot) = snapshot.as_ref() {
+            self.runner.copy_state_from_device(&self.ctx, snapshot).map_err(|e| e.to_string())?;
+            self.apply_args_to_runner(&base_args)?;
+            self.args = base_args;
+            self.dataloader_pos = base_dataloader_pos;
+        }
+        Ok(WorkerSfnnTrialOutcome {
+            steps: seen_steps,
+            optimizer_updates,
+            dataloader_pos,
+            test_metrics,
+            quantized_metrics,
+            elapsed,
+        })
+    }
+
+    fn save(&mut self, args: Option<Args>, epoch: usize, superbatch: usize) -> Result<std::path::PathBuf, String> {
+        self.save_impl(args.unwrap_or_else(|| self.args.clone()), None, epoch, superbatch)
+    }
+
+    fn save_exact(
+        &mut self,
+        args: Option<Args>,
+        dir: std::path::PathBuf,
+        epoch: usize,
+        superbatch: usize,
+    ) -> Result<std::path::PathBuf, String> {
+        self.save_impl(args.unwrap_or_else(|| self.args.clone()), Some(dir), epoch, superbatch)
+    }
+
+    fn save_impl(
+        &mut self,
+        save_args: Args,
+        exact_dir: Option<std::path::PathBuf>,
+        epoch: usize,
+        superbatch: usize,
+    ) -> Result<std::path::PathBuf, String> {
+        let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
+            &save_args,
+            self.feature_kind,
+            &self.ctx,
+            self.shape,
+            &self.runner,
+            &mut self.validation_cache,
+        )?;
+        self.ctx.synchronize().map_err(|e| e.to_string())?;
+        let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
+        let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
+        let dataloader_pos = self.dataloader_pos.unwrap_or(bulletou_lib::value::TeacherDataloaderPos {
+            byte_offset: 0,
+            plies: 0,
+        });
+        let log = CudaCppCheckpointLog {
+            epoch,
+            superbatch,
+            curr_batch: effective_batches_per_superbatch(&save_args)?,
+            prior_positions: 0,
+            train_steps: self.completed_steps,
+            test_metrics,
+            lr_start: save_args.lr,
+            lr_end: save_args.lr_min,
+            dataloader_pos,
+        };
+        let checkpoint_dir = if let Some(dir) = exact_dir.as_ref() {
+            let parent = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            let tmp_dir = parent.join(format!(
+                "{}.tmp-{}",
+                dir.file_name().and_then(|name| name.to_str()).unwrap_or("worker-checkpoint"),
+                std::process::id()
+            ));
+            if tmp_dir.exists() {
+                std::fs::remove_dir_all(&tmp_dir)
+                    .map_err(|err| format!("failed to remove {}: {err}", tmp_dir.display()))?;
+            }
+            std::fs::create_dir(&tmp_dir).map_err(|err| format!("failed to create {}: {err}", tmp_dir.display()))?;
+            let write_result = (|| -> Result<(), String> {
+                write_cuda_cpp_sfnn_nn_bin(
+                    &tmp_dir.join("nn.bin"),
+                    self.feature_kind,
+                    self.shape,
+                    &weights,
+                    effective_sfnn_factorizer_spec(&save_args),
+                    effective_sfnn_factorizer_alpha(&save_args),
+                    self.factorizer_axis_confidences.as_deref(),
+                    self.progress_params.as_ref(),
+                )?;
+                write_cuda_cpp_sfnn_weights_bin(
+                    &tmp_dir.join("state.bin"),
+                    &weights,
+                    &optimizer_states,
+                    self.completed_steps,
+                    self.optimizer_steps,
+                )?;
+                write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, &save_args, log)?;
+                Ok(())
+            })();
+            if let Err(err) = write_result {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(err);
+            }
+            if dir.exists() {
+                std::fs::remove_dir_all(dir).map_err(|err| format!("failed to remove {}: {err}", dir.display()))?;
+            }
+            std::fs::rename(&tmp_dir, dir)
+                .map_err(|err| format!("failed to rename {} to {}: {err}", tmp_dir.display(), dir.display()))?;
+            dir.clone()
+        } else {
+            write_cuda_cpp_sfnn_numbered_checkpoint(
+                &save_args,
+                self.feature_kind,
+                self.shape,
+                &weights,
+                &optimizer_states,
+                self.completed_steps,
+                self.optimizer_steps,
+                self.progress_params.as_ref(),
+                self.factorizer_axis_confidences.as_deref(),
+                log,
+            )?
+        };
+        if cuda_cpp_should_schedule_quantized_validation(&save_args) {
+            if let Some(test_args) =
+                quantized_test_args_from_training_args(&save_args, PathBuf::from("<worker-save-live-quantized-sfnn>"))?
+            {
+                if self.quantized_validation_cache.is_none() {
+                    self.quantized_validation_cache =
+                        CudaCppSfnnQuantizedValidationCache::try_new(&save_args, self.feature_kind, &self.ctx, self.shape)?;
+                }
+                if let Some(cache) = self.quantized_validation_cache.as_mut() {
+                    let metrics = cache.run_runner(
+                        &save_args,
+                        self.feature_kind,
+                        &self.ctx,
+                        self.shape,
+                        &self.runner,
+                        self.progress_params.as_ref(),
+                        &test_args,
+                    )?;
+                    update_checkpoint_learn_log_quantized_metrics(&checkpoint_dir, metrics)?;
+                    if exact_dir.is_none() {
+                        update_summary_log_quantized_metrics(&save_args.output_dir(), epoch, superbatch, metrics)?;
+                    }
+                }
+            }
+        }
+        Ok(checkpoint_dir)
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_trial_payload(outcome: &WorkerSfnnTrialOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "steps": outcome.steps,
+        "optimizer_updates": outcome.optimizer_updates,
+        "dataloader_pos": {
+            "byte_offset": outcome.dataloader_pos.byte_offset,
+            "plies": outcome.dataloader_pos.plies,
+        },
+        "elapsed_sec": outcome.elapsed.as_secs_f64(),
+        "test_value_accuracy": outcome.test_metrics.map(|m| worker_json_f32(m.accuracy)).unwrap_or(serde_json::Value::Null),
+        "test_value_loss": outcome.test_metrics.map(|m| worker_json_f32(m.loss)).unwrap_or(serde_json::Value::Null),
+        "quantized_value_accuracy": outcome.quantized_metrics.map(|m| worker_json_f32(m.accuracy)).unwrap_or(serde_json::Value::Null),
+        "quantized_value_loss": outcome.quantized_metrics.map(|m| worker_json_f32(m.loss)).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_handle_request(
+    args: &WorkerArgs,
+    request: &serde_json::Value,
+    session: &mut Option<WorkerSfnnSession>,
+) -> (serde_json::Value, bool) {
     let id = worker_request_id(request);
     let cmd = match request.get("cmd").and_then(serde_json::Value::as_str) {
         Some(cmd) => cmd,
@@ -9267,12 +9859,30 @@ fn worker_handle_request(args: &WorkerArgs, request: &serde_json::Value) -> (ser
                 serde_json::json!({
                     "worker": "bulletou",
                     "protocol_version": args.protocol_version,
-                    "capabilities": ["hello", "train", "quantized-test", "quit"],
-                    "note": "`train` currently reuses the existing trainer inside this process; GPU snapshot train-session support is the next phase.",
+                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "adopt", "save", "quit"],
+                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state and restores; `adopt` reruns and keeps the accepted branch.",
                 }),
             ),
             false,
         ),
+        "open" => match worker_args_from_json(request, "bulletou worker open").and_then(WorkerSfnnSession::open) {
+            Ok(opened) => {
+                let payload = serde_json::json!({
+                    "arch": opened.args.arch().cli_name(),
+                    "eval_type": opened.args.eval_type().cli_name(),
+                    "batch_size": opened.batch_size,
+                    "completed_steps": opened.completed_steps,
+                    "optimizer_steps": opened.optimizer_steps,
+                    "dataloader_pos": opened.dataloader_pos.map(|pos| serde_json::json!({
+                        "byte_offset": pos.byte_offset,
+                        "plies": pos.plies,
+                    })).unwrap_or(serde_json::Value::Null),
+                });
+                *session = Some(opened);
+                (worker_response_ok(id, cmd, payload), false)
+            }
+            Err(error) => (worker_response_error(id, error), false),
+        },
         "train" => match worker_run_train(request) {
             Ok(payload) => (worker_response_ok(id, cmd, payload), false),
             Err(error) => (worker_response_error(id, error), false),
@@ -9281,13 +9891,66 @@ fn worker_handle_request(args: &WorkerArgs, request: &serde_json::Value) -> (ser
             Ok(payload) => (worker_response_ok(id, cmd, payload), false),
             Err(error) => (worker_response_error(id, error), false),
         },
-        "trial" | "open" | "adopt" | "save" => (
-            worker_response_error(
-                id,
-                format!("worker command `{cmd}` needs SFNN train-session support and is not implemented yet"),
-            ),
-            false,
-        ),
+        "trial" | "adopt" => {
+            let Some(session) = session.as_mut() else {
+                return (worker_response_error(id, format!("worker command `{cmd}` requires `open` first")), false);
+            };
+            match worker_args_from_json(request, &format!("bulletou worker {cmd}")).and_then(|trial_args| {
+                let keep = if cmd == "adopt" { true } else { worker_json_bool(request, "keep", false)? };
+                session.run_trial(trial_args, keep).map(|outcome| (keep, outcome))
+            }) {
+                Ok((keep, outcome)) => {
+                    let mut payload = worker_trial_payload(&outcome);
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("kept".to_string(), serde_json::json!(keep));
+                        map.insert("completed_steps".to_string(), serde_json::json!(session.completed_steps));
+                        map.insert("optimizer_steps".to_string(), serde_json::json!(session.optimizer_steps));
+                    }
+                    (worker_response_ok(id, cmd, payload), false)
+                }
+                Err(error) => (worker_response_error(id, error), false),
+            }
+        }
+        "save" => {
+            let Some(session) = session.as_mut() else {
+                return (worker_response_error(id, "worker command `save` requires `open` first"), false);
+            };
+            let save_args = match request.get("args") {
+                Some(_) => match worker_args_from_json(request, "bulletou worker save") {
+                    Ok(args) => Some(args),
+                    Err(error) => return (worker_response_error(id, error), false),
+                },
+                None => None,
+            };
+            let epoch = request.get("epoch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+            let superbatch = request.get("superbatch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+            let exact_dir = request
+                .get("dir")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from);
+            let save_result = match exact_dir {
+                Some(dir) => session.save_exact(save_args, dir, epoch, superbatch),
+                None => session.save(save_args, epoch, superbatch),
+            };
+            match save_result {
+                Ok(checkpoint_dir) => (
+                    worker_response_ok(
+                        id,
+                        cmd,
+                        serde_json::json!({
+                            "checkpoint_dir": checkpoint_dir.display().to_string(),
+                            "state_bin": checkpoint_dir.join("state.bin").display().to_string(),
+                            "nn_bin": checkpoint_dir.join("nn.bin").display().to_string(),
+                            "summary": worker_last_summary_row(
+                                checkpoint_dir.parent().unwrap_or_else(|| std::path::Path::new("."))
+                            ).unwrap_or(None),
+                        }),
+                    ),
+                    false,
+                ),
+                Err(error) => (worker_response_error(id, error), false),
+            }
+        }
         "quit" | "exit" => (worker_response_ok(id, cmd, serde_json::json!({"bye": true})), true),
         _ => (worker_response_error(id, format!("unknown worker command `{cmd}`")), false),
     }
@@ -9304,6 +9967,7 @@ fn run_worker(args: &WorkerArgs) -> Result<(), String> {
     eprintln!("bulletou worker: ready (JSON Lines protocol v{})", args.protocol_version);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    let mut session = None::<WorkerSfnnSession>;
     for (line_index, line) in stdin.lock().lines().enumerate() {
         let line = line.map_err(|err| format!("worker failed to read stdin line {}: {err}", line_index + 1))?;
         if line.trim().is_empty() {
@@ -9318,7 +9982,7 @@ fn run_worker(args: &WorkerArgs) -> Result<(), String> {
                 continue;
             }
         };
-        let (response, should_quit) = worker_handle_request(args, &request);
+        let (response, should_quit) = worker_handle_request(args, &request, &mut session);
         writeln!(stdout, "{response}").map_err(|err| format!("worker failed to write response: {err}"))?;
         stdout.flush().map_err(|err| format!("worker failed to flush response: {err}"))?;
         if should_quit {

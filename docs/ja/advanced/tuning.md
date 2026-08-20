@@ -385,7 +385,9 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 trial 内の checkpoint 保存は trial 末だけですが、通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
-`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、各 trial を JSON Lines で worker に送ります。これにより trial ごとの process 起動は避けられます。ただし、現時点では trial 末の checkpoint 保存や既存 trainer の初期化経路は残っています。CUDA 状態を worker 内で snapshot / restore して disk 保存なしで plus/minus を比較する高速化は、次の実装段階です。
+`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。plus/minus の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。採用するときだけ、勝った方向のtrialを同じsession上で再実行して、その状態をGPU上に残します。
+
+`--use-worker` の保存は `--accepted-save-rate-sbs` に従います。たとえば `--accepted-save-rate-sbs 32` なら、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、`--accepted-save-rate-sbs` を小さくしてください。
 
 SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
 
