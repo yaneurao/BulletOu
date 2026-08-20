@@ -1565,8 +1565,7 @@ def move_checkpoint_to_current(src: Path, current_dir: Path, runner_dir: Path) -
 
 
 def accepted_checkpoint_name(accepted_sbs: int, epoch_sbs: int) -> str:
-    if accepted_sbs % epoch_sbs == 0:
-        return f"{accepted_sbs // epoch_sbs:04d}"
+    _ = epoch_sbs
     return f"sb{accepted_sbs:08d}"
 
 

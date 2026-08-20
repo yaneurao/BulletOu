@@ -387,13 +387,13 @@ retry は同じ iteration のまま実行されます。たとえば iteration 1
 
 qloss が小さかった probe のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
 
-デフォルトでは、probe の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
+デフォルトでは、probe の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、保存境界ごとに `accepted-checkpoints/sb00000032`, `sb00000064`, ... のように、採用経路の累計sb数で外向け checkpoint が保存されます。
 
 trial 内の checkpoint 保存は trial 末だけです。runner は BulletOu本体へ、trial中に到達しない大きな `--save-rate` を渡し、デフォルト有効の epoch末保存でtrial末checkpointだけを作ります。通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
 `--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker が重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。A/Bの2本を測ったあと、qloss が良かった trial の NN 重みをcacheから戻して、そのまま次の継続元にします。これは theta を良かった probe の値へ丸ごと変えるという意味ではありません。デフォルトでは、theta は2本のloss差からSPSAで推定した方向へ少しだけ動きます。採用のために同じprobeをもう一度学習することはありません。
 
-`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 8` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
+`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 8` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が32 sb進むたびに `accepted-checkpoints/sb00000032`, `sb00000064`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
 
 SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
 
