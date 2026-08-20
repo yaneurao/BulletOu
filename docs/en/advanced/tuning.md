@@ -375,31 +375,31 @@ You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confiden
 
 Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `spsa_local_runner.py` to search nearby settings instead of hand-writing many small runs.
 
-The runner branches two short trials, `plus` and `minus`, from the same checkpoint and compares their quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so the runner uses qloss as the objective.
+The runner branches two short probes from the same checkpoint. The probes are the two opposite points along one random direction `v` in hyperparameter space: one at `+v`, the other at `-v`. It compares their quantized validation loss (`quantized_value_loss`) and uses that difference to estimate which direction lowers qloss locally. Accuracy is noisier, so the runner uses qloss as the objective.
 
 At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss by itself. It prints the result as a `[base]` line. Use `--base-metric-source summary` only when you explicitly want to read the existing summary instead.
 
-If both trials are worse than the base, the runner does not adopt either side immediately. It shrinks the perturbation and retries. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-adopts the best qloss from the whole retry window, not merely the last plus/minus pair.
+If both trials are worse than the base, the runner does not adopt either side immediately. It shrinks the perturbation and retries. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-adopts the best qloss from the whole retry window, not merely the last probe pair.
 
 ```text
 1 iteration:
-  plus  trial: train 8 sb from the base checkpoint
-  minus trial: train 8 sb from the base checkpoint
-  adopt the checkpoint from the side with lower qloss
-  move the parameters only partway toward the winning side
+  probe A: train 8 sb from the base checkpoint
+  probe B: train 8 sb from the base checkpoint
+  continue from the checkpoint with lower qloss
+  move the parameters only partway along the SPSA-estimated direction
 ```
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
-The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` initially becomes roughly `0.309` and `0.291` on the plus/minus sides. With the default `--update-mode spsa`, the runner does not jump directly to the winning trial value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width toward the winning side, so this example moves to roughly `0.3009`, not `0.309`. If both sides get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. If both probes get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
 
-Use `--update-mode winner` only if you explicitly want to jump directly to the winning trial's parameter values.
+Use `--update-mode winner` only if you explicitly want to jump directly to the parameter values of the lower-qloss probe.
 
-By default, the plus/minus trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
+By default, the probe trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
 
 Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
-With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For plus/minus measurement, the worker snapshots/restores GPU weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. When a side is adopted, the worker reruns that side in the same session and keeps the resulting GPU state.
+With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For probe measurement, the worker snapshots/restores GPU weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. When a probe is selected as the continuation source, the worker reruns that probe's training condition in the same session and keeps the resulting GPU state.
 
 Saving under `--use-worker` follows `--accepted-save-rate-sbs`. For example, `--accepted-save-rate-sbs 32` writes `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller `--accepted-save-rate-sbs` when exact interruption recovery matters.
 
@@ -472,7 +472,7 @@ Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--valid
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
-The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The runner creates `accepted-summary-learn.log` with a header at startup, so you can open it in an editor immediately. The accepted summary includes `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`, so you can see how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
+The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The runner creates `accepted-summary-learn.log` with a header at startup, so you can open it in an editor immediately. The accepted summary includes `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`. The useful information is not the probe name; it is whether qloss improved and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
 To resume an interrupted runner, use the same `--output-folder` and `--tag-prefix` and add `--resume`. The runner root is determined as `--output-folder\spsa-<tag-prefix>`, so you normally do not need to pass `--runner-dir`. The runner restores the checkpoint, theta, step scale, retry state, and accepted sb count from `state.json`.
 

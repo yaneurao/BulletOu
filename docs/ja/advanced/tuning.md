@@ -361,7 +361,7 @@ axis 行・pair 行そのものを count に応じて弱めたい場合は、`--
 
 factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。既に良い checkpoint がある場合は、`spsa_local_runner.py` で近傍探索できます。
 
-この runner は、同じ checkpoint から `plus` と `minus` の2本を短く学習させ、量子化後 loss (`quantized_value_loss`) を比較します。accuracy は値が荒いので、判断には qloss を使います。
+この runner は、同じ checkpoint から2本の短い probe を走らせます。2本は、ハイパーパラメーター空間でランダムに選んだ方向 `v` に対して、片方を `+v`、もう片方を `-v` へ動かしたものです。量子化後 loss (`quantized_value_loss`) を比較し、その差から「この近傍ではどちらへ動かすと qloss が下がりやすいか」を推定します。accuracy は値が荒いので、判断には qloss を使います。
 
 開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を自分で測り直します。その結果は `[base]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
 
@@ -369,23 +369,23 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 ```text
 1 iteration:
-  plus  trial: base checkpoint から 8 sb 学習
-  minus trial: base checkpoint から 8 sb 学習
-  checkpoint は qloss が小さいほうを採用する
-  パラメーターは plus/minus の勝った方向へ、探索幅の一部だけ動かす
+  probe A: base checkpoint から 8 sb 学習
+  probe B: base checkpoint から 8 sb 学習
+  qloss が小さい probe の checkpoint を次の継続元にする
+  パラメーターは SPSA の推定方向へ、探索幅の一部だけ動かす
 ```
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
-パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、最初の plus/minus はおおむね `0.309` と `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、勝った trial の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、勝った方向へ探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
+パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.309`、反対側の probe では `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
 
-勝った trial のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
+qloss が小さかった probe のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
 
-デフォルトでは、plus/minus の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
+デフォルトでは、probe の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... として外向け checkpoint が保存されます。
 
 trial 内の checkpoint 保存は trial 末だけですが、通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
-`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。plus/minus の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。採用するときだけ、勝った方向のtrialを同じsession上で再実行して、その状態をGPU上に残します。
+`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。採用するときだけ、qloss が良かった probe と同じ条件で学習を進め、その状態をGPU上に残します。
 
 `--use-worker` の保存は `--accepted-save-rate-sbs` に従います。たとえば `--accepted-save-rate-sbs 32` なら、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、`--accepted-save-rate-sbs` を小さくしてください。
 
@@ -458,7 +458,7 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作られるので、学習開始直後からエディタで開いておけます。`accepted-summary-learn.log` には `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出るので、各ハイパーパラメーターがどちらへどれだけ動いたかを後から確認できます。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作られるので、学習開始直後からエディタで開いておけます。`accepted-summary-learn.log` には `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出ます。見るべきなのは、probe の名前ではなく、qloss が改善したか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
 

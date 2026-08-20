@@ -3,9 +3,9 @@
 
 This script does not change BulletOu's training algorithm.  It repeatedly
 branches from a checkpoint, runs two short trials with slightly different
-factorizer hyperparameters, estimates an SPSA direction from the plus/minus
-losses, and updates the hyperparameters by a small fraction of that
-perturbation width.
+factorizer hyperparameters along opposite random directions, estimates an SPSA
+direction from the two probe losses, and updates the hyperparameters by a small
+fraction of that perturbation width.
 The model weights are continued from the better short trial checkpoint.
 
 Typical use:
@@ -146,12 +146,21 @@ QUANTIZED_TEST_BOOL_FLAGS = {
 }
 
 
+PROBE_A = "probe_a"
+PROBE_B = "probe_b"
+LEGACY_PROBE_A = {"probe_a", "plus"}
+LEGACY_PROBE_B = {"probe_b", "minus"}
+
+
 ACCEPTED_SUMMARY_FIELDS = [
     "iteration",
     "accepted_sbs",
     "reason",
-    "accepted",
+    "score_before",
     "score",
+    "probe_a_score",
+    "probe_b_score",
+    "probe_score_diff",
     "quantized_value_loss",
     "quantized_value_accuracy",
     "test_value_loss",
@@ -166,6 +175,36 @@ ACCEPTED_SUMMARY_FIELDS = [
     "theta_before_json",
     "theta_delta_json",
     "theta_json",
+]
+
+
+HISTORY_FIELDS = [
+    "iteration",
+    "retry",
+    "reason",
+    "base_score_before",
+    "probe_a_score",
+    "probe_b_score",
+    "probe_score_diff",
+    "best_probe_score",
+    "new_base_score",
+    "new_base_checkpoint",
+    "accepted_sbs",
+    "public_checkpoint",
+    "retry_best_score",
+    "retry_best_checkpoint",
+    "update_mode",
+    "step_scale_used",
+    "step_scale_next",
+    "spsa_move_ratio",
+    "theta_change",
+    "theta_before_json",
+    "theta_delta_json",
+    "theta_json",
+    "theta_candidate_json",
+    "spsa_gradient_log_json",
+    "spsa_log_update_json",
+    "delta_json",
 ]
 
 
@@ -216,7 +255,7 @@ class SpsaUpdate:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run short plus/minus BulletOu trials and adopt better factorizer hyperparameters."
+        description="Run paired randomized BulletOu probes and tune factorizer hyperparameters."
     )
     parser.add_argument("--exe", required=True, help="Path to bulletou.exe")
     parser.add_argument("--base-checkpoint", type=Path, default=None, help="Checkpoint directory containing state.bin")
@@ -252,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-trials",
         action="store_true",
-        help="Keep plus/minus trial output directories. Default deletes both sides after the decision.",
+        help="Keep probe trial output directories. Default deletes trial outputs after the decision.",
     )
     parser.add_argument(
         "--trial-validation-rate-sbs",
@@ -321,9 +360,9 @@ def parse_args() -> argparse.Namespace:
         choices=["spsa", "winner"],
         default="spsa",
         help=(
-            "How to update theta after plus/minus trials. `spsa` uses the plus/minus "
-            "loss difference as a gradient estimate. `winner` keeps the old behavior "
-            "and jumps to the better trial's theta."
+            "How to update theta after paired probes. `spsa` uses the two-probe "
+            "loss difference as a gradient estimate. `winner` jumps directly to "
+            "the better observed probe theta."
         ),
     )
     parser.add_argument(
@@ -331,7 +370,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help=(
-            "Fraction of the plus/minus perturbation used for the accepted theta update. "
+            "Fraction of the paired perturbation used for the theta update. "
             "Default 0.1 means move theta by 10%% of the current delta width."
         ),
     )
@@ -339,7 +378,7 @@ def parse_args() -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=2,
-        help="Force-adopt the best retry trial after this many non-improving plus/minus pairs. Default: 2.",
+        help="Force-adopt the best retry trial after this many non-improving probe pairs. Default: 2.",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -351,7 +390,7 @@ def parse_args() -> argparse.Namespace:
         "--use-worker",
         action="store_true",
         help=(
-            "Run one GPU-resident bulletou.exe worker session. Plus/minus trials use GPU snapshot/restore "
+            "Run one GPU-resident bulletou.exe worker session. Probe trials use GPU snapshot/restore "
             "and do not write trial checkpoints; accepted states are saved only at --accepted-save-rate-sbs."
         ),
     )
@@ -658,19 +697,19 @@ def make_spsa_update(
     bounds: dict[str, tuple[float, float]],
     keys: list[str],
     delta: dict[str, int],
-    plus_score: float,
-    minus_score: float,
+    probe_a_score: float,
+    probe_b_score: float,
     step_scale: float,
     move_ratio: float,
 ) -> SpsaUpdate:
-    if not (math.isfinite(plus_score) and math.isfinite(minus_score)):
-        raise ValueError("SPSA update requires finite plus/minus scores")
+    if not (math.isfinite(probe_a_score) and math.isfinite(probe_b_score)):
+        raise ValueError("SPSA update requires finite paired probe scores")
     c = math.log(step_scale)
     if c <= 0.0:
         raise ValueError("--step-scale must be > 1 for SPSA update")
-    if plus_score < minus_score:
+    if probe_a_score < probe_b_score:
         winner_sign = +1
-    elif minus_score < plus_score:
+    elif probe_b_score < probe_a_score:
         winner_sign = -1
     else:
         winner_sign = 0
@@ -680,7 +719,7 @@ def make_spsa_update(
     for key in keys:
         lo, hi = bounds[key]
         direction = delta[key]
-        grad = (plus_score - minus_score) / (2.0 * c * direction)
+        grad = (probe_a_score - probe_b_score) / (2.0 * c * direction)
         update = winner_sign * direction * move_ratio * c
         z = theta_to_log(theta[key], lo, hi)
         next_theta[key] = theta_from_log(z + update, lo, hi)
@@ -1037,6 +1076,14 @@ def worker_trial_theta(result: TrialResult) -> dict[str, float]:
     return {str(k): float(v) for k, v in value.items()}
 
 
+def probe_label(side: str) -> str:
+    if side in LEGACY_PROBE_A:
+        return "probe A"
+    if side in LEGACY_PROBE_B:
+        return "probe B"
+    return side.replace("_", " ")
+
+
 def worker_adopt_trial(
     args: argparse.Namespace,
     worker: BulletOuWorker,
@@ -1049,7 +1096,7 @@ def worker_adopt_trial(
 ) -> TrialResult:
     cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
     log_path = log_dir / f"{tag}.stdout.log"
-    print(f"[adopt-run] {side} tag={tag}", flush=True)
+    print(f"[advance-run] tag={tag}", flush=True)
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     payload, elapsed, _lines = worker.request(
         "adopt",
@@ -1068,7 +1115,7 @@ def worker_adopt_trial(
         "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
     }
     print(
-        f"[adopt-done] {side} tag={tag} score={score:.9f} "
+        f"[advance-done] tag={tag} score={score:.9f} "
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
         flush=True,
     )
@@ -1157,7 +1204,7 @@ def run_trial(
 ) -> TrialResult:
     cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
     log_path = log_dir / f"{tag}.stdout.log"
-    print(f"[run] {side} tag={tag}", flush=True)
+    print(f"[run] {probe_label(side)} tag={tag}", flush=True)
     print("      " + subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
@@ -1180,7 +1227,7 @@ def run_trial(
             "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
         }
         print(
-            f"[done] {side} tag={tag} score={score:.9f} "
+            f"[done] {probe_label(side)} tag={tag} score={score:.9f} "
             f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
             flush=True,
         )
@@ -1202,7 +1249,7 @@ def run_trial(
     if not (next_checkpoint / "dataloader_pos.txt").exists():
         raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
     print(
-        f"[done] {side} tag={tag} score={score:.9f} "
+        f"[done] {probe_label(side)} tag={tag} score={score:.9f} "
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
         flush=True,
     )
@@ -1267,11 +1314,11 @@ def prune_trial_output_by_tag(trial_output_folder: Path, tag: str) -> None:
             safe_rmtree(path, trial_output_folder)
 
 
-def theta_for_result(result: TrialResult, plus_theta: dict[str, float], minus_theta: dict[str, float]) -> dict[str, float]:
-    if result.side == "plus":
-        return plus_theta
-    if result.side == "minus":
-        return minus_theta
+def theta_for_result(result: TrialResult, probe_a_theta: dict[str, float], probe_b_theta: dict[str, float]) -> dict[str, float]:
+    if result.side in LEGACY_PROBE_A:
+        return probe_a_theta
+    if result.side in LEGACY_PROBE_B:
+        return probe_b_theta
     raise ValueError(f"unknown trial side {result.side!r}")
 
 
@@ -1305,6 +1352,7 @@ def retry_best_to_json(retry_best: RetryBest | None) -> dict[str, Any] | None:
             "checkpoint_dir": str(result.checkpoint_dir),
             "metric": metric_to_json(result.metric),
             "score": result.score,
+            "summary_row": result.summary_row,
         },
     }
 
@@ -1323,7 +1371,7 @@ def retry_best_from_json(raw: Any) -> RetryBest | None:
         checkpoint_dir=Path(str(result_raw["checkpoint_dir"])),
         metric=metric,
         score=float(result_raw["score"]),
-        summary_row={},
+        summary_row=dict(result_raw.get("summary_row", {})),
     )
     theta_raw = raw.get("theta")
     if not isinstance(theta_raw, dict):
@@ -1354,32 +1402,46 @@ def theta_change_text(before: dict[str, float], after: dict[str, float], keys: l
     return ";".join(parts)
 
 
-def append_history(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
+def schema_backup_path(path: Path) -> Path:
+    base = path.with_name(path.name + ".old-schema")
+    if not base.exists():
+        return base
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.name}.old-schema{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0:
-        return
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+        if header == fieldnames:
+            return
+        backup = schema_backup_path(path)
+        path.replace(backup)
+        print(f"[log-schema] moved old CSV schema: {path} -> {backup}", flush=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
 
-def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
+def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
+    ensure_csv_header(path, fieldnames)
     with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=ACCEPTED_SUMMARY_FIELDS, extrasaction="ignore")
-        if not exists:
-            writer.writeheader()
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writerow(row)
+
+
+def append_history(path: Path, row: dict[str, Any]) -> None:
+    append_csv_row(path, HISTORY_FIELDS, row)
+
+
+def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
+    append_csv_row(path, ACCEPTED_SUMMARY_FIELDS, row)
 
 
 def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
@@ -1477,6 +1539,7 @@ def main() -> int:
         history_path = runner_dir / "history.csv"
         accepted_summary_path = runner_dir / "accepted-summary-learn.log"
         ensure_csv_header(accepted_summary_path, ACCEPTED_SUMMARY_FIELDS)
+        ensure_csv_header(history_path, HISTORY_FIELDS)
 
         if args.use_worker and not args.dry_run:
             worker = BulletOuWorker(str(args.exe), log_dir / "worker.stdout.log", stream=not args.no_stream_child_output)
@@ -1599,8 +1662,8 @@ def main() -> int:
             theta_before = dict(theta)
             step_scale_used = step_scale
             delta = {key: rng.choice([-1, 1]) for key in keys}
-            plus_theta = make_variant(theta, bounds, delta, +1, step_scale)
-            minus_theta = make_variant(theta, bounds, delta, -1, step_scale)
+            probe_a_theta = make_variant(theta, bounds, delta, +1, step_scale)
+            probe_b_theta = make_variant(theta, bounds, delta, -1, step_scale)
             retry = failed_retries + 1
             tag_base = f"{args.tag_prefix}-i{iteration:03d}-r{retry:02d}"
 
@@ -1625,41 +1688,42 @@ def main() -> int:
                 update_mode=args.update_mode,
             )
 
-            plus = run_trial(
+            probe_a = run_trial(
                 args,
                 accepted_checkpoint,
-                f"{tag_base}-plus",
-                "plus",
-                plus_theta,
+                f"{tag_base}-probe-a",
+                PROBE_A,
+                probe_a_theta,
                 trial_output_folder,
                 log_dir,
                 worker,
             )
-            minus = run_trial(
+            probe_b = run_trial(
                 args,
                 accepted_checkpoint,
-                f"{tag_base}-minus",
-                "minus",
-                minus_theta,
+                f"{tag_base}-probe-b",
+                PROBE_B,
+                probe_b_theta,
                 trial_output_folder,
                 log_dir,
                 worker,
             )
-            candidates = [plus, minus]
-            pair_best = min(candidates, key=lambda item: item.score)
-            pair_best_theta = theta_for_result(pair_best, plus_theta, minus_theta)
-            theta_candidate = pair_best_theta
+            candidates = [probe_a, probe_b]
+            best_probe = min(candidates, key=lambda item: item.score)
+            best_probe_theta = theta_for_result(best_probe, probe_a_theta, probe_b_theta)
+            theta_candidate = best_probe_theta
+            probe_score_diff = probe_a.score - probe_b.score
             spsa_gradient_log: dict[str, float] = {}
             spsa_log_update: dict[str, float] = {}
             if args.update_mode == "spsa":
-                if math.isfinite(plus.score) and math.isfinite(minus.score):
+                if math.isfinite(probe_a.score) and math.isfinite(probe_b.score):
                     update = make_spsa_update(
                         theta,
                         bounds,
                         keys,
                         delta,
-                        plus.score,
-                        minus.score,
+                        probe_a.score,
+                        probe_b.score,
                         step_scale,
                         args.spsa_move_ratio,
                     )
@@ -1668,7 +1732,7 @@ def main() -> int:
                     spsa_log_update = update.log_update
                     max_abs_log_update = max((abs(value) for value in spsa_log_update.values()), default=0.0)
                     print(
-                        f"[theta] mode=spsa score_diff={plus.score - minus.score:+.9f} "
+                        f"[theta] mode=spsa probe_score_diff={probe_score_diff:+.9f} "
                         f"move_ratio={args.spsa_move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
                         flush=True,
                     )
@@ -1676,45 +1740,45 @@ def main() -> int:
                     theta_candidate = dict(theta)
                     print("[theta] mode=spsa skipped because trial scores are not finite", flush=True)
             else:
-                print(f"[theta] mode=winner next={pair_best.side} trial theta", flush=True)
-            best = pair_best
+                print("[theta] mode=winner next=best observed probe theta", flush=True)
+            best = best_probe
             history_retry_best = retry_best
 
-            if pair_best.score < base_score:
+            if best_probe.score < base_score:
                 reason = "improved"
                 theta = theta_candidate
                 if worker is not None and not args.dry_run:
-                    train_theta = worker_trial_theta(pair_best)
+                    train_theta = worker_trial_theta(best_probe)
                     best = worker_adopt_trial(
                         args,
                         worker,
                         accepted_checkpoint,
-                        f"{tag_base}-adopt-{pair_best.side}",
-                        pair_best.side,
+                        f"{tag_base}-advance",
+                        best_probe.side,
                         train_theta,
                         trial_output_folder,
                         log_dir,
                     )
                     safe_rmtree(retry_best_dir, runner_dir)
                 elif not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(pair_best.checkpoint_dir, current_dir, runner_dir)
+                    accepted_checkpoint = move_checkpoint_to_current(best_probe.checkpoint_dir, current_dir, runner_dir)
                     safe_rmtree(retry_best_dir, runner_dir)
                 else:
-                    accepted_checkpoint = pair_best.checkpoint_dir
+                    accepted_checkpoint = best_probe.checkpoint_dir
                 retry_best = None
                 history_retry_best = None
-                base_metric = pair_best.metric
-                base_score = pair_best.score
+                base_metric = best_probe.metric
+                base_score = best_probe.score
                 failed_retries = 0
                 step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
                 accepted_sbs += args.sb_per_trial
             else:
-                if retry_best is None or pair_best.score < retry_best.result.score:
+                if retry_best is None or best_probe.score < retry_best.result.score:
                     if worker is not None and not args.dry_run:
-                        retry_best = RetryBest(pair_best, theta_candidate)
+                        retry_best = RetryBest(best_probe, theta_candidate)
                     else:
                         retry_best = stash_retry_best(
-                            pair_best,
+                            best_probe,
                             theta_candidate,
                             retry_best_dir,
                             runner_dir,
@@ -1723,12 +1787,12 @@ def main() -> int:
                         )
                     history_retry_best = retry_best
                     print(
-                        f"[retry-best] retry={retry} side={pair_best.side} score={pair_best.score:.9f} "
+                        f"[retry-best] retry={retry} score={best_probe.score:.9f} "
                         f"checkpoint={retry_best.result.checkpoint_dir}",
                         flush=True,
                     )
 
-            if pair_best.score >= old_base_score and failed_retries + 1 >= args.max_retries:
+            if best_probe.score >= old_base_score and failed_retries + 1 >= args.max_retries:
                 reason = f"forced_after_{args.max_retries}_retries"
                 if retry_best is None:
                     raise RuntimeError("internal error: retry_best is missing at forced acceptance")
@@ -1741,7 +1805,7 @@ def main() -> int:
                         args,
                         worker,
                         accepted_checkpoint,
-                        f"{tag_base}-forced-adopt-{best.side}",
+                        f"{tag_base}-advance-forced",
                         best.side,
                         train_theta,
                         trial_output_folder,
@@ -1757,7 +1821,7 @@ def main() -> int:
                 failed_retries = 0
                 step_scale = args.min_step_scale
                 accepted_sbs += args.sb_per_trial
-            elif pair_best.score >= old_base_score:
+            elif best_probe.score >= old_base_score:
                 reason = "retry_with_smaller_step"
                 failed_retries += 1
                 step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
@@ -1788,8 +1852,11 @@ def main() -> int:
                         "iteration": iteration,
                         "accepted_sbs": accepted_sbs,
                         "reason": reason,
-                        "accepted": best.side,
+                        "score_before": f"{old_base_score:.9f}",
                         "score": f"{base_score:.9f}",
+                        "probe_a_score": f"{probe_a.score:.9f}",
+                        "probe_b_score": f"{probe_b.score:.9f}",
+                        "probe_score_diff": f"{probe_score_diff:.9f}",
                         "quantized_value_loss": fmt_metric(best.metric.qloss),
                         "quantized_value_accuracy": fmt_metric(best.metric.qacc),
                         "test_value_loss": fmt_metric(best.metric.test_loss),
@@ -1815,10 +1882,11 @@ def main() -> int:
                     "iteration": iteration,
                     "retry": retry,
                     "reason": reason,
-                    "accepted": best.side if reason != "retry_with_smaller_step" else "base",
                     "base_score_before": f"{old_base_score:.9f}",
-                    "plus_score": f"{plus.score:.9f}",
-                    "minus_score": f"{minus.score:.9f}",
+                    "probe_a_score": f"{probe_a.score:.9f}",
+                    "probe_b_score": f"{probe_b.score:.9f}",
+                    "probe_score_diff": f"{probe_score_diff:.9f}",
+                    "best_probe_score": f"{best_probe.score:.9f}",
                     "new_base_score": f"{base_score:.9f}",
                     "new_base_checkpoint": str(accepted_checkpoint),
                     "accepted_sbs": accepted_sbs,
