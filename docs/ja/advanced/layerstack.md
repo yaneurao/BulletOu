@@ -430,7 +430,9 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3の分け方として progress bucket が使われます。必要な進行度情報は、BulletOu が `nn.bin` の一部として出力します。
 
-現在の BulletOu は、手駒量と大駒成りをもとにした固定の進行度パラメーターを使います。このパラメーターは `nn.bin` の Progress section に保存されますが、通常のSFNN重みのように学習で更新されるものではありません。これにより、BulletOu 学習時とやねうら王実行時の progress bucket が一致します。
+BulletOu では、progress の計算パラメーターも学習対象です。学習中は、隣り合う progress bucket を線形補間する soft bucket として扱います。これにより、どちらの progress bucket に寄せるべきかの勾配が progress パラメーターにも流れます。
+
+保存時には、学習された progress パラメーターを q16 整数に丸めて `nn.bin` の Progress section に書き出します。やねうら王側は、その Progress section を読んで hard bucket として使います。
 
 | 指定 | progress buckets |
 |---|---:|
@@ -450,7 +452,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 たとえば `progress8` なら、進行度 `0..255` をほぼ 32 刻みで 8 個に分けます。`progress16` なら 16 刻みです。
 
-`progressN` を使うと、出力される `nn.bin` には進行度計算用のデータも入ります。現状では、このデータは固定パラメーターです。
+`progressN` を使うと、出力される `nn.bin` には進行度計算用のデータも入ります。このデータは学習されたパラメーターです。
 
 | `nn.bin` 内の部分 | 内容 |
 |---|---|

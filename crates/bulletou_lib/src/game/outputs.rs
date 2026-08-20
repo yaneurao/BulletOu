@@ -4,11 +4,7 @@ use bulletformat::{ChessBoard, chess::MarlinFormat};
 
 use crate::shogi::{
     BonaPiece, Color, Hand, PackedSfenValue, Piece, PieceType, ShogiBoard,
-    bona_piece::{
-        E_DRAGON, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE, E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER,
-        E_HORSE, F_DRAGON, F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE, F_HAND_PAWN, F_HAND_ROOK,
-        F_HAND_SILVER, F_HORSE, FE_OLD_END,
-    },
+    bona_piece::FE_OLD_END,
     types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES, Square},
 };
 
@@ -1160,6 +1156,20 @@ impl ShogiSfnnLayerStackBucketKind {
         self.hand_bucket_count() * self.king_bucket_count() * self.progress_bucket_count()
     }
 
+    /// Bucket prefix before multiplying by the progress bucket count.
+    ///
+    /// YaneuraOu composes the final LayerStack index as:
+    ///
+    /// `((hand_bucket * king_bucket_count) + king_bucket) * progress_bucket_count + progress_bucket`.
+    ///
+    /// Trainable progress buckets need this prefix because the progress bucket
+    /// is selected later from the current progress parameters.
+    pub fn hand_king_bucket_from_board(self, board: &ShogiBoard) -> usize {
+        let hand_bucket = self.hand.bucket_from_board(board);
+        let king_bucket = self.king.bucket_from_board(board);
+        hand_bucket * self.king_bucket_count() + king_bucket
+    }
+
     pub fn bucket(self, pos: &PackedSfenValue) -> usize {
         let board = pos.decode();
         self.bucket_from_board(&board)
@@ -1169,28 +1179,25 @@ impl ShogiSfnnLayerStackBucketKind {
     /// the LayerStack index.
     ///
     /// The normal path decodes a full [`ShogiBoard`].  Bucket assignment only
-    /// needs side-to-move, king squares, hand counts, and for BulletOu's
-    /// built-in `progressN` heuristic the number of horses/dragons.  This
-    /// method reads just those pieces of information from the packed Huffman
-    /// stream.  If a future non-material progress model is installed, it falls
-    /// back to the full decode path.
+    /// needs side-to-move, king squares, and hand counts when no explicit
+    /// progress parameters are installed.  If progress parameters are loaded,
+    /// this method falls back to the full decode path so the Progress section
+    /// is applied exactly.
     pub fn bucket_fast(self, pos: &PackedSfenValue) -> usize {
         let (stm, black_king, white_king) = shogi_sfnn_fast_side_and_kings(pos);
         let king_bucket = self.king.bucket_from_perspective(stm, black_king, white_king);
         let progress_count = self.progress.bucket_count();
-        let progress_needs_material = progress_count > 1
-            && SHOGI_SFNN_PROGRESS_Q16_PARAMS.get().is_some()
-            && SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC.get().copied().unwrap_or(false);
+        let progress_has_params = progress_count > 1 && SHOGI_SFNN_PROGRESS_Q16_PARAMS.get().is_some();
         let progress_is_neutral = progress_count > 1 && SHOGI_SFNN_PROGRESS_Q16_PARAMS.get().is_none();
         if self.hand == ShogiSfnnHandBucketKind::None && self.progress == ShogiSfnnProgressBucketKind::None {
             return king_bucket;
         }
-        if progress_count > 1 && !progress_needs_material && !progress_is_neutral {
+        if progress_has_params {
             return self.bucket(pos);
         }
 
-        let parts = if self.hand != ShogiSfnnHandBucketKind::None || progress_needs_material {
-            Some(shogi_sfnn_fast_decode_bucket_parts(pos, progress_needs_material))
+        let parts = if self.hand != ShogiSfnnHandBucketKind::None {
+            Some(shogi_sfnn_fast_decode_bucket_parts(pos))
         } else {
             None
         };
@@ -1202,23 +1209,35 @@ impl ShogiSfnnLayerStackBucketKind {
         } else if progress_is_neutral {
             shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_sum_q16(0), progress_count)
         } else {
-            let parts = parts.expect("material progress parts decoded above");
-            let sum_q16 = shogi_sfnn_material_heuristic_sum_q16_from_parts(
-                parts.black_hand,
-                parts.white_hand,
-                parts.horse_count,
-                parts.dragon_count,
-            );
-            shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16), progress_count)
+            0
         };
         (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
     }
 
     pub fn bucket_from_board(self, board: &ShogiBoard) -> usize {
-        let hand_bucket = self.hand.bucket_from_board(board);
-        let king_bucket = self.king.bucket_from_board(board);
+        let base_bucket = self.hand_king_bucket_from_board(board);
         let progress_bucket = self.progress.bucket_from_board(board);
-        (hand_bucket * self.king_bucket_count() + king_bucket) * self.progress_bucket_count() + progress_bucket
+        base_bucket * self.progress_bucket_count() + progress_bucket
+    }
+
+    pub fn bucket_from_board_with_progress_params(
+        self,
+        board: &ShogiBoard,
+        progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    ) -> usize {
+        let base_bucket = self.hand_king_bucket_from_board(board);
+        let progress_count = self.progress_bucket_count();
+        let progress_bucket = if progress_count <= 1 {
+            0
+        } else if let Some(params) = progress_params {
+            shogi_sfnn_progress_bucket_from_value(
+                shogi_sfnn_progress_0_to_255_from_board_with_params(board, params),
+                progress_count,
+            )
+        } else {
+            shogi_sfnn_progress_bucket_from_value(shogi_sfnn_progress_0_to_255_from_sum_q16(0), progress_count)
+        };
+        base_bucket * progress_count + progress_bucket
     }
 }
 
@@ -1227,8 +1246,6 @@ struct ShogiSfnnFastBucketParts {
     stm: Color,
     black_hand: Hand,
     white_hand: Hand,
-    horse_count: u8,
-    dragon_count: u8,
 }
 
 #[inline]
@@ -1240,30 +1257,18 @@ fn shogi_sfnn_fast_side_and_kings(pos: &PackedSfenValue) -> (Color, Square, Squa
     (stm, black_king, white_king)
 }
 
-fn shogi_sfnn_fast_decode_bucket_parts(
-    pos: &PackedSfenValue,
-    count_material_progress: bool,
-) -> ShogiSfnnFastBucketParts {
+fn shogi_sfnn_fast_decode_bucket_parts(pos: &PackedSfenValue) -> ShogiSfnnFastBucketParts {
     let (stm, black_king, white_king) = shogi_sfnn_fast_side_and_kings(pos);
     let mut stream = ShogiSfnnFastBitReader::new(pos.sfen().as_bytes());
     stream.skip(1);
     stream.skip(7);
     stream.skip(7);
 
-    let mut horse_count = 0u8;
-    let mut dragon_count = 0u8;
     for sq_idx in 0..81u8 {
         if sq_idx == black_king.0 || sq_idx == white_king.0 {
             continue;
         }
-        let piece = stream.decode_board_piece();
-        if count_material_progress {
-            match piece {
-                ShogiSfnnFastBoardPiece::Horse => horse_count = horse_count.saturating_add(1),
-                ShogiSfnnFastBoardPiece::Dragon => dragon_count = dragon_count.saturating_add(1),
-                ShogiSfnnFastBoardPiece::None | ShogiSfnnFastBoardPiece::Other => {}
-            }
-        }
+        stream.decode_board_piece();
     }
 
     let mut black_hand = Hand::EMPTY;
@@ -1281,7 +1286,7 @@ fn shogi_sfnn_fast_decode_bucket_parts(
         }
     }
 
-    ShogiSfnnFastBucketParts { stm, black_hand, white_hand, horse_count, dragon_count }
+    ShogiSfnnFastBucketParts { stm, black_hand, white_hand }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1442,41 +1447,6 @@ impl<'a> ShogiSfnnFastBitReader<'a> {
     }
 }
 
-#[inline]
-fn shogi_sfnn_material_heuristic_sum_q16_from_parts(
-    black_hand: Hand,
-    white_hand: Hand,
-    horse_count: u8,
-    dragon_count: u8,
-) -> i64 {
-    #[inline]
-    fn q16(x: f32) -> i64 {
-        (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i64
-    }
-
-    let mut sum_q16 = q16(-3.0);
-    let hand_point = 0.07_f32;
-    let pawn = q16(hand_point * 1.0);
-    let lance_knight = q16(hand_point * 2.0);
-    let silver_gold = q16(hand_point * 3.0);
-    let bishop_rook = q16(hand_point * 5.0);
-    let horse = q16(0.18);
-    let dragon = q16(0.22);
-
-    sum_q16 += 2 * i64::from(horse_count) * horse;
-    sum_q16 += 2 * i64::from(dragon_count) * dragon;
-    for hand in [black_hand, white_hand] {
-        sum_q16 += 2 * i64::from(hand.pawn()) * pawn;
-        sum_q16 += 2 * i64::from(hand.lance()) * lance_knight;
-        sum_q16 += 2 * i64::from(hand.knight()) * lance_knight;
-        sum_q16 += 2 * i64::from(hand.silver()) * silver_gold;
-        sum_q16 += 2 * i64::from(hand.gold()) * silver_gold;
-        sum_q16 += 2 * i64::from(hand.bishop()) * bishop_rook;
-        sum_q16 += 2 * i64::from(hand.rook()) * bishop_rook;
-    }
-    sum_q16
-}
-
 #[derive(Clone, Copy, Default)]
 pub struct ShogiSfnnLayerStackBucket {
     kind: ShogiSfnnLayerStackBucketKind,
@@ -1524,6 +1494,13 @@ pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 /// `SQ_NB * Eval::fe_end`.
 pub const SHOGI_SFNN_PROGRESS_WEIGHT_COUNT: usize = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
 
+/// Conservative fixed width for active KP-absolute progress features.
+///
+/// Each non-king board or hand piece contributes one feature from Black's king
+/// square and one feature from White's king square.  The reachable maximum is
+/// below this value; the extra margin keeps the training batch layout simple.
+pub const SHOGI_SFNN_PROGRESS_MAX_ACTIVE: usize = 160;
+
 /// Number of scalar progress values used by YaneuraOu SFNN progress buckets.
 pub const SHOGI_SFNN_PROGRESS_VALUE_COUNT: usize = 256;
 
@@ -1549,61 +1526,6 @@ impl ShogiSfnnProgressQ16Params {
         Self { bias_q16: 0, weights_q16: vec![0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT].into_boxed_slice() }
     }
 
-    /// Deterministic built-in progress parameters used by BulletOu when an
-    /// SFNN `progressN` architecture is selected.
-    ///
-    /// This is intentionally not loaded from a user-provided side file. The
-    /// parameters are exported into the `nn.bin` Progress section, so
-    /// YaneuraOu and BulletOu see the same bucket assignment.
-    ///
-    /// The heuristic is deliberately simple: hand material increases progress,
-    /// and promoted major pieces on board add a small amount. Normal board
-    /// pieces are left at zero so the start position maps near the opening
-    /// side of the scale.
-    pub fn material_heuristic() -> Self {
-        fn q16(x: f32) -> i32 {
-            (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
-        }
-
-        fn fill_bp(bp_weights: &mut [i32], start: u16, len: usize, value: i32) {
-            let start = start as usize;
-            let end = start.saturating_add(len).min(bp_weights.len());
-            for weight in &mut bp_weights[start..end] {
-                *weight = value;
-            }
-        }
-
-        let mut bp_weights = vec![0i32; FE_OLD_END];
-        let hand_point = 0.07_f32;
-        for &(f_start, e_start, len, piece_points) in &[
-            (F_HAND_PAWN, E_HAND_PAWN, 18usize, 1.0_f32),
-            (F_HAND_LANCE, E_HAND_LANCE, 4usize, 2.0_f32),
-            (F_HAND_KNIGHT, E_HAND_KNIGHT, 4usize, 2.0_f32),
-            (F_HAND_SILVER, E_HAND_SILVER, 4usize, 3.0_f32),
-            (F_HAND_GOLD, E_HAND_GOLD, 4usize, 3.0_f32),
-            (F_HAND_BISHOP, E_HAND_BISHOP, 2usize, 5.0_f32),
-            (F_HAND_ROOK, E_HAND_ROOK, 2usize, 5.0_f32),
-        ] {
-            let value = q16(hand_point * piece_points);
-            fill_bp(&mut bp_weights, f_start, len, value);
-            fill_bp(&mut bp_weights, e_start, len, value);
-        }
-
-        // Horses and dragons usually imply the game has progressed even if the
-        // captured material is not currently in hand.
-        fill_bp(&mut bp_weights, F_HORSE, 81, q16(0.18));
-        fill_bp(&mut bp_weights, E_HORSE, 81, q16(0.18));
-        fill_bp(&mut bp_weights, F_DRAGON, 81, q16(0.22));
-        fill_bp(&mut bp_weights, E_DRAGON, 81, q16(0.22));
-
-        let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
-        for _sq in 0..81 {
-            weights_q16.extend_from_slice(&bp_weights);
-        }
-
-        Self { bias_q16: q16(-3.0), weights_q16: weights_q16.into_boxed_slice() }
-    }
-
     pub fn new(bias_q16: i32, weights_q16: Vec<i32>) -> Result<Self, String> {
         if weights_q16.len() != SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
             return Err(format!(
@@ -1620,7 +1542,6 @@ static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 static SHOGI_SFNN_PROGRESS_Q16_PARAMS: OnceLock<ShogiSfnnProgressQ16Params> = OnceLock::new();
-static SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC: OnceLock<bool> = OnceLock::new();
 static SHOGI_SFNN_PROGRESS_Q16_THRESHOLDS: OnceLock<[i64; SHOGI_SFNN_PROGRESS_VALUE_COUNT - 1]> = OnceLock::new();
 
 pub fn set_shogi_sfnn_progress_q16_params(params: ShogiSfnnProgressQ16Params) -> Result<(), String> {
@@ -1631,10 +1552,6 @@ pub fn set_shogi_sfnn_progress_q16_params(params: ShogiSfnnProgressQ16Params) ->
         return Err("different SFNN progress q16 parameters are already loaded in this process".to_string());
     }
 
-    let is_material_heuristic = params == ShogiSfnnProgressQ16Params::material_heuristic();
-    SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC
-        .set(is_material_heuristic)
-        .map_err(|_| "SFNN progress q16 parameter kind is already loaded in this process".to_string())?;
     SHOGI_SFNN_PROGRESS_Q16_PARAMS
         .set(params)
         .map_err(|_| "SFNN progress q16 parameters are already loaded in this process".to_string())
@@ -1674,11 +1591,18 @@ fn shogi_sfnn_progress_0_to_255_from_board(board: &ShogiBoard) -> u8 {
     shogi_sfnn_progress_0_to_255_from_sum_q16(shogi_sfnn_progress_sum_q16_from_board(board, params))
 }
 
-fn shogi_sfnn_progress_sum_q16_from_board(board: &ShogiBoard, params: &ShogiSfnnProgressQ16Params) -> i64 {
-    if SHOGI_SFNN_PROGRESS_IS_MATERIAL_HEURISTIC.get().copied().unwrap_or(false) {
-        return shogi_sfnn_material_heuristic_sum_q16_from_board(board);
-    }
+pub fn shogi_sfnn_progress_0_to_255_from_board_with_params(
+    board: &ShogiBoard,
+    params: &ShogiSfnnProgressQ16Params,
+) -> u8 {
+    shogi_sfnn_progress_0_to_255_from_sum_q16(shogi_sfnn_progress_sum_q16_from_board_explicit(board, params))
+}
 
+fn shogi_sfnn_progress_sum_q16_from_board(board: &ShogiBoard, params: &ShogiSfnnProgressQ16Params) -> i64 {
+    shogi_sfnn_progress_sum_q16_from_board_explicit(board, params)
+}
+
+fn shogi_sfnn_progress_sum_q16_from_board_explicit(board: &ShogiBoard, params: &ShogiSfnnProgressQ16Params) -> i64 {
     if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
         return i64::from(params.bias_q16);
     }
@@ -1722,42 +1646,6 @@ fn shogi_sfnn_progress_sum_q16_from_board(board: &ShogiBoard, params: &ShogiSfnn
                 }
             }
         }
-    }
-
-    sum_q16
-}
-
-fn shogi_sfnn_material_heuristic_sum_q16_from_board(board: &ShogiBoard) -> i64 {
-    #[inline]
-    fn q16(x: f32) -> i64 {
-        (x * 65_536.0).round().clamp(i32::MIN as f32, i32::MAX as f32) as i64
-    }
-
-    let mut sum_q16 = q16(-3.0);
-    let hand_point = 0.07_f32;
-    let pawn = q16(hand_point * 1.0);
-    let lance_knight = q16(hand_point * 2.0);
-    let silver_gold = q16(hand_point * 3.0);
-    let bishop_rook = q16(hand_point * 5.0);
-    let horse = q16(0.18);
-    let dragon = q16(0.22);
-
-    for piece in &board.board {
-        match piece.piece_type {
-            PieceType::Horse => sum_q16 += 2 * horse,
-            PieceType::Dragon => sum_q16 += 2 * dragon,
-            _ => {}
-        }
-    }
-
-    for hand in [board.black_hand, board.white_hand] {
-        sum_q16 += 2 * i64::from(hand.pawn()) * pawn;
-        sum_q16 += 2 * i64::from(hand.lance()) * lance_knight;
-        sum_q16 += 2 * i64::from(hand.knight()) * lance_knight;
-        sum_q16 += 2 * i64::from(hand.silver()) * silver_gold;
-        sum_q16 += 2 * i64::from(hand.gold()) * silver_gold;
-        sum_q16 += 2 * i64::from(hand.bishop()) * bishop_rook;
-        sum_q16 += 2 * i64::from(hand.rook()) * bishop_rook;
     }
 
     sum_q16
@@ -1956,6 +1844,14 @@ impl ShogiProgressKPAbs {
     pub fn collect_active_indices(pos: &PackedSfenValue, out: &mut Vec<usize>) {
         out.clear();
         Self::for_each_active_index(pos, |idx| out.push(idx));
+    }
+
+    /// Collects all active KP-absolute feature indices from an already decoded
+    /// board.  This is the feature set used by YaneuraOu's SFNN Progress
+    /// section.
+    pub fn collect_active_indices_from_board(board: &ShogiBoard, out: &mut Vec<usize>) {
+        out.clear();
+        Self::for_each_active_index_from_board(board, |idx| out.push(idx));
     }
 
     /// Loads KP-absolute weights from a binary coefficient file.
@@ -2565,31 +2461,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shogi_sfnn_progress_material_heuristic_shape() {
-        let params = ShogiSfnnProgressQ16Params::material_heuristic();
-        assert_eq!(params.weights_q16.len(), SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
-        assert!(params.bias_q16 < 0);
-        assert!(params.weights_q16.iter().any(|&w| w > 0));
-    }
-
-    #[test]
-    fn test_shogi_sfnn_progress_material_heuristic_fast_sum_matches_weight_sum() {
-        let params = ShogiSfnnProgressQ16Params::material_heuristic();
-        let mut board =
-            ShogiBoard { black_king_sq: Square::new(4, 8), white_king_sq: Square::new(4, 0), ..Default::default() };
-        board.board[Square::new(2, 3).index()] = Piece::new(Color::Black, PieceType::Horse);
-        board.board[Square::new(6, 5).index()] = Piece::new(Color::White, PieceType::Dragon);
-        board.black_hand.set_pawn(3);
-        board.black_hand.set_bishop(1);
-        board.white_hand.set_lance(2);
-        board.white_hand.set_rook(1);
-
-        let generic = shogi_sfnn_progress_sum_q16_from_board(&board, &params);
-        let fast = shogi_sfnn_material_heuristic_sum_q16_from_board(&board);
-        assert_eq!(fast, generic);
-    }
-
-    #[test]
     fn test_shogi_king9_by_king9_bucket_formula() {
         let pos = psv_with_kings(Color::Black, Square::new(4, 2), Square::new(4, 7));
         assert_eq!(ShogiKingRankBucket::<81>.bucket(&pos), 2 * 9 + 1);
@@ -2606,7 +2477,6 @@ mod tests {
 
     #[test]
     fn test_shogi_sfnn_layerstack_bucket_fast_matches_full_decode() {
-        let _ = set_shogi_sfnn_progress_q16_params(ShogiSfnnProgressQ16Params::material_heuristic());
         let positions = [
             psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0)),
             psv_with_kings(Color::White, Square::new(4, 2), Square::new(3, 7)),

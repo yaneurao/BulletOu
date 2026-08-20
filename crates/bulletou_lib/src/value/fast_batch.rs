@@ -43,6 +43,18 @@ pub struct FastBatchHost {
     pub targets: Vec<f32>,
     pub weights: Vec<f32>,
     pub hand_count: Option<Vec<f32>>,
+    pub progress: Option<FastBatchProgressHost>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FastBatchProgressHost {
+    /// Bucket prefix before the progress axis is appended:
+    /// `(hand_bucket * king_bucket_count) + king_bucket`.
+    pub base_buckets: Vec<i32>,
+    /// Fixed-width active KP-absolute feature indices for YaneuraOu-compatible
+    /// SFNN Progress parameters.  Missing entries are `-1`.
+    pub active_indices: Vec<i32>,
+    pub max_active: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +137,29 @@ impl FastBatchHost {
             return Err(
                 format!("weights length mismatch: got {}, expected {}", self.weights.len(), layout.batch_size,),
             );
+        }
+        if let Some(progress) = &self.progress {
+            if progress.base_buckets.len() != layout.batch_size {
+                return Err(format!(
+                    "progress base_buckets length mismatch: got {}, expected {}",
+                    progress.base_buckets.len(),
+                    layout.batch_size
+                ));
+            }
+            if progress.max_active == 0 {
+                return Err("progress max_active must be greater than zero".to_string());
+            }
+            let expected = layout
+                .batch_size
+                .checked_mul(progress.max_active)
+                .ok_or_else(|| "progress active_indices length overflow".to_string())?;
+            if progress.active_indices.len() != expected {
+                return Err(format!(
+                    "progress active_indices length mismatch: got {}, expected {}",
+                    progress.active_indices.len(),
+                    expected
+                ));
+            }
         }
         match (&self.hand_count, layout.hand_count_dim) {
             (Some(hand_count), dim) if dim > 0 && hand_count.len() != layout.hand_count_len() => Err(format!(
@@ -346,6 +381,7 @@ where
             targets: prepared.targets,
             weights: prepared.weights,
             hand_count: prepared.hand_count,
+            progress: None,
         }
     }
 }
@@ -374,6 +410,7 @@ mod tests {
             targets: vec![0.0; layout.target_len()],
             weights: vec![1.0; layout.batch_size],
             hand_count: None,
+            progress: None,
         };
 
         assert!(batch.validate().is_ok());
@@ -390,6 +427,7 @@ mod tests {
             targets: vec![0.0; layout.target_len()],
             weights: vec![1.0; layout.batch_size],
             hand_count: None,
+            progress: None,
         };
 
         let err = batch.validate().unwrap_err();
@@ -407,6 +445,7 @@ mod tests {
             targets: vec![0.25, 0.75],
             weights: vec![1.0, 0.5],
             hand_count: Some(vec![0.0, 1.0, 2.0, 3.0]),
+            progress: None,
         };
 
         let prepared = batch.clone().into_prepared_batch_host();
@@ -425,6 +464,7 @@ mod tests {
             targets: vec![0.0; layout.target_len()],
             weights: vec![1.0; layout.batch_size],
             hand_count: None,
+            progress: None,
         };
 
         assert_eq!(batch.stm_sample(0), Some([1, 2, -1].as_slice()));
@@ -451,6 +491,7 @@ mod tests {
             targets: vec![0.25],
             weights: vec![1.0],
             hand_count: None,
+            progress: None,
         };
         let mut prepared = batch.clone().into_prepared_batch_host();
         let (_, TValue::F32(targets)) =

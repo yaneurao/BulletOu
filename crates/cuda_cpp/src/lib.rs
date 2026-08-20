@@ -2410,6 +2410,54 @@ pub fn scalar_loss_host(
     Ok(ScalarLossReadback { per_sample, mean_output_gradients, weighted_sum: weighted_sum[0], mean: mean[0] })
 }
 
+fn scalar_loss_rust(
+    kind: ScalarLossKind,
+    output_inv_scale: f32,
+    outputs: &[f32],
+    targets: &[f32],
+    entry_weights: &[f32],
+) -> Result<ScalarLossReadback> {
+    let batch_size = outputs.len();
+    if batch_size == 0 {
+        return Err(CudaCppError::message("scalar loss host batch must not be empty"));
+    }
+    expect_len("loss host targets", batch_size, targets.len())?;
+    expect_len("loss host entry_weights", batch_size, entry_weights.len())?;
+    let mut per_sample = vec![0.0; batch_size];
+    let mut mean_output_gradients = vec![0.0; batch_size];
+    let mut weighted_sum = 0.0_f32;
+    for i in 0..batch_size {
+        let target = targets[i];
+        let weight = entry_weights[i];
+        let output = outputs[i];
+        let (prediction, prediction_gradient, pow_exp) = match kind {
+            ScalarLossKind::SigmoidPow { pow_exp } => {
+                let prediction = 1.0 / (1.0 + (-(output * output_inv_scale)).exp());
+                (prediction, prediction * (1.0 - prediction) * output_inv_scale, pow_exp)
+            }
+            ScalarLossKind::WinRateModel { pow_exp, in_offset_over_scaling } => {
+                let score_scaled = output * output_inv_scale;
+                let q = 1.0 / (1.0 + (-(score_scaled - in_offset_over_scaling)).exp());
+                let qm = 1.0 / (1.0 + (-(-score_scaled - in_offset_over_scaling)).exp());
+                let prediction = (1.0 + q - qm) * 0.5;
+                let prediction_gradient = 0.5 * output_inv_scale * (q * (1.0 - q) + qm * (1.0 - qm));
+                (prediction, prediction_gradient, pow_exp)
+            }
+        };
+        let error = prediction - target;
+        let abs_error = error.abs();
+        let loss = abs_error.powf(pow_exp);
+        let loss_gradient =
+            if abs_error == 0.0 { 0.0 } else { pow_exp * error.signum() * abs_error.powf(pow_exp - 1.0) };
+        let gradient = loss_gradient * prediction_gradient;
+        let weighted = weight * loss;
+        per_sample[i] = weighted;
+        mean_output_gradients[i] = weight * gradient / batch_size as f32;
+        weighted_sum += weighted;
+    }
+    Ok(ScalarLossReadback { per_sample, mean_output_gradients, weighted_sum, mean: weighted_sum / batch_size as f32 })
+}
+
 pub fn scalar_loss_device(
     ctx: &Context,
     kind: ScalarLossKind,
@@ -5752,6 +5800,64 @@ pub struct SfnnTrainStepHostBatch<'a> {
     pub max_active: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SfnnSoftProgressTrainStepHostBatch<'a> {
+    pub stm_indices: &'a [i32],
+    pub nstm_indices: &'a [i32],
+    pub buckets_a: &'a [i32],
+    pub buckets_b: &'a [i32],
+    pub interpolation: &'a [f32],
+    pub targets: &'a [f32],
+    pub entry_weights: &'a [f32],
+    pub batch_size: usize,
+    pub max_active: usize,
+}
+
+impl<'a> SfnnSoftProgressTrainStepHostBatch<'a> {
+    fn batch_a(self) -> SfnnTrainStepHostBatch<'a> {
+        SfnnTrainStepHostBatch {
+            stm_indices: self.stm_indices,
+            nstm_indices: self.nstm_indices,
+            buckets: self.buckets_a,
+            targets: self.targets,
+            entry_weights: self.entry_weights,
+            batch_size: self.batch_size,
+            max_active: self.max_active,
+        }
+    }
+
+    fn batch_b(self) -> SfnnTrainStepHostBatch<'a> {
+        SfnnTrainStepHostBatch {
+            stm_indices: self.stm_indices,
+            nstm_indices: self.nstm_indices,
+            buckets: self.buckets_b,
+            targets: self.targets,
+            entry_weights: self.entry_weights,
+            batch_size: self.batch_size,
+            max_active: self.max_active,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        self.batch_a().validate()?;
+        self.batch_b().validate()?;
+        expect_len("sfnn soft-progress interpolation", self.batch_size, self.interpolation.len())?;
+        for &value in self.interpolation {
+            if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+                return Err(CudaCppError::message("SFNN soft-progress interpolation must be finite and in [0, 1]"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SfnnSoftProgressStepReadback {
+    pub loss: ScalarLossReadback,
+    /// d(loss) / d(interpolation) for each sample.
+    pub interpolation_gradients: Vec<f32>,
+}
+
 impl<'a> SfnnTrainStepHostBatch<'a> {
     fn forward_batch(self) -> SfnnForwardHostBatch<'a> {
         SfnnForwardHostBatch {
@@ -5913,6 +6019,8 @@ pub struct SfnnTrainStepRunner {
     pub backward_workspace: SfnnBackwardWorkspace,
     pub upload_slots: Vec<SfnnTrainStepUploadSlot>,
     pub next_upload_slot: usize,
+    soft_progress_device_batch: Option<SfnnForwardDeviceBatch>,
+    soft_progress_forward_workspace: Option<SfnnForwardWorkspace>,
 }
 
 #[derive(Debug)]
@@ -6159,6 +6267,8 @@ impl SfnnTrainStepRunner {
             backward_workspace,
             upload_slots,
             next_upload_slot: 0,
+            soft_progress_device_batch: None,
+            soft_progress_forward_workspace: None,
         })
     }
 
@@ -6274,6 +6384,154 @@ impl SfnnTrainStepRunner {
         self.factorizer = factorizer;
         self.factorizer_alpha = factorizer_alpha;
         Ok(())
+    }
+
+    fn ensure_soft_progress_buffers(&mut self, ctx: &Context) -> Result<()> {
+        if self.soft_progress_device_batch.is_none() {
+            let sparse_len = self
+                .batch_size
+                .checked_mul(self.max_active)
+                .ok_or_else(|| CudaCppError::message("SFNN soft-progress sparse length overflow"))?;
+            self.soft_progress_device_batch = Some(SfnnForwardDeviceBatch {
+                batch_size: self.batch_size,
+                max_active: self.max_active,
+                stm_indices: I32Buffer::new(ctx, sparse_len)?,
+                nstm_indices: I32Buffer::new(ctx, sparse_len)?,
+                buckets: I32Buffer::new(ctx, self.batch_size)?,
+            });
+        }
+        if self.soft_progress_forward_workspace.is_none() {
+            self.soft_progress_forward_workspace =
+                Some(SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(self.shape, self.batch_size))?);
+        }
+        Ok(())
+    }
+
+    pub fn step_soft_progress_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+        &mut self,
+        ctx: &Context,
+        params: RangerUpdateParams,
+        loss_kind: ScalarLossKind,
+        output_inv_scale: f32,
+        batch: SfnnSoftProgressTrainStepHostBatch<'_>,
+        update_weights: bool,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_buckets: Option<&[i32]>,
+    ) -> Result<SfnnSoftProgressStepReadback> {
+        self.validate()?;
+        lr_multipliers.validate()?;
+        batch.validate()?;
+        if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
+            return Err(CudaCppError::message(format!(
+                "SFNN soft-progress train-step batch layout mismatch: got batch_size={} max_active={}, expected batch_size={} max_active={}",
+                batch.batch_size, batch.max_active, self.batch_size, self.max_active
+            )));
+        }
+        self.ensure_soft_progress_buffers(ctx)?;
+
+        self.device_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+        self.device_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+        self.device_batch.buckets.upload(ctx, batch.buckets_a)?;
+        self.targets.upload(ctx, batch.targets)?;
+        self.entry_weights.upload(ctx, batch.entry_weights)?;
+        {
+            let soft_batch =
+                self.soft_progress_device_batch.as_ref().expect("soft progress device batch allocated above");
+            soft_batch.stm_indices.upload(ctx, batch.stm_indices)?;
+            soft_batch.nstm_indices.upload(ctx, batch.nstm_indices)?;
+            soft_batch.buckets.upload(ctx, batch.buckets_b)?;
+        }
+
+        sfnn_forward_train_device_with_factorizer(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            self.factorizer,
+            self.factorizer_alpha,
+            &self.backward_workspace.l0w_gradients,
+            self.factorizer_axis_confidences(),
+        )?;
+        {
+            let soft_batch =
+                self.soft_progress_device_batch.as_ref().expect("soft progress device batch allocated above");
+            let soft_forward =
+                self.soft_progress_forward_workspace.as_ref().expect("soft progress forward workspace allocated above");
+            sfnn_forward_train_device_with_factorizer(
+                ctx,
+                soft_batch,
+                &self.weights,
+                soft_forward,
+                self.factorizer,
+                self.factorizer_alpha,
+                &self.backward_workspace.l0w_gradients,
+                self.factorizer_axis_confidences(),
+            )?;
+        }
+
+        let outputs_a = self.forward_workspace.download_output(ctx)?;
+        let outputs_b = self
+            .soft_progress_forward_workspace
+            .as_ref()
+            .expect("soft progress forward workspace allocated above")
+            .download_output(ctx)?;
+        let mut mixed_outputs = vec![0.0_f32; self.batch_size];
+        for i in 0..self.batch_size {
+            let t = batch.interpolation[i];
+            mixed_outputs[i] = outputs_a[i].mul_add(1.0 - t, outputs_b[i] * t);
+        }
+        let loss = scalar_loss_rust(loss_kind, output_inv_scale, &mixed_outputs, batch.targets, batch.entry_weights)?;
+        self.loss_workspace.per_sample.upload(ctx, &loss.per_sample)?;
+        self.loss_workspace.weighted_sum.upload(ctx, &[loss.weighted_sum])?;
+        self.loss_workspace.mean.upload(ctx, &[loss.mean])?;
+
+        let mut grad_a = vec![0.0_f32; self.batch_size];
+        let mut grad_b = vec![0.0_f32; self.batch_size];
+        let mut interpolation_gradients = vec![0.0_f32; self.batch_size];
+        for i in 0..self.batch_size {
+            let t = batch.interpolation[i];
+            let grad = loss.mean_output_gradients[i];
+            grad_a[i] = grad * (1.0 - t);
+            grad_b[i] = grad * t;
+            interpolation_gradients[i] = grad * (outputs_b[i] - outputs_a[i]);
+        }
+
+        self.loss_workspace.mean_output_gradients.upload(ctx, &grad_a)?;
+        sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
+            ctx,
+            &self.device_batch,
+            &self.weights,
+            &self.forward_workspace,
+            &self.loss_workspace,
+            &self.backward_workspace,
+            self.factorizer,
+            self.factorizer_alpha,
+            self.factorizer_axis_confidences(),
+        )?;
+
+        self.loss_workspace.mean_output_gradients.upload(ctx, &grad_b)?;
+        {
+            let soft_batch =
+                self.soft_progress_device_batch.as_ref().expect("soft progress device batch allocated above");
+            let soft_forward =
+                self.soft_progress_forward_workspace.as_ref().expect("soft progress forward workspace allocated above");
+            sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
+                ctx,
+                soft_batch,
+                &self.weights,
+                soft_forward,
+                &self.loss_workspace,
+                &self.backward_workspace,
+                self.factorizer,
+                self.factorizer_alpha,
+                self.factorizer_axis_confidences(),
+            )?;
+        }
+
+        if update_weights {
+            self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
+        }
+        Ok(SfnnSoftProgressStepReadback { loss, interpolation_gradients })
     }
 
     pub fn step(

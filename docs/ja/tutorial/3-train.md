@@ -101,7 +101,7 @@ count による confidence は、指定しなければ無効です。factorizer 
 
 residual / axis / pair の confidence は、同じ `count.bin` を使います。詳しい作り方と式は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
-`progress4` など `progressN` を含む architecture の `count.bin` を作る場合は、進行度bucketを決めるために同じ architecture の `nn.bin` も指定します。
+`progress4` など `progressN` を含む architecture では、進行度を計算するパラメーターも学習され、`nn.bin` の Progress section に保存されます。`count.bin` を作る場合は、進行度bucketを決めるために同じ architecture の `nn.bin` も指定します。
 
 巨大な教師フォルダ全体から `count.bin` を作る場合、`bucket-count` は固定長の `.psv` / `.bin` をまとめ読みしながら count します。Dドライブなどで読み込み速度が波打つ場合は、応用編の説明を見て `--buffer-mb` と `--read-buffers` を調整してください。
 

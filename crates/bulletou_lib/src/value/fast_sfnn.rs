@@ -712,6 +712,7 @@ mod tests {
             targets: vec![0.0; layout.target_len()],
             weights: vec![1.0; layout.batch_size],
             hand_count: None,
+            progress: None,
         }
     }
 

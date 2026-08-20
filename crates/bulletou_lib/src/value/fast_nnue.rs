@@ -353,6 +353,7 @@ mod tests {
             targets: vec![0.0],
             weights: vec![1.0],
             hand_count: None,
+            progress: None,
         };
 
         let outputs = weights.forward_batch(&batch).unwrap();
@@ -373,6 +374,7 @@ mod tests {
             targets: vec![0.0],
             weights: vec![1.0],
             hand_count: None,
+            progress: None,
         };
 
         let trace = weights.forward_batch_trace(&batch).unwrap();
@@ -409,6 +411,7 @@ mod tests {
             targets: vec![0.0],
             weights: vec![1.0],
             hand_count: None,
+            progress: None,
         };
 
         let borrowed_outputs = borrowed.forward_batch(&batch).unwrap();
@@ -460,6 +463,7 @@ mod tests {
             targets: vec![0.0, 0.0],
             weights: vec![1.0, 1.0],
             hand_count: None,
+            progress: None,
         };
         let cpu = weights.forward_batch(&batch).unwrap();
 

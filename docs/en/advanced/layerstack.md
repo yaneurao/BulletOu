@@ -407,7 +407,9 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`.
 
-Current BulletOu uses deterministic material-progress parameters based on hand material and promoted major pieces. These parameters are stored in the Progress section of `nn.bin`, but they are not updated by SFNN training like ordinary network weights. This keeps BulletOu training and YaneuraOu inference on the same progress bucket assignment.
+BulletOu trains the progress calculation parameters together with the SFNN weights. During training, progress is handled as a soft bucket: the output is linearly interpolated between two neighboring progress buckets, so the loss can send gradients into the progress parameters.
+
+When exporting, BulletOu rounds the learned progress parameters to q16 integers and writes them into the Progress section of `nn.bin`. YaneuraOu then reads that section and uses hard progress buckets during search.
 
 | Token | Progress buckets |
 |---|---:|
@@ -427,7 +429,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 For example, `progress8` splits `0..255` into roughly 32-point ranges. `progress16` uses roughly 16-point ranges.
 
-When `progressN` is used, the exported `nn.bin` includes a Progress section. In the current implementation, this section stores fixed parameters.
+When `progressN` is used, the exported `nn.bin` includes a Progress section. This section stores the learned progress parameters.
 
 | Section | Contents |
 |---|---|

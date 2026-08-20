@@ -17,12 +17,15 @@ use crate::{
             ShogiHalfKa2, SparseInputType, fill_halfka2_feature_indices_from_board, fill_halfkp_feature_indices,
             fill_ka2_feature_indices_from_board, fill_kp_feature_indices,
         },
-        outputs::{ShogiSfnnLayerStackBucket, ShogiSfnnLayerStackBucketKind},
+        outputs::{
+            SHOGI_SFNN_PROGRESS_MAX_ACTIVE, ShogiProgressKPAbs, ShogiSfnnLayerStackBucket,
+            ShogiSfnnLayerStackBucketKind,
+        },
     },
     shogi::{PackedSfenValue, ShogiBoard},
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
     value::{
-        FastBatchHost, FastBatchLayout, NoOutputBuckets,
+        FastBatchHost, FastBatchLayout, FastBatchProgressHost, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
             ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
@@ -1552,6 +1555,7 @@ fn prepare_halfkp_direct_fast_batch(
         targets: vec![0.0; batch_size],
         weights: vec![0.0; batch_size],
         hand_count: None,
+        progress: None,
     };
 
     let chunk_size = batch_size.div_ceil(threads.max(1));
@@ -1645,6 +1649,7 @@ fn prepare_kp_direct_fast_batch(
         targets: vec![0.0; batch_size],
         weights: vec![0.0; batch_size],
         hand_count: None,
+        progress: None,
     };
 
     let chunk_size = batch_size.div_ceil(threads.max(1));
@@ -2716,6 +2721,8 @@ fn prepare_sfnn_fast_batch_from_board_features(
 ) -> FastBatchHost {
     let batch_size = data.len();
     let sparse_len = max_active * batch_size;
+    let progress_bucket_count = config.layerstack_bucket.progress_bucket_count();
+    let progress_enabled = progress_bucket_count > 1;
     let mut batch = FastBatchHost {
         layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
         stm: vec![-1; sparse_len],
@@ -2724,6 +2731,11 @@ fn prepare_sfnn_fast_batch_from_board_features(
         targets: vec![0.0; batch_size],
         weights: vec![0.0; batch_size],
         hand_count: None,
+        progress: progress_enabled.then(|| FastBatchProgressHost {
+            base_buckets: vec![0; batch_size],
+            active_indices: vec![-1; batch_size * SHOGI_SFNN_PROGRESS_MAX_ACTIVE],
+            max_active: SHOGI_SFNN_PROGRESS_MAX_ACTIVE,
+        }),
     };
     let threads = config.threads.max(1);
     let chunk_size = batch_size.div_ceil(threads).max(1);
@@ -2739,7 +2751,10 @@ fn prepare_sfnn_fast_batch_from_board_features(
                       nstm_chunk: &mut [i32],
                       buckets_chunk: &mut [i32],
                       targets_chunk: &mut [f32],
-                      weights_chunk: &mut [f32]| {
+                      weights_chunk: &mut [f32],
+                      mut progress_base_chunk: Option<&mut [i32]>,
+                      mut progress_active_chunk: Option<&mut [i32]>| {
+        let mut progress_indices = Vec::<usize>::with_capacity(SHOGI_SFNN_PROGRESS_MAX_ACTIVE);
         for (i, pos) in data_chunk.iter().enumerate() {
             let board = pos.decode();
             let sparse_offset = max_active * i;
@@ -2765,7 +2780,36 @@ fn prepare_sfnn_fast_batch_from_board_features(
                 );
             }
 
-            buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
+            if progress_enabled {
+                let base_bucket = layerstack_bucket.hand_king_bucket_from_board(&board);
+                if let Some(base_chunk) = progress_base_chunk.as_deref_mut() {
+                    base_chunk[i] = base_bucket as i32;
+                }
+                if let Some(active_chunk) = progress_active_chunk.as_deref_mut() {
+                    let progress_offset = SHOGI_SFNN_PROGRESS_MAX_ACTIVE * i;
+                    let progress_slice =
+                        &mut active_chunk[progress_offset..progress_offset + SHOGI_SFNN_PROGRESS_MAX_ACTIVE];
+                    progress_slice.fill(-1);
+                    ShogiProgressKPAbs::collect_active_indices_from_board(&board, &mut progress_indices);
+                    assert!(
+                        progress_indices.len() <= SHOGI_SFNN_PROGRESS_MAX_ACTIVE,
+                        "SFNN/{input_label} progress active feature count {} exceeded max_active {}",
+                        progress_indices.len(),
+                        SHOGI_SFNN_PROGRESS_MAX_ACTIVE
+                    );
+                    for (dst, &idx) in progress_slice.iter_mut().zip(progress_indices.iter()) {
+                        *dst = idx as i32;
+                    }
+                    progress_indices.clear();
+                }
+                // Existing hard-bucket field is retained for consumers that do
+                // not use trainable progress.  With no process-global progress
+                // parameters installed this maps to the neutral progress
+                // bucket; trainable progress code uses `progress` above.
+                buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
+            } else {
+                buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
+            }
             let mut weight = 1.0;
             if let Some(cap) = config.score_drop_abs {
                 if pos.score().unsigned_abs() >= cap {
@@ -2789,7 +2833,8 @@ fn prepare_sfnn_fast_batch_from_board_features(
         let _ = chunk_index;
     };
 
-    if let Some(pool) = pool
+    if !progress_enabled
+        && let Some(pool) = pool
         && threads > 1
         && batch_size > 1
     {
@@ -2812,6 +2857,49 @@ fn prepare_sfnn_fast_batch_from_board_features(
                             buckets_chunk,
                             targets_chunk,
                             weights_chunk,
+                            None,
+                            None,
+                        );
+                    },
+                );
+        });
+    } else if let Some(progress) = batch.progress.as_mut()
+        && threads > 1
+        && batch_size > 1
+    {
+        let progress_chunk_size = SHOGI_SFNN_PROGRESS_MAX_ACTIVE * chunk_size;
+        let Some(pool) = pool else {
+            unreachable!("parallel progress branch requires a rayon pool");
+        };
+        pool.install(|| {
+            data.par_chunks(chunk_size)
+                .enumerate()
+                .zip(batch.stm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.nstm.par_chunks_mut(sparse_chunk_size))
+                .zip(batch.buckets.par_chunks_mut(chunk_size))
+                .zip(batch.targets.par_chunks_mut(chunk_size))
+                .zip(batch.weights.par_chunks_mut(chunk_size))
+                .zip(progress.base_buckets.par_chunks_mut(chunk_size))
+                .zip(progress.active_indices.par_chunks_mut(progress_chunk_size))
+                .for_each(
+                    |(
+                        (
+                            (((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), targets_chunk), weights_chunk),
+                            progress_base_chunk,
+                        ),
+                        progress_active_chunk,
+                    )| {
+                        let (chunk_index, data_chunk) = data_chunk;
+                        fill_chunk(
+                            chunk_index,
+                            data_chunk,
+                            stm_chunk,
+                            nstm_chunk,
+                            buckets_chunk,
+                            targets_chunk,
+                            weights_chunk,
+                            Some(progress_base_chunk),
+                            Some(progress_active_chunk),
                         );
                     },
                 );
@@ -2822,15 +2910,37 @@ fn prepare_sfnn_fast_batch_from_board_features(
             let sparse_start = start * max_active;
             let sparse_end = sparse_start + data_chunk.len() * max_active;
             let end = start + data_chunk.len();
-            fill_chunk(
-                chunk_index,
-                data_chunk,
-                &mut batch.stm[sparse_start..sparse_end],
-                &mut batch.nstm[sparse_start..sparse_end],
-                &mut batch.buckets[start..end],
-                &mut batch.targets[start..end],
-                &mut batch.weights[start..end],
-            );
+            if let Some(progress) = batch.progress.as_mut() {
+                let progress_base = &mut progress.base_buckets[start..end];
+                let progress_active = {
+                    let progress_start = start * SHOGI_SFNN_PROGRESS_MAX_ACTIVE;
+                    let progress_end = end * SHOGI_SFNN_PROGRESS_MAX_ACTIVE;
+                    &mut progress.active_indices[progress_start..progress_end]
+                };
+                fill_chunk(
+                    chunk_index,
+                    data_chunk,
+                    &mut batch.stm[sparse_start..sparse_end],
+                    &mut batch.nstm[sparse_start..sparse_end],
+                    &mut batch.buckets[start..end],
+                    &mut batch.targets[start..end],
+                    &mut batch.weights[start..end],
+                    Some(progress_base),
+                    Some(progress_active),
+                );
+            } else {
+                fill_chunk(
+                    chunk_index,
+                    data_chunk,
+                    &mut batch.stm[sparse_start..sparse_end],
+                    &mut batch.nstm[sparse_start..sparse_end],
+                    &mut batch.buckets[start..end],
+                    &mut batch.targets[start..end],
+                    &mut batch.weights[start..end],
+                    None,
+                    None,
+                );
+            }
         }
     }
 
