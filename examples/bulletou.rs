@@ -9300,6 +9300,12 @@ struct WorkerSfnnTrialOutcome {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+struct WorkerSfnnHostSnapshot {
+    weights: bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    optimizer_states: bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnSession {
     args: Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -9456,6 +9462,35 @@ impl WorkerSfnnSession {
         Ok(())
     }
 
+    fn snapshot_host(&mut self) -> Result<WorkerSfnnHostSnapshot, String> {
+        self.ctx.synchronize().map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
+        let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
+        eprintln!(
+            "  worker snapshot = host RAM: weights + optimizer state readback {}",
+            format_duration_secs(started.elapsed())
+        );
+        Ok(WorkerSfnnHostSnapshot { weights, optimizer_states })
+    }
+
+    fn restore_host_snapshot(&mut self, args: &Args, snapshot: &WorkerSfnnHostSnapshot) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        self.runner = bulletou_cuda_cpp::SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
+            &self.ctx,
+            cuda_cpp_sfnn_weights_readback_as_host(self.shape, &snapshot.weights),
+            cuda_cpp_sfnn_optimizer_readback_as_host(&snapshot.optimizer_states),
+            self.batch_size,
+            self.feature_kind.max_active(),
+            cuda_cpp_sfnn_factorizer_active(args),
+            cuda_cpp_sfnn_factorizer_alpha(args),
+        )
+        .map_err(|e| e.to_string())?;
+        self.apply_args_to_runner(args)?;
+        eprintln!("  worker restore = host RAM -> GPU: {}", format_duration_secs(started.elapsed()));
+        Ok(())
+    }
+
     fn run_quantized_validation(&mut self, args: &Args) -> Result<Option<TestMetrics>, String> {
         if !cuda_cpp_should_schedule_quantized_validation(args) {
             return Ok(None);
@@ -9511,7 +9546,7 @@ impl WorkerSfnnSession {
         let snapshot = if keep {
             None
         } else {
-            Some(self.runner.snapshot_device(&self.ctx).map_err(|e| e.to_string())?)
+            Some(self.snapshot_host()?)
         };
         let base_args = self.args.clone();
         let base_dataloader_pos = self.dataloader_pos;
@@ -9748,8 +9783,7 @@ impl WorkerSfnnSession {
             self.dataloader_pos = Some(dataloader_pos);
             self.args = trial_args;
         } else if let Some(snapshot) = snapshot.as_ref() {
-            self.runner.copy_state_from_device(&self.ctx, snapshot).map_err(|e| e.to_string())?;
-            self.apply_args_to_runner(&base_args)?;
+            self.restore_host_snapshot(&base_args, snapshot)?;
             self.args = base_args;
             self.dataloader_pos = base_dataloader_pos;
         }
