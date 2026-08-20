@@ -1122,7 +1122,7 @@ def trial_start_line(
 ) -> None:
     event_line(
         args,
-        "TRIAL",
+        "TRIAL START",
         (
             f"trial {trial_number} start  {probe_label(side)}  tag={tag}  "
             f"{accept_threshold_text(args, base_score, base_metric)}"
@@ -1147,7 +1147,7 @@ def trial_threshold_line(args: argparse.Namespace, trial: TrialResult, base_scor
     color = "green" if beats_target else "yellow"
     event_line(
         args,
-        "TRIAL",
+        "TRIAL END",
         (
             f"{probe_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
             f"qacc={fmt_metric(trial.metric.qacc)} result={status}"
