@@ -1066,6 +1066,27 @@ def event_line(args: argparse.Namespace, label: str, message: str, color: str, *
     print(f"{color_text(args, f'[{label}]', color, bold=bold)} {message}", flush=True)
 
 
+def objective_label(metric_name: str) -> str:
+    if metric_name == "quantized_value_loss":
+        return "qloss"
+    if metric_name == "test_value_loss":
+        return "test_loss"
+    return metric_name
+
+
+def accept_threshold_text(args: argparse.Namespace, base_score: float, base_metric: Metric) -> str:
+    label = objective_label(args.metric)
+    text = f"accept_if {label} < {base_score:.9f}"
+    if args.metric != "quantized_value_loss":
+        text += f"  base_qloss={fmt_metric(base_metric.qloss)}"
+    text += (
+        f"  base_qacc={fmt_metric(base_metric.qacc)}"
+        f"  base_test_loss={fmt_metric(base_metric.test_loss)}"
+        f"  base_test_acc={fmt_metric(base_metric.test_acc)}"
+    )
+    return text
+
+
 def next_save_sbs(args: argparse.Namespace, accepted_sbs: int) -> int | None:
     if args.accepted_save_rate_sbs <= 0:
         return None
@@ -1189,7 +1210,7 @@ def worker_adopt_trial(
         "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
     }
     print(
-        f"[advance-done] tag={tag} score={score:.9f} "
+        f"[advance-done] tag={tag} {objective_label(args.metric)}={score:.9f} "
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
         flush=True,
     )
@@ -1301,7 +1322,7 @@ def run_trial(
             "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
         }
         print(
-            f"[done] {probe_label(side)} tag={tag} score={score:.9f} "
+            f"[done] {probe_label(side)} tag={tag} {objective_label(args.metric)}={score:.9f} "
             f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
             flush=True,
         )
@@ -1323,7 +1344,7 @@ def run_trial(
     if not (next_checkpoint / "dataloader_pos.txt").exists():
         raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
     print(
-        f"[done] {probe_label(side)} tag={tag} score={score:.9f} "
+        f"[done] {probe_label(side)} tag={tag} {objective_label(args.metric)}={score:.9f} "
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} elapsed={elapsed:.1f}s",
         flush=True,
     )
@@ -1786,12 +1807,15 @@ def main() -> int:
         if not (accepted_checkpoint / "dataloader_pos.txt").exists():
             raise FileNotFoundError(f"{accepted_checkpoint / 'dataloader_pos.txt'} does not exist")
 
-        print(
-            f"[base] checkpoint={accepted_checkpoint} score={base_score:.9f} "
-            f"qloss={fmt_metric(base_metric.qloss)} qacc={fmt_metric(base_metric.qacc)} "
-            f"test_loss={fmt_metric(base_metric.test_loss)} test_acc={fmt_metric(base_metric.test_acc)} "
-            f"source={base_source}",
-            flush=True,
+        event_line(
+            args,
+            "BASE",
+            (
+                f"{accept_threshold_text(args, base_score, base_metric)} "
+                f"checkpoint={accepted_checkpoint} source={base_source}"
+            ),
+            "cyan",
+            bold=True,
         )
 
         if worker is not None and not args.dry_run:
@@ -1816,10 +1840,16 @@ def main() -> int:
             probe_b_theta = make_variant(theta, bounds, delta, -1, step_scale)
             tag_base = f"{args.tag_prefix}-i{iteration:03d}-r{retry:02d}"
 
-            print(
-                f"[iter] {iteration}/{args.iterations} base_score={base_score:.9f} "
-                f"step_scale={step_scale:.4f} failed_retries={failed_retries}",
-                flush=True,
+            event_line(
+                args,
+                "TARGET",
+                (
+                    f"iteration={iteration}/{args.iterations} retry={retry} "
+                    f"{accept_threshold_text(args, base_score, base_metric)} "
+                    f"step_scale={step_scale:.4f} failed_retries={failed_retries}"
+                ),
+                "cyan",
+                bold=True,
             )
             write_runner_state(
                 state_path,
@@ -1881,7 +1911,7 @@ def main() -> int:
                     spsa_log_update = update.log_update
                     max_abs_log_update = max((abs(value) for value in spsa_log_update.values()), default=0.0)
                     print(
-                        f"[theta] mode=spsa probe_score_diff={probe_score_diff:+.9f} "
+                        f"[theta] mode=spsa probe_{objective_label(args.metric)}_diff={probe_score_diff:+.9f} "
                         f"move_ratio={args.spsa_move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
                         flush=True,
                     )
@@ -1936,7 +1966,7 @@ def main() -> int:
                         )
                     history_retry_best = retry_best
                     print(
-                        f"[retry-best] retry={retry} score={best_probe.score:.9f} "
+                        f"[retry-best] retry={retry} {objective_label(args.metric)}={best_probe.score:.9f} "
                         f"checkpoint={retry_best.result.checkpoint_dir}",
                         flush=True,
                     )
@@ -2121,7 +2151,8 @@ def main() -> int:
                     "RETRY",
                     (
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"score_stays={base_score:.9f} next_step_scale={step_scale:.9f}"
+                        f"{objective_label(args.metric)}_stays={base_score:.9f} "
+                        f"next_step_scale={step_scale:.9f}"
                     ),
                     "yellow",
                     bold=True,
@@ -2132,7 +2163,8 @@ def main() -> int:
                     "ACCEPT",
                     (
                         f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"reason={reason} score={base_score:.9f} theta_change={theta_change}"
+                        f"reason={reason} new_{objective_label(args.metric)}={base_score:.9f} "
+                        f"theta_change={theta_change}"
                     ),
                     "green",
                     bold=True,
@@ -2183,7 +2215,7 @@ def main() -> int:
         )
         print(f"[complete] runner_dir={runner_dir}", flush=True)
         print(f"[complete] best_checkpoint={accepted_checkpoint}", flush=True)
-        print(f"[complete] best_score={base_score:.9f}", flush=True)
+        print(f"[complete] best_{objective_label(args.metric)}={base_score:.9f}", flush=True)
         return 0
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
