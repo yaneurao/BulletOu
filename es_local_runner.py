@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Local SPSA-style runner for BulletOu fine-tuning experiments.
+"""Local ES-style runner for BulletOu fine-tuning experiments.
 
 This script does not change BulletOu's training algorithm.  It repeatedly
-branches from a checkpoint, runs two short trials with slightly different
-factorizer hyperparameters along opposite random directions, estimates an SPSA
-direction from the two probe losses, and updates the hyperparameters by a small
-fraction of that perturbation width.
-The model weights are continued from the better short trial checkpoint.
+branches from a checkpoint, runs a small population of short trials with
+randomly perturbed factorizer hyperparameters, selects the lowest-loss trial,
+and moves the hyperparameters partway toward that winner.
+The model weights are continued from the selected trial checkpoint.
 
 Typical use:
 
-    python spsa_local_runner.py ^
+    python es_local_runner.py ^
       --exe .\target\release\examples\bulletou.exe ^
       --base-checkpoint C:\...\0033 ^
       --teacher D:\sojoteam_datasets ^
@@ -18,7 +17,7 @@ Typical use:
       --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 ^
       --bucket-counts D:\sojo_counts\...\count-all.bin ^
       --output-folder D:\BulletOu-snapshots\20260820 ^
-      --tag-prefix spsa-hp4 ^
+      --tag-prefix es-hp4 ^
       --iterations 20 ^
       --sb-per-trial 8 ^
       --theta shared=1,axis=1,pair=0.3,residual_count=1,axis_count=1,pair_count=10,king_axis_count=4 ^
@@ -159,10 +158,6 @@ QUANTIZED_TEST_BOOL_FLAGS = {
 }
 
 
-PROBE_A = "probe_a"
-PROBE_B = "probe_b"
-LEGACY_PROBE_A = {"probe_a", "plus"}
-LEGACY_PROBE_B = {"probe_b", "minus"}
 TRIAL_NO_INTERVAL_SAVE_RATE = 9999
 
 
@@ -174,10 +169,10 @@ ACCEPTED_SUMMARY_FIELDS = [
     "test_value_accuracy",
     "test_value_loss",
     "saved_checkpoint",
-    "update_mode",
-    "step_scale_used",
-    "step_scale_next",
-    "spsa_move_ratio",
+    "selected_trial",
+    "population_size",
+    "step_scale",
+    "move_ratio",
     "theta_change",
     "theta_before_json",
     "theta_delta_json",
@@ -188,37 +183,30 @@ ACCEPTED_SUMMARY_FIELDS = [
 
 HISTORY_FIELDS = [
     "iteration",
-    "retry",
     "reason",
     "base_score_before",
-    "probe_a_score",
-    "probe_b_score",
-    "probe_score_diff",
-    "best_probe_score",
+    "population_size",
+    "best_trial",
+    "best_trial_score",
     "new_base_score",
     "new_base_checkpoint",
     "accepted_sbs",
     "public_checkpoint",
-    "retry_best_score",
-    "retry_best_checkpoint",
-    "update_mode",
-    "step_scale_used",
-    "step_scale_next",
-    "spsa_move_ratio",
+    "step_scale",
+    "move_ratio",
     "theta_change",
     "theta_before_json",
     "theta_delta_json",
     "theta_json",
-    "theta_candidate_json",
-    "spsa_gradient_log_json",
-    "spsa_log_update_json",
-    "delta_json",
+    "winner_theta_json",
+    "directions_json",
+    "trial_scores_json",
 ]
 
 
 TRIAL_SUMMARY_FIELDS = [
     "iteration",
-    "retry",
+    "trial",
     "result",
     "reason",
     "accepted_sbs",
@@ -230,10 +218,9 @@ TRIAL_SUMMARY_FIELDS = [
     "trial_output_dir",
     "checkpoint",
     "saved_checkpoint",
-    "update_mode",
-    "step_scale_used",
-    "step_scale_next",
-    "spsa_move_ratio",
+    "population_size",
+    "step_scale",
+    "move_ratio",
     "theta_change",
     "theta_json",
 ]
@@ -271,22 +258,9 @@ class TrialResult:
     summary_row: dict[str, str]
 
 
-@dataclass(frozen=True)
-class RetryBest:
-    result: TrialResult
-    theta: dict[str, float]
-
-
-@dataclass(frozen=True)
-class SpsaUpdate:
-    theta: dict[str, float]
-    gradient_log: dict[str, float]
-    log_update: dict[str, float]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run paired randomized BulletOu probes and tune factorizer hyperparameters."
+        description="Run population randomized BulletOu trials and tune factorizer hyperparameters."
     )
     parser.add_argument("--exe", required=True, help="Path to bulletou.exe")
     parser.add_argument("--base-checkpoint", type=Path, default=None, help="Checkpoint directory containing state.bin")
@@ -295,7 +269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--bucket-counts", type=Path, default=None)
     parser.add_argument("--output-folder", required=True, type=Path, help="Root folder for runner outputs")
-    parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/spsa-<tag-prefix>")
+    parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/es-<tag-prefix>")
     parser.add_argument(
         "--resume",
         "--resume-runner",
@@ -307,6 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--factorizer", default="pair")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--sb-per-trial", type=int, default=8)
+    parser.add_argument("--population-size", type=int, default=4, help="Number of randomized trials per iteration. Default: 4.")
     parser.add_argument(
         "--epoch-sbs",
         type=int,
@@ -328,7 +303,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-trials",
         action="store_true",
-        help="Keep probe trial output directories. Default deletes trial outputs after the decision.",
+        help="Keep trial output directories. Default deletes trial outputs after the decision.",
     )
     parser.add_argument(
         "--trial-validation-rate-sbs",
@@ -389,29 +364,13 @@ def parse_args() -> argparse.Namespace:
         help="Fixed multiplicative perturbation scale. Default: 1.005. 1.005 moves 0.300 to about 0.3015/0.2985.",
     )
     parser.add_argument(
-        "--update-mode",
-        choices=["spsa", "winner"],
-        default="spsa",
-        help=(
-            "How to update theta after paired probes. `spsa` uses the two-probe "
-            "loss difference as a gradient estimate. `winner` jumps directly to "
-            "the better observed probe theta."
-        ),
-    )
-    parser.add_argument(
-        "--spsa-move-ratio",
+        "--move-ratio",
         type=float,
-        default=0.1,
+        default=0.25,
         help=(
-            "Fraction of the paired perturbation used for the theta update. "
-            "Default 0.1 means move theta by 10%% of the current delta width."
+            "Fraction of the winner direction used for the theta update. "
+            "Default 0.25 means move theta 25%% toward the best trial theta."
         ),
-    )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=2,
-        help="Force-accept the best retry trial after this many non-improving probe pairs. Default: 2.",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -444,6 +403,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--iterations must be > 0")
     if args.sb_per_trial <= 0:
         parser.error("--sb-per-trial must be > 0")
+    if args.population_size <= 0:
+        parser.error("--population-size must be > 0")
     if args.epoch_sbs <= 0:
         parser.error("--epoch-sbs must be > 0")
     if args.epoch_sbs % args.sb_per_trial != 0:
@@ -476,10 +437,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--step-scale must be finite and > 0")
         if args.step_scale <= 1.0:
             parser.error("--step-scale should be > 1")
-    if not math.isfinite(args.spsa_move_ratio) or args.spsa_move_ratio < 0.0:
-        parser.error("--spsa-move-ratio must be finite and >= 0")
-    if args.max_retries < 0:
-        parser.error("--max-retries must be >= 0")
+    if not math.isfinite(args.move_ratio) or args.move_ratio < 0.0:
+        parser.error("--move-ratio must be finite and >= 0")
     return args
 
 
@@ -739,50 +698,35 @@ def make_variant(
     return out
 
 
-def probe_direction(seed: int, iteration: int, retry: int, keys: list[str]) -> dict[str, int]:
+def trial_direction(seed: int, iteration: int, trial_number: int, keys: list[str]) -> dict[str, int]:
     mixed = (
         (seed & 0xFFFFFFFFFFFFFFFF)
         ^ ((iteration * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF)
-        ^ ((retry * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF)
+        ^ ((trial_number * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF)
     )
     rng = random.Random(mixed)
     return {key: rng.choice([-1, 1]) for key in keys}
 
 
-def make_spsa_update(
+def move_theta_toward(
     theta: dict[str, float],
     bounds: dict[str, tuple[float, float]],
     keys: list[str],
-    delta: dict[str, int],
-    probe_a_score: float,
-    probe_b_score: float,
-    step_scale: float,
+    winner_theta: dict[str, float],
     move_ratio: float,
-) -> SpsaUpdate:
-    if not (math.isfinite(probe_a_score) and math.isfinite(probe_b_score)):
-        raise ValueError("SPSA update requires finite paired probe scores")
-    c = math.log(step_scale)
-    if c <= 0.0:
-        raise ValueError("--step-scale must be > 1 for SPSA update")
-    if probe_a_score < probe_b_score:
-        winner_sign = +1
-    elif probe_b_score < probe_a_score:
-        winner_sign = -1
-    else:
-        winner_sign = 0
+) -> tuple[dict[str, float], dict[str, float]]:
+    if not math.isfinite(move_ratio) or move_ratio < 0.0:
+        raise ValueError("--move-ratio must be finite and >= 0")
     next_theta = dict(theta)
-    gradient_log: dict[str, float] = {}
     log_update: dict[str, float] = {}
     for key in keys:
         lo, hi = bounds[key]
-        direction = delta[key]
-        grad = (probe_a_score - probe_b_score) / (2.0 * c * direction)
-        update = winner_sign * direction * move_ratio * c
         z = theta_to_log(theta[key], lo, hi)
+        winner_z = theta_to_log(winner_theta[key], lo, hi)
+        update = (winner_z - z) * move_ratio
         next_theta[key] = theta_from_log(z + update, lo, hi)
-        gradient_log[key] = grad
         log_update[key] = update
-    return SpsaUpdate(next_theta, gradient_log, log_update)
+    return next_theta, log_update
 
 
 def alpha_arg(theta: dict[str, float]) -> str:
@@ -1092,9 +1036,9 @@ def objective_label(metric_name: str) -> str:
     return metric_name
 
 
-def accept_threshold_text(args: argparse.Namespace, base_score: float, base_metric: Metric) -> str:
+def base_metric_text(args: argparse.Namespace, base_score: float, base_metric: Metric) -> str:
     label = objective_label(args.metric)
-    text = color_text(args, f"accept_if {label} < {base_score:.9f}", "cyan", bold=True)
+    text = color_text(args, f"base_{label}={base_score:.9f}", "cyan", bold=True)
     if args.metric != "quantized_value_loss":
         text += f"  base_qloss={fmt_metric(base_metric.qloss)}"
     text += (
@@ -1118,8 +1062,8 @@ def trial_start_line(
         args,
         f"TRIAL {trial_number} START",
         (
-            f"{probe_label(side)}  tag={tag}  "
-            f"{accept_threshold_text(args, base_score, base_metric)}"
+            f"{trial_label(side)}  tag={tag}  "
+            f"{base_metric_text(args, base_score, base_metric)}"
         ),
         "cyan",
         bold=True,
@@ -1149,7 +1093,7 @@ def trial_threshold_line(
         args,
         f"TRIAL {trial_number} END",
         (
-            f"{probe_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
+            f"{trial_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
             f"qacc={fmt_metric(trial.metric.qacc)} result={status}"
         ),
         color,
@@ -1157,22 +1101,16 @@ def trial_threshold_line(
     )
 
 
-def probe_decision_line(args: argparse.Namespace, best_probe: TrialResult, base_score: float) -> None:
-    beats_target = best_probe.score < base_score
-    color = "green" if beats_target else "yellow"
-    if beats_target:
-        if args.update_mode == "spsa":
-            decision = "continue from lower-loss NN weights; theta_update=spsa_step"
-        else:
-            decision = "continue from lower-loss NN weights; theta_update=winner_theta"
-    else:
-        decision = "retry because lower-loss trial did not beat start"
+def population_decision_line(args: argparse.Namespace, best_trial: TrialResult, base_score: float) -> None:
+    beats_base = best_trial.score < base_score
+    color = "green" if beats_base else "yellow"
+    decision = "continue from best trial NN weights; theta_update=toward_best_trial"
     event_line(
         args,
         "DECISION",
         (
-            f"lower_loss_trial={probe_label(best_probe.side)} "
-            f"{score_compare_text(args, best_probe.score, base_score, value_name='lower_loss_trial')} "
+            f"best_trial={trial_label(best_trial.side)} "
+            f"{score_compare_text(args, best_trial.score, base_score, value_name='best_trial')} "
             f"decision={decision}"
         ),
         color,
@@ -1323,11 +1261,7 @@ def worker_open_session(
     )
 
 
-def probe_label(side: str) -> str:
-    if side in LEGACY_PROBE_A:
-        return "probe A"
-    if side in LEGACY_PROBE_B:
-        return "probe B"
+def trial_label(side: str) -> str:
     return side.replace("_", " ")
 
 
@@ -1358,8 +1292,8 @@ def worker_accept_cached_trial(
         args,
         "WEIGHTS",
         (
-            f"restored selected trial NN weights ({probe_label(result.side)}) tag={result.tag}; "
-            f"theta is updated separately by {args.update_mode}  "
+            f"restored selected trial NN weights ({trial_label(result.side)}) tag={result.tag}; "
+            f"theta is updated separately by population move  "
             f"{done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s"
         ),
         "green",
@@ -1500,7 +1434,7 @@ def run_trial(
             "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
         }
         print(
-            f"[done] {probe_label(side)} tag={tag} "
+            f"[done] {trial_label(side)} tag={tag} "
             f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
             flush=True,
         )
@@ -1522,7 +1456,7 @@ def run_trial(
     if not (next_checkpoint / "dataloader_pos.txt").exists():
         raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
     print(
-        f"[done] {probe_label(side)} tag={tag} "
+        f"[done] {trial_label(side)} tag={tag} "
         f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
         flush=True,
     )
@@ -1584,71 +1518,6 @@ def prune_trial_output_by_tag(trial_output_folder: Path, tag: str) -> None:
     for path in trial_output_folder.iterdir():
         if path.is_dir() and path.name.endswith(f"-{tag}"):
             safe_rmtree(path, trial_output_folder)
-
-
-def theta_for_result(result: TrialResult, probe_a_theta: dict[str, float], probe_b_theta: dict[str, float]) -> dict[str, float]:
-    if result.side in LEGACY_PROBE_A:
-        return probe_a_theta
-    if result.side in LEGACY_PROBE_B:
-        return probe_b_theta
-    raise ValueError(f"unknown trial side {result.side!r}")
-
-
-def stash_retry_best(
-    result: TrialResult,
-    theta: dict[str, float],
-    retry_best_dir: Path,
-    runner_dir: Path,
-    keep_trials: bool,
-    dry_run: bool,
-) -> RetryBest:
-    if keep_trials or dry_run:
-        return RetryBest(result, dict(theta))
-    safe_rmtree(retry_best_dir, runner_dir)
-    if not result.checkpoint_dir.exists():
-        raise FileNotFoundError(f"{result.checkpoint_dir} does not exist")
-    shutil.move(str(result.checkpoint_dir), str(retry_best_dir))
-    return RetryBest(replace(result, checkpoint_dir=retry_best_dir), dict(theta))
-
-
-def retry_best_to_json(retry_best: RetryBest | None) -> dict[str, Any] | None:
-    if retry_best is None:
-        return None
-    result = retry_best.result
-    return {
-        "theta": retry_best.theta,
-        "result": {
-            "side": result.side,
-            "tag": result.tag,
-            "output_dir": str(result.output_dir),
-            "checkpoint_dir": str(result.checkpoint_dir),
-            "metric": metric_to_json(result.metric),
-            "score": result.score,
-            "summary_row": result.summary_row,
-        },
-    }
-
-
-def retry_best_from_json(raw: Any) -> RetryBest | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict) or not isinstance(raw.get("result"), dict):
-        raise ValueError("retry_best state must be null or an object")
-    result_raw = raw["result"]
-    metric = metric_from_json(result_raw["metric"])
-    result = TrialResult(
-        side=str(result_raw["side"]),
-        tag=str(result_raw["tag"]),
-        output_dir=Path(str(result_raw["output_dir"])),
-        checkpoint_dir=Path(str(result_raw["checkpoint_dir"])),
-        metric=metric,
-        score=float(result_raw["score"]),
-        summary_row=dict(result_raw.get("summary_row", {})),
-    )
-    theta_raw = raw.get("theta")
-    if not isinstance(theta_raw, dict):
-        raise ValueError("retry_best theta must be an object")
-    return RetryBest(result, {str(key): float(value) for key, value in theta_raw.items()})
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -1762,7 +1631,7 @@ def trial_checkpoint_text(result: TrialResult) -> str:
 def make_trial_summary_row(
     *,
     iteration: int,
-    retry: int,
+    trial_number: int,
     result_label: str,
     reason: str,
     accepted_sbs: int,
@@ -1771,14 +1640,13 @@ def make_trial_summary_row(
     theta_before: dict[str, float],
     keys: list[str],
     saved_checkpoint: str,
-    update_mode: str,
-    step_scale_used: float,
-    step_scale_next: float,
-    spsa_move_ratio: float,
+    population_size: int,
+    step_scale: float,
+    move_ratio: float,
 ) -> dict[str, Any]:
     return {
         "iteration": iteration,
-        "retry": retry,
+        "trial": trial_number,
         "result": result_label,
         "reason": reason,
         "accepted_sbs": accepted_sbs,
@@ -1790,10 +1658,9 @@ def make_trial_summary_row(
         "trial_output_dir": str(trial.output_dir),
         "checkpoint": trial_checkpoint_text(trial),
         "saved_checkpoint": saved_checkpoint,
-        "update_mode": update_mode,
-        "step_scale_used": f"{step_scale_used:.9f}",
-        "step_scale_next": f"{step_scale_next:.9f}",
-        "spsa_move_ratio": f"{spsa_move_ratio:.9f}",
+        "population_size": population_size,
+        "step_scale": f"{step_scale:.9f}",
+        "move_ratio": f"{move_ratio:.9f}",
         "theta_change": theta_change_text(theta_before, trial_theta, keys),
         "theta_json": json.dumps(trial_theta, ensure_ascii=False, sort_keys=True),
     }
@@ -1803,7 +1670,7 @@ def append_trial_summary_row(path: Path, **kwargs: Any) -> None:
     append_trial_summary(path, make_trial_summary_row(**kwargs))
 
 
-def retry_window_rows(path: Path, iteration: int) -> list[dict[str, str]]:
+def trial_summary_iteration_rows(path: Path, iteration: int) -> list[dict[str, str]]:
     return [row for row in read_csv_rows(path, TRIAL_SUMMARY_FIELDS) if row.get("iteration") == str(iteration)]
 
 
@@ -1814,7 +1681,7 @@ def rewrite_trial_summary_iteration(path: Path, iteration: int, iteration_rows: 
 
 
 def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
-    return output_folder / f"spsa-{tag_prefix}"
+    return output_folder / f"es-{tag_prefix}"
 
 
 def resolve_runner_dir(args: argparse.Namespace) -> Path:
@@ -1828,19 +1695,6 @@ def resolve_runner_dir(args: argparse.Namespace) -> Path:
     if args.resume_runner:
         if (runner_dir / "state.json").exists():
             return runner_dir
-        legacy = [
-            path
-            for path in args.output_folder.glob(f"spsa-{args.tag_prefix}-*")
-            if path.is_dir() and (path / "state.json").exists()
-        ]
-        if len(legacy) == 1:
-            return legacy[0]
-        if len(legacy) > 1:
-            names = "\n  ".join(str(path) for path in legacy)
-            raise ValueError(
-                "multiple legacy runner directories match this tag-prefix; "
-                "refusing to choose by timestamp. Specify --runner-dir explicitly:\n  " + names
-            )
         raise FileNotFoundError(f"{runner_dir / 'state.json'} does not exist; start a new run without --resume")
 
     if (runner_dir / "state.json").exists():
@@ -1859,10 +1713,9 @@ def write_runner_state(
     base_metric: Metric,
     theta: dict[str, float],
     step_scale: float,
-    failed_retries: int,
     accepted_sbs: int,
-    retry_best: RetryBest | None,
-    update_mode: str,
+    population_size: int,
+    move_ratio: float,
     complete: bool = False,
 ) -> None:
     write_json(
@@ -1876,10 +1729,9 @@ def write_runner_state(
             "base_metric": metric_to_json(base_metric),
             "theta": theta,
             "step_scale": step_scale,
-            "failed_retries": failed_retries,
             "accepted_sbs": accepted_sbs,
-            "retry_best": retry_best_to_json(retry_best),
-            "update_mode": update_mode,
+            "population_size": population_size,
+            "move_ratio": move_ratio,
             "complete": complete,
         },
     )
@@ -1899,7 +1751,6 @@ def main() -> int:
         log_dir.mkdir(parents=True, exist_ok=True)
         current_dir = runner_dir / "current"
         accepted_root = runner_dir / "accepted-checkpoints"
-        retry_best_dir = runner_dir / "retry-best"
 
         state_path = runner_dir / "state.json"
         history_path = runner_dir / "history.csv"
@@ -1948,18 +1799,11 @@ def main() -> int:
                     flush=True,
                 )
                 step_scale = args.step_scale
-            failed_retries = int(state.get("failed_retries", 0))
+            population_size = int(state.get("population_size", args.population_size))
+            move_ratio = float(state.get("move_ratio", args.move_ratio))
             accepted_sbs = int(state.get("accepted_sbs", 0))
-            retry_best = retry_best_from_json(state.get("retry_best"))
             phase = str(state.get("phase", "complete" if state.get("complete") else "running_trials"))
-            if phase == "between_retries":
-                start_iteration = int(state.get("next_iteration", state["iteration"]))
-            elif phase == "between_iterations" and failed_retries > 0:
-                # Old runner versions wrote phase=between_iterations even when
-                # the logical iteration was still retrying the same target.
-                # Keep that retry under the same iteration number.
-                start_iteration = int(state["iteration"])
-            elif phase in ("between_iterations", "complete"):
+            if phase in ("between_iterations", "complete"):
                 start_iteration = int(state.get("next_iteration", int(state["iteration"]) + 1))
             else:
                 start_iteration = int(state.get("next_iteration", state["iteration"]))
@@ -2009,14 +1853,13 @@ def main() -> int:
                         "save_rate_accepts": args.save_rate,
                         "accepted_root": str(accepted_root),
                         "current_dir": str(current_dir),
-                        "retry_best_dir": str(retry_best_dir),
                     },
                 },
             )
             step_scale = args.step_scale if args.step_scale is not None else DEFAULT_STEP_SCALE
-            failed_retries = 0
+            population_size = args.population_size
+            move_ratio = args.move_ratio
             accepted_sbs = 0
-            retry_best = None
             start_iteration = 1
 
         print(
@@ -2035,7 +1878,7 @@ def main() -> int:
             args,
             "BASE",
             (
-                f"{accept_threshold_text(args, base_score, base_metric)} "
+                f"{base_metric_text(args, base_score, base_metric)} "
                 f"checkpoint={accepted_checkpoint} source={base_source}"
             ),
             "cyan",
@@ -2057,20 +1900,15 @@ def main() -> int:
         while iteration <= args.iterations:
             old_base_score = base_score
             theta_before = dict(theta)
-            step_scale_used = step_scale
-            retry = failed_retries + 1
-            delta = probe_direction(args.seed, iteration, retry, keys)
-            probe_a_theta = make_variant(theta, bounds, delta, +1, step_scale)
-            probe_b_theta = make_variant(theta, bounds, delta, -1, step_scale)
-            tag_base = f"{args.tag_prefix}-i{iteration:03d}-r{retry:02d}"
+            tag_base = f"{args.tag_prefix}-i{iteration:03d}"
 
             event_line(
                 args,
                 "TARGET",
                 (
-                    f"iteration={iteration}/{args.iterations} retry={retry} "
-                    f"{accept_threshold_text(args, base_score, base_metric)} "
-                    f"step_scale={step_scale:.4f} failed_retries={failed_retries}"
+                    f"iteration={iteration}/{args.iterations} population_size={population_size} "
+                    f"{base_metric_text(args, base_score, base_metric)} "
+                    f"step_scale={step_scale:.9f} move_ratio={move_ratio:.9f}"
                 ),
                 "cyan",
                 bold=True,
@@ -2085,154 +1923,68 @@ def main() -> int:
                 base_metric=base_metric,
                 theta=theta,
                 step_scale=step_scale,
-                failed_retries=failed_retries,
                 accepted_sbs=accepted_sbs,
-                retry_best=retry_best,
-                update_mode=args.update_mode,
+                population_size=population_size,
+                move_ratio=move_ratio,
             )
 
-            probe_a_trial_number = (retry - 1) * 2 + 1
-            probe_b_trial_number = (retry - 1) * 2 + 2
+            candidates: list[TrialResult] = []
+            trial_thetas: dict[str, dict[str, float]] = {}
+            trial_directions: dict[str, dict[str, int]] = {}
+            for trial_number in range(1, population_size + 1):
+                direction = trial_direction(args.seed, iteration, trial_number, keys)
+                trial_theta = make_variant(theta, bounds, direction, +1, step_scale)
+                side = f"trial_{trial_number:02d}"
+                tag = f"{tag_base}-t{trial_number:02d}"
+                trial = run_trial(
+                    args,
+                    accepted_checkpoint,
+                    tag,
+                    side,
+                    trial_number,
+                    old_base_score,
+                    base_metric,
+                    trial_theta,
+                    trial_output_folder,
+                    log_dir,
+                    worker,
+                )
+                trial_threshold_line(args, trial, old_base_score, trial_number=trial_number)
+                candidates.append(trial)
+                trial_thetas[trial.tag] = trial_theta
+                trial_directions[trial.tag] = direction
 
-            probe_a = run_trial(
-                args,
-                accepted_checkpoint,
-                f"{tag_base}-probe-a",
-                PROBE_A,
-                probe_a_trial_number,
-                old_base_score,
-                base_metric,
-                probe_a_theta,
-                trial_output_folder,
-                log_dir,
-                worker,
+            best = min(candidates, key=lambda item: item.score)
+            winner_theta = trial_thetas[best.tag]
+            theta, log_update = move_theta_toward(theta, bounds, keys, winner_theta, move_ratio)
+            max_abs_log_update = max((abs(value) for value in log_update.values()), default=0.0)
+            print(
+                f"[theta] mode=population winner={trial_label(best.side)} "
+                f"move_ratio={move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
+                flush=True,
             )
-            trial_threshold_line(args, probe_a, old_base_score, trial_number=probe_a_trial_number)
-            probe_b = run_trial(
-                args,
-                accepted_checkpoint,
-                f"{tag_base}-probe-b",
-                PROBE_B,
-                probe_b_trial_number,
-                old_base_score,
-                base_metric,
-                probe_b_theta,
-                trial_output_folder,
-                log_dir,
-                worker,
-            )
-            trial_threshold_line(args, probe_b, old_base_score, trial_number=probe_b_trial_number)
-            candidates = [probe_a, probe_b]
-            best_probe = min(candidates, key=lambda item: item.score)
-            best_probe_theta = theta_for_result(best_probe, probe_a_theta, probe_b_theta)
-            theta_candidate = best_probe_theta
-            probe_score_diff = probe_a.score - probe_b.score
-            spsa_gradient_log: dict[str, float] = {}
-            spsa_log_update: dict[str, float] = {}
-            if args.update_mode == "spsa":
-                if math.isfinite(probe_a.score) and math.isfinite(probe_b.score):
-                    update = make_spsa_update(
-                        theta,
-                        bounds,
-                        keys,
-                        delta,
-                        probe_a.score,
-                        probe_b.score,
-                        step_scale,
-                        args.spsa_move_ratio,
-                    )
-                    theta_candidate = update.theta
-                    spsa_gradient_log = update.gradient_log
-                    spsa_log_update = update.log_update
-                    max_abs_log_update = max((abs(value) for value in spsa_log_update.values()), default=0.0)
-                    print(
-                        f"[theta] mode=spsa probe_{objective_label(args.metric)}_diff={probe_score_diff:+.9f} "
-                        f"move_ratio={args.spsa_move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
-                        flush=True,
-                    )
-                else:
-                    theta_candidate = dict(theta)
-                    print("[theta] mode=spsa skipped because trial scores are not finite", flush=True)
-            else:
-                print("[theta] mode=winner next=best observed probe theta", flush=True)
-            probe_decision_line(args, best_probe, old_base_score)
-            best = best_probe
-            history_retry_best = retry_best
-            previous_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
+            population_decision_line(args, best, old_base_score)
 
-            if best_probe.score < base_score:
-                reason = "improved"
-                theta = theta_candidate
-                if worker is not None and not args.dry_run:
-                    best = worker_accept_cached_trial(args, worker, best_probe, log_dir)
-                    safe_rmtree(retry_best_dir, runner_dir)
-                elif not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(best_probe.checkpoint_dir, current_dir, runner_dir)
-                    safe_rmtree(retry_best_dir, runner_dir)
-                else:
-                    accepted_checkpoint = best_probe.checkpoint_dir
-                retry_best = None
-                history_retry_best = None
-                base_metric = best_probe.metric
-                base_score = best_probe.score
-                failed_retries = 0
-                accepted_sbs += args.sb_per_trial
-            else:
-                if retry_best is None or best_probe.score < retry_best.result.score:
-                    if worker is not None and not args.dry_run:
-                        retry_best = RetryBest(best_probe, theta_candidate)
-                    else:
-                        retry_best = stash_retry_best(
-                            best_probe,
-                            theta_candidate,
-                            retry_best_dir,
-                            runner_dir,
-                            args.keep_trials,
-                            args.dry_run,
-                        )
-                    history_retry_best = retry_best
-                    print(
-                        f"[retry-best] retry={retry} {objective_label(args.metric)}={best_probe.score:.9f} "
-                        f"checkpoint={retry_best.result.checkpoint_dir}",
-                        flush=True,
-                    )
-
-            if best_probe.score >= old_base_score and failed_retries + 1 >= args.max_retries:
-                reason = f"forced_after_{args.max_retries}_retries"
-                if retry_best is None:
-                    raise RuntimeError("internal error: retry_best is missing at forced acceptance")
-                history_retry_best = retry_best
-                best = retry_best.result
-                theta = retry_best.theta
-                if worker is not None and not args.dry_run:
-                    best = worker_accept_cached_trial(args, worker, best, log_dir)
-                elif not args.dry_run and not args.keep_trials:
-                    accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
-                else:
-                    accepted_checkpoint = retry_best.result.checkpoint_dir
-                retry_best = None
-                base_metric = best.metric
-                base_score = best.score
-                failed_retries = 0
-                accepted_sbs += args.sb_per_trial
-            elif best_probe.score >= old_base_score:
-                reason = "retry"
-                failed_retries += 1
-
-            if worker is not None and not args.dry_run and reason == "retry":
-                keep_tag = retry_best.result.tag if retry_best is not None else ""
-                drop_keys = [trial.tag for trial in candidates if trial.tag != keep_tag]
-                if previous_retry_best_tag and previous_retry_best_tag != keep_tag:
-                    drop_keys.append(previous_retry_best_tag)
+            if worker is not None and not args.dry_run:
+                best = worker_accept_cached_trial(args, worker, best, log_dir)
                 worker_drop_cached_trials(
                     worker,
-                    sorted(set(drop_keys)),
+                    sorted(trial.tag for trial in candidates if trial.tag != best.tag),
                     log_dir,
                     stream=not args.no_stream_child_output,
                 )
+            elif not args.dry_run and not args.keep_trials:
+                accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
+            else:
+                accepted_checkpoint = best.checkpoint_dir
+
+            reason = "best_improved" if best.score < old_base_score else "best_not_improved"
+            base_metric = best.metric
+            base_score = best.score
+            accepted_sbs += args.sb_per_trial
 
             public_checkpoint = ""
-            if reason != "retry" and not args.dry_run:
+            if not args.dry_run:
                 if should_save_accepted_checkpoint(args, accepted_sbs):
                     if worker is not None:
                         save_dir = accepted_root / accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)
@@ -2251,47 +2003,30 @@ def main() -> int:
                     else:
                         public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
                         event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
-            current_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
-            forced_retry_best_tag = history_retry_best.result.tag if reason.startswith("forced_after_") and history_retry_best is not None else ""
-            if reason == "retry":
-                selected_trial_tag = current_retry_best_tag
-                selected_result_label = "retry_best"
-            elif reason.startswith("forced_after_"):
-                selected_trial_tag = forced_retry_best_tag
-                selected_result_label = "forced_accepted"
-            else:
-                selected_trial_tag = best_probe.tag
-                selected_result_label = "accepted"
-            existing_iteration_rows = retry_window_rows(trial_summary_path, iteration)
-            iteration_rows: list[dict[str, Any]] = [dict(row) for row in existing_iteration_rows]
+
+            selected_trial_tag = best.tag
+            selected_result_label = "accepted"
+            iteration_rows: list[dict[str, Any]] = []
             for trial in candidates:
                 iteration_rows.append(
                     make_trial_summary_row(
                         iteration=iteration,
-                        retry=retry,
+                        trial_number=int(trial.side.rsplit("_", 1)[-1]),
                         result_label="pending",
                         reason=reason,
                         accepted_sbs=accepted_sbs,
                         trial=trial,
-                        trial_theta=theta_for_result(trial, probe_a_theta, probe_b_theta),
+                        trial_theta=trial_thetas[trial.tag],
                         theta_before=theta_before,
                         keys=keys,
                         saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
-                        update_mode=args.update_mode,
-                        step_scale_used=step_scale_used,
-                        step_scale_next=step_scale,
-                        spsa_move_ratio=args.spsa_move_ratio,
+                        population_size=population_size,
+                        step_scale=step_scale,
+                        move_ratio=move_ratio,
                     )
                 )
             public_checkpoint_name = Path(public_checkpoint).name if public_checkpoint else ""
-            if reason == "retry":
-                if worker is not None and not args.dry_run:
-                    selected_checkpoint_text = f"worker-cache:{selected_trial_tag}"
-                elif retry_best is not None:
-                    selected_checkpoint_text = str(retry_best.result.checkpoint_dir)
-                else:
-                    selected_checkpoint_text = ""
-            elif worker is not None and not args.dry_run and not public_checkpoint:
+            if worker is not None and not args.dry_run and not public_checkpoint:
                 selected_checkpoint_text = f"worker-resident:{selected_trial_tag}"
             else:
                 selected_checkpoint_text = str(accepted_checkpoint)
@@ -2309,7 +2044,7 @@ def main() -> int:
                     row["saved_checkpoint"] = ""
             rewrite_trial_summary_iteration(trial_summary_path, iteration, iteration_rows)
 
-            if reason != "retry" and not args.dry_run:
+            if not args.dry_run:
                 append_accepted_summary(
                     accepted_summary_path,
                     {
@@ -2321,10 +2056,10 @@ def main() -> int:
                         "test_value_loss": fmt_metric(best.metric.test_loss),
                         "test_value_accuracy": fmt_metric(best.metric.test_acc),
                         "saved_checkpoint": Path(public_checkpoint).name if public_checkpoint else "",
-                        "update_mode": args.update_mode,
-                        "step_scale_used": f"{step_scale_used:.9f}",
-                        "step_scale_next": f"{step_scale:.9f}",
-                        "spsa_move_ratio": f"{args.spsa_move_ratio:.9f}",
+                        "selected_trial": trial_label(best.side),
+                        "population_size": population_size,
+                        "step_scale": f"{step_scale:.9f}",
+                        "move_ratio": f"{move_ratio:.9f}",
                         "theta_change": theta_change_text(theta_before, theta, keys),
                         "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
                         "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
@@ -2338,38 +2073,30 @@ def main() -> int:
                 history_path,
                 {
                     "iteration": iteration,
-                    "retry": retry,
                     "reason": reason,
                     "base_score_before": f"{old_base_score:.9f}",
-                    "probe_a_score": f"{probe_a.score:.9f}",
-                    "probe_b_score": f"{probe_b.score:.9f}",
-                    "probe_score_diff": f"{probe_score_diff:.9f}",
-                    "best_probe_score": f"{best_probe.score:.9f}",
+                    "population_size": population_size,
+                    "best_trial": trial_label(best.side),
+                    "best_trial_score": f"{best.score:.9f}",
                     "new_base_score": f"{base_score:.9f}",
                     "new_base_checkpoint": str(accepted_checkpoint),
                     "accepted_sbs": accepted_sbs,
                     "public_checkpoint": public_checkpoint,
-                    "retry_best_score": f"{history_retry_best.result.score:.9f}" if history_retry_best is not None else "",
-                    "retry_best_checkpoint": str(history_retry_best.result.checkpoint_dir) if history_retry_best is not None else "",
-                    "update_mode": args.update_mode,
-                    "step_scale_used": f"{step_scale_used:.9f}",
-                    "step_scale_next": f"{step_scale:.9f}",
-                    "spsa_move_ratio": f"{args.spsa_move_ratio:.9f}",
+                    "step_scale": f"{step_scale:.9f}",
+                    "move_ratio": f"{move_ratio:.9f}",
                     "theta_change": theta_change_text(theta_before, theta, keys),
                     "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
                     "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
                     "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
-                    "theta_candidate_json": json.dumps(theta_candidate, ensure_ascii=False, sort_keys=True),
-                    "spsa_gradient_log_json": json.dumps(spsa_gradient_log, ensure_ascii=False, sort_keys=True),
-                    "spsa_log_update_json": json.dumps(spsa_log_update, ensure_ascii=False, sort_keys=True),
-                    "delta_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
+                    "winner_theta_json": json.dumps(winner_theta, ensure_ascii=False, sort_keys=True),
+                    "directions_json": json.dumps(trial_directions, ensure_ascii=False, sort_keys=True),
+                    "trial_scores_json": json.dumps({trial.tag: trial.score for trial in candidates}, ensure_ascii=False, sort_keys=True),
                 },
             )
-            next_iteration = iteration if reason == "retry" else iteration + 1
-            phase = "between_retries" if reason == "retry" else "between_iterations"
+            next_iteration = iteration + 1
             write_runner_state(
                 state_path,
-                phase=phase,
+                phase="between_iterations",
                 iteration=iteration,
                 next_iteration=next_iteration,
                 base_checkpoint=accepted_checkpoint,
@@ -2377,67 +2104,49 @@ def main() -> int:
                 base_metric=base_metric,
                 theta=theta,
                 step_scale=step_scale,
-                failed_retries=failed_retries,
                 accepted_sbs=accepted_sbs,
-                retry_best=retry_best,
-                update_mode=args.update_mode,
+                population_size=population_size,
+                move_ratio=move_ratio,
             )
             theta_change = theta_change_text(theta_before, theta, keys) or "-"
-            if reason == "retry":
+            event_line(
+                args,
+                "ACCEPT",
+                (
+                    f"iteration={iteration} accepted_sbs={accepted_sbs} "
+                    f"reason={reason} {score_compare_text(args, best.score, old_base_score, value_name='final')} "
+                    f"decision=accept best population trial "
+                    f"theta_change={theta_change}"
+                ),
+                "green" if best.score < old_base_score else "yellow",
+                bold=True,
+            )
+            if public_checkpoint:
                 event_line(
                     args,
-                    "RETRY",
-                    (
-                        f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"{score_compare_text(args, best_probe.score, old_base_score, value_name='best_trial')} "
-                        f"decision=retry because best_trial did not beat start "
-                        f"same_step_scale={step_scale:.9f}"
-                    ),
+                    "SAFE TO STOP",
+                    f"saved_checkpoint={public_checkpoint}",
+                    "green",
+                    bold=True,
+                )
+            elif worker is not None and not args.dry_run:
+                save_at = next_save_accept_count(args, accepted_sbs)
+                suffix = f" next_save_accept={save_at}" if save_at is not None else " public_save_disabled"
+                event_line(
+                    args,
+                    "WAIT FOR SAVE",
+                    "accepted state is GPU-resident; stopping now loses progress since last save." + suffix,
                     "yellow",
                     bold=True,
                 )
             else:
-                decision_score = best.score
-                forced_accept = decision_score >= old_base_score
-                decision = "accept because final beat start" if not forced_accept else f"force_accept after {args.max_retries} retries"
                 event_line(
                     args,
-                    "FORCE" if forced_accept else "ACCEPT",
-                    (
-                        f"iteration={iteration} retry={retry} accepted_sbs={accepted_sbs} "
-                        f"reason={reason} {score_compare_text(args, decision_score, old_base_score, value_name='final')} "
-                        f"decision={decision} "
-                        f"theta_change={theta_change}"
-                    ),
-                    "yellow" if forced_accept else "green",
+                    "SAFE TO STOP",
+                    f"runner_state_written checkpoint={accepted_checkpoint}",
+                    "green",
                     bold=True,
                 )
-                if public_checkpoint:
-                    event_line(
-                        args,
-                        "SAFE TO STOP",
-                        f"saved_checkpoint={public_checkpoint}",
-                        "green",
-                        bold=True,
-                    )
-                elif worker is not None and not args.dry_run:
-                    save_at = next_save_accept_count(args, accepted_sbs)
-                    suffix = f" next_save_accept={save_at}" if save_at is not None else " public_save_disabled"
-                    event_line(
-                        args,
-                        "WAIT FOR SAVE",
-                        "accepted state is GPU-resident; stopping now loses progress since last save." + suffix,
-                        "yellow",
-                        bold=True,
-                    )
-                else:
-                    event_line(
-                        args,
-                        "SAFE TO STOP",
-                        f"runner_state_written checkpoint={accepted_checkpoint}",
-                        "green",
-                        bold=True,
-                    )
             iteration = next_iteration
 
         write_runner_state(
@@ -2450,10 +2159,9 @@ def main() -> int:
             base_metric=base_metric,
             theta=theta,
             step_scale=step_scale,
-            failed_retries=failed_retries,
             accepted_sbs=accepted_sbs,
-            retry_best=retry_best,
-            update_mode=args.update_mode,
+            population_size=population_size,
+            move_ratio=move_ratio,
             complete=True,
         )
         print(f"[complete] runner_dir={runner_dir}", flush=True)

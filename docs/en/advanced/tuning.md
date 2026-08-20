@@ -371,52 +371,47 @@ The decay applies to the bucket-specific residual, not to the factorizer compone
 
 You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confidence` and `--sfnn-pair-count-confidence`. If one family needs a different strength, use the split options such as `--sfnn-king-axis-count-confidence` or `--sfnn-hand-progress-pair-count-confidence`. See [SFNN factorizer](sfnn-factorizer.md) for the formulas and the model-side interpretation.
 
-### 7.3 Automatic local tuning by qloss
+### 7.3 Automatic local ES tuning by qloss
 
-Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `spsa_local_runner.py` to search nearby settings instead of hand-writing many small runs.
+Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `es_local_runner.py` to search nearby settings instead of hand-writing many small runs.
 
-The runner branches two short probes from the same checkpoint. The probes are the two opposite points along one random direction `v` in hyperparameter space: one at `+v`, the other at `-v`. It compares their quantized validation loss (`quantized_value_loss`) and uses that difference to estimate which direction lowers qloss locally. Accuracy is noisier, so the runner uses qloss as the objective.
+This runner uses a small-population ES-style search. In one iteration, it runs `--population-size` short trials from the same checkpoint. Each trial perturbs the hyperparameters by a small random direction. The runner then selects the trial with the lowest quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so qloss is the objective.
 
-At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss by itself. It prints the result as a `[base]` line. Use `--base-metric-source summary` only when you explicitly want to read the existing summary instead.
-
-If both trials are worse than the base, the runner does not accept either side immediately. It retries with the same perturbation size and a new random direction. During that retry window, it keeps only the best qloss checkpoint under `retry-best/`. If `--max-retries` is reached without an improvement over the base, it force-accepts the best qloss from the whole retry window, not merely the last probe pair.
+At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss. It prints the result as a `[BASE]` line. Use `--base-metric-source summary` only when you explicitly want to read an existing summary instead.
 
 ```text
 1 iteration:
-  probe A: train 8 sb from the base checkpoint
-  probe B: train 8 sb from the base checkpoint
-  continue from the NN weights with lower qloss
-  move the parameters only partway along the SPSA-estimated direction
+  trial 1..N: train from the same base checkpoint for --sb-per-trial sb
+  continue from the NN weights of the lowest-qloss trial
+  move theta by --move-ratio toward that winner trial's hyperparameters
 ```
 
-`--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
+`--sb-per-trial 16` means each trial trains for 16 sb. With `--population-size 4`, one iteration spends 16 sb x 4 trials of GPU work, while the accepted path advances by 16 sb.
 
-Retries stay under the same iteration number. For example, if iteration 12 fails on its first attempt, the next attempt is iteration 12 / retry 2, not iteration 13. `accepted-summary-learn.log` only records rows where the accepted path advances, so iteration numbers do not skip. Use `summary-learn.log` when you want one row per trial, including discarded trials.
+There is no retry window. Each iteration always runs exactly `--population-size` trials, then accepts the lowest-qloss trial among them. Even if the selected trial is worse than the starting qloss, the runner still advances with the best trial in that population. This keeps the local search moving.
 
-`summary-learn.log` is rewritten per iteration. If retry 1 has a provisional best trial and retry 2 later beats it, the older row is rewritten as `discarded`. After the retry window is resolved, only the final selected trial for that iteration is marked `accepted` or `forced_accepted`; the other trials are marked `discarded`. `retry_best` appears only while the runner is still retrying and the accepted path has not advanced yet.
+Saving is based on accepted iterations. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
 
-Saving is also based on accepted trials, not on retry count. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
+The perturbation size is multiplicative. The default is `--step-scale 1.005`. For example, `pair=0.3` may become roughly `0.3015` or `0.2985` in a trial. The up/down direction is chosen independently for each tuned parameter and each trial.
 
-The perturbation size is multiplicative. The default is `--step-scale 1.005`. For example, `pair=0.3` becomes roughly `0.3015` in one probe and `0.2985` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.30015`, not `0.3015`. Retries and acceptances keep the same perturbation size.
+`--move-ratio` controls how far theta moves toward the winner. The default is `0.25`. For example, if the winner trial used `pair=0.3015` from a current value of `0.3000`, theta does not jump all the way to `0.3015`; it moves roughly one quarter of the way.
 
-Use `--update-mode winner` only if you explicitly want to jump directly to the parameter values of the lower-qloss probe.
-
-By default, the probe trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints by accepted sb count, such as `accepted-checkpoints/sb00000032`, `sb00000064`, ... at save boundaries.
+By default, trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints by accepted sb count, such as `accepted-checkpoints/sb00000064`, `sb00000128`, ... at save boundaries.
 
 Inside each trial, checkpoint saving happens only at the trial end. The runner passes a large `--save-rate` that is not reached during the trial, and relies on BulletOu's default epoch-end save to write the final trial checkpoint. Normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
-With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For probe measurement, the worker snapshots/restores weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. After the two A/B probes are measured, the worker restores the cached NN weights of the lower-qloss trial and uses them as the next continuation source. This does not mean theta jumps to the lower-qloss probe values. By default, theta is moved only a small amount in the SPSA-estimated direction from the two loss values. It does not train the selected probe a second time.
+With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. The worker snapshots/restores weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. After all population trials are measured, the worker restores the cached NN weights of the lowest-qloss trial and uses them as the next continuation source. This is not extra training; it only restores the selected trial state.
 
-Saving under `--use-worker` follows runner `--save-rate` too. For example, with `--sb-per-trial 8`, `--save-rate 4` writes `accepted-checkpoints/sb00000032`, `sb00000064`, ... every four accepts, which is every 32 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller runner `--save-rate` when exact interruption recovery matters.
+Saving under `--use-worker` follows runner `--save-rate` too. For example, with `--sb-per-trial 16`, `--save-rate 4` writes `accepted-checkpoints/sb00000064`, `sb00000128`, ... every four accepts, which is every 64 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller runner `--save-rate` when exact interruption recovery matters.
 
-The runner judges hyperparameters from the qloss difference between short trials. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting an 8-sb decision too much.
+The ES runner judges hyperparameters from short-trial qloss. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting very short trials too much.
 
 Example:
 
 ```powershell
 $base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
 
-python .\spsa_local_runner.py `
+python .\es_local_runner.py `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --base-checkpoint $base `
   --teacher D:\sojoteam_datasets `
@@ -424,10 +419,12 @@ python .\spsa_local_runner.py `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
-  --tag-prefix spsa-pair2-qloss `
+  --tag-prefix pair2-qloss `
   --factorizer pair `
   --iterations 20 `
-  --sb-per-trial 8 `
+  --sb-per-trial 16 `
+  --population-size 4 `
+  --move-ratio 0.25 `
   --epoch-sbs 32 `
   --save-rate 4 `
   --positions-per-superbatch 40000000 `
@@ -474,7 +471,7 @@ To tune everything except shared, use:
 
 The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common trial options such as `--lr` and `--optimizer` there.
 
-Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial. If you want to change the SPSA runner's own save interval, put runner `--save-rate` before the delimiter.
+Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial. If you want to change the ES runner's own save interval, put runner `--save-rate` before the delimiter.
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
@@ -484,16 +481,16 @@ The runner root contains three CSV logs.
 | --- | --- |
 | `summary-learn.log` | One row per trial, including discarded trials |
 | `accepted-summary-learn.log` | Accepted path only; useful for match-test candidates and interruption points |
-| `history.csv` | One compact row per paired decision; mostly for runner diagnostics |
+| `history.csv` | One compact row per iteration; mostly for runner diagnostics |
 
-`summary-learn.log` includes `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, and `theta_json`. `result` is one of values such as `accepted`, `forced_accepted`, `retry_best`, or `discarded`. `retry_best` is only the provisional retained candidate during a retry window; once that window is resolved, the iteration rows are rewritten to `accepted` / `forced_accepted` / `discarded`. `saved_checkpoint` is the folder name written under `accepted-checkpoints/`; it is empty on rows that did not save a checkpoint. `accepted-summary-learn.log` also puts `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, and `saved_checkpoint` near the front. Long text fields such as `reason` and `theta_json` are pushed to the right. The useful information is not the probe name; it is whether qloss improved, which point is saved, and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
+`summary-learn.log` includes `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, and `theta_json`. `result` is either `accepted` or `discarded`. `saved_checkpoint` is the folder name written under `accepted-checkpoints/`; it is empty on rows that did not save a checkpoint. `accepted-summary-learn.log` also puts `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, and `saved_checkpoint` near the front. Long text fields such as `reason` and `theta_json` are pushed to the right. The useful information is which trial was accepted, how qloss changed, which point is saved, and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
-The runner color-highlights only important event lines on the console. `BASE` is the initial baseline, and `TARGET` is the acceptance threshold for the current iteration. In the usual qloss mode it prints `accept_if qloss < ...`; a trial is accepted when its qloss goes below that value. At probe start, it prints `TRIAL 1 START`, `TRIAL 2 START`, and on retries `TRIAL 3 START`, ... using a per-iteration trial number. When each probe finishes, the matching `TRIAL 1 END`, `TRIAL 2 END`, ... line prints `final_qloss`, `start_qloss`, `delta`, and `qacc`. It is green when `final_qloss < start_qloss`, and yellow otherwise. After both probes, the `DECISION` line prints `lower_loss_trial_qloss`, `start_qloss`, `delta`, which NN weights will be used next, and how theta will be updated. With the default `--update-mode spsa`, theta does not jump to the lower-qloss probe values; it moves by `--spsa-move-ratio` along the SPSA-estimated direction. With `--use-worker`, a `WEIGHTS` line appears when the worker restores the NN weights that will be used as the next continuation source. This is not extra training, and theta is updated separately by SPSA. If the retry limit is reached, the runner force-accepts the best retry result and prints a yellow `FORCE` line. `ACCEPT` means an improved trial was accepted, `SAVE` means a checkpoint was written, and `SAFE TO STOP` marks a saved interruption point. With `--use-worker`, an `ACCEPT` without a following `SAVE` is still only resident in GPU memory; the runner prints yellow `WAIT FOR SAVE` in that case. Stop after the next `SAVE` / `SAFE TO STOP` if you do not want to lose accepted progress. Use `--color never` to disable colors.
+The runner color-highlights only important event lines on the console. `BASE` is the initial baseline, and `TARGET` is the iteration start. Trial starts are printed as `TRIAL 1 START`, `TRIAL 2 START`, ... . When each trial finishes, the matching `TRIAL 1 END`, `TRIAL 2 END`, ... line prints `final_qloss`, `start_qloss`, `delta`, and `qacc`. It is green when `final_qloss < start_qloss`, and yellow otherwise. After all trials, the `DECISION` line prints the best trial qloss, the starting qloss, which NN weights will be used next, and how theta will be updated. With `--use-worker`, a `WEIGHTS` line appears when the worker restores the NN weights that will be used as the next continuation source. `ACCEPT` means the best population trial was accepted, `SAVE` means a checkpoint was written, and `SAFE TO STOP` marks a saved interruption point. With `--use-worker`, an `ACCEPT` without a following `SAVE` is still only resident in GPU memory; the runner prints yellow `WAIT FOR SAVE` in that case. Stop after the next `SAVE` / `SAFE TO STOP` if you do not want to lose accepted progress. Use `--color never` to disable colors.
 
-To resume an interrupted runner, use the same `--output-folder` and `--tag-prefix` and add `--resume`. The runner root is determined as `--output-folder\spsa-<tag-prefix>`, so you normally do not need to pass `--runner-dir`. The runner restores the checkpoint, theta, step scale, retry state, and accepted sb count from `state.json`. You do not need to write `--theta` or `--theta-json` by hand when resuming. If they are present, the runner still uses the theta stored in `state.json`.
+To resume an interrupted runner, use the same `--output-folder` and `--tag-prefix` and add `--resume`. The runner root is determined as `--output-folder\es-<tag-prefix>`, so you normally do not need to pass `--runner-dir`. The runner restores the checkpoint, theta, step scale, population size, move ratio, and accepted sb count from `state.json`. You do not need to write `--theta` or `--theta-json` by hand when resuming. If they are present, the runner still uses the theta stored in `state.json`.
 
 ```powershell
-python .\spsa_local_runner.py `
+python .\es_local_runner.py `
   --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --teacher D:\sojoteam_datasets `
@@ -501,10 +498,10 @@ python .\spsa_local_runner.py `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
-  --tag-prefix spsa-pair2-qloss `
+  --tag-prefix pair2-qloss `
   --factorizer pair `
   --iterations 1000 `
-  --sb-per-trial 8 `
+  --sb-per-trial 16 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --tune alpha `

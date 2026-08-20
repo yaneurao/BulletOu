@@ -357,52 +357,47 @@ count decay は factorizer 成分ではなく、bucket 固有の residual にだ
 
 axis 行・pair 行そのものを count に応じて弱めたい場合は、`--sfnn-axis-count-confidence` と `--sfnn-pair-count-confidence` を使います。特定の種類だけ強さを変えたい場合は、`--sfnn-king-axis-count-confidence` や `--sfnn-hand-progress-pair-count-confidence` のような個別指定を使います。詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 
-### 6.3 qloss を見ながら自動調整する
+### 6.3 qloss を見ながらESで自動調整する
 
-factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。既に良い checkpoint がある場合は、`spsa_local_runner.py` で近傍探索できます。
+factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。すでに良い checkpoint がある場合は、`es_local_runner.py` で近傍探索できます。
 
-この runner は、同じ checkpoint から2本の短い probe を走らせます。2本は、ハイパーパラメーター空間でランダムに選んだ方向 `v` に対して、片方を `+v`、もう片方を `-v` へ動かしたものです。量子化後 loss (`quantized_value_loss`) を比較し、その差から「この近傍ではどちらへ動かすと qloss が下がりやすいか」を推定します。accuracy は値が荒いので、判断には qloss を使います。
+この runner は、小さな population を使う ES (evolution strategy) 方式です。1 iteration で、同じ checkpoint から `--population-size` 本の短い trial を走らせます。各 trial では、ハイパーパラメーターをランダム方向へ少しだけ動かします。その中で量子化後 loss (`quantized_value_loss`) が最も小さい trial を選びます。accuracy は値が荒いので、判断には qloss を使います。
 
-開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を自分で測り直します。その結果は `[base]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
-
-両方の trial が基準より悪い場合は、すぐには採用せず、同じ探索幅のまま別方向で retry します。retry 中に出た trial のうち、qloss が一番良かったものだけを `retry-best/` に退避します。`--max-retries` に達しても基準を超えられない場合は、最後の2本ではなく、retry 全体の best qloss を強制採用します。
+開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を測り直します。その結果は `[BASE]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
 
 ```text
 1 iteration:
-  probe A: base checkpoint から 8 sb 学習
-  probe B: base checkpoint から 8 sb 学習
-  qloss が小さい probe の NN 重みを次の継続元にする
-  パラメーターは SPSA の推定方向へ、探索幅の一部だけ動かす
+  trial 1..N: 同じ base checkpoint から --sb-per-trial sb だけ学習
+  qloss が最も小さい trial の NN 重みを次の継続元にする
+  theta を winner trial のハイパーパラメーターへ --move-ratio 分だけ近づける
 ```
 
-`--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
+`--sb-per-trial 16` は「1本の trial が16 sb」という意味です。`--population-size 4` なら、1 iteration でGPUが実行する量は 16 sb x 4 trial です。採用経路として進む量は16 sbです。
 
-retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての trial を1行ずつ見たい場合は `summary-learn.log` を見ます。
+retry window はありません。1 iteration では常に `--population-size` 本の trial を実行し、その中で qloss が一番小さいものを採用します。採用された trial が開始時 qloss より悪くても、その population の中で一番ましなものとして先へ進みます。
 
-`summary-learn.log` は iteration 単位で書き直されます。retry 1で暫定bestだったtrialが、retry 2以降で負けた場合、その古い行は `discarded` に書き直されます。retry window が終わった後の `summary-learn.log` では、その iteration で最終的に採用されたtrialだけが `accepted` または `forced_accepted` になり、それ以外は `discarded` になります。runner が retry 中でまだ採用経路が進んでいない間だけ、現時点の保持候補が `retry_best` として表示されます。
+保存は accept された回数で決まります。runner の `--save-rate 1` なら accept ごとに保存、`--save-rate 4` なら4回 accept するごとに `accepted-checkpoints/` へ保存します。`--save-rate 0` なら accepted checkpoint の自動保存を無効にします。
 
-保存も retry の回数ではなく、accept された回数で決まります。runner の `--save-rate 1` なら accept ごとに保存、`--save-rate 4` なら4回 accept するごとに `accepted-checkpoints/` へ保存します。`--save-rate 0` なら accepted checkpoint の自動保存を無効にします。
+パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.005` です。たとえば `pair=0.3` なら、trial によっておおむね `0.3015` や `0.2985` のような値になります。上下どちらへ動くかは、パラメーターごと、trial ごとにランダムです。
 
-パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.005` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.3015`、反対側の probe では `0.2985` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.3015` に飛ぶのではなく、だいたい `0.30015` 付近へ動きます。retry 時もaccept時も探索幅は変えません。
+`--move-ratio` は、theta を winner trial の値へどれだけ近づけるかを指定します。デフォルトは `0.25` です。たとえば現在の `pair=0.3000`、winner trial の `pair=0.3015` なら、theta は `0.3015` へ一気に飛ぶのではなく、おおむね4分の1だけ近づきます。
 
-qloss が小さかった probe のパラメーター値へそのまま移動する動作を試したい場合だけ、`--update-mode winner` を指定します。
-
-デフォルトでは、probe の trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、保存境界ごとに `accepted-checkpoints/sb00000032`, `sb00000064`, ... のように、採用経路の累計sb数で外向け checkpoint が保存されます。
+デフォルトでは、trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、保存境界ごとに `accepted-checkpoints/sb00000064`, `sb00000128`, ... のように、採用経路の累計sb数で外向け checkpoint が保存されます。
 
 trial 内の checkpoint 保存は trial 末だけです。runner は BulletOu本体へ、trial中に到達しない大きな `--save-rate` を渡し、デフォルト有効の epoch末保存でtrial末checkpointだけを作ります。通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
-`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker が重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。A/Bの2本を測ったあと、qloss が良かった trial の NN 重みをcacheから戻して、そのまま次の継続元にします。これは theta を良かった probe の値へ丸ごと変えるという意味ではありません。デフォルトでは、theta は2本のloss差からSPSAで推定した方向へ少しだけ動きます。採用のために同じprobeをもう一度学習することはありません。
+`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。worker が重みと optimizer state を snapshot/restore するため、trialごとの process 起動、CUDA warmup、checkpoint 保存を避けられます。population の全 trial を測ったあと、qloss が最も小さい trial の NN 重みを cache から戻し、そのまま次の継続元にします。これは追加学習ではなく、選ばれた trial の状態を復元するだけです。
 
-`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 8` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が32 sb進むたびに `accepted-checkpoints/sb00000032`, `sb00000064`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
+`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 16` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が64 sb進むたびに `accepted-checkpoints/sb00000064`, `sb00000128`, ... へ保存します。保存されていない採用状態は worker process のメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
 
-SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
+ES runner は、短い trial の qloss でハイパーパラメーターを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、短すぎる trial に頼りすぎないほうが安全です。
 
 例:
 
 ```powershell
 $base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
 
-python .\spsa_local_runner.py `
+python .\es_local_runner.py `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --base-checkpoint $base `
   --teacher D:\sojoteam_datasets `
@@ -410,10 +405,12 @@ python .\spsa_local_runner.py `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
-  --tag-prefix spsa-pair2-qloss `
+  --tag-prefix pair2-qloss `
   --factorizer pair `
   --iterations 20 `
-  --sb-per-trial 8 `
+  --sb-per-trial 16 `
+  --population-size 4 `
+  --move-ratio 0.25 `
   --epoch-sbs 32 `
   --save-rate 4 `
   --positions-per-superbatch 40000000 `
@@ -460,7 +457,7 @@ shared 以外を全部動かしたい場合は、次のようにします。
 
 `--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、各 trial で共通に使う学習条件を書きます。
 
-runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。SPSA runner 自体の保存頻度を変える `--save-rate` は、`--` より前に書きます。
+runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。ES runner 自体の保存頻度を変える `--save-rate` は、`--` より前に書きます。
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
@@ -470,16 +467,16 @@ runner root には3種類のCSVログが出ます。
 | --- | --- |
 | `summary-learn.log` | すべての trial を1行ずつ記録する。採用しなかった trial も残る |
 | `accepted-summary-learn.log` | 採用経路だけを記録する。棋力計測候補や停止地点の確認に使う |
-| `history.csv` | 1回のA/B判定を1行にまとめた内部寄りの履歴 |
+| `history.csv` | 1 iteration を1行にまとめた内部寄りの履歴 |
 
-`summary-learn.log` には `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, `theta_json` が出ます。`result` は `accepted`, `forced_accepted`, `retry_best`, `discarded` のような値です。`retry_best` はretry中の暫定保持候補で、retry window が確定すると `accepted` / `forced_accepted` / `discarded` に書き直されます。`saved_checkpoint` は `accepted-checkpoints/` に保存されたフォルダ名です。保存境界でない行では空欄になります。`accepted-summary-learn.log` も `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint` が先頭側に来る列順です。`reason` や `theta_json` のような長い列は右側に寄せています。見るべきなのは、probe の名前ではなく、qloss が改善したか、どこが保存済みか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+`summary-learn.log` には `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, `theta_json` が出ます。`result` は `accepted` または `discarded` です。`saved_checkpoint` は `accepted-checkpoints/` に保存されたフォルダ名です。保存境界でない行では空欄になります。`accepted-summary-learn.log` も `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint` が先頭側に来る列順です。`reason` や `theta_json` のような長い列は右側に寄せています。見るべきなのは、どの trial が採用されたか、qloss がどう動いたか、どこが保存済みか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
-画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration での採用閾値です。通常は `accept_if qloss < ...` と表示され、この値より trial の qloss が小さければ採用されます。各 probe の開始時には `TRIAL 1 START`, `TRIAL 2 START`, retry 時は `TRIAL 3 START`, ... のように iteration 内の通し番号で出ます。各 probe が終わると、対応する `TRIAL 1 END`, `TRIAL 2 END`, ... 行に `final_qloss`, `start_qloss`, `delta`, `qacc` が出ます。`final_qloss < start_qloss` なら緑、超えていなければ黄色です。2本の probe のあとに `DECISION` 行が出ます。ここには `lower_loss_trial_qloss`, `start_qloss`, `delta` と、次に使う NN 重み、theta 更新方法が出ます。デフォルトの `--update-mode spsa` では、theta は良かった probe の値へジャンプせず、SPSAで推定した方向へ `--spsa-move-ratio` 分だけ動きます。`--use-worker` では、次の継続元にする NN 重みを戻したときに `WEIGHTS` 行が出ます。これは追加学習ではなく、A/Bで良かった trial の NN 重みを次の開始点にするだけです。theta 更新は別にSPSAで行われます。retry上限に達して強制採用する場合は黄色の `FORCE` 行になります。`ACCEPT` は改善した trial の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
+画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration の開始地点です。trial の開始時には `TRIAL 1 START`, `TRIAL 2 START`, ... のように出ます。各 trial が終わると、対応する `TRIAL 1 END`, `TRIAL 2 END`, ... 行に `final_qloss`, `start_qloss`, `delta`, `qacc` が出ます。`final_qloss < start_qloss` なら緑、そうでなければ黄色です。全 trial のあとに `DECISION` 行が出ます。ここには best trial の qloss、開始時 qloss、次に使う NN 重み、theta 更新方法が出ます。`--use-worker` では、次の継続元にする NN 重みを戻したときに `WEIGHTS` 行が出ます。`ACCEPT` は population 内 best trial の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
 
-中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。再開時に `--theta` や `--theta-json` を手で書く必要はありません。書いてあっても、runner は `state.json` の theta を使います。
+中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\es-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、population size、move ratio、accepted sb count から再開します。再開時に `--theta` や `--theta-json` を手で書く必要はありません。書いてあっても、runner は `state.json` の theta を使います。
 
 ```powershell
-python .\spsa_local_runner.py `
+python .\es_local_runner.py `
   --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
   --teacher D:\sojoteam_datasets `
@@ -487,10 +484,12 @@ python .\spsa_local_runner.py `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
-  --tag-prefix spsa-pair2-qloss `
+  --tag-prefix pair2-qloss `
   --factorizer pair `
   --iterations 1000 `
-  --sb-per-trial 8 `
+  --sb-per-trial 16 `
+  --population-size 4 `
+  --move-ratio 0.25 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --tune alpha `
