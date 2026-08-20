@@ -73,7 +73,8 @@ use bulletou_lib::{
     game::outputs::{
         SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
         ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
-        set_shogi_sfnn_progress_q16_params,
+        set_shogi_sfnn_progress_q16_params, shogi_sfnn_progress_0_to_255_from_sum_q16,
+        shogi_sfnn_progress_bucket_from_value,
     },
     nn::optimiser,
     teacher_path::{DataFormat, expand_teacher, infer_data_format},
@@ -4071,6 +4072,14 @@ struct Args {
     #[arg(long)]
     sfnn_freeze_l1: bool,
 
+    /// Freeze trainable SFNN progress bucket parameters for the whole run.
+    /// For progressN architectures this switches training from soft progress
+    /// interpolation to fixed hard buckets computed from the current Progress
+    /// section, so bucket-count based regularization remains aligned with the
+    /// nn.bin used to create the count file.
+    #[arg(long = "sfnn-freeze-progress")]
+    sfnn_freeze_progress: bool,
+
     /// Restrict which SFNN parameter groups receive optimizer updates.
     /// Default `all` keeps normal training. Use `l3-only`, `bias-only`, or
     /// `l3-bias-only` for conservative fine-tuning when quantized accuracy
@@ -4917,6 +4926,18 @@ impl Args {
         }
         if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1) && !eval_type.uses_layerstack() {
             return Err("--sfnn-l1-lr-mult / --sfnn-freeze-l1 apply to SFNN / LayerStack eval types only".to_string());
+        }
+        if self.sfnn_freeze_progress {
+            if !eval_type.uses_layerstack() {
+                return Err("--sfnn-freeze-progress applies to SFNN / LayerStack eval types only".to_string());
+            }
+            let layerstack = self.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+            if layerstack.progress_bucket_count() <= 1 {
+                return Err(format!(
+                    "--sfnn-freeze-progress requires a progressN architecture; arch {} has no progress bucket axis",
+                    self.arch().cli_name()
+                ));
+            }
         }
         if self.sfnn_update_scope != SfnnUpdateScopeArg::All && !eval_type.uses_layerstack() {
             return Err("--sfnn-update-scope applies to SFNN / LayerStack eval types only".to_string());
@@ -8208,11 +8229,19 @@ enum CudaCppSfnnQuantizedValidationCache {
     Exact {
         cache: Arc<TestPositionsCache>,
         batch: bulletou_lib::value::FastBatchHost,
+        progress_params: Option<ShogiSfnnProgressQ16Params>,
     },
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppSfnnQuantizedValidationCache {
+    fn progress_params_match(&self, progress_params: Option<&ShogiSfnnProgressQ16Params>) -> bool {
+        match self {
+            Self::Proxy { inner, .. } => inner.progress_params_match(progress_params),
+            Self::Exact { progress_params: cached, .. } => cached.as_ref() == progress_params,
+        }
+    }
+
     fn try_new(
         args: &Args,
         feature_kind: CudaCppSfnnFeatureKind,
@@ -8251,7 +8280,7 @@ impl CudaCppSfnnQuantizedValidationCache {
                 format_count(batch.layout.max_active),
                 format_duration_secs(elapsed)
             );
-            return Ok(Some(Self::Exact { cache, batch }));
+            return Ok(Some(Self::Exact { cache, batch, progress_params: progress_params.cloned() }));
         }
 
         let proxy_shape = cuda_cpp_sfnn_quantized_proxy_shape(args, feature_kind, shape);
@@ -8343,7 +8372,7 @@ impl CudaCppSfnnQuantizedValidationCache {
                     bulletou_cuda_cpp::SfnnFactorizerAlpha::ONE,
                 )
             }
-            Self::Exact { cache, batch } => {
+            Self::Exact { cache, batch, .. } => {
                 let weights = runner.read_weights(ctx).map_err(|e| e.to_string())?;
                 let quantized = quantized_sfnn_weights_from_cuda_cpp_readback(
                     args,
@@ -8915,7 +8944,7 @@ fn maybe_run_live_sfnn_quantized_validation(
         return Ok(None);
     };
     let started = std::time::Instant::now();
-    if progress_params.is_some() {
+    if cache.as_ref().is_some_and(|cache| !cache.progress_params_match(progress_params)) {
         *cache = None;
     }
     if cache.is_none() {
@@ -9708,7 +9737,11 @@ impl WorkerSfnnSession {
             return Ok(None);
         };
         let progress_params = self.current_progress_params()?;
-        if progress_params.is_some() {
+        if self
+            .quantized_validation_cache
+            .as_ref()
+            .is_some_and(|cache| !cache.progress_params_match(progress_params.as_ref()))
+        {
             self.quantized_validation_cache = None;
         }
         if self.quantized_validation_cache.is_none() {
@@ -9805,9 +9838,20 @@ impl WorkerSfnnSession {
             if trial_args.sfnn_dirty_bucket_update { vec![false; self.shape.num_stacks] } else { Vec::new() };
         let mut dirty_buckets = Vec::<i32>::new();
         let progress_bucket_count = self.layerstack.progress_bucket_count();
-        let progress_trainable = progress_bucket_count > 1;
+        let progress_enabled = progress_bucket_count > 1;
+        let progress_trainable = progress_enabled && !trial_args.sfnn_freeze_progress;
+        let frozen_progress_params = if progress_enabled && trial_args.sfnn_freeze_progress {
+            Some(
+                self.current_progress_params()?
+                    .ok_or_else(|| "SFNN progress architecture has no progress params to freeze".to_string())?,
+            )
+        } else {
+            None
+        };
         let mut soft_progress_scratch =
             progress_trainable.then(|| CudaCppSfnnSoftProgressScratch::new(self.batch_size));
+        let mut hard_progress_buckets =
+            if frozen_progress_params.is_some() { vec![0; self.batch_size] } else { Vec::new() };
         let started = std::time::Instant::now();
         for_each_cuda_cpp_sfnn_teacher_batch(self.feature_kind, &config, train_steps, |teacher_batch| {
             seen_steps += 1;
@@ -9903,17 +9947,33 @@ impl WorkerSfnnSession {
                     progress_state.update_ranger(params)?;
                 }
             } else {
+                let buckets = if let Some(progress_params) = frozen_progress_params.as_ref() {
+                    let progress = fast
+                        .progress
+                        .as_ref()
+                        .ok_or_else(|| "SFNN teacher batch did not provide progress features".to_string())?;
+                    prepare_cuda_cpp_sfnn_hard_progress_buckets(
+                        progress_params,
+                        progress,
+                        progress_bucket_count,
+                        self.shape.num_stacks,
+                        &mut hard_progress_buckets,
+                    )?;
+                    hard_progress_buckets.as_slice()
+                } else {
+                    fast.buckets.as_slice()
+                };
                 let batch = bulletou_cuda_cpp::SfnnTrainStepHostBatch {
                     stm_indices: &fast.stm,
                     nstm_indices: &fast.nstm,
-                    buckets: &fast.buckets,
+                    buckets,
                     targets: &fast.targets,
                     entry_weights: &fast.weights,
                     batch_size: fast.layout.batch_size,
                     max_active: fast.layout.max_active,
                 };
                 if trial_args.sfnn_dirty_bucket_update {
-                    mark_cuda_cpp_sfnn_dirty_buckets(&fast.buckets, &mut dirty_bucket_marks, &mut dirty_buckets);
+                    mark_cuda_cpp_sfnn_dirty_buckets(buckets, &mut dirty_bucket_marks, &mut dirty_buckets);
                 }
                 let dirty_update_buckets = if trial_args.sfnn_dirty_bucket_update && is_optimizer_step {
                     Some(dirty_buckets.as_slice())
@@ -10219,7 +10279,11 @@ impl WorkerSfnnSession {
             if let Some(test_args) =
                 quantized_test_args_from_training_args(&save_args, PathBuf::from("<worker-save-live-quantized-sfnn>"))?
             {
-                if progress_params.is_some() {
+                if self
+                    .quantized_validation_cache
+                    .as_ref()
+                    .is_some_and(|cache| !cache.progress_params_match(progress_params.as_ref()))
+                {
                     self.quantized_validation_cache = None;
                 }
                 if self.quantized_validation_cache.is_none() {
@@ -15282,14 +15346,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let num_stacks = layerstack.num_stacks();
     let progress_bucket_count = layerstack.progress_bucket_count();
-    let progress_trainable = progress_bucket_count > 1;
+    let progress_enabled = progress_bucket_count > 1;
+    let progress_trainable = progress_enabled && !args.sfnn_freeze_progress;
     let device = args.cuda_cpp_device;
 
-    if progress_trainable && schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
-        return Err(
-            "SFNN progressN training uses trainable soft progress buckets and does not support --lr-schedule plateau yet"
-                .to_string(),
-        );
+    if progress_enabled && schedule.production && args.lr_schedule == LrScheduleKind::Plateau {
+        return Err("SFNN progressN training does not support --lr-schedule plateau yet".to_string());
     }
 
     print_startup_kv_colored(
@@ -15332,6 +15394,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let initial_state = build_sfnn_initial_state_for_cuda_cpp(args, feature_kind)?;
     let mut sfnn_progress_train_state = initial_state.progress.clone();
     let sfnn_progress_params = cuda_cpp_sfnn_progress_params_for_state(sfnn_progress_train_state.as_ref())?;
+    let frozen_progress_params = if progress_enabled && args.sfnn_freeze_progress {
+        Some(
+            sfnn_progress_params
+                .clone()
+                .ok_or_else(|| "SFNN progress architecture has no progress params to freeze".to_string())?,
+        )
+    } else {
+        None
+    };
     let initial_weights = &initial_state.weights;
     let factorizer_spec = effective_sfnn_factorizer_spec(args);
     let factorizer_active = cuda_cpp_sfnn_factorizer_active(args);
@@ -15602,17 +15673,27 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
-    if args.sfnn_l1_lr_mult != 1.0 || args.sfnn_freeze_l1 || args.sfnn_update_scope != SfnnUpdateScopeArg::All {
+    if args.sfnn_l1_lr_mult != 1.0
+        || args.sfnn_freeze_l1
+        || args.sfnn_freeze_progress
+        || args.sfnn_update_scope != SfnnUpdateScopeArg::All
+    {
         let freeze = if args.sfnn_freeze_l1 {
             paint("on", ConsoleColor::BoldYellow)
         } else {
             paint("off", ConsoleColor::Dim)
         };
+        let progress_freeze = if args.sfnn_freeze_progress {
+            paint("hard-bucket fixed", ConsoleColor::BoldYellow)
+        } else {
+            paint("trainable soft", ConsoleColor::Dim)
+        };
         print_startup_kv(
             "SFNN layer LR",
             format!(
-                "L1 multiplier={} freeze={freeze}, update_scope={}",
+                "L1 multiplier={} freeze={freeze}, progress={}, update_scope={}",
                 paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow),
+                progress_freeze,
                 paint(args.sfnn_update_scope.cli_name(), ConsoleColor::BoldYellow)
             ),
         );
@@ -16151,6 +16232,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if args.sfnn_dirty_bucket_update { vec![false; cuda_shape.num_stacks] } else { Vec::new() };
     let mut dirty_buckets = Vec::<i32>::new();
     let mut soft_progress_scratch = progress_trainable.then(|| CudaCppSfnnSoftProgressScratch::new(batch_size));
+    let mut hard_progress_buckets = if frozen_progress_params.is_some() { vec![0; batch_size] } else { Vec::new() };
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
@@ -16265,17 +16347,33 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 }
             }
         } else {
+            let buckets = if let Some(progress_params) = frozen_progress_params.as_ref() {
+                let progress = fast
+                    .progress
+                    .as_ref()
+                    .ok_or_else(|| "SFNN teacher batch did not provide progress features".to_string())?;
+                prepare_cuda_cpp_sfnn_hard_progress_buckets(
+                    progress_params,
+                    progress,
+                    progress_bucket_count,
+                    cuda_shape.num_stacks,
+                    &mut hard_progress_buckets,
+                )?;
+                hard_progress_buckets.as_slice()
+            } else {
+                fast.buckets.as_slice()
+            };
             let batch = SfnnTrainStepHostBatch {
                 stm_indices: &fast.stm,
                 nstm_indices: &fast.nstm,
-                buckets: &fast.buckets,
+                buckets,
                 targets: &fast.targets,
                 entry_weights: &fast.weights,
                 batch_size: fast.layout.batch_size,
                 max_active: fast.layout.max_active,
             };
             if args.sfnn_dirty_bucket_update {
-                mark_cuda_cpp_sfnn_dirty_buckets(&fast.buckets, &mut dirty_bucket_marks, &mut dirty_buckets);
+                mark_cuda_cpp_sfnn_dirty_buckets(buckets, &mut dirty_bucket_marks, &mut dirty_buckets);
             }
             let dirty_update_buckets = if args.sfnn_dirty_bucket_update && is_optimizer_step {
                 Some(dirty_buckets.as_slice())
@@ -17060,6 +17158,7 @@ struct CudaCppSfnnResidentValidationCache {
     chunks: Vec<CudaCppSfnnResidentValidationChunk>,
     workspaces: Vec<bulletou_cuda_cpp::SfnnForwardWorkspace>,
     outputs: Vec<f32>,
+    progress_params: Option<ShogiSfnnProgressQ16Params>,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -17163,7 +17262,17 @@ impl CudaCppSfnnResidentValidationCache {
             format_duration_secs(elapsed)
         );
         let output_len = cache.positions.len();
-        Ok(Some(Self { cache, chunks, workspaces, outputs: vec![0.0; output_len] }))
+        Ok(Some(Self {
+            cache,
+            chunks,
+            workspaces,
+            outputs: vec![0.0; output_len],
+            progress_params: progress_params.cloned(),
+        }))
+    }
+
+    fn progress_params_match(&self, progress_params: Option<&ShogiSfnnProgressQ16Params>) -> bool {
+        self.progress_params.as_ref() == progress_params
     }
 
     fn run(
@@ -17237,7 +17346,7 @@ fn run_cuda_cpp_sfnn_resident_validation_cached(
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
     cache: &mut Option<CudaCppSfnnResidentValidationCache>,
 ) -> Result<Option<TestMetrics>, String> {
-    if progress_params.is_some() {
+    if cache.as_ref().is_some_and(|cache| !cache.progress_params_match(progress_params)) {
         *cache = None;
     }
     if cache.is_none() {
@@ -20728,6 +20837,64 @@ fn prepare_cuda_cpp_sfnn_soft_progress_scratch(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn prepare_cuda_cpp_sfnn_hard_progress_buckets(
+    progress_params: &ShogiSfnnProgressQ16Params,
+    progress: &bulletou_lib::value::FastBatchProgressHost,
+    progress_bucket_count: usize,
+    num_stacks: usize,
+    buckets: &mut Vec<i32>,
+) -> Result<(), String> {
+    if progress_bucket_count <= 1 {
+        return Err("SFNN hard progress requires progress_bucket_count > 1".to_string());
+    }
+    let batch_size = progress.base_buckets.len();
+    if progress.active_indices.len() != batch_size.saturating_mul(progress.max_active) {
+        return Err(format!(
+            "SFNN progress active index length mismatch: got {}, expected {} x {}",
+            progress.active_indices.len(),
+            batch_size,
+            progress.max_active
+        ));
+    }
+    if buckets.len() != batch_size {
+        buckets.resize(batch_size, 0);
+    }
+
+    for i in 0..batch_size {
+        let base_bucket = progress.base_buckets[i];
+        if base_bucket < 0 {
+            return Err(format!("SFNN progress base bucket is negative at sample {i}: {base_bucket}"));
+        }
+        let mut sum_q16 = i64::from(progress_params.bias_q16);
+        let active_base = i * progress.max_active;
+        for &idx in &progress.active_indices[active_base..active_base + progress.max_active] {
+            if idx < 0 {
+                continue;
+            }
+            let idx = idx as usize;
+            let Some(&weight_q16) = progress_params.weights_q16.get(idx) else {
+                return Err(format!(
+                    "SFNN progress active feature index {idx} is out of range for {} q16 weights",
+                    progress_params.weights_q16.len()
+                ));
+            };
+            sum_q16 += i64::from(weight_q16);
+        }
+        let progress_value = shogi_sfnn_progress_0_to_255_from_sum_q16(sum_q16);
+        let progress_bucket = shogi_sfnn_progress_bucket_from_value(progress_value, progress_bucket_count);
+        let bucket = (base_bucket as usize)
+            .checked_mul(progress_bucket_count)
+            .and_then(|base| base.checked_add(progress_bucket))
+            .ok_or_else(|| "SFNN hard progress bucket index overflow".to_string())?;
+        if bucket >= num_stacks {
+            return Err(format!("SFNN hard progress bucket out of range at sample {i}: {bucket}, stacks={num_stacks}"));
+        }
+        buckets[i] = bucket as i32;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn accumulate_cuda_cpp_sfnn_progress_gradients(
     progress_state: &mut CudaCppSfnnProgressTrainState,
     progress: &bulletou_lib::value::FastBatchProgressHost,
@@ -22747,6 +22914,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
+        format!("sfnn_freeze_progress={}", args.sfnn_freeze_progress),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
@@ -22955,7 +23123,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     );
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_saturation_threshold=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
-    ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
+    ensure_line_after(&mut out, "sfnn_freeze_progress=", "sfnn_freeze_l1=", "sfnn_freeze_progress=false");
+    ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_progress=", "sfnn_update_scope=all");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');
@@ -29812,6 +29981,61 @@ mod tests {
         let legacy_partial = resume_signature(&frozen).replace("sfnn_freeze_l1=true", "sfnn_freeze_l1_sbs=27");
 
         assert!(!resume_signature_matches(&legacy_partial, &frozen));
+    }
+
+    #[test]
+    fn sfnn_freeze_progress_cli_requires_progress_arch_and_feeds_resume_signature() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--lr-schedule",
+            "step",
+            "--sfnn-freeze-progress",
+        ])
+        .unwrap();
+
+        assert!(args.sfnn_freeze_progress);
+        assert!(args.validate_backend_flags().is_ok());
+        assert!(resume_signature(&args).contains("sfnn_freeze_progress=true"));
+
+        let no_progress = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--lr-schedule",
+            "step",
+            "--sfnn-freeze-progress",
+        ])
+        .unwrap();
+        assert!(no_progress.validate_backend_flags().is_err());
+
+        let defaulted = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap();
+        assert!(resume_signature_matches(
+            &resume_signature_without_line(&resume_signature(&defaulted), "sfnn_freeze_progress="),
+            &defaulted
+        ));
     }
 
     #[test]

@@ -283,6 +283,17 @@ First, create a count.bin file:
 
 For architectures containing `progressN`, `--nn-bin` is required. The progress bucket is determined by the `bias_q16` / `weights_q16` values in the Progress section of `nn.bin`, so count.bin must be built against the same `nn.bin`. Architectures without `progressN` do not need `--nn-bin`.
 
+When you use count.bin with a `progressN` architecture, keep the progress bucket assignment aligned with the `nn.bin` used to create the count file. If the progress parameters keep changing after count.bin is built, the bucket distribution represented by count.bin drifts away from the buckets used during training.
+
+For count-aware fine-tuning from the checkpoint that produced count.bin, freeze progress:
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-freeze-progress
+```
+
+With `--sfnn-freeze-progress`, BulletOu does not update the progress parameters. Training also uses the same hard q16 Progress bucket rule that is exported to `nn.bin`. Validation batches can keep their GPU cache as long as the progress parameters do not change.
+
 If you omit `--positions`, BulletOu scans every file in the teacher path once. Keep `--positions` when you want to sample only a prefix of a very large teacher set.
 
 For fixed-size `.psv` / `.bin` records, BulletOu uses a dedicated fast path. It keeps several read buffers and reads into one buffer while counting another one. The implementation uses queues, but the buffers are reused like a ring buffer.

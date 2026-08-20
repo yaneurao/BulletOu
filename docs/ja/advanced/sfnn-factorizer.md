@@ -283,6 +283,17 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 
 `progressN` を含む architecture では、`--nn-bin` が必須です。progress bucket は `nn.bin` 内の Progress section に入っている `bias_q16` / `weights_q16` で決まるため、count.bin も同じ `nn.bin` を基準に作ります。`progressN` を含まない architecture では `--nn-bin` は不要です。
 
+`progressN` 付きの学習で count.bin を使う場合は、count.bin を作った `nn.bin` の progress 判定と、学習中の progress 判定を揃える必要があります。count.bin 作成後に progress parameter も動かし続けると、count.bin が表している bucket 分布と学習中の bucket 分布がずれていきます。
+
+そのため、count.bin を作った checkpoint から count-aware な追加学習をする場合は、次のように progress を固定します。
+
+```powershell
+--sfnn-bucket-counts D:\...\count.bin `
+--sfnn-freeze-progress
+```
+
+`--sfnn-freeze-progress` を指定すると、progress parameter は更新されません。学習時の bucket も `nn.bin` に書き出される q16 Progress section と同じ hard bucket 判定になります。validation 用の局面データも、progress parameter が変わらない限り GPU cache を再利用します。
+
 `--positions` を省略すると、指定した teacher path に含まれる全ファイルを1回だけ読んで count します。大きな教師データから一部だけサンプリングしたい場合は、上の例のように `--positions` を指定します。
 
 `.psv` / `.bin` は固定長レコードなので、BulletOu は専用の高速経路で読みます。読み込み用 buffer を複数個用意し、片方を count している間に別の buffer へディスク読み込みします。実装上は queue で buffer を回しますが、動作としては ring buffer です。
