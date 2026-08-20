@@ -218,6 +218,33 @@ HISTORY_FIELDS = [
 ]
 
 
+TRIAL_SUMMARY_FIELDS = [
+    "iteration",
+    "retry",
+    "result",
+    "reason",
+    "accepted_sbs",
+    "score_before",
+    "score",
+    "score_delta",
+    "quantized_value_loss",
+    "quantized_value_accuracy",
+    "test_value_loss",
+    "test_value_accuracy",
+    "trial_tag",
+    "trial_output_dir",
+    "checkpoint",
+    "current_checkpoint",
+    "public_checkpoint",
+    "update_mode",
+    "step_scale_used",
+    "step_scale_next",
+    "spsa_move_ratio",
+    "theta_change",
+    "theta_json",
+]
+
+
 @dataclass(frozen=True)
 class Metric:
     qloss: float | None
@@ -1501,6 +1528,67 @@ def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
     append_csv_row(path, ACCEPTED_SUMMARY_FIELDS, row)
 
 
+def append_trial_summary(path: Path, row: dict[str, Any]) -> None:
+    append_csv_row(path, TRIAL_SUMMARY_FIELDS, row)
+
+
+def trial_checkpoint_text(result: TrialResult) -> str:
+    checkpoint = result.summary_row.get("checkpoint", "").strip()
+    if checkpoint and checkpoint != "-":
+        return str(result.output_dir / checkpoint)
+    return str(result.checkpoint_dir)
+
+
+def append_trial_summary_row(
+    path: Path,
+    *,
+    iteration: int,
+    retry: int,
+    result_label: str,
+    reason: str,
+    accepted_sbs: int,
+    score_before: float,
+    trial: TrialResult,
+    trial_theta: dict[str, float],
+    theta_before: dict[str, float],
+    keys: list[str],
+    current_checkpoint: Path,
+    public_checkpoint: str,
+    update_mode: str,
+    step_scale_used: float,
+    step_scale_next: float,
+    spsa_move_ratio: float,
+) -> None:
+    append_trial_summary(
+        path,
+        {
+            "iteration": iteration,
+            "retry": retry,
+            "result": result_label,
+            "reason": reason,
+            "accepted_sbs": accepted_sbs,
+            "score_before": f"{score_before:.9f}",
+            "score": f"{trial.score:.9f}",
+            "score_delta": f"{trial.score - score_before:.9f}",
+            "quantized_value_loss": fmt_metric(trial.metric.qloss),
+            "quantized_value_accuracy": fmt_metric(trial.metric.qacc),
+            "test_value_loss": fmt_metric(trial.metric.test_loss),
+            "test_value_accuracy": fmt_metric(trial.metric.test_acc),
+            "trial_tag": trial.tag,
+            "trial_output_dir": str(trial.output_dir),
+            "checkpoint": trial_checkpoint_text(trial),
+            "current_checkpoint": str(current_checkpoint),
+            "public_checkpoint": public_checkpoint,
+            "update_mode": update_mode,
+            "step_scale_used": f"{step_scale_used:.9f}",
+            "step_scale_next": f"{step_scale_next:.9f}",
+            "spsa_move_ratio": f"{spsa_move_ratio:.9f}",
+            "theta_change": theta_change_text(theta_before, trial_theta, keys),
+            "theta_json": json.dumps(trial_theta, ensure_ascii=False, sort_keys=True),
+        },
+    )
+
+
 def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
     return output_folder / f"spsa-{tag_prefix}"
 
@@ -1593,7 +1681,9 @@ def main() -> int:
 
         state_path = runner_dir / "state.json"
         history_path = runner_dir / "history.csv"
+        trial_summary_path = runner_dir / "summary-learn.log"
         accepted_summary_path = runner_dir / "accepted-summary-learn.log"
+        ensure_csv_header(trial_summary_path, TRIAL_SUMMARY_FIELDS)
         ensure_csv_header(accepted_summary_path, ACCEPTED_SUMMARY_FIELDS)
         ensure_csv_header(history_path, HISTORY_FIELDS)
 
@@ -1906,6 +1996,57 @@ def main() -> int:
                     else:
                         public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
                         event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
+            current_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
+            forced_retry_best_tag = history_retry_best.result.tag if reason.startswith("forced_after_") and history_retry_best is not None else ""
+            candidate_tags = {trial.tag for trial in candidates}
+            for trial in candidates:
+                if reason == "retry_with_smaller_step":
+                    result_label = "retry_best" if trial.tag == current_retry_best_tag else "discarded"
+                elif reason.startswith("forced_after_"):
+                    result_label = "forced_accepted" if trial.tag == forced_retry_best_tag else "discarded"
+                else:
+                    result_label = "accepted" if trial.tag == best_probe.tag else "discarded"
+                append_trial_summary_row(
+                    trial_summary_path,
+                    iteration=iteration,
+                    retry=retry,
+                    result_label=result_label,
+                    reason=reason,
+                    accepted_sbs=accepted_sbs,
+                    score_before=old_base_score,
+                    trial=trial,
+                    trial_theta=theta_for_result(trial, probe_a_theta, probe_b_theta),
+                    theta_before=theta_before,
+                    keys=keys,
+                    current_checkpoint=accepted_checkpoint,
+                    public_checkpoint=public_checkpoint,
+                    update_mode=args.update_mode,
+                    step_scale_used=step_scale_used,
+                    step_scale_next=step_scale,
+                    spsa_move_ratio=args.spsa_move_ratio,
+                )
+            if forced_retry_best_tag and forced_retry_best_tag not in candidate_tags and history_retry_best is not None:
+                append_trial_summary_row(
+                    trial_summary_path,
+                    iteration=iteration,
+                    retry=retry,
+                    result_label="forced_accepted",
+                    reason=reason,
+                    accepted_sbs=accepted_sbs,
+                    score_before=old_base_score,
+                    trial=history_retry_best.result,
+                    trial_theta=history_retry_best.theta,
+                    theta_before=theta_before,
+                    keys=keys,
+                    current_checkpoint=accepted_checkpoint,
+                    public_checkpoint=public_checkpoint,
+                    update_mode=args.update_mode,
+                    step_scale_used=step_scale_used,
+                    step_scale_next=step_scale,
+                    spsa_move_ratio=args.spsa_move_ratio,
+                )
+
+            if reason != "retry_with_smaller_step" and not args.dry_run:
                 append_accepted_summary(
                     accepted_summary_path,
                     {

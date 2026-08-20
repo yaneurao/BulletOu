@@ -377,7 +377,7 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 `--sb-per-trial 8` は「1本の trial が8 sb」という意味です。1 iteration では2本走るので、GPUで実行する量は16 sb、採用経路として進む量は8 sbです。
 
-retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての試行を見たい場合は `history.csv` を見ます。
+retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての trial を1行ずつ見たい場合は `summary-learn.log` を見ます。
 
 保存も retry の回数ではなく、採用経路が進んだ量で決まります。採用または強制採用されると `accepted_sbs` が `--sb-per-trial` ぶん増え、その値が `--accepted-save-rate-sbs` の境界に来たときだけ `accepted-checkpoints/` に保存されます。
 
@@ -462,7 +462,15 @@ runner が自動で指定するので、後ろ側には `--resume`、`--superbat
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 
-採否履歴は `history.csv`、採用された checkpoint だけの要約は `accepted-summary-learn.log` に保存されます。`accepted-summary-learn.log` は runner 起動時にヘッダーだけ先に作られるので、学習開始直後からエディタで開いておけます。`accepted-summary-learn.log` には `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出ます。見るべきなのは、probe の名前ではなく、qloss が改善したか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
+runner root には3種類のCSVログが出ます。
+
+| ファイル | 内容 |
+| --- | --- |
+| `summary-learn.log` | すべての trial を1行ずつ記録する。採用しなかった trial も残る |
+| `accepted-summary-learn.log` | 採用経路だけを記録する。棋力計測候補や停止地点の確認に使う |
+| `history.csv` | 1回のA/B判定を1行にまとめた内部寄りの履歴 |
+
+`summary-learn.log` には `result`, `score`, `score_delta`, `quantized_value_loss`, `quantized_value_accuracy`, `theta_change`, `theta_json` が出ます。`result` は `accepted`, `forced_accepted`, `retry_best`, `discarded` のような値です。`accepted-summary-learn.log` には `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, `theta_json` が出ます。見るべきなのは、probe の名前ではなく、qloss が改善したか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
 
 画面上では、節目の行だけ色付きで出ます。`ACCEPT` は採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
 

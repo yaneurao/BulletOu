@@ -391,7 +391,7 @@ If both trials are worse than the base, the runner does not adopt either side im
 
 `--sb-per-trial 8` means each trial trains for 8 sb. One iteration runs two trials, so it spends 16 sb of GPU work while the accepted path advances by 8 sb.
 
-Retries stay under the same iteration number. For example, if iteration 12 fails on its first attempt, the next attempt is iteration 12 / retry 2, not iteration 13. `accepted-summary-learn.log` only records rows where the accepted path advances, so iteration numbers do not skip. Use `history.csv` when you want every attempt.
+Retries stay under the same iteration number. For example, if iteration 12 fails on its first attempt, the next attempt is iteration 12 / retry 2, not iteration 13. `accepted-summary-learn.log` only records rows where the accepted path advances, so iteration numbers do not skip. Use `summary-learn.log` when you want one row per trial, including discarded trials.
 
 Saving is also based on accepted progress, not on retry count. When an attempt is accepted or force-accepted, `accepted_sbs` increases by `--sb-per-trial`; the runner writes to `accepted-checkpoints/` only when that value reaches a `--accepted-save-rate-sbs` boundary.
 
@@ -476,7 +476,15 @@ Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--valid
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
-The accept/reject history is written to `history.csv`, and accepted-only checkpoint summaries are written to `accepted-summary-learn.log`. The runner creates `accepted-summary-learn.log` with a header at startup, so you can open it in an editor immediately. The accepted summary includes `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`. The useful information is not the probe name; it is whether qloss improved and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
+The runner root contains three CSV logs.
+
+| File | Purpose |
+| --- | --- |
+| `summary-learn.log` | One row per trial, including discarded trials |
+| `accepted-summary-learn.log` | Accepted path only; useful for match-test candidates and interruption points |
+| `history.csv` | One compact row per paired decision; mostly for runner diagnostics |
+
+`summary-learn.log` includes `result`, `score`, `score_delta`, `quantized_value_loss`, `quantized_value_accuracy`, `theta_change`, and `theta_json`. `result` is one of values such as `accepted`, `forced_accepted`, `retry_best`, or `discarded`. `accepted-summary-learn.log` includes `score_before`, `score`, `probe_a_score`, `probe_b_score`, `probe_score_diff`, `theta_change`, `theta_before_json`, `theta_delta_json`, and `theta_json`. The useful information is not the probe name; it is whether qloss improved and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
 
 The runner color-highlights only important event lines on the console. `ACCEPT` means the trial was accepted, `SAVE` means a checkpoint was written, and `SAFE TO STOP` marks a saved interruption point. With `--use-worker`, an `ACCEPT` without a following `SAVE` is still only resident in GPU memory; the runner prints yellow `WAIT FOR SAVE` in that case. Stop after the next `SAVE` / `SAFE TO STOP` if you do not want to lose accepted progress. Use `--color never` to disable colors.
 
