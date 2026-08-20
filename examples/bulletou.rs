@@ -9125,7 +9125,10 @@ fn worker_json_string_array(request: &serde_json::Value, field: &str) -> Result<
         .iter()
         .enumerate()
         .map(|(i, value)| {
-            value.as_str().map(str::to_string).ok_or_else(|| format!("worker `{field}` item {i} is not a string"))
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("worker `{field}` item {i} is not a string"))
         })
         .collect()
 }
@@ -9189,9 +9192,13 @@ fn worker_last_summary_row(output_dir: &std::path::Path) -> Result<Option<serde_
         row.insert((*key).to_string(), serde_json::Value::String(value.to_string()));
     }
     let mut metrics = serde_json::Map::new();
-    for key in
-        ["test_value_accuracy", "test_value_loss", "quantized_value_accuracy", "quantized_value_loss", "positions"]
-    {
+    for key in [
+        "test_value_accuracy",
+        "test_value_loss",
+        "quantized_value_accuracy",
+        "quantized_value_loss",
+        "positions",
+    ] {
         if let Some(value) = row.get(key).and_then(serde_json::Value::as_str) {
             if let Ok(parsed) = value.parse::<f64>() {
                 if let Some(number) = serde_json::Number::from_f64(parsed) {
@@ -9274,7 +9281,10 @@ fn worker_require_sfnn_feature(args: &Args) -> Result<CudaCppSfnnFeatureKind, St
         EvalType::SfnnHalfka2hm => Ok(CudaCppSfnnFeatureKind::Halfka2hm),
         EvalType::SfnnHalfka2 => Ok(CudaCppSfnnFeatureKind::Halfka2),
         EvalType::SfnnKa2 => Ok(CudaCppSfnnFeatureKind::Ka2),
-        other => Err(format!("worker train-session currently supports SFNN cuda-cpp only; got {}", other.cli_name())),
+        other => Err(format!(
+            "worker train-session currently supports SFNN cuda-cpp only; got {}",
+            other.cli_name()
+        )),
     }
 }
 
@@ -9377,8 +9387,7 @@ impl WorkerSfnnSession {
         let dataloader_pos =
             cuda_cpp_auto_resume_dataloader_pos(&args, batch_size, initial_state.completed_steps, "nnue")?;
         let validation_cache = CudaCppSfnnResidentValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
-        let quantized_validation_cache =
-            CudaCppSfnnQuantizedValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
+        let quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(&args, feature_kind, &ctx, shape)?;
         Ok(Self {
             args,
             feature_kind,
@@ -9425,8 +9434,7 @@ impl WorkerSfnnSession {
         }
         if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
             let counts = sfnn_bucket_counts.as_ref().ok_or_else(|| {
-                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
-                    .to_string()
+                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
             })?;
             let spec = effective_sfnn_factorizer_spec(args);
             let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, counts)?;
@@ -9444,7 +9452,10 @@ impl WorkerSfnnSession {
 
     fn apply_args_to_runner(&mut self, args: &Args) -> Result<(), String> {
         self.runner
-            .set_factorizer_config(cuda_cpp_sfnn_factorizer_active(args), cuda_cpp_sfnn_factorizer_alpha(args))
+            .set_factorizer_config(
+                cuda_cpp_sfnn_factorizer_active(args),
+                cuda_cpp_sfnn_factorizer_alpha(args),
+            )
             .map_err(|e| e.to_string())?;
         self.factorizer_axis_confidences =
             Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
@@ -9532,7 +9543,11 @@ impl WorkerSfnnSession {
         validate_teacher_shuffle_buffer(&trial_args, schedule.batches_per_superbatch)?;
         let teacher_shuffle_buffer_batches =
             effective_teacher_shuffle_buffer_batches(&trial_args, schedule.batches_per_superbatch)?;
-        let snapshot = if keep { None } else { Some(self.snapshot_host()?) };
+        let snapshot = if keep {
+            None
+        } else {
+            Some(self.snapshot_host()?)
+        };
         let base_args = self.args.clone();
         let base_dataloader_pos = self.dataloader_pos;
         self.apply_args_to_runner(&trial_args)?;
@@ -9740,21 +9755,26 @@ impl WorkerSfnnSession {
                 &mut self.validation_cache,
             )?
         };
-        let quantized_metrics = if last_quantized_metrics.is_some() {
-            last_quantized_metrics
-        } else {
-            self.run_quantized_validation(&trial_args)?
-        };
+        let quantized_metrics =
+            if last_quantized_metrics.is_some() { last_quantized_metrics } else { self.run_quantized_validation(&trial_args)? };
         let elapsed = started.elapsed();
         eprintln!(
             "  worker {}: steps={}, updates={}, test_loss={}, test_acc={}, qloss={}, qacc={}, elapsed={}",
             if keep { "adopt" } else { "trial" },
             format_count(seen_steps),
             format_count(optimizer_updates),
-            test_metrics.map(|m| format!("{:.8}", m.loss)).unwrap_or_else(|| "-".to_string()),
-            test_metrics.map(|m| format!("{:.7}", m.accuracy)).unwrap_or_else(|| "-".to_string()),
-            quantized_metrics.map(|m| format!("{:.8}", m.loss)).unwrap_or_else(|| "-".to_string()),
-            quantized_metrics.map(|m| format!("{:.7}", m.accuracy)).unwrap_or_else(|| "-".to_string()),
+            test_metrics
+                .map(|m| format!("{:.8}", m.loss))
+                .unwrap_or_else(|| "-".to_string()),
+            test_metrics
+                .map(|m| format!("{:.7}", m.accuracy))
+                .unwrap_or_else(|| "-".to_string()),
+            quantized_metrics
+                .map(|m| format!("{:.8}", m.loss))
+                .unwrap_or_else(|| "-".to_string()),
+            quantized_metrics
+                .map(|m| format!("{:.7}", m.accuracy))
+                .unwrap_or_else(|| "-".to_string()),
             format_duration_secs(elapsed)
         );
         if keep {
@@ -9775,30 +9795,6 @@ impl WorkerSfnnSession {
             quantized_metrics,
             elapsed,
         })
-    }
-
-    fn try_adopt_trial(
-        &mut self,
-        trial_args: Args,
-        metric: &str,
-        accept_below: f32,
-    ) -> Result<(bool, f32, WorkerSfnnTrialOutcome), String> {
-        let snapshot = self.snapshot_host()?;
-        let base_args = self.args.clone();
-        let base_dataloader_pos = self.dataloader_pos;
-        let base_completed_steps = self.completed_steps;
-        let base_optimizer_steps = self.optimizer_steps;
-        let outcome = self.run_trial(trial_args, true)?;
-        let score = worker_trial_score(&outcome, metric)?;
-        let accepted = score < accept_below;
-        if !accepted {
-            self.restore_host_snapshot(&base_args, &snapshot)?;
-            self.args = base_args;
-            self.dataloader_pos = base_dataloader_pos;
-            self.completed_steps = base_completed_steps;
-            self.optimizer_steps = base_optimizer_steps;
-        }
-        Ok((accepted, score, outcome))
     }
 
     fn save(&mut self, args: Option<Args>, epoch: usize, superbatch: usize) -> Result<std::path::PathBuf, String> {
@@ -9833,8 +9829,10 @@ impl WorkerSfnnSession {
         self.ctx.synchronize().map_err(|e| e.to_string())?;
         let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
         let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
-        let dataloader_pos =
-            self.dataloader_pos.unwrap_or(bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 });
+        let dataloader_pos = self.dataloader_pos.unwrap_or(bulletou_lib::value::TeacherDataloaderPos {
+            byte_offset: 0,
+            plies: 0,
+        });
         let log = CudaCppCheckpointLog {
             epoch,
             superbatch,
@@ -9848,7 +9846,8 @@ impl WorkerSfnnSession {
         };
         let checkpoint_dir = if let Some(dir) = exact_dir.as_ref() {
             let parent = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
-            std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
             let tmp_dir = parent.join(format!(
                 "{}.tmp-{}",
                 dir.file_name().and_then(|name| name.to_str()).unwrap_or("worker-checkpoint"),
@@ -9909,12 +9908,8 @@ impl WorkerSfnnSession {
                 quantized_test_args_from_training_args(&save_args, PathBuf::from("<worker-save-live-quantized-sfnn>"))?
             {
                 if self.quantized_validation_cache.is_none() {
-                    self.quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(
-                        &save_args,
-                        self.feature_kind,
-                        &self.ctx,
-                        self.shape,
-                    )?;
+                    self.quantized_validation_cache =
+                        CudaCppSfnnQuantizedValidationCache::try_new(&save_args, self.feature_kind, &self.ctx, self.shape)?;
                 }
                 if let Some(cache) = self.quantized_validation_cache.as_mut() {
                     let metrics = cache.run_runner(
@@ -9955,23 +9950,6 @@ fn worker_trial_payload(outcome: &WorkerSfnnTrialOutcome) -> serde_json::Value {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn worker_trial_score(outcome: &WorkerSfnnTrialOutcome, metric: &str) -> Result<f32, String> {
-    match metric {
-        "quantized_value_loss" => {
-            outcome.quantized_metrics.map(|m| m.loss).or_else(|| outcome.test_metrics.map(|m| m.loss)).ok_or_else(
-                || "worker try-adopt requires quantized_value_loss or test_value_loss in trial output".to_string(),
-            )
-        }
-        "test_value_loss" => {
-            outcome.test_metrics.map(|m| m.loss).or_else(|| outcome.quantized_metrics.map(|m| m.loss)).ok_or_else(
-                || "worker try-adopt requires test_value_loss or quantized_value_loss in trial output".to_string(),
-            )
-        }
-        other => Err(format!("worker try-adopt unsupported metric `{other}`")),
-    }
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn worker_handle_request(
     args: &WorkerArgs,
     request: &serde_json::Value,
@@ -9990,8 +9968,8 @@ fn worker_handle_request(
                 serde_json::json!({
                     "worker": "bulletou",
                     "protocol_version": args.protocol_version,
-                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "adopt", "try-adopt", "save", "quit"],
-                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state and restores; `adopt` runs and keeps the branch; `try-adopt` runs once, keeps it only if the requested metric improves, and otherwise restores.",
+                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "adopt", "save", "quit"],
+                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state and restores; `adopt` reruns and keeps the accepted branch.",
                 }),
             ),
             false,
@@ -10042,37 +10020,6 @@ fn worker_handle_request(
                 Err(error) => (worker_response_error(id, error), false),
             }
         }
-        "try-adopt" => {
-            let Some(session) = session.as_mut() else {
-                return (worker_response_error(id, "worker command `try-adopt` requires `open` first"), false);
-            };
-            let metric = request.get("metric").and_then(serde_json::Value::as_str).unwrap_or("quantized_value_loss");
-            let accept_below = match request.get("accept_below").and_then(serde_json::Value::as_f64) {
-                Some(value) if value.is_finite() => value as f32,
-                _ => {
-                    return (
-                        worker_response_error(id, "worker command `try-adopt` requires finite `accept_below`"),
-                        false,
-                    );
-                }
-            };
-            match worker_args_from_json(request, "bulletou worker try-adopt")
-                .and_then(|trial_args| session.try_adopt_trial(trial_args, metric, accept_below))
-            {
-                Ok((accepted, score, outcome)) => {
-                    let mut payload = worker_trial_payload(&outcome);
-                    if let Some(map) = payload.as_object_mut() {
-                        map.insert("kept".to_string(), serde_json::json!(accepted));
-                        map.insert("accepted".to_string(), serde_json::json!(accepted));
-                        map.insert("score".to_string(), worker_json_f32(score));
-                        map.insert("completed_steps".to_string(), serde_json::json!(session.completed_steps));
-                        map.insert("optimizer_steps".to_string(), serde_json::json!(session.optimizer_steps));
-                    }
-                    (worker_response_ok(id, cmd, payload), false)
-                }
-                Err(error) => (worker_response_error(id, error), false),
-            }
-        }
         "save" => {
             let Some(session) = session.as_mut() else {
                 return (worker_response_error(id, "worker command `save` requires `open` first"), false);
@@ -10086,7 +10033,10 @@ fn worker_handle_request(
             };
             let epoch = request.get("epoch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
             let superbatch = request.get("superbatch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
-            let exact_dir = request.get("dir").and_then(serde_json::Value::as_str).map(std::path::PathBuf::from);
+            let exact_dir = request
+                .get("dir")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from);
             let save_result = match exact_dir {
                 Some(dir) => session.save_exact(save_args, dir, epoch, superbatch),
                 None => session.save(save_args, epoch, superbatch),
