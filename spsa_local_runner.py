@@ -165,16 +165,15 @@ LEGACY_PROBE_B = {"probe_b", "minus"}
 ACCEPTED_SUMMARY_FIELDS = [
     "iteration",
     "accepted_sbs",
-    "reason",
-    "score_before",
     "score",
+    "quantized_value_accuracy",
+    "quantized_value_loss",
+    "test_value_accuracy",
+    "test_value_loss",
+    "score_before",
     "probe_a_score",
     "probe_b_score",
     "probe_score_diff",
-    "quantized_value_loss",
-    "quantized_value_accuracy",
-    "test_value_loss",
-    "test_value_accuracy",
     "current_checkpoint",
     "public_checkpoint",
     "update_mode",
@@ -185,6 +184,7 @@ ACCEPTED_SUMMARY_FIELDS = [
     "theta_before_json",
     "theta_delta_json",
     "theta_json",
+    "reason",
 ]
 
 
@@ -1498,6 +1498,21 @@ def schema_backup_path(path: Path) -> Path:
         index += 1
 
 
+def migrate_csv_schema(path: Path, backup: Path, fieldnames: list[str]) -> None:
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(dict(row))
+    path.replace(backup)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    print(f"[log-schema] migrated CSV schema: {path} (backup={backup})", flush=True)
+
+
 def ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0:
@@ -1507,8 +1522,8 @@ def ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
         if header == fieldnames:
             return
         backup = schema_backup_path(path)
-        path.replace(backup)
-        print(f"[log-schema] moved old CSV schema: {path} -> {backup}", flush=True)
+        migrate_csv_schema(path, backup, fieldnames)
+        return
     with path.open("w", encoding="utf-8", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
