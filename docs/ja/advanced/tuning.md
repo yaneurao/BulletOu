@@ -474,7 +474,7 @@ runner root には3種類のCSVログが出ます。
 
 画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration での採用閾値です。通常は `accept_if qloss < ...` と表示され、この値より trial の qloss が小さければ採用されます。各 probe の開始時には `TRIAL trial 1 start` / `TRIAL trial 2 start` が出ます。各 probe が終わると `done` 行の `qloss` / `qacc` が色付きで出ます。基準より良ければ緑、悪ければ黄色です。続く `TRIAL` 行には `final_qloss`, `start_qloss`, `delta` が出ます。`final_qloss < start_qloss` なら緑、超えていなければ黄色です。2本の probe のあとに `DECISION` 行が出ます。ここに `best_probe_qloss`, `start_qloss`, `delta`, `decision=accept best probe` または `decision=retry ...` が出ます。`DECISION` が緑なら採用、黄色ならretryまたは強制採用候補です。`--use-worker` では、採用probeをGPU上に残すために `ACCEPT RUN` / `ACCEPT DONE` が出ることがあります。これは新しい探索点ではなく、採用済みprobeをkeepするための内部再実行です。retry上限に達して強制採用する場合は黄色の `FORCE` 行になります。`ACCEPT` は改善した trial の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
 
-中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。
+中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\spsa-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、retry状態から再開します。再開時に `--theta` や `--theta-json` を手で書く必要はありません。書いてあっても、runner は `state.json` の theta を使います。
 
 ```powershell
 python .\spsa_local_runner.py `

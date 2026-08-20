@@ -1854,8 +1854,6 @@ def main() -> int:
     worker: BulletOuWorker | None = None
     try:
         bounds = load_bounds(args.bounds_json)
-        theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
-        keys = tuned_keys(args, theta)
 
         runner_dir = resolve_runner_dir(args)
         trial_output_folder = runner_dir / "trials"
@@ -1899,7 +1897,13 @@ def main() -> int:
             theta_raw = state.get("theta")
             if not isinstance(theta_raw, dict):
                 raise ValueError("state theta must be an object")
+            if args.theta or args.theta_json is not None:
+                print(
+                    "WARN: --resume loads theta from runner state.json; ignoring --theta/--theta-json from the command line.",
+                    flush=True,
+                )
             theta = clamp_theta({str(key): float(value) for key, value in theta_raw.items()}, bounds)
+            keys = tuned_keys(args, theta)
             step_scale = float(state["step_scale"])
             failed_retries = int(state.get("failed_retries", 0))
             accepted_sbs = int(state.get("accepted_sbs", 0))
@@ -1923,6 +1927,8 @@ def main() -> int:
                 flush=True,
             )
         else:
+            theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
+            keys = tuned_keys(args, theta)
             assert args.base_checkpoint is not None
             accepted_checkpoint = args.base_checkpoint.resolve()
             if not (accepted_checkpoint / "state.bin").exists():
@@ -1969,6 +1975,13 @@ def main() -> int:
             accepted_sbs = 0
             retry_best = None
             start_iteration = 1
+
+        print(
+            "[theta] loaded "
+            + json.dumps({key: theta[key] for key in sorted(theta)}, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
+        print(f"[theta] tuned_keys={','.join(keys) if keys else '-'}", flush=True)
 
         if not (accepted_checkpoint / "state.bin").exists():
             raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
