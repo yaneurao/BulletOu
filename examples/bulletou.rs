@@ -1603,6 +1603,13 @@ struct BucketCountArgs {
     #[arg(long)]
     arch: NnueArch,
 
+    /// nn.bin used to read the Progress section for progressN architectures.
+    ///
+    /// Required when --arch contains progress2/3/4/8/16/32, because progress
+    /// bucket assignment is part of the exported NNUE parameters.
+    #[arg(long = "nn-bin")]
+    nn_bin: Option<PathBuf>,
+
     /// Number of teacher positions to scan. If omitted, scan every record in the teacher path once.
     #[arg(long)]
     positions: Option<usize>,
@@ -1894,6 +1901,18 @@ impl BucketCountArgs {
                 "--arch {} is not an SFNN architecture; bucket-count counts SFNN LayerStack buckets only",
                 self.arch.cli_name()
             ));
+        }
+        let layerstack = self.effective_layerstack();
+        if layerstack.progress_bucket_count() > 1 && self.nn_bin.is_none() {
+            return Err(format!(
+                "--nn-bin is required for --arch {} because progressN bucket assignment is read from nn.bin",
+                self.arch.cli_name()
+            ));
+        }
+        if let Some(path) = &self.nn_bin {
+            if !path.exists() {
+                return Err(format!("--nn-bin {} does not exist", path.display()));
+            }
         }
         if self.positions == Some(0) {
             return Err("--positions must be > 0".to_string());
@@ -6332,6 +6351,130 @@ fn cuda_cpp_sfnn_feature_kind_from_arch(arch: NnueArch) -> Result<CudaCppSfnnFea
         (NnueArchFamily::Sfnn, NnueArchFeature::Ka2) => Ok(CudaCppSfnnFeatureKind::Ka2),
         _ => Err(format!("--arch {} is not a supported SFNN architecture", arch.cli_name())),
     }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_exact_array<const N: usize, R: std::io::Read>(reader: &mut R, path: &Path, label: &str) -> Result<[u8; N], String> {
+    let mut buf = [0u8; N];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|err| format!("failed to read {} from {}: {err}", label, path.display()))?;
+    Ok(buf)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_u32_le_from_reader<R: std::io::Read>(reader: &mut R, path: &Path, label: &str) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_exact_array::<4, _>(reader, path, label)?))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_i32_le_from_reader<R: std::io::Read>(reader: &mut R, path: &Path, label: &str) -> Result<i32, String> {
+    Ok(i32::from_le_bytes(read_exact_array::<4, _>(reader, path, label)?))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn seek_forward<R: std::io::Seek>(reader: &mut R, bytes: u64, path: &Path, label: &str) -> Result<(), String> {
+    let offset =
+        i64::try_from(bytes).map_err(|_| format!("{label}: cannot seek forward {bytes} byte(s) in {}", path.display()))?;
+    reader
+        .seek(std::io::SeekFrom::Current(offset))
+        .map_err(|err| format!("failed to skip {label} in {}: {err}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn skip_leb128_block_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let mut magic = vec![0u8; LEB128_MAGIC.len()];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|err| format!("failed to read {label} LEB128 magic from {}: {err}", path.display()))?;
+    if magic.as_slice() != LEB128_MAGIC {
+        return Err(format!(
+            "{label}: missing LEB128 magic in {}; this command expects an exported SFNN nn.bin",
+            path.display()
+        ));
+    }
+    let payload_size = u64::from(read_u32_le_from_reader(reader, path, &format!("{label} payload size"))?);
+    seek_forward(reader, payload_size, path, label)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_sfnn_progress_params_from_nn_bin(
+    path: &Path,
+    arch: NnueArch,
+    layerstack: LayerStackMode,
+) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
+    let wants_progress = layerstack.progress_bucket_count() > 1;
+    let file = std::fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    let version = read_u32_le_from_reader(&mut reader, path, "NNUE header version")?;
+    if version != SFNN_NNUE_VERSION {
+        return Err(format!(
+            "{}: NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}",
+            path.display()
+        ));
+    }
+    let model_hash = read_u32_le_from_reader(&mut reader, path, "NNUE header hash")?;
+    let desc_len = read_u32_le_from_reader(&mut reader, path, "NNUE header desc_len")?;
+    seek_forward(&mut reader, u64::from(desc_len), path, "NNUE header description")?;
+
+    let ft_hash = read_u32_le_from_reader(&mut reader, path, "FeatureTransformer hash")?;
+    if ft_hash != FT_HASH_SFNN && ft_hash != FT_HASH_SFNN_LEGACY_SUISHO11PLUS {
+        return Err(format!(
+            "{}: FeatureTransformer hash mismatch: expected 0x{FT_HASH_SFNN:08X} or legacy 0x{FT_HASH_SFNN_LEGACY_SUISHO11PLUS:08X}, got 0x{ft_hash:08X}",
+            path.display()
+        ));
+    }
+    let expected_hash = if wants_progress { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
+    if model_hash != expected_hash {
+        eprintln!(
+            "  WARN: NNUE header hash 0x{model_hash:08X} differs from expected 0x{expected_hash:08X} for --arch {}",
+            arch.cli_name()
+        );
+    }
+
+    skip_leb128_block_reader(&mut reader, path, "FeatureTransformer biases")?;
+    skip_leb128_block_reader(&mut reader, path, "FeatureTransformer weights")?;
+
+    let progress_hash = match read_u32_le_from_reader(&mut reader, path, "SFNN progress hash") {
+        Ok(hash) => hash,
+        Err(err) => {
+            if wants_progress {
+                return Err(format!(
+                    "--arch {} uses progress buckets, but {} has no readable SFNN progress parameter section: {err}",
+                    arch.cli_name(),
+                    path.display()
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    if progress_hash != SHOGI_SFNN_PROGRESS_HASH {
+        if wants_progress {
+            return Err(format!(
+                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section at the expected position",
+                arch.cli_name(),
+                path.display()
+            ));
+        }
+        return Ok(None);
+    }
+
+    let bias_q16 = read_i32_le_from_reader(&mut reader, path, "SFNN progress bias")?;
+    let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+    for index in 0..SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
+        weights_q16.push(read_i32_le_from_reader(
+            &mut reader,
+            path,
+            &format!("SFNN progress weight[{index}]"),
+        )?);
+    }
+    Ok(Some(ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)?))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -14683,9 +14826,23 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
     let layerstack = args.effective_layerstack();
     let stack_count = layerstack.num_stacks();
-    if let Some(params) = sfnn_progress_params_for_layerstack(layerstack) {
+    let progress_params_source = if layerstack.progress_bucket_count() > 1 {
+        let nn_bin = args
+            .nn_bin
+            .as_deref()
+            .ok_or_else(|| format!("--nn-bin is required for --arch {}", args.arch.cli_name()))?;
+        let params = read_sfnn_progress_params_from_nn_bin(nn_bin, args.arch, layerstack)?.ok_or_else(|| {
+            format!(
+                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
+                args.arch.cli_name(),
+                nn_bin.display()
+            )
+        })?;
         set_shogi_sfnn_progress_q16_params(params)?;
-    }
+        Some(nn_bin.display().to_string())
+    } else {
+        None
+    };
     let teacher_threads = match args.threads {
         Some(0) | None => cuda_cpp_default_cpu_threads(),
         Some(threads) => threads,
@@ -14730,6 +14887,9 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         feature_kind.source_label(),
         format_count(stack_count)
     );
+    if let Some(source) = &progress_params_source {
+        eprintln!("  progress    = nn.bin Progress section: {source}");
+    }
     eprintln!(
         "  scan        = {} positions ({}), shuffle_window={} batch(es)",
         args.positions.map(format_count).unwrap_or_else(|| "all".to_string()),

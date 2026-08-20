@@ -101,6 +101,8 @@ If needed, split them by factorizer family, for example `--sfnn-king-axis-count-
 
 The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
+When the architecture contains `progressN`, such as `progress4`, the count command also needs an `nn.bin` for the same architecture so it can use the same progress bucket assignment.
+
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
 
 ---

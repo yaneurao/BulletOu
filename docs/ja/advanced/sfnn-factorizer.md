@@ -274,11 +274,14 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --nn-bin C:\path\to\same-arch\nn.bin `
   --positions 500000000 `
   --buffer-mb 1024 `
   --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
+
+`progressN` を含む architecture では、`--nn-bin` が必須です。progress bucket は `nn.bin` 内の Progress section に入っている `bias_q16` / `weights_q16` で決まるため、count.bin も同じ `nn.bin` を基準に作ります。`progressN` を含まない architecture では `--nn-bin` は不要です。
 
 `--positions` を省略すると、指定した teacher path に含まれる全ファイルを1回だけ読んで count します。大きな教師データから一部だけサンプリングしたい場合は、上の例のように `--positions` を指定します。
 

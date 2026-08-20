@@ -336,9 +336,12 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --nn-bin C:\path\to\same-arch\nn.bin `
   --positions 500000000 `
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
+
+`progressN` を含む arch では `--nn-bin` が必須です。Progress section の進行度パラメーターで bucket が決まるため、count.bin は実際に使う `nn.bin` に合わせて作ります。
 
 `--positions` を省略すると、teacher path 内の全ファイルを1回だけ読んで count します。
 

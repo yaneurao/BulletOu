@@ -350,9 +350,12 @@ With many bucket stacks, rare stacks can sometimes learn unstable residuals. You
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --nn-bin C:\path\to\same-arch\nn.bin `
   --positions 500000000 `
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
+
+For arch names containing `progressN`, `--nn-bin` is required. Bucket-count uses the Progress section from that `nn.bin`, so the count file matches the actual progress bucket assignment.
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once.
 

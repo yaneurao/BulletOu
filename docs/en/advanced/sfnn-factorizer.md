@@ -274,11 +274,14 @@ First, create a count.bin file:
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --nn-bin C:\path\to\same-arch\nn.bin `
   --positions 500000000 `
   --buffer-mb 1024 `
   --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
+
+For architectures containing `progressN`, `--nn-bin` is required. The progress bucket is determined by the `bias_q16` / `weights_q16` values in the Progress section of `nn.bin`, so count.bin must be built against the same `nn.bin`. Architectures without `progressN` do not need `--nn-bin`.
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once. Keep `--positions` when you want to sample only a prefix of a very large teacher set.
 
