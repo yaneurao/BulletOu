@@ -1729,6 +1729,23 @@ def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> No
         writer.writerow(row)
 
 
+def read_csv_rows(path: Path, fieldnames: list[str]) -> list[dict[str, str]]:
+    ensure_csv_header(path, fieldnames)
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    tmp.replace(path)
+
+
 def append_history(path: Path, row: dict[str, Any]) -> None:
     append_csv_row(path, HISTORY_FIELDS, row)
 
@@ -1748,8 +1765,7 @@ def trial_checkpoint_text(result: TrialResult) -> str:
     return str(result.checkpoint_dir)
 
 
-def append_trial_summary_row(
-    path: Path,
+def make_trial_summary_row(
     *,
     iteration: int,
     retry: int,
@@ -1765,31 +1781,42 @@ def append_trial_summary_row(
     step_scale_used: float,
     step_scale_next: float,
     spsa_move_ratio: float,
-) -> None:
-    append_trial_summary(
-        path,
-        {
-            "iteration": iteration,
-            "retry": retry,
-            "result": result_label,
-            "reason": reason,
-            "accepted_sbs": accepted_sbs,
-            "quantized_value_loss": fmt_metric(trial.metric.qloss),
-            "quantized_value_accuracy": fmt_metric(trial.metric.qacc),
-            "test_value_loss": fmt_metric(trial.metric.test_loss),
-            "test_value_accuracy": fmt_metric(trial.metric.test_acc),
-            "trial_tag": trial.tag,
-            "trial_output_dir": str(trial.output_dir),
-            "checkpoint": trial_checkpoint_text(trial),
-            "saved_checkpoint": saved_checkpoint,
-            "update_mode": update_mode,
-            "step_scale_used": f"{step_scale_used:.9f}",
-            "step_scale_next": f"{step_scale_next:.9f}",
-            "spsa_move_ratio": f"{spsa_move_ratio:.9f}",
-            "theta_change": theta_change_text(theta_before, trial_theta, keys),
-            "theta_json": json.dumps(trial_theta, ensure_ascii=False, sort_keys=True),
-        },
-    )
+) -> dict[str, Any]:
+    return {
+        "iteration": iteration,
+        "retry": retry,
+        "result": result_label,
+        "reason": reason,
+        "accepted_sbs": accepted_sbs,
+        "quantized_value_loss": fmt_metric(trial.metric.qloss),
+        "quantized_value_accuracy": fmt_metric(trial.metric.qacc),
+        "test_value_loss": fmt_metric(trial.metric.test_loss),
+        "test_value_accuracy": fmt_metric(trial.metric.test_acc),
+        "trial_tag": trial.tag,
+        "trial_output_dir": str(trial.output_dir),
+        "checkpoint": trial_checkpoint_text(trial),
+        "saved_checkpoint": saved_checkpoint,
+        "update_mode": update_mode,
+        "step_scale_used": f"{step_scale_used:.9f}",
+        "step_scale_next": f"{step_scale_next:.9f}",
+        "spsa_move_ratio": f"{spsa_move_ratio:.9f}",
+        "theta_change": theta_change_text(theta_before, trial_theta, keys),
+        "theta_json": json.dumps(trial_theta, ensure_ascii=False, sort_keys=True),
+    }
+
+
+def append_trial_summary_row(path: Path, **kwargs: Any) -> None:
+    append_trial_summary(path, make_trial_summary_row(**kwargs))
+
+
+def retry_window_rows(path: Path, iteration: int) -> list[dict[str, str]]:
+    return [row for row in read_csv_rows(path, TRIAL_SUMMARY_FIELDS) if row.get("iteration") == str(iteration)]
+
+
+def rewrite_trial_summary_iteration(path: Path, iteration: int, iteration_rows: list[dict[str, Any]]) -> None:
+    rows = [row for row in read_csv_rows(path, TRIAL_SUMMARY_FIELDS) if row.get("iteration") != str(iteration)]
+    rows.extend(iteration_rows)
+    write_csv_rows(path, TRIAL_SUMMARY_FIELDS, rows)
 
 
 def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
@@ -2227,49 +2254,61 @@ def main() -> int:
                         event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
             current_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
             forced_retry_best_tag = history_retry_best.result.tag if reason.startswith("forced_after_") and history_retry_best is not None else ""
-            candidate_tags = {trial.tag for trial in candidates}
+            if reason == "retry":
+                selected_trial_tag = current_retry_best_tag
+                selected_result_label = "retry_best"
+            elif reason.startswith("forced_after_"):
+                selected_trial_tag = forced_retry_best_tag
+                selected_result_label = "forced_accepted"
+            else:
+                selected_trial_tag = best_probe.tag
+                selected_result_label = "accepted"
+            existing_iteration_rows = retry_window_rows(trial_summary_path, iteration)
+            iteration_rows: list[dict[str, Any]] = [dict(row) for row in existing_iteration_rows]
             for trial in candidates:
-                if reason == "retry":
-                    result_label = "retry_best" if trial.tag == current_retry_best_tag else "discarded"
-                elif reason.startswith("forced_after_"):
-                    result_label = "forced_accepted" if trial.tag == forced_retry_best_tag else "discarded"
+                iteration_rows.append(
+                    make_trial_summary_row(
+                        iteration=iteration,
+                        retry=retry,
+                        result_label="pending",
+                        reason=reason,
+                        accepted_sbs=accepted_sbs,
+                        trial=trial,
+                        trial_theta=theta_for_result(trial, probe_a_theta, probe_b_theta),
+                        theta_before=theta_before,
+                        keys=keys,
+                        saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
+                        update_mode=args.update_mode,
+                        step_scale_used=step_scale_used,
+                        step_scale_next=step_scale,
+                        spsa_move_ratio=args.spsa_move_ratio,
+                    )
+                )
+            public_checkpoint_name = Path(public_checkpoint).name if public_checkpoint else ""
+            if reason == "retry":
+                if worker is not None and not args.dry_run:
+                    selected_checkpoint_text = f"worker-cache:{selected_trial_tag}"
+                elif retry_best is not None:
+                    selected_checkpoint_text = str(retry_best.result.checkpoint_dir)
                 else:
-                    result_label = "accepted" if trial.tag == best_probe.tag else "discarded"
-                append_trial_summary_row(
-                    trial_summary_path,
-                    iteration=iteration,
-                    retry=retry,
-                    result_label=result_label,
-                    reason=reason,
-                    accepted_sbs=accepted_sbs,
-                    trial=trial,
-                    trial_theta=theta_for_result(trial, probe_a_theta, probe_b_theta),
-                    theta_before=theta_before,
-                    keys=keys,
-                    saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
-                    update_mode=args.update_mode,
-                    step_scale_used=step_scale_used,
-                    step_scale_next=step_scale,
-                    spsa_move_ratio=args.spsa_move_ratio,
-                )
-            if forced_retry_best_tag and forced_retry_best_tag not in candidate_tags and history_retry_best is not None:
-                append_trial_summary_row(
-                    trial_summary_path,
-                    iteration=iteration,
-                    retry=retry,
-                    result_label="forced_accepted",
-                    reason=reason,
-                    accepted_sbs=accepted_sbs,
-                    trial=history_retry_best.result,
-                    trial_theta=history_retry_best.theta,
-                    theta_before=theta_before,
-                    keys=keys,
-                    saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
-                    update_mode=args.update_mode,
-                    step_scale_used=step_scale_used,
-                    step_scale_next=step_scale,
-                    spsa_move_ratio=args.spsa_move_ratio,
-                )
+                    selected_checkpoint_text = ""
+            elif worker is not None and not args.dry_run and not public_checkpoint:
+                selected_checkpoint_text = f"worker-resident:{selected_trial_tag}"
+            else:
+                selected_checkpoint_text = str(accepted_checkpoint)
+            for row in iteration_rows:
+                trial_tag = str(row.get("trial_tag", ""))
+                row["reason"] = reason
+                row["accepted_sbs"] = accepted_sbs
+                if trial_tag == selected_trial_tag:
+                    row["result"] = selected_result_label
+                    if selected_checkpoint_text:
+                        row["checkpoint"] = selected_checkpoint_text
+                    row["saved_checkpoint"] = public_checkpoint_name
+                else:
+                    row["result"] = "discarded"
+                    row["saved_checkpoint"] = ""
+            rewrite_trial_summary_iteration(trial_summary_path, iteration, iteration_rows)
 
             if reason != "retry" and not args.dry_run:
                 append_accepted_summary(
