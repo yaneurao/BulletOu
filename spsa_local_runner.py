@@ -160,6 +160,7 @@ PROBE_A = "probe_a"
 PROBE_B = "probe_b"
 LEGACY_PROBE_A = {"probe_a", "plus"}
 LEGACY_PROBE_B = {"probe_b", "minus"}
+TRIAL_NO_INTERVAL_SAVE_RATE = 9999
 
 
 ACCEPTED_SUMMARY_FIELDS = [
@@ -797,6 +798,10 @@ def theta_args(theta: dict[str, float], bucket_counts: Path | None) -> list[str]
     return out
 
 
+def trial_no_interval_save_rate(sb_per_trial: int) -> int:
+    return max(TRIAL_NO_INTERVAL_SAVE_RATE, sb_per_trial + 1)
+
+
 def base_command(
     args: argparse.Namespace,
     checkpoint_dir: Path,
@@ -831,7 +836,7 @@ def base_command(
         "--max-epochs",
         "1",
         "--save-rate",
-        str(args.sb_per_trial),
+        str(trial_no_interval_save_rate(args.sb_per_trial)),
         "--validation-rate",
         str(args.trial_validation_rate_sbs),
         "--quantized-validation-rate",

@@ -401,7 +401,7 @@ Use `--update-mode winner` only if you explicitly want to jump directly to the p
 
 By default, the probe trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints under `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb.
 
-Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
+Inside each trial, checkpoint saving happens only at the trial end. The runner passes a large `--save-rate` that is not reached during the trial, and relies on BulletOu's default epoch-end save to write the final trial checkpoint. Normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
 With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For probe measurement, the worker snapshots/restores GPU weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. When a probe is selected as the continuation source, the worker reruns that probe's training condition in the same session and keeps the resulting GPU state.
 
