@@ -379,7 +379,7 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 retry は同じ iteration のまま実行されます。たとえば iteration 12 の1回目が悪かった場合、次は iteration 13 ではなく iteration 12 / retry 2 になります。`accepted-summary-learn.log` には採用経路が進んだ行だけが出るので、iteration 番号は飛びません。すべての trial を1行ずつ見たい場合は `summary-learn.log` を見ます。
 
-保存も retry の回数ではなく、採用経路が進んだ量で決まります。採用または強制採用されると `accepted_sbs` が `--sb-per-trial` ぶん増え、その値が `--accepted-save-rate-sbs` の境界に来たときだけ `accepted-checkpoints/` に保存されます。
+保存も retry の回数ではなく、accept された回数で決まります。runner の `--save-rate 1` なら accept ごとに保存、`--save-rate 4` なら4回 accept するごとに `accepted-checkpoints/` へ保存します。`--save-rate 0` なら accepted checkpoint の自動保存を無効にします。
 
 パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.03` です。たとえば `pair=0.3` なら、ある probe ではおおむね `0.309`、反対側の probe では `0.291` になります。ただし、デフォルトの `--update-mode spsa` では、良かった probe の値へそのままジャンプしません。`--spsa-move-ratio 0.1` により、探索幅の10%だけ動きます。つまりこの例では `0.309` に飛ぶのではなく、だいたい `0.3009` 付近へ動きます。両方悪化した場合は `--step-shrink 0.70` で探索幅を縮め、改善した場合は `--step-grow 1.01` で少しだけ広げます。探索幅の範囲はデフォルトで `--min-step-scale 1.005` から `--max-step-scale 1.10` です。
 
@@ -391,7 +391,7 @@ trial 内の checkpoint 保存は trial 末だけです。runner は BulletOu本
 
 `--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。probe の測定では、worker がGPU上の重みとoptimizer stateをsnapshot/restoreするため、trialごとのprocess起動、CUDA warmup、checkpoint保存を避けられます。採用するときだけ、qloss が良かった probe と同じ条件で学習を進め、その状態をGPU上に残します。
 
-`--use-worker` の保存は `--accepted-save-rate-sbs` に従います。たとえば `--accepted-save-rate-sbs 32` なら、採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、`--accepted-save-rate-sbs` を小さくしてください。
+`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 8` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が32 sb進むたびに `accepted-checkpoints/0001`, `0002`, ... へ保存します。保存されていない採用状態はworker processのメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
 
 SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
 
@@ -413,7 +413,7 @@ python .\spsa_local_runner.py `
   --iterations 20 `
   --sb-per-trial 8 `
   --epoch-sbs 32 `
-  --accepted-save-rate-sbs 32 `
+  --save-rate 4 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --use-worker `
@@ -458,7 +458,7 @@ shared 以外を全部動かしたい場合は、次のようにします。
 
 `--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、各 trial で共通に使う学習条件を書きます。
 
-runner が自動で指定するので、後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。
+runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。SPSA runner 自体の保存頻度を変える `--save-rate` は、`--` より前に書きます。
 
 runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
 

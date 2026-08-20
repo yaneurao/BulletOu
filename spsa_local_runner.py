@@ -311,10 +311,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of accepted superbatches treated as one runner epoch. Used for accepted checkpoint names.",
     )
     parser.add_argument(
+        "--save-rate",
+        type=int,
+        default=None,
+        help="Save the accepted path every N accepted trials. 1 saves after every accept; 0 disables public checkpoints.",
+    )
+    parser.add_argument(
         "--accepted-save-rate-sbs",
         type=int,
-        default=32,
-        help="Save the accepted path every N accepted superbatches. 0 disables public accepted checkpoints.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--keep-trials",
@@ -425,7 +431,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Run one GPU-resident bulletou.exe worker session. Probe trials use GPU snapshot/restore "
-            "and do not write trial checkpoints; accepted states are saved only at --accepted-save-rate-sbs."
+            "and do not write trial checkpoints; accepted states are saved only at runner --save-rate boundaries."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -443,10 +449,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epoch-sbs must be > 0")
     if args.epoch_sbs % args.sb_per_trial != 0:
         parser.error("--epoch-sbs must be divisible by --sb-per-trial")
-    if args.accepted_save_rate_sbs < 0:
-        parser.error("--accepted-save-rate-sbs must be >= 0")
-    if args.accepted_save_rate_sbs and args.accepted_save_rate_sbs % args.sb_per_trial != 0:
-        parser.error("--accepted-save-rate-sbs must be divisible by --sb-per-trial")
+    if args.save_rate is not None and args.accepted_save_rate_sbs is not None:
+        parser.error("use runner --save-rate, not both --save-rate and --accepted-save-rate-sbs")
+    if args.accepted_save_rate_sbs is not None:
+        if args.accepted_save_rate_sbs < 0:
+            parser.error("--accepted-save-rate-sbs must be >= 0")
+        if args.accepted_save_rate_sbs and args.accepted_save_rate_sbs % args.sb_per_trial != 0:
+            parser.error("--accepted-save-rate-sbs must be divisible by --sb-per-trial")
+        args.save_rate = 0 if args.accepted_save_rate_sbs == 0 else args.accepted_save_rate_sbs // args.sb_per_trial
+        print(
+            "WARN: --accepted-save-rate-sbs is deprecated; use "
+            f"--save-rate {args.save_rate} instead.",
+            flush=True,
+        )
+    if args.save_rate is None:
+        args.save_rate = 4
+    if args.save_rate < 0:
+        parser.error("--save-rate must be >= 0")
     if args.trial_validation_rate_sbs <= 0:
         parser.error("--trial-validation-rate-sbs must be > 0")
     if args.trial_quantized_validation_rate_sbs <= 0:
@@ -1195,13 +1214,25 @@ def done_metric_text(
     return " ".join(parts)
 
 
-def next_save_sbs(args: argparse.Namespace, accepted_sbs: int) -> int | None:
-    if args.accepted_save_rate_sbs <= 0:
+def accepted_count(args: argparse.Namespace, accepted_sbs: int) -> int:
+    return accepted_sbs // args.sb_per_trial
+
+
+def should_save_accepted_checkpoint(args: argparse.Namespace, accepted_sbs: int) -> bool:
+    if args.save_rate <= 0:
+        return False
+    count = accepted_count(args, accepted_sbs)
+    return count > 0 and count % args.save_rate == 0
+
+
+def next_save_accept_count(args: argparse.Namespace, accepted_sbs: int) -> int | None:
+    if args.save_rate <= 0:
         return None
-    remainder = accepted_sbs % args.accepted_save_rate_sbs
+    count = accepted_count(args, accepted_sbs)
+    remainder = count % args.save_rate
     if remainder == 0:
-        return accepted_sbs
-    return accepted_sbs + (args.accepted_save_rate_sbs - remainder)
+        return count
+    return count + (args.save_rate - remainder)
 
 
 def parse_quantized_test_metric(lines: list[str]) -> Metric:
@@ -1906,7 +1937,7 @@ def main() -> int:
                     "accepted_checkpoint_policy": {
                         "keep_trials": args.keep_trials,
                         "epoch_sbs": args.epoch_sbs,
-                        "accepted_save_rate_sbs": args.accepted_save_rate_sbs,
+                        "save_rate_accepts": args.save_rate,
                         "accepted_root": str(accepted_root),
                         "current_dir": str(current_dir),
                         "retry_best_dir": str(retry_best_dir),
@@ -2132,7 +2163,7 @@ def main() -> int:
 
             public_checkpoint = ""
             if reason != "retry_with_smaller_step" and not args.dry_run:
-                if args.accepted_save_rate_sbs and accepted_sbs % args.accepted_save_rate_sbs == 0:
+                if should_save_accepted_checkpoint(args, accepted_sbs):
                     if worker is not None:
                         save_dir = accepted_root / accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)
                         if save_dir.exists():
@@ -2308,8 +2339,8 @@ def main() -> int:
                         bold=True,
                     )
                 elif worker is not None and not args.dry_run:
-                    save_at = next_save_sbs(args, accepted_sbs)
-                    suffix = f" next_save_accepted_sbs={save_at}" if save_at is not None else " public_save_disabled"
+                    save_at = next_save_accept_count(args, accepted_sbs)
+                    suffix = f" next_save_accept={save_at}" if save_at is not None else " public_save_disabled"
                     event_line(
                         args,
                         "WAIT FOR SAVE",

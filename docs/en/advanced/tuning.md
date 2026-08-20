@@ -393,7 +393,7 @@ If both trials are worse than the base, the runner does not adopt either side im
 
 Retries stay under the same iteration number. For example, if iteration 12 fails on its first attempt, the next attempt is iteration 12 / retry 2, not iteration 13. `accepted-summary-learn.log` only records rows where the accepted path advances, so iteration numbers do not skip. Use `summary-learn.log` when you want one row per trial, including discarded trials.
 
-Saving is also based on accepted progress, not on retry count. When an attempt is accepted or force-accepted, `accepted_sbs` increases by `--sb-per-trial`; the runner writes to `accepted-checkpoints/` only when that value reaches a `--accepted-save-rate-sbs` boundary.
+Saving is also based on accepted trials, not on retry count. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
 
 The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. If both probes get worse, `--step-shrink 0.70` reduces the perturbation. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
 
@@ -405,7 +405,7 @@ Inside each trial, checkpoint saving happens only at the trial end. The runner p
 
 With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. For probe measurement, the worker snapshots/restores GPU weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. When a probe is selected as the continuation source, the worker reruns that probe's training condition in the same session and keeps the resulting GPU state.
 
-Saving under `--use-worker` follows `--accepted-save-rate-sbs`. For example, `--accepted-save-rate-sbs 32` writes `accepted-checkpoints/0001`, `0002`, ... every 32 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller `--accepted-save-rate-sbs` when exact interruption recovery matters.
+Saving under `--use-worker` follows runner `--save-rate` too. For example, with `--sb-per-trial 8`, `--save-rate 4` writes `accepted-checkpoints/0001`, `0002`, ... every four accepts, which is every 32 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller runner `--save-rate` when exact interruption recovery matters.
 
 The runner judges hyperparameters from the qloss difference between short trials. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting an 8-sb decision too much.
 
@@ -427,7 +427,7 @@ python .\spsa_local_runner.py `
   --iterations 20 `
   --sb-per-trial 8 `
   --epoch-sbs 32 `
-  --accepted-save-rate-sbs 32 `
+  --save-rate 4 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
   --use-worker `
@@ -472,7 +472,7 @@ To tune everything except shared, use:
 
 The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common trial options such as `--lr` and `--optimizer` there.
 
-Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial.
+Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial. If you want to change the SPSA runner's own save interval, put runner `--save-rate` before the delimiter.
 
 The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
 
