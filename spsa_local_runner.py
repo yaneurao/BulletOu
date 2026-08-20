@@ -347,6 +347,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not mirror bulletou.exe stdout to the console. Logs are still saved.",
     )
+    parser.add_argument(
+        "--use-worker",
+        action="store_true",
+        help=(
+            "Run bulletou.exe worker once and send train/quantized-test requests over JSON Lines. "
+            "This avoids per-trial process startup, but still uses the current trainer path."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to bulletou.exe")
     args = parser.parse_args()
@@ -854,6 +862,106 @@ def run_process_tee(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, 
     return returncode, elapsed, lines
 
 
+class BulletOuWorker:
+    def __init__(self, exe: str, log_path: Path, stream: bool) -> None:
+        self.exe = exe
+        self.stream = stream
+        self.next_id = 1
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.main_log = log_path.open("a", encoding="utf-8", newline="")
+        self.proc = subprocess.Popen(
+            [exe, "worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+        if self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError("failed to open bulletou worker pipes")
+
+    def close(self) -> None:
+        try:
+            if self.proc.poll() is None:
+                try:
+                    self.request("quit", {}, Path(os_devnull_log_name()), stream=False)
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                self.main_log.close()
+            except Exception:
+                pass
+
+    def request(
+        self,
+        cmd: str,
+        payload: dict[str, Any],
+        log_path: Path,
+        stream: bool,
+    ) -> tuple[dict[str, Any], float, list[str]]:
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"bulletou worker already exited with code {self.proc.returncode}")
+        request_id = self.next_id
+        self.next_id += 1
+        request = {"id": request_id, "cmd": cmd}
+        request.update(payload)
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+
+        lines: list[str] = []
+        started = time.time()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8", newline="") as log:
+            request_line = json.dumps(request, ensure_ascii=False)
+            self.main_log.write(f">>> {request_line}\n")
+            self.main_log.flush()
+            self.proc.stdin.write(request_line + "\n")
+            self.proc.stdin.flush()
+            while True:
+                line = self.proc.stdout.readline()
+                if line == "":
+                    returncode = self.proc.poll()
+                    if returncode is None:
+                        continue
+                    raise RuntimeError(f"bulletou worker exited while waiting for `{cmd}` response: code={returncode}")
+                lines.append(line)
+                log.write(line)
+                log.flush()
+                self.main_log.write(line)
+                self.main_log.flush()
+                if stream:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(response, dict) or response.get("id") != request_id or "ok" not in response:
+                    continue
+                elapsed = time.time() - started
+                if not response.get("ok"):
+                    error = response.get("error", "unknown worker error")
+                    raise RuntimeError(f"worker `{cmd}` failed: {error}")
+                payload_value = response.get("payload", {})
+                if not isinstance(payload_value, dict):
+                    raise RuntimeError(f"worker `{cmd}` returned non-object payload")
+                return payload_value, elapsed, lines
+
+
+def os_devnull_log_name() -> str:
+    return "NUL" if sys.platform.startswith("win") else "/dev/null"
+
+
 def parse_quantized_test_metric(lines: list[str]) -> Metric:
     qacc: float | None = None
     qloss: float | None = None
@@ -877,13 +985,25 @@ def parse_quantized_test_metric(lines: list[str]) -> Metric:
     return Metric(qloss=qloss, qacc=qacc, test_loss=test_loss, test_acc=None)
 
 
-def run_base_quantized_test(args: argparse.Namespace, base_checkpoint: Path, log_dir: Path) -> Metric:
+def metric_from_worker_quantized_payload(payload: dict[str, Any]) -> Metric:
+    return Metric(
+        qloss=parse_float(str(payload.get("quantized_value_loss")) if payload.get("quantized_value_loss") is not None else None),
+        qacc=parse_float(str(payload.get("quantized_value_accuracy")) if payload.get("quantized_value_accuracy") is not None else None),
+        test_loss=parse_float(str(payload.get("train_scale_loss")) if payload.get("train_scale_loss") is not None else None),
+        test_acc=None,
+    )
+
+
+def run_base_quantized_test(
+    args: argparse.Namespace,
+    base_checkpoint: Path,
+    log_dir: Path,
+    worker: BulletOuWorker | None = None,
+) -> Metric:
     nn_bin = base_checkpoint / "nn.bin"
     if not nn_bin.exists():
         raise FileNotFoundError(f"{nn_bin} does not exist; use --base-metric-source summary or provide a checkpoint with nn.bin")
-    cmd = [
-        str(args.exe),
-        "quantized-test",
+    qt_args = [
         "--arch",
         args.arch,
         "--nn-bin",
@@ -893,13 +1013,24 @@ def run_base_quantized_test(args: argparse.Namespace, base_checkpoint: Path, log
         "--mode",
         args.base_quantized_test_mode,
     ]
-    cmd.extend(quantized_test_passthrough_args(args.extra_args))
+    qt_args.extend(quantized_test_passthrough_args(args.extra_args))
+    cmd = [str(args.exe), "quantized-test", *qt_args]
     log_path = log_dir / "base-quantized-test.stdout.log"
-    print("[base-run] " + subprocess.list2cmdline(cmd), flush=True)
-    returncode, elapsed, lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
-    if returncode != 0:
-        raise RuntimeError(f"base quantized-test failed with exit code {returncode}; see {log_path}")
-    metric = parse_quantized_test_metric(lines)
+    if worker is not None:
+        print("[base-run worker] quantized-test " + subprocess.list2cmdline(qt_args), flush=True)
+        payload, elapsed, _lines = worker.request(
+            "quantized-test",
+            {"args": qt_args},
+            log_path,
+            stream=not args.no_stream_child_output,
+        )
+        metric = metric_from_worker_quantized_payload(payload)
+    else:
+        print("[base-run] " + subprocess.list2cmdline(cmd), flush=True)
+        returncode, elapsed, lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
+        if returncode != 0:
+            raise RuntimeError(f"base quantized-test failed with exit code {returncode}; see {log_path}")
+        metric = parse_quantized_test_metric(lines)
     print(
         f"[base-done] source=quantized-test mode={args.base_quantized_test_mode} "
         f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} "
@@ -917,6 +1048,7 @@ def run_trial(
     theta: dict[str, float],
     trial_output_folder: Path,
     log_dir: Path,
+    worker: BulletOuWorker | None = None,
 ) -> TrialResult:
     cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
     log_path = log_dir / f"{tag}.stdout.log"
@@ -925,9 +1057,17 @@ def run_trial(
     if args.dry_run:
         return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
     prune_trial_output_by_tag(trial_output_folder, tag)
-    returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
-    if returncode != 0:
-        raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
+    if worker is not None:
+        _payload, elapsed, _lines = worker.request(
+            "train",
+            {"args": cmd[1:]},
+            log_path,
+            stream=not args.no_stream_child_output,
+        )
+    else:
+        returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
+        if returncode != 0:
+            raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
     output_dir = find_output_dir(trial_output_folder, tag)
     row = last_summary_row(output_dir / "summary-learn.log")
     metric = metric_from_row(row)
@@ -1195,6 +1335,7 @@ def write_runner_state(
 
 def main() -> int:
     args = parse_args()
+    worker: BulletOuWorker | None = None
     try:
         bounds = load_bounds(args.bounds_json)
         theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
@@ -1215,6 +1356,20 @@ def main() -> int:
         history_path = runner_dir / "history.csv"
         accepted_summary_path = runner_dir / "accepted-summary-learn.log"
         ensure_csv_header(accepted_summary_path, ACCEPTED_SUMMARY_FIELDS)
+
+        if args.use_worker and not args.dry_run:
+            worker = BulletOuWorker(str(args.exe), log_dir / "worker.stdout.log", stream=not args.no_stream_child_output)
+            hello_payload, _hello_elapsed, _hello_lines = worker.request(
+                "hello",
+                {},
+                log_dir / "worker-hello.stdout.log",
+                stream=not args.no_stream_child_output,
+            )
+            print(
+                f"[worker] started protocol={hello_payload.get('protocol_version')} "
+                f"capabilities={hello_payload.get('capabilities')}",
+                flush=True,
+            )
 
         if args.resume_runner:
             if not state_path.exists():
@@ -1255,7 +1410,7 @@ def main() -> int:
                 base_score = args.base_score
                 base_source = "--base-score"
             elif args.base_metric_source == "quantized-test" and not args.dry_run:
-                base_metric = run_base_quantized_test(args, accepted_checkpoint, log_dir)
+                base_metric = run_base_quantized_test(args, accepted_checkpoint, log_dir, worker)
                 base_score = base_metric.score(args.metric)
                 base_source = str(log_dir / "base-quantized-test.stdout.log")
             else:
@@ -1346,8 +1501,26 @@ def main() -> int:
                 update_mode=args.update_mode,
             )
 
-            plus = run_trial(args, accepted_checkpoint, f"{tag_base}-plus", "plus", plus_theta, trial_output_folder, log_dir)
-            minus = run_trial(args, accepted_checkpoint, f"{tag_base}-minus", "minus", minus_theta, trial_output_folder, log_dir)
+            plus = run_trial(
+                args,
+                accepted_checkpoint,
+                f"{tag_base}-plus",
+                "plus",
+                plus_theta,
+                trial_output_folder,
+                log_dir,
+                worker,
+            )
+            minus = run_trial(
+                args,
+                accepted_checkpoint,
+                f"{tag_base}-minus",
+                "minus",
+                minus_theta,
+                trial_output_folder,
+                log_dir,
+                worker,
+            )
             candidates = [plus, minus]
             pair_best = min(candidates, key=lambda item: item.score)
             pair_best_theta = theta_for_result(pair_best, plus_theta, minus_theta)
@@ -1543,6 +1716,9 @@ def main() -> int:
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if worker is not None:
+            worker.close()
 
 
 if __name__ == "__main__":

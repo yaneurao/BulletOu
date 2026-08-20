@@ -399,6 +399,8 @@ By default, the plus/minus trial directories are deleted after the decision. The
 
 Inside each trial, checkpoint saving still happens only at the trial end, but normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
 
+With `--use-worker`, the runner starts `bulletou.exe worker` once and sends each trial through JSON Lines. This avoids per-trial process startup. At this stage, trial-end checkpoint saving and the existing trainer initialization path still remain. The faster design where the worker snapshots/restores CUDA state and compares plus/minus trials without disk checkpoints is the next implementation phase.
+
 The runner judges hyperparameters from the qloss difference between short trials. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting an 8-sb decision too much.
 
 Example:
@@ -422,6 +424,7 @@ python .\spsa_local_runner.py `
   --accepted-save-rate-sbs 32 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
+  --use-worker `
   --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
   --tune axis `
   --tune pair `

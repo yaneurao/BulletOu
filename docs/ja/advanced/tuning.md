@@ -385,6 +385,8 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 
 trial 内の checkpoint 保存は trial 末だけですが、通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
 
+`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、各 trial を JSON Lines で worker に送ります。これにより trial ごとの process 起動は避けられます。ただし、現時点では trial 末の checkpoint 保存や既存 trainer の初期化経路は残っています。CUDA 状態を worker 内で snapshot / restore して disk 保存なしで plus/minus を比較する高速化は、次の実装段階です。
+
 SPSA runner では、trial の qloss 差からハイパーパラメーターの良し悪しを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、8sbだけの判定に頼りすぎないほうが安全です。
 
 例:
@@ -408,6 +410,7 @@ python .\spsa_local_runner.py `
   --accepted-save-rate-sbs 32 `
   --positions-per-superbatch 40000000 `
   --metric quantized_value_loss `
+  --use-worker `
   --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
   --tune axis `
   --tune pair `
