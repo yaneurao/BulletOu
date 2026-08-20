@@ -9254,6 +9254,16 @@ fn worker_json_bool(request: &serde_json::Value, field: &str, default_value: boo
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_string_opt(request: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    match request.get(field) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => {
+            value.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("worker `{field}` must be a string"))
+        }
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn worker_args_from_json(request: &serde_json::Value, program: &str) -> Result<Args, String> {
     let mut raw_args = Vec::<std::ffi::OsString>::new();
     raw_args.push(std::ffi::OsString::from(program));
@@ -9296,6 +9306,16 @@ struct WorkerSfnnHostSnapshot {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+struct WorkerSfnnCachedTrialState {
+    snapshot: WorkerSfnnHostSnapshot,
+    args: Args,
+    dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+    completed_steps: usize,
+    optimizer_steps: usize,
+    outcome: WorkerSfnnTrialOutcome,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnSession {
     args: Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -9312,6 +9332,7 @@ struct WorkerSfnnSession {
     completed_steps: usize,
     optimizer_steps: usize,
     dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+    cached_trial_states: std::collections::HashMap<String, WorkerSfnnCachedTrialState>,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9395,6 +9416,7 @@ impl WorkerSfnnSession {
             completed_steps: initial_state.completed_steps,
             optimizer_steps: initial_state.optimizer_steps,
             dataloader_pos,
+            cached_trial_states: std::collections::HashMap::new(),
         })
     }
 
@@ -9451,13 +9473,13 @@ impl WorkerSfnnSession {
         Ok(())
     }
 
-    fn snapshot_host(&mut self) -> Result<WorkerSfnnHostSnapshot, String> {
+    fn snapshot_host_labeled(&mut self, label: &str) -> Result<WorkerSfnnHostSnapshot, String> {
         self.ctx.synchronize().map_err(|e| e.to_string())?;
         let started = std::time::Instant::now();
         let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
         let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
         eprintln!(
-            "  worker snapshot = host RAM: weights + optimizer state readback {}",
+            "  worker {label} = host RAM: weights + optimizer state readback {}",
             format_duration_secs(started.elapsed())
         );
         Ok(WorkerSfnnHostSnapshot { weights, optimizer_states })
@@ -9506,7 +9528,12 @@ impl WorkerSfnnSession {
         }
     }
 
-    fn run_trial(&mut self, trial_args: Args, keep: bool) -> Result<WorkerSfnnTrialOutcome, String> {
+    fn run_trial(
+        &mut self,
+        trial_args: Args,
+        keep: bool,
+        cache_key: Option<String>,
+    ) -> Result<WorkerSfnnTrialOutcome, String> {
         let trial_feature = worker_require_sfnn_feature(&trial_args)?;
         if trial_feature != self.feature_kind {
             return Err("worker trial feature kind differs from the opened session".to_string());
@@ -9531,7 +9558,7 @@ impl WorkerSfnnSession {
         validate_teacher_shuffle_buffer(&trial_args, schedule.batches_per_superbatch)?;
         let teacher_shuffle_buffer_batches =
             effective_teacher_shuffle_buffer_batches(&trial_args, schedule.batches_per_superbatch)?;
-        let snapshot = if keep { None } else { Some(self.snapshot_host()?) };
+        let snapshot = if keep { None } else { Some(self.snapshot_host_labeled("base snapshot")?) };
         let base_args = self.args.clone();
         let base_dataloader_pos = self.dataloader_pos;
         self.apply_args_to_runner(&trial_args)?;
@@ -9747,7 +9774,7 @@ impl WorkerSfnnSession {
         let elapsed = started.elapsed();
         eprintln!(
             "  worker {}: steps={}, updates={}, test_loss={}, test_acc={}, qloss={}, qacc={}, elapsed={}",
-            if keep { "adopt" } else { "trial" },
+            if keep { "keep" } else { "trial" },
             format_count(seen_steps),
             format_count(optimizer_updates),
             test_metrics.map(|m| format!("{:.8}", m.loss)).unwrap_or_else(|| "-".to_string()),
@@ -9756,24 +9783,60 @@ impl WorkerSfnnSession {
             quantized_metrics.map(|m| format!("{:.7}", m.accuracy)).unwrap_or_else(|| "-".to_string()),
             format_duration_secs(elapsed)
         );
-        if keep {
-            self.completed_steps = self.completed_steps.saturating_add(seen_steps);
-            self.optimizer_steps = self.optimizer_steps.saturating_add(optimizer_updates);
-            self.dataloader_pos = Some(dataloader_pos);
-            self.args = trial_args;
-        } else if let Some(snapshot) = snapshot.as_ref() {
-            self.restore_host_snapshot(&base_args, snapshot)?;
-            self.args = base_args;
-            self.dataloader_pos = base_dataloader_pos;
-        }
-        Ok(WorkerSfnnTrialOutcome {
+        let completed_steps_after = self.completed_steps.saturating_add(seen_steps);
+        let optimizer_steps_after = self.optimizer_steps.saturating_add(optimizer_updates);
+        let outcome = WorkerSfnnTrialOutcome {
             steps: seen_steps,
             optimizer_updates,
             dataloader_pos,
             test_metrics,
             quantized_metrics,
             elapsed,
-        })
+        };
+        if keep {
+            self.completed_steps = completed_steps_after;
+            self.optimizer_steps = optimizer_steps_after;
+            self.dataloader_pos = Some(dataloader_pos);
+            self.args = trial_args;
+            self.cached_trial_states.clear();
+        } else if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(cache_key) = cache_key {
+                let trial_snapshot = self.snapshot_host_labeled("trial cache")?;
+                let previous = self.cached_trial_states.insert(
+                    cache_key.clone(),
+                    WorkerSfnnCachedTrialState {
+                        snapshot: trial_snapshot,
+                        args: trial_args.clone(),
+                        dataloader_pos,
+                        completed_steps: completed_steps_after,
+                        optimizer_steps: optimizer_steps_after,
+                        outcome: outcome.clone(),
+                    },
+                );
+                if previous.is_some() {
+                    eprintln!("  WARN: replaced cached worker trial state `{cache_key}`");
+                }
+            }
+            self.restore_host_snapshot(&base_args, snapshot)?;
+            self.args = base_args;
+            self.dataloader_pos = base_dataloader_pos;
+        }
+        Ok(outcome)
+    }
+
+    fn accept_cached_trial(&mut self, key: &str) -> Result<WorkerSfnnTrialOutcome, String> {
+        let cached = self
+            .cached_trial_states
+            .remove(key)
+            .ok_or_else(|| format!("worker cached trial state `{key}` does not exist"))?;
+        self.restore_host_snapshot(&cached.args, &cached.snapshot)?;
+        self.args = cached.args;
+        self.dataloader_pos = Some(cached.dataloader_pos);
+        self.completed_steps = cached.completed_steps;
+        self.optimizer_steps = cached.optimizer_steps;
+        self.cached_trial_states.clear();
+        eprintln!("  worker accepted cached trial state `{key}` without extra training");
+        Ok(cached.outcome)
     }
 
     fn save(&mut self, args: Option<Args>, epoch: usize, superbatch: usize) -> Result<std::path::PathBuf, String> {
@@ -9948,8 +10011,8 @@ fn worker_handle_request(
                 serde_json::json!({
                     "worker": "bulletou",
                     "protocol_version": args.protocol_version,
-                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "adopt", "save", "quit"],
-                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state and restores; `adopt` reruns and keeps the accepted branch.",
+                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "accept-cached-trial", "drop-cached-trials", "save", "quit"],
+                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state, optionally caches the measured state, and restores; `accept-cached-trial` keeps one cached probe without extra training.",
                 }),
             ),
             false,
@@ -9980,13 +10043,14 @@ fn worker_handle_request(
             Ok(payload) => (worker_response_ok(id, cmd, payload), false),
             Err(error) => (worker_response_error(id, error), false),
         },
-        "trial" | "adopt" => {
+        "trial" => {
             let Some(session) = session.as_mut() else {
                 return (worker_response_error(id, format!("worker command `{cmd}` requires `open` first")), false);
             };
             match worker_args_from_json(request, &format!("bulletou worker {cmd}")).and_then(|trial_args| {
-                let keep = if cmd == "adopt" { true } else { worker_json_bool(request, "keep", false)? };
-                session.run_trial(trial_args, keep).map(|outcome| (keep, outcome))
+                let keep = worker_json_bool(request, "keep", false)?;
+                let cache_key = worker_json_string_opt(request, "cache_key")?;
+                session.run_trial(trial_args, keep, cache_key).map(|outcome| (keep, outcome))
             }) {
                 Ok((keep, outcome)) => {
                     let mut payload = worker_trial_payload(&outcome);
@@ -9994,11 +10058,71 @@ fn worker_handle_request(
                         map.insert("kept".to_string(), serde_json::json!(keep));
                         map.insert("completed_steps".to_string(), serde_json::json!(session.completed_steps));
                         map.insert("optimizer_steps".to_string(), serde_json::json!(session.optimizer_steps));
+                        map.insert(
+                            "cached_trial_states".to_string(),
+                            serde_json::json!(session.cached_trial_states.len()),
+                        );
                     }
                     (worker_response_ok(id, cmd, payload), false)
                 }
                 Err(error) => (worker_response_error(id, error), false),
             }
+        }
+        "accept-cached-trial" => {
+            let Some(session) = session.as_mut() else {
+                return (
+                    worker_response_error(id, "worker command `accept-cached-trial` requires `open` first"),
+                    false,
+                );
+            };
+            let cache_key = match worker_json_string_opt(request, "cache_key") {
+                Ok(Some(key)) => key,
+                Ok(None) => return (worker_response_error(id, "`accept-cached-trial` requires `cache_key`"), false),
+                Err(error) => return (worker_response_error(id, error), false),
+            };
+            match session.accept_cached_trial(&cache_key) {
+                Ok(outcome) => {
+                    let mut payload = worker_trial_payload(&outcome);
+                    if let Some(map) = payload.as_object_mut() {
+                        map.insert("kept".to_string(), serde_json::json!(true));
+                        map.insert("cache_key".to_string(), serde_json::json!(cache_key));
+                        map.insert("completed_steps".to_string(), serde_json::json!(session.completed_steps));
+                        map.insert("optimizer_steps".to_string(), serde_json::json!(session.optimizer_steps));
+                        map.insert(
+                            "cached_trial_states".to_string(),
+                            serde_json::json!(session.cached_trial_states.len()),
+                        );
+                    }
+                    (worker_response_ok(id, cmd, payload), false)
+                }
+                Err(error) => (worker_response_error(id, error), false),
+            }
+        }
+        "drop-cached-trials" => {
+            let Some(session) = session.as_mut() else {
+                return (worker_response_error(id, "worker command `drop-cached-trials` requires `open` first"), false);
+            };
+            let keys = match worker_json_string_array(request, "cache_keys") {
+                Ok(keys) => keys,
+                Err(error) => return (worker_response_error(id, error), false),
+            };
+            let mut dropped = 0usize;
+            for key in keys {
+                if session.cached_trial_states.remove(&key).is_some() {
+                    dropped += 1;
+                }
+            }
+            (
+                worker_response_ok(
+                    id,
+                    cmd,
+                    serde_json::json!({
+                        "dropped": dropped,
+                        "cached_trial_states": session.cached_trial_states.len(),
+                    }),
+                ),
+                false,
+            )
         }
         "save" => {
             let Some(session) = session.as_mut() else {

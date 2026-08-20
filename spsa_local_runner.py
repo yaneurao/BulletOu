@@ -412,7 +412,7 @@ def parse_args() -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=2,
-        help="Force-adopt the best retry trial after this many non-improving probe pairs. Default: 2.",
+        help="Force-accept the best retry trial after this many non-improving probe pairs. Default: 2.",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -1317,16 +1317,6 @@ def worker_open_session(
     )
 
 
-def worker_trial_theta(result: TrialResult) -> dict[str, float]:
-    raw = result.summary_row.get("worker_trial_theta_json")
-    if not raw:
-        raise ValueError(f"worker trial {result.tag} does not carry worker_trial_theta_json")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("worker_trial_theta_json must decode to an object")
-    return {str(k): float(v) for k, v in value.items()}
-
-
 def probe_label(side: str) -> str:
     if side in LEGACY_PROBE_A:
         return "probe A"
@@ -1335,23 +1325,16 @@ def probe_label(side: str) -> str:
     return side.replace("_", " ")
 
 
-def worker_adopt_trial(
+def worker_accept_cached_trial(
     args: argparse.Namespace,
     worker: BulletOuWorker,
-    checkpoint_dir: Path,
-    tag: str,
-    side: str,
-    theta: dict[str, float],
-    trial_output_folder: Path,
+    result: TrialResult,
     log_dir: Path,
 ) -> TrialResult:
-    cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
-    log_path = log_dir / f"{tag}.stdout.log"
-    event_line(args, "ACCEPT RUN", f"keep accepted {probe_label(side)} tag={tag}", "green", bold=True)
-    print("      " + subprocess.list2cmdline(cmd), flush=True)
+    log_path = log_dir / f"{result.tag}.accept.stdout.log"
     payload, elapsed, _lines = worker.request(
-        "adopt",
-        {"args": cmd[1:]},
+        "accept-cached-trial",
+        {"cache_key": result.tag},
         log_path,
         stream=not args.no_stream_child_output,
     )
@@ -1363,16 +1346,33 @@ def worker_adopt_trial(
         "quantized_value_accuracy": fmt_metric(metric.qacc),
         "quantized_value_loss": fmt_metric(metric.qloss),
         "checkpoint": "",
-        "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
+        "worker_trial_theta_json": result.summary_row.get("worker_trial_theta_json", ""),
     }
     event_line(
         args,
-        "ACCEPT DONE",
-        f"tag={tag} {done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s",
+        "CACHE",
+        f"accepted cached {probe_label(result.side)} state tag={result.tag} {done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s",
         "green",
         bold=True,
     )
-    return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
+    return TrialResult(result.side, result.tag, result.output_dir, result.checkpoint_dir, metric, score, row)
+
+
+def worker_drop_cached_trials(
+    worker: BulletOuWorker | None,
+    keys: list[str],
+    log_dir: Path,
+    *,
+    stream: bool,
+) -> None:
+    if worker is None or not keys:
+        return
+    worker.request(
+        "drop-cached-trials",
+        {"cache_keys": keys},
+        log_dir / "worker-drop-cached-trials.stdout.log",
+        stream=stream,
+    )
 
 
 def worker_save_checkpoint(
@@ -1475,7 +1475,7 @@ def run_trial(
     if worker is not None:
         payload, elapsed, _lines = worker.request(
             "trial",
-            {"args": cmd[1:]},
+            {"args": cmd[1:], "cache_key": tag},
             log_path,
             stream=not args.no_stream_child_output,
         )
@@ -2112,22 +2112,13 @@ def main() -> int:
             probe_decision_line(args, best_probe, old_base_score)
             best = best_probe
             history_retry_best = retry_best
+            previous_retry_best_tag = retry_best.result.tag if retry_best is not None else ""
 
             if best_probe.score < base_score:
                 reason = "improved"
                 theta = theta_candidate
                 if worker is not None and not args.dry_run:
-                    train_theta = worker_trial_theta(best_probe)
-                    best = worker_adopt_trial(
-                        args,
-                        worker,
-                        accepted_checkpoint,
-                        f"{tag_base}-accepted",
-                        best_probe.side,
-                        train_theta,
-                        trial_output_folder,
-                        log_dir,
-                    )
+                    best = worker_accept_cached_trial(args, worker, best_probe, log_dir)
                     safe_rmtree(retry_best_dir, runner_dir)
                 elif not args.dry_run and not args.keep_trials:
                     accepted_checkpoint = move_checkpoint_to_current(best_probe.checkpoint_dir, current_dir, runner_dir)
@@ -2169,17 +2160,7 @@ def main() -> int:
                 best = retry_best.result
                 theta = retry_best.theta
                 if worker is not None and not args.dry_run:
-                    train_theta = worker_trial_theta(best)
-                    best = worker_adopt_trial(
-                        args,
-                        worker,
-                        accepted_checkpoint,
-                        f"{tag_base}-accepted-forced",
-                        best.side,
-                        train_theta,
-                        trial_output_folder,
-                        log_dir,
-                    )
+                    best = worker_accept_cached_trial(args, worker, best, log_dir)
                 elif not args.dry_run and not args.keep_trials:
                     accepted_checkpoint = move_checkpoint_to_current(retry_best.result.checkpoint_dir, current_dir, runner_dir)
                 else:
@@ -2194,6 +2175,18 @@ def main() -> int:
                 reason = "retry_with_smaller_step"
                 failed_retries += 1
                 step_scale = max(args.min_step_scale, step_scale * args.step_shrink)
+
+            if worker is not None and not args.dry_run and reason == "retry_with_smaller_step":
+                keep_tag = retry_best.result.tag if retry_best is not None else ""
+                drop_keys = [trial.tag for trial in candidates if trial.tag != keep_tag]
+                if previous_retry_best_tag and previous_retry_best_tag != keep_tag:
+                    drop_keys.append(previous_retry_best_tag)
+                worker_drop_cached_trials(
+                    worker,
+                    sorted(set(drop_keys)),
+                    log_dir,
+                    stream=not args.no_stream_child_output,
+                )
 
             public_checkpoint = ""
             if reason != "retry_with_smaller_step" and not args.dry_run:
