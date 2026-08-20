@@ -46,6 +46,9 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_STEP_SCALE = 1.005
+
+
 DEFAULT_THETA: dict[str, float] = {
     "shared_alpha": 1.0,
     "king_axis_alpha": 1.0,
@@ -382,12 +385,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step-scale",
         type=float,
-        default=1.03,
-        help="Initial multiplicative perturbation scale. 1.03 moves 0.300 to about 0.309/0.291.",
+        default=None,
+        help="Fixed multiplicative perturbation scale. Default: 1.005. 1.005 moves 0.300 to about 0.3015/0.2985.",
     )
-    parser.add_argument("--step-grow", type=float, default=1.01, help="Grow factor after an improving acceptance")
-    parser.add_argument("--min-step-scale", type=float, default=1.005)
-    parser.add_argument("--max-step-scale", type=float, default=1.10)
     parser.add_argument(
         "--update-mode",
         choices=["spsa", "winner"],
@@ -471,16 +471,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--trial-quantized-validation-rate-sbs must be > 0")
     if args.positions_per_superbatch <= 0:
         parser.error("--positions-per-superbatch must be > 0")
-    for name in ["step_scale", "step_grow", "min_step_scale", "max_step_scale"]:
-        value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0:
-            parser.error(f"--{name.replace('_', '-')} must be finite and > 0")
-    if args.step_scale <= 1.0:
-        parser.error("--step-scale should be > 1")
-    if args.min_step_scale <= 1.0:
-        parser.error("--min-step-scale should be > 1")
-    if args.max_step_scale < args.min_step_scale:
-        parser.error("--max-step-scale must be >= --min-step-scale")
+    if args.step_scale is not None:
+        if not math.isfinite(args.step_scale) or args.step_scale <= 0:
+            parser.error("--step-scale must be finite and > 0")
+        if args.step_scale <= 1.0:
+            parser.error("--step-scale should be > 1")
     if not math.isfinite(args.spsa_move_ratio) or args.spsa_move_ratio < 0.0:
         parser.error("--spsa-move-ratio must be finite and >= 0")
     if args.max_retries < 0:
@@ -1946,6 +1941,13 @@ def main() -> int:
             theta = clamp_theta({str(key): float(value) for key, value in theta_raw.items()}, bounds)
             keys = tuned_keys(args, theta)
             step_scale = float(state["step_scale"])
+            if args.step_scale is not None:
+                print(
+                    f"WARN: --resume overriding fixed step_scale from state.json: "
+                    f"{step_scale:.9f} -> {args.step_scale:.9f}",
+                    flush=True,
+                )
+                step_scale = args.step_scale
             failed_retries = int(state.get("failed_retries", 0))
             accepted_sbs = int(state.get("accepted_sbs", 0))
             retry_best = retry_best_from_json(state.get("retry_best"))
@@ -2011,7 +2013,7 @@ def main() -> int:
                     },
                 },
             )
-            step_scale = args.step_scale
+            step_scale = args.step_scale if args.step_scale is not None else DEFAULT_STEP_SCALE
             failed_retries = 0
             accepted_sbs = 0
             retry_best = None
@@ -2174,7 +2176,6 @@ def main() -> int:
                 base_metric = best_probe.metric
                 base_score = best_probe.score
                 failed_retries = 0
-                step_scale = min(args.max_step_scale, max(args.min_step_scale, step_scale * args.step_grow))
                 accepted_sbs += args.sb_per_trial
             else:
                 if retry_best is None or best_probe.score < retry_best.result.score:
@@ -2213,7 +2214,6 @@ def main() -> int:
                 base_metric = best.metric
                 base_score = best.score
                 failed_retries = 0
-                step_scale = args.min_step_scale
                 accepted_sbs += args.sb_per_trial
             elif best_probe.score >= old_base_score:
                 reason = "retry"

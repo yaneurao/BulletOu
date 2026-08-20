@@ -397,7 +397,7 @@ Retries stay under the same iteration number. For example, if iteration 12 fails
 
 Saving is also based on accepted trials, not on retry count. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
 
-The perturbation size is multiplicative. The default is `--step-scale 1.03`. For example, `pair=0.3` becomes roughly `0.309` in one probe and `0.291` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.3009`, not `0.309`. Retries keep the same perturbation size. After an improving acceptance, `--step-grow 1.01` increases it slightly. The default allowed range is `--min-step-scale 1.005` to `--max-step-scale 1.10`.
+The perturbation size is multiplicative. The default is `--step-scale 1.005`. For example, `pair=0.3` becomes roughly `0.3015` in one probe and `0.2985` in the opposite probe. With the default `--update-mode spsa`, the runner does not jump directly to the better probe value. `--spsa-move-ratio 0.1` moves the parameter only 10% of the perturbation width, so this example moves to roughly `0.30015`, not `0.3015`. Retries and acceptances keep the same perturbation size.
 
 Use `--update-mode winner` only if you explicitly want to jump directly to the parameter values of the lower-qloss probe.
 
