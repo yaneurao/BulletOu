@@ -63,13 +63,13 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.25, "min": 0.0, "max": 20.0 },
-    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
-    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
-    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 }
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 20.0 },
+    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
   }
 }
 ```
@@ -176,9 +176,11 @@ Each parameter is written like this:
 | --- | --- |
 | `current` | Current value. Candidates are sampled around it |
 | `tune` | If `true`, ES may change it. If `false`, it is fixed |
-| `step` | Sampling radius. Candidate values are drawn from `current - step` to `current + step` |
+| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step, step))` |
 | `min` | Lower bound |
 | `max` | Upper bound |
+
+`step` is not an additive width. `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. Parameters with `tune = true` must have `current > 0`.
 
 When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
 

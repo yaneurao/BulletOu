@@ -74,15 +74,15 @@ DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
     "hand_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
     "progress_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
     "pair": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
-    "residual_count": {"current": 0.0, "tune": False, "step": 0.25, "min": 0.0, "max": 20.0},
-    "axis_count": {"current": 0.0, "tune": False, "step": 0.25, "min": 0.0, "max": 100.0},
-    "king_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
-    "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
-    "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
-    "pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
-    "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
-    "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
-    "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
+    "residual_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 20.0},
+    "axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
+    "king_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
+    "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
+    "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
+    "pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
+    "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
+    "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
+    "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
 }
 
 
@@ -312,7 +312,9 @@ def parse_parameter_spec(name: str, value: Any) -> ParameterSpec:
     spec = ParameterSpec(current=current, tune=tune, step=step, minimum=minimum, maximum=maximum)
     spec.current = spec.clamp(spec.current)
     if spec.tune and spec.step == 0.0:
-        raise ValueError(f"parameters.{name}: tune=true requires step > 0")
+        raise ValueError(f"parameters.{name}: tune=true requires multiplicative step > 0")
+    if spec.tune and spec.current <= 0.0:
+        raise ValueError(f"parameters.{name}: multiplicative ES requires current > 0")
     return spec
 
 
@@ -496,7 +498,7 @@ def perturb_parameters(specs: dict[str, ParameterSpec], rng: random.Random) -> d
     for name, spec in specs.items():
         if spec.tune:
             delta = rng.uniform(-spec.step, spec.step)
-            out[name] = spec.clamp(spec.current + delta)
+            out[name] = spec.clamp(spec.current * math.exp(delta))
     return out
 
 

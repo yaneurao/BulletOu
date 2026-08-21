@@ -63,13 +63,13 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.25, "min": 0.0, "max": 20.0 },
-    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
-    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
-    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 }
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 20.0 },
+    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
   }
 }
 ```
@@ -176,9 +176,11 @@ runner root は `output_folder/es-<tag_prefix>` になります。
 | --- | --- |
 | `current` | 現在値。候補はこの値の周辺に作られる |
 | `tune` | `true` なら ES が動かす。`false` なら固定 |
-| `step` | 候補を作る幅。`current - step` から `current + step` の範囲でランダムに選ぶ |
+| `step` | 候補を作る倍率の幅。候補は `current * exp(random(-step, step))` で作る |
 | `min` | 下限 |
 | `max` | 上限 |
+
+`step` は加算幅ではありません。`step = 0.02` なら候補はおよそ `current` の ±2% の範囲、`step = 0.10` ならおよそ 0.90 倍から 1.11 倍の範囲になります。`tune = true` にするパラメーターは `current > 0` にしてください。
 
 採用された候補の値は `current` に書き戻されます。再開時に手で `king_axis=...` のような長い値を打ち直す必要はありません。
 
