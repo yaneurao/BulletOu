@@ -216,6 +216,8 @@ count confidence は、`bucket-count` で作った `count.bin` を使って、�
 
 値が `0.0` なら、その count confidence は無効です。値を大きくすると、十分な出現回数がない成分をより強く抑えます。
 
+`axis_count` と `pair_count` は、それぞれ axis 系 / pair 系に共通の値を使いたい場合の項目です。`king_axis_count` や `king_progress_pair_count` のような個別項目を使う場合は、`axis_count` / `pair_count` を書かないほうが設定の意図が読みやすくなります。未指定のままなら、runner が勝手に書き戻すこともありません。
+
 ## `es.enabled=false` で current 値だけ使う
 
 ES を回さず、`parameters.current` の値だけを使いたい場合は、`es.enabled` を `false` にします。

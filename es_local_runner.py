@@ -466,13 +466,28 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
 
 def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, ParameterSpec]) -> None:
     params_obj: dict[str, Any] = {}
+    original_params = root.get("parameters", {})
+    if not isinstance(original_params, dict):
+        original_params = {}
     for name in sorted(KNOWN_PARAMETERS):
-        original = root.get("parameters", {}).get(name, {})
+        spec = specs[name]
+        defaults = DEFAULT_PARAMETER_SPECS[name]
+        was_explicit = name in original_params
+        is_default_inactive = (
+            not spec.tune
+            and spec.current == float(defaults["current"])
+            and spec.step == float(defaults["step"])
+            and spec.minimum == float(defaults["min"])
+            and spec.maximum == float(defaults["max"])
+        )
+        if not was_explicit and is_default_inactive:
+            continue
+
+        original = original_params.get(name, {})
         if isinstance(original, dict):
             obj = dict(original)
         else:
             obj = {}
-        spec = specs[name]
         obj["current"] = spec.current
         obj["tune"] = spec.tune
         obj["step"] = spec.step

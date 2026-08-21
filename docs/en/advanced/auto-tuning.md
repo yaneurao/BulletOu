@@ -216,6 +216,8 @@ Count confidence uses a `count.bin` file created by `bucket-count`. It weakens t
 
 `0.0` disables that confidence. Larger values require more observations before the corresponding term is trusted strongly.
 
+`axis_count` and `pair_count` are shared fallback values for all axis terms or all pair terms. If you use explicit fields such as `king_axis_count` or `king_progress_pair_count`, it is clearer to omit `axis_count` / `pair_count`. When they are omitted and inactive, the runner will not write them back automatically.
+
 ## Use current values without ES
 
 If you want to use the tuned `parameters.current` values without running ES, set `es.enabled` to `false`.
